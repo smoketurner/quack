@@ -1,0 +1,114 @@
+# CI/CD
+
+## What ships in the template
+
+- **`.github/workflows/ci.yml`** — `fmt`, `clippy` (`--locked -D warnings`), `test`
+  (`cargo test --locked`, Linux + macOS), `dependency-review` (PRs), and `license-check`
+  (`cargo-deny check`). Toolchain from `rust-toolchain.toml` via `rustup show`; caching via
+  `Swatinem/rust-cache`; actions SHA-pinned; `permissions: {}` top-level with per-job
+  `contents: read`.
+- **`.github/workflows/secure_workflows.yml`** — fails CI if any third-party action is used
+  without a full commit-SHA pin (`zgosalvez/github-actions-ensure-sha-pinned-actions`).
+- **`.github/dependabot.yml`** — `cargo` + `github-actions`, weekly, grouped, 7-day cooldown.
+
+These cover everything a library/workspace needs. The pieces below produce and ship
+**binaries/containers**. They mirror what `smoketurner/devbox` and `vouch-sh/vouch` do.
+
+The repo ships them as **samples** that reference placeholder `app-common`/`app-server`/
+`app-cli` crates — they won't build until you rename those to your crates and add the CI
+jobs shown below:
+
+- [`Dockerfile`](../Dockerfile) + [`.dockerignore`](../.dockerignore) — runtime server image
+  (static musl binary → distroless).
+- [`Dockerfile.build`](../Dockerfile.build) + [`docker-bake.hcl`](../docker-bake.hcl) +
+  [`Dockerfile.build.dockerignore`](../Dockerfile.build.dockerignore) — reproducible
+  multi-target binaries for the CI `build` matrix and releases.
+
+The CI/release **workflow jobs** below are not scaffolded — wire them up when you add these.
+
+## Deferred: static musl binaries (`build` job)
+
+Reproducible static binaries via `cargo-chef` (dependency caching) in the shipped
+[`Dockerfile.build`](../Dockerfile.build), orchestrated by [`docker-bake.hcl`](../docker-bake.hcl)
+(a `ci` target with `cache-from`/`cache-to` GitHub Actions cache), invoked from a CI `build`
+matrix job that is not scaffolded:
+
+```yaml
+build:
+  name: Build musl (${{ matrix.name }})
+  runs-on: ${{ matrix.runner }}
+  permissions:
+    contents: read
+  strategy:
+    matrix:
+      include:
+        - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+  steps:
+    - uses: actions/checkout@<sha> # pin
+      with: { persist-credentials: false }
+    - uses: docker/setup-buildx-action@<sha> # pin
+    - uses: docker/bake-action@<sha> # pin
+      with: { targets: ci }
+      env: { TARGET: "${{ matrix.target }}" }
+```
+
+## Deferred: container vulnerability scan (`scan` job)
+
+Build the server image (`Dockerfile`), scan it with Grype, and upload SARIF to the Security
+tab. Runs on `push`:
+
+```yaml
+scan:
+  if: github.event_name == 'push'
+  permissions: { actions: read, contents: read, security-events: write }
+  steps:
+    - uses: actions/checkout@<sha>          # pin, persist-credentials: false
+    - uses: docker/setup-buildx-action@<sha>
+    - uses: docker/build-push-action@<sha>  # load: true, tags: <name>-server:scan
+    - uses: anchore/scan-action@<sha>       # id: grype, severity-cutoff: high, output-format: sarif
+    - uses: github/codeql-action/upload-sarif@<sha>
+      with: { sarif_file: "${{ steps.grype.outputs.sarif }}" }
+```
+
+## Deferred: releases (`release.yml`)
+
+On a `v*` tag: build the musl binaries (same bake `ci` target), assemble `dist/` with
+crate-named assets, `sha256sum` them, and publish a GitHub release. The publish job needs
+`permissions: contents: write` and uses `gh release create "$TAG" --generate-notes ./dist/*`.
+
+## When you add these
+
+1. Rename the placeholder `app-*` paths in the shipped `Dockerfile`, `.dockerignore`,
+   `Dockerfile.build`, `docker-bake.hcl`, and `Dockerfile.build.dockerignore` to your crates,
+   and update the `image.source` label. Keep `.dockerignore` a deny-by-default allowlist so
+   the runtime-image context stays small and cache-stable:
+
+   ```gitignore
+   *
+   !Cargo.toml
+   !Cargo.lock
+   !crates/*/Cargo.toml
+   !crates/*/src/
+   ```
+
+2. Add the `docker` ecosystem to `dependabot.yml` to keep base-image tags current:
+
+   ```yaml
+   - package-ecosystem: "docker"
+     directory: "/"
+     schedule: { interval: "weekly" }
+     commit-message: { prefix: "docker" }
+     cooldown: { default-days: 7 }
+   ```
+
+3. Pin every new action to a SHA (`secure_workflows.yml` enforces it) — resolve current SHAs
+   with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
+4. Keep `--locked` on every cargo invocation and `persist-credentials: false` on checkout.
+
+Two more patterns to reach for when the code calls for them:
+
+- **Fuzzing** — once a crate parses untrusted input, add a detached `fuzz/` crate
+  (`cargo-fuzz` + `libfuzzer-sys`, its own empty `[workspace]`) and gitignore `fuzz/corpus/`
+  and `fuzz/artifacts/`.
+- **Docs site** — when `docs/` outgrows flat files, migrate to mdBook (`docs/book.toml` +
+  `src/SUMMARY.md`), deploy via a GitHub Pages workflow, and gitignore `docs/book/`.
