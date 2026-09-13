@@ -142,12 +142,12 @@ impl Config {
         &self.general.data_dir
     }
 
-    /// Find the first configured OpenAI-compatible provider with an embedding model.
+    /// Find the first configured provider with an embedding model.
     #[must_use]
     pub fn find_embedding_provider(&self) -> Option<(&str, &ProviderConfig)> {
         self.providers
             .iter()
-            .find(|(_, p)| p.provider_type == "openai-compat" && p.embedding_model.is_some())
+            .find(|(_, p)| p.embedding_model.is_some())
             .map(|(name, config)| (name.as_str(), config))
     }
 
@@ -209,32 +209,15 @@ mod tests {
     }
 
     #[test]
-    fn find_embedding_provider_skips_wrong_type() {
-        let mut config = Config::default();
-        config.providers.insert(
-            "anthropic".into(),
-            ProviderConfig {
-                provider_type: "anthropic".into(),
-                base_url: Some("https://api.anthropic.com".into()),
-                api_key_env: Some("ANTHROPIC_API_KEY".into()),
-                model: Some("claude-3".into()),
-                embedding_model: Some("embed-model".into()),
-                embedding_dimension: Some(1024),
-            },
-        );
-        assert!(config.find_embedding_provider().is_none());
-    }
-
-    #[test]
     fn find_embedding_provider_skips_without_embedding_model() {
         let mut config = Config::default();
         config.providers.insert(
-            "openai".into(),
+            "ollama".into(),
             ProviderConfig {
-                provider_type: "openai-compat".into(),
-                base_url: Some("http://localhost".into()),
+                provider_type: "ollama".into(),
+                base_url: Some("http://localhost:11434".into()),
                 api_key_env: None,
-                model: Some("gpt-4".into()),
+                model: Some("llama3.2".into()),
                 embedding_model: None,
                 embedding_dimension: None,
             },
@@ -249,8 +232,8 @@ mod tests {
         config.providers.insert(
             "ollama".into(),
             ProviderConfig {
-                provider_type: "openai-compat".into(),
-                base_url: Some("http://localhost:11434/v1".into()),
+                provider_type: "ollama".into(),
+                base_url: Some("http://localhost:11434".into()),
                 api_key_env: None,
                 model: None,
                 embedding_model: Some("nomic-embed-text".into()),

@@ -1,17 +1,16 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::io::{Read, Write};
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::agent;
-use quack_core::config::Config;
+use quack_core::config::{Config, ProviderConfig};
 use quack_core::ingestion;
-use quack_core::llm::openai_compat::OpenAiCompatClient;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::WorkspaceDb;
+use rig::prelude::*;
+use std::io::{Read, Write};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "quack", version, about = "Data analysis platform")]
@@ -160,10 +159,10 @@ async fn run_ingest(
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
 
-    let provider = if no_embed {
+    let embedding_model = if no_embed {
         None
     } else {
-        build_embedding_provider(&config)?
+        build_embedding_model(&config)?
     };
 
     let result = ingestion::ingest_file(
@@ -172,7 +171,7 @@ async fn run_ingest(
         &workspace.id,
         &effective_filename,
         &data,
-        provider.as_ref(),
+        embedding_model.as_ref(),
     )
     .await
     .context("ingestion failed")?;
@@ -189,7 +188,7 @@ async fn run_ingest(
     }
     if result.chunks_stored > 0 {
         writeln!(out, "  Chunks: {}", result.chunks_stored)?;
-        if provider.is_some() {
+        if embedding_model.is_some() {
             writeln!(out, "  Embeddings: generated")?;
         }
     }
@@ -239,11 +238,39 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
 
-    let provider = build_llm_provider(&config)?;
+    let (_, chat_config) = config.find_chat_provider().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no LLM provider configured with a chat model — \
+             add a [providers.<name>] section with 'model' set in ~/.quack/config.toml"
+        )
+    })?;
 
-    let response = agent::run_agent_loop(&ws_db, &provider, &config.analysis, message, &[])
-        .await
-        .context("agent loop failed")?;
+    let client = build_ollama_client(chat_config)?;
+
+    let chat_model_name = chat_config
+        .model
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("chat provider has no model configured"))?;
+
+    let completion_model = client.completion_model(chat_model_name);
+
+    let (embedding_model, embed_model_name) = build_rig_embedding_model(&config)?;
+
+    tracing::info!(
+        chat_model = %chat_model_name,
+        embed_model = %embed_model_name,
+        "starting chat agent"
+    );
+
+    let response = agent::run_analysis(
+        ws_db,
+        completion_model,
+        embedding_model,
+        &config.analysis,
+        message,
+    )
+    .await
+    .context("agent loop failed")?;
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -262,26 +289,76 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn build_llm_provider(config: &Config) -> Result<OpenAiCompatClient> {
-    let (name, provider_config) = config
-        .find_chat_provider()
-        .ok_or_else(|| anyhow::anyhow!("no LLM provider configured with a chat model — add a [providers.<name>] section with 'model' set in ~/.quack/config.toml"))?;
+fn build_ollama_client(provider_config: &ProviderConfig) -> Result<rig::providers::ollama::Client> {
+    let api_key = provider_config
+        .api_key_env
+        .as_ref()
+        .and_then(|env| std::env::var(env).ok())
+        .map(rig::providers::ollama::OllamaApiKey::from)
+        .unwrap_or_default();
 
-    tracing::info!(provider = %name, model = ?provider_config.model, "using chat provider");
+    let mut builder = rig::providers::ollama::Client::builder().api_key(api_key);
 
-    OpenAiCompatClient::from_config(provider_config).context("failed to build LLM client")
+    if let Some(base_url) = &provider_config.base_url {
+        let url = base_url.trim_end_matches("/v1");
+        builder = builder.base_url(url);
+    }
+
+    builder.build().context("failed to build Ollama client")
 }
 
-fn build_embedding_provider(config: &Config) -> Result<Option<OpenAiCompatClient>> {
-    let Some((name, provider_config)) = config.find_embedding_provider() else {
+fn build_rig_embedding_model(
+    config: &Config,
+) -> Result<(rig::providers::ollama::EmbeddingModel, String)> {
+    let (name, embed_config) = config.find_embedding_provider().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no embedding provider configured — \
+             add a [providers.<name>] section with 'embedding_model' set in ~/.quack/config.toml"
+        )
+    })?;
+
+    tracing::info!(provider = %name, "using embedding provider");
+
+    let client = build_ollama_client(embed_config)?;
+
+    let model_name = embed_config
+        .embedding_model
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("embedding provider has no embedding_model configured"))?;
+
+    let ndims = embed_config.embedding_dimension.ok_or_else(|| {
+        anyhow::anyhow!("embedding provider has no embedding_dimension configured")
+    })?;
+
+    let ndims_usize = usize::try_from(ndims).context("embedding_dimension overflow")?;
+
+    let model = client.embedding_model_with_ndims(model_name, ndims_usize);
+    Ok((model, model_name.to_owned()))
+}
+
+fn build_embedding_model(
+    config: &Config,
+) -> Result<Option<rig::providers::ollama::EmbeddingModel>> {
+    let Some((name, embed_config)) = config.find_embedding_provider() else {
         tracing::info!("no embedding provider configured — storing chunks without embeddings");
         return Ok(None);
     };
 
-    tracing::info!(provider = %name, "using embedding provider");
+    tracing::info!(provider = %name, "using embedding provider for ingestion");
 
-    let client = OpenAiCompatClient::from_config(provider_config)
-        .context("failed to build embedding client")?;
+    let client = build_ollama_client(embed_config)?;
 
-    Ok(Some(client))
+    let model_name = embed_config
+        .embedding_model
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("embedding provider has no embedding_model configured"))?;
+
+    let ndims = embed_config.embedding_dimension.ok_or_else(|| {
+        anyhow::anyhow!("embedding provider has no embedding_dimension configured")
+    })?;
+
+    let ndims_usize = usize::try_from(ndims).context("embedding_dimension overflow")?;
+
+    let model = client.embedding_model_with_ndims(model_name, ndims_usize);
+    Ok(Some(model))
 }

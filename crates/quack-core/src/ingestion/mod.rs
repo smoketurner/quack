@@ -1,9 +1,10 @@
 pub mod chunker;
 pub mod parser;
 
+use rig::embeddings::EmbeddingModel;
+
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::llm::EmbeddingProvider;
 use crate::storage::workspace::WorkspaceDb;
 
 /// Result of ingesting a single file into a workspace.
@@ -22,13 +23,13 @@ pub struct IngestResult {
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, parsed, or stored.
-pub async fn ingest_file<P: EmbeddingProvider>(
+pub async fn ingest_file<M: EmbeddingModel>(
     config: &Config,
     db: &WorkspaceDb,
     workspace_id: &str,
     filename: &str,
     data: &[u8],
-    provider: Option<&P>,
+    embedding_model: Option<&M>,
 ) -> Result<IngestResult> {
     let file_type = parser::detect_file_type(filename);
     let doc_id = uuid::Uuid::now_v7().to_string();
@@ -72,7 +73,7 @@ pub async fn ingest_file<P: EmbeddingProvider>(
                 &config.ingestion.tokenizer_encoding,
             )?;
 
-            let chunk_count = embed_and_store(db, &doc_id, &chunks, provider).await?;
+            let chunk_count = embed_and_store(db, &doc_id, &chunks, embedding_model).await?;
 
             db.update_document_status(&doc_id, "ready")?;
 
@@ -135,11 +136,11 @@ fn ingest_structured(
     Ok(table_name)
 }
 
-async fn embed_and_store<P: EmbeddingProvider>(
+async fn embed_and_store<M: EmbeddingModel>(
     db: &WorkspaceDb,
     document_id: &str,
     chunks: &[String],
-    provider: Option<&P>,
+    embedding_model: Option<&M>,
 ) -> Result<u32> {
     let mut stored: u32 = 0;
 
@@ -153,25 +154,33 @@ async fn embed_and_store<P: EmbeddingProvider>(
             .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
     }
 
-    if let Some(prov) = provider {
+    if let Some(model) = embedding_model {
         let batch_size = 64usize;
         let mut offset = 0usize;
 
         while offset < chunks.len() {
             let end = chunks.len().min(offset.saturating_add(batch_size));
-            let batch_texts: Vec<&str> = chunks
+            let batch_texts: Vec<String> = chunks
                 .get(offset..end)
                 .ok_or_else(|| Error::Ingestion("batch slice out of bounds".into()))?
-                .iter()
-                .map(String::as_str)
-                .collect();
+                .to_vec();
 
-            let embeddings = prov.embed(&batch_texts).await?;
+            let embeddings = model
+                .embed_texts(batch_texts)
+                .await
+                .map_err(|e| Error::Embedding(e.to_string()))?;
 
             for (j, embedding) in embeddings.into_iter().enumerate() {
                 let chunk_idx = u32::try_from(offset.saturating_add(j))
                     .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
-                db.update_chunk_embedding(document_id, chunk_idx, &embedding)?;
+
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
+                )]
+                let vec_f32: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
+
+                db.update_chunk_embedding(document_id, chunk_idx, &vec_f32)?;
             }
 
             offset = end;

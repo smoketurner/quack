@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 quack-core         = { path = "../quack-core" }
 anyhow             = { workspace = true, features = ["std"] }
+rig                = { workspace = true, features = ["agent", "derive", "rustls"] }
 clap               = { workspace = true, features = ["derive", "help", "std", "usage"] }
 mimalloc           = { workspace = true, features = ["secure"] }
 serde_json         = { workspace = true, features = ["std"] }

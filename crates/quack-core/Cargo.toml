@@ -14,7 +14,8 @@ aws-lc-rs     = { workspace = true }
 dirs          = { workspace = true }
 duckdb        = { workspace = true, features = ["bundled"] }
 pdf-extract   = { workspace = true }
-reqwest       = { workspace = true, features = ["rustls", "json"] }
+rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
+schemars      = { workspace = true, features = ["derive"] }
 sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
