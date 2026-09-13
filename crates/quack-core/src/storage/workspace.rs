@@ -3,6 +3,7 @@ use std::io::Write;
 use crate::config::Config;
 
 /// Query result set from a `DuckDB` workspace database.
+#[derive(Debug)]
 pub struct QueryResults {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -15,6 +16,21 @@ pub struct WorkspaceDb {
 }
 
 impl WorkspaceDb {
+    /// Open an in-memory `DuckDB` database (for tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be created.
+    pub fn open_in_memory(embedding_dimension: u32) -> crate::error::Result<Self> {
+        let conn = duckdb::Connection::open_in_memory()?;
+        let db = Self {
+            conn,
+            embedding_dimension,
+        };
+        db.create_internal_tables()?;
+        Ok(db)
+    }
+
     /// Open (or create) the `DuckDB` database for a workspace.
     ///
     /// Loads the vss extension and creates the internal schema tables
@@ -285,11 +301,103 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// List all user-created tables in the workspace (excludes internal tables).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn list_tables(&self) -> crate::error::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_name NOT IN ('documents', 'chunks')")?;
+        let mut rows = stmt.query([])?;
+        let mut tables = Vec::new();
+        while let Some(row) = rows.next()? {
+            tables.push(row.get::<_, String>(0)?);
+        }
+        Ok(tables)
+    }
+
+    /// Describe a table's columns (name, type) and return up to 3 sample rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the query fails.
+    pub fn describe_table(&self, table_name: &str) -> crate::error::Result<TableDescription> {
+        let describe_sql = format!("DESCRIBE \"{table_name}\"");
+        let mut stmt = self.conn.prepare(&describe_sql)?;
+        let mut rows = stmt.query([])?;
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next()? {
+            columns.push(ColumnInfo {
+                name: row.get(0)?,
+                column_type: row.get(1)?,
+            });
+        }
+
+        let sample_sql = format!("SELECT * FROM \"{table_name}\" LIMIT 3");
+        let sample = self.execute_query(&sample_sql)?;
+
+        Ok(TableDescription {
+            table_name: table_name.to_owned(),
+            columns,
+            sample_rows: sample,
+        })
+    }
+
+    /// List all ingested documents with their status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn list_documents(&self) -> crate::error::Result<Vec<DocumentInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, filename, mime_type, size_bytes, status FROM documents ORDER BY ingested_at DESC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut docs = Vec::new();
+        while let Some(row) = rows.next()? {
+            docs.push(DocumentInfo {
+                id: row.get(0)?,
+                filename: row.get(1)?,
+                mime_type: row.get(2)?,
+                size_bytes: row.get(3)?,
+                status: row.get(4)?,
+            });
+        }
+        Ok(docs)
+    }
+
     /// Access the underlying `DuckDB` connection.
     #[must_use]
     pub fn connection(&self) -> &duckdb::Connection {
         &self.conn
     }
+}
+
+/// Column metadata from DESCRIBE.
+#[derive(Debug)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub column_type: String,
+}
+
+/// Full table description with schema and sample data.
+#[derive(Debug)]
+pub struct TableDescription {
+    pub table_name: String,
+    pub columns: Vec<ColumnInfo>,
+    pub sample_rows: QueryResults,
+}
+
+/// Document metadata row.
+#[derive(Debug)]
+pub struct DocumentInfo {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub status: String,
 }
 
 /// A chunk returned from vector similarity search.
@@ -347,6 +455,16 @@ fn display_json_value(val: &serde_json::Value) -> String {
 }
 
 impl QueryResults {
+    /// Return a copy of the results with at most `max_rows` rows.
+    #[must_use]
+    pub fn clone_capped(&self, max_rows: u32) -> Self {
+        let limit = max_rows as usize;
+        Self {
+            columns: self.columns.clone(),
+            rows: self.rows.iter().take(limit).cloned().collect(),
+        }
+    }
+
     /// Write results as a human-readable aligned table.
     ///
     /// # Errors

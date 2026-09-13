@@ -3,37 +3,43 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use quack_core::config::{Config, GeneralConfig, IngestionConfig, ProviderConfig};
+use quack_core::config::{AnalysisConfig, Config, GeneralConfig, IngestionConfig, ProviderConfig};
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
-use quack_core::llm::EmbeddingProvider;
 use quack_core::storage::workspace::WorkspaceDb;
+use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
-const TEST_DIM: u32 = 4;
+const TEST_DIM: usize = 4;
+const TEST_DIM_U32: u32 = 4;
 
-struct MockEmbeddingProvider {
-    dim: u32,
+struct MockEmbeddingModel {
+    dim: usize,
 }
 
-impl EmbeddingProvider for MockEmbeddingProvider {
-    fn embed(
-        &self,
-        texts: &[&str],
-    ) -> impl std::future::Future<Output = quack_core::error::Result<Vec<Vec<f32>>>> + Send {
-        let dim = self.dim as usize;
-        let mut result = Vec::with_capacity(texts.len());
-        for _ in texts {
-            result.push(vec![0.1_f32; dim]);
-        }
-        std::future::ready(Ok(result))
+impl EmbeddingModel for MockEmbeddingModel {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = ();
+
+    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+        Self { dim: TEST_DIM }
     }
 
-    fn embedding_dimension(&self) -> u32 {
+    fn ndims(&self) -> usize {
         self.dim
     }
 
-    fn model_name(&self) -> &'static str {
-        "mock-model"
+    fn embed_texts(
+        &self,
+        texts: impl IntoIterator<Item = String> + Send,
+    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        let mut result = Vec::new();
+        for text in texts {
+            result.push(Embedding {
+                document: text,
+                vec: vec![0.1_f64; self.dim],
+            });
+        }
+        std::future::ready(Ok(result))
     }
 }
 
@@ -47,7 +53,7 @@ fn test_config(data_dir: &Path) -> Config {
             api_key_env: None,
             model: None,
             embedding_model: Some("mock-model".into()),
-            embedding_dimension: Some(TEST_DIM),
+            embedding_dimension: Some(TEST_DIM_U32),
         },
     );
     Config {
@@ -62,6 +68,7 @@ fn test_config(data_dir: &Path) -> Config {
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
         },
+        analysis: AnalysisConfig::default(),
     }
 }
 
@@ -73,6 +80,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         },
         providers: BTreeMap::new(),
         ingestion: IngestionConfig::default(),
+        analysis: AnalysisConfig::default(),
     }
 }
 
@@ -89,7 +97,7 @@ async fn ingest_text_without_embeddings() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let data = b"Hello world. This is a test document for ingestion testing.";
-    let result = ingestion::ingest_file::<MockEmbeddingProvider>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
         &db,
         workspace_id,
@@ -119,7 +127,7 @@ async fn ingest_text_with_mock_embeddings() {
     let workspace_id = "ws-text-embed";
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
-    let provider = MockEmbeddingProvider { dim: TEST_DIM };
+    let model = MockEmbeddingModel { dim: TEST_DIM };
 
     let data = b"This is a longer document with enough words to produce at least one chunk. \
                  We need to make sure the embedding pipeline works end to end with our mock.";
@@ -129,7 +137,7 @@ async fn ingest_text_with_mock_embeddings() {
         workspace_id,
         "embed_test.txt",
         data,
-        Some(&provider),
+        Some(&model),
     )
     .await
     .unwrap();
@@ -157,7 +165,7 @@ async fn ingest_csv_structured() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingProvider>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
         &db,
         workspace_id,
@@ -192,7 +200,7 @@ async fn ingest_json_structured() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingProvider>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
         &db,
         workspace_id,
@@ -221,7 +229,7 @@ async fn ingest_unknown_file_type_returns_error() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingProvider>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
         &db,
         workspace_id,
@@ -247,7 +255,7 @@ async fn ingest_empty_text_file() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingProvider>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
         &db,
         workspace_id,
@@ -271,7 +279,7 @@ async fn ingest_markdown_as_unstructured() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let data = b"# Heading\n\nSome paragraph text.\n\n- item 1\n- item 2\n";
-    let result = ingestion::ingest_file::<MockEmbeddingProvider>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
         &db,
         workspace_id,

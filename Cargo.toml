@@ -57,6 +57,8 @@ mimalloc             = { version = "=0.1.52", default-features = false }
 pdf-extract          = { version = "=0.12.0", default-features = false }
 proptest             = { version = "=1.11.0", default-features = false }
 reqwest              = { version = "=0.13.5", default-features = false }
+rig                  = { version = "=0.42.0", default-features = false }
+schemars             = { version = "=1.2.2", default-features = false }
 rust-embed           = { version = "=8.12.0", default-features = false }
 rustls               = { version = "=0.23.43", default-features = false }
 sea-query            = { version = "=1.0.2", default-features = false }

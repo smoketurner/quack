@@ -9,6 +9,7 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     pub ingestion: IngestionConfig,
+    pub analysis: AnalysisConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,20 +59,66 @@ impl Default for IngestionConfig {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct AnalysisConfig {
+    pub max_query_rows: u32,
+    pub query_timeout_seconds: u32,
+    pub memory_limit_mb: u32,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            max_query_rows: 100,
+            query_timeout_seconds: 30,
+            memory_limit_mb: 256,
+        }
+    }
+}
+
+const APP_NAME: &str = "quack";
+
+/// Return the path where the config file is expected.
+#[must_use]
+pub fn config_file_path() -> PathBuf {
+    let config_dir =
+        std::env::var("QUACK_CONFIG_DIR").map_or_else(|_| default_config_dir(), PathBuf::from);
+    config_dir.join("config.toml")
+}
+
+fn default_config_dir() -> PathBuf {
+    dirs::home_dir().map_or_else(
+        || PathBuf::from(".config").join(APP_NAME),
+        |d| d.join(".config").join(APP_NAME),
+    )
+}
+
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir().map_or_else(|| PathBuf::from(".quack"), |h| h.join(".quack"))
+    dirs::home_dir().map_or_else(
+        || PathBuf::from(".local/share").join(APP_NAME),
+        |d| d.join(".local/share").join(APP_NAME),
+    )
 }
 
 impl Config {
-    /// Load configuration from `~/.quack/config.toml`, falling back to defaults.
-    /// Environment variables override file values.
+    /// Load configuration from the XDG config directory, falling back to defaults.
+    ///
+    /// Config file location: `~/.config/quack/config.toml`
+    ///
+    /// Data directory (databases, workspaces): `~/.local/share/quack/`
+    ///
+    /// `QUACK_DATA_DIR` overrides the data directory.
+    /// `QUACK_CONFIG_DIR` overrides the config directory.
     ///
     /// # Errors
     ///
     /// Returns an error if the config file exists but cannot be read or parsed.
     pub fn load() -> crate::error::Result<Self> {
-        let default_dir = default_data_dir();
-        let config_path = default_dir.join("config.toml");
+        let config_dir =
+            std::env::var("QUACK_CONFIG_DIR").map_or_else(|_| default_config_dir(), PathBuf::from);
+
+        let config_path = config_dir.join("config.toml");
 
         let mut config = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
@@ -123,12 +170,21 @@ impl Config {
         &self.general.data_dir
     }
 
-    /// Find the first configured OpenAI-compatible provider.
+    /// Find the first configured provider with an embedding model.
     #[must_use]
     pub fn find_embedding_provider(&self) -> Option<(&str, &ProviderConfig)> {
         self.providers
             .iter()
-            .find(|(_, p)| p.provider_type == "openai-compat" && p.embedding_model.is_some())
+            .find(|(_, p)| p.embedding_model.is_some())
+            .map(|(name, config)| (name.as_str(), config))
+    }
+
+    /// Find the first configured provider with a chat model.
+    #[must_use]
+    pub fn find_chat_provider(&self) -> Option<(&str, &ProviderConfig)> {
+        self.providers
+            .iter()
+            .find(|(_, p)| p.model.is_some())
             .map(|(name, config)| (name.as_str(), config))
     }
 }
@@ -175,25 +231,36 @@ mod tests {
     }
 
     #[test]
-    fn find_embedding_provider_returns_none_when_empty() {
-        let config = Config::default();
-        assert!(config.find_embedding_provider().is_none());
+    fn default_data_dir_uses_xdg() {
+        let data_dir = default_data_dir();
+        let data_str = data_dir.to_string_lossy();
+        assert!(
+            data_str.contains(APP_NAME),
+            "data dir should contain app name: {data_str}"
+        );
+        assert!(
+            !data_str.contains(".quack"),
+            "data dir should not use legacy .quack path: {data_str}"
+        );
     }
 
     #[test]
-    fn find_embedding_provider_skips_wrong_type() {
-        let mut config = Config::default();
-        config.providers.insert(
-            "anthropic".into(),
-            ProviderConfig {
-                provider_type: "anthropic".into(),
-                base_url: Some("https://api.anthropic.com".into()),
-                api_key_env: Some("ANTHROPIC_API_KEY".into()),
-                model: Some("claude-3".into()),
-                embedding_model: Some("embed-model".into()),
-                embedding_dimension: Some(1024),
-            },
+    fn default_config_dir_uses_xdg() {
+        let config_dir = default_config_dir();
+        let config_str = config_dir.to_string_lossy();
+        assert!(
+            config_str.contains(APP_NAME),
+            "config dir should contain app name: {config_str}"
         );
+        assert!(
+            !config_str.contains(".quack"),
+            "config dir should not use legacy .quack path: {config_str}"
+        );
+    }
+
+    #[test]
+    fn find_embedding_provider_returns_none_when_empty() {
+        let config = Config::default();
         assert!(config.find_embedding_provider().is_none());
     }
 
@@ -201,12 +268,12 @@ mod tests {
     fn find_embedding_provider_skips_without_embedding_model() {
         let mut config = Config::default();
         config.providers.insert(
-            "openai".into(),
+            "ollama".into(),
             ProviderConfig {
-                provider_type: "openai-compat".into(),
-                base_url: Some("http://localhost".into()),
+                provider_type: "ollama".into(),
+                base_url: Some("http://localhost:11434".into()),
                 api_key_env: None,
-                model: Some("gpt-4".into()),
+                model: Some("llama3.2".into()),
                 embedding_model: None,
                 embedding_dimension: None,
             },
@@ -221,8 +288,8 @@ mod tests {
         config.providers.insert(
             "ollama".into(),
             ProviderConfig {
-                provider_type: "openai-compat".into(),
-                base_url: Some("http://localhost:11434/v1".into()),
+                provider_type: "ollama".into(),
+                base_url: Some("http://localhost:11434".into()),
                 api_key_env: None,
                 model: None,
                 embedding_model: Some("nomic-embed-text".into()),

@@ -17,6 +17,12 @@ pub enum Error {
     #[error("embedding error: {0}")]
     Embedding(String),
 
+    #[error("LLM error: {0}")]
+    Llm(String),
+
+    #[error("analysis error: {0}")]
+    Analysis(String),
+
     #[error("ingestion error: {0}")]
     Ingestion(String),
 
@@ -34,6 +40,9 @@ pub enum Error {
 
     #[error(transparent)]
     SeaQuery(#[from] sea_query::error::Error),
+
+    #[error("format error: {0}")]
+    Fmt(#[from] std::fmt::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
