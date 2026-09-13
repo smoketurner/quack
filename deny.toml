@@ -14,7 +14,11 @@ targets = [
 [advisories]
 # Fail on any security advisory. Add specific RUSTSEC IDs here only with a
 # justification comment when an advisory truly does not apply.
-ignore = []
+ignore = [
+    # ttf-parser is unmaintained but only used transitively by pdf-extract for
+    # font parsing during PDF text extraction. No security impact.
+    "RUSTSEC-2026-0192",
+]
 
 [licenses]
 confidence-threshold = 0.9

@@ -41,20 +41,22 @@ publish      = false
 anyhow               = { version = "=1.0.104", default-features = false }
 askama               = { version = "=0.16.1", default-features = false }
 aws-lc-rs            = { version = "=1.18.1", default-features = false }
-dirs                 = { version = "=6.0.0", default-features = false }
-duckdb               = { version = "=1.10505.0", default-features = false }
 axum                 = { version = "=0.8.9", default-features = false }
 axum-extra           = { version = "=0.12.6", default-features = false }
 axum-server          = { version = "=0.8.0", default-features = false }
 base64               = { version = "=0.23.1", default-features = false }
 clap                 = { version = "=4.6.6", default-features = false }
+dirs                 = { version = "=6.0.0", default-features = false }
+duckdb               = { version = "=1.10505.0", default-features = false }
 fluent-bundle        = { version = "=0.16.0", default-features = false }
 i18n-embed           = { version = "=0.16.0", default-features = false }
 i18n-embed-fl        = { version = "=0.10.1", default-features = false }
 jiff                 = { version = "=0.2.35", default-features = false } # date/time — preferred over chrono/time
 mime_guess           = { version = "=2.0.5", default-features = false }
 mimalloc             = { version = "=0.1.52", default-features = false }
+pdf-extract          = { version = "=0.12.0", default-features = false }
 proptest             = { version = "=1.11.0", default-features = false }
+reqwest              = { version = "=0.13.5", default-features = false }
 rust-embed           = { version = "=8.12.0", default-features = false }
 rustls               = { version = "=0.23.43", default-features = false }
 sea-query            = { version = "=1.0.2", default-features = false }
@@ -64,10 +66,11 @@ serde                = { version = "=1.0.229", default-features = false }
 serde_json           = { version = "=1.0.151", default-features = false }
 sqlx                 = { version = "=0.9.0", default-features = false }
 thiserror            = { version = "=2.0.20", default-features = false }
+tiktoken             = { version = "=4.1.2", default-features = false }
 tokio                = { version = "=1.53.1", default-features = false }
-toml                 = { version = "=1.1.6", default-features = false }
 tokio-rustls         = { version = "=0.26.5", default-features = false }
 tokio-util           = { version = "=0.7.19", default-features = false }
+toml                 = { version = "=1.1.6", default-features = false }
 tower                = { version = "=0.5.3", default-features = false }
 tower-http           = { version = "=0.7.1", default-features = false }
 tower_governor       = { version = "=0.8.0", default-features = false }

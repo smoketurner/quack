@@ -17,7 +17,7 @@ workspace = true
 quack-core         = { path = "../quack-core" }
 anyhow             = { workspace = true, features = ["std"] }
 clap               = { workspace = true, features = ["derive", "help", "std", "usage"] }
-mimalloc           = { workspace = true }
+mimalloc           = { workspace = true, features = ["secure"] }
 serde_json         = { workspace = true, features = ["std"] }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing            = { workspace = true, features = ["std"] }

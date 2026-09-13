@@ -1,10 +1,14 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub general: GeneralConfig,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    pub ingestion: IngestionConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +23,37 @@ impl Default for GeneralConfig {
         Self {
             data_dir: default_data_dir(),
             default_workspace: String::from("default"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderConfig {
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub model: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_dimension: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct IngestionConfig {
+    pub chunk_size_tokens: u32,
+    pub chunk_overlap_tokens: u32,
+    pub embedding_batch_size: u32,
+    pub tokenizer_encoding: String,
+}
+
+impl Default for IngestionConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size_tokens: 512,
+            chunk_overlap_tokens: 64,
+            embedding_batch_size: 64,
+            tokenizer_encoding: String::from("cl100k_base"),
         }
     }
 }
@@ -86,5 +121,14 @@ impl Config {
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.general.data_dir
+    }
+
+    /// Find the first configured OpenAI-compatible provider.
+    #[must_use]
+    pub fn find_embedding_provider(&self) -> Option<(&str, &ProviderConfig)> {
+        self.providers
+            .iter()
+            .find(|(_, p)| p.provider_type == "openai-compat" && p.embedding_model.is_some())
+            .map(|(name, config)| (name.as_str(), config))
     }
 }

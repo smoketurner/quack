@@ -14,6 +14,15 @@ pub enum Error {
     #[error("workspace not found: {0}")]
     WorkspaceNotFound(String),
 
+    #[error("embedding error: {0}")]
+    Embedding(String),
+
+    #[error("ingestion error: {0}")]
+    Ingestion(String),
+
+    #[error("unsupported file type: {0}")]
+    UnsupportedFileType(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

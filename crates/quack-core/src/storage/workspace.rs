@@ -11,10 +11,15 @@ pub struct QueryResults {
 /// Wraps a `DuckDB` connection for a single workspace.
 pub struct WorkspaceDb {
     conn: duckdb::Connection,
+    embedding_dimension: u32,
 }
 
 impl WorkspaceDb {
     /// Open (or create) the `DuckDB` database for a workspace.
+    ///
+    /// Loads the vss extension and creates the internal schema tables
+    /// (documents, chunks) if they do not exist. The `embedding_dimension`
+    /// sets the fixed-size `FLOAT[N]` column width for vector storage.
     ///
     /// # Errors
     ///
@@ -28,8 +33,205 @@ impl WorkspaceDb {
         let files_dir = config.workspace_files_dir(workspace_id);
         std::fs::create_dir_all(&files_dir)?;
 
+        let embedding_dimension = config
+            .find_embedding_provider()
+            .and_then(|(_, p)| p.embedding_dimension)
+            .unwrap_or(1024);
+
         let conn = duckdb::Connection::open(&db_path)?;
-        Ok(Self { conn })
+
+        let db = Self {
+            conn,
+            embedding_dimension,
+        };
+        db.load_vss();
+        db.create_internal_tables()?;
+        Ok(db)
+    }
+
+    fn load_vss(&self) {
+        if let Err(e) = self.conn.execute("INSTALL vss", []) {
+            tracing::debug!(err = %e, "vss INSTALL skipped (may already be installed)");
+        }
+        if let Err(e) = self.conn.execute("LOAD vss", []) {
+            tracing::warn!(err = %e, "failed to load vss extension — vector indexing unavailable");
+        }
+    }
+
+    fn create_internal_tables(&self) -> crate::error::Result<()> {
+        let dim = self.embedding_dimension;
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                mime_type TEXT,
+                size_bytes BIGINT,
+                ingested_at TIMESTAMP DEFAULT now(),
+                status TEXT DEFAULT 'pending',
+                error_message TEXT
+            );
+            CREATE TABLE IF NOT EXISTS chunks (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                embedding FLOAT[{dim}],
+                token_count INTEGER
+            );"
+        );
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Insert a document metadata row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert fails.
+    pub fn insert_document(
+        &self,
+        id: &str,
+        filename: &str,
+        mime_type: &str,
+        size_bytes: usize,
+        status: &str,
+    ) -> crate::error::Result<()> {
+        let size = i64::try_from(size_bytes)
+            .map_err(|_| crate::error::Error::Ingestion("file size overflow".into()))?;
+
+        self.conn.execute(
+            "INSERT INTO documents (id, filename, mime_type, size_bytes, status) VALUES (?, ?, ?, ?, ?)",
+            duckdb::params![id, filename, mime_type, size, status],
+        )?;
+        Ok(())
+    }
+
+    /// Update a document's status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn update_document_status(&self, id: &str, status: &str) -> crate::error::Result<()> {
+        self.conn.execute(
+            "UPDATE documents SET status = ? WHERE id = ?",
+            duckdb::params![status, id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a text chunk, optionally with an embedding vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert fails.
+    pub fn insert_chunk(
+        &self,
+        id: &str,
+        document_id: &str,
+        chunk_index: u32,
+        content: &str,
+        embedding: Option<&[f32]>,
+    ) -> crate::error::Result<()> {
+        match embedding {
+            Some(emb) => {
+                let emb_str = format_embedding(emb);
+                let dim = self.embedding_dimension;
+                let sql = format!(
+                    "INSERT INTO chunks (id, document_id, chunk_index, content, embedding) \
+                     VALUES (?, ?, ?, ?, {emb_str}::FLOAT[{dim}])"
+                );
+                self.conn
+                    .execute(&sql, duckdb::params![id, document_id, chunk_index, content])?;
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO chunks (id, document_id, chunk_index, content) VALUES (?, ?, ?, ?)",
+                    duckdb::params![id, document_id, chunk_index, content],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Update a chunk's embedding vector by document ID and chunk index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn update_chunk_embedding(
+        &self,
+        document_id: &str,
+        chunk_index: u32,
+        embedding: &[f32],
+    ) -> crate::error::Result<()> {
+        let emb_str = format_embedding(embedding);
+        let dim = self.embedding_dimension;
+        let sql = format!(
+            "UPDATE chunks SET embedding = {emb_str}::FLOAT[{dim}] \
+             WHERE document_id = ? AND chunk_index = ?"
+        );
+        self.conn
+            .execute(&sql, duckdb::params![document_id, chunk_index])?;
+        Ok(())
+    }
+
+    /// Create an HNSW index on the chunks embedding column for cosine similarity.
+    ///
+    /// Requires the vss extension to be loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if index creation fails (e.g., vss not loaded or
+    /// no embeddings stored yet).
+    pub fn create_embedding_index(&self) -> crate::error::Result<()> {
+        self.conn
+            .execute("SET hnsw_enable_experimental_persistence = true", [])?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS chunks_embedding_idx \
+             ON chunks USING HNSW (embedding) \
+             WITH (metric = 'cosine')",
+            [],
+        )?;
+        tracing::info!("created HNSW cosine index on chunks.embedding");
+        Ok(())
+    }
+
+    /// Search for the most similar chunks to a query embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the search query fails.
+    pub fn search_similar_chunks(
+        &self,
+        query_embedding: &[f32],
+        top_k: u32,
+    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+        let emb_str = format_embedding(query_embedding);
+        let dim = self.embedding_dimension;
+        let sql = format!(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, \
+                    array_cosine_distance(c.embedding, {emb_str}::FLOAT[{dim}]) AS distance \
+             FROM chunks c \
+             WHERE c.embedding IS NOT NULL \
+             ORDER BY distance ASC \
+             LIMIT {top_k}"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut results = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            results.push(ChunkSearchResult {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                document_id: row.get(2)?,
+                chunk_index: row.get(3)?,
+                distance: row.get(4)?,
+            });
+        }
+
+        Ok(results)
     }
 
     /// Execute an arbitrary SQL statement and return the results.
@@ -73,11 +275,36 @@ impl WorkspaceDb {
         })
     }
 
+    /// Execute a SQL statement that does not return rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid or execution fails.
+    pub fn execute_statement(&self, sql: &str) -> crate::error::Result<()> {
+        self.conn.execute(sql, [])?;
+        Ok(())
+    }
+
     /// Access the underlying `DuckDB` connection.
     #[must_use]
     pub fn connection(&self) -> &duckdb::Connection {
         &self.conn
     }
+}
+
+/// A chunk returned from vector similarity search.
+#[derive(Debug)]
+pub struct ChunkSearchResult {
+    pub id: String,
+    pub content: String,
+    pub document_id: String,
+    pub chunk_index: u32,
+    pub distance: f64,
+}
+
+fn format_embedding(embedding: &[f32]) -> String {
+    let inner: Vec<String> = embedding.iter().map(|v| format!("{v}")).collect();
+    format!("[{}]", inner.join(","))
 }
 
 fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {

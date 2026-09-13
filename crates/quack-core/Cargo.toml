@@ -10,14 +10,18 @@ publish                = false
 workspace = true
 
 [dependencies]
-dirs       = { workspace = true }
-duckdb     = { workspace = true, features = ["bundled"] }
-sea-query  = { workspace = true, features = ["backend-sqlite", "derive"] }
-serde      = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true, features = ["std"] }
-sqlx       = { workspace = true, features = ["runtime-tokio", "sqlite"] }
-thiserror  = { workspace = true, features = ["std"] }
-tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
-toml       = { workspace = true, features = ["std", "parse", "serde"] }
-tracing    = { workspace = true, features = ["std"] }
-uuid       = { workspace = true, features = ["std", "v7"] }
+aws-lc-rs     = { workspace = true }
+dirs          = { workspace = true }
+duckdb        = { workspace = true, features = ["bundled"] }
+pdf-extract   = { workspace = true }
+reqwest       = { workspace = true, features = ["rustls", "json"] }
+sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
+serde         = { workspace = true, features = ["derive", "std"] }
+serde_json    = { workspace = true, features = ["std"] }
+sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+thiserror     = { workspace = true, features = ["std"] }
+tiktoken      = { workspace = true, features = ["vocabs-all"] }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+toml          = { workspace = true, features = ["std", "parse", "serde"] }
+tracing       = { workspace = true, features = ["std"] }
+uuid          = { workspace = true, features = ["std", "v7"] }
