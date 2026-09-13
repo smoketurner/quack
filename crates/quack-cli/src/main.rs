@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use quack_core::analysis::agent;
 use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::llm::openai_compat::OpenAiCompatClient;
@@ -52,6 +53,16 @@ enum Commands {
         #[arg(long)]
         no_embed: bool,
     },
+
+    /// Chat with the analysis agent
+    Chat {
+        /// Question or message for the agent
+        message: String,
+
+        /// Workspace name (defaults to config value)
+        #[arg(long, short = 'w')]
+        workspace: Option<String>,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -83,6 +94,7 @@ async fn main() -> Result<()> {
             filename,
             no_embed,
         } => run_ingest(&file, workspace.as_deref(), filename.as_deref(), no_embed).await,
+        Commands::Chat { message, workspace } => run_chat(&message, workspace.as_deref()).await,
     }
 }
 
@@ -209,6 +221,55 @@ fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, S
 
         Ok((data, filename))
     }
+}
+
+async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
+    let config = Config::load().context("failed to load configuration")?;
+
+    let control = ControlPlane::open(&config)
+        .await
+        .context("failed to open control plane")?;
+
+    let ws_name = workspace_name.unwrap_or(config.general.default_workspace.as_str());
+    let workspace = control
+        .find_or_create_workspace(ws_name)
+        .await
+        .context("failed to resolve workspace")?;
+
+    let ws_db =
+        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+
+    let provider = build_llm_provider(&config)?;
+
+    let response = agent::run_agent_loop(&ws_db, &provider, &config.analysis, message, &[])
+        .await
+        .context("agent loop failed")?;
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    writeln!(out, "{}", response.content)?;
+
+    if let Some(chart_spec) = &response.chart_spec {
+        writeln!(out)?;
+        writeln!(out, "--- ECharts Spec ---")?;
+        let json =
+            serde_json::to_string_pretty(chart_spec).context("failed to serialize chart spec")?;
+        writeln!(out, "{json}")?;
+    }
+
+    out.flush()?;
+    Ok(())
+}
+
+fn build_llm_provider(config: &Config) -> Result<OpenAiCompatClient> {
+    let (name, provider_config) = config
+        .find_chat_provider()
+        .ok_or_else(|| anyhow::anyhow!("no LLM provider configured with a chat model — add a [providers.<name>] section with 'model' set in ~/.quack/config.toml"))?;
+
+    tracing::info!(provider = %name, model = ?provider_config.model, "using chat provider");
+
+    OpenAiCompatClient::from_config(provider_config).context("failed to build LLM client")
 }
 
 fn build_embedding_provider(config: &Config) -> Result<Option<OpenAiCompatClient>> {

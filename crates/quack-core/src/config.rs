@@ -9,6 +9,7 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     pub ingestion: IngestionConfig,
+    pub analysis: AnalysisConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +55,24 @@ impl Default for IngestionConfig {
             chunk_overlap_tokens: 64,
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct AnalysisConfig {
+    pub max_query_rows: u32,
+    pub query_timeout_seconds: u32,
+    pub memory_limit_mb: u32,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            max_query_rows: 100,
+            query_timeout_seconds: 30,
+            memory_limit_mb: 256,
         }
     }
 }
@@ -123,12 +142,21 @@ impl Config {
         &self.general.data_dir
     }
 
-    /// Find the first configured OpenAI-compatible provider.
+    /// Find the first configured OpenAI-compatible provider with an embedding model.
     #[must_use]
     pub fn find_embedding_provider(&self) -> Option<(&str, &ProviderConfig)> {
         self.providers
             .iter()
             .find(|(_, p)| p.provider_type == "openai-compat" && p.embedding_model.is_some())
+            .map(|(name, config)| (name.as_str(), config))
+    }
+
+    /// Find the first configured provider with a chat model.
+    #[must_use]
+    pub fn find_chat_provider(&self) -> Option<(&str, &ProviderConfig)> {
+        self.providers
+            .iter()
+            .find(|(_, p)| p.model.is_some())
             .map(|(name, config)| (name.as_str(), config))
     }
 }

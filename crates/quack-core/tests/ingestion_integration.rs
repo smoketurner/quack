@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use quack_core::config::{Config, GeneralConfig, IngestionConfig, ProviderConfig};
+use quack_core::config::{AnalysisConfig, Config, GeneralConfig, IngestionConfig, ProviderConfig};
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
 use quack_core::llm::EmbeddingProvider;
@@ -62,6 +62,7 @@ fn test_config(data_dir: &Path) -> Config {
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
         },
+        analysis: AnalysisConfig::default(),
     }
 }
 
@@ -73,6 +74,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         },
         providers: BTreeMap::new(),
         ingestion: IngestionConfig::default(),
+        analysis: AnalysisConfig::default(),
     }
 }
 
