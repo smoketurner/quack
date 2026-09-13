@@ -33,7 +33,10 @@ allow = [
     "Unlicense",
     "Zlib",
 ]
-exceptions = []
+exceptions = [
+    # webpki-roots ships Mozilla CA certs; pulled by ureq (build dep of libduckdb-sys).
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 
 [bans]
 multiple-versions   = "warn"
@@ -45,7 +48,9 @@ deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
     { name = "native-tls" },
-    { name = "ring" },
+    # ring is banned from runtime code, but libduckdb-sys pulls it at build time
+    # via ureq → rustls for downloading DuckDB sources.
+    { name = "ring", wrappers = ["rustls", "rustls-webpki"] },
 ]
 
 [sources]

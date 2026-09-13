@@ -1,0 +1,24 @@
+[package]
+name                   = "quack-cli"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish                = false
+
+[[bin]]
+name = "quack"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+quack-core         = { path = "../quack-core" }
+anyhow             = { workspace = true, features = ["std"] }
+clap               = { workspace = true, features = ["derive", "help", "std", "usage"] }
+mimalloc           = { workspace = true }
+serde_json         = { workspace = true, features = ["std"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing            = { workspace = true, features = ["std"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "std"] }
