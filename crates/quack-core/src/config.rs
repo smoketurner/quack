@@ -132,3 +132,109 @@ impl Config {
             .map(|(name, config)| (name.as_str(), config))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_values() {
+        let config = Config::default();
+        assert_eq!(config.general.default_workspace, "default");
+        assert_eq!(config.ingestion.chunk_size_tokens, 512);
+        assert_eq!(config.ingestion.chunk_overlap_tokens, 64);
+        assert_eq!(config.ingestion.embedding_batch_size, 64);
+        assert_eq!(config.ingestion.tokenizer_encoding, "cl100k_base");
+    }
+
+    #[test]
+    fn path_helpers_use_data_dir() {
+        let mut config = Config::default();
+        config.general.data_dir = PathBuf::from("/data");
+
+        assert_eq!(config.control_db_path(), PathBuf::from("/data/control.db"));
+        assert_eq!(
+            config.workspace_dir("ws1"),
+            PathBuf::from("/data/workspaces/ws1")
+        );
+        assert_eq!(
+            config.workspace_db_path("ws1"),
+            PathBuf::from("/data/workspaces/ws1/data.duckdb")
+        );
+        assert_eq!(
+            config.workspace_files_dir("ws1"),
+            PathBuf::from("/data/workspaces/ws1/files")
+        );
+    }
+
+    #[test]
+    fn data_dir_accessor() {
+        let mut config = Config::default();
+        config.general.data_dir = PathBuf::from("/custom");
+        assert_eq!(config.data_dir(), Path::new("/custom"));
+    }
+
+    #[test]
+    fn find_embedding_provider_returns_none_when_empty() {
+        let config = Config::default();
+        assert!(config.find_embedding_provider().is_none());
+    }
+
+    #[test]
+    fn find_embedding_provider_skips_wrong_type() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "anthropic".into(),
+            ProviderConfig {
+                provider_type: "anthropic".into(),
+                base_url: Some("https://api.anthropic.com".into()),
+                api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                model: Some("claude-3".into()),
+                embedding_model: Some("embed-model".into()),
+                embedding_dimension: Some(1024),
+            },
+        );
+        assert!(config.find_embedding_provider().is_none());
+    }
+
+    #[test]
+    fn find_embedding_provider_skips_without_embedding_model() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "openai".into(),
+            ProviderConfig {
+                provider_type: "openai-compat".into(),
+                base_url: Some("http://localhost".into()),
+                api_key_env: None,
+                model: Some("gpt-4".into()),
+                embedding_model: None,
+                embedding_dimension: None,
+            },
+        );
+        assert!(config.find_embedding_provider().is_none());
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Some")]
+    fn find_embedding_provider_returns_valid() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "ollama".into(),
+            ProviderConfig {
+                provider_type: "openai-compat".into(),
+                base_url: Some("http://localhost:11434/v1".into()),
+                api_key_env: None,
+                model: None,
+                embedding_model: Some("nomic-embed-text".into()),
+                embedding_dimension: Some(768),
+            },
+        );
+        let (name, provider) = config.find_embedding_provider().unwrap();
+        assert_eq!(name, "ollama");
+        assert_eq!(provider.embedding_dimension, Some(768));
+        assert_eq!(
+            provider.embedding_model.as_deref(),
+            Some("nomic-embed-text")
+        );
+    }
+}

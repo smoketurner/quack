@@ -130,3 +130,62 @@ impl EmbeddingProvider for OpenAiCompatClient {
         &self.model
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_provider_config() -> ProviderConfig {
+        ProviderConfig {
+            provider_type: "openai-compat".into(),
+            base_url: Some("http://localhost:11434/v1".into()),
+            api_key_env: None,
+            model: None,
+            embedding_model: Some("test-model".into()),
+            embedding_dimension: Some(128),
+        }
+    }
+
+    #[test]
+    fn missing_base_url_returns_error() {
+        let mut cfg = base_provider_config();
+        cfg.base_url = None;
+        assert!(OpenAiCompatClient::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn missing_embedding_model_returns_error() {
+        let mut cfg = base_provider_config();
+        cfg.embedding_model = None;
+        assert!(OpenAiCompatClient::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn missing_dimension_returns_error() {
+        let mut cfg = base_provider_config();
+        cfg.embedding_dimension = None;
+        assert!(OpenAiCompatClient::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn valid_config_succeeds() {
+        assert!(OpenAiCompatClient::from_config(&base_provider_config()).is_ok());
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn strips_trailing_slash_from_base_url() {
+        let mut cfg = base_provider_config();
+        cfg.base_url = Some("http://localhost:11434/v1/".into());
+        let client = OpenAiCompatClient::from_config(&cfg).unwrap();
+        assert_eq!(client.base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn exposes_dimension_and_model() {
+        let client = OpenAiCompatClient::from_config(&base_provider_config()).unwrap();
+        assert_eq!(client.embedding_dimension(), 128);
+        assert_eq!(client.model_name(), "test-model");
+    }
+}

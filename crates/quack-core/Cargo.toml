@@ -25,3 +25,6 @@ tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sy
 toml          = { workspace = true, features = ["std", "parse", "serde"] }
 tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

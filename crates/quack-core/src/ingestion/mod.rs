@@ -7,6 +7,7 @@ use crate::llm::EmbeddingProvider;
 use crate::storage::workspace::WorkspaceDb;
 
 /// Result of ingesting a single file into a workspace.
+#[derive(Debug)]
 pub struct IngestResult {
     pub document_id: String,
     pub filename: String,
@@ -201,4 +202,49 @@ fn sanitize_table_name(filename: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_extension() {
+        assert_eq!(sanitize_table_name("data.csv"), "data");
+    }
+
+    #[test]
+    fn sanitize_replaces_non_alphanumeric() {
+        assert_eq!(sanitize_table_name("my-data file.csv"), "my_data_file");
+    }
+
+    #[test]
+    fn sanitize_preserves_underscores() {
+        assert_eq!(sanitize_table_name("my_data.json"), "my_data");
+    }
+
+    #[test]
+    fn sanitize_no_extension() {
+        assert_eq!(sanitize_table_name("readme"), "readme");
+    }
+
+    #[test]
+    fn sanitize_empty_uses_fallback() {
+        assert_eq!(sanitize_table_name(""), "imported");
+    }
+
+    #[test]
+    fn sanitize_dotfile_replaces_leading_dot() {
+        assert_eq!(sanitize_table_name(".hidden"), "_hidden");
+    }
+
+    #[test]
+    fn sanitize_multiple_extensions() {
+        assert_eq!(sanitize_table_name("data.2024.csv"), "data_2024");
+    }
+
+    #[test]
+    fn sanitize_preserves_alphanumeric() {
+        assert_eq!(sanitize_table_name("Sales2024.parquet"), "Sales2024");
+    }
 }

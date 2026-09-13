@@ -427,3 +427,130 @@ impl QueryResults {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_embedding_multiple_values() {
+        let emb = [1.0_f32, 2.5, -3.0];
+        assert_eq!(format_embedding(&emb), "[1,2.5,-3]");
+    }
+
+    #[test]
+    fn format_embedding_empty() {
+        let emb: [f32; 0] = [];
+        assert_eq!(format_embedding(&emb), "[]");
+    }
+
+    #[test]
+    fn format_embedding_single_value() {
+        let emb = [0.5_f32];
+        assert_eq!(format_embedding(&emb), "[0.5]");
+    }
+
+    #[test]
+    fn display_json_null() {
+        assert_eq!(display_json_value(&serde_json::Value::Null), "NULL");
+    }
+
+    #[test]
+    fn display_json_string() {
+        let val = serde_json::Value::String("hello".into());
+        assert_eq!(display_json_value(&val), "hello");
+    }
+
+    #[test]
+    fn display_json_number() {
+        let val = serde_json::Value::Number(42.into());
+        assert_eq!(display_json_value(&val), "42");
+    }
+
+    #[test]
+    fn display_json_bool_true() {
+        assert_eq!(display_json_value(&serde_json::Value::Bool(true)), "true");
+    }
+
+    #[test]
+    fn display_json_bool_false() {
+        assert_eq!(display_json_value(&serde_json::Value::Bool(false)), "false");
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
+    fn write_table_empty_columns_prints_ok() {
+        let results = QueryResults {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        results.write_table(&mut buf).unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf), "OK\n");
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
+    fn write_table_renders_aligned_columns() {
+        let results = QueryResults {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![
+                    serde_json::Value::Number(1.into()),
+                    serde_json::Value::String("alice".into()),
+                ],
+                vec![
+                    serde_json::Value::Number(2.into()),
+                    serde_json::Value::String("bob".into()),
+                ],
+            ],
+        };
+        let mut buf = Vec::new();
+        results.write_table(&mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains("id"));
+        assert!(output.contains("name"));
+        assert!(output.contains("alice"));
+        assert!(output.contains("bob"));
+        assert!(output.contains("(2 rows)"));
+        assert!(output.contains("-+-"));
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
+    fn write_json_produces_valid_array() {
+        let results = QueryResults {
+            columns: vec!["id".into(), "val".into()],
+            rows: vec![vec![
+                serde_json::Value::Number(1.into()),
+                serde_json::Value::String("x".into()),
+            ]],
+        };
+        let mut buf = Vec::new();
+        results.write_json(&mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+        let parsed: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let first = parsed.first().unwrap();
+        assert_eq!(first.get("id"), Some(&serde_json::Value::Number(1.into())));
+        assert_eq!(
+            first.get("val"),
+            Some(&serde_json::Value::String("x".into()))
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
+    fn write_json_empty_rows_produces_empty_array() {
+        let results = QueryResults {
+            columns: vec!["a".into()],
+            rows: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        results.write_json(&mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert!(parsed.is_empty());
+    }
+}
