@@ -21,7 +21,7 @@ Customize the conventions below for this project.
 
 ## Before Creating a PR
 
-Pre-commit checks (these require at least one crate under `crates/`):
+Pre-commit checks:
 
 ```bash
 cargo fmt --all --check
@@ -30,11 +30,7 @@ cargo test --locked --workspace
 cargo deny check
 ```
 
-- For changes touching the **data layer, crypto/TLS, or dependencies**, verify the review
-  gates in [`code-standards.md`](code-standards.md) pass (links into `docs/dsql.md`,
-  `docs/migrations.md`, `docs/crypto.md`)
+- For changes touching **crypto/TLS or dependencies**, verify the review
+  gates in [`code-standards.md`](code-standards.md) pass (links into `docs/crypto.md`)
 - Formatting runs on **stable** (`.rustfmt.toml` uses stable-only options — no nightly needed)
 - Update `CHANGELOG.md` (`[Unreleased]` section if no version assigned)
-- If you touched the data layer, run migrations against both SQLite and a Postgres/DSQL
-  target (see `docs/migrations.md`)
-- If you touched the UI, rebuild Tailwind CSS (`make css-build`) before committing

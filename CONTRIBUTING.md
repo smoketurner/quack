@@ -6,7 +6,6 @@ Prerequisites:
 
 - **Rust** — pinned in `rust-toolchain.toml`; install via [rustup](https://rustup.rs/)
 - **cmake** + **clang** — build dependency of `aws-lc-rs`
-- **Tailwind CSS CLI** — v4.3.3 standalone CLI, for UI work (`make css-build`)
 
 Common commands (`make help` lists all):
 
@@ -20,7 +19,7 @@ make deny    # cargo deny check
 
 ## Before opening a PR
 
-Run the gate (requires at least one crate under `crates/`):
+Run the gate:
 
 ```bash
 cargo fmt --all --check
@@ -31,7 +30,7 @@ cargo deny check
 
 Then check your change against the review gates in
 [`.claude/rules/code-standards.md`](.claude/rules/code-standards.md) — crypto (aws-lc-rs
-only), the DSQL/data-layer rules, and workspace hygiene.
+only), data-layer rules, and workspace hygiene.
 
 ## Commit messages
 

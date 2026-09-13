@@ -1,12 +1,11 @@
-# Makefile for rust-template.
-#
-# NOTE: this template ships no crates yet, so cargo targets report
-# "no members" until you add one under crates/ (see crates/README.md).
+# Makefile for quack.
 
 -include .env
 export
 
 CARGO ?= cargo
+
+BIN ?= quack
 
 # Name of the server crate used by the CSS targets. Override once you create it:
 #   make css-build SERVER_CRATE=my-server

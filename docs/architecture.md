@@ -1,6 +1,6 @@
 # Architecture
 
-How the pieces of a project built from this template fit together.
+How the pieces of this project fit together.
 
 ## Workspace
 
@@ -16,42 +16,23 @@ root:
 
 `resolver = "3"` (the edition-2024 default) gives MSRV-aware dependency resolution.
 
-## Recommended layering
+## Layering
 
 ```
             +-----------------------------+
-            |        <name>-server        |  axum, rust-embed, fluent, Tailwind
-            |        (or <name>-cli)      |  + persistence (db module):
-            |                             |  sqlx + sea-query, migrations, DSQL auth
+            |         quack-cli           |  clap binary, output formatting
             +--------------+--------------+
                            | depends on
             +--------------v--------------+
-            |        <name>-common        |  domain types, error, config
+            |         quack-core          |  config, error, control plane (SQLite),
+            |                             |  workspace engine (DuckDB), sea-query
             +-----------------------------+
 ```
 
-- **`-common`** has no I/O. Pure types, the crate's error enum (`thiserror`), and config
-  parsing. Everything else depends on it.
-- **`-server`** owns the HTTP surface, the embedded UI, **and persistence**. Keep the data
-  layer in a `db` module — the `Pool` abstraction over SQLite and Postgres/DSQL, the
-  sea-query store, and migrations, exposing typed methods (never raw SQL) to handlers. The
-  crate holds shared state (`Arc<AppState>` containing the store) and wires routes,
-  middleware, assets, and i18n.
-
-Keeping persistence in a `db` module and types in `-common` means the SQLite-vs-DSQL decision
-and the sea-query translation never leak into request handlers.
-
-## Request flow (server)
-
-```
-HTTP request
-  -> tower middleware (request-id, timeout, body limit, i18n negotiation)
-  -> axum handler
-       -> store method (db module)      sea-query -> SqliteQueryBuilder | PostgresQueryBuilder
-            -> sqlx Pool (Sqlite | Pg)  (Pg path wraps writes in OCC retry for DSQL)
-       -> askama template + fluent translations
-  -> response (HTML from embedded templates, assets from rust-embed)
-```
+- **`quack-core`** owns config parsing, error types, the SQLite control plane (workspace
+  metadata, threads, audit log), and the DuckDB workspace engine. Queries against the
+  control plane are built with sea-query; user SQL runs directly against DuckDB.
+- **`quack-cli`** owns the clap CLI surface and output formatting (table, JSON).
 
 ## Lint inheritance
 
@@ -74,13 +55,9 @@ make test    # cargo test --workspace --all-features
 make deny    # cargo deny check (advisories, licenses, bans)
 ```
 
-Tests use SQLite in-memory (`sqlite::memory:`) so they need no external services. The
-Postgres/DSQL path is exercised against a real cluster or a vanilla Postgres for
-wire-compatible checks; DSQL-only constraints are verified separately (`dsql.md`).
-
 ## Adding a layer
 
-1. `cargo new --lib crates/<name>-<layer>` (see `crates/README.md`).
+1. `cargo new --lib crates/<name>` (see `crates/README.md`).
 2. Add `[lints] workspace = true` and inherit package fields.
 3. Pull deps from the workspace menu; add new ones (pinned) to `[workspace.dependencies]`.
 4. Read the matching `docs/` file for that layer's patterns before writing code.

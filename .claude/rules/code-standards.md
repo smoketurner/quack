@@ -21,22 +21,13 @@ and code — this file is the gate, the doc is the detail.
 - [ ] After touching TLS deps: `cargo tree -i ring` and `cargo tree -i openssl-sys` return no
       match; `cargo deny check` passes.
 
-## Data layer & DSQL → [docs/dsql.md](../../docs/dsql.md), [docs/migrations.md](../../docs/migrations.md)
+## Data layer
 
-- [ ] **No `FOREIGN KEY`** in DDL — enforce referential integrity in code.
 - [ ] **UUID v7 primary keys**, client-generated via `uuid::Uuid::now_v7()` — not v4
       (`gen_random_uuid()`), not `SERIAL`/sequential PKs.
-- [ ] **One DDL statement per migration file**; never mix DDL and DML in one transaction.
-- [ ] Indexes on non-empty tables use **`CREATE INDEX ASYNC`** (sync `CREATE INDEX` only on
-      empty tables).
-- [ ] Every write is **idempotent and wrapped in OCC retry** (`with_dsql_retry!`, SQLSTATE
-      `40001`).
-- [ ] Bulk writes chunked under the per-transaction row/byte limits; pool `max_lifetime` is
-      **below the ~60-min** connection cap.
-- [ ] No unsupported features: triggers, materialized views, PL/pgSQL, extensions, temp
-      tables, `TRUNCATE`, `money`/`enum`/custom types.
-- [ ] Queries built with sea-query through the `db_*!` dispatch macros — **no raw SQL in
-      handlers**, and both backends covered.
+- [ ] Control plane queries built with sea-query — **no raw SQL in handlers**.
+- [ ] DuckDB workspaces are isolated per workspace ID; user SQL executes only in DuckDB,
+      never against the control plane.
 
 ## Workspace hygiene → [docs/architecture.md](../../docs/architecture.md)
 
@@ -58,6 +49,5 @@ cargo test --locked --workspace
 cargo deny check
 ```
 
-(These require at least one crate under `crates/`.) See
-[branching.md](branching.md) for the full pre-PR gate and
+See [branching.md](branching.md) for the full pre-PR gate and
 [commits-and-issues.md](commits-and-issues.md) for commit format.

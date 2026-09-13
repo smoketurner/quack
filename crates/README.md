@@ -1,38 +1,26 @@
 # crates/
 
-Your workspace members live here. The template ships one: **`deps-lock`**, a code-free
-anchor crate that pins every `[workspace.dependencies]` entry into `Cargo.lock` so
-Dependabot and `cargo update` keep the menu current before real crates exist (see
-[`deps-lock/src/lib.rs`](deps-lock/src/lib.rs)). It compiles nothing — add your own crates
-alongside it.
+Your workspace members live here. The root `Cargo.toml` picks up every crate via
+`members = ["crates/*"]`.
 
-The root `Cargo.toml` picks up every crate via `members = ["crates/*"]`.
-
-## Recommended decomposition
-
-This is guidance, not a requirement — split as the project needs:
+## Current crates
 
 | Crate | Responsibility | Key deps (from the workspace menu) |
 |---|---|---|
-| `<name>-common` | Shared domain types, error type (`thiserror`), config | `serde`, `thiserror`, `uuid`, `jiff` |
-| `<name>-server` | axum server, embedded UI (rust-embed + fluent + Tailwind), and persistence: pool + backend selection, sea-query store, migrations, DSQL auth | `axum`, `rust-embed`, `askama`, `i18n-embed`, `tokio`, `anyhow`, `tracing`, `sqlx`, `sea-query`, `sea-query-sqlx`, `aws-sdk-dsql`, `aws-lc-rs` |
-| `<name>-cli` | optional clap binary; shares `-common` | `clap`, `anyhow`, `rustls`, `aws-lc-rs` |
-
-See `docs/architecture.md` for how the layers fit together, and the other `docs/` files for
-each layer's patterns. Keep the data layer in a `db` module inside `-server` so the
-SQLite-vs-DSQL split stays out of request handlers.
+| `quack-core` | Config, error types, SQLite control plane, DuckDB workspace management | `sqlx`, `duckdb`, `sea-query`, `serde`, `toml`, `thiserror`, `tracing`, `uuid` |
+| `quack-cli` | `quack` binary with `query` subcommand | `quack-core`, `clap`, `anyhow`, `tokio`, `tracing-subscriber`, `mimalloc` |
 
 ## Adding a crate
 
 ```bash
-cargo new --lib crates/<name>-common    # or --bin for a binary
+cargo new --lib crates/<name>    # or --bin for a binary
 ```
 
 Then make it inherit the workspace baseline. A minimal member `Cargo.toml`:
 
 ```toml
 [package]
-name         = "<name>-common"
+name         = "<name>"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

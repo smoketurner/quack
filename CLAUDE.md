@@ -6,19 +6,13 @@ It also drives the `rust-agents` Claude Code plugin (conventions live in `.claud
 
 ## What this is
 
-An opinionated **template repository** for Rust services. It ships configuration, lints,
-CI, supply-chain policy, and documented patterns, plus one code-free member crate —
-`crates/deps-lock` — that anchors the `[workspace.dependencies]` menu into `Cargo.lock`
-so Dependabot and `cargo update` can keep the pins current before you add real crates.
-The chosen stack:
+A data analysis platform built with Rust. The chosen stack:
 
 - **Workspace** of crates under `crates/` (edition 2024, resolver 3, MSRV 1.98.0)
-- **SQLite** for local dev and in-memory tests; **Amazon Aurora DSQL** (Postgres-compatible)
-  in production
-- **sea-query** as the query-building translation layer between the two backends, over **sqlx**
+- **SQLite** (via `sqlx`) for the control plane (workspace metadata, threads, audit log)
+- **DuckDB** (via `duckdb-rs`) for per-workspace analytical databases
+- **sea-query** for type-safe SQL generation in the control plane
 - **aws-lc-rs** as the single crypto/TLS provider (never OpenSSL or `ring`)
-- **axum** + **rust-embed** + **fluent** (via `i18n-embed`) + **Tailwind CSS** for the
-  embedded server UI
 
 ## Repository layout
 
@@ -28,8 +22,8 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 .rustfmt.toml         # stable-only formatting
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.98.0 + rustfmt + clippy
-Makefile              # build / fmt / lint / test / deny / css / run
-crates/               # deps-lock anchor crate + YOUR crates — see crates/README.md
+Makefile              # build / fmt / lint / test / deny
+crates/               # quack-core, quack-cli — see crates/README.md
 docs/                 # the stack patterns, with code
 .claude/rules/        # branching, commits, continuous-improvement conventions
 ```
@@ -56,7 +50,7 @@ docs/                 # the stack patterns, with code
 Enforceable invariants the compiler can't catch — read before implementing or reviewing a
 data-layer, crypto, or dependency change:
 
-- **`.claude/rules/code-standards.md`** — crypto (aws-lc-rs only), DSQL/data-layer schema
+- **`.claude/rules/code-standards.md`** — crypto (aws-lc-rs only), data-layer schema
   rules, and workspace hygiene, as review-gate checklists linking to `docs/`.
 - **`.claude/rules/development-discipline.md`** — how agents carry out design,
   implementation, diagnostics, and agent-team hand-offs (the *how*, complementing
@@ -73,7 +67,6 @@ make fmt       # cargo fmt --all
 make lint      # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test      # cargo test --workspace --all-features
 make deny      # cargo deny check
-make css-build # build + minify Tailwind for the server crate
 make help      # list targets
 ```
 
@@ -85,13 +78,9 @@ cargo test -p <crate>                # all tests in one crate
 cargo test --workspace <test_name>   # name filter across the workspace
 ```
 
-> `crates/deps-lock` is a code-free anchor (see `crates/deps-lock/src/lib.rs`); it compiles
-> nothing, so most cargo commands stay near-instant until you add real crates.
 > Coverage and mutation testing are local-only: `make test-coverage`, `make test-mutants`.
 
 ## Where to read more
 
-The data-layer, DSQL, migration, query, UI, and crypto patterns each have a doc under
-`docs/` (see the table in `README.md`). Read the relevant one before implementing that layer
-— the DSQL constraints in particular (`docs/dsql.md`) change how schema and migrations must
-be written versus vanilla Postgres.
+The migration, query, and crypto patterns each have a doc under `docs/` (see the table in
+`README.md`). Read the relevant one before implementing that layer.
