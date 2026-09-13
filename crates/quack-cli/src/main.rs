@@ -8,6 +8,7 @@ use quack_core::config::{self, Config, ProviderConfig};
 use quack_core::ingestion;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::WorkspaceDb;
+use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use rig::prelude::*;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -69,6 +70,49 @@ enum OutputFormat {
     Table,
     Json,
 }
+
+// ---------------------------------------------------------------------------
+// Provider-agnostic embedding model enum
+// ---------------------------------------------------------------------------
+
+enum EmbedModel {
+    Ollama(rig::providers::ollama::EmbeddingModel),
+    OpenAi(
+        rig::providers::openai::GenericEmbeddingModel<rig::providers::openai::OpenAICompletionsExt>,
+    ),
+}
+
+impl EmbeddingModel for EmbedModel {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = rig::providers::ollama::Client;
+
+    fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
+        Self::Ollama(rig::providers::ollama::EmbeddingModel::make(
+            client, model, dims,
+        ))
+    }
+
+    fn ndims(&self) -> usize {
+        match self {
+            Self::Ollama(m) => m.ndims(),
+            Self::OpenAi(m) => m.ndims(),
+        }
+    }
+
+    async fn embed_texts(
+        &self,
+        texts: impl IntoIterator<Item = String> + Send,
+    ) -> Result<Vec<Embedding>, EmbeddingError> {
+        match self {
+            Self::Ollama(m) => m.embed_texts(texts).await,
+            Self::OpenAi(m) => m.embed_texts(texts).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -246,31 +290,62 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
         )
     })?;
 
-    let client = build_ollama_client(chat_config)?;
-
     let chat_model_name = chat_config
         .model
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("chat provider has no model configured"))?;
-
-    let completion_model = client.completion_model(chat_model_name);
+        .ok_or_else(|| anyhow::anyhow!("chat provider has no model configured"))?
+        .to_owned();
 
     let (embedding_model, embed_model_name) = build_rig_embedding_model(&config)?;
 
     tracing::info!(
         chat_model = %chat_model_name,
         embed_model = %embed_model_name,
+        provider_type = %chat_config.provider_type,
         "starting chat agent"
     );
 
-    let response = agent::run_analysis(
-        ws_db,
-        completion_model,
-        embedding_model,
-        &config.analysis,
-        message,
-    )
-    .await
+    let response = match chat_config.provider_type.as_str() {
+        "ollama" => {
+            let client = build_ollama_client(chat_config)?;
+            let completion_model = client.completion_model(&chat_model_name);
+            agent::run_analysis(
+                ws_db,
+                completion_model,
+                embedding_model,
+                &config.analysis,
+                message,
+            )
+            .await
+        }
+        "openai" => {
+            let client = build_openai_client(chat_config)?;
+            let completion_model = client.completion_model(&chat_model_name);
+            agent::run_analysis(
+                ws_db,
+                completion_model,
+                embedding_model,
+                &config.analysis,
+                message,
+            )
+            .await
+        }
+        "anthropic" => {
+            let client = build_anthropic_client(chat_config)?;
+            let completion_model = client.completion_model(&chat_model_name);
+            agent::run_analysis(
+                ws_db,
+                completion_model,
+                embedding_model,
+                &config.analysis,
+                message,
+            )
+            .await
+        }
+        other => anyhow::bail!(
+            "unsupported provider type '{other}' — expected 'ollama', 'openai', or 'anthropic'"
+        ),
+    }
     .context("agent loop failed")?;
 
     let stdout = std::io::stdout();
@@ -290,11 +365,19 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn build_ollama_client(provider_config: &ProviderConfig) -> Result<rig::providers::ollama::Client> {
-    let api_key = provider_config
+// ---------------------------------------------------------------------------
+// Provider client builders
+// ---------------------------------------------------------------------------
+
+fn resolve_api_key(provider_config: &ProviderConfig) -> Option<String> {
+    provider_config
         .api_key_env
         .as_ref()
         .and_then(|env| std::env::var(env).ok())
+}
+
+fn build_ollama_client(provider_config: &ProviderConfig) -> Result<rig::providers::ollama::Client> {
+    let api_key = resolve_api_key(provider_config)
         .map(rig::providers::ollama::OllamaApiKey::from)
         .unwrap_or_default();
 
@@ -308,9 +391,41 @@ fn build_ollama_client(provider_config: &ProviderConfig) -> Result<rig::provider
     builder.build().context("failed to build Ollama client")
 }
 
-fn build_rig_embedding_model(
-    config: &Config,
-) -> Result<(rig::providers::ollama::EmbeddingModel, String)> {
+fn build_openai_client(
+    provider_config: &ProviderConfig,
+) -> Result<rig::providers::openai::CompletionsClient> {
+    let api_key = resolve_api_key(provider_config)
+        .ok_or_else(|| anyhow::anyhow!("OpenAI provider requires api_key_env to be set"))?;
+
+    let mut builder = rig::providers::openai::CompletionsClient::builder().api_key(&api_key);
+
+    if let Some(base_url) = &provider_config.base_url {
+        builder = builder.base_url(base_url);
+    }
+
+    builder.build().context("failed to build OpenAI client")
+}
+
+fn build_anthropic_client(
+    provider_config: &ProviderConfig,
+) -> Result<rig::providers::anthropic::Client> {
+    let api_key = resolve_api_key(provider_config)
+        .ok_or_else(|| anyhow::anyhow!("Anthropic provider requires api_key_env to be set"))?;
+
+    let mut builder = rig::providers::anthropic::Client::builder().api_key(&api_key);
+
+    if let Some(base_url) = &provider_config.base_url {
+        builder = builder.base_url(base_url);
+    }
+
+    builder.build().context("failed to build Anthropic client")
+}
+
+// ---------------------------------------------------------------------------
+// Embedding model builders (provider-agnostic via EmbedModel enum)
+// ---------------------------------------------------------------------------
+
+fn build_rig_embedding_model(config: &Config) -> Result<(EmbedModel, String)> {
     let (name, embed_config) = config.find_embedding_provider().ok_or_else(|| {
         anyhow::anyhow!(
             "no embedding provider configured — \
@@ -321,8 +436,6 @@ fn build_rig_embedding_model(
 
     tracing::info!(provider = %name, "using embedding provider");
 
-    let client = build_ollama_client(embed_config)?;
-
     let model_name = embed_config
         .embedding_model
         .as_deref()
@@ -334,13 +447,24 @@ fn build_rig_embedding_model(
 
     let ndims_usize = usize::try_from(ndims).context("embedding_dimension overflow")?;
 
-    let model = client.embedding_model_with_ndims(model_name, ndims_usize);
+    let model = match embed_config.provider_type.as_str() {
+        "ollama" => {
+            let client = build_ollama_client(embed_config)?;
+            EmbedModel::Ollama(client.embedding_model_with_ndims(model_name, ndims_usize))
+        }
+        "openai" => {
+            let client = build_openai_client(embed_config)?;
+            EmbedModel::OpenAi(client.embedding_model_with_ndims(model_name, ndims_usize))
+        }
+        other => anyhow::bail!(
+            "provider type '{other}' does not support embeddings — use 'ollama' or 'openai'"
+        ),
+    };
+
     Ok((model, model_name.to_owned()))
 }
 
-fn build_embedding_model(
-    config: &Config,
-) -> Result<Option<rig::providers::ollama::EmbeddingModel>> {
+fn build_embedding_model(config: &Config) -> Result<Option<EmbedModel>> {
     let Some((name, embed_config)) = config.find_embedding_provider() else {
         tracing::info!("no embedding provider configured — storing chunks without embeddings");
         return Ok(None);
@@ -348,8 +472,6 @@ fn build_embedding_model(
 
     tracing::info!(provider = %name, "using embedding provider for ingestion");
 
-    let client = build_ollama_client(embed_config)?;
-
     let model_name = embed_config
         .embedding_model
         .as_deref()
@@ -361,6 +483,19 @@ fn build_embedding_model(
 
     let ndims_usize = usize::try_from(ndims).context("embedding_dimension overflow")?;
 
-    let model = client.embedding_model_with_ndims(model_name, ndims_usize);
+    let model = match embed_config.provider_type.as_str() {
+        "ollama" => {
+            let client = build_ollama_client(embed_config)?;
+            EmbedModel::Ollama(client.embedding_model_with_ndims(model_name, ndims_usize))
+        }
+        "openai" => {
+            let client = build_openai_client(embed_config)?;
+            EmbedModel::OpenAi(client.embedding_model_with_ndims(model_name, ndims_usize))
+        }
+        other => anyhow::bail!(
+            "provider type '{other}' does not support embeddings — use 'ollama' or 'openai'"
+        ),
+    };
+
     Ok(Some(model))
 }
