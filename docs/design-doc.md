@@ -135,7 +135,7 @@ quack/
 
 ### 4.1 Control Plane Database
 
-A single SQLite database at `~/.quack/control.db` (configurable) holds all metadata. SQLite is chosen over Postgres for MVP because it works identically in local, containerized, and air-gapped deployments with zero dependencies.
+A single SQLite database at `<data_dir>/control.db` (configurable) holds all metadata. The default data directory follows XDG conventions: `~/.local/share/quack/` on all platforms (or `$XDG_DATA_HOME/quack/` on Linux). Override with `QUACK_DATA_DIR`. SQLite is chosen over Postgres for MVP because it works identically in local, containerized, and air-gapped deployments with zero dependencies.
 
 ```sql
 -- schema version tracking
@@ -199,7 +199,7 @@ CREATE TABLE audit_log (
 
 ### 4.2 Workspace Data Database
 
-Each workspace gets its own DuckDB file at `~/.quack/workspaces/{workspace_id}/data.duckdb`. This provides hard isolation - no query can cross workspace boundaries.
+Each workspace gets its own DuckDB file at `<data_dir>/workspaces/{workspace_id}/data.duckdb`. This provides hard isolation - no query can cross workspace boundaries.
 
 Each workspace database contains these tables:
 
@@ -270,7 +270,7 @@ CREATE TABLE saved_charts (
 
 ### 4.3 File Storage
 
-Uploaded files are stored on the local filesystem at `~/.quack/workspaces/{workspace_id}/files/`. DuckDB reads tabular files directly from this path. In a future cloud deployment, this becomes an object storage prefix, but for MVP, local filesystem only.
+Uploaded files are stored on the local filesystem at `<data_dir>/workspaces/{workspace_id}/files/`. DuckDB reads tabular files directly from this path. In a future cloud deployment, this becomes an object storage prefix, but for MVP, local filesystem only.
 
 ### 4.4 Internal Query Building (SeaQuery)
 
@@ -446,7 +446,7 @@ For TUI and CLI modes where opening a browser isn't possible (e.g. SSH into a re
 
 #### Provider Configuration Examples
 
-Provider configuration in `~/.quack/config.toml`:
+Provider configuration in `<config_dir>/config.toml` (default: `~/.config/quack/config.toml`; override with `QUACK_CONFIG_DIR`):
 
 ```toml
 # No auth - local Ollama
@@ -485,7 +485,7 @@ issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 scopes = ["https://cognitiveservices.azure.com/.default"]
 # redirect_uri = "http://localhost:19876/callback"   # default, override if needed
-# token_cache_path = "~/.quack/tokens/azure.json"    # optional, encrypted at rest
+# token_cache_path = "<data_dir>/tokens/azure.json"    # optional, encrypted at rest
 ```
 
 ### 5.4 Provider Selection
@@ -874,11 +874,11 @@ MCP uses SSE (Server-Sent Events) transport since the server is already an HTTP 
 
 ## 12. Configuration
 
-All configuration lives in `~/.quack/config.toml` with environment variable overrides.
+All configuration lives in `<config_dir>/config.toml` with environment variable overrides. The config directory defaults to `~/.config/quack/`; override with `QUACK_CONFIG_DIR`.
 
 ```toml
 [general]
-data_dir = "~/.quack"             # override: QUACK_DATA_DIR
+# data_dir defaults to XDG data dir; override: QUACK_DATA_DIR
 default_workspace = "default"
 
 [server]

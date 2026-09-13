@@ -77,20 +77,48 @@ impl Default for AnalysisConfig {
     }
 }
 
+const APP_NAME: &str = "quack";
+
+/// Return the path where the config file is expected.
+#[must_use]
+pub fn config_file_path() -> PathBuf {
+    let config_dir =
+        std::env::var("QUACK_CONFIG_DIR").map_or_else(|_| default_config_dir(), PathBuf::from);
+    config_dir.join("config.toml")
+}
+
+fn default_config_dir() -> PathBuf {
+    dirs::home_dir().map_or_else(
+        || PathBuf::from(".config").join(APP_NAME),
+        |d| d.join(".config").join(APP_NAME),
+    )
+}
+
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir().map_or_else(|| PathBuf::from(".quack"), |h| h.join(".quack"))
+    dirs::home_dir().map_or_else(
+        || PathBuf::from(".local/share").join(APP_NAME),
+        |d| d.join(".local/share").join(APP_NAME),
+    )
 }
 
 impl Config {
-    /// Load configuration from `~/.quack/config.toml`, falling back to defaults.
-    /// Environment variables override file values.
+    /// Load configuration from the XDG config directory, falling back to defaults.
+    ///
+    /// Config file location: `~/.config/quack/config.toml`
+    ///
+    /// Data directory (databases, workspaces): `~/.local/share/quack/`
+    ///
+    /// `QUACK_DATA_DIR` overrides the data directory.
+    /// `QUACK_CONFIG_DIR` overrides the config directory.
     ///
     /// # Errors
     ///
     /// Returns an error if the config file exists but cannot be read or parsed.
     pub fn load() -> crate::error::Result<Self> {
-        let default_dir = default_data_dir();
-        let config_path = default_dir.join("config.toml");
+        let config_dir =
+            std::env::var("QUACK_CONFIG_DIR").map_or_else(|_| default_config_dir(), PathBuf::from);
+
+        let config_path = config_dir.join("config.toml");
 
         let mut config = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
@@ -200,6 +228,34 @@ mod tests {
         let mut config = Config::default();
         config.general.data_dir = PathBuf::from("/custom");
         assert_eq!(config.data_dir(), Path::new("/custom"));
+    }
+
+    #[test]
+    fn default_data_dir_uses_xdg() {
+        let data_dir = default_data_dir();
+        let data_str = data_dir.to_string_lossy();
+        assert!(
+            data_str.contains(APP_NAME),
+            "data dir should contain app name: {data_str}"
+        );
+        assert!(
+            !data_str.contains(".quack"),
+            "data dir should not use legacy .quack path: {data_str}"
+        );
+    }
+
+    #[test]
+    fn default_config_dir_uses_xdg() {
+        let config_dir = default_config_dir();
+        let config_str = config_dir.to_string_lossy();
+        assert!(
+            config_str.contains(APP_NAME),
+            "config dir should contain app name: {config_str}"
+        );
+        assert!(
+            !config_str.contains(".quack"),
+            "config dir should not use legacy .quack path: {config_str}"
+        );
     }
 
     #[test]

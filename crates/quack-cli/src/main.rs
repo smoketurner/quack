@@ -4,7 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::agent;
-use quack_core::config::{Config, ProviderConfig};
+use quack_core::config::{self, Config, ProviderConfig};
 use quack_core::ingestion;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -241,7 +241,8 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
     let (_, chat_config) = config.find_chat_provider().ok_or_else(|| {
         anyhow::anyhow!(
             "no LLM provider configured with a chat model — \
-             add a [providers.<name>] section with 'model' set in ~/.quack/config.toml"
+             add a [providers.<name>] section with 'model' set in {}",
+            config::config_file_path().display()
         )
     })?;
 
@@ -313,7 +314,8 @@ fn build_rig_embedding_model(
     let (name, embed_config) = config.find_embedding_provider().ok_or_else(|| {
         anyhow::anyhow!(
             "no embedding provider configured — \
-             add a [providers.<name>] section with 'embedding_model' set in ~/.quack/config.toml"
+             add a [providers.<name>] section with 'embedding_model' set in {}",
+            config::config_file_path().display()
         )
     })?;
 
