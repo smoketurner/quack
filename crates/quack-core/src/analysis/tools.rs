@@ -10,7 +10,8 @@ use serde_json::json;
 use crate::storage::workspace::{ChunkSearchResult, StatementKind, WorkspaceDb};
 
 use super::chart;
-use super::policy::{Decision, RefusalFlag, WritePolicy};
+use super::events::TurnRecorder;
+use super::policy::{RefusalFlag, WritePolicy};
 use super::text_to_sql;
 
 pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
@@ -33,31 +34,9 @@ impl From<std::fmt::Error> for ToolError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// run_sql
-// ---------------------------------------------------------------------------
-
-pub struct RunSqlTool {
-    db: SharedDb,
-    max_query_rows: u32,
-    policy: WritePolicy,
-    refused: RefusalFlag,
-}
-
-impl RunSqlTool {
-    pub fn new(
-        db: SharedDb,
-        max_query_rows: u32,
-        policy: WritePolicy,
-        refused: RefusalFlag,
-    ) -> Self {
-        Self {
-            db,
-            max_query_rows,
-            policy,
-            refused,
-        }
-    }
+fn lock(db: &SharedDb) -> Result<std::sync::MutexGuard<'_, WorkspaceDb>, ToolError> {
+    db.lock()
+        .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))
 }
 
 /// Message returned to the model when a write is refused.
@@ -68,35 +47,81 @@ Do not retry it. Tell the user it needs write permission (re-run with --allow-wr
 pub const INTERNAL_TABLE_REFUSED: &str =
     "This statement references quack's internal tables, which are not available to queries.";
 
-/// Gate a statement: classify it, refuse internal tables, apply the write
-/// policy. Returns `Ok(None)` when the statement may run and `Ok(Some(msg))`
-/// with the text to hand back to the model otherwise.
-fn gate_statement(
-    db: &WorkspaceDb,
+/// What the gate decided about a statement.
+enum Gate {
+    Run,
+    /// Do not run; hand this text back to the model.
+    Reject(String),
+}
+
+/// Classify a statement and apply the write policy. Takes and releases the
+/// database lock itself so a permission prompt never holds it.
+async fn gate_statement(
+    db: &SharedDb,
     sql: &str,
-    policy: &WritePolicy,
+    policy: WritePolicy,
     refused: &RefusalFlag,
-) -> Result<Option<String>, ToolError> {
-    if db
-        .references_internal_table(sql)
-        .map_err(|e| ToolError::Query(e.to_string()))?
-    {
-        return Ok(Some(String::from(INTERNAL_TABLE_REFUSED)));
-    }
-    match db
-        .classify_statement(sql)
-        .map_err(|e| ToolError::Query(e.to_string()))?
-    {
-        StatementKind::Read => Ok(None),
-        StatementKind::Invalid(msg) => Ok(Some(format!("SQL syntax error: {msg}"))),
-        StatementKind::Write => match policy.decide(sql) {
-            Decision::Run => Ok(None),
-            Decision::Refused => {
+    recorder: &TurnRecorder,
+) -> Result<Gate, ToolError> {
+    let kind = {
+        let guard = lock(db)?;
+        if guard
+            .references_internal_table(sql)
+            .map_err(|e| ToolError::Query(e.to_string()))?
+        {
+            return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
+        }
+        guard
+            .classify_statement(sql)
+            .map_err(|e| ToolError::Query(e.to_string()))?
+    };
+    match kind {
+        StatementKind::Read => Ok(Gate::Run),
+        StatementKind::Invalid(msg) => Ok(Gate::Reject(format!("SQL syntax error: {msg}"))),
+        StatementKind::Write => {
+            let allowed = match policy {
+                WritePolicy::Allow => true,
+                WritePolicy::Deny => false,
+                WritePolicy::Ask => recorder.ask_permission(sql).await,
+            };
+            if allowed {
+                Ok(Gate::Run)
+            } else {
                 refused.set();
                 tracing::warn!(sql, "refused write statement from agent");
-                Ok(Some(String::from(WRITE_REFUSED)))
+                Ok(Gate::Reject(String::from(WRITE_REFUSED)))
             }
-        },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run_sql
+// ---------------------------------------------------------------------------
+
+pub struct RunSqlTool {
+    db: SharedDb,
+    max_query_rows: u32,
+    policy: WritePolicy,
+    refused: RefusalFlag,
+    recorder: TurnRecorder,
+}
+
+impl RunSqlTool {
+    pub fn new(
+        db: SharedDb,
+        max_query_rows: u32,
+        policy: WritePolicy,
+        refused: RefusalFlag,
+        recorder: TurnRecorder,
+    ) -> Self {
+        Self {
+            db,
+            max_query_rows,
+            policy,
+            refused,
+            recorder,
+        }
     }
 }
 
@@ -125,27 +150,44 @@ impl Tool for RunSqlTool {
             .unwrap_or_else(|_| json!({"type": "object"}))
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "Tool trait requires async fn"
-    )]
     async fn call(
         &self,
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let db = self
-            .db
-            .lock()
-            .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
-        if let Some(message) = gate_statement(&db, &args.query, &self.policy, &self.refused)? {
-            return Ok(message);
+        let step = self.recorder.start(Self::NAME, args.query.trim());
+        match gate_statement(
+            &self.db,
+            &args.query,
+            self.policy,
+            &self.refused,
+            &self.recorder,
+        )
+        .await?
+        {
+            Gate::Reject(message) => {
+                step.finish("refused");
+                Ok(message)
+            }
+            Gate::Run => {
+                let results = {
+                    let db = lock(&self.db)?;
+                    db.execute_query(&args.query)
+                        .map_err(|e| ToolError::Query(e.to_string()))
+                };
+                match results {
+                    Ok(results) => {
+                        step.finish(format!("{} rows", results.rows.len()));
+                        text_to_sql::format_query_result(&results, self.max_query_rows)
+                            .map_err(|e| ToolError::Query(e.to_string()))
+                    }
+                    Err(e) => {
+                        step.finish(format!("error: {e}"));
+                        Err(e)
+                    }
+                }
+            }
         }
-        let results = db
-            .execute_query(&args.query)
-            .map_err(|e| ToolError::Query(e.to_string()))?;
-        text_to_sql::format_query_result(&results, self.max_query_rows)
-            .map_err(|e| ToolError::Query(e.to_string()))
     }
 }
 
@@ -157,14 +199,21 @@ pub struct SearchDocumentsTool<M> {
     db: SharedDb,
     embedding_model: M,
     default_top_k: u32,
+    recorder: TurnRecorder,
 }
 
 impl<M> SearchDocumentsTool<M> {
-    pub fn new(db: SharedDb, embedding_model: M, default_top_k: u32) -> Self {
+    pub fn new(
+        db: SharedDb,
+        embedding_model: M,
+        default_top_k: u32,
+        recorder: TurnRecorder,
+    ) -> Self {
         Self {
             db,
             embedding_model,
             default_top_k,
+            recorder,
         }
     }
 }
@@ -206,11 +255,14 @@ where
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let embedding = self
-            .embedding_model
-            .embed_text(&args.query)
-            .await
-            .map_err(|e| ToolError::Embedding(e.to_string()))?;
+        let step = self.recorder.start(Self::NAME, &args.query);
+        let embedding = match self.embedding_model.embed_text(&args.query).await {
+            Ok(e) => e,
+            Err(e) => {
+                step.finish(format!("error: {e}"));
+                return Err(ToolError::Embedding(e.to_string()));
+            }
+        };
 
         #[expect(
             clippy::cast_possible_truncation,
@@ -221,15 +273,20 @@ where
         let top_k = args.top_k.unwrap_or(self.default_top_k).max(1);
 
         let results = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
+            let db = lock(&self.db)?;
             db.search_similar_chunks(&query_vec, top_k, &args.document_ids)
-                .map_err(|e| ToolError::Query(e.to_string()))?
+                .map_err(|e| ToolError::Query(e.to_string()))
         };
-
-        format_search_results(&results).map_err(Into::into)
+        match results {
+            Ok(results) => {
+                step.finish(format!("{} chunks", results.len()));
+                format_search_results(&results).map_err(Into::into)
+            }
+            Err(e) => {
+                step.finish(format!("error: {e}"));
+                Err(e)
+            }
+        }
     }
 }
 
@@ -264,11 +321,12 @@ pub fn format_search_results(results: &[ChunkSearchResult]) -> Result<String, st
 
 pub struct DescribeTableTool {
     db: SharedDb,
+    recorder: TurnRecorder,
 }
 
 impl DescribeTableTool {
-    pub fn new(db: SharedDb) -> Self {
-        Self { db }
+    pub fn new(db: SharedDb, recorder: TurnRecorder) -> Self {
+        Self { db, recorder }
     }
 }
 
@@ -302,13 +360,18 @@ impl Tool for DescribeTableTool {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let step = self.recorder.start(Self::NAME, &args.table_name);
         let desc = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
+            let db = lock(&self.db)?;
             db.describe_table(&args.table_name)
-                .map_err(|e| ToolError::Query(e.to_string()))?
+                .map_err(|e| ToolError::Query(e.to_string()))
+        };
+        let desc = match desc {
+            Ok(d) => d,
+            Err(e) => {
+                step.finish(format!("error: {e}"));
+                return Err(e);
+            }
         };
 
         let mut output = String::new();
@@ -328,6 +391,7 @@ impl Tool for DescribeTableTool {
             }
         }
 
+        step.finish(format!("{} columns", desc.columns.len()));
         Ok(output)
     }
 }
@@ -338,11 +402,12 @@ impl Tool for DescribeTableTool {
 
 pub struct ListTablesTool {
     db: SharedDb,
+    recorder: TurnRecorder,
 }
 
 impl ListTablesTool {
-    pub fn new(db: SharedDb) -> Self {
-        Self { db }
+    pub fn new(db: SharedDb, recorder: TurnRecorder) -> Self {
+        Self { db, recorder }
     }
 }
 
@@ -372,14 +437,13 @@ impl Tool for ListTablesTool {
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let step = self.recorder.start(Self::NAME, "");
         let tables = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
+            let db = lock(&self.db)?;
             db.list_tables()
                 .map_err(|e| ToolError::Query(e.to_string()))?
         };
+        step.finish(format!("{} tables", tables.len()));
         if tables.is_empty() {
             return Ok(String::from("No tables found in this workspace."));
         }
@@ -397,11 +461,12 @@ impl Tool for ListTablesTool {
 
 pub struct ListDocumentsTool {
     db: SharedDb,
+    recorder: TurnRecorder,
 }
 
 impl ListDocumentsTool {
-    pub fn new(db: SharedDb) -> Self {
-        Self { db }
+    pub fn new(db: SharedDb, recorder: TurnRecorder) -> Self {
+        Self { db, recorder }
     }
 }
 
@@ -431,14 +496,13 @@ impl Tool for ListDocumentsTool {
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let step = self.recorder.start(Self::NAME, "");
         let docs = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
+            let db = lock(&self.db)?;
             db.list_documents()
                 .map_err(|e| ToolError::Query(e.to_string()))?
         };
+        step.finish(format!("{} documents", docs.len()));
         if docs.is_empty() {
             return Ok(String::from("No documents found in this workspace."));
         }
@@ -464,11 +528,20 @@ impl Tool for ListDocumentsTool {
 pub struct CreateChartTool {
     db: SharedDb,
     chart_spec: Arc<Mutex<Option<serde_json::Value>>>,
+    recorder: TurnRecorder,
 }
 
 impl CreateChartTool {
-    pub fn new(db: SharedDb, chart_spec: Arc<Mutex<Option<serde_json::Value>>>) -> Self {
-        Self { db, chart_spec }
+    pub fn new(
+        db: SharedDb,
+        chart_spec: Arc<Mutex<Option<serde_json::Value>>>,
+        recorder: TurnRecorder,
+    ) -> Self {
+        Self {
+            db,
+            chart_spec,
+            recorder,
+        }
     }
 }
 
@@ -503,30 +576,41 @@ impl Tool for CreateChartTool {
             .unwrap_or_else(|_| json!({"type": "object"}))
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "Tool trait requires async fn"
-    )]
     async fn call(
         &self,
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let step = self.recorder.start(Self::NAME, args.sql.trim());
+        // Charts are read-only: never prompt, never write.
+        if let Gate::Reject(message) = gate_statement(
+            &self.db,
+            &args.sql,
+            WritePolicy::Deny,
+            &RefusalFlag::default(),
+            &self.recorder,
+        )
+        .await?
+        {
+            step.finish("rejected");
+            return Ok(format!("Chart query rejected. {message}"));
+        }
+
         let results = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
-            if let Some(message) =
-                gate_statement(&db, &args.sql, &WritePolicy::Deny, &RefusalFlag::default())?
-            {
-                return Ok(format!("Chart query rejected. {message}"));
-            }
+            let db = lock(&self.db)?;
             db.execute_query(&args.sql)
-                .map_err(|e| ToolError::Query(e.to_string()))?
+                .map_err(|e| ToolError::Query(e.to_string()))
+        };
+        let results = match results {
+            Ok(r) => r,
+            Err(e) => {
+                step.finish(format!("error: {e}"));
+                return Err(e);
+            }
         };
 
         if results.rows.is_empty() {
+            step.finish("0 rows");
             return Ok(String::from(
                 "Query returned no rows — cannot generate chart.",
             ));
@@ -547,6 +631,11 @@ impl Tool for CreateChartTool {
             *guard = Some(spec);
         }
 
+        step.finish(format!(
+            "{} chart, {} rows",
+            args.chart_type,
+            results.rows.len()
+        ));
         Ok(format!(
             "Chart generated successfully. ECharts spec:\n{spec_json}"
         ))
@@ -587,5 +676,94 @@ mod tests {
     fn format_search_results_empty_tells_model_to_say_so() {
         let out = format_search_results(&[]).unwrap();
         assert!(out.contains("No relevant chunks found"));
+    }
+
+    fn shared_db() -> SharedDb {
+        Arc::new(Mutex::new(
+            WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| unreachable_db(&e.to_string())),
+        ))
+    }
+
+    #[expect(clippy::panic, reason = "test helper: in-memory DuckDB must open")]
+    fn unreachable_db(msg: &str) -> WorkspaceDb {
+        panic!("in-memory DuckDB failed to open: {msg}");
+    }
+
+    #[tokio::test]
+    async fn gate_runs_reads_and_rejects_internal_tables_and_syntax_errors() {
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let db = shared_db();
+        let refused = RefusalFlag::default();
+        assert!(matches!(
+            gate_statement(&db, "SELECT 1", WritePolicy::Deny, &refused, &recorder).await,
+            Ok(Gate::Run)
+        ));
+        assert!(matches!(
+            gate_statement(&db, "SELECT * FROM _quack_chunks", WritePolicy::Allow, &refused, &recorder).await,
+            Ok(Gate::Reject(m)) if m == INTERNAL_TABLE_REFUSED
+        ));
+        assert!(matches!(
+            gate_statement(&db, "SELEC 1", WritePolicy::Allow, &refused, &recorder).await,
+            Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
+        ));
+        assert!(!refused.was_refused());
+    }
+
+    #[tokio::test]
+    async fn gate_applies_allow_and_deny_to_writes() {
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let db = shared_db();
+        let refused = RefusalFlag::default();
+        assert!(matches!(
+            gate_statement(
+                &db,
+                "CREATE TABLE t(a INT)",
+                WritePolicy::Allow,
+                &refused,
+                &recorder
+            )
+            .await,
+            Ok(Gate::Run)
+        ));
+        assert!(!refused.was_refused());
+        assert!(matches!(
+            gate_statement(&db, "DROP TABLE t", WritePolicy::Deny, &refused, &recorder).await,
+            Ok(Gate::Reject(m)) if m == WRITE_REFUSED
+        ));
+        assert!(refused.was_refused());
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test asserts the event kind")]
+    async fn gate_ask_waits_for_the_interface() {
+        use super::super::events::AgentEvent;
+        let (sink, mut rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let db = shared_db();
+        let refused = RefusalFlag::default();
+
+        let gate = tokio::spawn({
+            let db = Arc::clone(&db);
+            let recorder = recorder.clone();
+            let refused = refused.clone();
+            async move {
+                matches!(
+                    gate_statement(&db, "DELETE FROM t", WritePolicy::Ask, &refused, &recorder)
+                        .await,
+                    Ok(Gate::Run)
+                )
+            }
+        });
+        let req = match rx.recv().await {
+            Some(AgentEvent::PermissionRequired(req)) => Some(req),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(req.sql, "DELETE FROM t");
+        req.allow();
+        assert!(gate.await.is_ok_and(|ran| ran));
+        assert!(!refused.was_refused());
     }
 }

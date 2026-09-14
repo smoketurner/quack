@@ -24,14 +24,18 @@ implements an earlier slice of it; section 17 of the design doc lists the gaps.
 ## Quick start (current code)
 
 ```bash
-cargo run --bin quack -- query "SELECT 1 AS answer"
-cargo run --bin quack -- query "SELECT * FROM generate_series(1, 5) AS t(n)" -f json
+cargo run --bin quack -- -q "SELECT 1 AS answer"
+cargo run --bin quack -- -q "SELECT * FROM generate_series(1, 5) AS t(n)" -f csv
 cargo run --bin quack -- ingest sales.csv -w myworkspace
-cargo run --bin quack -- chat "total sales by region" -w myworkspace
-cargo run --bin quack -- -w myworkspace          # interactive terminal session
+cargo run --bin quack -- -p "total sales by region" -w myworkspace   # answer to stdout, steps to stderr
+cargo run --bin quack -- -p "total sales by region" -f json           # {answer, steps, chart}
+cargo run --bin quack -- -w myworkspace                               # interactive terminal session
 ```
 
-`chat` and the terminal session need `[general].chat_model` and `[general].embedding_model`
+`-q` prints a table on a terminal and ndjson when piped; `-f` selects table, json, ndjson, csv,
+or markdown. Exit codes: 0 ok, 1 error, 2 usage, 3 write refused.
+
+`-p` and the terminal session need `[general].chat_model` and `[general].embedding_model`
 set to `PROVIDER/MODEL` references in `~/.config/quack/config.toml`, with a matching
 `[providers.<name>]` section for each (see the configuration section of the design doc).
 Unknown keys are rejected. `QUACK_MODEL` overrides the chat model; `QUACK_DATA_DIR` keeps

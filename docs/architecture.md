@@ -43,7 +43,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | Crate | Binary | Owns |
 |---|---|---|
 | `quack-core` | — | config, errors, crypto provider install, `control.db` (sqlx + sea-query), workspace DuckDB engine with statement classification and limits, ingestion, chunking, vector search, rig-based agent, tools, write policy, `llm` provider construction and `run_turn` dispatch, chart spec |
-| `quack` | `quack` | interactive terminal session when run with no subcommand; `query`, `ingest`, `chat` subcommands; `--allow-write` |
+| `quack` | `quack` | interactive terminal session when run with no arguments; `-p` print mode; `-q` SQL with output formats; `ingest`; `--allow-write` |
 
 `serve`, `mcp`, print mode (`-p`), admin, and later `desktop` are added to `quack` as
 subcommands (design doc section 4). There are no Cargo features; every build contains
@@ -62,7 +62,7 @@ every surface.
 | `analytics/` | SQL execution, read/write classification, resource limits, schema introspection |
 | `ontology/` | ontology tables, validation, versions, induction (propose and review) |
 | `graph/` | ontology-guided extraction, entity resolution, provenance, traversal |
-| `agent/` | the tool-calling loop as an event stream, tools, permissions, prompt, chat modes |
+| `agent/` | the tool-calling loop as an event stream (`events.rs`), tools, permissions, prompt, chat modes |
 | `llm/` | rig provider construction; auth none / API key / OAuth PKCE with a token manager |
 | `context/` | the stored workspace context; Markdown import and export |
 

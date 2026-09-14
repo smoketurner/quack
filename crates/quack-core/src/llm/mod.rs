@@ -9,6 +9,7 @@ use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use rig::prelude::*;
 
 use crate::analysis::agent::{self, AgentResponse};
+use crate::analysis::events::EventSink;
 use crate::analysis::policy::WritePolicy;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
@@ -220,6 +221,7 @@ pub async fn run_turn(
     db: WorkspaceDb,
     policy: WritePolicy,
     message: &str,
+    sink: EventSink,
 ) -> Result<AgentResponse> {
     let chat = config.chat_model_ref()?;
     let embedding_model = required_embedding_model(config)?;
@@ -237,6 +239,7 @@ pub async fn run_turn(
                 &config.retrieval,
                 policy,
                 message,
+                sink,
             )
             .await
         }
@@ -250,6 +253,7 @@ pub async fn run_turn(
                 &config.retrieval,
                 policy,
                 message,
+                sink,
             )
             .await
         }
@@ -263,6 +267,7 @@ pub async fn run_turn(
                 &config.retrieval,
                 policy,
                 message,
+                sink,
             )
             .await
         }

@@ -1297,18 +1297,14 @@ the time of the last edit.
    `_quack_audit` do not exist; every turn is stateless. Sections 5.4, 8, 12.
 3. **Document registry lacks** `sha256`, `source`, `pinned`, `title`. Section 5.4.
 4. **No workspace context, no chat modes.** Sections 5.3, 7.5.
-5. **No event stream, no streaming, no tool visibility** in TUI or CLI, and the terminal
-   cannot prompt for a write: the `Ask` policy exists in the core, but both interfaces use
-   `--allow-write` (Allow) or refuse (Deny) until the event stream lands. Sections 7.1,
-   7.4, 7.6.
+5. **No `--continue` / `--resume`, no stdin-as-data in print mode.** Both wait on the
+   session tables. Sections 8, 11.5.
 6. **No ontology, no induction, no graph.** Sections 6.3 to 6.5.
 7. **Chart spec is ECharts JSON** re-parsed by the TUI. Section 9.
 8. **No OAuth, no server, no MCP, no desktop window, no web UI.** `auth = "oauth"` parses
    and is rejected as unimplemented. Sections 10.2, 11, 12.
 9. **DOCX, HTML, PPTX, XLSX unsupported.** Sections 6.1, 6.2.
-10. **No print mode flags** (`-p`, `-f ndjson|csv|markdown`, stdin as data); `chat` and
-    `query` cover the basics with exit codes 2 and 3 in place. Section 11.5.
-11. **`text_to_sql` tests are a placeholder.** Section 16.
+10. **`text_to_sql` tests are a placeholder.** Section 16.
 
 ---
 
@@ -1371,8 +1367,9 @@ deployment for document chat is the end of step 8.
 3. Storage consolidation: `_quack_` prefix, `_quack_meta`, dimension check, and
    `control.db` reduced to access control are done; sessions, messages, context, and audit
    detail tables remain and land with steps 4 and 6.
-4. Agent loop as an event stream; TUI streaming, inline steps, permission prompt, direct
-   SQL; print mode with formats and exit codes; `--continue`/`--resume`; export.
+4. ~~Agent loop as an event stream; TUI streaming, inline steps, permission prompt, direct
+   SQL; print mode with formats and exit codes.~~ Done. `--continue`/`--resume` and export
+   move to step 3's remainder (they need the session tables).
 5. Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
    documents, chat and query modes; DOCX, HTML, PPTX parsers.
 6. Workspace context (stored, versioned, import/export) and the prompt rewrite; new chart

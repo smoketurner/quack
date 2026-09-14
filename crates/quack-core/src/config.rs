@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 
 /// The whole `config.toml`. Unknown keys anywhere are an error so a typo can
 /// never silently disable a setting.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -17,7 +17,7 @@ pub struct Config {
     pub analysis: AnalysisConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     pub data_dir: PathBuf,
@@ -101,7 +101,7 @@ impl std::fmt::Display for ModelRef<'_> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IngestionConfig {
     pub chunk_size_tokens: u32,
@@ -122,7 +122,7 @@ impl Default for IngestionConfig {
 }
 
 /// Document retrieval settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetrievalConfig {
     /// Default number of chunks returned by `search_documents`.
@@ -143,13 +143,15 @@ impl Default for RetrievalConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
     pub max_query_rows: u32,
     pub query_timeout_seconds: u32,
     pub memory_limit_mb: u32,
     pub threads: u32,
+    /// Maximum model round-trips (tool calls) per turn.
+    pub max_turns: u32,
 }
 
 impl Default for AnalysisConfig {
@@ -159,6 +161,7 @@ impl Default for AnalysisConfig {
             query_timeout_seconds: 30,
             memory_limit_mb: 256,
             threads: 4,
+            max_turns: 10,
         }
     }
 }
@@ -408,6 +411,7 @@ always_retrieve = true
         assert_eq!(config.retrieval.top_k, 8);
         assert!(!config.retrieval.always_retrieve);
         assert_eq!(config.analysis.threads, 4);
+        assert_eq!(config.analysis.max_turns, 10);
     }
 
     #[test]

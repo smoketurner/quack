@@ -9,13 +9,13 @@ Customize the sections below as the project grows.
 Run with a temporary data directory:
 
 ```bash
-QUACK_DATA_DIR=/tmp/quack-dev cargo run --bin quack -- query "SELECT 1"
+QUACK_DATA_DIR=/tmp/quack-dev cargo run --bin quack -- -q "SELECT 1"
 ```
 
 For debug output:
 
 ```bash
-RUST_LOG=debug QUACK_DATA_DIR=/tmp/quack-dev cargo run --bin quack -- query "SELECT 1" 2>/tmp/quack-debug.log
+RUST_LOG=debug QUACK_DATA_DIR=/tmp/quack-dev cargo run --bin quack -- -q "SELECT 1" 2>/tmp/quack-debug.log
 ```
 
 ## Project Subsystems
@@ -37,9 +37,10 @@ Workspace members are auto-detected from `Cargo.toml`. Track these logical subsy
 
 ## Interfaces
 
-- CLI: `cargo run --bin quack -- query|ingest|chat ...`
-- TUI: `cargo run --bin quack -- -w <workspace>` (no subcommand, needs a TTY)
-- Target (design doc section 11): `quack -p`, `quack serve`, `quack mcp`, `quack desktop`
+- Print mode: `cargo run --bin quack -- -p "question" [-f text|json]`; SQL: `-q "..." [-f ...]`
+- Ingest: `cargo run --bin quack -- ingest FILE`
+- TUI: `cargo run --bin quack -- -w <workspace>` (no arguments, needs a TTY)
+- Target (design doc section 11): `quack serve`, `quack mcp`, `quack desktop`
 
 ## Critical Paths
 
@@ -48,7 +49,8 @@ Features prone to silent breakage — live-test before any PR that touches them:
 - `control.db` migrations and the append-only `audit_log`
 - sea-query query generation (correct SQLite dialect)
 - Classification boundary: nothing workspace-revealing written outside the workspace file
-- Agent SQL read/write classification and permission prompts
+- Agent SQL read/write classification and the terminal permission prompt (y/n/a)
+- Event stream ordering: every tool call emits started then finished; `-p` steps on stderr only
 - Citation validation (every `[n]` maps to a chunk retrieved in that turn)
 - Embedding dimension recorded per workspace and checked on open
 - DuckDB workspace isolation (each workspace gets its own database file)

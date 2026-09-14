@@ -31,6 +31,34 @@ pub enum StatementKind {
     Invalid(String),
 }
 
+/// Leading keywords that mark terminal input as SQL to run directly rather
+/// than a question for the agent.
+const DIRECT_SQL_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "WITH",
+    "FROM",
+    "DESCRIBE",
+    "SHOW",
+    "PIVOT",
+    "UNPIVOT",
+    "SUMMARIZE",
+    "EXPLAIN",
+];
+
+/// Whether interactive input should run as SQL instead of going to the agent.
+#[must_use]
+pub fn looks_like_direct_sql(input: &str) -> bool {
+    let word: String = input
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    !word.is_empty()
+        && DIRECT_SQL_KEYWORDS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(&word))
+}
+
 /// Read-only statements `DuckDB` cannot serialize to JSON but which never mutate.
 const READ_ONLY_KEYWORDS: &[&str] = &[
     "DESCRIBE",
@@ -952,6 +980,80 @@ impl QueryResults {
         Ok(())
     }
 
+    /// One JSON object per line.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or writing fails.
+    pub fn write_ndjson(&self, out: &mut impl Write) -> crate::error::Result<()> {
+        // Written by hand so keys keep column order; serde_json's map sorts.
+        for row in &self.rows {
+            let mut fields = Vec::with_capacity(self.columns.len());
+            for (column, value) in self.columns.iter().zip(row) {
+                fields.push(format!(
+                    "{}:{}",
+                    serde_json::to_string(column)?,
+                    serde_json::to_string(value)?
+                ));
+            }
+            writeln!(out, "{{{}}}", fields.join(","))?;
+        }
+        Ok(())
+    }
+
+    /// RFC 4180 CSV with a header row; fields containing a comma, quote, or
+    /// newline are quoted and embedded quotes doubled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing fails.
+    pub fn write_csv(&self, out: &mut impl Write) -> crate::error::Result<()> {
+        fn field(value: &str) -> String {
+            if value.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", value.replace('"', "\"\""))
+            } else {
+                value.to_owned()
+            }
+        }
+        let header: Vec<String> = self.columns.iter().map(|c| field(c)).collect();
+        writeln!(out, "{}", header.join(","))?;
+        for row in &self.rows {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|v| match v {
+                    serde_json::Value::Null => String::new(),
+                    other => field(&display_json_value(other)),
+                })
+                .collect();
+            writeln!(out, "{}", cells.join(","))?;
+        }
+        Ok(())
+    }
+
+    /// A GitHub-flavored Markdown table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing fails.
+    pub fn write_markdown(&self, out: &mut impl Write) -> crate::error::Result<()> {
+        fn cell(value: &str) -> String {
+            value.replace('|', "\\|").replace('\n', " ")
+        }
+        if self.columns.is_empty() {
+            writeln!(out, "OK")?;
+            return Ok(());
+        }
+        let header: Vec<String> = self.columns.iter().map(|c| cell(c)).collect();
+        writeln!(out, "| {} |", header.join(" | "))?;
+        let rule: Vec<&str> = self.columns.iter().map(|_| "---").collect();
+        writeln!(out, "| {} |", rule.join(" | "))?;
+        for row in &self.rows {
+            let cells: Vec<String> = row.iter().map(|v| cell(&display_json_value(v))).collect();
+            writeln!(out, "| {} |", cells.join(" | "))?;
+        }
+        Ok(())
+    }
+
     /// Write results as a JSON array of objects.
     ///
     /// # Errors
@@ -979,6 +1081,84 @@ impl QueryResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample() -> QueryResults {
+        QueryResults {
+            columns: vec![String::from("name"), String::from("n")],
+            rows: vec![
+                vec![
+                    serde_json::Value::String(String::from("a,b")),
+                    serde_json::Value::Number(1.into()),
+                ],
+                vec![
+                    serde_json::Value::String(String::from("say \"hi\"")),
+                    serde_json::Value::Null,
+                ],
+            ],
+        }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn write_ndjson_one_object_per_line() {
+        let mut buf = Vec::new();
+        sample().write_ndjson(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.first().copied(), Some(r#"{"name":"a,b","n":1}"#));
+        assert_eq!(
+            lines.last().copied(),
+            Some(r#"{"name":"say \"hi\"","n":null}"#)
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn write_csv_quotes_and_escapes() {
+        let mut buf = Vec::new();
+        sample().write_csv(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text, "name,n\n\"a,b\",1\n\"say \"\"hi\"\"\",\n");
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn write_markdown_renders_table() {
+        let mut buf = Vec::new();
+        sample().write_markdown(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("| name | n |\n| --- | --- |\n| a,b | 1 |\n"));
+        assert!(text.contains("| say \"hi\" | NULL |"));
+    }
+
+    #[test]
+    fn direct_sql_detection_by_leading_keyword() {
+        for yes in [
+            "SELECT 1",
+            "  with x as (select 1) select * from x",
+            "FROM t",
+            "describe t",
+            "SHOW TABLES",
+            "summarize t",
+            "PIVOT t ON a",
+            "explain select 1",
+            "select(1)",
+        ] {
+            assert!(looks_like_direct_sql(yes), "{yes}");
+        }
+        for no in [
+            "what were sales by region",
+            "",
+            "   ",
+            "/sql select 1",
+            "selected items please",
+            "DROP TABLE t",
+            "insert into t values (1)",
+        ] {
+            assert!(!looks_like_direct_sql(no), "{no}");
+        }
+    }
 
     #[test]
     fn quote_ident_wraps_and_escapes() {

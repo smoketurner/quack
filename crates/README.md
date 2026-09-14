@@ -8,7 +8,7 @@ Your workspace members live here. The root `Cargo.toml` picks up every crate via
 | Crate | Responsibility | Key deps (from the workspace menu) |
 |---|---|---|
 | `quack-core` | Config, errors, crypto provider, `control.db`, DuckDB workspaces, ingestion, retrieval, agent and tools, write policy, rig providers (`llm`) | `sqlx`, `duckdb`, `sea-query`, `rig`, `rustls`, `serde`, `toml`, `thiserror`, `tracing`, `uuid` |
-| `quack` | The one binary: interactive terminal session (no subcommand), `query`, `ingest`, `chat` | `quack-core`, `clap`, `ratatui`, `ratatui-textarea`, `crossterm`, `anyhow`, `tokio`, `mimalloc` |
+| `quack` | The one binary: interactive terminal session (no arguments), `-p` print mode, `-q` SQL, `ingest` | `quack-core`, `clap`, `ratatui`, `ratatui-textarea`, `crossterm`, `anyhow`, `tokio`, `mimalloc` |
 
 Two crates, no Cargo features. `quack-core::llm` owns provider construction and the
 per-turn dispatch (`llm::run_turn`); the binary never touches rig directly. Later

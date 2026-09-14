@@ -116,18 +116,30 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(&app.textarea, text_area);
     } else {
         let frame_str = spinner_frame(app.tick);
-        let label = match app.state {
-            AppState::Thinking => "Thinking...",
-            AppState::Ingesting => "Ingesting file...",
-            AppState::Idle => "",
+        let status_line = if app.state == AppState::AwaitingPermission {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "Run this statement?",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  [y] run   [n] refuse   [a] run and allow writes this session",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ])
+        } else {
+            let label = state_label(&app.state);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!("{frame_str} {label}"),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ])
         };
-        let status_line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                format!("{frame_str} {label}"),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]);
         frame.render_widget(Paragraph::new(status_line), inner);
     }
 }
@@ -181,6 +193,8 @@ fn format_messages(app: &App) -> Vec<Line<'static>> {
         let (prefix, style) = match msg.role {
             MessageRole::User => (" > ", Style::default().fg(Color::Cyan)),
             MessageRole::Assistant => ("   ", Style::default()),
+            MessageRole::Step => ("   ", Style::default().fg(Color::Yellow)),
+            MessageRole::Sql => ("   ", Style::default().fg(Color::White)),
             MessageRole::System => ("   ", Style::default().fg(Color::DarkGray)),
             MessageRole::Error => ("   ", Style::default().fg(Color::Red)),
         };
@@ -213,13 +227,9 @@ fn format_messages(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
 
-    if app.state != AppState::Idle {
+    if app.state != AppState::Idle && app.state != AppState::AwaitingPermission {
         let frame_str = spinner_frame(app.tick);
-        let label = match app.state {
-            AppState::Thinking => "Thinking...",
-            AppState::Ingesting => "Ingesting file...",
-            AppState::Idle => "",
-        };
+        let label = state_label(&app.state);
         lines.push(Line::from(vec![
             Span::raw("   "),
             Span::styled(
@@ -230,6 +240,16 @@ fn format_messages(app: &App) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn state_label(state: &AppState) -> &'static str {
+    match state {
+        AppState::Thinking => "Thinking...",
+        AppState::Ingesting => "Ingesting file...",
+        AppState::RunningSql => "Running query...",
+        AppState::AwaitingPermission => "Waiting for your answer...",
+        AppState::Idle => "",
+    }
 }
 
 #[expect(

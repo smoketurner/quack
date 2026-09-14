@@ -7,10 +7,11 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc;
 
+use quack_core::analysis::events::{self, AgentEvent, EventStream, PermissionRequest};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::config::Config;
 use quack_core::ingestion;
-use quack_core::storage::workspace::WorkspaceDb;
+use quack_core::storage::workspace::{WorkspaceDb, looks_like_direct_sql};
 
 use crate::terminal::chart::ChartData;
 use crate::terminal::ui;
@@ -20,20 +21,18 @@ const TICK_RATE_MS: u64 = 50;
 const WELCOME_TEXT: &str = "\
 Welcome to quack!
 
-Ask questions about your data or type SQL queries directly.
-Drop a file here to load it (CSV, JSON, Parquet, PDF, TXT, MD).
-Type /help for available commands.";
+Ask questions about your data, or type SQL (SELECT, WITH, FROM, DESCRIBE, SHOW,
+SUMMARIZE, PIVOT) to run it directly. Drop a file path here to load it
+(CSV, JSON, Parquet, PDF, TXT, MD). Type /help for commands.";
 
 const HELP_TEXT: &str = "\
 Commands:
   /help             Show this help message
+  /sql [STATEMENT]  Run SQL directly; with no argument, edit the last query
+  /tables           List tables in the workspace
   /clear            Clear messages and chart
-  /quit, /exit      Exit quack
   /workspace        Show current workspace
-
-Writes:
-  The agent may run SELECT queries freely. Statements that modify the
-  workspace are refused unless quack was started with --allow-write.
+  /quit, /exit      Exit quack
 
 Shortcuts:
   Enter             Send message
@@ -41,19 +40,30 @@ Shortcuts:
   PageUp/PageDown   Scroll messages
   Ctrl+U            Clear input line
   Ctrl+L            Clear screen
-  Ctrl+C            Quit";
+  Ctrl+C            Quit
+
+Writes:
+  SELECT queries always run. When the agent wants to modify the workspace
+  you are asked: y runs it, n refuses it, a allows writes for this session.
+  Start with --allow-write to skip the prompt.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppState {
     Idle,
     Thinking,
     Ingesting,
+    RunningSql,
+    AwaitingPermission,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MessageRole {
     User,
     Assistant,
+    /// A tool call: `> run_sql` plus its detail and outcome.
+    Step,
+    /// A direct SQL result table.
+    Sql,
     System,
     Error,
 }
@@ -65,43 +75,18 @@ pub(crate) struct Message {
 }
 
 impl Message {
-    fn system(content: &str) -> Self {
+    fn new(role: MessageRole, content: impl Into<String>) -> Self {
         Self {
-            role: MessageRole::System,
-            content: content.to_owned(),
-        }
-    }
-
-    fn user(content: String) -> Self {
-        Self {
-            role: MessageRole::User,
-            content,
-        }
-    }
-
-    fn assistant(content: String) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            content,
-        }
-    }
-
-    fn error(content: String) -> Self {
-        Self {
-            role: MessageRole::Error,
-            content,
+            role,
+            content: content.into(),
         }
     }
 }
 
+/// Results from work that is not an agent turn.
 enum BackgroundResult {
-    Chat {
-        content: String,
-        chart_spec: Option<serde_json::Value>,
-    },
-    Ingested {
-        summary: String,
-    },
+    Ingested { summary: String },
+    SqlResult { text: String },
     Error(String),
 }
 
@@ -115,11 +100,19 @@ pub(crate) struct App {
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
     pub(crate) current_chart: Option<ChartData>,
+    /// The write awaiting a decision, while `state` is `AwaitingPermission`.
+    pending_permission: Option<PermissionRequest>,
+    /// Index into `messages` of the step line being filled in.
+    open_step: Option<usize>,
+    /// Whether the assistant message being streamed is the last message.
+    streaming_assistant: bool,
+    last_sql: Option<String>,
     input_history: Vec<String>,
     history_cursor: Option<usize>,
     config: Arc<Config>,
     workspace_id: String,
     allow_write: bool,
+    agent_events: Option<EventStream>,
     response_rx: mpsc::UnboundedReceiver<BackgroundResult>,
     response_tx: mpsc::UnboundedSender<BackgroundResult>,
 }
@@ -146,15 +139,21 @@ impl App {
             workspace_name,
             provider_display,
             current_chart: None,
+            pending_permission: None,
+            open_step: None,
+            streaming_assistant: false,
+            last_sql: None,
             input_history: Vec::new(),
             history_cursor: None,
             config,
             workspace_id,
             allow_write,
+            agent_events: None,
             response_rx,
             response_tx,
         };
-        app.messages.push(Message::system(WELCOME_TEXT));
+        app.messages
+            .push(Message::new(MessageRole::System, WELCOME_TEXT));
         app
     }
 
@@ -167,6 +166,7 @@ impl App {
             while let Ok(result) = self.response_rx.try_recv() {
                 self.handle_background_result(result);
             }
+            self.drain_agent_events();
 
             if event::poll(tick_rate)?
                 && let Event::Key(key) = event::read()?
@@ -185,14 +185,133 @@ impl App {
         Ok(())
     }
 
+    fn drain_agent_events(&mut self) {
+        let mut pending = Vec::new();
+        let mut closed = false;
+        if let Some(rx) = self.agent_events.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => pending.push(event),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in pending {
+            self.handle_agent_event(event);
+        }
+        if closed {
+            self.agent_events = None;
+            if self.state == AppState::Thinking {
+                // The task ended without TurnComplete or Failed.
+                self.finish_turn();
+            }
+        }
+    }
+
+    fn handle_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::TextDelta(text) => {
+                if self.streaming_assistant
+                    && let Some(last) = self.messages.last_mut()
+                    && last.role == MessageRole::Assistant
+                {
+                    last.content.push_str(&text);
+                } else {
+                    self.messages
+                        .push(Message::new(MessageRole::Assistant, text));
+                    self.streaming_assistant = true;
+                }
+                self.scroll_offset = 0;
+            }
+            AgentEvent::ToolStarted { tool, detail } => {
+                self.streaming_assistant = false;
+                let mut content = format!("> {tool}");
+                for line in detail.lines().take(12) {
+                    content.push_str("\n  ");
+                    content.push_str(line);
+                }
+                if detail.lines().count() > 12 {
+                    content.push_str("\n  ...");
+                }
+                self.messages.push(Message::new(MessageRole::Step, content));
+                self.open_step = Some(self.messages.len().saturating_sub(1));
+                self.scroll_offset = 0;
+            }
+            AgentEvent::ToolFinished(step) => {
+                let line = format!("\n  {}, {} ms", step.summary, step.duration_ms);
+                if let Some(idx) = self.open_step.take()
+                    && let Some(msg) = self.messages.get_mut(idx)
+                {
+                    msg.content.push_str(&line);
+                } else {
+                    self.messages.push(Message::new(
+                        MessageRole::Step,
+                        format!("> {}{line}", step.tool),
+                    ));
+                }
+            }
+            AgentEvent::PermissionRequired(request) => {
+                self.streaming_assistant = false;
+                self.messages.push(Message::new(
+                    MessageRole::System,
+                    format!(
+                        "The agent wants to run a statement that modifies the workspace:\n{}\n\
+                         Run it?  y = yes   n = no   a = yes, and allow writes for this session",
+                        request.sql
+                    ),
+                ));
+                self.pending_permission = Some(request);
+                self.state = AppState::AwaitingPermission;
+                self.scroll_offset = 0;
+            }
+            AgentEvent::TurnComplete(response) => {
+                if !self.streaming_assistant && !response.content.trim().is_empty() {
+                    self.messages
+                        .push(Message::new(MessageRole::Assistant, response.content));
+                }
+                if let Some(spec) = response.chart_spec {
+                    self.current_chart = ChartData::from_echart_spec(&spec);
+                }
+                if response.write_refused && !self.allow_write {
+                    self.messages.push(Message::new(
+                        MessageRole::System,
+                        "A write was refused this turn. Answer y next time, or restart with --allow-write.",
+                    ));
+                }
+                self.finish_turn();
+            }
+            AgentEvent::Failed(err) => {
+                self.messages.push(Message::new(MessageRole::Error, err));
+                self.finish_turn();
+            }
+        }
+    }
+
+    fn finish_turn(&mut self) {
+        self.state = AppState::Idle;
+        self.streaming_assistant = false;
+        self.open_step = None;
+        self.pending_permission = None;
+        self.scroll_offset = 0;
+    }
+
     fn handle_key_event(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if self.state == AppState::AwaitingPermission {
+            self.handle_permission_key(code);
+            return;
+        }
         match (code, modifiers) {
             (KeyCode::Char('c' | 'q'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 self.messages.clear();
-                self.messages.push(Message::system(WELCOME_TEXT));
+                self.messages
+                    .push(Message::new(MessageRole::System, WELCOME_TEXT));
                 self.current_chart = None;
                 self.scroll_offset = 0;
             }
@@ -223,6 +342,41 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_permission_key(&mut self, code: KeyCode) {
+        let decision = match code {
+            KeyCode::Char('y' | 'Y') => Some((true, false)),
+            KeyCode::Char('a' | 'A') => Some((true, true)),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some((false, false)),
+            _ => None,
+        };
+        let Some((allow, for_session)) = decision else {
+            return;
+        };
+        let Some(request) = self.pending_permission.take() else {
+            self.state = AppState::Thinking;
+            return;
+        };
+        if allow {
+            request.allow();
+            self.messages.push(Message::new(
+                MessageRole::System,
+                if for_session {
+                    "Allowed. Writes are permitted for the rest of this session."
+                } else {
+                    "Allowed."
+                },
+            ));
+            if for_session {
+                self.allow_write = true;
+            }
+        } else {
+            request.deny();
+            self.messages
+                .push(Message::new(MessageRole::System, "Refused."));
+        }
+        self.state = AppState::Thinking;
     }
 
     fn history_up(&mut self) {
@@ -268,7 +422,7 @@ impl App {
     }
 
     fn handle_slash_command(&mut self, input: &str) {
-        let (cmd, _args) = input
+        let (cmd, args) = input
             .split_once(' ')
             .map_or((input, ""), |(c, a)| (c, a.trim()));
 
@@ -278,22 +432,40 @@ impl App {
             }
             "/clear" => {
                 self.messages.clear();
-                self.messages.push(Message::system(WELCOME_TEXT));
+                self.messages
+                    .push(Message::new(MessageRole::System, WELCOME_TEXT));
                 self.current_chart = None;
                 self.scroll_offset = 0;
             }
             "/help" | "/?" => {
-                self.messages.push(Message::system(HELP_TEXT));
+                self.messages
+                    .push(Message::new(MessageRole::System, HELP_TEXT));
             }
             "/workspace" => {
-                self.messages.push(Message::system(&format!(
-                    "Workspace: {} ({})",
-                    self.workspace_name, self.workspace_id
-                )));
+                self.messages.push(Message::new(
+                    MessageRole::System,
+                    format!("Workspace: {} ({})", self.workspace_name, self.workspace_id),
+                ));
+            }
+            "/tables" => self.run_direct_sql("SHOW TABLES"),
+            "/sql" => {
+                if args.is_empty() {
+                    match self.last_sql.clone() {
+                        Some(sql) => self.set_textarea_content(&sql),
+                        None => self.messages.push(Message::new(
+                            MessageRole::System,
+                            "No query has run yet. Use /sql STATEMENT.",
+                        )),
+                    }
+                } else {
+                    self.run_direct_sql(args);
+                }
             }
             other => {
-                self.messages
-                    .push(Message::error(format!("unknown command: {other}")));
+                self.messages.push(Message::new(
+                    MessageRole::Error,
+                    format!("unknown command: {other}"),
+                ));
             }
         }
     }
@@ -316,69 +488,107 @@ impl App {
             return;
         }
 
+        if let Some(path) = detect_file_path(&trimmed) {
+            self.start_ingest(path);
+            return;
+        }
+
+        if looks_like_direct_sql(&trimmed) {
+            self.run_direct_sql(&trimmed);
+            return;
+        }
+
+        self.start_agent_turn(trimmed);
+    }
+
+    fn start_ingest(&mut self, path: PathBuf) {
         let config = Arc::clone(&self.config);
         let workspace_id = self.workspace_id.clone();
         let tx = self.response_tx.clone();
+        self.messages.push(Message::new(
+            MessageRole::System,
+            format!("Ingesting {}", path.display()),
+        ));
+        self.state = AppState::Ingesting;
 
-        if let Some(path) = detect_file_path(&trimmed) {
-            self.messages
-                .push(Message::system(&format!("Ingesting {}", path.display())));
-            self.state = AppState::Ingesting;
-
-            // WorkspaceDb is !Sync so the ingest future is !Send.
-            // Run on a dedicated thread with its own single-threaded runtime.
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                match rt {
-                    Ok(rt) => {
-                        let result = rt.block_on(run_ingest_task(config, workspace_id, path));
-                        drop(tx.send(result));
-                    }
-                    Err(e) => {
-                        drop(tx.send(BackgroundResult::Error(format!(
-                            "failed to create runtime: {e:#}"
-                        ))));
-                    }
+        // WorkspaceDb is !Sync so the ingest future is !Send.
+        // Run on a dedicated thread with its own single-threaded runtime.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => {
+                    let result = rt.block_on(run_ingest_task(config, workspace_id, path));
+                    drop(tx.send(result));
                 }
-            });
-        } else {
-            self.messages.push(Message::user(trimmed.clone()));
-            self.state = AppState::Thinking;
-            let policy = if self.allow_write {
-                WritePolicy::Allow
-            } else {
-                WritePolicy::Deny
-            };
+                Err(e) => {
+                    drop(tx.send(BackgroundResult::Error(format!(
+                        "failed to create runtime: {e:#}"
+                    ))));
+                }
+            }
+        });
+    }
 
-            tokio::spawn(async move {
-                let result = run_agent_task(config, workspace_id, policy, trimmed).await;
-                drop(tx.send(result));
-            });
-        }
+    fn run_direct_sql(&mut self, sql: &str) {
+        let sql = sql.trim().to_owned();
+        self.messages
+            .push(Message::new(MessageRole::User, sql.clone()));
+        self.last_sql = Some(sql.clone());
+        self.state = AppState::RunningSql;
+
+        let config = Arc::clone(&self.config);
+        let workspace_id = self.workspace_id.clone();
+        let tx = self.response_tx.clone();
+        std::thread::spawn(move || {
+            let result = run_sql_task(&config, &workspace_id, &sql);
+            drop(tx.send(result));
+        });
+    }
+
+    fn start_agent_turn(&mut self, message: String) {
+        self.messages
+            .push(Message::new(MessageRole::User, message.clone()));
+        self.state = AppState::Thinking;
+        self.streaming_assistant = false;
+        self.open_step = None;
+
+        let policy = if self.allow_write {
+            WritePolicy::Allow
+        } else {
+            WritePolicy::Ask
+        };
+        let (sink, rx) = events::channel();
+        self.agent_events = Some(rx);
+
+        let config = Arc::clone(&self.config);
+        let workspace_id = self.workspace_id.clone();
+        tokio::spawn(async move {
+            let db = match WorkspaceDb::open(&config, &workspace_id) {
+                Ok(db) => db,
+                Err(e) => {
+                    drop(sink.send(AgentEvent::Failed(format!("failed to open workspace: {e}"))));
+                    return;
+                }
+            };
+            // run_turn emits TurnComplete or Failed itself; the returned
+            // value is the same response, so it is not needed here.
+            drop(quack_core::llm::run_turn(&config, db, policy, &message, sink).await);
+        });
     }
 
     fn handle_background_result(&mut self, result: BackgroundResult) {
         match result {
-            BackgroundResult::Chat {
-                content,
-                chart_spec,
-            } => {
-                if let Some(spec) = chart_spec {
-                    self.current_chart = ChartData::from_echart_spec(&spec);
-                    if self.current_chart.is_none() {
-                        self.messages.push(Message::assistant(content));
-                    }
-                } else {
-                    self.messages.push(Message::assistant(content));
-                }
-            }
             BackgroundResult::Ingested { summary } => {
-                self.messages.push(Message::system(&summary));
+                self.messages
+                    .push(Message::new(MessageRole::System, summary));
+            }
+            BackgroundResult::SqlResult { text } => {
+                self.messages.push(Message::new(MessageRole::Sql, text));
             }
             BackgroundResult::Error(err) => {
-                self.messages.push(Message::error(err));
+                self.messages.push(Message::new(MessageRole::Error, err));
             }
         }
         self.state = AppState::Idle;
@@ -391,38 +601,36 @@ fn configure_textarea(textarea: &mut TextArea<'_>) {
 
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(Style::default().fg(Color::Reset).bg(Color::White));
-    textarea.set_placeholder_text("Type a question or SQL query...");
+    textarea.set_placeholder_text("Ask a question, or type SQL...");
 }
 
-async fn run_agent_task(
-    config: Arc<Config>,
-    workspace_id: String,
-    policy: WritePolicy,
-    message: String,
-) -> BackgroundResult {
-    match run_agent_inner(&config, &workspace_id, policy, &message).await {
-        Ok((content, chart_spec)) => BackgroundResult::Chat {
-            content,
-            chart_spec,
-        },
-        Err(e) => BackgroundResult::Error(format!("{e:#}")),
+fn run_sql_task(config: &Config, workspace_id: &str, sql: &str) -> BackgroundResult {
+    let db = match WorkspaceDb::open(config, workspace_id) {
+        Ok(db) => db,
+        Err(e) => return BackgroundResult::Error(format!("failed to open workspace: {e}")),
+    };
+    let started = std::time::Instant::now();
+    match db.execute_query(sql) {
+        Ok(results) => {
+            let mut buf = Vec::new();
+            let capped = results.clone_capped(200);
+            if let Err(e) = capped.write_table(&mut buf) {
+                return BackgroundResult::Error(format!("failed to render results: {e}"));
+            }
+            let mut text = String::from_utf8_lossy(&buf).into_owned();
+            if results.rows.len() > 200 {
+                let omitted = format!(
+                    "... {} more rows not shown\n",
+                    results.rows.len().saturating_sub(200)
+                );
+                text.push_str(&omitted);
+            }
+            let elapsed = format!("{} ms", started.elapsed().as_millis());
+            text.push_str(&elapsed);
+            BackgroundResult::SqlResult { text }
+        }
+        Err(e) => BackgroundResult::Error(format!("{e}")),
     }
-}
-
-async fn run_agent_inner(
-    config: &Config,
-    workspace_id: &str,
-    policy: WritePolicy,
-    message: &str,
-) -> Result<(String, Option<serde_json::Value>)> {
-    let ws_db = WorkspaceDb::open(config, workspace_id)
-        .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
-
-    let response = quack_core::llm::run_turn(config, ws_db, policy, message)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    Ok((response.content, response.chart_spec))
 }
 
 fn detect_file_path(input: &str) -> Option<PathBuf> {

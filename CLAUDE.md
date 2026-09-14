@@ -76,14 +76,16 @@ data-layer, crypto, or dependency change:
 ## Interfaces today
 
 ```bash
-cargo run --bin quack -- query "SELECT 1"           # SQL against a workspace
-cargo run --bin quack -- ingest sales.csv -w ws     # file -> table or chunks
-cargo run --bin quack -- chat "question" -w ws      # one agent turn (needs providers in config)
-cargo run --bin quack -- -w ws                      # interactive terminal session (needs a TTY)
+cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
+cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table or chunks
+cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
+cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 ```
 
-`--allow-write` lets the agent run mutating SQL; without it writes are refused and `chat`
-exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
+The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
+started/finished with timing, permission requests, turn complete. Every interface consumes
+it. `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
+prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
 clients themselves. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
 `quack ontology propose`, ...) is in design doc section 11.
 

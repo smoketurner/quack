@@ -1,6 +1,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod print;
 mod terminal;
 
 use anyhow::{Context, Result};
@@ -25,9 +26,29 @@ const EXIT_WRITE_REFUSED: u8 = 3;
     name = "quack",
     version,
     about = "Knowledge engine: documents, tables, and a knowledge graph in one workspace",
-    long_about = "With no subcommand, starts the interactive terminal session in a workspace."
+    long_about = "With no arguments, starts the interactive terminal session in a workspace.\n\
+                  `-p PROMPT` asks the agent one question and prints the answer; \
+                  `-q SQL` runs SQL directly. Both are pipe-friendly."
 )]
 struct Cli {
+    /// Ask the agent one question, print the answer, and exit
+    #[arg(
+        short = 'p',
+        long = "print",
+        value_name = "PROMPT",
+        conflicts_with = "query"
+    )]
+    prompt: Option<String>,
+
+    /// Run SQL directly against the workspace and print the result set
+    #[arg(short = 'q', long = "query", value_name = "SQL")]
+    query: Option<String>,
+
+    /// Output format. Default: table on a terminal, ndjson when piped
+    /// (`-p` accepts text or json only)
+    #[arg(short = 'f', long, value_enum)]
+    format: Option<OutputFormat>,
+
     /// Workspace name (defaults to config value)
     #[arg(long, short = 'w', global = true)]
     workspace: Option<String>,
@@ -36,22 +57,16 @@ struct Cli {
     #[arg(long, global = true)]
     allow_write: bool,
 
+    /// Print full tool inputs and outputs to stderr in print mode
+    #[arg(long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Execute a SQL query against a workspace
-    Query {
-        /// SQL query to execute
-        sql: String,
-
-        /// Output format
-        #[arg(long, short = 'f', value_enum, default_value_t = OutputFormat::Table)]
-        format: OutputFormat,
-    },
-
     /// Ingest a file into a workspace
     Ingest {
         /// File path to ingest (use - for stdin)
@@ -65,18 +80,32 @@ enum Commands {
         #[arg(long)]
         no_embed: bool,
     },
-
-    /// Ask the agent one question and print the answer
-    Chat {
-        /// Question or message for the agent
-        message: String,
-    },
 }
 
-#[derive(Clone, ValueEnum)]
-enum OutputFormat {
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OutputFormat {
+    /// Aligned text table (SQL) or plain answer text (`-p`)
     Table,
+    /// One JSON document
     Json,
+    /// One JSON object per line
+    Ndjson,
+    /// Comma-separated values with a header row
+    Csv,
+    /// GitHub-flavored Markdown table
+    Markdown,
+    /// Plain answer text (`-p` only)
+    Text,
+}
+
+impl OutputFormat {
+    fn default_for(stdout_is_tty: bool) -> Self {
+        if stdout_is_tty {
+            Self::Table
+        } else {
+            Self::Ndjson
+        }
+    }
 }
 
 #[tokio::main]
@@ -91,23 +120,50 @@ async fn main() -> Result<ExitCode> {
     } else {
         WritePolicy::Deny
     };
+    let stdout_is_tty = std::io::stdout().is_terminal();
+
+    if let Some(prompt) = cli.prompt.as_deref() {
+        init_logging();
+        let format = match cli.format.unwrap_or(OutputFormat::Text) {
+            OutputFormat::Json => print::PromptFormat::Json,
+            OutputFormat::Text | OutputFormat::Table => print::PromptFormat::Text,
+            OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::Markdown => {
+                tracing::error!("-p accepts only --format text or json");
+                return Ok(ExitCode::from(EXIT_USAGE));
+            }
+        };
+        let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+        let ws_db = WorkspaceDb::open(&config, &workspace.id)
+            .context("failed to open workspace database")?;
+        let refused =
+            print::run_prompt(&config, ws_db, policy, prompt, format, cli.verbose).await?;
+        return Ok(if refused {
+            ExitCode::from(EXIT_WRITE_REFUSED)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+
+    if let Some(sql) = cli.query.as_deref() {
+        init_logging();
+        let format = cli
+            .format
+            .unwrap_or_else(|| OutputFormat::default_for(stdout_is_tty));
+        run_query(sql, cli.workspace.as_deref(), format).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
     match cli.command {
         None => {
-            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            if !std::io::stdin().is_terminal() || !stdout_is_tty {
                 init_logging();
                 tracing::error!(
-                    "the interactive session needs a terminal; use `quack chat` or `quack query` in pipelines"
+                    "the interactive session needs a terminal; use `quack -p PROMPT` or `quack -q SQL` in pipelines"
                 );
                 return Ok(ExitCode::from(EXIT_USAGE));
             }
             let (config, workspace, ws_name) = resolve_workspace(cli.workspace.as_deref()).await?;
             terminal::run(config, ws_name, workspace.id, cli.allow_write)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Commands::Query { sql, format }) => {
-            init_logging();
-            run_query(&sql, cli.workspace.as_deref(), &format).await?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Ingest {
@@ -125,20 +181,11 @@ async fn main() -> Result<ExitCode> {
             .await?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Chat { message }) => {
-            init_logging();
-            let refused = run_chat(&message, cli.workspace.as_deref(), policy).await?;
-            Ok(if refused {
-                ExitCode::from(EXIT_WRITE_REFUSED)
-            } else {
-                ExitCode::SUCCESS
-            })
-        }
     }
 }
 
-/// Log to stderr for the non-interactive subcommands. The terminal session
-/// owns the screen, so it does not install a subscriber.
+/// Log to stderr for the non-interactive paths. The terminal session owns
+/// the screen, so it does not install a subscriber.
 fn init_logging() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -166,7 +213,7 @@ async fn resolve_workspace(workspace_name: Option<&str>) -> Result<(Config, Work
     Ok((config, workspace, ws_name))
 }
 
-async fn run_query(sql: &str, workspace_name: Option<&str>, format: &OutputFormat) -> Result<()> {
+async fn run_query(sql: &str, workspace_name: Option<&str>, format: OutputFormat) -> Result<()> {
     let (config, workspace, _) = resolve_workspace(workspace_name).await?;
 
     let ws_db =
@@ -178,8 +225,11 @@ async fn run_query(sql: &str, workspace_name: Option<&str>, format: &OutputForma
     let mut out = std::io::BufWriter::new(stdout.lock());
 
     match format {
-        OutputFormat::Table => results.write_table(&mut out)?,
+        OutputFormat::Table | OutputFormat::Text => results.write_table(&mut out)?,
         OutputFormat::Json => results.write_json(&mut out)?,
+        OutputFormat::Ndjson => results.write_ndjson(&mut out)?,
+        OutputFormat::Csv => results.write_csv(&mut out)?,
+        OutputFormat::Markdown => results.write_markdown(&mut out)?,
     }
 
     out.flush()?;
@@ -269,35 +319,4 @@ fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, S
 
         Ok((data, filename))
     }
-}
-
-async fn run_chat(
-    message: &str,
-    workspace_name: Option<&str>,
-    policy: WritePolicy,
-) -> Result<bool> {
-    let (config, workspace, _) = resolve_workspace(workspace_name).await?;
-
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-
-    let response = llm::run_turn(&config, ws_db, policy, message)
-        .await
-        .context("agent turn failed")?;
-
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-
-    writeln!(out, "{}", response.content)?;
-
-    if let Some(chart_spec) = &response.chart_spec {
-        writeln!(out)?;
-        writeln!(out, "--- ECharts Spec ---")?;
-        let json =
-            serde_json::to_string_pretty(chart_spec).context("failed to serialize chart spec")?;
-        writeln!(out, "{json}")?;
-    }
-
-    out.flush()?;
-    Ok(response.write_refused)
 }
