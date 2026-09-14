@@ -185,15 +185,15 @@ impl App {
             sessions::messages(&db, session_id)?
         };
         if rows.is_empty() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!("Session {session_id} has no messages yet."),
+            ));
             return Ok(());
         }
         self.messages.push(Message::new(
             MessageRole::System,
-            format!(
-                "Resumed session {} ({} messages)",
-                short_id(session_id),
-                rows.len()
-            ),
+            format!("Resumed session {session_id} ({} messages)", rows.len()),
         ));
         for row in rows {
             match row.role {
@@ -613,14 +613,17 @@ impl App {
                     let marker = if row.id == self.session_id { "*" } else { " " };
                     let line = format!(
                         "\n{marker} {}  {}  {:>3} msgs  {}",
-                        short_id(&row.id),
+                        row.id,
                         row.updated_at,
                         row.message_count,
                         row.title.as_deref().unwrap_or("(untitled)")
                     );
                     text.push_str(&line);
                 }
-                text.push_str("\nUse /resume ID to switch.");
+                text.push_str(
+                    "\nUse /resume ID to switch (any unique prefix works; ids created close \
+                     together differ only near the end).",
+                );
                 self.messages.push(Message::new(MessageRole::System, text));
             }
             Err(e) => self
@@ -657,26 +660,37 @@ impl App {
         match found {
             Ok(matches) if matches.len() == 1 => {
                 let id = matches.into_iter().next().map(|s| s.id).unwrap_or_default();
-                self.forget_session_if_empty();
-                self.messages.clear();
-                self.current_chart = None;
-                self.session_id.clone_from(&id);
-                if let Err(e) = self.replay_session(&id) {
-                    self.messages
-                        .push(Message::new(MessageRole::Error, format!("{e}")));
+                if id == self.session_id {
+                    self.messages.push(Message::new(
+                        MessageRole::System,
+                        "That is the current session.",
+                    ));
+                } else {
+                    self.forget_session_if_empty();
+                    self.messages.clear();
+                    self.current_chart = None;
+                    self.session_id.clone_from(&id);
+                    if let Err(e) = self.replay_session(&id) {
+                        self.messages
+                            .push(Message::new(MessageRole::Error, format!("{e}")));
+                    }
                 }
             }
             Ok(matches) if matches.is_empty() => self.messages.push(Message::new(
                 MessageRole::Error,
                 format!("no session matches '{prefix}'"),
             )),
-            Ok(matches) => self.messages.push(Message::new(
-                MessageRole::Error,
-                format!(
-                    "'{prefix}' matches {} sessions; use more of the id",
+            Ok(matches) => {
+                let mut text = format!(
+                    "'{prefix}' matches {} sessions; use more of the id:",
                     matches.len()
-                ),
-            )),
+                );
+                for m in matches.iter().take(10) {
+                    text.push_str("\n  ");
+                    text.push_str(&m.id);
+                }
+                self.messages.push(Message::new(MessageRole::Error, text));
+            }
             Err(e) => self
                 .messages
                 .push(Message::new(MessageRole::Error, format!("{e}"))),
@@ -710,7 +724,7 @@ impl App {
                 self.current_chart = None;
                 self.messages.push(Message::new(
                     MessageRole::System,
-                    format!("New session {}", short_id(&self.session_id)),
+                    format!("New session {}", self.session_id),
                 ));
             }
             Err(e) => self
