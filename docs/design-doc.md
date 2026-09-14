@@ -926,10 +926,14 @@ Lifecycle: acquire via `quack auth login PROVIDER` (browser PKCE, or device code
 `device_code = true`, no browser, or `SSH_CONNECTION` is set; endpoints from
 `{issuer_url}/.well-known/openid-configuration`; verifier from aws-lc-rs randomness);
 reuse while more than 60 s remain; refresh silently under `refresh_lock`; restart on
-refresh failure; in print and server modes, where no flow can run, fail with exit 4 /
-HTTP 503 naming the command to run. Cache encrypted with a key in the OS keychain where
-available (macOS Keychain, Linux Secret Service, Windows Credential Manager), else a
-0600 key file. `quack auth status` and `logout`.
+refresh failure; in print, ingest, and server modes, where no flow can run, fail with exit
+4 / HTTP 503 naming the command to run. Cache encrypted (AES-256-GCM, the provider name as
+associated data) with a key in the OS keychain where available (macOS Keychain, the Linux
+kernel keyring via `keyutils`, which is always present but in-memory, so a reboot needs a
+new login; Windows Credential Manager), else a 0600 key file. `quack auth status` and
+`logout`. The `oauth2` crate is used without its bundled HTTP client (that would pull
+`ring`); requests go through the same rustls + aws-lc-rs `reqwest` as rig. Scopes must
+include `offline_access` where the issuer needs it to return a refresh token.
 
 The server holds one `TokenManager` per OAuth provider, shared across requests. A server
 that reaches Azure OpenAI this way is a confidential client and should be registered as
@@ -1147,7 +1151,7 @@ embedding_dimension = 1536
 [providers.azure.oauth]
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
-scopes = ["https://cognitiveservices.azure.com/.default"]
+scopes = ["https://cognitiveservices.azure.com/.default", "offline_access"]
 # client_secret_env = "AZURE_CLIENT_SECRET"   # server as confidential client
 # device_code = false
 
@@ -1221,7 +1225,7 @@ tick_rate_ms = 50
   `rust-toolchain.toml`. A compose file runs `quack serve` beside Ollama with the model
   volume pre-populated; the image tarball is `docker load`ed on air-gapped hosts.
 - **Dependencies** follow the workspace rules in `CLAUDE.md`. New entries this design
-  needs, versions looked up when added: `oauth2`, `keyring`, `argon2`, an MCP crate,
+  needs, versions looked up when added: `argon2`, an MCP crate,
   `docx-rs`, `scraper` or `html2text`, `serde_yaml` or `serde_yml` for ontology
   interchange, `tauri` (only when `quack desktop` is built), `tower_governor`.
 
@@ -1309,7 +1313,9 @@ updated as issues close. Ordered by risk.
 
 1. ~~Verify against a live model~~ (#20, closed): print mode and the terminal session are
    verified with gpt-oss:20b on Ollama. Sections 7, 8, 9.
-2. **No OAuth** (#25). `auth = "oauth"` parses and is rejected. Section 10.2.
+2. ~~No OAuth~~ (#25, closed): PKCE and device-code login, encrypted cache, `quack auth`;
+   the server's confidential-client mode is wired (`client_secret_env`) and gets its live
+   test with #26. Section 10.2.
 3. **No server, REST API, web UI** (#26); **no MCP** (#29); **no desktop window** (#35).
    Sections 11, 12.
 4. **No ontology or induction** (#27); **no graph** (#28). Sections 6.3 to 6.5.
@@ -1395,7 +1401,7 @@ deployment for document chat is the end of step 8.
    documents, chat and query modes.~~ Done. DOCX, HTML, PPTX, XLSX parsers are issue #16.
 6. ~~Workspace context (stored, versioned, import/export), the prompt rewrite, and the
    chart spec with its terminal renderer.~~ Done.
-7. OAuth: `TokenManager`, PKCE and device code, cache, `quack auth`.
+7. ~~OAuth: `TokenManager`, PKCE and device code, cache, `quack auth`.~~ Done.
 8. `quack serve`: `control.db`, users, tokens, roles, split audit, upload queue; REST API;
    SSE; web UI (workspaces, chat with citations, documents, tables, context editor).
    **Milestone: document chat replacement.**

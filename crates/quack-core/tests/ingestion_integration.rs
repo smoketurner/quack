@@ -56,6 +56,7 @@ fn test_config(data_dir: &Path) -> Config {
             base_url: Some("http://localhost:9999".into()),
             api_key_env: None,
             embedding_dimension: Some(TEST_DIM_U32),
+            oauth: None,
         },
     );
     Config {

@@ -1121,7 +1121,7 @@ async fn run_ingest_inner(
     let ws_db = WorkspaceDb::open(config, workspace_id)
         .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
 
-    let embedding_model = quack_core::llm::optional_embedding_model(config)?;
+    let embedding_model = quack_core::llm::optional_embedding_model(config).await?;
 
     let result = ingestion::ingest_file(
         config,

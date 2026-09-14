@@ -11,6 +11,7 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::llm;
+use quack_core::llm::oauth::{LoginOptions, LoginPrompt};
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
@@ -24,6 +25,8 @@ use std::sync::{Arc, Mutex};
 const EXIT_USAGE: u8 = 2;
 /// Exit status when the agent needed a write that was not permitted.
 const EXIT_WRITE_REFUSED: u8 = 3;
+/// Exit status when an OAuth provider needs `quack auth login` first.
+const EXIT_AUTH_REQUIRED: u8 = 4;
 
 #[derive(Parser)]
 #[command(
@@ -134,6 +137,12 @@ enum Commands {
         action: Option<ContextAction>,
     },
 
+    /// Log in to an OAuth provider, show token state, or forget a token
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+
     /// List ingested documents, or pin and unpin one
     Docs {
         /// Pin a document by id (prefixes accepted)
@@ -147,6 +156,30 @@ enum Commands {
         /// Emit one JSON object per document
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Obtain a token: browser sign-in with PKCE, or a device code when no
+    /// browser can open here
+    Login {
+        /// Provider name from [providers.NAME] with auth = "oauth"
+        provider: String,
+
+        /// Use the device-code flow even if a browser is available
+        #[arg(long)]
+        device_code: bool,
+    },
+    /// Show whether each OAuth provider has a token and when it expires
+    Status {
+        /// Only this provider
+        provider: Option<String>,
+    },
+    /// Forget the cached token for a provider
+    Logout {
+        /// Provider name from [providers.NAME] with auth = "oauth"
+        provider: String,
     },
 }
 
@@ -270,14 +303,21 @@ async fn main() -> Result<ExitCode> {
             pin,
         }) => {
             init_logging();
-            run_ingest(
+            let outcome = run_ingest(
                 &file,
                 cli.workspace.as_deref(),
                 filename.as_deref(),
                 no_embed,
                 pin,
             )
-            .await?;
+            .await;
+            if let Err(e) = &outcome
+                && let Some(code) = auth_exit_code(e)
+            {
+                tracing::error!("{e:#}");
+                return Ok(code);
+            }
+            outcome?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Context { action }) => {
@@ -286,6 +326,12 @@ async fn main() -> Result<ExitCode> {
             let ws_db = WorkspaceDb::open(&config, &workspace.id)
                 .context("failed to open workspace database")?;
             run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::Auth { action }) => {
+            init_logging();
+            let config = Config::load().context("failed to load configuration")?;
+            run_auth(&config, action).await?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Docs { pin, unpin, json }) => {
@@ -344,12 +390,186 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     {
         drop(sessions::delete_if_empty(&guard, &session_id));
     }
+    if let Err(e) = &outcome
+        && let Some(code) = auth_exit_code(e)
+    {
+        tracing::error!("{e:#}");
+        return Ok(code);
+    }
     let refused = outcome?;
     Ok(if refused {
         ExitCode::from(EXIT_WRITE_REFUSED)
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Exit 4 when the failure is an OAuth provider without a usable token:
+/// print and ingest cannot run a login flow, so the message names the
+/// command that can.
+fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
+    err.chain()
+        .any(|cause| {
+            matches!(
+                cause.downcast_ref::<quack_core::error::Error>(),
+                Some(quack_core::error::Error::AuthRequired { .. })
+            )
+        })
+        .then_some(ExitCode::from(EXIT_AUTH_REQUIRED))
+}
+
+/// `quack auth login|status|logout`.
+async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
+    let stdout = std::io::stdout();
+    match action {
+        AuthAction::Login {
+            provider,
+            device_code,
+        } => {
+            let manager = oauth_manager(config, &provider)?;
+            let options = LoginOptions {
+                device_code: device_code || !browser_can_open(),
+            };
+            let token = manager.login(options, &show_login_prompt).await?;
+            let mut out = stdout.lock();
+            writeln!(
+                out,
+                "Logged in to '{provider}'; the token expires at {}{}.",
+                token.expires_at,
+                if token.refresh_token.is_some() {
+                    " and will refresh itself"
+                } else {
+                    ""
+                }
+            )?;
+            out.flush()?;
+        }
+        AuthAction::Status { provider } => {
+            let mut names: Vec<&str> = config
+                .providers
+                .iter()
+                .filter(|(_, p)| p.auth == quack_core::config::AuthMode::Oauth)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if let Some(only) = provider.as_deref() {
+                names.retain(|n| *n == only);
+                if names.is_empty() {
+                    anyhow::bail!("'{only}' is not a provider with auth = \"oauth\"");
+                }
+            }
+            let mut out = std::io::BufWriter::new(stdout.lock());
+            if names.is_empty() {
+                writeln!(out, "No providers use auth = \"oauth\".")?;
+            }
+            for name in names {
+                let status = oauth_manager(config, name)?.status().await?;
+                let state = match status.expires_at {
+                    Some(at) if status.logged_in => format!(
+                        "logged in, token expires {at}{}",
+                        if status.has_refresh_token {
+                            ", refreshable"
+                        } else {
+                            ", no refresh token"
+                        }
+                    ),
+                    _ => format!("not logged in; run `quack auth login {name}`"),
+                };
+                writeln!(out, "{name}: {state} (key in {})", status.key_source)?;
+            }
+            out.flush()?;
+        }
+        AuthAction::Logout { provider } => {
+            oauth_manager(config, &provider)?.logout().await?;
+            let mut out = stdout.lock();
+            writeln!(out, "Logged out of '{provider}'.")?;
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn oauth_manager(config: &Config, name: &str) -> Result<Arc<quack_core::llm::oauth::TokenManager>> {
+    let provider = config.providers.get(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "provider '{name}' is not configured; add [providers.{name}] with auth = \"oauth\""
+        )
+    })?;
+    if provider.auth != quack_core::config::AuthMode::Oauth {
+        anyhow::bail!("provider '{name}' does not use auth = \"oauth\"");
+    }
+    quack_core::llm::oauth::shared_manager(&config.tokens_dir(), name, provider)
+        .context("failed to prepare the OAuth token manager")
+}
+
+/// Print what the user must do for a login step. The browser prompt also
+/// tries to open the URL; if that fails the URL is on screen to copy.
+fn show_login_prompt(prompt: LoginPrompt) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let written = match prompt {
+        LoginPrompt::Browser { url } => {
+            let opened = open_browser(&url);
+            writeln!(
+                out,
+                "{}\n\n  {url}\n\nWaiting for the sign-in to finish...",
+                if opened {
+                    "Opening your browser to sign in. If it does not appear, open this URL:"
+                } else {
+                    "Open this URL in a browser to sign in:"
+                }
+            )
+        }
+        LoginPrompt::DeviceCode {
+            verification_uri,
+            user_code,
+            verification_uri_complete,
+            expires_in,
+        } => {
+            let complete =
+                verification_uri_complete.map_or(String::new(), |u| format!("\n  or open {u}"));
+            writeln!(
+                out,
+                "Open {verification_uri} and enter the code {user_code}{complete}\n\nThe code is valid for {} minutes. Waiting for approval...",
+                expires_in.as_secs().checked_div(60).unwrap_or_default()
+            )
+        }
+    };
+    if written.is_err() {
+        tracing::error!("could not write the login prompt to stdout");
+    }
+    drop(out.flush());
+}
+
+/// Whether a browser on this machine can reach the loopback redirect: not
+/// over SSH, and on Linux only with a display.
+fn browser_can_open() -> bool {
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    }
+    true
+}
+
+/// Launch the platform's URL opener. Returns whether it started.
+fn open_browser(url: &str) -> bool {
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 /// No arguments: the interactive session, which needs a terminal.
@@ -688,7 +908,9 @@ async fn run_ingest(
     let embedding_model = if no_embed {
         None
     } else {
-        llm::optional_embedding_model(&config).context("failed to build embedding model")?
+        llm::optional_embedding_model(&config)
+            .await
+            .context("failed to build embedding model")?
     };
 
     let result = ingestion::ingest_file(

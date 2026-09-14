@@ -36,6 +36,7 @@ cargo run --bin quack -- export 01a0a0e1 --sql                        # replay a
 cargo run --bin quack -- ingest policy.pdf --pin                      # full text in every prompt
 cargo run --bin quack -- -p "what is excluded?" --mode query          # sources only, cited [n]
 cargo run --bin quack -- context edit                                 # definitions the agent follows
+cargo run --bin quack -- auth login azure                             # OAuth sign-in for a provider
 ```
 
 The workspace context is the owner's instructions for the agent: persona, what columns
@@ -56,7 +57,15 @@ Every turn is recorded in the workspace's own database. `-c` continues the lates
 file or a Markdown transcript.
 
 `-q` prints a table on a terminal and ndjson when piped; `-f` selects table, json, ndjson, csv,
-or markdown. Exit codes: 0 ok, 1 error, 2 usage, 3 write refused.
+or markdown. Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
+
+A provider with `auth = "oauth"` (Azure OpenAI, gateways that forbid static keys) gets its
+bearer token from `quack auth login PROVIDER`: a browser sign-in with PKCE, or a device
+code over SSH, without a display, or with `--device-code`. The token is cached encrypted
+under `~/.local/share/quack/tokens/`, with the key in the OS keychain (macOS Keychain,
+Linux kernel keyring, Windows Credential Manager) or a 0600 key file, and refreshes itself.
+`quack auth status` and `quack auth logout` inspect and forget it; `-p` and `ingest` exit 4
+naming the login command when no token is usable.
 
 `-p` and the terminal session need `[general].chat_model` and `[general].embedding_model`
 set to `PROVIDER/MODEL` references in `~/.config/quack/config.toml`, with a matching

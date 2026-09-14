@@ -10,14 +10,22 @@ publish                = false
 workspace = true
 
 [dependencies]
+aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
+base64        = { workspace = true, features = ["std"] }
 dirs          = { workspace = true }
 duckdb        = { workspace = true, features = ["bundled", "json"] }
 futures       = { workspace = true, features = ["std"] }
+http          = { workspace = true, features = ["std"] }
+jiff          = { workspace = true, features = ["std", "serde"] }
+keyring-core  = { workspace = true }
+oauth2        = { workspace = true }
 pdf-extract   = { workspace = true }
+reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
 rustls        = { workspace = true, features = ["aws_lc_rs", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
 sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
+secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
 sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite"] }
@@ -27,6 +35,15 @@ tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sy
 toml          = { workspace = true, features = ["std", "parse", "serde"] }
 tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true, features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

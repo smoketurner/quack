@@ -20,6 +20,10 @@ pub enum Error {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    /// An OAuth provider has no usable token and no login flow can run here.
+    #[error("provider '{provider}' needs a login ({reason}); run `quack auth login {provider}`")]
+    AuthRequired { provider: String, reason: String },
+
     #[error("analysis error: {0}")]
     Analysis(String),
 

@@ -70,9 +70,39 @@ pub enum AuthMode {
     None,
     /// Static key from the environment variable named by `api_key_env`.
     ApiKey,
-    /// OAuth 2.0 PKCE against an identity provider (design doc 10.2). Parsed
-    /// so configs can carry it, but not implemented yet.
+    /// OAuth 2.0 against an identity provider (design doc 10.2): the access
+    /// token from `[providers.NAME.oauth]` is the bearer for the endpoint.
     Oauth,
+}
+
+/// `[providers.NAME.oauth]`: Authorization Code with PKCE, or the device-code
+/// flow, against an `OpenID` Connect issuer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// Issuer whose `/.well-known/openid-configuration` names the endpoints,
+    /// e.g. `https://login.microsoftonline.com/{tenant}/v2.0`.
+    pub issuer_url: String,
+    pub client_id: String,
+    /// Scopes requested at login, e.g.
+    /// `["https://cognitiveservices.azure.com/.default", "offline_access"]`.
+    /// Include `offline_access` where the issuer needs it to return a refresh
+    /// token.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Loopback redirect for the browser flow.
+    #[serde(default = "default_redirect_uri")]
+    pub redirect_uri: String,
+    /// Always use the device-code flow (headless hosts, SSH, servers).
+    #[serde(default)]
+    pub device_code: bool,
+    /// Environment variable holding a client secret: the server as a
+    /// confidential client.
+    pub client_secret_env: Option<String>,
+}
+
+fn default_redirect_uri() -> String {
+    String::from("http://127.0.0.1:19876/callback")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +116,8 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     /// Width of the vectors this provider's embedding models produce.
     pub embedding_dimension: Option<u32>,
+    /// Required when `auth = "oauth"`, forbidden otherwise.
+    pub oauth: Option<OAuthConfig>,
 }
 
 /// A resolved `PROVIDER/MODEL` reference.
@@ -269,6 +301,11 @@ impl Config {
     /// Returns a `Config` error describing the first violation found.
     pub fn validate(&self) -> Result<()> {
         for (name, provider) in &self.providers {
+            if provider.auth != AuthMode::Oauth && provider.oauth.is_some() {
+                return Err(Error::Config(format!(
+                    "provider '{name}' has an [providers.{name}.oauth] section but auth is not \"oauth\""
+                )));
+            }
             match provider.auth {
                 AuthMode::None => {
                     if provider.api_key_env.is_some() {
@@ -286,9 +323,21 @@ impl Config {
                     }
                 }
                 AuthMode::Oauth => {
-                    return Err(Error::Config(format!(
-                        "provider '{name}': auth = \"oauth\" is not implemented yet"
-                    )));
+                    if provider.api_key_env.is_some() {
+                        return Err(Error::Config(format!(
+                            "provider '{name}' has auth = \"oauth\" but sets api_key_env"
+                        )));
+                    }
+                    let Some(oauth) = &provider.oauth else {
+                        return Err(Error::Config(format!(
+                            "provider '{name}' has auth = \"oauth\" but no [providers.{name}.oauth] section"
+                        )));
+                    };
+                    if oauth.issuer_url.is_empty() || oauth.client_id.is_empty() {
+                        return Err(Error::Config(format!(
+                            "provider '{name}': [providers.{name}.oauth] needs issuer_url and client_id"
+                        )));
+                    }
                 }
             }
         }
@@ -363,6 +412,12 @@ impl Config {
             .as_deref()
             .map(|spec| self.resolve_model("embedding_model", spec))
             .transpose()
+    }
+
+    /// Directory holding the encrypted OAuth token caches, one per provider.
+    #[must_use]
+    pub fn tokens_dir(&self) -> PathBuf {
+        self.general.data_dir.join("tokens")
     }
 
     #[must_use]
@@ -528,8 +583,37 @@ always_retrieve = true
         );
         assert!(
             err_of("[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n")
-                .contains("not implemented")
+                .contains("no [providers.o.oauth] section")
         );
+    }
+
+    #[test]
+    fn oauth_section_is_required_by_and_exclusive_to_oauth_mode() {
+        let stray = "[providers.o]\ntype = \"openai\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n";
+        assert!(err_of(stray).contains("auth is not \"oauth\""));
+        let with_key = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\napi_key_env = \"K\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n";
+        assert!(err_of(with_key).contains("sets api_key_env"));
+        let empty = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"\"\nclient_id = \"c\"\n";
+        assert!(err_of(empty).contains("needs issuer_url and client_id"));
+        assert!(err_of("[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\ntenant = \"x\"\n").contains("tenant"));
+    }
+
+    #[test]
+    fn oauth_section_defaults_and_fields_parse() {
+        let config = Config::parse(
+            "[providers.azure]\ntype = \"openai\"\nauth = \"oauth\"\nbase_url = \"https://r.openai.azure.com/openai/deployments/d\"\n[providers.azure.oauth]\nissuer_url = \"https://login.microsoftonline.com/t/v2.0\"\nclient_id = \"abc\"\nscopes = [\"https://cognitiveservices.azure.com/.default\", \"offline_access\"]\nclient_secret_env = \"AZURE_CLIENT_SECRET\"\n",
+        );
+        let Ok(config) = config else {
+            return assert!(config.is_ok(), "{config:?}");
+        };
+        let oauth = config.providers.get("azure").and_then(|p| p.oauth.as_ref());
+        assert!(oauth.is_some_and(|o| {
+            o.redirect_uri == "http://127.0.0.1:19876/callback"
+                && !o.device_code
+                && o.scopes.len() == 2
+                && o.client_secret_env.as_deref() == Some("AZURE_CLIENT_SECRET")
+        }));
+        assert_eq!(config.tokens_dir(), config.general.data_dir.join("tokens"));
     }
 
     #[test]
