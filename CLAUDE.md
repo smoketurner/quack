@@ -82,6 +82,7 @@ cargo run --bin quack -- -p "question" -w ws [-f text|json]                    #
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
+cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 ```
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
@@ -103,7 +104,13 @@ prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quac
 clients themselves. OAuth providers (`quack_core::llm::oauth`) hand out a bearer through
 one shared `TokenManager` per provider: PKCE or device-code login via `quack auth`, an
 AES-256-GCM cache under `<data_dir>/tokens/` keyed from the OS keychain or a 0600 key file,
-silent refresh, and `Error::AuthRequired` (exit 4 in `-p` and `ingest`) when no flow can run. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
+silent refresh, and `Error::AuthRequired` (exit 4 in `-p` and `ingest`) when no flow can run.
+Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
+membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
+`Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content
+half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace under the
+same UUID v7. Ingestion is `register_document` (status `queued`) plus `process_document`
+(`processing` to `ready` or `error`); `ingest_file` does both. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
 `quack ontology propose`, ...) is in design doc section 11.
 
 ## Common commands

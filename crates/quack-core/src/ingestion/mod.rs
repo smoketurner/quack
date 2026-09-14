@@ -18,11 +18,13 @@ pub struct IngestResult {
 }
 
 /// Ingest a file into a workspace, producing either a `DuckDB` table (structured)
-/// or embedded chunks (unstructured).
+/// or embedded chunks (unstructured). Registers the document and processes
+/// it in one go; the server registers first and processes from its queue.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read, parsed, or stored.
+/// Returns an error if the file type is unsupported or the file cannot be
+/// parsed or stored; the document row then carries the error.
 pub async fn ingest_file<M: EmbeddingModel>(
     config: &Config,
     db: &WorkspaceDb,
@@ -31,82 +33,142 @@ pub async fn ingest_file<M: EmbeddingModel>(
     data: &[u8],
     embedding_model: Option<&M>,
 ) -> Result<IngestResult> {
-    let file_type = parser::detect_file_type(filename);
-    let doc_id = uuid::Uuid::now_v7().to_string();
+    let doc_id = register_document(db, filename, data.len())?;
+    process_document(
+        config,
+        db,
+        workspace_id,
+        &doc_id,
+        filename,
+        data,
+        embedding_model,
+    )
+    .await
+}
 
+/// Insert the document row with status `queued` and return its id. Fails
+/// before writing anything for a file type nothing can parse.
+///
+/// # Errors
+///
+/// Returns `UnsupportedFileType` or a storage error.
+pub fn register_document(db: &WorkspaceDb, filename: &str, size_bytes: usize) -> Result<String> {
+    let file_type = parser::detect_file_type(filename);
+    if matches!(file_type, parser::FileType::Unknown) {
+        return Err(Error::UnsupportedFileType(filename.to_owned()));
+    }
+    let doc_id = uuid::Uuid::now_v7().to_string();
+    db.insert_document(
+        &doc_id,
+        filename,
+        file_type.mime_type(),
+        size_bytes,
+        "queued",
+    )?;
+    Ok(doc_id)
+}
+
+/// Parse, store, and embed a registered document, moving its status from
+/// `processing` to `ready`, or to `error` with the message when it fails.
+///
+/// # Errors
+///
+/// Returns the failure after recording it on the document row.
+pub async fn process_document<M: EmbeddingModel>(
+    config: &Config,
+    db: &WorkspaceDb,
+    workspace_id: &str,
+    doc_id: &str,
+    filename: &str,
+    data: &[u8],
+    embedding_model: Option<&M>,
+) -> Result<IngestResult> {
+    db.update_document_status(doc_id, "processing")?;
+    let outcome = process_inner(
+        config,
+        db,
+        workspace_id,
+        doc_id,
+        filename,
+        data,
+        embedding_model,
+    )
+    .await;
+    match &outcome {
+        Ok(_) => db.update_document_status(doc_id, "ready")?,
+        Err(e) => db.mark_document_error(doc_id, &e.to_string())?,
+    }
+    outcome
+}
+
+async fn process_inner<M: EmbeddingModel>(
+    config: &Config,
+    db: &WorkspaceDb,
+    workspace_id: &str,
+    doc_id: &str,
+    filename: &str,
+    data: &[u8],
+    embedding_model: Option<&M>,
+) -> Result<IngestResult> {
+    let file_type = parser::detect_file_type(filename);
     match file_type {
         parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json => {
-            let table_name = ingest_structured(config, db, workspace_id, filename, &file_type)?;
-
-            db.insert_document(
-                &doc_id,
-                filename,
-                file_type.mime_type(),
-                data.len(),
-                "ready",
-            )?;
-
+            let table_name =
+                ingest_structured(config, db, workspace_id, filename, data, &file_type)?;
             Ok(IngestResult {
-                document_id: doc_id,
+                document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
                 file_type,
                 chunks_stored: 0,
                 table_name: Some(table_name),
             })
         }
-
         parser::FileType::Pdf | parser::FileType::Text | parser::FileType::Markdown => {
             let sections = parser::extract_sections(&file_type, data)?;
-
-            db.insert_document(
-                &doc_id,
-                filename,
-                file_type.mime_type(),
-                data.len(),
-                "processing",
-            )?;
-
             let chunks = chunker::chunk_sections(
                 &sections,
                 config.ingestion.chunk_size_tokens,
                 config.ingestion.chunk_overlap_tokens,
                 &config.ingestion.tokenizer_encoding,
             )?;
-
-            let chunk_count = embed_and_store(db, &doc_id, &chunks, embedding_model).await?;
-
-            db.update_document_status(&doc_id, "ready")?;
-
+            let chunk_count = embed_and_store(db, doc_id, &chunks, embedding_model).await?;
             Ok(IngestResult {
-                document_id: doc_id,
+                document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
                 file_type,
                 chunks_stored: chunk_count,
                 table_name: None,
             })
         }
-
         parser::FileType::Unknown => Err(Error::UnsupportedFileType(filename.to_owned())),
     }
 }
 
+/// The table a structured file loads into: its stem with anything outside
+/// `[A-Za-z0-9_]` replaced by `_`.
+#[must_use]
+pub fn table_name_for(filename: &str) -> String {
+    sanitize_table_name(filename)
+}
+
+/// Write the bytes under `files/` and load them as a table with `DuckDB`'s
+/// reader for the type. The path is bound, never interpolated.
 fn ingest_structured(
     config: &Config,
     db: &WorkspaceDb,
     workspace_id: &str,
     filename: &str,
+    data: &[u8],
     file_type: &parser::FileType,
 ) -> Result<String> {
     let files_dir = config.workspace_files_dir(workspace_id);
     std::fs::create_dir_all(&files_dir)?;
-
-    let dest = files_dir.join(filename);
-    if !dest.exists() {
-        return Err(Error::Ingestion(format!(
-            "file not found at {}; copy it to the workspace files directory first",
-            dest.display()
-        )));
-    }
+    let dest = files_dir.join(
+        std::path::Path::new(filename)
+            .file_name()
+            .ok_or_else(|| Error::Ingestion(format!("'{filename}' is not a file name")))?,
+    );
+    std::fs::write(&dest, data)?;
 
     let table_name = sanitize_table_name(filename);
     let path = dest.to_string_lossy();

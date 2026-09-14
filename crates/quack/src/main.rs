@@ -1,6 +1,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod admin;
 mod print;
 mod terminal;
 
@@ -142,6 +143,27 @@ enum Commands {
         #[command(subcommand)]
         action: AuthAction,
     },
+
+    /// Server users: create one or list them
+    User {
+        #[command(subcommand)]
+        action: admin::UserAction,
+    },
+
+    /// API tokens scoped to a workspace: create, list, or revoke
+    Token {
+        #[command(subcommand)]
+        action: admin::TokenAction,
+    },
+
+    /// Workspace membership: add, remove, or list members
+    Member {
+        #[command(subcommand)]
+        action: admin::MemberAction,
+    },
+
+    /// Read the access audit log with filters
+    Audit(admin::AuditArgs),
 
     /// List ingested documents, or pin and unpin one
     Docs {
@@ -334,20 +356,23 @@ async fn main() -> Result<ExitCode> {
             run_auth(&config, action).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(
+            command @ (Commands::User { .. }
+            | Commands::Token { .. }
+            | Commands::Member { .. }
+            | Commands::Audit(_)),
+        ) => {
+            init_logging();
+            let config = Config::load().context("failed to load configuration")?;
+            run_admin(&config, cli.workspace.as_deref(), command).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Commands::Docs { pin, unpin, json }) => {
             init_logging();
             let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
             let ws_db = WorkspaceDb::open(&config, &workspace.id)
                 .context("failed to open workspace database")?;
-            if let Some(prefix) = pin.as_deref() {
-                let id = find_document(&ws_db, prefix)?;
-                ws_db.set_document_pinned(&id, true)?;
-            }
-            if let Some(prefix) = unpin.as_deref() {
-                let id = find_document(&ws_db, prefix)?;
-                ws_db.set_document_pinned(&id, false)?;
-            }
-            list_documents(&ws_db, json)?;
+            run_docs(&ws_db, pin.as_deref(), unpin.as_deref(), json)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -402,6 +427,22 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `quack user|token|member|audit`: server administration from the shell.
+async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) -> Result<()> {
+    match command {
+        Commands::User { action } => admin::run_user(config, action).await,
+        Commands::Token { action } => admin::run_token(config, workspace, action).await,
+        Commands::Member { action } => admin::run_member(config, workspace, action).await,
+        Commands::Audit(args) => admin::run_audit(config, args).await,
+        Commands::Sessions { .. }
+        | Commands::Export { .. }
+        | Commands::Ingest { .. }
+        | Commands::Context { .. }
+        | Commands::Auth { .. }
+        | Commands::Docs { .. } => Ok(()),
+    }
 }
 
 /// Exit 4 when the failure is an OAuth provider without a usable token:
@@ -628,7 +669,7 @@ fn resolve_session(
     let model = config
         .chat_model_ref()
         .map_or_else(|_| String::from("unconfigured"), |m| m.to_string());
-    Ok(sessions::create_session(db, &model, mode.unwrap_or_default())?.id)
+    Ok(sessions::create_session(db, &model, mode.unwrap_or_default(), None)?.id)
 }
 
 fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
@@ -717,6 +758,19 @@ fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+/// `quack docs [--pin ID] [--unpin ID]`: change pins, then list.
+fn run_docs(db: &WorkspaceDb, pin: Option<&str>, unpin: Option<&str>, json: bool) -> Result<()> {
+    if let Some(prefix) = pin {
+        let id = find_document(db, prefix)?;
+        db.set_document_pinned(&id, true)?;
+    }
+    if let Some(prefix) = unpin {
+        let id = find_document(db, prefix)?;
+        db.set_document_pinned(&id, false)?;
+    }
+    list_documents(db, json)
 }
 
 /// Resolve a full document id or a unique prefix.
@@ -892,15 +946,6 @@ async fn run_ingest(
     let (config, workspace, _) = resolve_workspace(workspace_name).await?;
 
     let (data, effective_filename) = read_input(file, filename_override)?;
-
-    let file_type = ingestion::parser::detect_file_type(&effective_filename);
-
-    if file_type.is_structured() {
-        let files_dir = config.workspace_files_dir(&workspace.id);
-        std::fs::create_dir_all(&files_dir).context("failed to create workspace files dir")?;
-        let dest = files_dir.join(&effective_filename);
-        std::fs::write(&dest, &data).context("failed to write file to workspace directory")?;
-    }
 
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;

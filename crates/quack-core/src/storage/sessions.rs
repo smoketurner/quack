@@ -83,6 +83,8 @@ pub struct SessionRow {
     pub title: Option<String>,
     pub mode: ChatMode,
     pub model: String,
+    /// The server user who started it; `None` from the CLI and TUI.
+    pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub message_count: i64,
@@ -104,7 +106,7 @@ const TITLE_CHARS: usize = 80;
 
 const SESSION_COLUMNS: &str = "s.id, s.title, s.mode, s.model, CAST(s.created_at AS VARCHAR), \
      CAST(s.updated_at AS VARCHAR), \
-     (SELECT count(*) FROM _quack_messages m WHERE m.session_id = s.id)";
+     (SELECT count(*) FROM _quack_messages m WHERE m.session_id = s.id), s.created_by";
 
 fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
     let mode: String = row.get(2)?;
@@ -116,19 +118,26 @@ fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
         message_count: row.get(6)?,
+        created_by: row.get(7)?,
     })
 }
 
-/// Start a new session for `model` (`provider/model`) in `mode`.
+/// Start a new session for `model` (`provider/model`) in `mode`, owned by
+/// `created_by` in server mode.
 ///
 /// # Errors
 ///
 /// Returns an error if the insert fails.
-pub fn create_session(db: &WorkspaceDb, model: &str, mode: ChatMode) -> Result<SessionRow> {
+pub fn create_session(
+    db: &WorkspaceDb,
+    model: &str,
+    mode: ChatMode,
+    created_by: Option<&str>,
+) -> Result<SessionRow> {
     let id = uuid::Uuid::now_v7().to_string();
     db.connection().execute(
-        "INSERT INTO _quack_sessions (id, model, mode) VALUES (?, ?, ?)",
-        duckdb::params![id, model, mode.as_str()],
+        "INSERT INTO _quack_sessions (id, model, mode, created_by) VALUES (?, ?, ?, ?)",
+        duckdb::params![id, model, mode.as_str(), created_by],
     )?;
     get_session(db, &id)?
         .ok_or_else(|| Error::Analysis(String::from("session vanished after insert")))
@@ -192,6 +201,42 @@ pub fn list_sessions(db: &WorkspaceDb, limit: u32) -> Result<Vec<SessionRow>> {
         out.push(session_from_row(row)?);
     }
     Ok(out)
+}
+
+/// Sessions a server user may see: their own, those marked shared, and
+/// those without an owner (started from the CLI or TUI). An owner sees all.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn list_sessions_for(
+    db: &WorkspaceDb,
+    limit: u32,
+    user_id: &str,
+    sees_all: bool,
+) -> Result<Vec<SessionRow>> {
+    if sees_all {
+        return list_sessions(db, limit);
+    }
+    let sql = format!(
+        "SELECT {SESSION_COLUMNS} FROM _quack_sessions s \
+         WHERE s.created_by IS NULL OR s.created_by = ? OR s.shared \
+         ORDER BY s.updated_at DESC, s.id DESC LIMIT ?"
+    );
+    let mut stmt = db.connection().prepare(&sql)?;
+    let mut rows = stmt.query(duckdb::params![user_id, i64::from(limit)])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(session_from_row(row)?);
+    }
+    Ok(out)
+}
+
+/// Whether `user_id` may read the session: its creator, or any user when it
+/// is shared or ownerless. Owners bypass this with `sees_all`.
+#[must_use]
+pub fn visible_to(session: &SessionRow, user_id: &str, sees_all: bool) -> bool {
+    sees_all || session.created_by.as_deref().is_none_or(|c| c == user_id)
 }
 
 /// Append one message and return its sequence number.
@@ -530,10 +575,36 @@ mod tests {
     }
 
     #[test]
+    fn created_by_filters_the_listing_unless_the_viewer_sees_all() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let mine = create_session(&db, "m", ChatMode::Chat, Some("u1"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let theirs = create_session(&db, "m", ChatMode::Chat, Some("u2"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let cli =
+            create_session(&db, "m", ChatMode::Chat, None).unwrap_or_else(|e| fail(&e.to_string()));
+        let visible = list_sessions_for(&db, 10, "u1", false);
+        assert!(visible.is_ok_and(|v| {
+            v.iter()
+                .map(|s| s.id.as_str())
+                .eq([cli.id.as_str(), mine.id.as_str()])
+        }));
+        assert!(list_sessions_for(&db, 10, "u1", true).is_ok_and(|v| v.len() == 3));
+        assert!(visible_to(&mine, "u1", false) && !visible_to(&theirs, "u1", false));
+        assert!(visible_to(&theirs, "u1", true) && visible_to(&cli, "u1", false));
+        assert_eq!(mine.created_by.as_deref(), Some("u1"));
+    }
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn record_turn_writes_user_tool_and_assistant_in_order_and_titles_session() {
         let db = db();
-        let session = create_session(&db, "ollama/llama3", ChatMode::Chat).unwrap();
+        let session = create_session(&db, "ollama/llama3", ChatMode::Chat, None).unwrap();
         assert!(session.title.is_none());
         assert_eq!(session.message_count, 0);
         assert_eq!(session.mode, ChatMode::Chat);
@@ -584,8 +655,8 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn latest_session_is_the_most_recently_updated() {
         let db = db();
-        let first = create_session(&db, "m", ChatMode::Query).unwrap();
-        let second = create_session(&db, "m", ChatMode::Query).unwrap();
+        let first = create_session(&db, "m", ChatMode::Query, None).unwrap();
+        let second = create_session(&db, "m", ChatMode::Query, None).unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, second.id);
         record_turn(&db, &first.id, "q", &response("a", vec![])).unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, first.id);
@@ -603,7 +674,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn history_skips_tool_messages_and_trims_oldest_first() {
         let db = db();
-        let session = create_session(&db, "m", ChatMode::Query).unwrap();
+        let session = create_session(&db, "m", ChatMode::Query, None).unwrap();
         record_turn(
             &db,
             &session.id,
@@ -634,7 +705,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn export_sql_pairs_questions_with_statements() {
         let db = db();
-        let session = create_session(&db, "m", ChatMode::Query).unwrap();
+        let session = create_session(&db, "m", ChatMode::Query, None).unwrap();
         record_turn(
             &db,
             &session.id,
@@ -663,8 +734,8 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn delete_if_empty_removes_only_sessions_without_messages() {
         let db = db();
-        let empty = create_session(&db, "m", ChatMode::Query).unwrap();
-        let used = create_session(&db, "m", ChatMode::Query).unwrap();
+        let empty = create_session(&db, "m", ChatMode::Query, None).unwrap();
+        let used = create_session(&db, "m", ChatMode::Query, None).unwrap();
         record_turn(&db, &used.id, "q", &response("a", vec![])).unwrap();
         assert!(delete_if_empty(&db, &empty.id).unwrap());
         assert!(!delete_if_empty(&db, &used.id).unwrap());
@@ -676,7 +747,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn export_markdown_has_headings_steps_and_answers() {
         let db = db();
-        let session = create_session(&db, "ollama/llama3", ChatMode::Chat).unwrap();
+        let session = create_session(&db, "ollama/llama3", ChatMode::Chat, None).unwrap();
         record_turn(
             &db,
             &session.id,

@@ -10,6 +10,17 @@ pub enum SchemaVersion {
 }
 
 #[derive(Iden)]
+pub enum Users {
+    Table,
+    Id,
+    Username,
+    PasswordHash,
+    OidcSubject,
+    IsAdmin,
+    CreatedAt,
+}
+
+#[derive(Iden)]
 pub enum Workspaces {
     Table,
     Id,
@@ -36,8 +47,10 @@ pub enum ApiTokens {
     WorkspaceId,
     UserId,
     Name,
+    Scopes,
     CreatedAt,
     ExpiresAt,
+    LastUsedAt,
 }
 
 /// Access audit: who accessed what, when, how, and whether it was allowed.

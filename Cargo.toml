@@ -40,6 +40,7 @@ publish      = false
 [workspace.dependencies]
 anyhow               = { version = "=1.0.104", default-features = false }
 apple-native-keyring-store = { version = "=1.0.2", default-features = false }
+argon2               = { version = "=0.6.0", default-features = false }
 askama               = { version = "=0.16.1", default-features = false }
 aws-lc-rs            = { version = "=1.18.1", default-features = false }
 axum                 = { version = "=0.8.9", default-features = false }

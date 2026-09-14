@@ -714,7 +714,7 @@ impl App {
                 .ok()
                 .flatten()
                 .map_or(ChatMode::Chat, |s| s.mode);
-            sessions::create_session(&db, &self.provider_display, mode)
+            sessions::create_session(&db, &self.provider_display, mode, None)
         };
         match created {
             Ok(session) => {
@@ -1106,17 +1106,6 @@ async fn run_ingest_inner(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_owned();
-
-    let file_type = ingestion::parser::detect_file_type(&filename);
-
-    if file_type.is_structured() {
-        let files_dir = config.workspace_files_dir(workspace_id);
-        std::fs::create_dir_all(&files_dir)
-            .map_err(|e| anyhow::anyhow!("failed to create workspace files dir: {e}"))?;
-        let dest = files_dir.join(&filename);
-        std::fs::write(&dest, &data)
-            .map_err(|e| anyhow::anyhow!("failed to copy file to workspace: {e}"))?;
-    }
 
     let ws_db = WorkspaceDb::open(config, workspace_id)
         .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;

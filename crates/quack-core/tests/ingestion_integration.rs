@@ -5,7 +5,7 @@ use std::path::Path;
 
 use quack_core::config::{
     AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, IngestionConfig,
-    ProviderConfig, ProviderType, RetrievalConfig,
+    ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
@@ -72,10 +72,12 @@ fn test_config(data_dir: &Path) -> Config {
             chunk_overlap_tokens: 10,
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
+            upload_max_mb: 512,
         },
         retrieval: RetrievalConfig::default(),
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
+        server: ServerConfig::default(),
     }
 }
 
@@ -92,6 +94,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         retrieval: RetrievalConfig::default(),
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
+        server: ServerConfig::default(),
     }
 }
 
@@ -835,18 +838,18 @@ fn legacy_unprefixed_tables_are_renamed_on_open() {
 }
 
 #[tokio::test]
-async fn control_db_migrates_to_v2_and_drops_content_tables() {
+async fn control_db_migrates_to_the_latest_version_and_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let control = quack_core::storage::control::ControlPlane::open(&config)
         .await
         .unwrap();
-    assert_eq!(control.schema_version().await.unwrap(), 2);
+    assert_eq!(control.schema_version().await.unwrap(), 3);
     // Reopening is a no-op.
     let again = quack_core::storage::control::ControlPlane::open(&config)
         .await
         .unwrap();
-    assert_eq!(again.schema_version().await.unwrap(), 2);
+    assert_eq!(again.schema_version().await.unwrap(), 3);
 }
 
 // ---------------------------------------------------------------------------

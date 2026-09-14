@@ -328,6 +328,13 @@ impl WorkspaceDb {
                 metadata JSON,
                 created_at TIMESTAMP DEFAULT now(),
                 UNIQUE (session_id, seq)
+            );
+            CREATE TABLE IF NOT EXISTS _quack_audit (
+                id TEXT PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT now(),
+                user_id TEXT,
+                action TEXT NOT NULL,
+                detail JSON
             );"
         );
         self.conn.execute_batch(&sql)?;
@@ -485,17 +492,79 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Update a document's status.
+    /// Update a document's status and clear any earlier error.
     ///
     /// # Errors
     ///
     /// Returns an error if the update fails.
     pub fn update_document_status(&self, id: &str, status: &str) -> crate::error::Result<()> {
         self.conn.execute(
-            "UPDATE _quack_documents SET status = ? WHERE id = ?",
+            "UPDATE _quack_documents SET status = ?, error_message = NULL WHERE id = ?",
             duckdb::params![status, id],
         )?;
         Ok(())
+    }
+
+    /// Mark a document as failed with the reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn mark_document_error(&self, id: &str, message: &str) -> crate::error::Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET status = 'error', error_message = ? WHERE id = ?",
+            duckdb::params![message, id],
+        )?;
+        Ok(())
+    }
+
+    /// One document by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn document(&self, id: &str) -> crate::error::Result<Option<DocumentInfo>> {
+        let sql = format!("{DOCUMENT_SELECT} WHERE id = ?");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(document_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a document with its chunks and term index. When it was loaded
+    /// as a table, the table (named by `table_name`) is dropped too. Returns
+    /// whether the document existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any delete fails.
+    pub fn delete_document(
+        &self,
+        id: &str,
+        table_name: Option<&str>,
+    ) -> crate::error::Result<bool> {
+        let Some(_doc) = self.document(id)? else {
+            return Ok(false);
+        };
+        self.conn.execute(
+            "DELETE FROM _quack_terms WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
+            duckdb::params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM _quack_chunks WHERE document_id = ?",
+            duckdb::params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM _quack_documents WHERE id = ?",
+            duckdb::params![id],
+        )?;
+        if let Some(table) = table_name {
+            self.conn
+                .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
+        }
+        Ok(true)
     }
 
     /// Insert a text chunk, optionally with an embedding vector, and index
@@ -933,20 +1002,12 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn list_documents(&self) -> crate::error::Result<Vec<DocumentInfo>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, filename, mime_type, size_bytes, status, COALESCE(pinned, false) FROM _quack_documents ORDER BY ingested_at DESC",
-        )?;
+        let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC");
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut docs = Vec::new();
         while let Some(row) = rows.next()? {
-            docs.push(DocumentInfo {
-                id: row.get(0)?,
-                filename: row.get(1)?,
-                mime_type: row.get(2)?,
-                size_bytes: row.get(3)?,
-                status: row.get(4)?,
-                pinned: row.get(5)?,
-            });
+            docs.push(document_from_row(row)?);
         }
         Ok(docs)
     }
@@ -974,14 +1035,33 @@ pub struct TableDescription {
 }
 
 /// Document metadata row.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DocumentInfo {
     pub id: String,
     pub filename: String,
     pub mime_type: Option<String>,
     pub size_bytes: Option<i64>,
+    /// `queued`, `processing`, `ready`, or `error`.
     pub status: String,
+    pub error_message: Option<String>,
     pub pinned: bool,
+    pub ingested_at: String,
+}
+
+const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
+     COALESCE(pinned, false), CAST(ingested_at AS VARCHAR) FROM _quack_documents";
+
+fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
+    Ok(DocumentInfo {
+        id: row.get(0)?,
+        filename: row.get(1)?,
+        mime_type: row.get(2)?,
+        size_bytes: row.get(3)?,
+        status: row.get(4)?,
+        error_message: row.get(5)?,
+        pinned: row.get(6)?,
+        ingested_at: row.get(7)?,
+    })
 }
 
 /// A chunk to store.

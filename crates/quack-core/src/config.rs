@@ -16,6 +16,7 @@ pub struct Config {
     pub retrieval: RetrievalConfig,
     pub context: ContextConfig,
     pub analysis: AnalysisConfig,
+    pub server: ServerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +142,8 @@ pub struct IngestionConfig {
     pub chunk_overlap_tokens: u32,
     pub embedding_batch_size: u32,
     pub tokenizer_encoding: String,
+    /// Largest upload the server accepts, in megabytes.
+    pub upload_max_mb: u32,
 }
 
 impl Default for IngestionConfig {
@@ -150,6 +153,29 @@ impl Default for IngestionConfig {
             chunk_overlap_tokens: 64,
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
+            upload_max_mb: 512,
+        }
+    }
+}
+
+/// `quack serve` settings (design doc 12 and 13).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Listen address. Override: `QUACK_BIND`.
+    pub bind: String,
+    /// No authentication, one implicit user, loopback only.
+    pub local: bool,
+    /// Concurrent ingest workers per workspace.
+    pub workers_per_workspace: u32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: String::from("127.0.0.1:8080"),
+            local: false,
+            workers_per_workspace: 1,
         }
     }
 }
@@ -275,6 +301,9 @@ impl Config {
         }
         if let Ok(model) = std::env::var("QUACK_MODEL") {
             config.general.chat_model = Some(model);
+        }
+        if let Ok(bind) = std::env::var("QUACK_BIND") {
+            config.server.bind = bind;
         }
 
         config.validate()?;
@@ -495,6 +524,17 @@ always_retrieve = true
         assert_eq!(config.analysis.threads, 4);
         assert_eq!(config.analysis.max_turns, 10);
         assert_eq!(config.analysis.history_token_budget, 32_000);
+        assert_eq!(config.ingestion.upload_max_mb, 512);
+        assert_eq!(config.server.bind, "127.0.0.1:8080");
+        assert!(!config.server.local);
+        assert_eq!(config.server.workers_per_workspace, 1);
+    }
+
+    #[test]
+    fn server_section_parses_and_rejects_unknown_keys() {
+        let ok = Config::parse("[server]\nbind = \"0.0.0.0:9000\"\nlocal = true\n");
+        assert!(ok.is_ok_and(|c| c.server.bind == "0.0.0.0:9000" && c.server.local));
+        assert!(err_of("[server]\nport = 1\n").contains("port"));
     }
 
     #[test]

@@ -37,6 +37,9 @@ cargo run --bin quack -- ingest policy.pdf --pin                      # full tex
 cargo run --bin quack -- -p "what is excluded?" --mode query          # sources only, cited [n]
 cargo run --bin quack -- context edit                                 # definitions the agent follows
 cargo run --bin quack -- auth login azure                             # OAuth sign-in for a provider
+cargo run --bin quack -- user add alice --admin                       # server users, tokens, members, audit
+cargo run --bin quack -- token create -w myworkspace --user alice --name ci --scopes read,write
+cargo run --bin quack -- audit --outcome denied --csv
 ```
 
 The workspace context is the owner's instructions for the agent: persona, what columns
