@@ -27,7 +27,7 @@
             {% for st in m.steps %}<li><span class="font-semibold">{{ st.tool }}</span> {{ st.detail }} <span class="text-slate-500">→ {{ st.summary }}, {{ st.duration_ms }} ms</span></li>{% endfor %}
           </ol></details>
         {% endif %}
-        <div class="mt-2 whitespace-pre-wrap">{{ m.content }}</div>
+        <div class="answer mt-2{% if m.role == "user" %} whitespace-pre-wrap{% endif %}">{{ m.content_html|safe }}</div>
         {% if let Some(chart) = m.chart_json %}<div class="chart mt-3 h-72" data-chart="{{ chart }}"></div>{% endif %}
         {% if !m.citations.is_empty() %}
         <ol class="mt-3 space-y-1 text-sm text-slate-600">

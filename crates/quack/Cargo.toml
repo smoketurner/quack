@@ -27,6 +27,7 @@ futures            = { workspace = true, features = ["std"] }
 jiff               = { workspace = true, features = ["std"] }
 mimalloc           = { workspace = true, features = ["secure"] }
 mime_guess         = { workspace = true }
+pulldown-cmark     = { workspace = true, features = ["html"] }
 ratatui            = { workspace = true, features = ["crossterm"] }
 ratatui-textarea   = { workspace = true, features = ["crossterm"] }
 rust-embed         = { workspace = true, features = ["deterministic-timestamps"] }

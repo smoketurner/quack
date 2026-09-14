@@ -3,6 +3,8 @@
 //! the streamed chat (design doc 11.1). Everything a page does, the API can
 //! do; the handlers here only shape the response as HTML.
 
+pub(crate) mod markdown;
+
 use askama::Template;
 use axum::Form;
 use axum::Router;
@@ -159,7 +161,8 @@ struct WorkspacesPage {
 
 struct MessageView {
     role: String,
-    content: String,
+    /// Rendered HTML for assistant answers; escaped text for user messages.
+    content_html: String,
     steps: Vec<StepView>,
     citations: Vec<CitationView>,
     chart_json: Option<String>,
@@ -559,9 +562,16 @@ fn message_view(row: &sessions::MessageRow) -> Option<MessageView> {
         .get("chart")
         .filter(|c| !c.is_null())
         .map(ToString::to_string);
+    let content_html = if row.role == MessageRole::Assistant {
+        markdown::to_html(&row.content)
+    } else {
+        askama::filters::escape(&row.content, askama::filters::Html)
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+    };
     Some(MessageView {
         role: role.to_owned(),
-        content: row.content.clone(),
+        content_html,
         steps,
         citations,
         chart_json,

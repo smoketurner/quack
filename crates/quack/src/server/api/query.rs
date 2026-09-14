@@ -285,9 +285,19 @@ pub(crate) async fn stream(
                         Some(&response),
                     )
                     .await;
+                    // The web page swaps this in for the streamed plain text.
+                    let mut payload = response_json(&response, &session_id);
+                    if let serde_json::Value::Object(map) = &mut payload {
+                        map.insert(
+                            String::from("answer_html"),
+                            serde_json::Value::String(crate::server::web::markdown::to_html(
+                                &response.content,
+                            )),
+                        );
+                    }
                     Event::default()
                         .event("complete")
-                        .json_data(response_json(&response, &session_id))
+                        .json_data(payload)
                         .unwrap_or_default()
                 }
                 AgentEvent::Failed(message) => {

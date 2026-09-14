@@ -58,7 +58,7 @@
     var steps = el("ol", "mt-1 space-y-1 font-mono text-xs");
     details.appendChild(steps);
     article.appendChild(details);
-    var body = el("div", "mt-2 whitespace-pre-wrap");
+    var body = el("div", "answer mt-2 whitespace-pre-wrap");
     article.appendChild(body);
     var working = el("div", "mt-2 flex items-center gap-2 text-sm text-slate-500");
     var dot = el("span", "inline-block h-2.5 w-2.5 animate-pulse rounded-full bg-blue-600");
@@ -201,7 +201,13 @@
       }
     } else if (event === "complete") {
       var r = JSON.parse(data);
-      view.body.textContent = r.answer;
+      if (r.answer_html) {
+        // Rendered server-side from the Markdown, with raw HTML escaped.
+        view.body.classList.remove("whitespace-pre-wrap");
+        view.body.innerHTML = r.answer_html;
+      } else {
+        view.body.textContent = r.answer;
+      }
       if (r.chart) {
         var c = el("div", "chart mt-3 h-72");
         view.article.appendChild(c);
