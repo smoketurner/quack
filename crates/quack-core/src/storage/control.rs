@@ -50,25 +50,46 @@ impl ControlPlane {
             .execute(&self.pool)
             .await?;
 
-        let statements = super::migrations::v1_statements();
-        for sql in &statements {
-            sqlx::query(AssertSqlSafe(sql.as_str()))
+        // schema_version itself is created by v1, so bootstrap it first.
+        let bootstrap = super::migrations::v1_statements();
+        if let Some(create_schema_version) = bootstrap.first() {
+            sqlx::query(AssertSqlSafe(create_schema_version.as_str()))
                 .execute(&self.pool)
                 .await?;
         }
 
-        let version_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM schema_version WHERE version = 1)")
-                .fetch_one(&self.pool)
-                .await?;
+        let current = self.schema_version().await?;
 
-        if !version_exists {
-            sqlx::query("INSERT INTO schema_version (version) VALUES (1)")
+        for (version, statements) in super::migrations::versions() {
+            if version <= current {
+                continue;
+            }
+            for sql in &statements {
+                sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .execute(&self.pool)
+                    .await?;
+            }
+            sqlx::query("INSERT INTO schema_version (version) VALUES (?)")
+                .bind(version)
                 .execute(&self.pool)
                 .await?;
+            tracing::info!(version, "applied control.db migration");
         }
 
         Ok(())
+    }
+
+    /// Highest applied schema version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn schema_version(&self) -> crate::error::Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     /// Look up a workspace by name.

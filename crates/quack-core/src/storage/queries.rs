@@ -40,34 +40,21 @@ pub enum ApiTokens {
     ExpiresAt,
 }
 
-#[derive(Iden)]
-pub enum Threads {
-    Table,
-    Id,
-    WorkspaceId,
-    Title,
-    CreatedBy,
-    CreatedAt,
-}
-
-#[derive(Iden)]
-pub enum Messages {
-    Table,
-    Id,
-    ThreadId,
-    Role,
-    Content,
-    Metadata,
-    CreatedAt,
-}
-
+/// Access audit: who accessed what, when, how, and whether it was allowed.
+/// Never holds content; detail lives inside the workspace (design doc 5.5).
 #[derive(Iden)]
 pub enum AuditLog {
     Table,
     Id,
     Timestamp,
-    WorkspaceId,
     UserId,
+    TokenHash,
+    WorkspaceId,
     Action,
-    Detail,
+    ResourceType,
+    ResourceId,
+    Outcome,
+    Channel,
+    ClientAddr,
+    RequestId,
 }

@@ -7,7 +7,17 @@ use crate::config::Config;
 
 /// Tables quack manages inside a workspace database. Hidden from the agent's
 /// table listing and refused in agent SQL.
-pub const INTERNAL_TABLES: &[&str] = &["documents", "chunks"];
+pub const INTERNAL_TABLES: &[&str] = &["_quack_meta", "_quack_documents", "_quack_chunks"];
+
+/// Every internal table carries this prefix; anything starting with it is hidden.
+pub const INTERNAL_PREFIX: &str = "_quack_";
+
+/// Schema version of the internal tables, recorded in `_quack_meta`.
+const WORKSPACE_SCHEMA_VERSION: &str = "1";
+
+/// Width used when no embedding provider is configured and the workspace has
+/// not recorded one yet.
+const DEFAULT_EMBEDDING_DIMENSION: u32 = 1024;
 
 /// What a SQL statement would do if executed, decided by the `DuckDB` parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,9 +81,9 @@ impl WorkspaceDb {
 
     /// Open (or create) the `DuckDB` database for a workspace.
     ///
-    /// Loads the vss extension and creates the internal schema tables
-    /// (documents, chunks) if they do not exist. The `embedding_dimension`
-    /// sets the fixed-size `FLOAT[N]` column width for vector storage.
+    /// Loads the vss extension, creates the `_quack_` internal tables if they
+    /// do not exist, and reconciles the embedding dimension recorded in
+    /// `_quack_meta` with the configured provider.
     ///
     /// # Errors
     ///
@@ -87,20 +97,29 @@ impl WorkspaceDb {
         let files_dir = config.workspace_files_dir(workspace_id);
         std::fs::create_dir_all(&files_dir)?;
 
-        let embedding_dimension = config
-            .find_embedding_provider()
-            .and_then(|(_, p)| p.embedding_dimension)
-            .unwrap_or(1024);
+        let provider = config.find_embedding_provider().map(|(_, p)| p);
+        let configured_dimension = provider.and_then(|p| p.embedding_dimension);
+        let configured_model = provider.and_then(|p| p.embedding_model.as_deref());
 
         let conn = duckdb::Connection::open(&db_path)?;
 
-        let db = Self {
+        let mut db = Self {
             conn,
-            embedding_dimension,
+            embedding_dimension: configured_dimension.unwrap_or(DEFAULT_EMBEDDING_DIMENSION),
             query_timeout: Duration::from_secs(u64::from(config.analysis.query_timeout_seconds)),
         };
         db.apply_resource_limits(config)?;
         db.load_vss();
+        db.rename_legacy_tables()?;
+        db.reconcile_embedding_dimension(configured_dimension, configured_model)
+            .or_else(|e| match e {
+                // A brand-new workspace has no meta table yet; create it first.
+                crate::error::Error::DuckDb(_) => {
+                    db.create_internal_tables()?;
+                    db.reconcile_embedding_dimension(configured_dimension, configured_model)
+                }
+                other => Err(other),
+            })?;
         db.create_internal_tables()?;
         Ok(db)
     }
@@ -201,9 +220,7 @@ impl WorkspaceDb {
     /// Returns an error if the classification query fails.
     pub fn references_internal_table(&self, sql: &str) -> crate::error::Result<bool> {
         match self.referenced_base_tables(sql)? {
-            Some(names) => Ok(names
-                .iter()
-                .any(|n| INTERNAL_TABLES.iter().any(|t| t.eq_ignore_ascii_case(n)))),
+            Some(names) => Ok(names.iter().any(|n| is_internal_name(n))),
             None => Ok(mentions_internal_table_token(sql)),
         }
     }
@@ -218,9 +235,14 @@ impl WorkspaceDb {
     }
 
     fn create_internal_tables(&self) -> crate::error::Result<()> {
+        self.rename_legacy_tables()?;
         let dim = self.embedding_dimension;
         let sql = format!(
-            "CREATE TABLE IF NOT EXISTS documents (
+            "CREATE TABLE IF NOT EXISTS _quack_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS _quack_documents (
                 id TEXT PRIMARY KEY,
                 filename TEXT NOT NULL,
                 mime_type TEXT,
@@ -229,7 +251,7 @@ impl WorkspaceDb {
                 status TEXT DEFAULT 'pending',
                 error_message TEXT
             );
-            CREATE TABLE IF NOT EXISTS chunks (
+            CREATE TABLE IF NOT EXISTS _quack_chunks (
                 id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
@@ -239,6 +261,126 @@ impl WorkspaceDb {
             );"
         );
         self.conn.execute_batch(&sql)?;
+        self.set_meta("schema_version", WORKSPACE_SCHEMA_VERSION)?;
+        self.set_meta("embedding_dimension", &dim.to_string())?;
+        Ok(())
+    }
+
+    /// Workspaces created before the `_quack_` prefix keep their data.
+    fn rename_legacy_tables(&self) -> crate::error::Result<()> {
+        for (old, new) in [
+            ("documents", "_quack_documents"),
+            ("chunks", "_quack_chunks"),
+        ] {
+            let old_exists = self.table_exists(old)?;
+            let new_exists = self.table_exists(new)?;
+            if old_exists && !new_exists {
+                self.conn
+                    .execute(&format!("ALTER TABLE {old} RENAME TO {new}"), [])?;
+                tracing::info!(old, new, "renamed legacy internal table");
+            }
+        }
+        Ok(())
+    }
+
+    fn table_exists(&self, name: &str) -> crate::error::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+            duckdb::params![name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Read a `_quack_meta` value, if the table and key exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn meta(&self, key: &str) -> crate::error::Result<Option<String>> {
+        if !self.table_exists("_quack_meta")? {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM _quack_meta WHERE key = ?")?;
+        let mut rows = stmt.query(duckdb::params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn set_meta(&self, key: &str, value: &str) -> crate::error::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _quack_meta (key, value) VALUES (?, ?)",
+            duckdb::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The embedding width this workspace stores.
+    #[must_use]
+    pub fn embedding_dimension(&self) -> u32 {
+        self.embedding_dimension
+    }
+
+    /// Reconcile the configured embedding dimension with what the workspace
+    /// recorded. A fresh or empty workspace adopts the configured value; a
+    /// workspace that already holds embeddings of a different width is an
+    /// error, never a silent mismatch.
+    fn reconcile_embedding_dimension(
+        &mut self,
+        configured: Option<u32>,
+        configured_model: Option<&str>,
+    ) -> crate::error::Result<()> {
+        let recorded = self
+            .meta("embedding_dimension")?
+            .and_then(|v| v.parse::<u32>().ok());
+        let recorded_model = self.meta("embedding_model")?;
+
+        match (recorded, configured) {
+            (Some(rec), Some(conf)) if rec != conf => {
+                let stored_chunks: i64 = self.conn.query_row(
+                    "SELECT count(*) FROM _quack_chunks WHERE embedding IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if stored_chunks > 0 {
+                    return Err(crate::error::Error::Config(format!(
+                        "workspace embeddings are {rec}-dimensional ({}) but the configured \
+                         provider produces {conf}-dimensional ({}) vectors; re-ingest the \
+                         documents or switch back to the original embedding model",
+                        recorded_model.as_deref().unwrap_or("unknown model"),
+                        configured_model.unwrap_or("unknown model"),
+                    )));
+                }
+                tracing::info!(
+                    from = rec,
+                    to = conf,
+                    "no embeddings stored; adopting the configured embedding dimension"
+                );
+                self.conn.execute_batch(&format!(
+                    "DROP TABLE _quack_chunks;
+                     CREATE TABLE _quack_chunks (
+                        id TEXT PRIMARY KEY,
+                        document_id TEXT NOT NULL,
+                        chunk_index INTEGER NOT NULL,
+                        content TEXT NOT NULL,
+                        embedding FLOAT[{conf}],
+                        token_count INTEGER
+                    );"
+                ))?;
+                self.embedding_dimension = conf;
+            }
+            (Some(rec), None) => self.embedding_dimension = rec,
+            (None, Some(conf)) => self.embedding_dimension = conf,
+            (Some(_), Some(_)) | (None, None) => {}
+        }
+        self.set_meta("embedding_dimension", &self.embedding_dimension.to_string())?;
+        if let Some(model) = configured_model {
+            self.set_meta("embedding_model", model)?;
+        }
         Ok(())
     }
 
@@ -259,7 +401,7 @@ impl WorkspaceDb {
             .map_err(|_| crate::error::Error::Ingestion("file size overflow".into()))?;
 
         self.conn.execute(
-            "INSERT INTO documents (id, filename, mime_type, size_bytes, status) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO _quack_documents (id, filename, mime_type, size_bytes, status) VALUES (?, ?, ?, ?, ?)",
             duckdb::params![id, filename, mime_type, size, status],
         )?;
         Ok(())
@@ -272,7 +414,7 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn update_document_status(&self, id: &str, status: &str) -> crate::error::Result<()> {
         self.conn.execute(
-            "UPDATE documents SET status = ? WHERE id = ?",
+            "UPDATE _quack_documents SET status = ? WHERE id = ?",
             duckdb::params![status, id],
         )?;
         Ok(())
@@ -296,7 +438,7 @@ impl WorkspaceDb {
                 let emb_str = format_embedding(emb);
                 let dim = self.embedding_dimension;
                 let sql = format!(
-                    "INSERT INTO chunks (id, document_id, chunk_index, content, embedding) \
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, embedding) \
                      VALUES (?, ?, ?, ?, {emb_str}::FLOAT[{dim}])"
                 );
                 self.conn
@@ -304,7 +446,7 @@ impl WorkspaceDb {
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO chunks (id, document_id, chunk_index, content) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content) VALUES (?, ?, ?, ?)",
                     duckdb::params![id, document_id, chunk_index, content],
                 )?;
             }
@@ -326,7 +468,7 @@ impl WorkspaceDb {
         let emb_str = format_embedding(embedding);
         let dim = self.embedding_dimension;
         let sql = format!(
-            "UPDATE chunks SET embedding = {emb_str}::FLOAT[{dim}] \
+            "UPDATE _quack_chunks SET embedding = {emb_str}::FLOAT[{dim}] \
              WHERE document_id = ? AND chunk_index = ?"
         );
         self.conn
@@ -347,11 +489,11 @@ impl WorkspaceDb {
             .execute("SET hnsw_enable_experimental_persistence = true", [])?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS chunks_embedding_idx \
-             ON chunks USING HNSW (embedding) \
+             ON _quack_chunks USING HNSW (embedding) \
              WITH (metric = 'cosine')",
             [],
         )?;
-        tracing::info!("created HNSW cosine index on chunks.embedding");
+        tracing::info!("created HNSW cosine index on _quack_chunks.embedding");
         Ok(())
     }
 
@@ -380,8 +522,8 @@ impl WorkspaceDb {
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, \
                     array_cosine_distance(c.embedding, {emb_str}::FLOAT[{dim}]) AS distance \
-             FROM chunks c \
-             JOIN documents d ON d.id = c.document_id \
+             FROM _quack_chunks c \
+             JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL{filter} \
              ORDER BY distance ASC \
              LIMIT {top_k}"
@@ -498,10 +640,7 @@ impl WorkspaceDb {
         let mut tables = Vec::new();
         while let Some(row) = rows.next()? {
             let name: String = row.get(0)?;
-            if !INTERNAL_TABLES
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case(&name))
-            {
+            if !is_internal_name(&name) {
                 tables.push(name);
             }
         }
@@ -542,7 +681,7 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn list_documents(&self) -> crate::error::Result<Vec<DocumentInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, filename, mime_type, size_bytes, status FROM documents ORDER BY ingested_at DESC",
+            "SELECT id, filename, mime_type, size_bytes, status FROM _quack_documents ORDER BY ingested_at DESC",
         )?;
         let mut rows = stmt.query([])?;
         let mut docs = Vec::new();
@@ -658,9 +797,13 @@ fn collect_table_names(node: &serde_json::Value, out: &mut Vec<String>) {
 }
 
 /// Conservative token scan used for statements the parser will not serialize.
+fn is_internal_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(INTERNAL_PREFIX)
+}
+
 fn mentions_internal_table_token(sql: &str) -> bool {
     sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .any(|tok| INTERNAL_TABLES.iter().any(|t| t.eq_ignore_ascii_case(tok)))
+        .any(is_internal_name)
 }
 
 fn format_embedding(embedding: &[f32]) -> String {

@@ -118,7 +118,7 @@ async fn ingest_text_without_embeddings() {
     assert!(result.table_name.is_none());
 
     let qr = db
-        .execute_query("SELECT COUNT(*) AS cnt FROM chunks")
+        .execute_query("SELECT COUNT(*) AS cnt FROM _quack_chunks")
         .unwrap();
     let count = qr.rows.first().unwrap().first().unwrap();
     assert_ne!(count, &serde_json::Value::Number(0.into()));
@@ -150,7 +150,7 @@ async fn ingest_text_with_mock_embeddings() {
     assert!(result.chunks_stored > 0);
 
     let qr = db
-        .execute_query("SELECT COUNT(*) AS cnt FROM chunks WHERE embedding IS NOT NULL")
+        .execute_query("SELECT COUNT(*) AS cnt FROM _quack_chunks WHERE embedding IS NOT NULL")
         .unwrap();
     let count = qr.rows.first().unwrap().first().unwrap();
     assert_ne!(count, &serde_json::Value::Number(0.into()));
@@ -314,14 +314,14 @@ fn workspace_db_document_crud() {
         .unwrap();
 
     let qr = db
-        .execute_query("SELECT id, filename, status FROM documents WHERE id = 'doc-1'")
+        .execute_query("SELECT id, filename, status FROM _quack_documents WHERE id = 'doc-1'")
         .unwrap();
     assert_eq!(qr.rows.len(), 1);
 
     db.update_document_status("doc-1", "ready").unwrap();
 
     let qr = db
-        .execute_query("SELECT status FROM documents WHERE id = 'doc-1'")
+        .execute_query("SELECT status FROM _quack_documents WHERE id = 'doc-1'")
         .unwrap();
     let status = qr.rows.first().unwrap().first().unwrap();
     assert_eq!(status, &serde_json::Value::String("ready".into()));
@@ -341,7 +341,7 @@ fn workspace_db_chunk_without_embedding() {
         .unwrap();
 
     let qr = db
-        .execute_query("SELECT id, content FROM chunks WHERE id = 'c1'")
+        .execute_query("SELECT id, content FROM _quack_chunks WHERE id = 'c1'")
         .unwrap();
     assert_eq!(qr.rows.len(), 1);
     let content = qr.rows.first().unwrap().get(1).unwrap();
@@ -363,7 +363,7 @@ fn workspace_db_chunk_with_embedding() {
         .unwrap();
 
     let qr = db
-        .execute_query("SELECT content FROM chunks WHERE embedding IS NOT NULL")
+        .execute_query("SELECT content FROM _quack_chunks WHERE embedding IS NOT NULL")
         .unwrap();
     assert_eq!(qr.rows.len(), 1);
 }
@@ -383,7 +383,9 @@ fn workspace_db_update_chunk_embedding() {
 
     // Embedding should be NULL initially
     let qr = db
-        .execute_query("SELECT COUNT(*) AS cnt FROM chunks WHERE id = 'c1' AND embedding IS NULL")
+        .execute_query(
+            "SELECT COUNT(*) AS cnt FROM _quack_chunks WHERE id = 'c1' AND embedding IS NULL",
+        )
         .unwrap();
     let count = qr.rows.first().unwrap().first().unwrap();
     assert_eq!(count, &serde_json::Value::Number(1.into()));
@@ -395,7 +397,7 @@ fn workspace_db_update_chunk_embedding() {
     // Embedding should now be non-NULL
     let qr = db
         .execute_query(
-            "SELECT COUNT(*) AS cnt FROM chunks WHERE id = 'c1' AND embedding IS NOT NULL",
+            "SELECT COUNT(*) AS cnt FROM _quack_chunks WHERE id = 'c1' AND embedding IS NOT NULL",
         )
         .unwrap();
     let count = qr.rows.first().unwrap().first().unwrap();
@@ -587,29 +589,39 @@ fn internal_tables_are_detected_in_parsed_and_unparsed_statements() {
     let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
     db.execute_statement("CREATE TABLE sales(a INT)").unwrap();
     assert!(
-        db.references_internal_table("SELECT * FROM chunks")
+        db.references_internal_table("SELECT * FROM _quack_chunks")
             .unwrap()
     );
     assert!(
-        db.references_internal_table("SELECT content FROM main.\"Chunks\" c")
+        db.references_internal_table("SELECT content FROM main.\"_Quack_Chunks\" c")
             .unwrap()
     );
     assert!(
-        db.references_internal_table("SELECT * FROM sales JOIN documents d ON true")
+        db.references_internal_table("SELECT * FROM sales JOIN _quack_documents d ON true")
             .unwrap()
     );
-    assert!(db.references_internal_table("DESCRIBE documents").unwrap());
-    assert!(db.references_internal_table("DROP TABLE chunks").unwrap());
+    assert!(
+        db.references_internal_table("DESCRIBE _quack_documents")
+            .unwrap()
+    );
+    assert!(
+        db.references_internal_table("DROP TABLE _quack_chunks")
+            .unwrap()
+    );
     assert!(!db.references_internal_table("SELECT * FROM sales").unwrap());
     assert!(
-        !db.references_internal_table("SELECT 'documents' AS label")
+        !db.references_internal_table("SELECT '_quack_documents' AS label")
+            .unwrap()
+    );
+    assert!(
+        !db.references_internal_table("SELECT * FROM documents")
             .unwrap()
     );
     assert!(
         !db.list_tables()
             .unwrap()
             .iter()
-            .any(|t| t == "chunks" || t == "documents")
+            .any(|t| t.starts_with("_quack_"))
     );
 }
 
@@ -655,4 +667,128 @@ fn open_applies_memory_and_thread_limits() {
         "memory_limit was {mem}"
     );
     assert_eq!(row.last().unwrap().to_string().trim_matches('"'), "2");
+}
+
+// ---------------------------------------------------------------------------
+// Workspace meta, dimension reconciliation, legacy rename (#9)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn open_records_schema_version_and_embedding_meta() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("1"));
+    assert_eq!(
+        db.meta("embedding_dimension").unwrap().as_deref(),
+        Some("4")
+    );
+    assert_eq!(
+        db.meta("embedding_model").unwrap().as_deref(),
+        Some("mock-model")
+    );
+    assert_eq!(db.embedding_dimension(), TEST_DIM_U32);
+    assert!(db.list_tables().unwrap().is_empty());
+}
+
+#[test]
+fn reopen_without_provider_keeps_recorded_dimension() {
+    let dir = tempfile::tempdir().unwrap();
+    let with = test_config(dir.path());
+    drop(WorkspaceDb::open(&with, "ws-dim").unwrap());
+
+    let without = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&without, "ws-dim").unwrap();
+    assert_eq!(db.embedding_dimension(), TEST_DIM_U32);
+}
+
+#[test]
+fn dimension_change_with_stored_embeddings_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    {
+        let db = WorkspaceDb::open(&config, "ws-mismatch").unwrap();
+        db.insert_document("d", "a.txt", "text/plain", 1, "ready")
+            .unwrap();
+        db.insert_chunk("c", "d", 0, "x", Some(&[1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+    }
+    let mut changed = test_config(dir.path());
+    if let Some(p) = changed.providers.get_mut("mock") {
+        p.embedding_dimension = Some(8);
+        p.embedding_model = Some("other-model".into());
+    }
+    let err = WorkspaceDb::open(&changed, "ws-mismatch").err().unwrap();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("4-dimensional") && msg.contains("8-dimensional"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("mock-model") && msg.contains("other-model"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn dimension_change_without_embeddings_adopts_new_width() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    {
+        let db = WorkspaceDb::open(&config, "ws-adopt").unwrap();
+        db.insert_document("d", "a.txt", "text/plain", 1, "ready")
+            .unwrap();
+        db.insert_chunk("c", "d", 0, "x", None).unwrap();
+    }
+    let mut changed = test_config(dir.path());
+    if let Some(p) = changed.providers.get_mut("mock") {
+        p.embedding_dimension = Some(8);
+    }
+    let db = WorkspaceDb::open(&changed, "ws-adopt").unwrap();
+    assert_eq!(db.embedding_dimension(), 8);
+    assert_eq!(
+        db.meta("embedding_dimension").unwrap().as_deref(),
+        Some("8")
+    );
+    db.insert_chunk("c2", "d", 1, "y", Some(&[0.5; 8])).unwrap();
+}
+
+#[test]
+fn legacy_unprefixed_tables_are_renamed_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let path = config.workspace_db_path("ws-legacy");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    {
+        let conn = duckdb::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (id TEXT PRIMARY KEY, filename TEXT NOT NULL, mime_type TEXT, \
+             size_bytes BIGINT, ingested_at TIMESTAMP DEFAULT now(), status TEXT DEFAULT 'pending', \
+             error_message TEXT);
+             CREATE TABLE chunks (id TEXT PRIMARY KEY, document_id TEXT NOT NULL, chunk_index INTEGER \
+             NOT NULL, content TEXT NOT NULL, embedding FLOAT[4], token_count INTEGER);
+             INSERT INTO documents (id, filename) VALUES ('old', 'old.txt');",
+        )
+        .unwrap();
+    }
+    let db = WorkspaceDb::open(&config, "ws-legacy").unwrap();
+    let docs = db.list_documents().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs.first().unwrap().filename, "old.txt");
+    assert!(db.list_tables().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn control_db_migrates_to_v2_and_drops_content_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let control = quack_core::storage::control::ControlPlane::open(&config)
+        .await
+        .unwrap();
+    assert_eq!(control.schema_version().await.unwrap(), 2);
+    // Reopening is a no-op.
+    let again = quack_core::storage::control::ControlPlane::open(&config)
+        .await
+        .unwrap();
+    assert_eq!(again.schema_version().await.unwrap(), 2);
 }
