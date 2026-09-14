@@ -12,7 +12,7 @@ use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::llm;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
-use quack_core::storage::sessions;
+use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::WorkspaceDb;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -68,6 +68,11 @@ struct Cli {
     #[arg(short = 'r', long, value_name = "SESSION_ID")]
     resume: Option<String>,
 
+    /// Answer mode: chat may use general knowledge; query answers only from
+    /// retrieved chunks and query results
+    #[arg(long, value_enum, global = true)]
+    mode: Option<ModeArg>,
+
     /// Print full tool inputs and outputs to stderr in print mode
     #[arg(long, global = true)]
     verbose: bool,
@@ -115,7 +120,41 @@ enum Commands {
         /// Skip embedding generation
         #[arg(long)]
         no_embed: bool,
+
+        /// Pin the document: its full text goes into every prompt
+        #[arg(long)]
+        pin: bool,
     },
+
+    /// List ingested documents, or pin and unpin one
+    Docs {
+        /// Pin a document by id (prefixes accepted)
+        #[arg(long, value_name = "DOCUMENT_ID", conflicts_with = "unpin")]
+        pin: Option<String>,
+
+        /// Unpin a document by id (prefixes accepted)
+        #[arg(long, value_name = "DOCUMENT_ID")]
+        unpin: Option<String>,
+
+        /// Emit one JSON object per document
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModeArg {
+    Chat,
+    Query,
+}
+
+impl From<ModeArg> for ChatMode {
+    fn from(mode: ModeArg) -> Self {
+        match mode {
+            ModeArg::Chat => Self::Chat,
+            ModeArg::Query => Self::Query,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -197,6 +236,7 @@ async fn main() -> Result<ExitCode> {
             file,
             filename,
             no_embed,
+            pin,
         }) => {
             init_logging();
             run_ingest(
@@ -204,8 +244,25 @@ async fn main() -> Result<ExitCode> {
                 cli.workspace.as_deref(),
                 filename.as_deref(),
                 no_embed,
+                pin,
             )
             .await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::Docs { pin, unpin, json }) => {
+            init_logging();
+            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+            let ws_db = WorkspaceDb::open(&config, &workspace.id)
+                .context("failed to open workspace database")?;
+            if let Some(prefix) = pin.as_deref() {
+                let id = find_document(&ws_db, prefix)?;
+                ws_db.set_document_pinned(&id, true)?;
+            }
+            if let Some(prefix) = unpin.as_deref() {
+                let id = find_document(&ws_db, prefix)?;
+                ws_db.set_document_pinned(&id, false)?;
+            }
+            list_documents(&ws_db, json)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -225,7 +282,13 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    let session_id = resolve_session(&config, &ws_db, cli.continue_latest, cli.resume.as_deref())?;
+    let session_id = resolve_session(
+        &config,
+        &ws_db,
+        cli.continue_latest,
+        cli.resume.as_deref(),
+        cli.mode.map(ChatMode::from),
+    )?;
     let db: SharedDb = Arc::new(Mutex::new(ws_db));
     let outcome = print::run_prompt(
         &config,
@@ -262,7 +325,13 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     let (config, workspace, ws_name) = resolve_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    let session_id = resolve_session(&config, &ws_db, cli.continue_latest, cli.resume.as_deref())?;
+    let session_id = resolve_session(
+        &config,
+        &ws_db,
+        cli.continue_latest,
+        cli.resume.as_deref(),
+        cli.mode.map(ChatMode::from),
+    )?;
     terminal::run(
         config,
         ws_name,
@@ -276,22 +345,83 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
 
 /// Pick the session for this run: the latest with `--continue`, a specific
 /// one with `--resume`, otherwise a new one for the configured chat model.
+/// `--mode` sets the mode on a new session and overrides it on a resumed one.
 fn resolve_session(
     config: &Config,
     db: &WorkspaceDb,
     continue_latest: bool,
     resume: Option<&str>,
+    mode: Option<ChatMode>,
 ) -> Result<String> {
-    if let Some(prefix) = resume {
-        return find_session(db, prefix).map(|s| s.id);
-    }
-    if continue_latest && let Some(latest) = sessions::latest_session(db)? {
-        return Ok(latest.id);
+    let existing = if let Some(prefix) = resume {
+        Some(find_session(db, prefix)?.id)
+    } else if continue_latest {
+        sessions::latest_session(db)?.map(|s| s.id)
+    } else {
+        None
+    };
+    if let Some(id) = existing {
+        if let Some(mode) = mode {
+            sessions::set_session_mode(db, &id, mode)?;
+        }
+        return Ok(id);
     }
     let model = config
         .chat_model_ref()
         .map_or_else(|_| String::from("unconfigured"), |m| m.to_string());
-    Ok(sessions::create_session(db, &model)?.id)
+    Ok(sessions::create_session(db, &model, mode.unwrap_or_default())?.id)
+}
+
+/// Resolve a full document id or a unique prefix.
+fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<String> {
+    let matches: Vec<String> = db
+        .list_documents()?
+        .into_iter()
+        .filter(|d| d.id.starts_with(prefix))
+        .map(|d| d.id)
+        .collect();
+    match matches.len() {
+        0 => anyhow::bail!("no document matches '{prefix}'; run `quack docs`"),
+        1 => matches.into_iter().next().context("document vanished"),
+        n => anyhow::bail!("'{prefix}' matches {n} documents; use more of the id"),
+    }
+}
+
+fn list_documents(db: &WorkspaceDb, json: bool) -> Result<()> {
+    let docs = db.list_documents()?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    if json {
+        for doc in &docs {
+            serde_json::to_writer(
+                &mut out,
+                &serde_json::json!({
+                    "id": doc.id,
+                    "filename": doc.filename,
+                    "mime_type": doc.mime_type,
+                    "size_bytes": doc.size_bytes,
+                    "status": doc.status,
+                    "pinned": doc.pinned,
+                }),
+            )?;
+            writeln!(out)?;
+        }
+    } else if docs.is_empty() {
+        writeln!(out, "No documents yet.")?;
+    } else {
+        for doc in &docs {
+            writeln!(
+                out,
+                "{}  {:<10}  {}  {}",
+                doc.id,
+                doc.status,
+                if doc.pinned { "pinned  " } else { "        " },
+                doc.filename
+            )?;
+        }
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// Resolve a full id or a unique prefix to a session.
@@ -410,6 +540,7 @@ async fn run_ingest(
     workspace_name: Option<&str>,
     filename_override: Option<&str>,
     no_embed: bool,
+    pin: bool,
 ) -> Result<()> {
     let (config, workspace, _) = resolve_workspace(workspace_name).await?;
 
@@ -447,9 +578,16 @@ async fn run_ingest(
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
+    if pin {
+        ws_db.set_document_pinned(&result.document_id, true)?;
+    }
+
     writeln!(out, "Ingested: {}", result.filename)?;
     writeln!(out, "  Type: {}", result.file_type)?;
     writeln!(out, "  Document ID: {}", result.document_id)?;
+    if pin {
+        writeln!(out, "  Pinned: yes")?;
+    }
 
     if let Some(table) = &result.table_name {
         writeln!(out, "  Table: {table}")?;

@@ -1,0 +1,208 @@
+//! Citations: the chunks a turn retrieved, numbered `[n]`, and the check
+//! that the answer only cites chunks it actually saw.
+
+use std::sync::{Arc, Mutex};
+
+use crate::storage::workspace::ChunkSearchResult;
+
+/// One retrievable source the model may cite by its marker.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Citation {
+    pub n: u32,
+    pub chunk_id: String,
+    pub document_id: String,
+    pub filename: String,
+    pub chunk_index: u32,
+    pub page: Option<u32>,
+    pub heading: Option<String>,
+}
+
+impl Citation {
+    /// `filename, page 12, under "Exclusions"` for footers and status lines.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let page = self
+            .page
+            .map_or_else(String::new, |p| format!(", page {p}"));
+        let heading = self
+            .heading
+            .as_deref()
+            .map_or_else(String::new, |h| format!(", under \"{h}\""));
+        format!("{}{page}{heading}", self.filename)
+    }
+}
+
+/// Chunks retrieved during one turn, numbered in the order they were shown
+/// to the model. Shared between the search tool and the agent loop.
+#[derive(Debug, Clone, Default)]
+pub struct CitationRegistry {
+    inner: Arc<Mutex<Vec<Citation>>>,
+}
+
+impl CitationRegistry {
+    /// Assign markers to `hits` continuing from the last one and return the
+    /// first marker number.
+    #[must_use]
+    pub fn register(&self, hits: &[ChunkSearchResult]) -> u32 {
+        let Ok(mut all) = self.inner.lock() else {
+            return 1;
+        };
+        let first = u32::try_from(all.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        for (i, hit) in hits.iter().enumerate() {
+            let n = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+            all.push(Citation {
+                n,
+                chunk_id: hit.id.clone(),
+                document_id: hit.document_id.clone(),
+                filename: hit.filename.clone(),
+                chunk_index: hit.chunk_index,
+                page: hit.page,
+                heading: hit.heading.clone(),
+            });
+        }
+        first
+    }
+
+    #[must_use]
+    pub fn all(&self) -> Vec<Citation> {
+        self.inner.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+}
+
+/// Keep the `[n]` markers that name a registered chunk, strip the rest, and
+/// return the cited chunks in order of first use with markers renumbered
+/// from 1 so the footer reads naturally.
+#[must_use]
+pub fn validate(answer: &str, registered: &[Citation]) -> (String, Vec<Citation>) {
+    let mut out = String::with_capacity(answer.len());
+    let mut cited: Vec<Citation> = Vec::new();
+
+    // Walk the text as `text[marker]text[marker]...`. Every '[' starts a
+    // candidate; only `[digits]` naming a registered chunk is a marker.
+    let mut pieces = answer.split('[');
+    if let Some(first) = pieces.next() {
+        out.push_str(first);
+    }
+    for piece in pieces {
+        let Some((inside, after)) = piece.split_once(']') else {
+            out.push('[');
+            out.push_str(piece);
+            continue;
+        };
+        let digits = inside.trim();
+        let parsed = if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            None
+        } else {
+            digits.parse::<u32>().ok()
+        };
+        match parsed.and_then(|n| registered.iter().find(|c| c.n == n)) {
+            Some(source) => {
+                let renumbered =
+                    if let Some(pos) = cited.iter().position(|c| c.chunk_id == source.chunk_id) {
+                        u32::try_from(pos).unwrap_or(u32::MAX).saturating_add(1)
+                    } else {
+                        let next = u32::try_from(cited.len())
+                            .unwrap_or(u32::MAX)
+                            .saturating_add(1);
+                        let mut c = source.clone();
+                        c.n = next;
+                        cited.push(c);
+                        next
+                    };
+                out.push('[');
+                out.push_str(&renumbered.to_string());
+                out.push(']');
+            }
+            None if parsed.is_some() => {
+                // A marker the model invented: dropped.
+            }
+            None => {
+                out.push('[');
+                out.push_str(inside);
+                out.push(']');
+            }
+        }
+        out.push_str(after);
+    }
+    (out, cited)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(id: &str, file: &str, idx: u32) -> ChunkSearchResult {
+        ChunkSearchResult {
+            id: id.to_owned(),
+            content: String::new(),
+            document_id: format!("doc-{file}"),
+            chunk_index: idx,
+            filename: file.to_owned(),
+            heading: None,
+            page: Some(idx.saturating_add(1)),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn markers_continue_across_searches() {
+        let registry = CitationRegistry::default();
+        assert_eq!(
+            registry.register(&[hit("a", "p.pdf", 0), hit("b", "p.pdf", 1)]),
+            1
+        );
+        assert_eq!(registry.register(&[hit("c", "q.md", 0)]), 3);
+        let all = registry.all();
+        assert_eq!(all.iter().map(|c| c.n).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(all.last().map(|c| c.chunk_id.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn validate_keeps_known_markers_renumbered_and_drops_unknown() {
+        let registry = CitationRegistry::default();
+        let first = registry.register(&[
+            hit("a", "p.pdf", 0),
+            hit("b", "p.pdf", 1),
+            hit("c", "q.md", 0),
+        ]);
+        assert_eq!(first, 1);
+        let (text, cited) = validate(
+            "Flood is excluded [3]. Claims close in 30 days [1][3]. See also [7] and [x] and [ 2 ].",
+            &registry.all(),
+        );
+        assert_eq!(
+            text,
+            "Flood is excluded [1]. Claims close in 30 days [2][1]. See also  and [x] and [3]."
+        );
+        assert_eq!(
+            cited
+                .iter()
+                .map(|c| (c.n, c.chunk_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "c"), (2, "a"), (3, "b")]
+        );
+    }
+
+    #[test]
+    fn validate_leaves_text_without_markers_alone() {
+        let (text, cited) = validate("no citations [here", &[]);
+        assert_eq!(text, "no citations [here");
+        assert!(cited.is_empty());
+    }
+
+    #[test]
+    fn label_includes_page_and_heading_when_present() {
+        let c = Citation {
+            n: 1,
+            chunk_id: String::from("a"),
+            document_id: String::from("d"),
+            filename: String::from("policy.pdf"),
+            chunk_index: 0,
+            page: Some(12),
+            heading: Some(String::from("Exclusions")),
+        };
+        assert_eq!(c.label(), "policy.pdf, page 12, under \"Exclusions\"");
+    }
+}

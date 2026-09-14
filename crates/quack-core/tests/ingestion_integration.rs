@@ -9,7 +9,7 @@ use quack_core::config::{
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
-use quack_core::storage::workspace::{StatementKind, WorkspaceDb};
+use quack_core::storage::workspace::{NewChunk, StatementKind, WorkspaceDb};
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
 const TEST_DIM: usize = 4;
@@ -341,8 +341,16 @@ fn workspace_db_chunk_without_embedding() {
     db.insert_document("doc-1", "test.txt", "text/plain", 100, "ready")
         .unwrap();
 
-    db.insert_chunk("c1", "doc-1", 0, "hello world", None)
-        .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c1",
+        document_id: "doc-1",
+        chunk_index: 0,
+        content: "hello world",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
 
     let qr = db
         .execute_query("SELECT id, content FROM _quack_chunks WHERE id = 'c1'")
@@ -363,8 +371,16 @@ fn workspace_db_chunk_with_embedding() {
         .unwrap();
 
     let embedding = [0.5_f32, 0.3, -0.2, 0.8];
-    db.insert_chunk("c1", "doc-1", 0, "embedded chunk", Some(&embedding))
-        .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c1",
+        document_id: "doc-1",
+        chunk_index: 0,
+        content: "embedded chunk",
+        heading: None,
+        page: None,
+        embedding: Some(&embedding),
+    })
+    .unwrap();
 
     let qr = db
         .execute_query("SELECT content FROM _quack_chunks WHERE embedding IS NOT NULL")
@@ -382,8 +398,16 @@ fn workspace_db_update_chunk_embedding() {
     db.insert_document("doc-1", "test.txt", "text/plain", 100, "ready")
         .unwrap();
 
-    db.insert_chunk("c1", "doc-1", 0, "hello world", None)
-        .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c1",
+        document_id: "doc-1",
+        chunk_index: 0,
+        content: "hello world",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
 
     // Embedding should be NULL initially
     let qr = db
@@ -436,21 +460,25 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
         .unwrap();
     db.insert_document("doc-b", "faq.md", "text/markdown", 10, "ready")
         .unwrap();
-    db.insert_chunk(
-        "a0",
-        "doc-a",
-        0,
-        "flood exclusion",
-        Some(&[1.0, 0.0, 0.0, 0.0]),
-    )
+    db.insert_chunk(&NewChunk {
+        id: "a0",
+        document_id: "doc-a",
+        chunk_index: 0,
+        content: "flood exclusion",
+        heading: None,
+        page: None,
+        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+    })
     .unwrap();
-    db.insert_chunk(
-        "b0",
-        "doc-b",
-        0,
-        "claims timeline",
-        Some(&[0.9, 0.1, 0.0, 0.0]),
-    )
+    db.insert_chunk(&NewChunk {
+        id: "b0",
+        document_id: "doc-b",
+        chunk_index: 0,
+        content: "claims timeline",
+        heading: None,
+        page: None,
+        embedding: Some(&[0.9, 0.1, 0.0, 0.0]),
+    })
     .unwrap();
 
     let query = [1.0_f32, 0.0, 0.0, 0.0];
@@ -493,18 +521,36 @@ fn workspace_db_search_similar_chunks() {
     db.insert_document("doc-1", "test.txt", "text/plain", 100, "ready")
         .unwrap();
 
-    db.insert_chunk("c1", "doc-1", 0, "first chunk", Some(&[1.0, 0.0, 0.0, 0.0]))
-        .unwrap();
-    db.insert_chunk(
-        "c2",
-        "doc-1",
-        1,
-        "second chunk",
-        Some(&[0.0, 1.0, 0.0, 0.0]),
-    )
+    db.insert_chunk(&NewChunk {
+        id: "c1",
+        document_id: "doc-1",
+        chunk_index: 0,
+        content: "first chunk",
+        heading: None,
+        page: None,
+        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+    })
     .unwrap();
-    db.insert_chunk("c3", "doc-1", 2, "third chunk", Some(&[0.7, 0.7, 0.0, 0.0]))
-        .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c2",
+        document_id: "doc-1",
+        chunk_index: 1,
+        content: "second chunk",
+        heading: None,
+        page: None,
+        embedding: Some(&[0.0, 1.0, 0.0, 0.0]),
+    })
+    .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c3",
+        document_id: "doc-1",
+        chunk_index: 2,
+        content: "third chunk",
+        heading: None,
+        page: None,
+        embedding: Some(&[0.7, 0.7, 0.0, 0.0]),
+    })
+    .unwrap();
 
     let query = [1.0_f32, 0.0, 0.0, 0.0];
     match db.search_similar_chunks(&query, 3, &[]) {
@@ -682,7 +728,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("2"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("3"));
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("4")
@@ -714,8 +760,16 @@ fn dimension_change_with_stored_embeddings_is_an_error() {
         let db = WorkspaceDb::open(&config, "ws-mismatch").unwrap();
         db.insert_document("d", "a.txt", "text/plain", 1, "ready")
             .unwrap();
-        db.insert_chunk("c", "d", 0, "x", Some(&[1.0, 0.0, 0.0, 0.0]))
-            .unwrap();
+        db.insert_chunk(&NewChunk {
+            id: "c",
+            document_id: "d",
+            chunk_index: 0,
+            content: "x",
+            heading: None,
+            page: None,
+            embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+        })
+        .unwrap();
     }
     let mut changed = test_config(dir.path());
     if let Some(p) = changed.providers.get_mut("mock") {
@@ -742,7 +796,16 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         let db = WorkspaceDb::open(&config, "ws-adopt").unwrap();
         db.insert_document("d", "a.txt", "text/plain", 1, "ready")
             .unwrap();
-        db.insert_chunk("c", "d", 0, "x", None).unwrap();
+        db.insert_chunk(&NewChunk {
+            id: "c",
+            document_id: "d",
+            chunk_index: 0,
+            content: "x",
+            heading: None,
+            page: None,
+            embedding: None,
+        })
+        .unwrap();
     }
     let mut changed = test_config(dir.path());
     if let Some(p) = changed.providers.get_mut("mock") {
@@ -754,7 +817,16 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("8")
     );
-    db.insert_chunk("c2", "d", 1, "y", Some(&[0.5; 8])).unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c2",
+        document_id: "d",
+        chunk_index: 1,
+        content: "y",
+        heading: None,
+        page: None,
+        embedding: Some(&[0.5; 8]),
+    })
+    .unwrap();
 }
 
 #[test]
@@ -845,4 +917,157 @@ fn describe_table_handles_quoted_identifier() {
         err.to_string().contains("does not exist") || err.to_string().contains("Catalog"),
         "{err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid retrieval, chunk metadata, pinning (#15)
+// ---------------------------------------------------------------------------
+
+fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
+    let db = WorkspaceDb::open(config, ws).unwrap();
+    db.insert_document("doc-a", "policy.pdf", "application/pdf", 10, "ready")
+        .unwrap();
+    db.insert_document("doc-b", "faq.md", "text/markdown", 10, "ready")
+        .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "a0",
+        document_id: "doc-a",
+        chunk_index: 0,
+        content: "Flood damage is excluded from coverage.",
+        heading: Some("Exclusions"),
+        page: Some(12),
+        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+    })
+    .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "b0",
+        document_id: "doc-b",
+        chunk_index: 0,
+        content: "Policy POL-8841 renews every March.",
+        heading: None,
+        page: None,
+        embedding: Some(&[0.0, 1.0, 0.0, 0.0]),
+    })
+    .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "b1",
+        document_id: "doc-b",
+        chunk_index: 1,
+        content: "Claims close within thirty days of filing.",
+        heading: Some("Claims"),
+        page: None,
+        embedding: Some(&[0.0, 0.0, 1.0, 0.0]),
+    })
+    .unwrap();
+    db.rebuild_fts_index().unwrap();
+    db
+}
+
+#[test]
+fn chunk_metadata_round_trips_through_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = seeded_for_search(&config, "ws-meta-search");
+    let hits = db
+        .search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 1, &[])
+        .unwrap();
+    let top = hits.first().unwrap();
+    assert_eq!(top.id, "a0");
+    assert_eq!(top.heading.as_deref(), Some("Exclusions"));
+    assert_eq!(top.page, Some(12));
+    assert!(top.score > 0.99, "{}", top.score);
+}
+
+#[test]
+fn keyword_search_finds_exact_tokens_the_vector_misses() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = seeded_for_search(&config, "ws-keyword");
+    let hits = db.search_keyword_chunks("POL-8841", 5, &[]).unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b0"]
+    );
+    let none = db.search_keyword_chunks("zebra", 5, &[]).unwrap();
+    assert!(none.is_empty());
+    let filtered = db
+        .search_keyword_chunks("flood", 5, &[String::from("doc-b")])
+        .unwrap();
+    assert!(filtered.is_empty());
+}
+
+#[test]
+fn keyword_search_without_an_index_is_empty_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-noindex").unwrap();
+    assert!(
+        db.search_keyword_chunks("anything", 3, &[])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn hybrid_search_fuses_vector_and_keyword_rankings() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = seeded_for_search(&config, "ws-hybrid");
+    // Vector nearest is a0 (flood); the keyword "POL-8841" only matches b0.
+    let hits = db
+        .search_hybrid_chunks("POL-8841", &[1.0, 0.0, 0.0, 0.0], 3, 60, &[])
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids.len(), 3);
+    // b0 ranks first in keyword and second in vector, so it wins the fusion.
+    assert_eq!(ids.first().copied(), Some("b0"), "{ids:?}");
+    assert!(ids.contains(&"a0"));
+    let top_score = hits.first().unwrap().score;
+    assert!(hits.iter().all(|h| h.score <= top_score));
+
+    let limited = db
+        .search_hybrid_chunks("flood", &[1.0, 0.0, 0.0, 0.0], 1, 60, &[])
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited.first().unwrap().id, "a0");
+}
+
+#[tokio::test]
+async fn ingest_markdown_stores_headings_and_pinned_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-md-meta").unwrap();
+    let md = b"# Exclusions\n\nFlood is excluded.\n\n# Claims\n\nClose in thirty days.\n";
+    let result = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-md-meta",
+        "rules.md",
+        md,
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.chunks_stored, 2);
+    let rows = db
+        .execute_query("SELECT heading, page FROM _quack_chunks ORDER BY chunk_index")
+        .unwrap();
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(
+        rows.rows.first().unwrap().first().unwrap().as_str(),
+        Some("Exclusions")
+    );
+    assert!(rows.rows.first().unwrap().last().unwrap().is_null());
+    let hits = db.search_keyword_chunks("thirty", 5, &[]).unwrap();
+    assert_eq!(
+        hits.first().map(|h| h.heading.as_deref()),
+        Some(Some("Claims"))
+    );
+
+    let doc = db.list_documents().unwrap().into_iter().next().unwrap();
+    assert!(!doc.pinned);
+    db.set_document_pinned(&doc.id, true).unwrap();
+    let pinned = db.pinned_documents().unwrap();
+    assert_eq!(pinned.len(), 1);
+    assert!(pinned.first().unwrap().1.contains("Flood is excluded."));
 }

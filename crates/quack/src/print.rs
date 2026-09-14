@@ -44,6 +44,7 @@ pub(crate) async fn run_prompt(
     let mut err = stderr.lock();
     let mut out = stdout.lock();
     let mut streamed_any = false;
+    let mut streamed_text = String::new();
 
     while let Some(event) = events.recv().await {
         match event {
@@ -52,6 +53,7 @@ pub(crate) async fn run_prompt(
                     write!(out, "{text}")?;
                     out.flush()?;
                     streamed_any = true;
+                    streamed_text.push_str(&text);
                 }
             }
             AgentEvent::ToolStarted { tool, detail } => {
@@ -77,15 +79,29 @@ pub(crate) async fn run_prompt(
         PromptFormat::Text => {
             if !streamed_any {
                 write!(out, "{}", response.content)?;
+            } else if streamed_text != response.content {
+                // Citation validation renumbered or stripped markers after
+                // the text was already streamed; show the final form.
+                writeln!(out)?;
+                writeln!(out, "---")?;
+                write!(out, "{}", response.content)?;
             }
             if !response.content.ends_with('\n') {
                 writeln!(out)?;
+            }
+            if !response.citations.is_empty() {
+                writeln!(out)?;
+                writeln!(out, "Sources:")?;
+                for citation in &response.citations {
+                    writeln!(out, "  [{}] {}", citation.n, citation.label())?;
+                }
             }
         }
         PromptFormat::Json => {
             let object = serde_json::json!({
                 "answer": response.content,
                 "steps": response.steps,
+                "citations": response.citations,
                 "chart": response.chart_spec,
                 "write_refused": response.write_refused,
                 "session_id": session_id,

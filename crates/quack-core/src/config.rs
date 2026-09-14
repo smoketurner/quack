@@ -127,6 +127,10 @@ impl Default for IngestionConfig {
 pub struct RetrievalConfig {
     /// Default number of chunks returned by `search_documents`.
     pub top_k: u32,
+    /// Reciprocal rank fusion constant for merging vector and keyword ranks.
+    pub rrf_k: u32,
+    /// Approximate token budget for pinned documents injected into the prompt.
+    pub pinned_token_budget: u32,
     /// Also inject the top chunks for every user message via rig's
     /// `dynamic_context`, in addition to the `search_documents` tool.
     /// Off by default: retrieval should be a visible tool call the model
@@ -138,6 +142,8 @@ impl Default for RetrievalConfig {
     fn default() -> Self {
         Self {
             top_k: 8,
+            rrf_k: 60,
+            pinned_token_budget: 8000,
             always_retrieve: false,
         }
     }
@@ -412,6 +418,8 @@ always_retrieve = true
         assert!(config.general.chat_model.is_none());
         assert_eq!(config.ingestion.chunk_size_tokens, 512);
         assert_eq!(config.retrieval.top_k, 8);
+        assert_eq!(config.retrieval.rrf_k, 60);
+        assert_eq!(config.retrieval.pinned_token_budget, 8000);
         assert!(!config.retrieval.always_retrieve);
         assert_eq!(config.analysis.threads, 4);
         assert_eq!(config.analysis.max_turns, 10);

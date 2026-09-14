@@ -1289,14 +1289,13 @@ tenant; desktop app on each platform; air-gapped static binary with bundled exte
 Ordered by risk. Closed items are removed as they land; this list is the honest delta at
 the time of the last edit.
 
-1. **Vector-only retrieval, no citations.** No FTS index, no fusion, no page or heading
-   metadata on chunks, no citation validation. `search_documents` returns numbered chunks
-   with filename and distance, which is the seed for citations. Section 6.1.
+1. **No reranking hook, no SHA dedup, no `title` on documents.** Hybrid retrieval,
+   chunk metadata, citations, pinned documents, and chat/query modes are in. Section 6.1.
 2. **Context and audit detail tables do not exist yet.** Sessions and messages are
    stored and replayed; `_quack_context` lands with step 6 and `_quack_audit` with the
    server. Sections 5.3, 5.4, 12.
 3. **Document registry lacks** `sha256`, `source`, `pinned`, `title`. Section 5.4.
-4. **No workspace context, no chat modes.** Sections 5.3, 7.5.
+4. **No workspace context.** Section 5.3.
 5. **No stdin-as-data in print mode, no session sharing or `created_by`.** Sections 8,
    11.5. History replays user and assistant text only; tool payloads are not summarized
    into history yet.
@@ -1304,7 +1303,7 @@ the time of the last edit.
 7. **Chart spec is ECharts JSON** re-parsed by the TUI. Section 9.
 8. **No OAuth, no server, no MCP, no desktop window, no web UI.** `auth = "oauth"` parses
    and is rejected as unimplemented. Sections 10.2, 11, 12.
-9. **DOCX, HTML, PPTX, XLSX unsupported.** Sections 6.1, 6.2.
+9. **DOCX, HTML, PPTX, XLSX unsupported** (tracked as issue #16). Sections 6.1, 6.2.
 10. **`text_to_sql` tests are a placeholder.** Section 16.
 
 ---
@@ -1371,8 +1370,8 @@ deployment for document chat is the end of step 8.
    detail with the server.
 4. ~~Agent loop as an event stream; TUI streaming, inline steps, permission prompt, direct
    SQL; print mode with formats and exit codes.~~ Done.
-5. Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
-   documents, chat and query modes; DOCX, HTML, PPTX parsers.
+5. ~~Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
+   documents, chat and query modes.~~ Done. DOCX, HTML, PPTX, XLSX parsers are issue #16.
 6. Workspace context (stored, versioned, import/export) and the prompt rewrite; new chart
    spec and terminal renderer.
 7. OAuth: `TokenManager`, PKCE and device code, cache, `quack auth`.

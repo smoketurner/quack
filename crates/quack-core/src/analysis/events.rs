@@ -10,6 +10,7 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 use super::agent::AgentResponse;
+use super::citations::CitationRegistry;
 
 /// One tool invocation, recorded for the transcript and the final response.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -82,6 +83,7 @@ pub fn channel() -> (EventSink, EventStream) {
 pub struct TurnRecorder {
     sink: EventSink,
     steps: Arc<Mutex<Vec<ToolStep>>>,
+    citations: CitationRegistry,
 }
 
 impl TurnRecorder {
@@ -90,7 +92,14 @@ impl TurnRecorder {
         Self {
             sink,
             steps: Arc::new(Mutex::new(Vec::new())),
+            citations: CitationRegistry::default(),
         }
+    }
+
+    /// The chunks retrieved so far this turn, numbered for citing.
+    #[must_use]
+    pub fn citations(&self) -> &CitationRegistry {
+        &self.citations
     }
 
     pub fn emit(&self, event: AgentEvent) {

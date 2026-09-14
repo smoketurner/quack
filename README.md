@@ -33,7 +33,15 @@ cargo run --bin quack -- -w myworkspace                               # interact
 cargo run --bin quack -- -p "and by month?" -c                        # continue the latest session
 cargo run --bin quack -- sessions                                     # list sessions
 cargo run --bin quack -- export 01a0a0e1 --sql                        # replay a session's SQL
+cargo run --bin quack -- ingest policy.pdf --pin                      # full text in every prompt
+cargo run --bin quack -- -p "what is excluded?" --mode query          # sources only, cited [n]
 ```
+
+Document search is hybrid: vector similarity and BM25 keyword matching fused with reciprocal
+rank fusion, so exact tokens such as policy numbers are found. Chunks carry page and
+heading; answers cite `[n]` markers that are validated against what was retrieved and
+listed as sources. `--mode query` makes the agent answer only from retrieved chunks and
+query results.
 
 Every turn is recorded in the workspace's own database. `-c` continues the latest session,
 `-r ID` resumes one (id prefixes work), and `export` writes a session as a runnable `.sql`

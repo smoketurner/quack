@@ -133,3 +133,88 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+/// A chunk ready to store: its text, where it came from, and the text to
+/// embed (the heading prepended so retrieval sees the context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub content: String,
+    pub heading: Option<String>,
+    pub page: Option<u32>,
+}
+
+impl Chunk {
+    /// Text handed to the embedding model.
+    #[must_use]
+    pub fn embedding_input(&self) -> String {
+        match &self.heading {
+            Some(h) => format!("{h}\n\n{}", self.content),
+            None => self.content.clone(),
+        }
+    }
+}
+
+/// Chunk every section, carrying its heading and page onto each chunk.
+///
+/// # Errors
+///
+/// Returns an error if the encoding name is not recognized.
+pub fn chunk_sections(
+    sections: &[crate::ingestion::parser::Section],
+    chunk_size_tokens: u32,
+    overlap_tokens: u32,
+    encoding_name: &str,
+) -> Result<Vec<Chunk>> {
+    let mut out = Vec::new();
+    for section in sections {
+        for content in chunk_text(
+            &section.text,
+            chunk_size_tokens,
+            overlap_tokens,
+            encoding_name,
+        )? {
+            out.push(Chunk {
+                content,
+                heading: section.heading.clone(),
+                page: section.page,
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+    use crate::ingestion::parser::Section;
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn sections_keep_heading_and_page_on_every_chunk() {
+        let words: Vec<String> = (0..120).map(|i| format!("w{i}")).collect();
+        let sections = vec![
+            Section {
+                heading: Some(String::from("Exclusions")),
+                page: Some(3),
+                text: words.join(" "),
+            },
+            Section {
+                heading: None,
+                page: Some(4),
+                text: String::from("short"),
+            },
+        ];
+        let chunks = chunk_sections(&sections, 40, 5, "cl100k_base").unwrap();
+        assert!(chunks.len() > 2);
+        let last = chunks.last().unwrap();
+        assert_eq!(last.content, "short");
+        assert_eq!(last.page, Some(4));
+        assert!(last.heading.is_none());
+        for chunk in chunks.iter().take(chunks.len() - 1) {
+            assert_eq!(chunk.heading.as_deref(), Some("Exclusions"));
+            assert_eq!(chunk.page, Some(3));
+            assert!(chunk.embedding_input().starts_with("Exclusions\n\n"));
+        }
+        assert_eq!(last.embedding_input(), "short");
+    }
+}

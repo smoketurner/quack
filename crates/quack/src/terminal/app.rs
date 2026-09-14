@@ -12,7 +12,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion;
-use quack_core::storage::sessions::{self, MessageRole as StoredRole};
+use quack_core::storage::sessions::{self, ChatMode, MessageRole as StoredRole};
 use quack_core::storage::workspace::{WorkspaceDb, looks_like_direct_sql};
 
 use crate::terminal::chart::ChartData;
@@ -35,6 +35,9 @@ Commands:
   /sessions         List recent sessions
   /resume ID        Switch to a session (id prefix accepted) and replay it
   /new              Start a fresh session
+  /mode [chat|query] Show or set the answer mode (query = sources only)
+  /docs             List ingested documents
+  /pin ID, /unpin ID  Pin a document's full text into every prompt
   /clear            Clear messages and chart
   /workspace        Show current workspace and session
   /quit, /exit      Exit quack
@@ -201,6 +204,23 @@ impl App {
                     }
                     self.messages
                         .push(Message::new(MessageRole::Assistant, row.content));
+                    if let Some(citations) = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("citations"))
+                        .and_then(|c| {
+                            serde_json::from_value::<
+                                    Vec<quack_core::analysis::citations::Citation>,
+                                >(c.clone())
+                                .ok()
+                        })
+                        && !citations.is_empty()
+                    {
+                        self.messages.push(Message::new(
+                            MessageRole::System,
+                            sources_footer(&citations),
+                        ));
+                    }
                 }
                 StoredRole::Tool => {
                     let tool = row
@@ -338,9 +358,21 @@ impl App {
                 self.scroll_offset = 0;
             }
             AgentEvent::TurnComplete(response) => {
-                if !self.streaming_assistant && !response.content.trim().is_empty() {
+                if self.streaming_assistant
+                    && let Some(last) = self.messages.last_mut()
+                    && last.role == MessageRole::Assistant
+                {
+                    // Citation validation may have renumbered or stripped markers.
+                    last.content.clone_from(&response.content);
+                } else if !response.content.trim().is_empty() {
                     self.messages
                         .push(Message::new(MessageRole::Assistant, response.content));
+                }
+                if !response.citations.is_empty() {
+                    self.messages.push(Message::new(
+                        MessageRole::System,
+                        sources_footer(&response.citations),
+                    ));
                 }
                 if let Some(spec) = response.chart_spec {
                     self.current_chart = ChartData::from_echart_spec(&spec);
@@ -522,6 +554,10 @@ impl App {
             "/sessions" => self.show_sessions(),
             "/resume" => self.switch_session(args),
             "/new" => self.new_session(),
+            "/mode" => self.set_mode(args),
+            "/docs" => self.show_documents(),
+            "/pin" => self.set_pinned(args, true),
+            "/unpin" => self.set_pinned(args, false),
             "/tables" => self.run_direct_sql("SHOW TABLES"),
             "/sql" => {
                 if args.is_empty() {
@@ -652,7 +688,11 @@ impl App {
                     return;
                 }
             };
-            sessions::create_session(&db, &self.provider_display)
+            let mode = sessions::get_session(&db, &self.session_id)
+                .ok()
+                .flatten()
+                .map_or(ChatMode::Chat, |s| s.mode);
+            sessions::create_session(&db, &self.provider_display, mode)
         };
         match created {
             Ok(session) => {
@@ -670,6 +710,126 @@ impl App {
                 .push(Message::new(MessageRole::Error, format!("{e}"))),
         }
         self.scroll_offset = 0;
+    }
+
+    fn set_mode(&mut self, args: &str) {
+        let Ok(db) = self.db.lock() else {
+            self.messages
+                .push(Message::new(MessageRole::Error, "workspace lock poisoned"));
+            return;
+        };
+        if args.is_empty() {
+            let current = sessions::get_session(&db, &self.session_id)
+                .ok()
+                .flatten()
+                .map_or(ChatMode::Chat, |s| s.mode);
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!("Mode: {current}. Use /mode chat or /mode query to change it."),
+            ));
+            return;
+        }
+        let Some(mode) = ChatMode::parse(args) else {
+            self.messages.push(Message::new(
+                MessageRole::Error,
+                format!("unknown mode '{args}'; use chat or query"),
+            ));
+            return;
+        };
+        match sessions::set_session_mode(&db, &self.session_id, mode) {
+            Ok(()) => self.messages.push(Message::new(
+                MessageRole::System,
+                format!("Mode set to {mode} for this session."),
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+    }
+
+    fn show_documents(&mut self) {
+        let listing = match self.db.lock() {
+            Ok(db) => db.list_documents(),
+            Err(e) => {
+                self.messages.push(Message::new(
+                    MessageRole::Error,
+                    format!("workspace lock poisoned: {e}"),
+                ));
+                return;
+            }
+        };
+        match listing {
+            Ok(docs) if docs.is_empty() => self
+                .messages
+                .push(Message::new(MessageRole::System, "No documents yet.")),
+            Ok(docs) => {
+                let mut text = String::from("Documents:");
+                for doc in docs {
+                    let line = format!(
+                        "\n  {}  {:<10}  {}  {}",
+                        short_id(&doc.id),
+                        doc.status,
+                        if doc.pinned { "pinned" } else { "      " },
+                        doc.filename
+                    );
+                    text.push_str(&line);
+                }
+                text.push_str("\nUse /pin ID or /unpin ID.");
+                self.messages.push(Message::new(MessageRole::System, text));
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+    }
+
+    fn set_pinned(&mut self, prefix: &str, pinned: bool) {
+        if prefix.is_empty() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                if pinned {
+                    "Usage: /pin DOCUMENT_ID"
+                } else {
+                    "Usage: /unpin DOCUMENT_ID"
+                },
+            ));
+            return;
+        }
+        let outcome = match self.db.lock() {
+            Ok(db) => db.list_documents().and_then(|docs| {
+                let matches: Vec<String> = docs
+                    .into_iter()
+                    .filter(|d| d.id.starts_with(prefix))
+                    .map(|d| d.id)
+                    .collect();
+                match matches.as_slice() {
+                    [id] => db.set_document_pinned(id, pinned).map(|()| id.clone()),
+                    [] => Err(quack_core::error::Error::Ingestion(format!(
+                        "no document matches '{prefix}'"
+                    ))),
+                    many => Err(quack_core::error::Error::Ingestion(format!(
+                        "'{prefix}' matches {} documents; use more of the id",
+                        many.len()
+                    ))),
+                }
+            }),
+            Err(e) => Err(quack_core::error::Error::Analysis(format!(
+                "workspace lock poisoned: {e}"
+            ))),
+        };
+        match outcome {
+            Ok(id) => self.messages.push(Message::new(
+                MessageRole::System,
+                format!(
+                    "{} {}",
+                    if pinned { "Pinned" } else { "Unpinned" },
+                    short_id(&id)
+                ),
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
     }
 
     /// Drop the current session if nothing was ever recorded in it.
@@ -804,6 +964,14 @@ fn configure_textarea(textarea: &mut TextArea<'_>) {
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(Style::default().fg(Color::Reset).bg(Color::White));
     textarea.set_placeholder_text("Ask a question, or type SQL...");
+}
+
+fn sources_footer(citations: &[quack_core::analysis::citations::Citation]) -> String {
+    let lines: Vec<String> = citations
+        .iter()
+        .map(|c| format!("\n  [{}] {}", c.n, c.label()))
+        .collect();
+    format!("Sources:{}", lines.concat())
 }
 
 fn short_id(id: &str) -> String {

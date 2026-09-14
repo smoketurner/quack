@@ -55,6 +55,10 @@ Features prone to silent breakage — live-test before any PR that touches them:
 - Event stream ordering: every tool call emits started then finished; `-p` steps on stderr only
 - Session recording: user, one tool message per step, assistant, in that order; a failed
   first turn leaves no empty session behind
+- BM25 index rebuild after every document ingest (the fts index is a snapshot)
+- Citation validation: `[n]` markers not registered this turn are stripped; the rest are
+  renumbered from 1 and listed as sources
+- Pinned documents injected in full within `[retrieval].pinned_token_budget`
 - Citation validation (every `[n]` maps to a chunk retrieved in that turn)
 - Embedding dimension recorded per workspace and checked on open
 - DuckDB workspace isolation (each workspace gets its own database file)

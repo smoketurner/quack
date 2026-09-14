@@ -199,6 +199,7 @@ pub struct SearchDocumentsTool<M> {
     db: SharedDb,
     embedding_model: M,
     default_top_k: u32,
+    rrf_k: u32,
     recorder: TurnRecorder,
 }
 
@@ -207,12 +208,14 @@ impl<M> SearchDocumentsTool<M> {
         db: SharedDb,
         embedding_model: M,
         default_top_k: u32,
+        rrf_k: u32,
         recorder: TurnRecorder,
     ) -> Self {
         Self {
             db,
             embedding_model,
             default_top_k,
+            rrf_k,
             recorder,
         }
     }
@@ -240,8 +243,9 @@ where
 
     fn description(&self) -> String {
         String::from(
-            "Semantic search over the ingested documents. Returns the most relevant text chunks, \
-             each numbered [n] with its source filename, for citing in the answer.",
+            "Search the ingested documents by meaning and by keyword. Returns the most relevant \
+             text chunks, each numbered [n] with its source file, page, and heading, for citing \
+             in the answer.",
         )
     }
 
@@ -274,13 +278,20 @@ where
 
         let results = {
             let db = lock(&self.db)?;
-            db.search_similar_chunks(&query_vec, top_k, &args.document_ids)
-                .map_err(|e| ToolError::Query(e.to_string()))
+            db.search_hybrid_chunks(
+                &args.query,
+                &query_vec,
+                top_k,
+                self.rrf_k,
+                &args.document_ids,
+            )
+            .map_err(|e| ToolError::Query(e.to_string()))
         };
         match results {
             Ok(results) => {
                 step.finish(format!("{} chunks", results.len()));
-                format_search_results(&results).map_err(Into::into)
+                let first = self.recorder.citations().register(&results);
+                format_search_results(&results, first).map_err(Into::into)
             }
             Err(e) => {
                 step.finish(format!("error: {e}"));
@@ -295,7 +306,10 @@ where
 /// # Errors
 ///
 /// Returns an error only if formatting into the output buffer fails.
-pub fn format_search_results(results: &[ChunkSearchResult]) -> Result<String, std::fmt::Error> {
+pub fn format_search_results(
+    results: &[ChunkSearchResult],
+    first_marker: u32,
+) -> Result<String, std::fmt::Error> {
     if results.is_empty() {
         return Ok(String::from(
             "No relevant chunks found. Tell the user the documents do not appear to cover this.",
@@ -303,11 +317,16 @@ pub fn format_search_results(results: &[ChunkSearchResult]) -> Result<String, st
     }
     let mut out = String::new();
     for (i, chunk) in results.iter().enumerate() {
-        let n = i.saturating_add(1);
+        let n = first_marker.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+        let page = chunk.page.map_or(String::new(), |p| format!(", page {p}"));
+        let heading = chunk
+            .heading
+            .as_deref()
+            .map_or(String::new(), |h| format!(", under \"{h}\""));
         writeln!(
             out,
-            "[{n}] {} (document_id: {}, chunk {}, distance {:.3})",
-            chunk.filename, chunk.document_id, chunk.chunk_index, chunk.distance
+            "[{n}] {}{page}{heading} (document_id: {}, chunk {}, score {:.4})",
+            chunk.filename, chunk.document_id, chunk.chunk_index, chunk.score
         )?;
         writeln!(out, "{}", chunk.content.trim())?;
         writeln!(out)?;
@@ -653,28 +672,45 @@ mod tests {
             document_id: String::from("doc-1"),
             chunk_index: n,
             filename: filename.to_owned(),
-            distance: 0.125,
+            heading: (n == 0).then(|| String::from("Exclusions")),
+            page: (n == 0).then_some(12),
+            score: 0.125,
         }
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn format_search_results_numbers_hits_with_filename() {
-        let out = format_search_results(&[
-            hit(0, "policy.pdf", "  Flood is excluded.  "),
-            hit(1, "faq.md", "Claims close in 30 days."),
-        ])
+        let out = format_search_results(
+            &[
+                hit(0, "policy.pdf", "  Flood is excluded.  "),
+                hit(1, "faq.md", "Claims close in 30 days."),
+            ],
+            1,
+        )
         .unwrap();
-        assert!(out.starts_with("[1] policy.pdf (document_id: doc-1, chunk 0, distance 0.125)\n"));
+        assert!(
+            out.starts_with(
+                "[1] policy.pdf, page 12, under \"Exclusions\" (document_id: doc-1, chunk 0, score 0.1250)\n"
+            ),
+            "{out}"
+        );
         assert!(out.contains("\nFlood is excluded.\n"));
-        assert!(out.contains("[2] faq.md (document_id: doc-1, chunk 1, distance 0.125)\n"));
+        assert!(out.contains("[2] faq.md (document_id: doc-1, chunk 1, score 0.1250)\n"));
         assert!(out.contains("Claims close in 30 days."));
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn format_search_results_continues_numbering() {
+        let out = format_search_results(&[hit(0, "a.md", "x")], 5).unwrap();
+        assert!(out.starts_with("[5] a.md"), "{out}");
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn format_search_results_empty_tells_model_to_say_so() {
-        let out = format_search_results(&[]).unwrap();
+        let out = format_search_results(&[], 4).unwrap();
         assert!(out.contains("No relevant chunks found"));
     }
 

@@ -12,6 +12,44 @@ use crate::error::{Error, Result};
 
 use super::workspace::WorkspaceDb;
 
+/// How the agent may answer in a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatMode {
+    /// General knowledge allowed; cite when a source was used.
+    #[default]
+    Chat,
+    /// Every claim must come from a retrieved chunk or a query result; say
+    /// so when nothing relevant was found.
+    Query,
+}
+
+impl ChatMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Query => "query",
+        }
+    }
+
+    /// Parse `chat` or `query`, case-insensitively.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chat" => Some(Self::Chat),
+            "query" => Some(Self::Query),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ChatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
@@ -43,7 +81,7 @@ impl MessageRole {
 pub struct SessionRow {
     pub id: String,
     pub title: Option<String>,
-    pub mode: String,
+    pub mode: ChatMode,
     pub model: String,
     pub created_at: String,
     pub updated_at: String,
@@ -69,10 +107,11 @@ const SESSION_COLUMNS: &str = "s.id, s.title, s.mode, s.model, CAST(s.created_at
      (SELECT count(*) FROM _quack_messages m WHERE m.session_id = s.id)";
 
 fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
+    let mode: String = row.get(2)?;
     Ok(SessionRow {
         id: row.get(0)?,
         title: row.get(1)?,
-        mode: row.get(2)?,
+        mode: ChatMode::parse(&mode).unwrap_or_default(),
         model: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
@@ -80,19 +119,37 @@ fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
     })
 }
 
-/// Start a new session for `model` (`provider/model`).
+/// Start a new session for `model` (`provider/model`) in `mode`.
 ///
 /// # Errors
 ///
 /// Returns an error if the insert fails.
-pub fn create_session(db: &WorkspaceDb, model: &str) -> Result<SessionRow> {
+pub fn create_session(db: &WorkspaceDb, model: &str, mode: ChatMode) -> Result<SessionRow> {
     let id = uuid::Uuid::now_v7().to_string();
     db.connection().execute(
-        "INSERT INTO _quack_sessions (id, model) VALUES (?, ?)",
-        duckdb::params![id, model],
+        "INSERT INTO _quack_sessions (id, model, mode) VALUES (?, ?, ?)",
+        duckdb::params![id, model, mode.as_str()],
     )?;
     get_session(db, &id)?
         .ok_or_else(|| Error::Analysis(String::from("session vanished after insert")))
+}
+
+/// Change a session's mode.
+///
+/// # Errors
+///
+/// Returns an error if the session does not exist or the update fails.
+pub fn set_session_mode(db: &WorkspaceDb, session_id: &str, mode: ChatMode) -> Result<()> {
+    let changed = db.connection().execute(
+        "UPDATE _quack_sessions SET mode = ? WHERE id = ?",
+        duckdb::params![mode.as_str(), session_id],
+    )?;
+    if changed == 0 {
+        return Err(Error::Analysis(format!(
+            "session '{session_id}' does not exist"
+        )));
+    }
+    Ok(())
 }
 
 /// The session with the given id.
@@ -245,6 +302,12 @@ pub fn record_turn(
     let mut metadata = serde_json::Map::new();
     if let Some(chart) = &response.chart_spec {
         metadata.insert(String::from("chart"), chart.clone());
+    }
+    if !response.citations.is_empty() {
+        metadata.insert(
+            String::from("citations"),
+            serde_json::to_value(&response.citations)?,
+        );
     }
     if response.write_refused {
         metadata.insert(String::from("write_refused"), serde_json::Value::Bool(true));
@@ -451,6 +514,7 @@ mod tests {
         AgentResponse {
             content: content.to_owned(),
             steps,
+            citations: Vec::new(),
             chart_spec: None,
             write_refused: false,
         }
@@ -469,9 +533,16 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn record_turn_writes_user_tool_and_assistant_in_order_and_titles_session() {
         let db = db();
-        let session = create_session(&db, "ollama/llama3").unwrap();
+        let session = create_session(&db, "ollama/llama3", ChatMode::Chat).unwrap();
         assert!(session.title.is_none());
         assert_eq!(session.message_count, 0);
+        assert_eq!(session.mode, ChatMode::Chat);
+        set_session_mode(&db, &session.id, ChatMode::Query).unwrap();
+        assert_eq!(
+            get_session(&db, &session.id).unwrap().unwrap().mode,
+            ChatMode::Query
+        );
+        assert!(set_session_mode(&db, "missing", ChatMode::Chat).is_err());
 
         record_turn(
             &db,
@@ -513,8 +584,8 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn latest_session_is_the_most_recently_updated() {
         let db = db();
-        let first = create_session(&db, "m").unwrap();
-        let second = create_session(&db, "m").unwrap();
+        let first = create_session(&db, "m", ChatMode::Query).unwrap();
+        let second = create_session(&db, "m", ChatMode::Query).unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, second.id);
         record_turn(&db, &first.id, "q", &response("a", vec![])).unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, first.id);
@@ -532,7 +603,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn history_skips_tool_messages_and_trims_oldest_first() {
         let db = db();
-        let session = create_session(&db, "m").unwrap();
+        let session = create_session(&db, "m", ChatMode::Query).unwrap();
         record_turn(
             &db,
             &session.id,
@@ -563,7 +634,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn export_sql_pairs_questions_with_statements() {
         let db = db();
-        let session = create_session(&db, "m").unwrap();
+        let session = create_session(&db, "m", ChatMode::Query).unwrap();
         record_turn(
             &db,
             &session.id,
@@ -592,8 +663,8 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn delete_if_empty_removes_only_sessions_without_messages() {
         let db = db();
-        let empty = create_session(&db, "m").unwrap();
-        let used = create_session(&db, "m").unwrap();
+        let empty = create_session(&db, "m", ChatMode::Query).unwrap();
+        let used = create_session(&db, "m", ChatMode::Query).unwrap();
         record_turn(&db, &used.id, "q", &response("a", vec![])).unwrap();
         assert!(delete_if_empty(&db, &empty.id).unwrap());
         assert!(!delete_if_empty(&db, &used.id).unwrap());
@@ -605,7 +676,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn export_markdown_has_headings_steps_and_answers() {
         let db = db();
-        let session = create_session(&db, "ollama/llama3").unwrap();
+        let session = create_session(&db, "ollama/llama3", ChatMode::Chat).unwrap();
         record_turn(
             &db,
             &session.id,

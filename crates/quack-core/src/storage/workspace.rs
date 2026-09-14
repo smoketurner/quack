@@ -19,7 +19,7 @@ pub const INTERNAL_TABLES: &[&str] = &[
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "2";
+const WORKSPACE_SCHEMA_VERSION: &str = "3";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -260,11 +260,13 @@ impl WorkspaceDb {
     }
 
     fn load_vss(&self) {
-        if let Err(e) = self.conn.execute("INSTALL vss", []) {
-            tracing::debug!(err = %e, "vss INSTALL skipped (may already be installed)");
-        }
-        if let Err(e) = self.conn.execute("LOAD vss", []) {
-            tracing::warn!(err = %e, "failed to load vss extension — vector indexing unavailable");
+        for ext in ["vss", "fts"] {
+            if let Err(e) = self.conn.execute(&format!("INSTALL {ext}"), []) {
+                tracing::debug!(err = %e, ext, "INSTALL skipped (may already be installed)");
+            }
+            if let Err(e) = self.conn.execute(&format!("LOAD {ext}"), []) {
+                tracing::warn!(err = %e, ext, "failed to load extension");
+            }
         }
     }
 
@@ -283,16 +285,22 @@ impl WorkspaceDb {
                 size_bytes BIGINT,
                 ingested_at TIMESTAMP DEFAULT now(),
                 status TEXT DEFAULT 'pending',
-                error_message TEXT
+                error_message TEXT,
+                pinned BOOLEAN NOT NULL DEFAULT false
             );
             CREATE TABLE IF NOT EXISTS _quack_chunks (
                 id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 content TEXT NOT NULL,
+                heading TEXT,
+                page INTEGER,
                 embedding FLOAT[{dim}],
                 token_count INTEGER
             );
+            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
+            ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
+            ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
             CREATE TABLE IF NOT EXISTS _quack_sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT,
@@ -479,34 +487,127 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the insert fails.
-    pub fn insert_chunk(
-        &self,
-        id: &str,
-        document_id: &str,
-        chunk_index: u32,
-        content: &str,
-        embedding: Option<&[f32]>,
-    ) -> crate::error::Result<()> {
-        match embedding {
+    pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> crate::error::Result<()> {
+        let page = chunk.page.map(i64::from);
+        match chunk.embedding {
             Some(emb) => {
                 let sql = format!(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, embedding) \
-                     VALUES (?, ?, ?, ?, ?::{})",
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, embedding) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?::{})",
                     self.vector_type()
                 );
                 self.conn.execute(
                     &sql,
-                    duckdb::params![id, document_id, chunk_index, content, format_embedding(emb)],
+                    duckdb::params![
+                        chunk.id,
+                        chunk.document_id,
+                        chunk.chunk_index,
+                        chunk.content,
+                        chunk.heading,
+                        page,
+                        format_embedding(emb)
+                    ],
                 )?;
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content) VALUES (?, ?, ?, ?)",
-                    duckdb::params![id, document_id, chunk_index, content],
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    duckdb::params![
+                        chunk.id,
+                        chunk.document_id,
+                        chunk.chunk_index,
+                        chunk.content,
+                        chunk.heading,
+                        page
+                    ],
                 )?;
             }
         }
         Ok(())
+    }
+
+    /// Rebuild the BM25 index over chunk content and headings. Call after
+    /// ingestion: the index is a snapshot and does not see later inserts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fts extension is unavailable or indexing fails.
+    pub fn rebuild_fts_index(&self) -> crate::error::Result<()> {
+        self.conn.execute(
+            "PRAGMA create_fts_index('_quack_chunks', 'id', 'content', 'heading', overwrite = 1)",
+            [],
+        )?;
+        tracing::info!("rebuilt BM25 index on _quack_chunks");
+        Ok(())
+    }
+
+    /// Keyword (BM25) search over chunk content and headings. Returns an
+    /// empty list when no index has been built yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails for a reason other than a
+    /// missing index.
+    pub fn search_keyword_chunks(
+        &self,
+        query: &str,
+        top_k: u32,
+        document_ids: &[String],
+    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+        let filter = document_filter(document_ids);
+        let sql = format!(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, c.s \
+             FROM (SELECT *, fts_main__quack_chunks.match_bm25(id, ?::VARCHAR) AS s \
+                   FROM _quack_chunks) c \
+             JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE c.s IS NOT NULL{filter} \
+             ORDER BY c.s DESC, c.chunk_index ASC \
+             LIMIT ?"
+        );
+        let limit = i64::from(top_k);
+        let mut stmt = match self.conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) if e.to_string().contains("fts_main__quack_chunks") => {
+                tracing::debug!("no BM25 index yet; keyword search returns nothing");
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let query_owned = query.to_owned();
+        let mut params: Vec<&dyn duckdb::ToSql> =
+            Vec::with_capacity(document_ids.len().saturating_add(2));
+        params.push(&query_owned);
+        for id in document_ids {
+            params.push(id);
+        }
+        params.push(&limit);
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            results.push(chunk_from_row(row, 7)?);
+        }
+        Ok(results)
+    }
+
+    /// Hybrid retrieval: vector and keyword rankings fused with reciprocal
+    /// rank fusion (`score = sum over rankings of 1 / (rrf_k + rank)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either search fails.
+    pub fn search_hybrid_chunks(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: u32,
+        rrf_k: u32,
+        document_ids: &[String],
+    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+        let candidates = top_k.saturating_mul(2).max(1);
+        let vector = self.search_similar_chunks(query_embedding, candidates, document_ids)?;
+        let keyword = self.search_keyword_chunks(query_text, candidates, document_ids)?;
+        Ok(fuse_rankings(vector, keyword, top_k, rrf_k))
     }
 
     /// Update a chunk's embedding vector by document ID and chunk index.
@@ -559,7 +660,8 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Search for the most similar chunks to a query embedding.
+    /// Search for the most similar chunks to a query embedding. `score` is
+    /// `1 / (1 + cosine distance)`.
     ///
     /// When `document_ids` is non-empty the search is restricted to those
     /// documents. Results carry the source filename for citations.
@@ -573,19 +675,14 @@ impl WorkspaceDb {
         top_k: u32,
         document_ids: &[String],
     ) -> crate::error::Result<Vec<ChunkSearchResult>> {
-        let filter = if document_ids.is_empty() {
-            String::new()
-        } else {
-            let placeholders = vec!["?"; document_ids.len()].join(", ");
-            format!(" AND c.document_id IN ({placeholders})")
-        };
+        let filter = document_filter(document_ids);
         let sql = format!(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, \
-                    array_cosine_distance(c.embedding, ?::{}) AS distance \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
+                    1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL{filter} \
-             ORDER BY distance ASC \
+             ORDER BY score DESC \
              LIMIT ?",
             self.vector_type()
         );
@@ -604,17 +701,50 @@ impl WorkspaceDb {
         let mut results = Vec::new();
 
         while let Some(row) = rows.next()? {
-            results.push(ChunkSearchResult {
-                id: row.get(0)?,
-                content: row.get(1)?,
-                document_id: row.get(2)?,
-                chunk_index: row.get(3)?,
-                filename: row.get(4)?,
-                distance: row.get(5)?,
-            });
+            results.push(chunk_from_row(row, 7)?);
         }
 
         Ok(results)
+    }
+
+    /// Pin or unpin a document. Pinned documents are injected in full into
+    /// the system prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document does not exist or the update fails.
+    pub fn set_document_pinned(&self, document_id: &str, pinned: bool) -> crate::error::Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE _quack_documents SET pinned = ? WHERE id = ?",
+            duckdb::params![pinned, document_id],
+        )?;
+        if changed == 0 {
+            return Err(crate::error::Error::Ingestion(format!(
+                "document '{document_id}' does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Full text of every pinned document, in chunk order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn pinned_documents(&self) -> crate::error::Result<Vec<(DocumentInfo, String)>> {
+        let mut out = Vec::new();
+        for doc in self.list_documents()?.into_iter().filter(|d| d.pinned) {
+            let mut stmt = self.conn.prepare(
+                "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
+            )?;
+            let mut rows = stmt.query(duckdb::params![doc.id])?;
+            let mut parts: Vec<String> = Vec::new();
+            while let Some(row) = rows.next()? {
+                parts.push(row.get(0)?);
+            }
+            out.push((doc, parts.join("\n")));
+        }
+        Ok(out)
     }
 
     /// Execute an arbitrary SQL statement and return the results.
@@ -760,7 +890,7 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn list_documents(&self) -> crate::error::Result<Vec<DocumentInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, filename, mime_type, size_bytes, status FROM _quack_documents ORDER BY ingested_at DESC",
+            "SELECT id, filename, mime_type, size_bytes, status, COALESCE(pinned, false) FROM _quack_documents ORDER BY ingested_at DESC",
         )?;
         let mut rows = stmt.query([])?;
         let mut docs = Vec::new();
@@ -771,6 +901,7 @@ impl WorkspaceDb {
                 mime_type: row.get(2)?,
                 size_bytes: row.get(3)?,
                 status: row.get(4)?,
+                pinned: row.get(5)?,
             });
         }
         Ok(docs)
@@ -806,17 +937,87 @@ pub struct DocumentInfo {
     pub mime_type: Option<String>,
     pub size_bytes: Option<i64>,
     pub status: String,
+    pub pinned: bool,
 }
 
-/// A chunk returned from vector similarity search.
-#[derive(Debug)]
+/// A chunk to store.
+#[derive(Debug, Clone, Copy)]
+pub struct NewChunk<'a> {
+    pub id: &'a str,
+    pub document_id: &'a str,
+    pub chunk_index: u32,
+    pub content: &'a str,
+    pub heading: Option<&'a str>,
+    pub page: Option<u32>,
+    pub embedding: Option<&'a [f32]>,
+}
+
+/// A chunk returned from retrieval, with what a citation needs.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ChunkSearchResult {
     pub id: String,
     pub content: String,
     pub document_id: String,
     pub chunk_index: u32,
     pub filename: String,
-    pub distance: f64,
+    pub heading: Option<String>,
+    pub page: Option<u32>,
+    /// Higher is better. Vector-only: `1 / (1 + distance)`; keyword-only:
+    /// BM25; hybrid: reciprocal rank fusion.
+    pub score: f64,
+}
+
+fn chunk_from_row(row: &duckdb::Row<'_>, score_idx: usize) -> duckdb::Result<ChunkSearchResult> {
+    let page: Option<i64> = row.get(6)?;
+    Ok(ChunkSearchResult {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        document_id: row.get(2)?,
+        chunk_index: row.get(3)?,
+        filename: row.get(4)?,
+        heading: row.get(5)?,
+        page: page.and_then(|p| u32::try_from(p).ok()),
+        score: row.get(score_idx)?,
+    })
+}
+
+fn document_filter(document_ids: &[String]) -> String {
+    if document_ids.is_empty() {
+        String::new()
+    } else {
+        let placeholders = vec!["?"; document_ids.len()].join(", ");
+        format!(" AND c.document_id IN ({placeholders})")
+    }
+}
+
+/// Reciprocal rank fusion of two rankings of the same chunk space.
+fn fuse_rankings(
+    vector: Vec<ChunkSearchResult>,
+    keyword: Vec<ChunkSearchResult>,
+    top_k: u32,
+    rrf_k: u32,
+) -> Vec<ChunkSearchResult> {
+    let mut fused: Vec<ChunkSearchResult> = Vec::new();
+    let k = f64::from(rrf_k);
+    for ranking in [vector, keyword] {
+        for (rank, mut hit) in ranking.into_iter().enumerate() {
+            let contribution = 1.0 / (k + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)) + 1.0);
+            if let Some(existing) = fused.iter_mut().find(|h| h.id == hit.id) {
+                existing.score += contribution;
+            } else {
+                hit.score = contribution;
+                fused.push(hit);
+            }
+        }
+    }
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_index.cmp(&b.chunk_index))
+    });
+    fused.truncate(usize::try_from(top_k).unwrap_or(usize::MAX));
+    fused
 }
 
 struct TimeoutGuard {

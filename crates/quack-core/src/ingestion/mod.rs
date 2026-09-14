@@ -5,7 +5,7 @@ use rig::embeddings::EmbeddingModel;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::storage::workspace::{WorkspaceDb, quote_ident};
+use crate::storage::workspace::{NewChunk, WorkspaceDb, quote_ident};
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -56,7 +56,7 @@ pub async fn ingest_file<M: EmbeddingModel>(
         }
 
         parser::FileType::Pdf | parser::FileType::Text | parser::FileType::Markdown => {
-            let text = parser::extract_text(&file_type, data)?;
+            let sections = parser::extract_sections(&file_type, data)?;
 
             db.insert_document(
                 &doc_id,
@@ -66,14 +66,18 @@ pub async fn ingest_file<M: EmbeddingModel>(
                 "processing",
             )?;
 
-            let chunks = chunker::chunk_text(
-                &text,
+            let chunks = chunker::chunk_sections(
+                &sections,
                 config.ingestion.chunk_size_tokens,
                 config.ingestion.chunk_overlap_tokens,
                 &config.ingestion.tokenizer_encoding,
             )?;
 
             let chunk_count = embed_and_store(db, &doc_id, &chunks, embedding_model).await?;
+
+            if let Err(e) = db.rebuild_fts_index() {
+                tracing::warn!(err = %e, "keyword index not rebuilt; keyword search may be stale");
+            }
 
             db.update_document_status(&doc_id, "ready")?;
 
@@ -136,7 +140,7 @@ fn ingest_structured(
 async fn embed_and_store<M: EmbeddingModel>(
     db: &WorkspaceDb,
     document_id: &str,
-    chunks: &[String],
+    chunks: &[chunker::Chunk],
     embedding_model: Option<&M>,
 ) -> Result<u32> {
     let mut stored: u32 = 0;
@@ -145,7 +149,15 @@ async fn embed_and_store<M: EmbeddingModel>(
         let chunk_id = uuid::Uuid::now_v7().to_string();
         let idx = u32::try_from(i).map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
 
-        db.insert_chunk(&chunk_id, document_id, idx, chunk, None)?;
+        db.insert_chunk(&NewChunk {
+            id: &chunk_id,
+            document_id,
+            chunk_index: idx,
+            content: &chunk.content,
+            heading: chunk.heading.as_deref(),
+            page: chunk.page,
+            embedding: None,
+        })?;
         stored = stored
             .checked_add(1)
             .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
@@ -160,7 +172,9 @@ async fn embed_and_store<M: EmbeddingModel>(
             let batch_texts: Vec<String> = chunks
                 .get(offset..end)
                 .ok_or_else(|| Error::Ingestion("batch slice out of bounds".into()))?
-                .to_vec();
+                .iter()
+                .map(chunker::Chunk::embedding_input)
+                .collect();
 
             let embeddings = model
                 .embed_texts(batch_texts)

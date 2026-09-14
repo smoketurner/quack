@@ -50,7 +50,7 @@ where
         results
             .into_iter()
             .map(|chunk| {
-                let score = 1.0 / (1.0 + chunk.distance);
+                let score = chunk.score;
                 let value = json!({
                     "content": chunk.content,
                     "source_document": chunk.document_id,
@@ -86,10 +86,7 @@ where
 
         Ok(results
             .into_iter()
-            .map(|chunk| {
-                let score = 1.0 / (1.0 + chunk.distance);
-                (score, chunk.id)
-            })
+            .map(|chunk| (chunk.score, chunk.id))
             .collect())
     }
 }

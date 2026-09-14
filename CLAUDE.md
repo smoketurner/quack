@@ -85,7 +85,10 @@ cargo run --bin quack -- sessions | export ID [--sql]                          #
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model, trimmed
-to `[analysis].history_token_budget`.
+to `[analysis].history_token_budget`. Retrieval is hybrid (vss + fts, reciprocal rank
+fusion in `WorkspaceDb::search_hybrid_chunks`); citations are registered per turn
+(`analysis::citations`) and validated before the answer is returned. Sessions have a mode,
+`chat` or `query`; `--mode` / `/mode` set it.
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes

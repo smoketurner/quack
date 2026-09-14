@@ -49,6 +49,16 @@ impl std::fmt::Display for FileType {
     }
 }
 
+/// A run of text that shares one heading and one page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// Nearest preceding heading, if the source has headings.
+    pub heading: Option<String>,
+    /// 1-based page number for paginated sources.
+    pub page: Option<u32>,
+    pub text: String,
+}
+
 /// Detect file type from the filename extension.
 #[must_use]
 pub fn detect_file_type(filename: &str) -> FileType {
@@ -69,25 +79,136 @@ pub fn detect_file_type(filename: &str) -> FileType {
     }
 }
 
-/// Extract text content from an unstructured file.
+/// Extract an unstructured file as sections carrying heading and page
+/// metadata: PDFs one section per page, Markdown one per heading, plain
+/// text a single section.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be parsed.
-pub fn extract_text(file_type: &FileType, data: &[u8]) -> Result<String> {
+/// Returns an error if the file cannot be parsed, or if a PDF has no text
+/// layer at all (scanned pages need OCR, which is not supported).
+pub fn extract_sections(file_type: &FileType, data: &[u8]) -> Result<Vec<Section>> {
     match file_type {
-        FileType::Pdf => extract_pdf_text(data),
-        FileType::Text | FileType::Markdown => String::from_utf8(data.to_vec())
-            .map_err(|e| Error::Ingestion(format!("invalid UTF-8: {e}"))),
+        FileType::Pdf => extract_pdf_sections(data),
+        FileType::Markdown => Ok(markdown_sections(&utf8(data)?)),
+        FileType::Text => Ok(vec![Section {
+            heading: None,
+            page: None,
+            text: utf8(data)?,
+        }]),
         other => Err(Error::Ingestion(format!(
             "cannot extract text from {other} files"
         ))),
     }
 }
 
-fn extract_pdf_text(data: &[u8]) -> Result<String> {
-    pdf_extract::extract_text_from_mem(data)
-        .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))
+/// The whole text of an unstructured file, sections joined.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be parsed.
+pub fn extract_text(file_type: &FileType, data: &[u8]) -> Result<String> {
+    let sections = extract_sections(file_type, data)?;
+    Ok(sections
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn utf8(data: &[u8]) -> Result<String> {
+    String::from_utf8(data.to_vec()).map_err(|e| Error::Ingestion(format!("invalid UTF-8: {e}")))
+}
+
+fn extract_pdf_sections(data: &[u8]) -> Result<Vec<Section>> {
+    let pages = pdf_extract::extract_text_from_mem_by_pages(data)
+        .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
+    let sections: Vec<Section> = pages
+        .into_iter()
+        .enumerate()
+        .filter(|(_, text)| !text.trim().is_empty())
+        .map(|(i, text)| Section {
+            heading: None,
+            page: u32::try_from(i.saturating_add(1)).ok(),
+            text,
+        })
+        .collect();
+    if sections.is_empty() {
+        return Err(Error::Ingestion(String::from(
+            "no extractable text: the PDF has no text layer (scanned pages need OCR)",
+        )));
+    }
+    Ok(sections)
+}
+
+/// Split Markdown at ATX (`# Title`) and setext (underlined) headings. Text
+/// before the first heading becomes a section without one.
+fn markdown_sections(text: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections: Vec<Section> = Vec::new();
+    let mut heading: Option<String> = None;
+    let mut buf: Vec<&str> = Vec::new();
+
+    let flush = |heading: &Option<String>, buf: &mut Vec<&str>, out: &mut Vec<Section>| {
+        let body = buf.join("\n");
+        if !body.trim().is_empty() {
+            out.push(Section {
+                heading: heading.clone(),
+                page: None,
+                text: body.trim().to_owned(),
+            });
+        }
+        buf.clear();
+    };
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines.get(i).copied().unwrap_or_default();
+        let next = lines.get(i.saturating_add(1)).copied();
+        if let Some(title) = atx_heading(line) {
+            flush(&heading, &mut buf, &mut sections);
+            heading = Some(title);
+            i = i.saturating_add(1);
+            continue;
+        }
+        if let Some(underline) = next
+            && is_setext_underline(underline)
+            && !line.trim().is_empty()
+            && !line.trim_start().starts_with(['-', '*', '+', '>', '|'])
+        {
+            flush(&heading, &mut buf, &mut sections);
+            heading = Some(line.trim().to_owned());
+            i = i.saturating_add(2);
+            continue;
+        }
+        buf.push(line);
+        i = i.saturating_add(1);
+    }
+    flush(&heading, &mut buf, &mut sections);
+    sections
+}
+
+fn atx_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = trimmed.get(hashes..)?;
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let title = rest.trim().trim_end_matches('#').trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_owned())
+    }
+}
+
+fn is_setext_underline(line: &str) -> bool {
+    let t = line.trim();
+    t.len() >= 3 && (t.chars().all(|c| c == '=') || t.chars().all(|c| c == '-'))
 }
 
 #[cfg(test)]
@@ -142,5 +263,45 @@ mod tests {
     fn rejects_structured_extraction() {
         let result = extract_text(&FileType::Csv, b"a,b,c");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn markdown_splits_on_atx_and_setext_headings() {
+        let md = "intro line\n\n# Exclusions\n\nFlood is excluded.\n\nClaims\n------\n\nClose in 30 days.\n\n## Not a heading\ntext\n#nope\n- list\n---\n";
+        let sections = markdown_sections(md);
+        let summary: Vec<(Option<&str>, &str)> = sections
+            .iter()
+            .map(|s| (s.heading.as_deref(), s.text.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (None, "intro line"),
+                (Some("Exclusions"), "Flood is excluded."),
+                (Some("Claims"), "Close in 30 days."),
+                (Some("Not a heading"), "text\n#nope\n- list\n---"),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_without_headings_is_one_section() {
+        let sections = markdown_sections("just\n\ntext");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections.first().and_then(|s| s.heading.as_deref()), None);
+    }
+
+    #[test]
+    fn atx_heading_requires_space_and_trims_closing_hashes() {
+        assert_eq!(atx_heading("## Title ##"), Some(String::from("Title")));
+        assert_eq!(atx_heading("#nospace"), None);
+        assert_eq!(atx_heading("####### seven"), None);
+        assert_eq!(atx_heading("# "), None);
+    }
+
+    #[test]
+    fn pdf_without_text_layer_is_an_error() {
+        let err = extract_sections(&FileType::Pdf, b"%PDF-1.4\n%%EOF").err();
+        assert!(err.is_some());
     }
 }

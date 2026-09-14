@@ -16,7 +16,7 @@ use crate::analysis::policy::WritePolicy;
 use crate::analysis::tools::SharedDb;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
-use crate::storage::sessions;
+use crate::storage::sessions::{self, ChatMode};
 
 /// Embedding model over every provider that supports embeddings.
 #[derive(Clone)]
@@ -232,13 +232,16 @@ pub async fn run_turn(
     let chat = config.chat_model_ref()?;
     let embedding_model = required_embedding_model(config)?;
 
-    let history = {
+    let (mode, history) = {
         let guard = db
             .lock()
             .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
-        sessions::get_session(&guard, session_id)?
+        let session = sessions::get_session(&guard, session_id)?
             .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
-        sessions::history_for_model(&guard, session_id, config.analysis.history_token_budget)?
+        (
+            session.mode,
+            sessions::history_for_model(&guard, session_id, config.analysis.history_token_budget)?,
+        )
     };
 
     tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
@@ -249,6 +252,7 @@ pub async fn run_turn(
         chat,
         embedding_model,
         policy,
+        mode,
         history,
         message,
         sink,
@@ -272,6 +276,7 @@ async fn dispatch(
     chat: ModelRef<'_>,
     embedding_model: EmbedModel,
     policy: WritePolicy,
+    mode: ChatMode,
     history: Vec<rig::message::Message>,
     message: &str,
     sink: EventSink,
@@ -286,6 +291,7 @@ async fn dispatch(
                 &config.analysis,
                 &config.retrieval,
                 policy,
+                mode,
                 history,
                 message,
                 sink,
@@ -301,6 +307,7 @@ async fn dispatch(
                 &config.analysis,
                 &config.retrieval,
                 policy,
+                mode,
                 history,
                 message,
                 sink,
@@ -316,6 +323,7 @@ async fn dispatch(
                 &config.analysis,
                 &config.retrieval,
                 policy,
+                mode,
                 history,
                 message,
                 sink,

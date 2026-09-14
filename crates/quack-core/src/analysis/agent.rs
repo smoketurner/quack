@@ -7,6 +7,7 @@ use rig::streaming::StreamedAssistantContent;
 use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::error::{Error, Result};
 
+use super::citations::{self, Citation};
 use super::events::{AgentEvent, EventSink, ToolStep, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::text_to_sql;
@@ -15,6 +16,7 @@ use super::tools::{
     SearchDocumentsTool, SharedDb,
 };
 use super::vector_index::DuckDbVectorIndex;
+use crate::storage::sessions::ChatMode;
 
 /// Everything a turn produced, delivered with `AgentEvent::TurnComplete` and
 /// returned from `run_analysis`.
@@ -22,6 +24,8 @@ use super::vector_index::DuckDbVectorIndex;
 pub struct AgentResponse {
     pub content: String,
     pub steps: Vec<ToolStep>,
+    /// Sources the answer cites, numbered as they appear in `content`.
+    pub citations: Vec<Citation>,
     pub chart_spec: Option<serde_json::Value>,
     /// At least one mutating statement was refused during this turn.
     pub write_refused: bool,
@@ -52,6 +56,7 @@ pub async fn run_analysis<M>(
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     write_policy: WritePolicy,
+    mode: ChatMode,
     history: Vec<rig::message::Message>,
     user_message: &str,
     sink: EventSink,
@@ -67,6 +72,7 @@ where
         analysis_config,
         retrieval_config,
         write_policy,
+        mode,
         history,
         user_message,
         &recorder,
@@ -92,6 +98,7 @@ async fn run_inner<M>(
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     write_policy: WritePolicy,
+    mode: ChatMode,
     history: Vec<rig::message::Message>,
     user_message: &str,
     recorder: &TurnRecorder,
@@ -103,7 +110,7 @@ where
         let db = shared_db
             .lock()
             .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
-        text_to_sql::build_system_prompt(&db)?
+        text_to_sql::build_system_prompt(&db, mode, retrieval_config.pinned_token_budget)?
     };
     let chart_spec: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
     let refused = RefusalFlag::default();
@@ -115,6 +122,7 @@ where
             Arc::clone(&shared_db),
             embedding_model.clone(),
             retrieval_config.top_k,
+            retrieval_config.rrf_k,
             recorder.clone(),
         ))
         .tool(RunSqlTool::new(
@@ -183,10 +191,11 @@ where
 
     // Prefer what the model streamed for the last turn; fall back to the
     // aggregated final text when a provider did not stream deltas.
-    let content = match final_text {
+    let raw = match final_text {
         Some(text) if streamed.trim().is_empty() => text,
         Some(_) | None => streamed,
     };
+    let (content, cited) = citations::validate(&raw, &recorder.citations().all());
 
     let chart = chart_spec
         .lock()
@@ -196,6 +205,7 @@ where
     Ok(AgentResponse {
         content,
         steps: recorder.steps(),
+        citations: cited,
         chart_spec: chart,
         write_refused: refused.was_refused(),
     })
