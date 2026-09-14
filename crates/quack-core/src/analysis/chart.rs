@@ -1,135 +1,154 @@
-use serde_json::json;
+//! quack's chart spec: small enough for the model to fill and for every
+//! interface to render (ratatui in the terminal, `ECharts` in a browser later).
 
 use crate::error::{Error, Result};
 use crate::storage::workspace::QueryResults;
 
-/// Generate an `ECharts` option spec from query results.
+/// Most points per series; beyond this the query should aggregate.
+pub const MAX_POINTS: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChartKind {
+    Bar,
+    Line,
+    Scatter,
+    Pie,
+}
+
+impl ChartKind {
+    /// Parse `bar`, `line`, `scatter`, or `pie`, case-insensitively.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the accepted kinds otherwise.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bar" => Ok(Self::Bar),
+            "line" => Ok(Self::Line),
+            "scatter" => Ok(Self::Scatter),
+            "pie" => Ok(Self::Pie),
+            other => Err(Error::Analysis(format!(
+                "unsupported chart kind '{other}'; use bar, line, scatter, or pie"
+            ))),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bar => "bar",
+            Self::Line => "line",
+            Self::Scatter => "scatter",
+            Self::Pie => "pie",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Axis {
+    pub label: String,
+    /// Category labels, one per point (or per pie slice).
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Series {
+    pub name: String,
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChartSpec {
+    pub title: String,
+    pub kind: ChartKind,
+    pub x: Axis,
+    pub series: Vec<Series>,
+}
+
+impl ChartSpec {
+    /// Number of points in the longest series.
+    #[must_use]
+    pub fn points(&self) -> usize {
+        self.series
+            .iter()
+            .map(|s| s.values.len())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Build a spec from a result set: `x_column` supplies the labels and
+/// `y_column` the values. At most [`MAX_POINTS`] rows.
 ///
 /// # Errors
 ///
-/// Returns an error if the specified columns are not found in the results.
+/// Returns an error if a column is missing, a value is not numeric, or
+/// there are too many rows.
 pub fn generate_chart_spec(
     results: &QueryResults,
-    chart_type: &str,
+    kind: &str,
     x_column: &str,
     y_column: &str,
     title: &str,
-) -> Result<serde_json::Value> {
-    let x_idx = results
-        .columns
-        .iter()
-        .position(|c| c == x_column)
-        .ok_or_else(|| {
-            Error::Analysis(format!("column '{x_column}' not found in query results"))
-        })?;
+) -> Result<ChartSpec> {
+    let kind = ChartKind::parse(kind)?;
+    let column = |name: &str| {
+        results
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| Error::Analysis(format!("column '{name}' not found in query results")))
+    };
+    let x_idx = column(x_column)?;
+    let y_idx = column(y_column)?;
 
-    let y_idx = results
-        .columns
-        .iter()
-        .position(|c| c == y_column)
-        .ok_or_else(|| {
-            Error::Analysis(format!("column '{y_column}' not found in query results"))
-        })?;
+    if results.rows.len() > MAX_POINTS {
+        return Err(Error::Analysis(format!(
+            "{} rows is too many for a chart (max {MAX_POINTS}); aggregate or limit the query",
+            results.rows.len()
+        )));
+    }
 
-    let x_data: Vec<serde_json::Value> = results
-        .rows
-        .iter()
-        .filter_map(|row| row.get(x_idx).cloned())
-        .collect();
-
-    let y_data: Vec<serde_json::Value> = results
-        .rows
-        .iter()
-        .filter_map(|row| row.get(y_idx).cloned())
-        .collect();
-
-    match chart_type {
-        "pie" => Ok(build_pie_spec(title, x_column, &x_data, &y_data)),
-        "bar" | "line" | "scatter" | "area" => {
-            let series_type = if chart_type == "area" {
-                "line"
-            } else {
-                chart_type
-            };
-            Ok(build_cartesian_spec(
-                title,
-                series_type,
-                chart_type == "area",
-                x_column,
-                y_column,
-                &x_data,
-                &y_data,
+    let mut labels = Vec::with_capacity(results.rows.len());
+    let mut values = Vec::with_capacity(results.rows.len());
+    for (i, row) in results.rows.iter().enumerate() {
+        let x = row.get(x_idx).cloned().unwrap_or(serde_json::Value::Null);
+        let y = row.get(y_idx).cloned().unwrap_or(serde_json::Value::Null);
+        labels.push(match x {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Null => String::from("NULL"),
+            other => other.to_string(),
+        });
+        let number = match &y {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            serde_json::Value::Null => Some(0.0),
+            _ => None,
+        };
+        values.push(number.ok_or_else(|| {
+            Error::Analysis(format!(
+                "row {} of column '{y_column}' is not numeric: {y}",
+                i.saturating_add(1)
             ))
-        }
-        other => Err(Error::Analysis(format!("unsupported chart type: {other}"))),
-    }
-}
-
-fn build_cartesian_spec(
-    title: &str,
-    series_type: &str,
-    area_style: bool,
-    x_label: &str,
-    y_label: &str,
-    x_data: &[serde_json::Value],
-    y_data: &[serde_json::Value],
-) -> serde_json::Value {
-    let mut series = json!({
-        "type": series_type,
-        "data": y_data,
-        "name": y_label,
-    });
-
-    if area_style && let Some(obj) = series.as_object_mut() {
-        obj.insert(String::from("areaStyle"), json!({}));
+        })?);
     }
 
-    json!({
-        "title": { "text": title },
-        "tooltip": { "trigger": "axis" },
-        "xAxis": {
-            "type": "category",
-            "data": x_data,
-            "name": x_label,
+    Ok(ChartSpec {
+        title: title.to_owned(),
+        kind,
+        x: Axis {
+            label: x_column.to_owned(),
+            values: labels,
         },
-        "yAxis": {
-            "type": "value",
-            "name": y_label,
-        },
-        "series": [series],
-    })
-}
-
-fn build_pie_spec(
-    title: &str,
-    category_label: &str,
-    categories: &[serde_json::Value],
-    values: &[serde_json::Value],
-) -> serde_json::Value {
-    let data: Vec<serde_json::Value> = categories
-        .iter()
-        .zip(values.iter())
-        .map(|(name, value)| {
-            json!({
-                "name": name,
-                "value": value,
-            })
-        })
-        .collect();
-
-    json!({
-        "title": { "text": title },
-        "tooltip": { "trigger": "item" },
-        "series": [{
-            "type": "pie",
-            "data": data,
-            "name": category_label,
+        series: vec![Series {
+            name: y_column.to_owned(),
+            values,
         }],
     })
 }
 
 #[cfg(test)]
-#[expect(clippy::indexing_slicing, reason = "JSON path access in tests")]
 mod tests {
     use super::*;
 
@@ -143,66 +162,93 @@ mod tests {
                 ],
                 vec![
                     serde_json::Value::String("South".into()),
-                    serde_json::Value::Number(200.into()),
+                    serde_json::Value::from(200.5),
                 ],
-                vec![
-                    serde_json::Value::String("East".into()),
-                    serde_json::Value::Number(150.into()),
-                ],
+                vec![serde_json::Value::Null, serde_json::Value::Null],
             ],
         }
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn generates_bar_chart() {
+    fn builds_a_spec_with_labels_and_numeric_values() {
         let spec = generate_chart_spec(
             &sample_results(),
-            "bar",
+            "Bar",
             "region",
             "sales",
             "Sales by Region",
         )
         .unwrap();
-        assert_eq!(spec["title"]["text"], "Sales by Region");
-        assert_eq!(spec["series"][0]["type"], "bar");
+        assert_eq!(spec.title, "Sales by Region");
+        assert_eq!(spec.kind, ChartKind::Bar);
+        assert_eq!(spec.x.label, "region");
+        assert_eq!(spec.x.values, vec!["North", "South", "NULL"]);
+        assert_eq!(spec.series.len(), 1);
+        assert_eq!(spec.series.first().unwrap().name, "sales");
+        assert_eq!(spec.series.first().unwrap().values, vec![100.0, 200.5, 0.0]);
+        assert_eq!(spec.points(), 3);
     }
 
     #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn generates_line_chart() {
-        let spec = generate_chart_spec(&sample_results(), "line", "region", "sales", "Sales Trend")
-            .unwrap();
-        assert_eq!(spec["series"][0]["type"], "line");
+    #[expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test asserts Ok and reads known JSON paths"
+    )]
+    fn spec_round_trips_through_json() {
+        let spec =
+            generate_chart_spec(&sample_results(), "pie", "region", "sales", "Share").unwrap();
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["kind"], "pie");
+        assert_eq!(json["x"]["values"][0], "North");
+        let back: ChartSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back, spec);
     }
 
     #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn generates_area_chart() {
-        let spec = generate_chart_spec(&sample_results(), "area", "region", "sales", "Area Chart")
-            .unwrap();
-        assert_eq!(spec["series"][0]["type"], "line");
-        assert!(spec["series"][0]["areaStyle"].is_object());
+    fn all_kinds_parse_and_others_do_not() {
+        for (text, kind) in [
+            ("bar", ChartKind::Bar),
+            ("LINE", ChartKind::Line),
+            (" scatter ", ChartKind::Scatter),
+            ("pie", ChartKind::Pie),
+        ] {
+            assert!(ChartKind::parse(text).is_ok_and(|k| k == kind));
+        }
+        let err = ChartKind::parse("area").err();
+        assert!(err.is_some_and(|e| e.to_string().contains("bar, line, scatter, or pie")));
     }
 
     #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn generates_pie_chart() {
-        let spec = generate_chart_spec(&sample_results(), "pie", "region", "sales", "Market Share")
-            .unwrap();
-        assert_eq!(spec["series"][0]["type"], "pie");
-        assert!(spec["series"][0]["data"].is_array());
+    fn missing_column_and_non_numeric_values_are_errors() {
+        assert!(generate_chart_spec(&sample_results(), "bar", "missing", "sales", "t").is_err());
+        let text_values = QueryResults {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec![
+                serde_json::Value::String("x".into()),
+                serde_json::Value::String("not a number".into()),
+            ]],
+        };
+        let err = generate_chart_spec(&text_values, "bar", "a", "b", "t").err();
+        assert!(err.is_some_and(|e| e.to_string().contains("not numeric")));
     }
 
     #[test]
-    fn missing_column_returns_error() {
-        let result = generate_chart_spec(&sample_results(), "bar", "missing", "sales", "Title");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn unsupported_chart_type_returns_error() {
-        let result = generate_chart_spec(&sample_results(), "radar", "region", "sales", "Title");
-        assert!(result.is_err());
+    fn too_many_rows_is_an_error() {
+        let rows: Vec<Vec<serde_json::Value>> = (0..=MAX_POINTS)
+            .map(|i| {
+                vec![
+                    serde_json::Value::String(i.to_string()),
+                    serde_json::Value::Number(i.into()),
+                ]
+            })
+            .collect();
+        let big = QueryResults {
+            columns: vec!["a".into(), "b".into()],
+            rows,
+        };
+        let err = generate_chart_spec(&big, "line", "a", "b", "t").err();
+        assert!(err.is_some_and(|e| e.to_string().contains("too many")));
     }
 }

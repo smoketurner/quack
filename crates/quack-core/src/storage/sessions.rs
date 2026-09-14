@@ -300,8 +300,8 @@ pub fn record_turn(
     }
 
     let mut metadata = serde_json::Map::new();
-    if let Some(chart) = &response.chart_spec {
-        metadata.insert(String::from("chart"), chart.clone());
+    if let Some(chart) = &response.chart {
+        metadata.insert(String::from("chart"), serde_json::to_value(chart)?);
     }
     if !response.citations.is_empty() {
         metadata.insert(
@@ -515,7 +515,7 @@ mod tests {
             content: content.to_owned(),
             steps,
             citations: Vec::new(),
-            chart_spec: None,
+            chart: None,
             write_refused: false,
         }
     }

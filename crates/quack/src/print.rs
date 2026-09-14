@@ -102,7 +102,7 @@ pub(crate) async fn run_prompt(
                 "answer": response.content,
                 "steps": response.steps,
                 "citations": response.citations,
-                "chart": response.chart_spec,
+                "chart": response.chart,
                 "write_refused": response.write_refused,
                 "session_id": session_id,
             });

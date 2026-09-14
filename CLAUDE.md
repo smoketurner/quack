@@ -92,7 +92,8 @@ no DuckDB extension is ever loaded, see design doc section 14); citations are re
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected
 into the system prompt after the schema and documents, capped at `[context].max_tokens`;
-the agent never writes it.
+the agent never writes it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
+pie; 200 points max), not ECharts.
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes

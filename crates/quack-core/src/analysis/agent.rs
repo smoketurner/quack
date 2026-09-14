@@ -7,6 +7,7 @@ use rig::streaming::StreamedAssistantContent;
 use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::error::{Error, Result};
 
+use super::chart::ChartSpec;
 use super::citations::{self, Citation};
 use super::events::{AgentEvent, EventSink, ToolStep, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
@@ -25,7 +26,7 @@ pub struct AgentResponse {
     pub steps: Vec<ToolStep>,
     /// Sources the answer cites, numbered as they appear in `content`.
     pub citations: Vec<Citation>,
-    pub chart_spec: Option<serde_json::Value>,
+    pub chart: Option<ChartSpec>,
     /// At least one mutating statement was refused during this turn.
     pub write_refused: bool,
 }
@@ -111,7 +112,7 @@ where
             .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
         text_to_sql::build_system_prompt(&db, &prompt)?
     };
-    let chart_spec: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let chart_spec: Arc<Mutex<Option<ChartSpec>>> = Arc::new(Mutex::new(None));
     let refused = RefusalFlag::default();
 
     let mut builder = completion_model
@@ -205,7 +206,7 @@ where
         content,
         steps: recorder.steps(),
         citations: cited,
-        chart_spec: chart,
+        chart,
         write_refused: refused.was_refused(),
     })
 }

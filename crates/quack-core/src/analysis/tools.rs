@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::storage::workspace::{ChunkSearchResult, StatementKind, WorkspaceDb};
 
-use super::chart;
+use super::chart::{self, ChartSpec};
 use super::events::TurnRecorder;
 use super::policy::{RefusalFlag, WritePolicy};
 use super::text_to_sql;
@@ -546,14 +546,14 @@ impl Tool for ListDocumentsTool {
 
 pub struct CreateChartTool {
     db: SharedDb,
-    chart_spec: Arc<Mutex<Option<serde_json::Value>>>,
+    chart_spec: Arc<Mutex<Option<ChartSpec>>>,
     recorder: TurnRecorder,
 }
 
 impl CreateChartTool {
     pub fn new(
         db: SharedDb,
-        chart_spec: Arc<Mutex<Option<serde_json::Value>>>,
+        chart_spec: Arc<Mutex<Option<ChartSpec>>>,
         recorder: TurnRecorder,
     ) -> Self {
         Self {
@@ -566,13 +566,13 @@ impl CreateChartTool {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct CreateChartArgs {
-    /// SQL query to get chart data
+    /// SQL query to get chart data (at most 200 rows; aggregate first)
     pub sql: String,
-    /// Type of chart: bar, line, scatter, area, or pie
-    pub chart_type: String,
-    /// Column name for the x-axis (or category for pie charts)
+    /// Kind of chart: bar, line, scatter, or pie
+    pub kind: String,
+    /// Column for the x axis (category labels; slice names for pie)
     pub x: String,
-    /// Column name for the y-axis (or value for pie charts)
+    /// Numeric column for the y axis (slice values for pie)
     pub y: String,
     /// Chart title
     pub title: String,
@@ -586,7 +586,8 @@ impl Tool for CreateChartTool {
 
     fn description(&self) -> String {
         String::from(
-            "Generate an ECharts chart specification from a SQL query result. Runs the SQL, then produces a chart spec.",
+            "Draw a chart from a SQL query: runs the query and renders a bar, line, scatter, or pie \
+             chart of column y against column x. The query must return at most 200 rows.",
         )
     }
 
@@ -636,12 +637,22 @@ impl Tool for CreateChartTool {
         }
 
         let spec =
-            chart::generate_chart_spec(&results, &args.chart_type, &args.x, &args.y, &args.title)
-                .map_err(|e| ToolError::Analysis(e.to_string()))?;
+            match chart::generate_chart_spec(&results, &args.kind, &args.x, &args.y, &args.title) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    step.finish(format!("error: {e}"));
+                    return Ok(format!("Chart not created: {e}"));
+                }
+            };
 
-        let spec_json = serde_json::to_string_pretty(&spec)
-            .map_err(|e| ToolError::Analysis(format!("failed to serialize chart spec: {e}")))?;
-
+        let summary = format!(
+            "{} chart \"{}\" with {} points ({} by {})",
+            spec.kind.as_str(),
+            spec.title,
+            spec.points(),
+            args.y,
+            args.x
+        );
         {
             let mut guard = self
                 .chart_spec
@@ -650,13 +661,9 @@ impl Tool for CreateChartTool {
             *guard = Some(spec);
         }
 
-        step.finish(format!(
-            "{} chart, {} rows",
-            args.chart_type,
-            results.rows.len()
-        ));
+        step.finish(format!("{} points", results.rows.len()));
         Ok(format!(
-            "Chart generated successfully. ECharts spec:\n{spec_json}"
+            "Chart created and shown to the user: {summary}. Describe what it shows; do not repeat the data."
         ))
     }
 }

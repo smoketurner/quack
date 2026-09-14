@@ -3,7 +3,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::Line;
-use ratatui::widgets::{Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset};
+use ratatui::widgets::{Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType};
+
+use quack_core::analysis::chart::{ChartKind as SpecKind, ChartSpec};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesData {
@@ -27,6 +29,7 @@ pub(crate) enum ChartKind {
         y_bounds: [f64; 2],
         x_labels: Vec<String>,
         y_labels: Vec<String>,
+        scatter: bool,
     },
     Pie {
         slices: Vec<(String, u64)>,
@@ -39,26 +42,55 @@ pub(crate) struct ChartData {
     pub(crate) kind: ChartKind,
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "bar and pie widgets take integer magnitudes; negatives clamp to zero"
+)]
+fn to_u64(value: f64) -> u64 {
+    value.max(0.0).round() as u64
+}
+
 impl ChartData {
-    pub(crate) fn from_echart_spec(spec: &serde_json::Value) -> Option<Self> {
-        let title = spec
-            .get("title")
-            .and_then(|t| t.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Chart")
-            .to_owned();
-
-        let all_series = spec.get("series")?.as_array()?;
-        let first = all_series.first()?;
-        let chart_type = first.get("type")?.as_str()?;
-
-        match chart_type {
-            "bar" if all_series.len() > 1 => parse_grouped_bar_chart(spec, all_series, title),
-            "bar" => parse_bar_chart(spec, first, title),
-            "line" => parse_line_chart(spec, first, title),
-            "pie" => parse_pie_chart(first, title),
-            _ => None,
-        }
+    /// Map quack's chart spec onto the terminal renderers.
+    pub(crate) fn from_spec(spec: &ChartSpec) -> Self {
+        let title = spec.title.clone();
+        let labels = spec.x.values.clone();
+        let kind = match spec.kind {
+            SpecKind::Bar if spec.series.len() > 1 => ChartKind::Grouped {
+                labels,
+                series: spec
+                    .series
+                    .iter()
+                    .map(|s| SeriesData {
+                        name: s.name.clone(),
+                        values: s.values.iter().copied().map(to_u64).collect(),
+                    })
+                    .collect(),
+            },
+            SpecKind::Bar => ChartKind::Bar {
+                labels,
+                values: spec
+                    .series
+                    .first()
+                    .map(|s| s.values.iter().copied().map(to_u64).collect())
+                    .unwrap_or_default(),
+            },
+            SpecKind::Line | SpecKind::Scatter => line_kind(spec, spec.kind == SpecKind::Scatter),
+            SpecKind::Pie => ChartKind::Pie {
+                slices: labels
+                    .into_iter()
+                    .zip(
+                        spec.series
+                            .first()
+                            .map(|s| s.values.clone())
+                            .unwrap_or_default(),
+                    )
+                    .map(|(name, value)| (name, to_u64(value)))
+                    .collect(),
+            },
+        };
+        Self { title, kind }
     }
 
     pub(crate) fn height(&self) -> u16 {
@@ -86,100 +118,12 @@ impl ChartData {
     }
 }
 
-fn json_to_f64(v: &serde_json::Value) -> Option<f64> {
-    v.as_f64()
-        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "JSON numeric values converted to u64 for chart display"
-)]
-fn json_to_u64(v: &serde_json::Value) -> Option<u64> {
-    v.as_u64().or_else(|| json_to_f64(v).map(|f| f as u64))
-}
-
-fn parse_bar_chart(
-    spec: &serde_json::Value,
-    series: &serde_json::Value,
-    title: String,
-) -> Option<ChartData> {
-    let x_data = spec
-        .get("xAxis")
-        .and_then(|x| x.get("data"))
-        .and_then(|d| d.as_array())?;
-    let y_data = series.get("data").and_then(|d| d.as_array())?;
-
-    let labels: Vec<String> = x_data
-        .iter()
-        .map(|v| v.as_str().map_or_else(|| v.to_string(), String::from))
-        .collect();
-    let values: Vec<u64> = y_data.iter().filter_map(json_to_u64).collect();
-
-    Some(ChartData {
-        title,
-        kind: ChartKind::Bar { labels, values },
-    })
-}
-
-fn parse_grouped_bar_chart(
-    spec: &serde_json::Value,
-    all_series: &[serde_json::Value],
-    title: String,
-) -> Option<ChartData> {
-    let x_data = spec
-        .get("xAxis")
-        .and_then(|x| x.get("data"))
-        .and_then(|d| d.as_array())?;
-
-    let labels: Vec<String> = x_data
-        .iter()
-        .map(|v| v.as_str().map_or_else(|| v.to_string(), String::from))
-        .collect();
-
-    let mut series = Vec::new();
-    for s in all_series {
-        let name = s
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("series")
-            .to_owned();
-        let values: Vec<u64> = s
-            .get("data")
-            .and_then(|d| d.as_array())
-            .map_or_else(Vec::new, |arr| arr.iter().filter_map(json_to_u64).collect());
-        series.push(SeriesData { name, values });
-    }
-
-    Some(ChartData {
-        title,
-        kind: ChartKind::Grouped { labels, series },
-    })
-}
-
-fn parse_line_chart(
-    spec: &serde_json::Value,
-    series: &serde_json::Value,
-    title: String,
-) -> Option<ChartData> {
-    let y_data = series.get("data").and_then(|d| d.as_array())?;
-    let y_values: Vec<f64> = y_data.iter().filter_map(json_to_f64).collect();
-
-    if y_values.is_empty() {
-        return None;
-    }
-
-    let x_data = spec
-        .get("xAxis")
-        .and_then(|x| x.get("data"))
-        .and_then(|d| d.as_array());
-
-    let x_labels: Vec<String> = x_data.map_or_else(Vec::new, |arr| {
-        arr.iter()
-            .map(|v| v.as_str().map_or_else(|| v.to_string(), String::from))
-            .collect()
-    });
+fn line_kind(spec: &ChartSpec, scatter: bool) -> ChartKind {
+    let y_values: Vec<f64> = spec
+        .series
+        .first()
+        .map(|s| s.values.clone())
+        .unwrap_or_default();
 
     #[expect(
         clippy::cast_precision_loss,
@@ -198,46 +142,27 @@ fn parse_line_chart(
         .copied()
         .fold(f64::INFINITY, f64::min)
         .min(0.0);
-    let y_max = y_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let y_max = y_values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(0.0);
     let y_pad = (y_max - y_min).abs() * 0.1;
 
     let y_labels = vec![
-        format!("{:.0}", y_min),
+        format!("{y_min:.0}"),
         format!("{:.0}", f64::midpoint(y_min, y_max)),
-        format!("{:.0}", y_max),
+        format!("{y_max:.0}"),
     ];
 
-    Some(ChartData {
-        title,
-        kind: ChartKind::Line {
-            points,
-            x_bounds: [0.0, x_max],
-            y_bounds: [y_min - y_pad, y_max + y_pad],
-            x_labels,
-            y_labels,
-        },
-    })
-}
-
-fn parse_pie_chart(series: &serde_json::Value, title: String) -> Option<ChartData> {
-    let data = series.get("data").and_then(|d| d.as_array())?;
-    let slices: Vec<(String, u64)> = data
-        .iter()
-        .filter_map(|item| {
-            let name = item
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("?")
-                .to_owned();
-            let value = json_to_u64(item.get("value")?)?;
-            Some((name, value))
-        })
-        .collect();
-
-    Some(ChartData {
-        title,
-        kind: ChartKind::Pie { slices },
-    })
+    ChartKind::Line {
+        points,
+        x_bounds: [0.0, x_max.max(1.0)],
+        y_bounds: [y_min - y_pad, y_max + y_pad],
+        x_labels: spec.x.values.clone(),
+        y_labels,
+        scatter,
+    }
 }
 
 pub(crate) fn render_chart(frame: &mut Frame<'_>, area: Rect, chart_data: &ChartData) {
@@ -344,6 +269,7 @@ fn render_line(frame: &mut Frame<'_>, area: Rect, block: Block<'_>, kind: &Chart
         y_bounds,
         x_labels,
         y_labels,
+        scatter,
     } = kind
     else {
         return;
@@ -351,6 +277,11 @@ fn render_line(frame: &mut Frame<'_>, area: Rect, block: Block<'_>, kind: &Chart
 
     let dataset = Dataset::default()
         .marker(symbols::Marker::Braille)
+        .graph_type(if *scatter {
+            GraphType::Scatter
+        } else {
+            GraphType::Line
+        })
         .style(Style::default().fg(Color::Cyan))
         .data(points);
 
@@ -436,199 +367,125 @@ fn render_pie(frame: &mut Frame<'_>, area: Rect, block: Block<'_>, slices: &[(St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use quack_core::analysis::chart::{Axis as SpecAxis, Series};
 
-    #[test]
-    #[expect(clippy::unwrap_used, clippy::panic, reason = "test assertion")]
-    fn parse_bar_spec() {
-        let spec = json!({
-            "title": {"text": "Sales by Region"},
-            "xAxis": {"data": ["North", "South", "East"]},
-            "series": [{"type": "bar", "data": [100, 200, 150]}]
-        });
-        let chart = ChartData::from_echart_spec(&spec).unwrap();
-        assert_eq!(chart.title, "Sales by Region");
-        match &chart.kind {
-            ChartKind::Bar { labels, values } => {
-                assert_eq!(labels, &["North", "South", "East"]);
-                assert_eq!(values, &[100, 200, 150]);
-            }
-            other => panic!("expected Bar, got {other:?}"),
+    fn spec(kind: SpecKind, labels: &[&str], series: &[(&str, &[f64])]) -> ChartSpec {
+        ChartSpec {
+            title: String::from("t"),
+            kind,
+            x: SpecAxis {
+                label: String::from("x"),
+                values: labels.iter().map(|s| (*s).to_owned()).collect(),
+            },
+            series: series
+                .iter()
+                .map(|(name, values)| Series {
+                    name: (*name).to_owned(),
+                    values: values.to_vec(),
+                })
+                .collect(),
         }
     }
 
     #[test]
-    #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn parse_line_spec() {
-        let spec = json!({
-            "title": {"text": "Trend"},
-            "xAxis": {"data": ["Jan", "Feb", "Mar"]},
-            "series": [{"type": "line", "data": [10.0, 20.5, 15.3]}]
-        });
-        let chart = ChartData::from_echart_spec(&spec).unwrap();
-        assert_eq!(chart.title, "Trend");
-        assert!(matches!(chart.kind, ChartKind::Line { .. }));
-        assert_eq!(chart.height(), 12);
+    fn bar_with_one_series_is_a_bar_chart() {
+        let data = ChartData::from_spec(&spec(
+            SpecKind::Bar,
+            &["N", "S"],
+            &[("sales", &[100.0, 200.4])],
+        ));
+        assert!(matches!(
+            &data.kind,
+            ChartKind::Bar { labels, values } if labels == &["N", "S"] && values == &[100, 200]
+        ));
+        assert_eq!(data.height(), 12);
     }
 
     #[test]
-    #[expect(
-        clippy::unwrap_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        reason = "test assertion"
-    )]
-    fn parse_pie_spec() {
-        let spec = json!({
-            "title": {"text": "Market Share"},
-            "series": [{"type": "pie", "data": [
-                {"name": "A", "value": 60},
-                {"name": "B", "value": 40}
-            ]}]
-        });
-        let chart = ChartData::from_echart_spec(&spec).unwrap();
-        assert_eq!(chart.title, "Market Share");
-        match &chart.kind {
-            ChartKind::Pie { slices } => {
-                assert_eq!(slices.len(), 2);
-                assert_eq!(slices[0], ("A".to_owned(), 60));
-                assert_eq!(slices[1], ("B".to_owned(), 40));
-            }
-            other => panic!("expected Pie, got {other:?}"),
-        }
+    fn bar_with_two_series_is_grouped() {
+        let data = ChartData::from_spec(&spec(
+            SpecKind::Bar,
+            &["Q1", "Q2"],
+            &[("revenue", &[420.0, 480.0]), ("profit", &[105.0, 120.0])],
+        ));
+        assert!(matches!(
+            &data.kind,
+            ChartKind::Grouped { series, .. }
+                if series.len() == 2 && series.last().is_some_and(|s| s.name == "profit")
+        ));
     }
 
     #[test]
-    fn unsupported_type_returns_none() {
-        let spec = json!({
-            "series": [{"type": "radar", "data": [1, 2, 3]}]
-        });
-        assert!(ChartData::from_echart_spec(&spec).is_none());
+    fn line_and_scatter_share_the_line_kind() {
+        let line = ChartData::from_spec(&spec(
+            SpecKind::Line,
+            &["a", "b", "c"],
+            &[("y", &[1.0, 3.0, 2.0])],
+        ));
+        assert!(matches!(
+            &line.kind,
+            ChartKind::Line { scatter: false, points, .. } if points.len() == 3
+        ));
+        let scatter = ChartData::from_spec(&spec(SpecKind::Scatter, &["a"], &[("y", &[-5.0])]));
+        assert!(matches!(
+            &scatter.kind,
+            ChartKind::Line { scatter: true, y_bounds, .. } if y_bounds.first().is_some_and(|b| *b < -5.0)
+        ));
     }
 
     #[test]
-    fn missing_series_returns_none() {
-        let spec = json!({"title": {"text": "Empty"}});
-        assert!(ChartData::from_echart_spec(&spec).is_none());
+    fn pie_pairs_labels_with_the_first_series() {
+        let data = ChartData::from_spec(&spec(
+            SpecKind::Pie,
+            &["A", "B"],
+            &[("share", &[60.0, 40.0])],
+        ));
+        assert!(matches!(
+            &data.kind,
+            ChartKind::Pie { slices } if slices == &[(String::from("A"), 60), (String::from("B"), 40)]
+        ));
+        assert_eq!(data.height(), 6);
     }
 
     #[test]
-    fn area_chart_parsed_as_line() {
-        let spec = json!({
-            "title": {"text": "Area"},
-            "xAxis": {"data": ["a", "b"]},
-            "series": [{"type": "line", "areaStyle": {}, "data": [5, 10]}]
-        });
-        assert!(ChartData::from_echart_spec(&spec).is_some());
+    fn empty_series_render_without_panicking() {
+        let empty = ChartData::from_spec(&spec(SpecKind::Bar, &[], &[]));
+        assert_eq!(empty.height(), 3);
+        render_to_string(&empty);
     }
 
-    #[test]
-    #[expect(
-        clippy::unwrap_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        reason = "test assertion"
-    )]
-    fn parse_grouped_bar_spec() {
-        let spec = json!({
-            "title": {"text": "Revenue vs Profit"},
-            "xAxis": {"data": ["Q1", "Q2", "Q3", "Q4"]},
-            "series": [
-                {"type": "bar", "name": "Revenue", "data": [420, 480, 542, 607]},
-                {"type": "bar", "name": "Profit", "data": [105, 120, 135, 152]}
-            ]
-        });
-        let chart = ChartData::from_echart_spec(&spec).unwrap();
-        assert_eq!(chart.title, "Revenue vs Profit");
-        match &chart.kind {
-            ChartKind::Grouped { labels, series } => {
-                assert_eq!(labels, &["Q1", "Q2", "Q3", "Q4"]);
-                assert_eq!(series.len(), 2);
-                assert_eq!(series[0].name, "Revenue");
-                assert_eq!(series[1].name, "Profit");
-            }
-            other => panic!("expected Grouped, got {other:?}"),
-        }
-    }
-
-    #[test]
-    #[expect(
-        clippy::unwrap_used,
-        clippy::print_stdout,
-        reason = "visual demo test — run with --nocapture"
-    )]
-    fn render_all_chart_types() {
+    #[expect(clippy::unwrap_used, reason = "test helper renders into a buffer")]
+    fn render_to_string(chart_data: &ChartData) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-
-        let specs = [
-            (
-                "BAR CHART",
-                json!({
-                    "title": {"text": "Revenue by Region"},
-                    "xAxis": {"data": ["North", "South", "East", "West"]},
-                    "series": [{"type": "bar", "data": [175, 148, 162, 122]}]
-                }),
-            ),
-            (
-                "LINE CHART",
-                json!({
-                    "title": {"text": "Monthly Active Users"},
-                    "xAxis": {"data": ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]},
-                    "series": [{"type": "line", "data": [12500, 13200, 14800, 15600,
-                        16900, 18200, 19500, 20800, 21200, 22500, 24000, 25800]}]
-                }),
-            ),
-            (
-                "GROUPED BAR CHART (stacked)",
-                json!({
-                    "title": {"text": "Revenue vs Profit by Quarter"},
-                    "xAxis": {"data": ["Q1", "Q2", "Q3", "Q4"]},
-                    "series": [
-                        {"type": "bar", "name": "Revenue", "data": [420, 480, 542, 607]},
-                        {"type": "bar", "name": "Profit", "data": [105, 120, 135, 152]}
-                    ]
-                }),
-            ),
-            (
-                "PIE CHART",
-                json!({
-                    "title": {"text": "Market Share"},
-                    "series": [{"type": "pie", "data": [
-                        {"name": "Product A", "value": 45},
-                        {"name": "Product B", "value": 28},
-                        {"name": "Product C", "value": 17},
-                        {"name": "Other", "value": 10}
-                    ]}]
-                }),
-            ),
-        ];
-
-        for (label, spec) in &specs {
-            let chart_data = ChartData::from_echart_spec(spec).unwrap();
-            let height = chart_data.height();
-            let width = 80;
-
-            let backend = TestBackend::new(width, height);
-            let mut terminal = Terminal::new(backend).unwrap();
-
-            terminal
-                .draw(|frame| {
-                    render_chart(frame, frame.area(), &chart_data);
-                })
-                .unwrap();
-
-            let buf = terminal.backend().buffer().clone();
-            println!("\n=== {label} ===");
-            for y in 0..height {
-                let mut line = String::new();
-                for x in 0..width {
-                    let cell = buf.cell((x, y)).unwrap();
-                    line.push_str(cell.symbol());
-                }
-                println!("{}", line.trim_end());
+        let height = chart_data.height();
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_chart(frame, frame.area(), chart_data))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..80 {
+                out.push_str(buf.cell((x, y)).unwrap().symbol());
             }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn every_kind_renders_its_title() {
+        for kind in [
+            SpecKind::Bar,
+            SpecKind::Line,
+            SpecKind::Scatter,
+            SpecKind::Pie,
+        ] {
+            let data =
+                ChartData::from_spec(&spec(kind, &["a", "b", "c"], &[("y", &[1.0, 2.0, 3.0])]));
+            assert!(render_to_string(&data).contains(" t "), "{kind:?}");
         }
     }
 }

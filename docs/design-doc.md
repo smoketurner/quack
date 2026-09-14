@@ -1319,7 +1319,8 @@ the time of the last edit.
    11.5. History replays user and assistant text only; tool payloads are not summarized
    into history yet.
 6. **No ontology, no induction, no graph.** Sections 6.3 to 6.5.
-7. **Chart spec is ECharts JSON** re-parsed by the TUI. Section 9.
+7. **Web UI mapping of the chart spec to ECharts** does not exist yet (no web UI).
+   Section 9.
 8. **No OAuth, no server, no MCP, no desktop window, no web UI.** `auth = "oauth"` parses
    and is rejected as unimplemented. Sections 10.2, 11, 12.
 9. **DOCX, HTML, PPTX, XLSX unsupported** (tracked as issue #16; XLSX via a Rust
@@ -1394,8 +1395,8 @@ deployment for document chat is the end of step 8.
    SQL; print mode with formats and exit codes.~~ Done.
 5. ~~Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
    documents, chat and query modes.~~ Done. DOCX, HTML, PPTX, XLSX parsers are issue #16.
-6. ~~Workspace context (stored, versioned, import/export) and the prompt rewrite.~~ Done.
-   New chart spec and terminal renderer: issue #19.
+6. ~~Workspace context (stored, versioned, import/export), the prompt rewrite, and the
+   chart spec with its terminal renderer.~~ Done.
 7. OAuth: `TokenManager`, PKCE and device code, cache, `quack auth`.
 8. `quack serve`: `control.db`, users, tokens, roles, split audit, upload queue; REST API;
    SSE; web UI (workspaces, chat with citations, documents, tables, context editor).

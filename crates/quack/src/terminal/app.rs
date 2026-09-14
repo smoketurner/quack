@@ -17,6 +17,7 @@ use quack_core::storage::workspace::{WorkspaceDb, looks_like_direct_sql};
 
 use crate::terminal::chart::ChartData;
 use crate::terminal::ui;
+use quack_core::analysis::chart::ChartSpec;
 
 const TICK_RATE_MS: u64 = 50;
 
@@ -200,8 +201,13 @@ impl App {
                     .messages
                     .push(Message::new(MessageRole::User, row.content)),
                 StoredRole::Assistant => {
-                    if let Some(chart) = row.metadata.as_ref().and_then(|m| m.get("chart")) {
-                        self.current_chart = ChartData::from_echart_spec(chart);
+                    if let Some(spec) = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("chart"))
+                        .and_then(|c| serde_json::from_value::<ChartSpec>(c.clone()).ok())
+                    {
+                        self.current_chart = Some(ChartData::from_spec(&spec));
                     }
                     self.messages
                         .push(Message::new(MessageRole::Assistant, row.content));
@@ -375,8 +381,8 @@ impl App {
                         sources_footer(&response.citations),
                     ));
                 }
-                if let Some(spec) = response.chart_spec {
-                    self.current_chart = ChartData::from_echart_spec(&spec);
+                if let Some(spec) = &response.chart {
+                    self.current_chart = Some(ChartData::from_spec(spec));
                 }
                 if response.write_refused && !self.allow_write {
                     self.messages.push(Message::new(
