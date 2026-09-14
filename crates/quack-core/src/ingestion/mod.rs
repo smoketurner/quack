@@ -75,10 +75,6 @@ pub async fn ingest_file<M: EmbeddingModel>(
 
             let chunk_count = embed_and_store(db, &doc_id, &chunks, embedding_model).await?;
 
-            if let Err(e) = db.rebuild_fts_index() {
-                tracing::warn!(err = %e, "keyword index not rebuilt; keyword search may be stale");
-            }
-
             db.update_document_status(&doc_id, "ready")?;
 
             Ok(IngestResult {

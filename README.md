@@ -37,8 +37,10 @@ cargo run --bin quack -- ingest policy.pdf --pin                      # full tex
 cargo run --bin quack -- -p "what is excluded?" --mode query          # sources only, cited [n]
 ```
 
-Document search is hybrid: vector similarity and BM25 keyword matching fused with reciprocal
-rank fusion, so exact tokens such as policy numbers are found. Chunks carry page and
+Document search is hybrid: an exact cosine scan over stored embeddings and quack's own BM25
+term index, fused with reciprocal rank fusion, so exact tokens such as policy numbers are
+found. No DuckDB extension is downloaded or loaded; everything is compiled into the one
+binary. Chunks carry page and
 heading; answers cite `[n]` markers that are validated against what was retrieved and
 listed as sources. `--mode query` makes the agent answer only from retrieved chunks and
 query results.

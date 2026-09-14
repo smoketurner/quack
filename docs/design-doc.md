@@ -113,8 +113,8 @@ exports; the pgvector store does not need to be migrated in place (re-embedding 
 +------------------------------------------------------------------------------+
                                        |
 +------------------------------------------------------------------------------+
-|  DuckDB (bundled, static): vss (HNSW), fts (BM25), json, excel;               |
-|  httpfs / postgres / sqlite scanners autoloaded on ATTACH                     |
+|  DuckDB (bundled, static, core + json + parquet only; no runtime extensions)  |
+|  vectors: exact cosine scan; keywords: quack's own BM25 term index            |
 |  SQLite (sqlx, bundled): control.db (server access control only)             |
 +------------------------------------------------------------------------------+
 ```
@@ -259,8 +259,15 @@ CREATE TABLE _quack_chunks (
     token_count INTEGER,
     embedding   FLOAT[N]                    -- N fixed per workspace, recorded in _quack_meta
 );
--- CREATE INDEX ... USING HNSW (embedding) WITH (metric = 'cosine');   -- vss
--- PRAGMA create_fts_index('_quack_chunks', 'id', 'content', 'heading'); -- fts, BM25
+-- No vector index: search is an exact cosine scan with the core
+-- array_cosine_distance function (see section 15).
+
+CREATE TABLE _quack_terms (              -- BM25 index quack maintains at insert time
+    chunk_id TEXT NOT NULL,
+    term     TEXT NOT NULL,              -- lowercased alphanumeric run from content + heading
+    tf       INTEGER NOT NULL
+);
+CREATE INDEX _quack_terms_term_idx ON _quack_terms (term);
 
 -- ontology (section 6.3)
 CREATE TABLE _quack_ontology_versions (
@@ -506,8 +513,9 @@ recorded where the source has them. Token counts via `tiktoken` (`cl100k_base`).
 built after a document's chunks are stored; the FTS index is rebuilt incrementally.
 Re-uploading a file with the same SHA-256 is a no-op with a message.
 
-**Hybrid retrieval.** A query runs both a cosine search over `embedding` (vss) and a BM25
-search over `content` and `heading` (fts). Results are fused with reciprocal rank fusion
+**Hybrid retrieval.** A query runs both an exact cosine scan over `embedding` (core
+`array_cosine_distance`) and a BM25 search over the terms quack tokenized at ingest
+(`_quack_terms`, scored in SQL; no DuckDB extension). Results are fused with reciprocal rank fusion
 (`k = 60`) and the top `k` chunks (default 8) are returned. A reranking hook accepts an
 optional cross-encoder provider later; it is a no-op at MVP. This is the main retrieval
 quality improvement over the pgvector setup, where keyword-exact questions (part numbers,
@@ -528,7 +536,7 @@ each turn (subject to the history token budget) rather than retrieved.
 | CSV, TSV, Parquet, JSON, JSONL | `read_csv_auto` / `read_parquet` / `read_json_auto` | Table in `data.duckdb` (server, desktop); view over the file in place (TUI in a `.quack/` directory) |
 | Excel `.xlsx` | `excel` extension, `read_xlsx` | One table per sheet |
 | stdin (print mode) | sniffed | Temporary table `stdin` |
-| Postgres, SQLite, MySQL, S3/HTTP Parquet | `ATTACH` via scanner extensions | Session-scoped, permission-gated, credentials redacted in audit |
+| Postgres, SQLite, S3/HTTP Parquet | Deferred: the scanner and httpfs extensions cannot be compiled into the static binary (section 15); a Rust-side importer is the candidate design | — |
 
 Table naming: sanitized file stem; on collision the web UI and TUI ask (replace, rename,
 skip), the API and print mode require an explicit name. `DESCRIBE`, row count, and three
@@ -1192,9 +1200,13 @@ tick_rate_ms = 50
 
 - **One binary, `quack`, no Cargo features.** Every surface is a subcommand and every
   build contains all of them. Static musl on Linux (`x86_64`, `aarch64`), native on macOS
-  and Windows. DuckDB and SQLite bundled; vss, fts, json, excel compiled in; scanner
-  extensions fetched on `ATTACH` or pre-bundled with `quack extensions bundle` for
-  air-gapped installs.
+  and Windows. DuckDB and SQLite are bundled and statically linked.
+- **No DuckDB extension is ever installed or loaded at runtime.** A static musl binary
+  cannot `dlopen`, and `libduckdb-sys` can only compile in `json`, `parquet`, `icu`, and
+  `autocomplete`. Anything that would need another extension (`vss`, `fts`, `excel`,
+  `httpfs`, the Postgres and SQLite scanners) is implemented in Rust or not built.
+  XLSX uses a Rust reader; keyword search is quack's own BM25 index; vector search is
+  an exact scan.
 - **Desktop bundles:** when `quack desktop` exists, `tauri build` wraps the same binary
   into `.dmg`, `.msi`, and `.AppImage` installers. Not a separate binary.
 - **mimalloc** (`secure`) as the global allocator.
@@ -1223,9 +1235,13 @@ because the system being replaced runs on Postgres.
    MVCC lets the ingestion worker, session writes, and readers share a workspace.
    Horizontal scaling or an HA pair is not possible without moving storage to a server
    database. For a single-instance deployment this is a simplification, not a limitation.
-2. **HNSW persistence in DuckDB's vss extension is marked experimental.** The index is
-   rebuilt from stored embeddings on open if it is missing or fails to load; embeddings are
-   the source of truth, the index is a cache. Budget for rebuild time on large workspaces.
+2. **Vector search is an exact scan, not an index.** Every query computes the cosine
+   distance against every stored embedding inside DuckDB. That is tens of milliseconds
+   for a hundred thousand 768-dimensional chunks and grows linearly; the working set is
+   `chunks × dimension × 4` bytes (about 3 GB per million chunks). Past a few hundred
+   thousand chunks per workspace, add an approximate index that ships inside the binary
+   (a pure-Rust HNSW crate over the same stored vectors) rather than a DuckDB extension.
+   BM25 is an indexed join on `_quack_terms` and stays fast far beyond that.
 3. **One file is the boundary, so one file is the backup unit.** Back up a workspace by
    copying its directory while the server holds no write transaction (`quack workspace
    snapshot NAME` does this via DuckDB's `CHECKPOINT` and a copy). There is no
@@ -1303,8 +1319,11 @@ the time of the last edit.
 7. **Chart spec is ECharts JSON** re-parsed by the TUI. Section 9.
 8. **No OAuth, no server, no MCP, no desktop window, no web UI.** `auth = "oauth"` parses
    and is rejected as unimplemented. Sections 10.2, 11, 12.
-9. **DOCX, HTML, PPTX, XLSX unsupported** (tracked as issue #16). Sections 6.1, 6.2.
-10. **`text_to_sql` tests are a placeholder.** Section 16.
+9. **DOCX, HTML, PPTX, XLSX unsupported** (tracked as issue #16; XLSX via a Rust
+   reader, not the `excel` extension). Sections 6.1, 6.2.
+10. **No `ATTACH` to external databases.** Needs a Rust-side design now that scanner
+    extensions are out (section 6.2). Step 13.
+11. ~~`text_to_sql` tests are a placeholder.~~ Done.
 
 ---
 

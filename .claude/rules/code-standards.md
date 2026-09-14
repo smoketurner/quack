@@ -41,6 +41,8 @@ and code — this file is the gate, the doc is the detail.
       `_quack_` tables (design doc section 7.4).
 - [ ] DuckDB workspaces are isolated per workspace; user SQL executes only in DuckDB,
       never against `control.db`; no `ATTACH` between workspaces.
+- [ ] **No `INSTALL` or `LOAD` of DuckDB extensions anywhere.** The static binary cannot
+      load them; only what `libduckdb-sys` compiles in (`json`, `parquet`) may be used.
 
 ## Workspace hygiene → [docs/architecture.md](../../docs/architecture.md)
 

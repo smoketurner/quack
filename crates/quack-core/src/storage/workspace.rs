@@ -13,13 +13,18 @@ pub const INTERNAL_TABLES: &[&str] = &[
     "_quack_chunks",
     "_quack_sessions",
     "_quack_messages",
+    "_quack_terms",
 ];
+
+/// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
 
 /// Every internal table carries this prefix; anything starting with it is hidden.
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "3";
+const WORKSPACE_SCHEMA_VERSION: &str = "4";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -115,7 +120,7 @@ impl WorkspaceDb {
 
     /// Open (or create) the `DuckDB` database for a workspace.
     ///
-    /// Loads the vss extension, creates the `_quack_` internal tables if they
+    /// Creates the `_quack_` internal tables if they
     /// do not exist, and reconciles the embedding dimension recorded in
     /// `_quack_meta` with the configured provider.
     ///
@@ -143,7 +148,6 @@ impl WorkspaceDb {
             query_timeout: Duration::from_secs(u64::from(config.analysis.query_timeout_seconds)),
         };
         db.apply_resource_limits(config)?;
-        db.load_vss();
         db.rename_legacy_tables()?;
         db.reconcile_embedding_dimension(configured_dimension, configured_model)
             .or_else(|e| match e {
@@ -259,17 +263,6 @@ impl WorkspaceDb {
         }
     }
 
-    fn load_vss(&self) {
-        for ext in ["vss", "fts"] {
-            if let Err(e) = self.conn.execute(&format!("INSTALL {ext}"), []) {
-                tracing::debug!(err = %e, ext, "INSTALL skipped (may already be installed)");
-            }
-            if let Err(e) = self.conn.execute(&format!("LOAD {ext}"), []) {
-                tracing::warn!(err = %e, ext, "failed to load extension");
-            }
-        }
-    }
-
     fn create_internal_tables(&self) -> crate::error::Result<()> {
         self.rename_legacy_tables()?;
         let dim = self.embedding_dimension;
@@ -301,6 +294,14 @@ impl WorkspaceDb {
             ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
+            CREATE TABLE IF NOT EXISTS _quack_terms (
+                chunk_id TEXT NOT NULL,
+                term TEXT NOT NULL,
+                tf INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS _quack_terms_term_idx ON _quack_terms (term);
+            CREATE INDEX IF NOT EXISTS _quack_terms_chunk_idx ON _quack_terms (chunk_id);
+            DROP SCHEMA IF EXISTS fts_main__quack_chunks CASCADE;
             CREATE TABLE IF NOT EXISTS _quack_sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT,
@@ -323,6 +324,14 @@ impl WorkspaceDb {
             );"
         );
         self.conn.execute_batch(&sql)?;
+        let recorded = self
+            .meta("schema_version")?
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        if recorded < 4 && self.chunk_count()? > 0 {
+            tracing::info!("indexing existing chunks for keyword search");
+            self.reindex_terms()?;
+        }
         self.set_meta("schema_version", WORKSPACE_SCHEMA_VERSION)?;
         self.set_meta("embedding_dimension", &dim.to_string())?;
         Ok(())
@@ -482,18 +491,21 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Insert a text chunk, optionally with an embedding vector.
+    /// Insert a text chunk, optionally with an embedding vector, and index
+    /// its terms for keyword search.
     ///
     /// # Errors
     ///
     /// Returns an error if the insert fails.
     pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> crate::error::Result<()> {
         let page = chunk.page.map(i64::from);
+        let terms = term_frequencies(chunk.content, chunk.heading);
+        let length = term_count(&terms);
         match chunk.embedding {
             Some(emb) => {
                 let sql = format!(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, embedding) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?::{})",
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{})",
                     self.vector_type()
                 );
                 self.conn.execute(
@@ -505,109 +517,73 @@ impl WorkspaceDb {
                         chunk.content,
                         chunk.heading,
                         page,
+                        length,
                         format_embedding(emb)
                     ],
                 )?;
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page) \
-                     VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
                     duckdb::params![
                         chunk.id,
                         chunk.document_id,
                         chunk.chunk_index,
                         chunk.content,
                         chunk.heading,
-                        page
+                        page,
+                        length
                     ],
                 )?;
             }
         }
+        self.insert_terms(chunk.id, &terms)?;
         Ok(())
     }
 
-    /// Rebuild the BM25 index over chunk content and headings. Call after
-    /// ingestion: the index is a snapshot and does not see later inserts.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the fts extension is unavailable or indexing fails.
-    pub fn rebuild_fts_index(&self) -> crate::error::Result<()> {
-        self.conn.execute(
-            "PRAGMA create_fts_index('_quack_chunks', 'id', 'content', 'heading', overwrite = 1)",
-            [],
-        )?;
-        tracing::info!("rebuilt BM25 index on _quack_chunks");
-        Ok(())
-    }
-
-    /// Keyword (BM25) search over chunk content and headings. Returns an
-    /// empty list when no index has been built yet.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query fails for a reason other than a
-    /// missing index.
-    pub fn search_keyword_chunks(
-        &self,
-        query: &str,
-        top_k: u32,
-        document_ids: &[String],
-    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
-        let filter = document_filter(document_ids);
-        let sql = format!(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, c.s \
-             FROM (SELECT *, fts_main__quack_chunks.match_bm25(id, ?::VARCHAR) AS s \
-                   FROM _quack_chunks) c \
-             JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE c.s IS NOT NULL{filter} \
-             ORDER BY c.s DESC, c.chunk_index ASC \
-             LIMIT ?"
-        );
-        let limit = i64::from(top_k);
-        let mut stmt = match self.conn.prepare(&sql) {
-            Ok(stmt) => stmt,
-            Err(e) if e.to_string().contains("fts_main__quack_chunks") => {
-                tracing::debug!("no BM25 index yet; keyword search returns nothing");
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let query_owned = query.to_owned();
-        let mut params: Vec<&dyn duckdb::ToSql> =
-            Vec::with_capacity(document_ids.len().saturating_add(2));
-        params.push(&query_owned);
-        for id in document_ids {
-            params.push(id);
+    fn insert_terms(&self, chunk_id: &str, terms: &[(String, u32)]) -> crate::error::Result<()> {
+        if terms.is_empty() {
+            return Ok(());
         }
-        params.push(&limit);
-        let mut rows = stmt.query(params.as_slice())?;
-        let mut results = Vec::new();
+        let mut appender = self.conn.appender("_quack_terms")?;
+        for (term, tf) in terms {
+            appender.append_row(duckdb::params![chunk_id, term, i64::from(*tf)])?;
+        }
+        appender.flush()?;
+        Ok(())
+    }
+
+    fn chunk_count(&self) -> crate::error::Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM _quack_chunks", [], |row| row.get(0))?)
+    }
+
+    /// Rebuild the keyword index from every stored chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading chunks or writing terms fails.
+    pub fn reindex_terms(&self) -> crate::error::Result<()> {
+        self.conn.execute("DELETE FROM _quack_terms", [])?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content, heading FROM _quack_chunks")?;
+        let mut rows = stmt.query([])?;
+        let mut chunks: Vec<(String, String, Option<String>)> = Vec::new();
         while let Some(row) = rows.next()? {
-            results.push(chunk_from_row(row, 7)?);
+            chunks.push((row.get(0)?, row.get(1)?, row.get(2)?));
         }
-        Ok(results)
-    }
-
-    /// Hybrid retrieval: vector and keyword rankings fused with reciprocal
-    /// rank fusion (`score = sum over rankings of 1 / (rrf_k + rank)`).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either search fails.
-    pub fn search_hybrid_chunks(
-        &self,
-        query_text: &str,
-        query_embedding: &[f32],
-        top_k: u32,
-        rrf_k: u32,
-        document_ids: &[String],
-    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
-        let candidates = top_k.saturating_mul(2).max(1);
-        let vector = self.search_similar_chunks(query_embedding, candidates, document_ids)?;
-        let keyword = self.search_keyword_chunks(query_text, candidates, document_ids)?;
-        Ok(fuse_rankings(vector, keyword, top_k, rrf_k))
+        for (id, content, heading) in &chunks {
+            let terms = term_frequencies(content, heading.as_deref());
+            self.conn.execute(
+                "UPDATE _quack_chunks SET token_count = ? WHERE id = ?",
+                duckdb::params![term_count(&terms), id],
+            )?;
+            self.insert_terms(id, &terms)?;
+        }
+        Ok(())
     }
 
     /// Update a chunk's embedding vector by document ID and chunk index.
@@ -639,25 +615,86 @@ impl WorkspaceDb {
         format!("FLOAT[{}]", self.embedding_dimension)
     }
 
-    /// Create an HNSW index on the chunks embedding column for cosine similarity.
-    ///
-    /// Requires the vss extension to be loaded.
+    /// Keyword search: BM25 over the terms quack indexed at ingest, scored in
+    /// SQL from `_quack_terms` and each chunk's term count. Needs no
+    /// extension and no rebuild step.
     ///
     /// # Errors
     ///
-    /// Returns an error if index creation fails (e.g., vss not loaded or
-    /// no embeddings stored yet).
-    pub fn create_embedding_index(&self) -> crate::error::Result<()> {
-        self.conn
-            .execute("SET hnsw_enable_experimental_persistence = true", [])?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS chunks_embedding_idx \
-             ON _quack_chunks USING HNSW (embedding) \
-             WITH (metric = 'cosine')",
-            [],
-        )?;
-        tracing::info!("created HNSW cosine index on _quack_chunks.embedding");
-        Ok(())
+    /// Returns an error if the query fails.
+    pub fn search_keyword_chunks(
+        &self,
+        query: &str,
+        top_k: u32,
+        document_ids: &[String],
+    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+        let terms: Vec<String> = term_frequencies(query, None)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Terms are alphanumeric runs, so the list literal needs no quoting.
+        let term_list = format!("[{}]", terms.join(", "));
+        let filter = document_filter(document_ids);
+        let sql = format!(
+            "WITH q AS (SELECT DISTINCT unnest(?::VARCHAR[]) AS term), \
+                  stats AS (SELECT count(*) AS n, avg(token_count) AS avgdl \
+                            FROM _quack_chunks WHERE token_count > 0), \
+                  df AS (SELECT t.term, count(DISTINCT t.chunk_id) AS df \
+                         FROM _quack_terms t JOIN q ON q.term = t.term GROUP BY t.term), \
+                  scored AS (SELECT t.chunk_id, \
+                         sum(ln(1 + (s.n - d.df + 0.5) / (d.df + 0.5)) \
+                             * (t.tf * ({BM25_K1} + 1)) \
+                             / (t.tf + {BM25_K1} * (1 - {BM25_B} + {BM25_B} * ch.token_count / s.avgdl))) AS score \
+                         FROM _quack_terms t \
+                         JOIN df d ON d.term = t.term \
+                         JOIN _quack_chunks ch ON ch.id = t.chunk_id, stats s \
+                         GROUP BY t.chunk_id) \
+             SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score \
+             FROM scored sc \
+             JOIN _quack_chunks c ON c.id = sc.chunk_id \
+             JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE sc.score > 0{filter} \
+             ORDER BY sc.score DESC, c.chunk_index ASC \
+             LIMIT ?"
+        );
+        let limit = i64::from(top_k);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn duckdb::ToSql> =
+            Vec::with_capacity(document_ids.len().saturating_add(2));
+        params.push(&term_list);
+        for id in document_ids {
+            params.push(id);
+        }
+        params.push(&limit);
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            results.push(chunk_from_row(row, 7)?);
+        }
+        Ok(results)
+    }
+
+    /// Hybrid retrieval: vector and keyword rankings fused with reciprocal
+    /// rank fusion (`score = sum over rankings of 1 / (rrf_k + rank)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either search fails.
+    pub fn search_hybrid_chunks(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        top_k: u32,
+        rrf_k: u32,
+        document_ids: &[String],
+    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+        let candidates = top_k.saturating_mul(2).max(1);
+        let vector = self.search_similar_chunks(query_embedding, candidates, document_ids)?;
+        let keyword = self.search_keyword_chunks(query_text, candidates, document_ids)?;
+        Ok(fuse_rankings(vector, keyword, top_k, rrf_k))
     }
 
     /// Search for the most similar chunks to a query embedding. `score` is
@@ -979,6 +1016,36 @@ fn chunk_from_row(row: &duckdb::Row<'_>, score_idx: usize) -> duckdb::Result<Chu
         page: page.and_then(|p| u32::try_from(p).ok()),
         score: row.get(score_idx)?,
     })
+}
+
+/// Lowercased alphanumeric runs; the same rule indexes chunks and parses
+/// queries, so `POL-8841` becomes `pol` and `8841` on both sides.
+#[must_use]
+pub fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Term frequencies for a chunk's content plus its heading.
+fn term_frequencies(content: &str, heading: Option<&str>) -> Vec<(String, u32)> {
+    let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for term in tokenize(content)
+        .into_iter()
+        .chain(heading.map(tokenize).unwrap_or_default())
+    {
+        let entry = counts.entry(term).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+    counts.into_iter().collect()
+}
+
+/// Total term occurrences, the chunk length BM25 normalizes by.
+fn term_count(terms: &[(String, u32)]) -> i64 {
+    terms
+        .iter()
+        .fold(0i64, |acc, (_, tf)| acc.saturating_add(i64::from(*tf)))
 }
 
 fn document_filter(document_ids: &[String]) -> String {
@@ -1385,6 +1452,38 @@ mod tests {
         ] {
             assert!(!looks_like_direct_sql(no), "{no}");
         }
+    }
+
+    #[test]
+    fn tokenize_lowercases_and_splits_on_punctuation() {
+        assert_eq!(
+            tokenize("Policy POL-8841 renews; see \"Exclusions\" (page 12)."),
+            vec![
+                "policy",
+                "pol",
+                "8841",
+                "renews",
+                "see",
+                "exclusions",
+                "page",
+                "12"
+            ]
+        );
+        assert!(tokenize("  --- ").is_empty());
+    }
+
+    #[test]
+    fn term_frequencies_count_heading_too() {
+        let tf = term_frequencies("flood flood damage", Some("Flood Exclusions"));
+        assert_eq!(
+            tf,
+            vec![
+                (String::from("damage"), 1),
+                (String::from("exclusions"), 1),
+                (String::from("flood"), 3),
+            ]
+        );
+        assert_eq!(term_count(&tf), 5);
     }
 
     #[test]

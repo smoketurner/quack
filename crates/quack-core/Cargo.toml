@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 dirs          = { workspace = true }
-duckdb        = { workspace = true, features = ["bundled"] }
+duckdb        = { workspace = true, features = ["bundled", "json"] }
 futures       = { workspace = true, features = ["std"] }
 pdf-extract   = { workspace = true }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }

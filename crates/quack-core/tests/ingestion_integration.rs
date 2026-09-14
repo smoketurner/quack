@@ -483,17 +483,7 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
 
     let query = [1.0_f32, 0.0, 0.0, 0.0];
 
-    let all = match db.search_similar_chunks(&query, 5, &[]) {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("array_cosine_distance") || msg.contains("Catalog Error"),
-                "unexpected error: {msg}"
-            );
-            return;
-        }
-    };
+    let all = db.search_similar_chunks(&query, 5, &[]).unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all.first().unwrap().filename, "policy.pdf");
     assert_eq!(all.last().unwrap().filename, "faq.md");
@@ -553,23 +543,10 @@ fn workspace_db_search_similar_chunks() {
     .unwrap();
 
     let query = [1.0_f32, 0.0, 0.0, 0.0];
-    match db.search_similar_chunks(&query, 3, &[]) {
-        Ok(results) => {
-            assert_eq!(results.len(), 3);
-            let first = results.first().unwrap();
-            assert_eq!(first.content, "first chunk");
-            let last = results.last().unwrap();
-            assert_eq!(last.content, "second chunk");
-        }
-        Err(e) => {
-            // vss extension may not be available in all environments
-            let msg = e.to_string();
-            assert!(
-                msg.contains("array_cosine_distance") || msg.contains("Catalog Error"),
-                "unexpected error: {msg}"
-            );
-        }
-    }
+    let results = db.search_similar_chunks(&query, 3, &[]).unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.first().unwrap().content, "first chunk");
+    assert_eq!(results.last().unwrap().content, "second chunk");
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +705,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("3"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("4"));
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("4")
@@ -959,7 +936,6 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
         embedding: Some(&[0.0, 0.0, 1.0, 0.0]),
     })
     .unwrap();
-    db.rebuild_fts_index().unwrap();
     db
 }
 
@@ -997,7 +973,7 @@ fn keyword_search_finds_exact_tokens_the_vector_misses() {
 }
 
 #[test]
-fn keyword_search_without_an_index_is_empty_not_an_error() {
+fn keyword_search_on_empty_workspace_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-noindex").unwrap();
@@ -1005,6 +981,60 @@ fn keyword_search_without_an_index_is_empty_not_an_error() {
         db.search_keyword_chunks("anything", 3, &[])
             .unwrap()
             .is_empty()
+    );
+    assert!(db.search_keyword_chunks("   ", 3, &[]).unwrap().is_empty());
+}
+
+#[test]
+fn keyword_search_ranks_by_bm25_and_uses_headings() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = seeded_for_search(&config, "ws-bm25");
+    // "flood" appears in a0's content; "exclusions" only in its heading.
+    let hits = db
+        .search_keyword_chunks("flood exclusions", 5, &[])
+        .unwrap();
+    assert_eq!(hits.first().map(|h| h.id.as_str()), Some("a0"));
+    assert_eq!(hits.len(), 1);
+    // "thirty" only in b1; "claims" also only in b1's content here.
+    let hits = db.search_keyword_chunks("claims thirty", 5, &[]).unwrap();
+    assert_eq!(hits.first().map(|h| h.id.as_str()), Some("b1"));
+    assert!(hits.iter().all(|h| h.score > 0.0));
+}
+
+#[test]
+fn legacy_workspace_gets_its_terms_indexed_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    {
+        let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
+        db.insert_document("d", "a.md", "text/markdown", 1, "ready")
+            .unwrap();
+        db.insert_chunk(&NewChunk {
+            id: "c0",
+            document_id: "d",
+            chunk_index: 0,
+            content: "renewal POL-8841 notice",
+            heading: None,
+            page: None,
+            embedding: None,
+        })
+        .unwrap();
+        // Simulate a v3 workspace: no term rows, old version recorded.
+        db.execute_statement("DELETE FROM _quack_terms").unwrap();
+        db.execute_statement("UPDATE _quack_meta SET value = '3' WHERE key = 'schema_version'")
+            .unwrap();
+        assert!(db.search_keyword_chunks("8841", 3, &[]).unwrap().is_empty());
+    }
+    let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("4"));
+    let hits = db.search_keyword_chunks("8841", 3, &[]).unwrap();
+    assert_eq!(hits.first().map(|h| h.id.as_str()), Some("c0"));
+    assert!(
+        !db.list_tables()
+            .unwrap()
+            .iter()
+            .any(|t| t.starts_with("fts_"))
     );
 }
 
