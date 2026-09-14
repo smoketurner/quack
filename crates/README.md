@@ -8,7 +8,12 @@ Your workspace members live here. The root `Cargo.toml` picks up every crate via
 | Crate | Responsibility | Key deps (from the workspace menu) |
 |---|---|---|
 | `quack-core` | Config, error types, SQLite control plane, DuckDB workspace management | `sqlx`, `duckdb`, `sea-query`, `serde`, `toml`, `thiserror`, `tracing`, `uuid` |
-| `quack-cli` | `quack` binary with `query` subcommand | `quack-core`, `clap`, `anyhow`, `tokio`, `tracing-subscriber`, `mimalloc` |
+| `quack-cli` | `quack` binary with `query`, `ingest`, `chat` subcommands | `quack-core`, `clap`, `anyhow`, `tokio`, `rig`, `tracing-subscriber`, `mimalloc` |
+| `quack-tui` | `quack-tui` binary: ratatui chat session | `quack-core`, `ratatui`, `ratatui-textarea`, `crossterm`, `rig`, `tokio` |
+
+Target layout (design doc section 4): `quack-cli` and `quack-tui` merge into a single
+`quack` crate (terminal, print mode, `serve`, `mcp`, admin), and `quack-desktop` is added
+for the Tauri app. Provider construction moves into `quack-core::llm`.
 
 ## Adding a crate
 

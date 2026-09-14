@@ -1,7 +1,15 @@
 # sea-query as the query builder
 
-sea-query builds type-safe SQL queries for the SQLite control plane. Handlers call typed
-store methods and never see raw SQL.
+sea-query builds type-safe SQL queries for `control.db`, the SQLite access-control
+database used in server mode (design doc section 5.5). Handlers call typed store methods
+and never see raw SQL.
+
+It is **not** used for the workspace DuckDB files: sea-query's SQLite backend does not
+produce DuckDB's array, extension, or recursive-CTE syntax. Internal DuckDB statements
+(chunks, graph, ontology, sessions) are constant strings with `duckdb::params!` bindings,
+and the only interpolated values are identifiers via `quote_ident` and the validated
+`FLOAT[N]` width (design doc section 5.6). Agent- and user-written SQL is executed as-is
+through the permission layer and is never assembled by application code.
 
 Crates (from the workspace menu):
 

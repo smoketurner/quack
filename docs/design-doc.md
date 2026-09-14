@@ -1348,6 +1348,7 @@ Ordered by risk.
 10. In-process embedding models (ONNX) to drop the Ollama requirement offline
 11. DuckPGQ for graph queries
 12. Kubernetes manifests; WebSocket MCP transport; object-storage file backend
+13. Web UI localization via fluent (pattern already documented in `docs/web-ui.md`)
 
 ---
 

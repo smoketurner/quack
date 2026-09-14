@@ -23,21 +23,34 @@ RUST_LOG=debug QUACK_DATA_DIR=/tmp/quack-dev cargo run --bin quack -- query "SEL
 Workspace members are auto-detected from `Cargo.toml`. Track these logical subsystems in
 `coverage-status.md` as crates are added:
 
-- **control plane** — SQLite-backed workspace metadata, sea-query migrations
-- **workspace engine** — DuckDB per-workspace databases, query execution
-- **CLI** — clap-based command interface
-- **crypto** — aws-lc-rs default provider installation
+- **access control** — `control.db`: users, workspaces, membership, tokens, access audit
+  (sea-query migrations)
+- **workspace storage** — DuckDB per-workspace files: user tables, `_quack_` tables, query
+  execution, read/write classification, limits
+- **ingestion and retrieval** — parsers, chunking, embedding, hybrid vector + FTS search,
+  citations
+- **ontology and graph** — ontology tables and induction, extraction, resolution,
+  traversal
+- **agent** — rig-based tool loop, permissions, prompt, chat modes, event stream
+- **interfaces** — CLI/print, TUI, web UI, REST, MCP, desktop
+- **crypto and auth** — aws-lc-rs default provider installation, OAuth token manager
 
 ## Interfaces
 
-- CLI: `cargo run --bin quack -- <subcommand>`
+- CLI: `cargo run --bin quack -- query|ingest|chat ...`
+- TUI: `cargo run --bin quack-tui -- -w <workspace>`
+- Target (design doc section 11): `quack -p`, `quack serve`, `quack mcp`, `quack-desktop`
 
 ## Critical Paths
 
 Features prone to silent breakage — live-test before any PR that touches them:
 
-- SQLite control plane migrations
+- `control.db` migrations and the append-only `audit_log`
 - sea-query query generation (correct SQLite dialect)
+- Classification boundary: nothing workspace-revealing written outside the workspace file
+- Agent SQL read/write classification and permission prompts
+- Citation validation (every `[n]` maps to a chunk retrieved in that turn)
+- Embedding dimension recorded per workspace and checked on open
 - DuckDB workspace isolation (each workspace gets its own database file)
 - aws-lc-rs default crypto provider installed exactly once at startup
 
