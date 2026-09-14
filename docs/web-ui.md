@@ -64,6 +64,10 @@ async fn static_asset(Path(path): Path<String>) -> Response {
 }
 ```
 
+The real handler also sets an `ETag` from rust-embed's content hash and
+`Cache-Control: no-cache`, answering `If-None-Match` with 304, so a rebuilt stylesheet
+or script is picked up on the next load without a hard refresh.
+
 ## Tailwind pipeline
 
 Tailwind v4 is CSS-first: `styles/input.css` is one `@import "tailwindcss";`. Build with:

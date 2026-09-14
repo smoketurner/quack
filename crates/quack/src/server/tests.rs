@@ -1351,6 +1351,28 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
             .is_some_and(|c| c.to_str().unwrap_or_default().starts_with("text/css"))
     );
     assert!(css.contains("tailwindcss"));
+    assert!(
+        css.contains(".answer"),
+        "answer styles must be in the built CSS"
+    );
+    let etag = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        etag.starts_with('"')
+            && headers
+                .get(header::CACHE_CONTROL)
+                .is_some_and(|c| c == "no-cache")
+    );
+    let revalidate = Request::builder()
+        .uri("/static/css/output.css")
+        .header(header::IF_NONE_MATCH, &etag)
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, _) = h.send(revalidate).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
     let (status, _, _) = h.page("/static/nope.js", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, html, _) = h.page("/w/nope/chat", Some(&cookie)).await;

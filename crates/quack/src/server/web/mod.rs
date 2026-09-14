@@ -311,15 +311,39 @@ pub(crate) fn router() -> Router<App> {
         .route("/admin/audit", get(admin_audit))
 }
 
-async fn static_asset(Path(path): Path<String>) -> Response {
+/// Embedded assets with an `ETag` from the content hash and `no-cache`, so a
+/// browser revalidates on every load and picks up a rebuilt stylesheet or
+/// script immediately, at the cost of one cheap 304 per asset.
+async fn static_asset(Path(path): Path<String>, headers: axum::http::HeaderMap) -> Response {
     let Some(file) = Assets::get(&path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let mut etag = String::from("\"");
+    for b in file.metadata.sha256_hash() {
+        etag.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        etag.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+    }
+    etag.push('"');
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|candidate| candidate.trim() == etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, String::from("no-cache")),
+            ],
+        )
+            .into_response();
+    }
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
     (
         [
             (header::CONTENT_TYPE, mime.as_ref().to_owned()),
-            (header::CACHE_CONTROL, String::from("public, max-age=86400")),
+            (header::CACHE_CONTROL, String::from("no-cache")),
+            (header::ETAG, etag),
         ],
         file.data.into_owned(),
     )
