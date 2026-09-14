@@ -12,8 +12,8 @@ Your workspace members live here. The root `Cargo.toml` picks up every crate via
 | `quack-tui` | `quack-tui` binary: ratatui chat session | `quack-core`, `ratatui`, `ratatui-textarea`, `crossterm`, `rig`, `tokio` |
 
 Target layout (design doc section 4): `quack-cli` and `quack-tui` merge into a single
-`quack` crate (terminal, print mode, `serve`, `mcp`, admin), and `quack-desktop` is added
-for the Tauri app. Provider construction moves into `quack-core::llm`.
+`quack` crate (terminal, print mode, `serve`, `mcp`, admin, and later `desktop`). Two
+crates, no Cargo features. Provider construction moves into `quack-core::llm`.
 
 ## Adding a crate
 

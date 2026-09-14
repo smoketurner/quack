@@ -20,11 +20,12 @@ Around that core sit thin interfaces that all call the same functions:
   agents, over stdio or SSE.
 - **TUI** - a Claude Code-style terminal session, plus a non-interactive print mode for
   pipelines.
-- **Tauri desktop app** - the web UI in a native window with the core running in-process,
-  for laptops and offline use.
+- **Desktop window** (`quack desktop`) - the web UI in a native Tauri window with the
+  server running in-process, for laptops and offline use. Last on the roadmap, if built.
 
-One binary, `quack`, provides the server, the terminal, and the MCP transport; the Tauri
-app is a second binary that links the same core.
+One binary, `quack`, provides every interface. There are no Cargo features to enable or
+disable surfaces; every build of `quack` on every platform contains the server, the
+terminal, the MCP transport, and the admin commands.
 
 The tool works offline with local models via Ollama and with hosted providers (OpenAI,
 Anthropic, Azure OpenAI via OAuth, and anything OpenAI-compatible).
@@ -92,7 +93,7 @@ exports; the pgvector store does not need to be migrated in place (re-embedding 
 ```
 +------------------------------------------------------------------------------+
 |                                Interfaces                                     |
-|  web UI (askama+htmx) | REST | MCP (stdio, SSE) | TUI | print | Tauri desktop |
+|  web UI (askama+htmx) | REST | MCP (stdio, SSE) | TUI | print | desktop window |
 +------------------------------------------------------------------------------+
                                        |  in-process calls; no internal network hop
 +------------------------------------------------------------------------------+
@@ -123,16 +124,18 @@ Crates:
 ```
 crates/
   quack-core/      the engine
-  quack/           binary: `quack serve`, `quack mcp`, terminal session, print mode, admin
+  quack/           the one binary: `quack serve`, `quack mcp`, `quack desktop`,
+                   terminal session, print mode, admin
     src/
       main.rs          clap surface, crypto provider install
       terminal/        ratatui session
       print.rs         one-shot mode and output formats
       serve/           axum router, REST, SSE, MCP SSE transport, templates, embedded assets
       mcp_stdio.rs
-  quack-desktop/   Tauri app: starts the embedded server on a loopback port with a
-                   per-launch token and opens the web UI in the webview (section 11.6)
+      desktop.rs       `quack desktop`: embedded server + Tauri window (section 11.6)
 ```
+
+Two crates, no Cargo features. Surfaces are subcommands, not build variants.
 
 Every interface calls the same core entry points:
 
@@ -1058,14 +1061,21 @@ stdin that is not a TTY is data (loaded as table `stdin`, or as a pasted documen
 `--as-document`); stdout carries the answer or result set; stderr carries steps. Exit
 codes: 0 ok, 1 runtime error, 2 usage, 3 write refused, 4 auth required.
 
-### 11.6 Tauri desktop app
+### 11.6 Desktop window (`quack desktop`)
 
-`quack-desktop` links `quack-core` and the `serve` module, starts the axum server on a
-random loopback port with a per-launch bearer token, and opens the web UI in the webview
-with that token. Nothing is duplicated: the desktop app is the web UI plus native file
-dialogs, drag-drop of files and folders, a system tray, and OS keychain access for OAuth
-token keys. Data lives in the platform app-data directory as named workspaces. The local
-Ollama provider is auto-detected. Builds: `.dmg`, `.msi`, `.AppImage` via `tauri build`.
+`quack desktop` starts the embedded server on a random loopback port with a per-launch
+bearer token and opens the web UI in a Tauri webview with that token. Nothing is
+duplicated: the desktop window is the web UI plus native file dialogs, drag-drop of files
+and folders, a system tray, and OS keychain access for OAuth token keys. Data lives in the
+platform app-data directory as named workspaces. The local Ollama provider is
+auto-detected.
+
+It is a subcommand of the same `quack` binary, so the Tauri runtime is linked into every
+build. That cost is accepted in exchange for one artifact; if the size or the platform
+webview dependencies ever become a problem for the container image, the fallback is a
+separate `quack-desktop` crate, not a Cargo feature. Installer bundles (`.dmg`, `.msi`,
+`.AppImage`) wrap the same binary with `tauri build`. This is the last interface on the
+roadmap and may never be built.
 
 ---
 
@@ -1180,12 +1190,13 @@ tick_rate_ms = 50
 
 ## 14. Build and Distribution
 
-- **`quack` binary:** `serve` Cargo feature on by default; `--no-default-features` for a
-  terminal-and-MCP-only build. Static musl on Linux (`x86_64`, `aarch64`), native on macOS
+- **One binary, `quack`, no Cargo features.** Every surface is a subcommand and every
+  build contains all of them. Static musl on Linux (`x86_64`, `aarch64`), native on macOS
   and Windows. DuckDB and SQLite bundled; vss, fts, json, excel compiled in; scanner
   extensions fetched on `ATTACH` or pre-bundled with `quack extensions bundle` for
   air-gapped installs.
-- **`quack-desktop`:** Tauri 2 bundles for macOS, Windows, Linux.
+- **Desktop bundles:** when `quack desktop` exists, `tauri build` wraps the same binary
+  into `.dmg`, `.msi`, and `.AppImage` installers. Not a separate binary.
 - **mimalloc** (`secure`) as the global allocator.
 - **Crypto:** rustls + aws-lc-rs; `fips` as a build-time option; `cargo tree -i ring` and
   `-i openssl-sys` are release gates.
@@ -1198,7 +1209,7 @@ tick_rate_ms = 50
 - **Dependencies** follow the workspace rules in `CLAUDE.md`. New entries this design
   needs, versions looked up when added: `oauth2`, `keyring`, `argon2`, an MCP crate,
   `docx-rs`, `scraper` or `html2text`, `serde_yaml` or `serde_yml` for ontology
-  interchange, `tauri` (in the desktop crate only), `tower_governor`.
+  interchange, `tauri` (only when `quack desktop` is built), `tower_governor`.
 
 ---
 
@@ -1330,7 +1341,8 @@ Ordered by risk.
 - Charts: one spec, rendered everywhere
 - Providers: ollama, openai (and compatible), anthropic; auth none / api-key / OAuth PKCE
   with device code, encrypted cache, confidential-client mode for the server
-- Interfaces: web UI, REST API, MCP (stdio and SSE), TUI, print mode, Tauri desktop
+- Interfaces, all in one binary: web UI, REST API, MCP (stdio and SSE), TUI, print mode,
+  and `quack desktop` (last, if ever)
 - Server: users with password login, tokens with scopes, roles, audit, upload queue
 - Static builds, container image and compose, desktop bundles
 
@@ -1381,9 +1393,8 @@ deployment for document chat is the end of step 8.
 11. Graph: extraction from documents and mapped tables, resolution, provenance, traversal,
     tools, TUI tree, web graph page, stale and provisional handling.
 12. MCP over stdio and SSE.
-13. Tauri desktop app.
-14. `/attach`, XLSX, embedding dimension recording, `workspace snapshot`, `extensions
+13. `/attach`, XLSX, embedding dimension recording, `workspace snapshot`, `extensions
     bundle`.
-15. Release engineering: musl targets, macOS, Windows, container image, compose, desktop
-    bundles.
-16. AnythingLLM import command.
+14. Release engineering: musl targets, macOS, Windows, container image, compose.
+15. AnythingLLM import command.
+16. `quack desktop` and installer bundles, last and only if there is demand.

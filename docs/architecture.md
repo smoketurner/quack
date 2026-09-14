@@ -25,10 +25,11 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 
 ```
       +------------+  +------------+  +------------+  +------------+  +---------------+
-      |  web UI    |  |  REST API  |  |    MCP     |  | TUI/print  |  | quack-desktop |
-      |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |  | (Tauri, embeds|
-      |   htmx)    |  |            |  |  SSE)      |  |  clap)     |  |  the server)  |
+      |  web UI    |  |  REST API  |  |    MCP     |  | TUI/print  |  | quack desktop |
+      |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |  | (Tauri window |
+      |   htmx)    |  |            |  |  SSE)      |  |  clap)     |  |  over serve)  |
       +------------+  +------------+  +------------+  +------------+  +---------------+
+                        all subcommands of the single `quack` binary
              \               |               |               |                /
               +--------------+---------------+---------------+---------------+
                                              | in-process calls
@@ -47,7 +48,8 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 
 **Target crates** (design doc section 4): `quack-cli` and `quack-tui` merge into one
 `quack` crate providing `serve`, `mcp`, the terminal session, print mode, and admin
-subcommands; `quack-desktop` is added for the Tauri app. Provider construction moves from
+subcommands, with `quack desktop` as a later subcommand for the Tauri window. There are
+no Cargo features; every build contains every surface. Provider construction moves from
 the binaries into `quack-core::llm`.
 
 ## Core modules

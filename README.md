@@ -4,7 +4,7 @@ A knowledge engine with many interfaces, built in Rust. A workspace holds docume
 (vectorized for retrieval), tables (DuckDB analytics), and an ontology-backed knowledge
 graph; one agent answers questions across all three and shows every action it takes.
 The core is a library; the web UI, REST API, MCP server, terminal session, print mode,
-and desktop app are thin clients of it.
+and desktop window are thin clients of it, all subcommands of one `quack` binary.
 
 The full design is in [docs/design-doc.md](docs/design-doc.md). The code currently
 implements an earlier slice of it; section 17 of the design doc lists the gaps.

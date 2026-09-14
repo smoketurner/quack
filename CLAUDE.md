@@ -9,7 +9,8 @@ It also drives the `rust-agents` Claude Code plugin (conventions live in `.claud
 A knowledge engine with many interfaces, built in Rust. A workspace holds documents
 (vectorized), tables (DuckDB), and an ontology-backed knowledge graph; one agent answers
 across all three and shows every action. The core is a library; the web UI, REST API, MCP
-server, terminal session, print mode, and Tauri desktop app are thin clients of it. The
+server, terminal session, print mode, and desktop window are thin clients of it, all
+subcommands of one `quack` binary with no Cargo features. The
 design is `docs/design-doc.md`; read it before any non-trivial change, and check its
 section 17 for where the code still lags. The chosen stack:
 

@@ -39,7 +39,7 @@ Workspace members are auto-detected from `Cargo.toml`. Track these logical subsy
 
 - CLI: `cargo run --bin quack -- query|ingest|chat ...`
 - TUI: `cargo run --bin quack-tui -- -w <workspace>`
-- Target (design doc section 11): `quack -p`, `quack serve`, `quack mcp`, `quack-desktop`
+- Target (design doc section 11): `quack -p`, `quack serve`, `quack mcp`, `quack desktop`
 
 ## Critical Paths
 

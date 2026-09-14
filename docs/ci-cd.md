@@ -14,7 +14,7 @@
 These cover everything the workspace needs today. The pieces below produce and ship
 **binaries and containers** for the release targets in design doc section 14: the static
 `quack` binary for Linux (musl) and macOS, the `quack serve` container image, and later
-the `quack-desktop` Tauri bundles.
+the installer bundles around `quack desktop`.
 
 The repo ships them as **samples** that still reference placeholder `app-common`/
 `app-server`/`app-cli` crates — they won't build until those are renamed to `quack-core`
