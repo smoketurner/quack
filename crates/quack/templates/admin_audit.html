@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-xl font-semibold">Access audit</h1>
+<form method="get" action="/admin/audit" class="mt-4 flex flex-wrap items-end gap-2 text-sm">
+  <input name="action" value="{{ action }}" placeholder="action" class="rounded border border-slate-300 px-3 py-2">
+  <input name="outcome" value="{{ outcome }}" placeholder="outcome" class="rounded border border-slate-300 px-3 py-2">
+  <input name="workspace_id" value="{{ workspace_id }}" placeholder="workspace id" class="rounded border border-slate-300 px-3 py-2">
+  <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Filter</button>
+</form>
+<div class="mt-4 overflow-x-auto rounded border border-slate-200 bg-white">
+<table class="min-w-full text-xs"><thead><tr class="border-b border-slate-300 text-left uppercase text-slate-500"><th class="px-2 py-2">Time</th><th>Outcome</th><th>Channel</th><th>Action</th><th>User</th><th>Workspace</th><th>Resource</th><th>Client</th></tr></thead><tbody>
+  {% for r in rows %}<tr class="border-b border-slate-100 {% if r.outcome == "denied" %}bg-red-50{% endif %}"><td class="px-2 py-1 whitespace-nowrap">{{ r.timestamp }}</td><td>{{ r.outcome }}</td><td>{{ r.channel }}</td><td>{{ r.action }}</td><td class="font-mono">{{ r.user_id.as_deref().unwrap_or("-") }}</td><td class="font-mono">{{ r.workspace_id.as_deref().unwrap_or("-") }}</td><td class="font-mono">{{ r.resource_type.as_deref().unwrap_or("") }} {{ r.resource_id.as_deref().unwrap_or("") }}</td><td>{{ r.client_addr.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
+</tbody></table>
+</div>
+<p class="mt-2 text-xs text-slate-500">This is the access record: who touched which resource by id. The content detail is inside each workspace, visible to its members.</p>
+{% endblock %}

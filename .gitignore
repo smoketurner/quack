@@ -14,8 +14,9 @@
 .env.*
 !.env.example
 
-# Generated Tailwind CSS (built from styles/input.css)
-**/static/css/output.css
+# Tailwind CSS is built from styles/input.css with `make css-build` and committed
+# (crates/quack/static/css/output.css) because rust-embed needs it at compile time
+# and CI has no Tailwind binary.
 
 # Editor / OS
 .idea/

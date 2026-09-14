@@ -5,9 +5,9 @@
 mod admin;
 mod auth;
 mod context;
-mod documents;
+pub(crate) mod documents;
 mod members;
-mod query;
+pub(crate) mod query;
 mod sessions;
 mod tables;
 mod workspaces;

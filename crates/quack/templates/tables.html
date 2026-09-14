@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<div class="grid gap-6 md:grid-cols-[14rem_1fr]">
+  <aside>
+    <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Tables</h2>
+    {% if tables.is_empty() %}<p class="mt-2 text-sm text-slate-600">No tables. Upload a CSV, Parquet, or JSON file.</p>{% endif %}
+    <ul class="mt-2 space-y-1 text-sm">
+      {% for t in tables %}<li><a class="block rounded px-2 py-1 font-mono hover:bg-slate-100" href="/w/{{ ws.id }}/tables/{{ t }}">{{ t }}</a></li>{% endfor %}
+    </ul>
+  </aside>
+  <section>
+    {% if let Some(t) = selected %}
+    <h1 class="font-mono text-xl font-semibold">{{ t.name }}</h1>
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-500">Schema</h2>
+    <table class="mt-1 text-sm"><tbody>
+      {% for c in t.columns %}<tr><td class="pr-6 font-mono">{{ c.0 }}</td><td class="text-slate-600">{{ c.1 }}</td></tr>{% endfor %}
+    </tbody></table>
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-500">Sample rows</h2>
+    <div class="mt-1 overflow-x-auto rounded border border-slate-200 bg-white">
+      <table class="min-w-full text-sm">
+        <thead><tr class="border-b border-slate-300 text-left">{% for c in t.sample_columns %}<th class="px-3 py-2 font-mono">{{ c }}</th>{% endfor %}</tr></thead>
+        <tbody>{% for r in t.sample_rows %}<tr class="border-b border-slate-100">{% for v in r %}<td class="px-3 py-1">{{ v }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+      </table>
+    </div>
+    <p class="mt-4 text-sm"><a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/sql">Query it in SQL</a></p>
+    {% else %}
+    <p class="text-slate-600">Pick a table to see its schema and sample rows.</p>
+    {% endif %}
+  </section>
+</div>
+{% endif %}
+{% endblock %}

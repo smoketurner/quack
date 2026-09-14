@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title }} · quack</title>
+  <link rel="stylesheet" href="/static/css/output.css">
+  <script src="/static/js/htmx.min.js" defer></script>
+  <script src="/static/js/echarts.min.js" defer></script>
+  <script src="/static/js/app.js" defer></script>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-900">
+  <header class="border-b border-slate-200 bg-white">
+    <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
+      <a href="/workspaces" class="text-lg font-semibold tracking-tight">quack</a>
+      {% if let Some(ws) = page.workspace %}
+      <nav class="flex flex-wrap items-center gap-1 text-sm">
+        <span class="mr-2 rounded bg-slate-100 px-2 py-1 font-medium">{{ ws.name }} <span class="text-slate-500">· {{ ws.role }}</span></span>
+        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/chat">Chat</a>
+        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/documents">Documents</a>
+        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/tables">Tables</a>
+        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/sql">SQL</a>
+        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/context">Context</a>
+        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/settings">Settings</a>
+      </nav>
+      {% endif %}
+      <div class="ml-auto flex items-center gap-3 text-sm text-slate-600">
+        {% if page.is_admin %}
+        <a class="hover:underline" href="/admin/users">Users</a>
+        <a class="hover:underline" href="/admin/audit">Audit</a>
+        {% endif %}
+        <span>{{ page.username }}</span>
+        {% if !page.local %}
+        <form method="post" action="/logout"><button class="rounded border border-slate-300 px-2 py-1 hover:bg-slate-100" type="submit">Log out</button></form>
+        {% endif %}
+      </div>
+    </div>
+  </header>
+  <main class="mx-auto max-w-6xl px-4 py-6">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

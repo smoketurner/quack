@@ -10,10 +10,11 @@ use quack_core::ingestion;
 use quack_core::storage::control::Outcome;
 use serde::Deserialize;
 
-use crate::server::auth::{Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::UploadJob;
 use crate::server::state::{App, with_db};
+use quack_core::storage::workspace::DocumentInfo;
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -63,51 +64,81 @@ pub(crate) async fn upload(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    if content_type.starts_with("multipart/form-data") {
-        let mut multipart = Multipart::from_request(request, &app)
+    let files = if content_type.starts_with("multipart/form-data") {
+        let multipart = Multipart::from_request(request, &app)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?
-        {
-            let Some(name) = field.file_name().map(str::to_owned) else {
-                continue;
-            };
-            let data = field
-                .bytes()
-                .await
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            files.push((name, data.to_vec()));
-        }
+        multipart_files(multipart).await?
     } else {
         let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         let pasted: PastedText =
             serde_json::from_slice(&bytes).map_err(|e| ApiError::bad_request(e.to_string()))?;
-        if pasted.text.trim().is_empty() {
-            return Err(ApiError::bad_request("text must not be empty"));
-        }
-        let title = pasted
-            .title
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| String::from("pasted"));
-        let has_text_extension = std::path::Path::new(&title)
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"));
-        let filename = if has_text_extension {
-            title
-        } else {
-            format!("{title}.md")
+        vec![pasted_file(&pasted.text, pasted.title.as_deref())?]
+    };
+    let queued = enqueue(&app, &access, files).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "documents": queued })),
+    ))
+}
+
+/// Every part that carries a file name, as `(name, bytes)`.
+pub(crate) async fn multipart_files(mut multipart: Multipart) -> ApiResult<Vec<(String, Vec<u8>)>> {
+    let mut files = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?
+    {
+        let Some(name) = field.file_name().map(str::to_owned) else {
+            continue;
         };
-        files.push((filename, pasted.text.into_bytes()));
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if name.is_empty() && data.is_empty() {
+            continue;
+        }
+        files.push((name, data.to_vec()));
     }
+    Ok(files)
+}
+
+/// A pasted text becomes a Markdown (or `.txt`) file named by its title.
+pub(crate) fn pasted_file(text: &str, title: Option<&str>) -> ApiResult<(String, Vec<u8>)> {
+    if text.trim().is_empty() {
+        return Err(ApiError::bad_request("text must not be empty"));
+    }
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("pasted")
+        .to_owned();
+    let has_text_extension = std::path::Path::new(&title)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"));
+    let filename = if has_text_extension {
+        title
+    } else {
+        format!("{title}.md")
+    };
+    Ok((filename, text.as_bytes().to_vec()))
+}
+
+/// Register each file with status `queued`, audit it, and hand it to the
+/// workspace's upload lane. Returns `{id, filename, status}` per file.
+pub(crate) async fn enqueue(
+    app: &App,
+    access: &Access,
+    files: Vec<(String, Vec<u8>)>,
+) -> ApiResult<Vec<serde_json::Value>> {
     if files.is_empty() {
         return Err(ApiError::bad_request("no file or text in the request"));
     }
+    let id = access.workspace.id.clone();
     let db = app.workspace_db(&id).await?;
     let mut queued = Vec::new();
     for (filename, data) in files {
@@ -124,7 +155,7 @@ pub(crate) async fn upload(
         .await?;
         access
             .audit(
-                &app,
+                app,
                 "ingest",
                 Some(("document", &document_id)),
                 Outcome::Allowed,
@@ -148,10 +179,7 @@ pub(crate) async fn upload(
             serde_json::json!({ "id": document_id, "filename": filename, "status": "queued" }),
         );
     }
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "documents": queued })),
-    ))
+    Ok(queued)
 }
 
 #[derive(Deserialize)]
@@ -166,27 +194,38 @@ pub(crate) async fn update(
     Json(body): Json<UpdateDocument>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let doc_id = doc.clone();
+    let document = set_pinned(&app, &access, &doc, body.pinned).await?;
+    Ok(Json(serde_json::to_value(document)?))
+}
+
+/// Pin or unpin, audited.
+pub(crate) async fn set_pinned(
+    app: &App,
+    access: &Access,
+    doc: &str,
+    pinned: bool,
+) -> ApiResult<DocumentInfo> {
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let doc_id = doc.to_owned();
     let updated = with_db(db, move |db| {
         if db.document(&doc_id)?.is_none() {
             return Ok(None);
         }
-        db.set_document_pinned(&doc_id, body.pinned)?;
+        db.set_document_pinned(&doc_id, pinned)?;
         db.document(&doc_id)
     })
     .await?;
     let document = updated.ok_or_else(|| ApiError::not_found("no such document"))?;
     access
         .audit(
-            &app,
+            app,
             "context",
-            Some(("document", &doc)),
+            Some(("document", doc)),
             Outcome::Allowed,
-            Some(serde_json::json!({ "pinned": body.pinned })),
+            Some(serde_json::json!({ "pinned": pinned })),
         )
         .await?;
-    Ok(Json(serde_json::to_value(document)?))
+    Ok(document)
 }
 
 pub(crate) async fn remove(
@@ -195,8 +234,15 @@ pub(crate) async fn remove(
     Path((id, doc)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let doc_id = doc.clone();
+    delete_document(&app, &access, &doc).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete a document (and its table when it was loaded as one), audited.
+/// Returns the filename.
+pub(crate) async fn delete_document(app: &App, access: &Access, doc: &str) -> ApiResult<String> {
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let doc_id = doc.to_owned();
     let removed = with_db(db, move |db| {
         let Some(document) = db.document(&doc_id)? else {
             return Ok(None);
@@ -211,14 +257,14 @@ pub(crate) async fn remove(
     let filename = removed.ok_or_else(|| ApiError::not_found("no such document"))?;
     access
         .audit(
-            &app,
+            app,
             "delete",
-            Some(("document", &doc)),
+            Some(("document", doc)),
             Outcome::Allowed,
             Some(serde_json::json!({ "filename": filename })),
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(filename)
 }
 
 use axum::extract::FromRequest;

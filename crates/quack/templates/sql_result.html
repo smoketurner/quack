@@ -1,0 +1,14 @@
+{% if let Some(error) = error %}
+<p class="rounded border border-red-200 bg-red-50 px-3 py-2 font-mono text-sm text-red-800">{{ error }}</p>
+{% else %}
+<div class="flex items-center gap-4 text-sm text-slate-600">
+  <span>{{ row_count }} rows{% if truncated %} (showing {{ rows.len() }}){% endif %}</span>
+  <a class="text-blue-700 hover:underline" href="{{ csv_href }}">Download CSV</a>
+</div>
+<div class="mt-2 overflow-x-auto rounded border border-slate-200 bg-white">
+  <table class="min-w-full text-sm">
+    <thead><tr class="border-b border-slate-300 text-left">{% for c in columns %}<th class="px-3 py-2 font-mono">{{ c }}</th>{% endfor %}</tr></thead>
+    <tbody>{% for r in rows %}<tr class="border-b border-slate-100">{% for v in r %}<td class="px-3 py-1">{{ v }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+  </table>
+</div>
+{% endif %}

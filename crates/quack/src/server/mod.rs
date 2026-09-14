@@ -8,6 +8,7 @@ mod queue;
 mod state;
 #[cfg(test)]
 mod tests;
+mod web;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -88,6 +89,7 @@ pub(crate) fn router(app: App) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api/v1", api)
+        .merge(web::router())
         .layer(DefaultBodyLimit::max(upload_limit))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,

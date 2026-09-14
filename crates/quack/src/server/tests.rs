@@ -969,3 +969,257 @@ async fn local_mode_needs_no_login_and_owns_everything() {
         .await;
     assert!(rows.iter().all(|r| r.user_id.as_deref() == Some("local")));
 }
+
+// --- web UI ------------------------------------------------------------------
+
+impl Harness {
+    async fn page(
+        &self,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String, axum::http::HeaderMap) {
+        let mut builder = Request::builder().uri(path);
+        if let Some(token) = cookie {
+            builder = builder.header(header::COOKIE, format!("quack_session={token}"));
+        }
+        let request = builder
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (status, body, headers) = self.send(request).await;
+        (
+            status,
+            body.as_str().unwrap_or_default().to_owned(),
+            headers,
+        )
+    }
+
+    async fn form(
+        &self,
+        path: &str,
+        cookie: Option<&str>,
+        form: &str,
+    ) -> (StatusCode, String, axum::http::HeaderMap) {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(token) = cookie {
+            builder = builder.header(header::COOKIE, format!("quack_session={token}"));
+        }
+        let request = builder
+            .body(Body::from(form.to_owned()))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (status, body, headers) = self.send(request).await;
+        (
+            status,
+            body.as_str().unwrap_or_default().to_owned(),
+            headers,
+        )
+    }
+}
+
+fn location(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
+    let h = harness(false).await;
+    h.user("root", true).await;
+    let (status, _, headers) = h.page("/workspaces", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/login");
+    let (status, html, _) = h.page("/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("<form method=\"post\" action=\"/login\""),
+        "{html}"
+    );
+    let (status, _, headers) = h.form("/login", None, "username=root&password=wrong").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location(&headers).starts_with("/login?error="));
+    let (status, _, headers) = h.form("/login", None, "username=root&password=pw").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/workspaces");
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(cookie.starts_with("qs_"));
+
+    let (status, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let chat_url = location(&headers);
+    assert!(chat_url.ends_with("/chat"), "{chat_url}");
+    let ws = chat_url
+        .trim_start_matches("/w/")
+        .trim_end_matches("/chat")
+        .to_owned();
+
+    let (status, html, _) = h.page("/workspaces", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("team") && html.contains("owner"), "{html}");
+    let (status, html, _) = h.page(&chat_url, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("id=\"chat\"") && html.contains(&format!("data-workspace=\"{ws}\"")),
+        "{html}"
+    );
+    assert!(html.contains("Allow the agent to change tables"));
+
+    // Documents: paste through the form, then the polled rows fragment.
+    let boundary = "webform";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nnotes\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nhello from the web\r\n--{boundary}--\r\n"
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/w/{ws}/documents"))
+        .header(header::COOKIE, format!("quack_session={cookie}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, headers) = h.send(request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/documents"));
+    let (status, html, _) = h.page(&format!("/w/{ws}/documents"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("notes.md"), "{html}");
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/rows"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("hx-post=\"/w/") && html.contains("/pin\""),
+        "{html}"
+    );
+
+    // SQL grid and CSV download.
+    let (status, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            "sql=SELECT+1+AS+n%2C+%27a%27+AS+s",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("<th class=\"px-3 py-2 font-mono\">n</th>") && html.contains("Download CSV"),
+        "{html}"
+    );
+    let (status, csv, headers) = h
+        .page(&format!("/w/{ws}/sql.csv?sql=SELECT+1+AS+n"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|c| c.to_str().unwrap_or_default().starts_with("text/csv"))
+    );
+    assert_eq!(csv, "n\n1\n");
+    let (status, html, _) = h
+        .form(&format!("/w/{ws}/sql"), Some(&cookie), "sql=SELEC+broken")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("text-red-800"), "{html}");
+
+    // Context, settings, tables, admin pages all render.
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/context"),
+            Some(&cookie),
+            "content=Be+brief.",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/context"));
+    let (status, html, _) = h.page(&format!("/w/{ws}/context"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Be brief.") && html.contains("by root"),
+        "{html}"
+    );
+    let (status, html, _) = h.page(&format!("/w/{ws}/settings"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("API tokens") && html.contains("Members"),
+        "{html}"
+    );
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/tokens"),
+            Some(&cookie),
+            "name=ci&scopes=read&scopes=write",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        location(&headers).contains("?token=qk_"),
+        "{}",
+        location(&headers)
+    );
+    let (status, html, _) = h.page(&format!("/w/{ws}/tables"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("No tables"), "{html}");
+    let (status, html, _) = h.page("/admin/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("root"), "{html}");
+    let (status, html, _) = h.page("/admin/audit?outcome=denied", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Access audit"), "{html}");
+
+    // Static assets and the error page.
+    let (status, css, headers) = h.page("/static/css/output.css", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|c| c.to_str().unwrap_or_default().starts_with("text/css"))
+    );
+    assert!(css.contains("tailwindcss"));
+    let (status, _, _) = h.page("/static/nope.js", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, html, _) = h.page("/w/nope/chat", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(html.contains("no such workspace"), "{html}");
+
+    // A non-member sees the 403 page, not the content.
+    h.user("bob", false).await;
+    let (_, _, headers) = h.form("/login", None, "username=bob&password=pw").await;
+    let bob = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    let (status, html, _) = h.page(&format!("/w/{ws}/documents"), Some(&bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(html.contains("not a member"), "{html}");
+    let (status, _, _) = h.page("/admin/users", Some(&bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_mode_web_skips_login() {
+    let h = harness(true).await;
+    let (status, _, headers) = h.page("/login", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/workspaces");
+    let (status, html, _) = h.page("/workspaces", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("New workspace") && !html.contains("Log out"),
+        "{html}"
+    );
+}

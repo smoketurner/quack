@@ -1,0 +1,28 @@
+{% if documents.is_empty() %}
+<p class="text-slate-600">No documents yet.</p>
+{% else %}
+<table class="w-full border-collapse text-sm">
+  <thead><tr class="border-b border-slate-300 text-left text-xs uppercase text-slate-500"><th class="py-2">File</th><th>Status</th><th>Size</th><th>Ingested</th><th></th></tr></thead>
+  <tbody>
+  {% for d in documents %}
+  <tr id="doc-{{ d.id }}" class="border-b border-slate-200">
+    <td class="py-2 font-medium">{{ d.filename }}{% if d.pinned %} <span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">pinned</span>{% endif %}</td>
+    <td>{{ d.status }}{% if let Some(err) = d.error_message %} <span class="text-red-700">{{ err }}</span>{% endif %}</td>
+    <td>{{ d.size_bytes.unwrap_or(0) }}</td>
+    <td class="text-slate-500">{{ d.ingested_at }}</td>
+    <td class="text-right">
+      {% if can_write %}
+      {% if d.pinned %}
+      <button class="text-blue-700 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/unpin" hx-target="#rows" hx-swap="innerHTML">Unpin</button>
+      {% else %}
+      <button class="text-blue-700 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/pin" hx-target="#rows" hx-swap="innerHTML">Pin</button>
+      {% endif %}
+      <button class="ml-3 text-red-700 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/delete" hx-confirm="Delete {{ d.filename }}?" hx-target="#rows" hx-swap="innerHTML">Delete</button>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if pending %}<p class="mt-2 text-xs text-slate-500">Processing… this list refreshes itself.</p>{% endif %}
+{% endif %}

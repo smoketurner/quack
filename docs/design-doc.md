@@ -951,10 +951,14 @@ the tree.
 
 ### 11.1 Web UI
 
-Server-rendered askama templates, Tailwind compiled at build time with the standalone
-binary (no Node.js), htmx for interactivity, a custom ECharts build (bar, line, scatter,
-pie, graph series), all embedded with `rust-embed`. This is the replacement for the
-AnythingLLM screen people use today and must cover:
+Server-rendered askama templates, Tailwind compiled with the standalone binary (no
+Node.js; the built CSS is committed so `cargo build` needs no Tailwind), htmx for
+interactivity, ECharts (the full minified build, vendored; a trimmed custom build needs
+Node and can replace it later), all embedded with `rust-embed`. The chat's permission
+step is an "allow the agent to change tables" checkbox on the message rather than a
+mid-stream dialog: an HTTP response cannot ask a question back, and a refused write
+tells the user to tick it and ask again. This is the replacement for the AnythingLLM
+screen people use today and must cover:
 
 - Workspace list and switcher; workspace settings (context editor with version history,
   mode default, allowed providers, members).
@@ -1316,9 +1320,12 @@ updated as issues close. Ordered by risk.
 2. ~~No OAuth~~ (#25, closed): PKCE and device-code login, encrypted cache, `quack auth`;
    the server's confidential-client mode is wired (`client_secret_env`) and gets its live
    test with #26. Section 10.2.
-3. **Server** (#26): the REST API, auth, roles, split audit, and upload queue are in;
-   the web UI is in progress. **No MCP** (#29); **no desktop window** (#35).
-   Sections 11, 12.
+3. ~~No server, REST API, web UI~~ (#26, closed): `quack serve` with the REST API,
+   password and token auth, roles, the split audit, the upload queue, and the askama +
+   htmx web UI (workspaces, chat with steps, citations, and charts, documents, tables,
+   SQL, context editor, settings with members and tokens, admin users and audit). The
+   graph and ontology pages arrive with #27 and #28. **No MCP** (#29); **no desktop
+   window** (#35). Sections 11, 12.
 4. **No ontology or induction** (#27); **no graph** (#28). Sections 6.3 to 6.5.
 5. **DOCX, HTML, PPTX, XLSX unsupported** (#16; XLSX via a Rust reader). Sections 6.1, 6.2.
 6. **No `ATTACH` to external databases** (#21): needs a Rust-side design now that scanner
@@ -1332,8 +1339,8 @@ updated as issues close. Ordered by risk.
 10. **No release pipeline** (#30). Section 14.
 11. **No stemming in keyword search** (#31, deliberately deferred); **no reranking hook**
     (#34); **large-workspace vector index options** (#32, research). Sections 6.1, 15.
-12. **Web UI mapping of the chart spec to ECharts** arrives with the web UI (#26).
-    Section 9.
+12. ~~Web UI mapping of the chart spec to ECharts~~ (#26, closed): `static/js/app.js`
+    maps the spec to an ECharts option. Section 9.
 
 ---
 
@@ -1404,9 +1411,9 @@ deployment for document chat is the end of step 8.
 6. ~~Workspace context (stored, versioned, import/export), the prompt rewrite, and the
    chart spec with its terminal renderer.~~ Done.
 7. ~~OAuth: `TokenManager`, PKCE and device code, cache, `quack auth`.~~ Done.
-8. `quack serve`: `control.db`, users, tokens, roles, split audit, upload queue; REST API;
-   SSE; web UI (workspaces, chat with citations, documents, tables, context editor).
-   **Milestone: document chat replacement.**
+8. ~~`quack serve`: `control.db`, users, tokens, roles, split audit, upload queue; REST
+   API; SSE; web UI (workspaces, chat with citations, documents, tables, context
+   editor).~~ Done. **Milestone: document chat replacement.**
 9. Ontology: tables, model, validation, default, versioning, YAML interchange, prompt
    rendering, editor page, API.
 10. Ontology induction: table evidence, document evidence, candidates, review queue,

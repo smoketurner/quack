@@ -7,9 +7,8 @@ CARGO ?= cargo
 
 BIN ?= quack
 
-# Name of the server crate used by the CSS targets. Override once you create it:
-#   make css-build SERVER_CRATE=my-server
-SERVER_CRATE ?= app-server
+# The crate whose templates Tailwind scans; its built CSS is committed.
+SERVER_CRATE ?= quack
 
 .PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny hooks css-dev css-build run help
 
@@ -55,10 +54,10 @@ hooks: ## Install prek git hooks (pre-commit + pre-push)
 
 ##@ UI assets
 
-css-dev: ## Watch and rebuild Tailwind CSS for the server crate
+css-dev: ## Watch and rebuild Tailwind CSS for the web UI (commit the result)
 	cd crates/$(SERVER_CRATE) && tailwindcss -i styles/input.css -o static/css/output.css --watch
 
-css-build: ## Build minified Tailwind CSS for the server crate
+css-build: ## Build minified Tailwind CSS for the web UI (commit the result)
 	cd crates/$(SERVER_CRATE) && tailwindcss -i styles/input.css -o static/css/output.css --minify
 
 ##@ Run

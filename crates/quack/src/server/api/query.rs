@@ -297,6 +297,16 @@ pub(crate) struct SqlRequest {
 
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
+/// A capped result set for the API and the web grid.
+pub(crate) struct SqlOutcome {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub row_count: usize,
+    pub truncated: bool,
+}
+
+/// Direct SQL. Reads need the viewer role; anything that mutates needs the
+/// member role and the write scope. `_quack_` tables are never reachable.
 pub(crate) async fn sql(
     State(app): State<App>,
     identity: Identity,
@@ -304,8 +314,23 @@ pub(crate) async fn sql(
     Json(body): Json<SqlRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let db = app.workspace_db(&id).await?;
-    let sql = body.sql.clone();
+    let outcome = execute_sql(&app, &access, &body.sql).await?;
+    Ok(Json(serde_json::json!({
+        "columns": outcome.columns,
+        "rows": outcome.rows,
+        "row_count": outcome.row_count,
+        "truncated": outcome.truncated,
+    })))
+}
+
+/// Classify, authorize, run, and audit one statement for an `Access`.
+pub(crate) async fn execute_sql(
+    app: &App,
+    access: &Access,
+    statement: &str,
+) -> ApiResult<SqlOutcome> {
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let sql = statement.to_owned();
     let kind = with_db(Arc::clone(&db), move |db| {
         if db.references_internal_table(&sql)? {
             return Err(quack_core::error::Error::Analysis(String::from(
@@ -321,21 +346,16 @@ pub(crate) async fn sql(
         StatementKind::Write => true,
         StatementKind::Invalid(message) => return Err(ApiError::bad_request(message)),
     };
+    let detail = serde_json::json!({ "sql": statement });
     if is_write && !access.permits(Need::WRITE) {
         access
-            .audit(
-                &app,
-                "sql",
-                None,
-                Outcome::Denied,
-                Some(serde_json::json!({ "sql": body.sql })),
-            )
+            .audit(app, "sql", None, Outcome::Denied, Some(detail))
             .await?;
         return Err(ApiError::forbidden(
             "writes need the member role and the write scope",
         ));
     }
-    let sql = body.sql.clone();
+    let sql = statement.to_owned();
     let max_rows = app.config.analysis.max_query_rows;
     let result = with_db(db, move |db| db.execute_query(&sql)).await;
     let outcome = if result.is_ok() {
@@ -344,24 +364,18 @@ pub(crate) async fn sql(
         Outcome::Error
     };
     access
-        .audit(
-            &app,
-            "sql",
-            None,
-            outcome,
-            Some(serde_json::json!({ "sql": body.sql })),
-        )
+        .audit(app, "sql", None, outcome, Some(detail))
         .await?;
     let results = result
         .map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.message))?;
     let total = results.rows.len();
     let capped = results.clone_capped(max_rows);
-    Ok(Json(serde_json::json!({
-        "columns": capped.columns,
-        "rows": capped.rows,
-        "row_count": total,
-        "truncated": capped.rows.len() < total,
-    })))
+    Ok(SqlOutcome {
+        truncated: capped.rows.len() < total,
+        columns: capped.columns,
+        rows: capped.rows,
+        row_count: total,
+    })
 }
 
 #[derive(Deserialize)]

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<h1 class="text-xl font-semibold">SQL</h1>
+<form hx-post="/w/{{ ws.id }}/sql" hx-target="#result" hx-swap="innerHTML" class="mt-4">
+  <textarea name="sql" rows="6" required class="w-full rounded border border-slate-300 px-3 py-2 font-mono text-sm" placeholder="SELECT * FROM ...">{{ sql }}</textarea>
+  <div class="mt-2 flex items-center gap-3 text-sm">
+    <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Run</button>
+    {% if !ws.can_write %}<span class="text-slate-500">Read-only: your role cannot change tables.</span>{% endif %}
+  </div>
+</form>
+<div id="result" class="mt-6">{{ result|safe }}</div>
+{% endif %}
+{% endblock %}

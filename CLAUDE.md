@@ -83,7 +83,7 @@ cargo run --bin quack -- -w ws                                                 #
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
-cargo run --bin quack -- serve [--bind ADDR] [--local]                          # REST API under /api/v1 (design doc 11.2)
+cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI and REST API under /api/v1
 ```
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
@@ -121,7 +121,11 @@ workspace-touching handler then records the allowed row plus its `_quack_audit` 
 through `Access::audit`. `query/stream` forwards the agent event stream as SSE (`text`,
 `tool_started`, `tool_finished`, `complete`, `error`); uploads return 202 and are processed
 by `queue.rs`, one bounded lane per workspace, which locks the workspace only around each
-database step. Tests drive the router with `tower::ServiceExt::oneshot` and no model. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
+database step. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
+the same `access()` checks and the API's helpers; `WebUser` redirects to `/login` instead
+of a 401; the built Tailwind CSS is committed (`make css-build` after template edits) and
+htmx and ECharts are vendored (`docs/web-ui.md`). Tests drive the router with
+`tower::ServiceExt::oneshot` and no model. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
 `quack ontology propose`, ...) is in design doc section 11.
 
 ## Common commands

@@ -16,8 +16,9 @@ workspace = true
 [dependencies]
 quack-core         = { path = "../quack-core" }
 anyhow             = { workspace = true, features = ["std"] }
+askama             = { workspace = true, features = ["derive", "std", "config"] }
 axum               = { workspace = true, features = ["http1", "json", "query", "form", "tokio", "multipart", "matched-path"] }
-axum-extra         = { workspace = true, features = ["cookie"] }
+axum-extra         = { workspace = true, features = ["cookie", "form"] }
 base64             = { workspace = true, features = ["std"] }
 clap               = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm          = { workspace = true }
@@ -25,8 +26,10 @@ dirs               = { workspace = true }
 futures            = { workspace = true, features = ["std"] }
 jiff               = { workspace = true, features = ["std"] }
 mimalloc           = { workspace = true, features = ["secure"] }
+mime_guess         = { workspace = true }
 ratatui            = { workspace = true, features = ["crossterm"] }
 ratatui-textarea   = { workspace = true, features = ["crossterm"] }
+rust-embed         = { workspace = true, features = ["deterministic-timestamps"] }
 serde              = { workspace = true, features = ["derive", "std"] }
 serde_json         = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }

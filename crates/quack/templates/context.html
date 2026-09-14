@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<h1 class="text-xl font-semibold">Workspace context</h1>
+<p class="mt-1 text-sm text-slate-600">Instructions and definitions the agent follows in every turn: persona, what columns mean, how metrics are defined, known data problems.</p>
+{% if let Some(c) = current %}<p class="mt-2 text-xs text-slate-500">Version {{ c.version }}, {{ c.edited_at }}{% if let Some(by) = c.edited_by %} by {{ by }}{% endif %}</p>{% endif %}
+<form method="post" action="/w/{{ ws.id }}/context" class="mt-4">
+  <textarea name="content" rows="16" class="w-full rounded border border-slate-300 px-3 py-2 font-mono text-sm" {% if !ws.can_write %}readonly{% endif %}>{{ content }}</textarea>
+  {% if ws.can_write %}<button type="submit" class="mt-2 rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-700">Save as new version</button>{% endif %}
+</form>
+{% if !versions.is_empty() %}
+<h2 class="mt-8 text-sm font-semibold uppercase text-slate-500">History</h2>
+<ul class="mt-2 divide-y divide-slate-200 rounded border border-slate-200 bg-white text-sm">
+  {% for v in versions %}
+  <li class="px-4 py-2"><details><summary class="cursor-pointer">v{{ v.version }} · {{ v.edited_at }}{% if let Some(by) = v.edited_by %} · {{ by }}{% endif %}</summary><pre class="mt-2 whitespace-pre-wrap font-mono text-xs">{{ v.content }}</pre></details></li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endif %}
+{% endblock %}

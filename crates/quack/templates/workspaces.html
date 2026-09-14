@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-xl font-semibold">Workspaces</h1>
+{% if let Some(error) = error %}
+<p class="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{{ error }}</p>
+{% endif %}
+{% if workspaces.is_empty() %}
+<p class="mt-4 text-slate-600">No workspaces yet.</p>
+{% else %}
+<ul class="mt-4 divide-y divide-slate-200 rounded border border-slate-200 bg-white">
+  {% for ws in workspaces %}
+  <li class="flex items-center gap-4 px-4 py-3">
+    <a class="font-medium text-blue-700 hover:underline" href="/w/{{ ws.id }}/chat">{{ ws.name }}</a>
+    <span class="text-sm text-slate-500">{{ ws.classification }}</span>
+    <span class="ml-auto rounded bg-slate-100 px-2 py-0.5 text-xs">{{ ws.role }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if can_create %}
+<form method="post" action="/workspaces" class="mt-6 flex items-end gap-2">
+  <label class="text-sm"><span class="text-slate-700">New workspace</span>
+    <input name="name" required class="mt-1 block rounded border border-slate-300 px-3 py-2" placeholder="name"></label>
+  <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Create</button>
+</form>
+{% endif %}
+{% endblock %}
