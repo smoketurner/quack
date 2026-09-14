@@ -288,6 +288,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces", get(workspaces).post(create_workspace))
         .route("/w/{id}", get(workspace_index))
         .route("/w/{id}/chat", get(chat))
+        .route("/w/{id}/chat/{sid}/delete", post(delete_session))
         .route("/w/{id}/documents", get(documents).post(upload))
         .route("/w/{id}/documents/rows", get(document_rows))
         .route("/w/{id}/documents/{doc}/pin", post(pin))
@@ -610,6 +611,16 @@ async fn chat(
         current,
         messages: messages.iter().filter_map(message_view).collect(),
     })
+}
+
+async fn delete_session(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, sid)): Path<(String, String)>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    super::api::sessions::delete_session(&app, &access, &sid).await?;
+    Ok(Redirect::to(&format!("/w/{id}/chat")).into_response())
 }
 
 async fn render_rows(app: &App, access: &Access) -> WebResult<String> {

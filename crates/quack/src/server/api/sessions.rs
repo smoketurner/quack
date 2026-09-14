@@ -82,6 +82,48 @@ pub(crate) async fn show(
     ))
 }
 
+/// Delete a session: its creator, or an owner, may. Audited as `delete`.
+pub(crate) async fn remove(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, sid)): Path<(String, String)>,
+) -> ApiResult<axum::http::StatusCode> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    delete_session(&app, &access, &sid).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// The shared delete behind the API and the web button.
+pub(crate) async fn delete_session(
+    app: &App,
+    access: &crate::server::auth::Access,
+    sid: &str,
+) -> ApiResult<()> {
+    let session = visible_session(app, access, &access.workspace.id, sid).await?;
+    let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
+    if !mine && !access.sees_all_sessions() {
+        access
+            .audit(app, "delete", Some(("session", sid)), Outcome::Denied, None)
+            .await?;
+        return Err(ApiError::forbidden(
+            "only the session's creator or an owner may delete it",
+        ));
+    }
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let session_id = session.id.clone();
+    with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
+    access
+        .audit(
+            app,
+            "delete",
+            Some(("session", sid)),
+            Outcome::Allowed,
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub(crate) struct ExportQuery {
     #[serde(default = "default_format")]

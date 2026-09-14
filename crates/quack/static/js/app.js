@@ -70,6 +70,30 @@
     return { article: article, details: details, summary: summary, steps: steps, body: body, working: working, count: 0 };
   }
 
+  // The sidebar lists sessions at render time; a session started from this
+  // page appears once its first answer completes.
+  function addSessionEntry(chat, sessionId, prompt) {
+    var list = document.getElementById("sessions");
+    if (!list) return;
+    var ws = chat.getAttribute("data-workspace");
+    var li = el("li", "group flex items-start gap-1");
+    var a = el("a", "block min-w-0 flex-1 truncate rounded bg-slate-100 px-2 py-1");
+    a.href = "/w/" + ws + "/chat?session=" + sessionId;
+    a.textContent = prompt.length > 80 ? prompt.slice(0, 80) : prompt;
+    a.appendChild(el("span", "block text-xs text-slate-500", "just now · " + document.getElementById("ask").mode.value));
+    li.appendChild(a);
+    var form = el("form");
+    form.method = "post";
+    form.action = "/w/" + ws + "/chat/" + sessionId + "/delete";
+    form.onsubmit = function () { return confirm("Delete this session?"); };
+    var button = el("button", "rounded px-2 py-1 text-slate-400 hover:bg-red-50 hover:text-red-700", "×");
+    button.type = "submit";
+    button.title = "Delete session";
+    form.appendChild(button);
+    li.appendChild(form);
+    list.insertBefore(li, list.firstChild);
+  }
+
   function setWorking(view, text) {
     if (!view.working) return;
     view.working.lastChild.textContent = text;
@@ -117,6 +141,7 @@
     messages.appendChild(user);
     form.prompt.value = "";
     var view = startAssistant(messages);
+    view.prompt = prompt;
     setBusy(form, true);
     status.textContent = "";
     var body = { prompt: prompt, mode: form.mode.value };
@@ -199,6 +224,7 @@
       if (!chat.getAttribute("data-session") && r.session_id) {
         chat.setAttribute("data-session", r.session_id);
         history.replaceState(null, "", "?session=" + r.session_id);
+        addSessionEntry(chat, r.session_id, view.prompt);
       }
       finishWorking(view);
     } else if (event === "error") {

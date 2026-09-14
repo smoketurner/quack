@@ -941,6 +941,120 @@ async fn a_failed_first_turn_leaves_no_empty_session_behind() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sessions_are_deleted_by_their_creator_or_an_owner() {
+    use quack_core::storage::sessions::{ChatMode, create_session};
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let viewer = h.user("viewer", false).await;
+    let other = h.user("other", false).await;
+    let ws = h.workspace("s", &owner).await;
+    for u in [&viewer, &other] {
+        h.app
+            .control
+            .set_member(&ws, u, Role::Viewer)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let (mine, theirs) = {
+        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
+        let mine = create_session(&guard, "m", ChatMode::Chat, Some(&viewer))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let theirs = create_session(&guard, "m", ChatMode::Chat, Some(&other))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        (mine.id, theirs.id)
+    };
+    let viewer_token = h.login("viewer").await;
+    let owner_token = h.login("owner").await;
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{ws}/sessions/{theirs}"),
+            Some(&viewer_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "another user's session is invisible"
+    );
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{ws}/sessions/{mine}"),
+            Some(&viewer_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{ws}/sessions/{theirs}"),
+            Some(&owner_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{ws}/sessions/{theirs}"),
+            Some(&owner_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, body) = h
+        .get(&format!("/api/v1/workspaces/{ws}/sessions"), &owner_token)
+        .await;
+    assert_eq!(body["sessions"], serde_json::json!([]));
+    let deletes = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("delete")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(deletes.len(), 2);
+    assert!(
+        deletes
+            .iter()
+            .all(|r| r.resource_type.as_deref() == Some("session"))
+    );
+
+    // The web button redirects back to the chat page; a missing session is a 404 page.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    let (status, _, _) = h
+        .form(&format!("/w/{ws}/chat/nope/delete"), Some(&cookie), "")
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let fresh = {
+        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
+        create_session(&guard, "m", ChatMode::Chat, Some(&owner))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .id
+    };
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/chat/{fresh}/delete"), Some(&cookie), "")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/chat"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_endpoints_manage_users_and_read_the_audit() {
     let h = harness(false).await;
     h.user("root", true).await;

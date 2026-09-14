@@ -8,7 +8,7 @@ mod context;
 pub(crate) mod documents;
 mod members;
 pub(crate) mod query;
-mod sessions;
+pub(crate) mod sessions;
 mod tables;
 mod workspaces;
 
@@ -53,7 +53,10 @@ pub(crate) fn router() -> Router<App> {
         )
         .route("/workspaces/{id}/context/versions", get(context::versions))
         .route("/workspaces/{id}/sessions", get(sessions::list))
-        .route("/workspaces/{id}/sessions/{sid}", get(sessions::show))
+        .route(
+            "/workspaces/{id}/sessions/{sid}",
+            get(sessions::show).delete(sessions::remove),
+        )
         .route(
             "/workspaces/{id}/sessions/{sid}/export",
             get(sessions::export),

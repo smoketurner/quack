@@ -521,6 +521,26 @@ pub fn export_markdown(session: &SessionRow, rows: &[MessageRow]) -> Result<Stri
     Ok(out)
 }
 
+/// Remove a session and every message in it. Returns whether it existed.
+///
+/// # Errors
+///
+/// Returns an error if a delete fails.
+pub fn delete_session(db: &WorkspaceDb, session_id: &str) -> Result<bool> {
+    if get_session(db, session_id)?.is_none() {
+        return Ok(false);
+    }
+    db.connection().execute(
+        "DELETE FROM _quack_messages WHERE session_id = ?",
+        duckdb::params![session_id],
+    )?;
+    db.connection().execute(
+        "DELETE FROM _quack_sessions WHERE id = ?",
+        duckdb::params![session_id],
+    )?;
+    Ok(true)
+}
+
 /// Remove a session that never recorded a message (a failed first turn).
 /// Returns whether it was removed.
 ///
@@ -572,6 +592,22 @@ mod tests {
             summary: summary.to_owned(),
             duration_ms: 7,
         }
+    }
+
+    #[test]
+    fn delete_session_removes_its_messages_too() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let session =
+            create_session(&db, "m", ChatMode::Chat, None).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(append_message(&db, &session.id, MessageRole::User, "hi", None).is_ok());
+        assert!(delete_session(&db, &session.id).is_ok_and(|d| d));
+        assert!(get_session(&db, &session.id).is_ok_and(|s| s.is_none()));
+        let left: i64 = db
+            .connection()
+            .query_row("SELECT count(*) FROM _quack_messages", [], |r| r.get(0))
+            .unwrap_or(-1);
+        assert_eq!(left, 0);
+        assert!(delete_session(&db, &session.id).is_ok_and(|d| !d));
     }
 
     #[test]
