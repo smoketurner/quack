@@ -423,23 +423,44 @@ async fn run_agent_inner(
         "ollama" => {
             let client = providers::build_ollama_client(chat_config)?;
             let model = client.completion_model(&chat_model_name);
-            agent::run_analysis(ws_db, model, embedding_model, &config.analysis, message)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            agent::run_analysis(
+                ws_db,
+                model,
+                embedding_model,
+                &config.analysis,
+                &config.retrieval,
+                message,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
         }
         "openai" => {
             let client = providers::build_openai_client(chat_config)?;
             let model = client.completion_model(&chat_model_name);
-            agent::run_analysis(ws_db, model, embedding_model, &config.analysis, message)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            agent::run_analysis(
+                ws_db,
+                model,
+                embedding_model,
+                &config.analysis,
+                &config.retrieval,
+                message,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
         }
         "anthropic" => {
             let client = providers::build_anthropic_client(chat_config)?;
             let model = client.completion_model(&chat_model_name);
-            agent::run_analysis(ws_db, model, embedding_model, &config.analysis, message)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            agent::run_analysis(
+                ws_db,
+                model,
+                embedding_model,
+                &config.analysis,
+                &config.retrieval,
+                message,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
         }
         other => anyhow::bail!("unsupported provider type: {other}"),
     };

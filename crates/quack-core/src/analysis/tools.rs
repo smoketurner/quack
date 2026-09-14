@@ -1,12 +1,13 @@
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
+use rig::embeddings::EmbeddingModel;
 use rig::tool::{Tool, ToolContext};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{ChunkSearchResult, WorkspaceDb};
 
 use super::chart;
 use super::text_to_sql;
@@ -88,6 +89,115 @@ impl Tool for RunSqlTool {
         text_to_sql::format_query_result(&results, self.max_query_rows)
             .map_err(|e| ToolError::Query(e.to_string()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// search_documents
+// ---------------------------------------------------------------------------
+
+pub struct SearchDocumentsTool<M> {
+    db: SharedDb,
+    embedding_model: M,
+    default_top_k: u32,
+}
+
+impl<M> SearchDocumentsTool<M> {
+    pub fn new(db: SharedDb, embedding_model: M, default_top_k: u32) -> Self {
+        Self {
+            db,
+            embedding_model,
+            default_top_k,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SearchDocumentsArgs {
+    /// Natural-language query to search the ingested documents for
+    pub query: String,
+    /// Number of chunks to return (default from config)
+    pub top_k: Option<u32>,
+    /// Restrict the search to these document ids (from `list_documents`)
+    #[serde(default)]
+    pub document_ids: Vec<String>,
+}
+
+impl<M> Tool for SearchDocumentsTool<M>
+where
+    M: EmbeddingModel + Send + Sync,
+{
+    const NAME: &'static str = "search_documents";
+    type Error = ToolError;
+    type Args = SearchDocumentsArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Semantic search over the ingested documents. Returns the most relevant text chunks, \
+             each numbered [n] with its source filename, for citing in the answer.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(SearchDocumentsArgs))
+            .unwrap_or_else(|_| json!({"type": "object"}))
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let embedding = self
+            .embedding_model
+            .embed_text(&args.query)
+            .await
+            .map_err(|e| ToolError::Embedding(e.to_string()))?;
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
+        )]
+        let query_vec: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
+
+        let top_k = args.top_k.unwrap_or(self.default_top_k).max(1);
+
+        let results = {
+            let db = self
+                .db
+                .lock()
+                .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
+            db.search_similar_chunks(&query_vec, top_k, &args.document_ids)
+                .map_err(|e| ToolError::Query(e.to_string()))?
+        };
+
+        format_search_results(&results).map_err(Into::into)
+    }
+}
+
+/// Render search hits as numbered, citable chunks.
+///
+/// # Errors
+///
+/// Returns an error only if formatting into the output buffer fails.
+pub fn format_search_results(results: &[ChunkSearchResult]) -> Result<String, std::fmt::Error> {
+    if results.is_empty() {
+        return Ok(String::from(
+            "No relevant chunks found. Tell the user the documents do not appear to cover this.",
+        ));
+    }
+    let mut out = String::new();
+    for (i, chunk) in results.iter().enumerate() {
+        let n = i.saturating_add(1);
+        writeln!(
+            out,
+            "[{n}] {} (document_id: {}, chunk {}, distance {:.3})",
+            chunk.filename, chunk.document_id, chunk.chunk_index, chunk.distance
+        )?;
+        writeln!(out, "{}", chunk.content.trim())?;
+        writeln!(out)?;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,5 +487,42 @@ impl Tool for CreateChartTool {
         Ok(format!(
             "Chart generated successfully. ECharts spec:\n{spec_json}"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(n: u32, filename: &str, content: &str) -> ChunkSearchResult {
+        ChunkSearchResult {
+            id: format!("c{n}"),
+            content: content.to_owned(),
+            document_id: String::from("doc-1"),
+            chunk_index: n,
+            filename: filename.to_owned(),
+            distance: 0.125,
+        }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn format_search_results_numbers_hits_with_filename() {
+        let out = format_search_results(&[
+            hit(0, "policy.pdf", "  Flood is excluded.  "),
+            hit(1, "faq.md", "Claims close in 30 days."),
+        ])
+        .unwrap();
+        assert!(out.starts_with("[1] policy.pdf (document_id: doc-1, chunk 0, distance 0.125)\n"));
+        assert!(out.contains("\nFlood is excluded.\n"));
+        assert!(out.contains("[2] faq.md (document_id: doc-1, chunk 1, distance 0.125)\n"));
+        assert!(out.contains("Claims close in 30 days."));
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn format_search_results_empty_tells_model_to_say_so() {
+        let out = format_search_results(&[]).unwrap();
+        assert!(out.contains("No relevant chunks found"));
     }
 }

@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use quack_core::config::{AnalysisConfig, Config, GeneralConfig, IngestionConfig, ProviderConfig};
+use quack_core::config::{
+    AnalysisConfig, Config, GeneralConfig, IngestionConfig, ProviderConfig, RetrievalConfig,
+};
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -68,6 +70,7 @@ fn test_config(data_dir: &Path) -> Config {
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
         },
+        retrieval: RetrievalConfig::default(),
         analysis: AnalysisConfig::default(),
     }
 }
@@ -80,6 +83,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         },
         providers: BTreeMap::new(),
         ingestion: IngestionConfig::default(),
+        retrieval: RetrievalConfig::default(),
         analysis: AnalysisConfig::default(),
     }
 }
@@ -417,6 +421,63 @@ fn workspace_db_execute_statement() {
 }
 
 #[test]
+fn workspace_db_search_returns_filename_and_honors_document_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-search-filter").unwrap();
+
+    db.insert_document("doc-a", "policy.pdf", "application/pdf", 10, "ready")
+        .unwrap();
+    db.insert_document("doc-b", "faq.md", "text/markdown", 10, "ready")
+        .unwrap();
+    db.insert_chunk(
+        "a0",
+        "doc-a",
+        0,
+        "flood exclusion",
+        Some(&[1.0, 0.0, 0.0, 0.0]),
+    )
+    .unwrap();
+    db.insert_chunk(
+        "b0",
+        "doc-b",
+        0,
+        "claims timeline",
+        Some(&[0.9, 0.1, 0.0, 0.0]),
+    )
+    .unwrap();
+
+    let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+    let all = match db.search_similar_chunks(&query, 5, &[]) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("array_cosine_distance") || msg.contains("Catalog Error"),
+                "unexpected error: {msg}"
+            );
+            return;
+        }
+    };
+    assert_eq!(all.len(), 2);
+    assert_eq!(all.first().unwrap().filename, "policy.pdf");
+    assert_eq!(all.last().unwrap().filename, "faq.md");
+
+    let only_b = db
+        .search_similar_chunks(&query, 5, &[String::from("doc-b")])
+        .unwrap();
+    assert_eq!(only_b.len(), 1);
+    assert_eq!(only_b.first().unwrap().document_id, "doc-b");
+    assert_eq!(only_b.first().unwrap().filename, "faq.md");
+
+    let none = db
+        .search_similar_chunks(&query, 5, &[String::from("missing")])
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+#[test]
 fn workspace_db_search_similar_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
@@ -440,7 +501,7 @@ fn workspace_db_search_similar_chunks() {
         .unwrap();
 
     let query = [1.0_f32, 0.0, 0.0, 0.0];
-    match db.search_similar_chunks(&query, 3) {
+    match db.search_similar_chunks(&query, 3, &[]) {
         Ok(results) => {
             assert_eq!(results.len(), 3);
             let first = results.first().unwrap();

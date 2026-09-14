@@ -214,6 +214,9 @@ impl WorkspaceDb {
 
     /// Search for the most similar chunks to a query embedding.
     ///
+    /// When `document_ids` is non-empty the search is restricted to those
+    /// documents. Results carry the source filename for citations.
+    ///
     /// # Errors
     ///
     /// Returns an error if the search query fails.
@@ -221,20 +224,32 @@ impl WorkspaceDb {
         &self,
         query_embedding: &[f32],
         top_k: u32,
+        document_ids: &[String],
     ) -> crate::error::Result<Vec<ChunkSearchResult>> {
         let emb_str = format_embedding(query_embedding);
         let dim = self.embedding_dimension;
+        let filter = if document_ids.is_empty() {
+            String::new()
+        } else {
+            let placeholders = vec!["?"; document_ids.len()].join(", ");
+            format!(" AND c.document_id IN ({placeholders})")
+        };
         let sql = format!(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, \
                     array_cosine_distance(c.embedding, {emb_str}::FLOAT[{dim}]) AS distance \
              FROM chunks c \
-             WHERE c.embedding IS NOT NULL \
+             JOIN documents d ON d.id = c.document_id \
+             WHERE c.embedding IS NOT NULL{filter} \
              ORDER BY distance ASC \
              LIMIT {top_k}"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(document_ids.len());
+        for id in document_ids {
+            params.push(id);
+        }
+        let mut rows = stmt.query(params.as_slice())?;
         let mut results = Vec::new();
 
         while let Some(row) = rows.next()? {
@@ -243,7 +258,8 @@ impl WorkspaceDb {
                 content: row.get(1)?,
                 document_id: row.get(2)?,
                 chunk_index: row.get(3)?,
-                distance: row.get(4)?,
+                filename: row.get(4)?,
+                distance: row.get(5)?,
             });
         }
 
@@ -407,6 +423,7 @@ pub struct ChunkSearchResult {
     pub content: String,
     pub document_id: String,
     pub chunk_index: u32,
+    pub filename: String,
     pub distance: f64,
 }
 

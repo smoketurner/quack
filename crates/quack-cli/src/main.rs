@@ -75,6 +75,7 @@ enum OutputFormat {
 // Provider-agnostic embedding model enum
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 enum EmbedModel {
     Ollama(rig::providers::ollama::EmbeddingModel),
     OpenAi(
@@ -314,6 +315,7 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
                 completion_model,
                 embedding_model,
                 &config.analysis,
+                &config.retrieval,
                 message,
             )
             .await
@@ -326,6 +328,7 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
                 completion_model,
                 embedding_model,
                 &config.analysis,
+                &config.retrieval,
                 message,
             )
             .await
@@ -338,6 +341,7 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
                 completion_model,
                 embedding_model,
                 &config.analysis,
+                &config.retrieval,
                 message,
             )
             .await
