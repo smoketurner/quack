@@ -3,6 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
 mod print;
+mod server;
 mod terminal;
 
 use anyhow::{Context, Result};
@@ -165,6 +166,16 @@ enum Commands {
     /// Read the access audit log with filters
     Audit(admin::AuditArgs),
 
+    /// Serve the REST API and web UI
+    Serve {
+        /// Listen address (default from `[server].bind`, or `QUACK_BIND`)
+        #[arg(long)]
+        bind: Option<String>,
+        /// No authentication, one implicit user; loopback only
+        #[arg(long)]
+        local: bool,
+    },
+
     /// List ingested documents, or pin and unpin one
     Docs {
         /// Pin a document by id (prefixes accepted)
@@ -274,7 +285,7 @@ async fn main() -> Result<ExitCode> {
     quack_core::crypto::install_default_provider()
         .context("failed to install the aws-lc-rs crypto provider")?;
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     let policy = if cli.allow_write {
         WritePolicy::Allow
@@ -296,9 +307,17 @@ async fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    match cli.command {
+    match cli.command.take() {
         None => run_terminal_session(&cli, stdout_is_tty).await,
-        Some(Commands::Sessions { json, limit }) => {
+        Some(command) => run_command(&cli, command).await,
+    }
+}
+
+/// Every subcommand; print mode, `-q`, and the terminal session are
+/// dispatched by `main` itself.
+async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
+    match command {
+        Commands::Sessions { json, limit } => {
             init_logging();
             let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
             let ws_db = WorkspaceDb::open(&config, &workspace.id)
@@ -306,11 +325,11 @@ async fn main() -> Result<ExitCode> {
             list_sessions(&ws_db, json, limit)?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Export {
+        Commands::Export {
             session_id,
             sql,
             markdown: _,
-        }) => {
+        } => {
             init_logging();
             let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
             let ws_db = WorkspaceDb::open(&config, &workspace.id)
@@ -318,12 +337,12 @@ async fn main() -> Result<ExitCode> {
             export_session(&ws_db, &session_id, sql)?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Ingest {
+        Commands::Ingest {
             file,
             filename,
             no_embed,
             pin,
-        }) => {
+        } => {
             init_logging();
             let outcome = run_ingest(
                 &file,
@@ -342,7 +361,7 @@ async fn main() -> Result<ExitCode> {
             outcome?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Context { action }) => {
+        Commands::Context { action } => {
             init_logging();
             let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
             let ws_db = WorkspaceDb::open(&config, &workspace.id)
@@ -350,24 +369,28 @@ async fn main() -> Result<ExitCode> {
             run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Auth { action }) => {
+        Commands::Auth { action } => {
             init_logging();
             let config = Config::load().context("failed to load configuration")?;
             run_auth(&config, action).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(
-            command @ (Commands::User { .. }
-            | Commands::Token { .. }
-            | Commands::Member { .. }
-            | Commands::Audit(_)),
-        ) => {
+        Commands::Serve { bind, local } => {
+            init_logging();
+            let config = Config::load().context("failed to load configuration")?;
+            server::serve(config, bind, local).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        command @ (Commands::User { .. }
+        | Commands::Token { .. }
+        | Commands::Member { .. }
+        | Commands::Audit(_)) => {
             init_logging();
             let config = Config::load().context("failed to load configuration")?;
             run_admin(&config, cli.workspace.as_deref(), command).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Docs { pin, unpin, json }) => {
+        Commands::Docs { pin, unpin, json } => {
             init_logging();
             let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
             let ws_db = WorkspaceDb::open(&config, &workspace.id)
@@ -441,6 +464,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Ingest { .. }
         | Commands::Context { .. }
         | Commands::Auth { .. }
+        | Commands::Serve { .. }
         | Commands::Docs { .. } => Ok(()),
     }
 }

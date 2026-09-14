@@ -1,0 +1,87 @@
+//! The workspace context: read, replace (a new version), and history.
+
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, header};
+use axum::response::{IntoResponse, Response};
+use quack_core::storage::context;
+use quack_core::storage::control::Outcome;
+use serde::Deserialize;
+
+use crate::server::auth::{Identity, Need, access};
+use crate::server::error::ApiResult;
+use crate::server::state::{App, with_db};
+
+pub(crate) async fn show(
+    State(app): State<App>,
+    identity: Identity,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let _access = access(&app, identity, &id, Need::READ).await?;
+    let db = app.workspace_db(&id).await?;
+    let current = with_db(db, context::current).await?;
+    let wants_markdown = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/markdown"));
+    if wants_markdown {
+        let body = current.map(|c| c.content).unwrap_or_default();
+        return Ok((
+            [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            body,
+        )
+            .into_response());
+    }
+    Ok(Json(serde_json::json!({ "context": current })).into_response())
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ReplaceContext {
+    pub content: String,
+}
+
+pub(crate) async fn replace(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Json(body): Json<ReplaceContext>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let db = app.workspace_db(&id).await?;
+    let editor = access.identity.username.clone();
+    let stored = with_db(db, move |db| context::set(db, &body.content, Some(&editor))).await?;
+    access
+        .audit(
+            &app,
+            "context",
+            Some(("context", &stored.version.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "version": stored.version, "chars": stored.content.chars().count() })),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "context": stored })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct VersionsQuery {
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+fn default_limit() -> u32 {
+    20
+}
+
+pub(crate) async fn versions(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Query(q): Query<VersionsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _access = access(&app, identity, &id, Need::READ).await?;
+    let db = app.workspace_db(&id).await?;
+    let limit = q.limit;
+    let history = with_db(db, move |db| context::history(db, limit)).await?;
+    Ok(Json(serde_json::json!({ "versions": history })))
+}

@@ -111,7 +111,7 @@ async fn ingest_text_without_embeddings() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let data = b"Hello world. This is a test document for ingestion testing.";
-    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
         &config,
         &db,
         workspace_id,
@@ -179,7 +179,7 @@ async fn ingest_csv_structured() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
         &config,
         &db,
         workspace_id,
@@ -214,7 +214,7 @@ async fn ingest_json_structured() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
         &config,
         &db,
         workspace_id,
@@ -243,7 +243,7 @@ async fn ingest_unknown_file_type_returns_error() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
         &config,
         &db,
         workspace_id,
@@ -269,7 +269,7 @@ async fn ingest_empty_text_file() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
         &config,
         &db,
         workspace_id,
@@ -293,7 +293,7 @@ async fn ingest_markdown_as_unstructured() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let data = b"# Heading\n\nSome paragraph text.\n\n- item 1\n- item 2\n";
-    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
         &config,
         &db,
         workspace_id,

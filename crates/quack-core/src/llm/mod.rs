@@ -98,6 +98,20 @@ impl EmbeddingModel for EmbedModel {
     }
 }
 
+/// Embed one query string as `f32`s, the width stored in the workspace.
+///
+/// # Errors
+///
+/// Returns an error when the provider call fails.
+pub async fn embed_query(model: &EmbedModel, text: &str) -> Result<Vec<f32>> {
+    let embedding = model
+        .embed_text(text)
+        .await
+        .map_err(|e| Error::Embedding(e.to_string()))?;
+    #[expect(clippy::cast_possible_truncation, reason = "stored vectors are f32")]
+    Ok(embedding.vec.into_iter().map(|v| v as f32).collect())
+}
+
 /// The bearer credential for a provider, according to its `auth` mode: none,
 /// the static key from the environment, or the current OAuth access token.
 async fn credential(

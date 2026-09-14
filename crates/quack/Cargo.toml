@@ -16,15 +16,24 @@ workspace = true
 [dependencies]
 quack-core         = { path = "../quack-core" }
 anyhow             = { workspace = true, features = ["std"] }
+axum               = { workspace = true, features = ["http1", "json", "query", "form", "tokio", "multipart", "matched-path"] }
+axum-extra         = { workspace = true, features = ["cookie"] }
+base64             = { workspace = true, features = ["std"] }
 clap               = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm          = { workspace = true }
 dirs               = { workspace = true }
+futures            = { workspace = true, features = ["std"] }
 jiff               = { workspace = true, features = ["std"] }
 mimalloc           = { workspace = true, features = ["secure"] }
 ratatui            = { workspace = true, features = ["crossterm"] }
 ratatui-textarea   = { workspace = true, features = ["crossterm"] }
+serde              = { workspace = true, features = ["derive", "std"] }
 serde_json         = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }
-tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net"] }
+tower              = { workspace = true, features = ["util"] }
+tower-http         = { workspace = true, features = ["timeout", "request-id", "limit"] }
+tower_governor     = { workspace = true, features = ["axum"] }
 tracing            = { workspace = true, features = ["std"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "std"] }
+uuid               = { workspace = true, features = ["std", "v7"] }

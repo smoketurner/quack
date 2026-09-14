@@ -1,11 +1,40 @@
 pub mod chunker;
 pub mod parser;
 
+use std::sync::{Arc, Mutex};
+
 use rig::embeddings::EmbeddingModel;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::storage::workspace::{NewChunk, WorkspaceDb, quote_ident};
+
+/// Access to a workspace database for ingestion: a bare handle, or a
+/// shared one that is locked only around each database step so embedding
+/// calls run with the workspace free for other requests.
+pub trait DbHandle {
+    /// Run `f` against the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error, or an error when a shared handle is poisoned.
+    fn with<R>(&self, f: impl FnOnce(&WorkspaceDb) -> Result<R>) -> Result<R>;
+}
+
+impl DbHandle for WorkspaceDb {
+    fn with<R>(&self, f: impl FnOnce(&WorkspaceDb) -> Result<R>) -> Result<R> {
+        f(self)
+    }
+}
+
+impl DbHandle for Arc<Mutex<WorkspaceDb>> {
+    fn with<R>(&self, f: impl FnOnce(&WorkspaceDb) -> Result<R>) -> Result<R> {
+        let guard = self
+            .lock()
+            .map_err(|e| Error::Ingestion(format!("workspace mutex poisoned: {e}")))?;
+        f(&guard)
+    }
+}
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -25,15 +54,15 @@ pub struct IngestResult {
 ///
 /// Returns an error if the file type is unsupported or the file cannot be
 /// parsed or stored; the document row then carries the error.
-pub async fn ingest_file<M: EmbeddingModel>(
+pub async fn ingest_file<M: EmbeddingModel, D: DbHandle>(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &D,
     workspace_id: &str,
     filename: &str,
     data: &[u8],
     embedding_model: Option<&M>,
 ) -> Result<IngestResult> {
-    let doc_id = register_document(db, filename, data.len())?;
+    let doc_id = db.with(|db| register_document(db, filename, data.len()))?;
     process_document(
         config,
         db,
@@ -74,16 +103,16 @@ pub fn register_document(db: &WorkspaceDb, filename: &str, size_bytes: usize) ->
 /// # Errors
 ///
 /// Returns the failure after recording it on the document row.
-pub async fn process_document<M: EmbeddingModel>(
+pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &D,
     workspace_id: &str,
     doc_id: &str,
     filename: &str,
     data: &[u8],
     embedding_model: Option<&M>,
 ) -> Result<IngestResult> {
-    db.update_document_status(doc_id, "processing")?;
+    db.with(|db| db.update_document_status(doc_id, "processing"))?;
     let outcome = process_inner(
         config,
         db,
@@ -95,15 +124,15 @@ pub async fn process_document<M: EmbeddingModel>(
     )
     .await;
     match &outcome {
-        Ok(_) => db.update_document_status(doc_id, "ready")?,
-        Err(e) => db.mark_document_error(doc_id, &e.to_string())?,
+        Ok(_) => db.with(|db| db.update_document_status(doc_id, "ready"))?,
+        Err(e) => db.with(|db| db.mark_document_error(doc_id, &e.to_string()))?,
     }
     outcome
 }
 
-async fn process_inner<M: EmbeddingModel>(
+async fn process_inner<M: EmbeddingModel, D: DbHandle>(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &D,
     workspace_id: &str,
     doc_id: &str,
     filename: &str,
@@ -113,8 +142,9 @@ async fn process_inner<M: EmbeddingModel>(
     let file_type = parser::detect_file_type(filename);
     match file_type {
         parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json => {
-            let table_name =
-                ingest_structured(config, db, workspace_id, filename, data, &file_type)?;
+            let table_name = db.with(|db| {
+                ingest_structured(config, db, workspace_id, filename, data, &file_type)
+            })?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
@@ -195,31 +225,33 @@ fn ingest_structured(
     Ok(table_name)
 }
 
-async fn embed_and_store<M: EmbeddingModel>(
-    db: &WorkspaceDb,
+async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
+    db: &D,
     document_id: &str,
     chunks: &[chunker::Chunk],
     embedding_model: Option<&M>,
 ) -> Result<u32> {
-    let mut stored: u32 = 0;
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        let chunk_id = uuid::Uuid::now_v7().to_string();
-        let idx = u32::try_from(i).map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
-
-        db.insert_chunk(&NewChunk {
-            id: &chunk_id,
-            document_id,
-            chunk_index: idx,
-            content: &chunk.content,
-            heading: chunk.heading.as_deref(),
-            page: chunk.page,
-            embedding: None,
-        })?;
-        stored = stored
-            .checked_add(1)
-            .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
-    }
+    let stored = db.with(|db| {
+        let mut stored: u32 = 0;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_id = uuid::Uuid::now_v7().to_string();
+            let idx =
+                u32::try_from(i).map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
+            db.insert_chunk(&NewChunk {
+                id: &chunk_id,
+                document_id,
+                chunk_index: idx,
+                content: &chunk.content,
+                heading: chunk.heading.as_deref(),
+                page: chunk.page,
+                embedding: None,
+            })?;
+            stored = stored
+                .checked_add(1)
+                .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
+        }
+        Ok(stored)
+    })?;
 
     if let Some(model) = embedding_model {
         let batch_size = 64usize;
@@ -239,18 +271,21 @@ async fn embed_and_store<M: EmbeddingModel>(
                 .await
                 .map_err(|e| Error::Embedding(e.to_string()))?;
 
-            for (j, embedding) in embeddings.into_iter().enumerate() {
-                let chunk_idx = u32::try_from(offset.saturating_add(j))
-                    .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
+            db.with(|db| {
+                for (j, embedding) in embeddings.into_iter().enumerate() {
+                    let chunk_idx = u32::try_from(offset.saturating_add(j))
+                        .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
 
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
-                )]
-                let vec_f32: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
+                    )]
+                    let vec_f32: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
 
-                db.update_chunk_embedding(document_id, chunk_idx, &vec_f32)?;
-            }
+                    db.update_chunk_embedding(document_id, chunk_idx, &vec_f32)?;
+                }
+                Ok(())
+            })?;
 
             offset = end;
         }

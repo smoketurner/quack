@@ -40,6 +40,7 @@ cargo run --bin quack -- auth login azure                             # OAuth si
 cargo run --bin quack -- user add alice --admin                       # server users, tokens, members, audit
 cargo run --bin quack -- token create -w myworkspace --user alice --name ci --scopes read,write
 cargo run --bin quack -- audit --outcome denied --csv
+cargo run --bin quack -- serve --local                                # REST API on 127.0.0.1:8080, no login
 ```
 
 The workspace context is the owner's instructions for the agent: persona, what columns
@@ -69,6 +70,15 @@ under `~/.local/share/quack/tokens/`, with the key in the OS keychain (macOS Key
 Linux kernel keyring, Windows Credential Manager) or a 0600 key file, and refreshes itself.
 `quack auth status` and `quack auth logout` inspect and forget it; `-p` and `ingest` exit 4
 naming the login command when no token is usable.
+
+`quack serve` exposes the same engine as a REST API under `/api/v1` (design doc section
+11.2): password login with a session cookie or bearer token, API tokens scoped to one
+workspace with read, write, and admin scopes, viewer, member, and owner roles, an agent
+`query` endpoint and its SSE `query/stream`, direct `sql`, `search`, documents through a
+per-workspace upload queue, tables, the context editor, sessions with export, members, and
+admin users. Every request that names a workspace writes an access-audit row in
+`control.db`, denied ones included, and its content detail inside the workspace.
+`--local` skips authentication on a loopback address for a single user.
 
 `-p` and the terminal session need `[general].chat_model` and `[general].embedding_model`
 set to `PROVIDER/MODEL` references in `~/.config/quack/config.toml`, with a matching

@@ -83,6 +83,7 @@ cargo run --bin quack -- -w ws                                                 #
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
+cargo run --bin quack -- serve [--bind ADDR] [--local]                          # REST API under /api/v1 (design doc 11.2)
 ```
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
@@ -110,7 +111,17 @@ membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 has
 `Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content
 half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace under the
 same UUID v7. Ingestion is `register_document` (status `queued`) plus `process_document`
-(`processing` to `ready` or `error`); `ingest_file` does both. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
+(`processing` to `ready` or `error`); `ingest_file` does both.
+
+`quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
+bearer (login session or API token), the session cookie, or `--local` into an `Identity`,
+and `access()` resolves the workspace, checks role and token scope, and writes the denied
+audit row itself, so a handler holding an `Access` is already authorized. Every
+workspace-touching handler then records the allowed row plus its `_quack_audit` detail
+through `Access::audit`. `query/stream` forwards the agent event stream as SSE (`text`,
+`tool_started`, `tool_finished`, `complete`, `error`); uploads return 202 and are processed
+by `queue.rs`, one bounded lane per workspace, which locks the workspace only around each
+database step. Tests drive the router with `tower::ServiceExt::oneshot` and no model. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
 `quack ontology propose`, ...) is in design doc section 11.
 
 ## Common commands

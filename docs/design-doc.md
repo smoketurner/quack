@@ -1316,7 +1316,8 @@ updated as issues close. Ordered by risk.
 2. ~~No OAuth~~ (#25, closed): PKCE and device-code login, encrypted cache, `quack auth`;
    the server's confidential-client mode is wired (`client_secret_env`) and gets its live
    test with #26. Section 10.2.
-3. **No server, REST API, web UI** (#26); **no MCP** (#29); **no desktop window** (#35).
+3. **Server** (#26): the REST API, auth, roles, split audit, and upload queue are in;
+   the web UI is in progress. **No MCP** (#29); **no desktop window** (#35).
    Sections 11, 12.
 4. **No ontology or induction** (#27); **no graph** (#28). Sections 6.3 to 6.5.
 5. **DOCX, HTML, PPTX, XLSX unsupported** (#16; XLSX via a Rust reader). Sections 6.1, 6.2.
@@ -1325,8 +1326,9 @@ updated as issues close. Ordered by risk.
 7. **Document registry lacks `sha256` dedup, `source`, `title`** (#22). Section 5.4.
 8. **Sessions have no `created_by` or sharing; print mode cannot take stdin as data**
    (#23). Sections 8, 11.5.
-9. **Context `edited_by` and the `_quack_audit` detail table** wait for users and the
-   server (#24). Sections 5.3, 5.4, 12.
+9. ~~Context `edited_by` and the `_quack_audit` detail table~~ (#24, closed): the
+   server records the editing user and writes the detail row under the access row's id.
+   Sections 5.3, 5.4, 12.
 10. **No release pipeline** (#30). Section 14.
 11. **No stemming in keyword search** (#31, deliberately deferred); **no reranking hook**
     (#34); **large-workspace vector index options** (#32, research). Sections 6.1, 15.

@@ -1,0 +1,412 @@
+//! The agent turn (`query`, and its SSE form), direct SQL, and hybrid
+//! search without the model.
+
+use std::convert::Infallible;
+use std::sync::Arc;
+
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::Stream;
+use quack_core::analysis::agent::AgentResponse;
+use quack_core::analysis::events::{self, AgentEvent};
+use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::tools::SharedDb;
+use quack_core::llm;
+use quack_core::storage::control::Outcome;
+use quack_core::storage::sessions::{self, ChatMode};
+use quack_core::storage::workspace::StatementKind;
+use serde::Deserialize;
+
+use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::error::{ApiError, ApiResult};
+use crate::server::state::{App, with_db};
+
+#[derive(Deserialize)]
+pub(crate) struct QueryRequest {
+    pub prompt: String,
+    pub session_id: Option<String>,
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub allow_write: bool,
+}
+
+/// The response object shared with print mode (design doc 11.2).
+pub(crate) fn response_json(response: &AgentResponse, session_id: &str) -> serde_json::Value {
+    let queries: Vec<serde_json::Value> = response
+        .steps
+        .iter()
+        .filter(|s| s.tool == "run_sql")
+        .map(|s| {
+            let rows = s
+                .summary
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok());
+            serde_json::json!({ "sql": s.detail, "rows": rows, "duration_ms": s.duration_ms })
+        })
+        .collect();
+    serde_json::json!({
+        "answer": response.content,
+        "citations": response.citations,
+        "queries": queries,
+        "steps": response.steps,
+        "graph": serde_json::Value::Null,
+        "chart": response.chart,
+        "write_refused": response.write_refused,
+        "session_id": session_id,
+    })
+}
+
+/// Everything a turn needs before the model is called: the authorization,
+/// the provider check, and the session (existing or new).
+async fn prepare(
+    app: &App,
+    identity: Identity,
+    workspace_id: &str,
+    body: &QueryRequest,
+) -> ApiResult<(Access, SharedDb, String, WritePolicy)> {
+    let access = access(app, identity, workspace_id, Need::READ).await?;
+    if body.allow_write && !access.permits(Need::WRITE) {
+        access
+            .audit(app, "query", None, Outcome::Denied, None)
+            .await?;
+        return Err(ApiError::forbidden(
+            "allow_write needs the member role and the write scope",
+        ));
+    }
+    if body.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("prompt must not be empty"));
+    }
+    let chat = app.config.chat_model_ref()?;
+    if let Some(allowed) = access.workspace.allowed_providers.as_deref() {
+        let names: Vec<String> = serde_json::from_str(allowed).unwrap_or_default();
+        if !names.iter().any(|n| n == chat.provider_name) {
+            return Err(ApiError::forbidden(format!(
+                "provider '{}' is not allowed in this workspace",
+                chat.provider_name
+            )));
+        }
+    }
+    let mode = match body.mode.as_deref() {
+        None => None,
+        Some(m) => Some(
+            ChatMode::parse(m)
+                .ok_or_else(|| ApiError::bad_request("mode must be chat or query"))?,
+        ),
+    };
+    let db = app.workspace_db(workspace_id).await?;
+    let requested = body.session_id.clone();
+    let model = chat.to_string();
+    let user = access.identity.user_id.clone();
+    let sees_all = access.sees_all_sessions();
+    let session_id = with_db(Arc::clone(&db), move |db| {
+        if let Some(id) = requested {
+            let session = sessions::get_session(db, &id)?.ok_or_else(|| {
+                quack_core::error::Error::Analysis(format!("session '{id}' does not exist"))
+            })?;
+            if !sessions::visible_to(&session, &user, sees_all) {
+                return Err(quack_core::error::Error::Analysis(format!(
+                    "session '{id}' does not exist"
+                )));
+            }
+            if let Some(mode) = mode {
+                sessions::set_session_mode(db, &id, mode)?;
+            }
+            Ok(id)
+        } else {
+            Ok(sessions::create_session(db, &model, mode.unwrap_or_default(), Some(&user))?.id)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::not_found(e.message))?;
+    let policy = if body.allow_write {
+        WritePolicy::Allow
+    } else {
+        WritePolicy::Deny
+    };
+    Ok((access, db, session_id, policy))
+}
+
+fn start_turn(
+    app: &App,
+    db: SharedDb,
+    session_id: &str,
+    policy: WritePolicy,
+    prompt: &str,
+) -> events::EventStream {
+    let (sink, stream) = events::channel();
+    let config = app.config.clone();
+    let session_id = session_id.to_owned();
+    let prompt = prompt.to_owned();
+    tokio::spawn(async move {
+        // run_turn emits TurnComplete or Failed itself.
+        drop(llm::run_turn(&config, db, &session_id, policy, &prompt, sink).await);
+    });
+    stream
+}
+
+async fn record_turn(
+    app: &App,
+    access: &Access,
+    session_id: &str,
+    prompt: &str,
+    outcome: Outcome,
+    response: Option<&AgentResponse>,
+) {
+    let detail = serde_json::json!({
+        "prompt": prompt,
+        "steps": response.map(|r| r.steps.clone()).unwrap_or_default(),
+    });
+    if let Err(e) = access
+        .audit(
+            app,
+            "query",
+            Some(("session", session_id)),
+            outcome,
+            Some(detail),
+        )
+        .await
+    {
+        tracing::error!(error = %e.message, "audit write failed");
+    }
+}
+
+pub(crate) async fn query(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Json(body): Json<QueryRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (access, db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
+    let mut stream = start_turn(&app, db, &session_id, policy, &body.prompt);
+    let mut failure = None;
+    let mut complete = None;
+    while let Some(event) = stream.recv().await {
+        match event {
+            AgentEvent::PermissionRequired(request) => request.deny(),
+            AgentEvent::TurnComplete(response) => complete = Some(response),
+            AgentEvent::Failed(message) => failure = Some(message),
+            AgentEvent::TextDelta(_)
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished(_) => {}
+        }
+    }
+    match (complete, failure) {
+        (Some(response), _) => {
+            record_turn(
+                &app,
+                &access,
+                &session_id,
+                &body.prompt,
+                Outcome::Allowed,
+                Some(&response),
+            )
+            .await;
+            Ok(Json(response_json(&response, &session_id)))
+        }
+        (None, failure) => {
+            record_turn(
+                &app,
+                &access,
+                &session_id,
+                &body.prompt,
+                Outcome::Error,
+                None,
+            )
+            .await;
+            let message =
+                failure.unwrap_or_else(|| String::from("the turn ended without an answer"));
+            Err(turn_error(&message))
+        }
+    }
+}
+
+fn turn_error(message: &str) -> ApiError {
+    if message.contains("quack auth login") {
+        ApiError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
+    } else if message.contains("no chat model configured") {
+        ApiError::bad_request(message)
+    } else {
+        ApiError::internal(message)
+    }
+}
+
+/// The same turn as SSE: `text`, `tool_started`, `tool_finished`, then
+/// `complete` with the full response object, or `error`.
+pub(crate) async fn stream(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Json(body): Json<QueryRequest>,
+) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let (access, db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
+    let events = start_turn(&app, db, &session_id, policy, &body.prompt);
+    let prompt = body.prompt.clone();
+    let state = (events, app, access, session_id, prompt);
+    let stream = futures::stream::unfold(
+        state,
+        |(mut events, app, access, session_id, prompt)| async move {
+            let event = events.recv().await?;
+            let out = match event {
+                AgentEvent::TextDelta(text) => Event::default().event("text").data(text),
+                AgentEvent::ToolStarted { tool, detail } => Event::default()
+                    .event("tool_started")
+                    .json_data(serde_json::json!({ "tool": tool, "detail": detail }))
+                    .unwrap_or_default(),
+                AgentEvent::ToolFinished(step) => Event::default()
+                    .event("tool_finished")
+                    .json_data(&step)
+                    .unwrap_or_default(),
+                AgentEvent::PermissionRequired(request) => {
+                    request.deny();
+                    Event::default()
+                        .event("permission_denied")
+                        .data("writes are off for this request")
+                }
+                AgentEvent::TurnComplete(response) => {
+                    record_turn(
+                        &app,
+                        &access,
+                        &session_id,
+                        &prompt,
+                        Outcome::Allowed,
+                        Some(&response),
+                    )
+                    .await;
+                    Event::default()
+                        .event("complete")
+                        .json_data(response_json(&response, &session_id))
+                        .unwrap_or_default()
+                }
+                AgentEvent::Failed(message) => {
+                    record_turn(&app, &access, &session_id, &prompt, Outcome::Error, None).await;
+                    Event::default().event("error").data(message)
+                }
+            };
+            Some((Ok(out), (events, app, access, session_id, prompt)))
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SqlRequest {
+    pub sql: String,
+}
+
+/// Direct SQL. Reads need the viewer role; anything that mutates needs the
+/// member role and the write scope. `_quack_` tables are never reachable.
+pub(crate) async fn sql(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Json(body): Json<SqlRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    let db = app.workspace_db(&id).await?;
+    let sql = body.sql.clone();
+    let kind = with_db(Arc::clone(&db), move |db| {
+        if db.references_internal_table(&sql)? {
+            return Err(quack_core::error::Error::Analysis(String::from(
+                "internal tables are not accessible",
+            )));
+        }
+        db.classify_statement(&sql)
+    })
+    .await
+    .map_err(|e| ApiError::forbidden(e.message))?;
+    let is_write = match kind {
+        StatementKind::Read => false,
+        StatementKind::Write => true,
+        StatementKind::Invalid(message) => return Err(ApiError::bad_request(message)),
+    };
+    if is_write && !access.permits(Need::WRITE) {
+        access
+            .audit(
+                &app,
+                "sql",
+                None,
+                Outcome::Denied,
+                Some(serde_json::json!({ "sql": body.sql })),
+            )
+            .await?;
+        return Err(ApiError::forbidden(
+            "writes need the member role and the write scope",
+        ));
+    }
+    let sql = body.sql.clone();
+    let max_rows = app.config.analysis.max_query_rows;
+    let result = with_db(db, move |db| db.execute_query(&sql)).await;
+    let outcome = if result.is_ok() {
+        Outcome::Allowed
+    } else {
+        Outcome::Error
+    };
+    access
+        .audit(
+            &app,
+            "sql",
+            None,
+            outcome,
+            Some(serde_json::json!({ "sql": body.sql })),
+        )
+        .await?;
+    let results = result
+        .map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.message))?;
+    let total = results.rows.len();
+    let capped = results.clone_capped(max_rows);
+    Ok(Json(serde_json::json!({
+        "columns": capped.columns,
+        "rows": capped.rows,
+        "row_count": total,
+        "truncated": capped.rows.len() < total,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SearchQuery {
+    pub q: String,
+    pub k: Option<u32>,
+}
+
+/// Hybrid retrieval with no model call: the embedding provider when one is
+/// configured, else keyword search alone.
+pub(crate) async fn search(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    let query = q.q.trim().to_owned();
+    if query.is_empty() {
+        return Err(ApiError::bad_request("q must not be empty"));
+    }
+    let top_k = q.k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
+    let rrf_k = app.config.retrieval.rrf_k;
+    let embedding: Option<Vec<f32>> = match llm::optional_embedding_model(&app.config).await? {
+        Some(model) => Some(llm::embed_query(&model, &query).await?),
+        None => None,
+    };
+    let db = app.workspace_db(&id).await?;
+    let text = query.clone();
+    let hits = with_db(db, move |db| {
+        let none: [String; 0] = [];
+        match embedding.as_deref() {
+            Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &none),
+            None => db.search_keyword_chunks(&text, top_k, &none),
+        }
+    })
+    .await?;
+    access
+        .audit(
+            &app,
+            "search",
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({ "q": query })),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "chunks": hits })))
+}

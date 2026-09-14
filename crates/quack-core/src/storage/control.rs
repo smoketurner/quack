@@ -290,6 +290,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Fill `bytes` from the process's CSPRNG (aws-lc-rs).
+///
+/// # Errors
+///
+/// Returns an error when the random source fails.
+pub fn random_bytes(bytes: &mut [u8]) -> Result<()> {
+    aws_lc_rs::rand::fill(bytes)
+        .map_err(|_| Error::Config(String::from("random generation failed")))
+}
+
 /// Hash a password with argon2id and default parameters.
 ///
 /// # Errors
@@ -490,24 +500,27 @@ impl ControlPlane {
         id: &str,
         changes: &WorkspaceChanges,
     ) -> Result<WorkspaceRow> {
-        let mut update = Query::update();
-        update
-            .table(Workspaces::Table)
-            .value(Workspaces::UpdatedAt, Expr::cust("CURRENT_TIMESTAMP"))
-            .and_where(Expr::col(Workspaces::Id).eq(id));
-        if let Some(c) = &changes.classification {
-            update.value(Workspaces::Classification, c.as_str());
-        }
-        match &changes.allowed_providers {
-            ProviderAllowList::Keep => {}
-            ProviderAllowList::All => {
-                update.value(Workspaces::AllowedProviders, Option::<String>::None);
+        // The builder is dropped before the await so the future stays Send.
+        let sql = {
+            let mut update = Query::update();
+            update
+                .table(Workspaces::Table)
+                .value(Workspaces::UpdatedAt, Expr::cust("CURRENT_TIMESTAMP"))
+                .and_where(Expr::col(Workspaces::Id).eq(id));
+            if let Some(c) = &changes.classification {
+                update.value(Workspaces::Classification, c.as_str());
             }
-            ProviderAllowList::Only(names) => {
-                update.value(Workspaces::AllowedProviders, serde_json::to_string(names)?);
+            match &changes.allowed_providers {
+                ProviderAllowList::Keep => {}
+                ProviderAllowList::All => {
+                    update.value(Workspaces::AllowedProviders, Option::<String>::None);
+                }
+                ProviderAllowList::Only(names) => {
+                    update.value(Workspaces::AllowedProviders, serde_json::to_string(names)?);
+                }
             }
-        }
-        let sql = update.to_string(SqliteQueryBuilder);
+            update.to_string(SqliteQueryBuilder)
+        };
         sqlx::query(AssertSqlSafe(sql.as_str()))
             .execute(&self.pool)
             .await?;
@@ -877,8 +890,7 @@ impl ControlPlane {
         expires_at: Option<&str>,
     ) -> Result<(String, TokenRow)> {
         let mut secret = [0u8; 32];
-        aws_lc_rs::rand::fill(&mut secret)
-            .map_err(|_| Error::Config(String::from("token generation failed")))?;
+        random_bytes(&mut secret)?;
         let token = format!(
             "qk_{}",
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, secret)
@@ -1037,45 +1049,7 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditRow>> {
-        let mut select = Query::select();
-        select
-            .columns([
-                AuditLog::Id,
-                AuditLog::Timestamp,
-                AuditLog::UserId,
-                AuditLog::TokenHash,
-                AuditLog::WorkspaceId,
-                AuditLog::Action,
-                AuditLog::ResourceType,
-                AuditLog::ResourceId,
-                AuditLog::Outcome,
-                AuditLog::Channel,
-                AuditLog::ClientAddr,
-                AuditLog::RequestId,
-            ])
-            .from(AuditLog::Table)
-            .order_by(AuditLog::Timestamp, Order::Desc)
-            .order_by(AuditLog::Id, Order::Desc)
-            .limit(u64::from(Ord::max(filter.limit, 1)));
-        if let Some(v) = &filter.user_id {
-            select.and_where(Expr::col(AuditLog::UserId).eq(v.as_str()));
-        }
-        if let Some(v) = &filter.workspace_id {
-            select.and_where(Expr::col(AuditLog::WorkspaceId).eq(v.as_str()));
-        }
-        if let Some(v) = &filter.action {
-            select.and_where(Expr::col(AuditLog::Action).eq(v.as_str()));
-        }
-        if let Some(v) = &filter.outcome {
-            select.and_where(Expr::col(AuditLog::Outcome).eq(v.as_str()));
-        }
-        if let Some(v) = &filter.since {
-            select.and_where(Expr::col(AuditLog::Timestamp).gte(v.as_str()));
-        }
-        if let Some(v) = &filter.until {
-            select.and_where(Expr::col(AuditLog::Timestamp).lt(v.as_str()));
-        }
-        let sql = select.to_string(SqliteQueryBuilder);
+        let sql = audit_query_sql(filter);
         let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .fetch_all(&self.pool)
             .await?;
@@ -1098,6 +1072,50 @@ impl ControlPlane {
             })
             .collect()
     }
+}
+
+/// The filtered audit select, built and rendered in one scope so no
+/// builder lives across an await.
+fn audit_query_sql(filter: &AuditFilter) -> String {
+    let mut select = Query::select();
+    select
+        .columns([
+            AuditLog::Id,
+            AuditLog::Timestamp,
+            AuditLog::UserId,
+            AuditLog::TokenHash,
+            AuditLog::WorkspaceId,
+            AuditLog::Action,
+            AuditLog::ResourceType,
+            AuditLog::ResourceId,
+            AuditLog::Outcome,
+            AuditLog::Channel,
+            AuditLog::ClientAddr,
+            AuditLog::RequestId,
+        ])
+        .from(AuditLog::Table)
+        .order_by(AuditLog::Timestamp, Order::Desc)
+        .order_by(AuditLog::Id, Order::Desc)
+        .limit(u64::from(Ord::max(filter.limit, 1)));
+    if let Some(v) = &filter.user_id {
+        select.and_where(Expr::col(AuditLog::UserId).eq(v.as_str()));
+    }
+    if let Some(v) = &filter.workspace_id {
+        select.and_where(Expr::col(AuditLog::WorkspaceId).eq(v.as_str()));
+    }
+    if let Some(v) = &filter.action {
+        select.and_where(Expr::col(AuditLog::Action).eq(v.as_str()));
+    }
+    if let Some(v) = &filter.outcome {
+        select.and_where(Expr::col(AuditLog::Outcome).eq(v.as_str()));
+    }
+    if let Some(v) = &filter.since {
+        select.and_where(Expr::col(AuditLog::Timestamp).gte(v.as_str()));
+    }
+    if let Some(v) = &filter.until {
+        select.and_where(Expr::col(AuditLog::Timestamp).lt(v.as_str()));
+    }
+    select.to_string(SqliteQueryBuilder)
 }
 
 /// A valid argon2id hash of a random string, verified against when the
