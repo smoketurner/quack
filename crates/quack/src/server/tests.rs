@@ -34,8 +34,11 @@ fn fail(msg: &str) -> ! {
 }
 
 async fn harness(local: bool) -> Harness {
+    harness_with(local, Config::default()).await
+}
+
+async fn harness_with(local: bool, mut config: Config) -> Harness {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-    let mut config = Config::default();
     config.general.data_dir = dir.path().to_path_buf();
     let control = ControlPlane::open(&config)
         .await
@@ -888,6 +891,53 @@ async fn query_endpoints_fail_cleanly_without_a_chat_model() {
         .get(&format!("/api/v1/workspaces/{ws}/search?q="), &owner_token)
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_first_turn_leaves_no_empty_session_behind() {
+    // A chat model whose provider is unreachable: the turn fails after the
+    // session was created.
+    let config = Config::parse(
+        "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(true, config).await;
+    let (status, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "w" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/query"),
+            None,
+            Some(serde_json::json!({ "prompt": "hi" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let (_, body) = h
+        .call(
+            Method::GET,
+            &format!("/api/v1/workspaces/{ws}/sessions"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(body["sessions"], serde_json::json!([]), "{body}");
+    let errors = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("query")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(errors.first().map(|r| r.outcome.as_str()), Some("error"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

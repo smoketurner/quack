@@ -146,6 +146,9 @@ fn start_turn(
     stream
 }
 
+/// Audit the turn. A failed turn that left the session without any message
+/// (a fresh session whose first turn never reached the model) is removed,
+/// as print mode does, so the session list shows no empty entries.
 async fn record_turn(
     app: &App,
     access: &Access,
@@ -154,6 +157,14 @@ async fn record_turn(
     outcome: Outcome,
     response: Option<&AgentResponse>,
 ) {
+    if outcome == Outcome::Error
+        && let Ok(db) = app.workspace_db(&access.workspace.id).await
+    {
+        let sid = session_id.to_owned();
+        if let Err(e) = with_db(db, move |db| sessions::delete_if_empty(db, &sid)).await {
+            tracing::warn!(error = %e.message, "could not remove the empty session");
+        }
+    }
     let detail = serde_json::json!({
         "prompt": prompt,
         "steps": response.map(|r| r.steps.clone()).unwrap_or_default(),
