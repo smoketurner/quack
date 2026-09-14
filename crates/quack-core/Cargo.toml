@@ -10,11 +10,11 @@ publish                = false
 workspace = true
 
 [dependencies]
-aws-lc-rs     = { workspace = true }
 dirs          = { workspace = true }
 duckdb        = { workspace = true, features = ["bundled"] }
 pdf-extract   = { workspace = true }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
+rustls        = { workspace = true, features = ["aws_lc_rs", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
 sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 serde         = { workspace = true, features = ["derive", "std"] }

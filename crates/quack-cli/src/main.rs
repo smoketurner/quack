@@ -124,6 +124,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    quack_core::crypto::install_default_provider()
+        .context("failed to install the aws-lc-rs crypto provider")?;
+
     let cli = Cli::parse();
 
     match cli.command {

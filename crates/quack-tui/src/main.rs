@@ -21,6 +21,9 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    quack_core::crypto::install_default_provider()
+        .context("failed to install the aws-lc-rs crypto provider")?;
+
     let cli = Cli::parse();
     let config = quack_core::config::Config::load().context("failed to load configuration")?;
 

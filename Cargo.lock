@@ -5302,11 +5302,11 @@ dependencies = [
 name = "quack-core"
 version = "0.1.0"
 dependencies = [
- "aws-lc-rs",
  "dirs",
  "duckdb",
  "pdf-extract",
  "rig",
+ "rustls",
  "schemars 1.2.2",
  "sea-query",
  "serde",
