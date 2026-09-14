@@ -1139,24 +1139,25 @@ volumes:
 
 ### In Scope (build this)
 
-- [ ] Single Rust binary with `tui`, `serve`, and `query` subcommands
-- [ ] DuckDB workspace isolation (one .duckdb file per workspace)
-- [ ] SQLite control plane (workspaces, threads, messages, audit log)
-- [ ] File ingestion: CSV, Parquet, JSON/JSONL -> DuckDB tables
-- [ ] File ingestion: PDF, DOCX, TXT, MD -> chunked + embedded for RAG
-- [ ] OpenAI-compatible LLM provider (covers Ollama + OpenAI + most gateways)
-- [ ] Anthropic LLM provider
-- [ ] Text-to-SQL agent loop with tool calling
-- [ ] RAG retrieval over document chunks
-- [ ] TUI with chat, SQL editor, table browser tabs
+- [x] Single Rust binary with `tui`, `serve`, and `query` subcommands
+- [x] DuckDB workspace isolation (one .duckdb file per workspace)
+- [x] SQLite control plane (workspaces, threads, messages, audit log)
+- [x] File ingestion: CSV, Parquet, JSON/JSONL -> DuckDB tables
+- [x] File ingestion: PDF, DOCX, TXT, MD -> chunked + embedded for RAG
+- [x] OpenAI-compatible LLM provider (covers Ollama + OpenAI + most gateways)
+- [x] Anthropic LLM provider
+- [x] Text-to-SQL agent loop with tool calling
+- [x] RAG retrieval over document chunks
+- [x] TUI with chat input and agent loop (quack-tui crate)
+- [ ] TUI SQL editor and table browser tabs
 - [ ] Web UI with chat (askama + htmx + SSE streaming)
 - [ ] REST API for all operations
 - [ ] MCP server (workspace-scoped)
-- [ ] ECharts chart generation (web UI; ASCII fallback in TUI)
+- [x] ECharts chart generation (chart spec in analysis engine)
 - [ ] Graph tables (nodes/edges) with entity extraction
 - [ ] Graph traversal via recursive CTE
 - [ ] ASCII graph rendering in TUI
-- [ ] Configuration via TOML + env vars
+- [x] Configuration via TOML + env vars
 - [ ] Basic audit logging
 - [ ] Docker image and docker-compose for deployment
 

@@ -1,0 +1,28 @@
+[package]
+name                   = "quack-tui"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish                = false
+
+[[bin]]
+name = "quack-tui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+quack-core         = { path = "../quack-core" }
+anyhow             = { workspace = true, features = ["std"] }
+crossterm          = { workspace = true }
+dirs               = { workspace = true }
+ratatui            = { workspace = true, features = ["crossterm"] }
+ratatui-textarea   = { workspace = true, features = ["crossterm"] }
+rig                = { workspace = true, features = ["agent", "derive", "rustls"] }
+clap               = { workspace = true, features = ["derive", "help", "std", "usage"] }
+mimalloc           = { workspace = true, features = ["secure"] }
+serde_json         = { workspace = true, features = ["std"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+tracing            = { workspace = true, features = ["std"] }
