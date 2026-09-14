@@ -13,10 +13,11 @@ use rig::prelude::*;
 use crate::analysis::agent::{self, AgentResponse};
 use crate::analysis::events::EventSink;
 use crate::analysis::policy::WritePolicy;
+use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::SharedDb;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
-use crate::storage::sessions::{self, ChatMode};
+use crate::storage::{context, sessions};
 
 /// Embedding model over every provider that supports embeddings.
 #[derive(Clone)]
@@ -232,14 +233,20 @@ pub async fn run_turn(
     let chat = config.chat_model_ref()?;
     let embedding_model = required_embedding_model(config)?;
 
-    let (mode, history) = {
+    let (prompt, history) = {
         let guard = db
             .lock()
             .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
         let session = sessions::get_session(&guard, session_id)?
             .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
+        let prompt = PromptOptions {
+            mode: session.mode,
+            pinned_token_budget: config.retrieval.pinned_token_budget,
+            context: context::combined(&guard)?,
+            context_max_tokens: config.context.max_tokens,
+        };
         (
-            session.mode,
+            prompt,
             sessions::history_for_model(&guard, session_id, config.analysis.history_token_budget)?,
         )
     };
@@ -252,7 +259,7 @@ pub async fn run_turn(
         chat,
         embedding_model,
         policy,
-        mode,
+        prompt,
         history,
         message,
         sink,
@@ -276,7 +283,7 @@ async fn dispatch(
     chat: ModelRef<'_>,
     embedding_model: EmbedModel,
     policy: WritePolicy,
-    mode: ChatMode,
+    prompt: PromptOptions,
     history: Vec<rig::message::Message>,
     message: &str,
     sink: EventSink,
@@ -291,7 +298,7 @@ async fn dispatch(
                 &config.analysis,
                 &config.retrieval,
                 policy,
-                mode,
+                prompt,
                 history,
                 message,
                 sink,
@@ -307,7 +314,7 @@ async fn dispatch(
                 &config.analysis,
                 &config.retrieval,
                 policy,
-                mode,
+                prompt,
                 history,
                 message,
                 sink,
@@ -323,7 +330,7 @@ async fn dispatch(
                 &config.analysis,
                 &config.retrieval,
                 policy,
-                mode,
+                prompt,
                 history,
                 message,
                 sink,

@@ -60,6 +60,9 @@ Features prone to silent breakage — live-test before any PR that touches them:
 - Citation validation: `[n]` markers not registered this turn are stripped; the rest are
   renumbered from 1 and listed as sources
 - Pinned documents injected in full within `[retrieval].pinned_token_budget`
+- System prompt order (design doc 7.2): role and mode, tool guidance, tables, documents and
+  pinned text, workspace context, permission rules; context truncated at
+  `[context].max_tokens` with a visible note
 - Citation validation (every `[n]` maps to a chunk retrieved in that turn)
 - Embedding dimension recorded per workspace and checked on open
 - DuckDB workspace isolation (each workspace gets its own database file)

@@ -35,7 +35,13 @@ cargo run --bin quack -- sessions                                     # list ses
 cargo run --bin quack -- export 01a0a0e1 --sql                        # replay a session's SQL
 cargo run --bin quack -- ingest policy.pdf --pin                      # full text in every prompt
 cargo run --bin quack -- -p "what is excluded?" --mode query          # sources only, cited [n]
+cargo run --bin quack -- context edit                                 # definitions the agent follows
 ```
+
+The workspace context is the owner's instructions for the agent: persona, what columns
+mean, how metrics are defined, known data problems. It is stored and versioned inside the
+workspace file (`quack context show|edit|history|export|import`), and a global prefix can
+live at `~/.config/quack/context.md`.
 
 Document search is hybrid: an exact cosine scan over stored embeddings and quack's own BM25
 term index, fused with reciprocal rank fusion, so exact tokens such as policy numbers are

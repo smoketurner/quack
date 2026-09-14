@@ -10,13 +10,12 @@ use crate::error::{Error, Result};
 use super::citations::{self, Citation};
 use super::events::{AgentEvent, EventSink, ToolStep, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
-use super::text_to_sql;
+use super::text_to_sql::{self, PromptOptions};
 use super::tools::{
     CreateChartTool, DescribeTableTool, ListDocumentsTool, ListTablesTool, RunSqlTool,
     SearchDocumentsTool, SharedDb,
 };
 use super::vector_index::DuckDbVectorIndex;
-use crate::storage::sessions::ChatMode;
 
 /// Everything a turn produced, delivered with `AgentEvent::TurnComplete` and
 /// returned from `run_analysis`.
@@ -56,7 +55,7 @@ pub async fn run_analysis<M>(
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     write_policy: WritePolicy,
-    mode: ChatMode,
+    prompt: PromptOptions,
     history: Vec<rig::message::Message>,
     user_message: &str,
     sink: EventSink,
@@ -72,7 +71,7 @@ where
         analysis_config,
         retrieval_config,
         write_policy,
-        mode,
+        prompt,
         history,
         user_message,
         &recorder,
@@ -98,7 +97,7 @@ async fn run_inner<M>(
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     write_policy: WritePolicy,
-    mode: ChatMode,
+    prompt: PromptOptions,
     history: Vec<rig::message::Message>,
     user_message: &str,
     recorder: &TurnRecorder,
@@ -110,7 +109,7 @@ where
         let db = shared_db
             .lock()
             .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
-        text_to_sql::build_system_prompt(&db, mode, retrieval_config.pinned_token_budget)?
+        text_to_sql::build_system_prompt(&db, &prompt)?
     };
     let chart_spec: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
     let refused = RefusalFlag::default();

@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use quack_core::config::{
-    AnalysisConfig, AuthMode, Config, GeneralConfig, IngestionConfig, ProviderConfig, ProviderType,
-    RetrievalConfig,
+    AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, IngestionConfig,
+    ProviderConfig, ProviderType, RetrievalConfig,
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
@@ -73,6 +73,7 @@ fn test_config(data_dir: &Path) -> Config {
             tokenizer_encoding: String::from("cl100k_base"),
         },
         retrieval: RetrievalConfig::default(),
+        context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
     }
 }
@@ -88,6 +89,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         providers: BTreeMap::new(),
         ingestion: IngestionConfig::default(),
         retrieval: RetrievalConfig::default(),
+        context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
     }
 }
@@ -705,7 +707,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("4"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("5"));
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("4")
@@ -1027,7 +1029,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
         assert!(db.search_keyword_chunks("8841", 3, &[]).unwrap().is_empty());
     }
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("4"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("5"));
     let hits = db.search_keyword_chunks("8841", 3, &[]).unwrap();
     assert_eq!(hits.first().map(|h| h.id.as_str()), Some("c0"));
     assert!(

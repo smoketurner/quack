@@ -3,21 +3,47 @@ use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::WorkspaceDb;
 use std::fmt::Write;
 
-/// Build the system prompt: role and mode, tool guidance, table schemas,
-/// documents, and the full text of pinned documents within `pinned_token_budget`.
+/// Everything that shapes the system prompt besides the workspace itself.
+#[derive(Debug, Clone)]
+pub struct PromptOptions {
+    pub mode: ChatMode,
+    /// Budget for pinned document text (four characters per token).
+    pub pinned_token_budget: u32,
+    /// Global prefix plus workspace context, already joined, if any.
+    pub context: Option<String>,
+    /// Budget for `context` (four characters per token).
+    pub context_max_tokens: u32,
+}
+
+/// Build the system prompt in the order the design fixes (section 7.2):
+/// role and mode, tool guidance and dialect, tables, documents and pinned
+/// text, the workspace context, and the permission rules.
 ///
 /// # Errors
 ///
 /// Returns an error if schema introspection fails.
-pub fn build_system_prompt(
-    db: &WorkspaceDb,
-    mode: ChatMode,
-    pinned_token_budget: u32,
-) -> Result<String> {
+pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<String> {
     let mut prompt = String::from(
-        "You are a data analysis assistant. You help users explore and analyze data stored in a DuckDB database.\n\n\
-         You have access to tools that let you run SQL queries, search documents, describe tables, and create charts.\n\n\
-         When answering analytical questions about structured data:\n\
+        "You are a data analysis assistant working inside one workspace that holds tables, \
+         documents, or both. Answer by using the tools: run SQL rather than estimating, search \
+         the documents rather than recalling, state assumptions, and when a question is \
+         ambiguous ask one clarifying question instead of guessing.\n\n",
+    );
+
+    match options.mode {
+        ChatMode::Chat => prompt.push_str(
+            "Mode: chat. You may draw on general knowledge, but whenever you use a retrieved chunk \
+             or a query result, cite it.\n\n",
+        ),
+        ChatMode::Query => prompt.push_str(
+            "Mode: query. Every factual claim must come from a retrieved chunk (cite its [n] marker) \
+             or from a query you ran this turn. Do not answer from memory. If search and queries \
+             find nothing relevant, say that the workspace does not cover the question and stop.\n\n",
+        ),
+    }
+
+    prompt.push_str(
+        "When answering analytical questions about structured data:\n\
          1. First use list_tables or describe_table to understand the available data\n\
          2. Write and execute SQL queries using run_sql\n\
          3. Explain the results in natural language\n\
@@ -34,18 +60,6 @@ pub fn build_system_prompt(
          - ILIKE for case-insensitive matching\n\
          - Use double quotes for identifiers with special characters\n\n",
     );
-
-    match mode {
-        ChatMode::Chat => prompt.push_str(
-            "Mode: chat. You may draw on general knowledge, but whenever you use a retrieved chunk \
-             or a query result, cite it.\n\n",
-        ),
-        ChatMode::Query => prompt.push_str(
-            "Mode: query. Every factual claim must come from a retrieved chunk (cite its [n] marker) \
-             or from a query you ran this turn. Do not answer from memory. If search and queries \
-             find nothing relevant, say that the workspace does not cover the question and stop.\n\n",
-        ),
-    }
 
     let tables = db.list_tables()?;
     if !tables.is_empty() {
@@ -88,16 +102,57 @@ pub fn build_system_prompt(
         writeln!(prompt)?;
     }
 
-    append_pinned_documents(&mut prompt, db, pinned_token_budget)?;
+    append_pinned_documents(&mut prompt, db, options.pinned_token_budget)?;
 
     if tables.is_empty() && docs.is_empty() {
         writeln!(
             prompt,
             "No tables or documents have been ingested yet. Let the user know they can ingest files first."
         )?;
+        writeln!(prompt)?;
     }
 
+    append_context(&mut prompt, options)?;
+
+    prompt.push_str(
+        "Permissions: SELECT queries always run. A statement that would modify the workspace \
+         is only run if the user allows it; if it is refused, do not retry it and tell the \
+         user it needs write permission.\n",
+    );
+
     Ok(prompt)
+}
+
+/// The owner-written context, truncated to `context_max_tokens` with a note
+/// so the model knows it is incomplete.
+fn append_context(prompt: &mut String, options: &PromptOptions) -> Result<()> {
+    let Some(context) = options.context.as_deref() else {
+        return Ok(());
+    };
+    let budget_chars = usize::try_from(options.context_max_tokens)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    writeln!(
+        prompt,
+        "Workspace context (written by the workspace owner; follow it over general knowledge):"
+    )?;
+    if context.len() <= budget_chars {
+        writeln!(prompt, "{context}")?;
+    } else {
+        let cut: String = context.chars().take(budget_chars).collect();
+        tracing::warn!(
+            max_tokens = options.context_max_tokens,
+            "workspace context exceeds the token budget and was truncated"
+        );
+        writeln!(prompt, "{cut}")?;
+        writeln!(
+            prompt,
+            "[context truncated at {} tokens; ask the owner to shorten it]",
+            options.context_max_tokens
+        )?;
+    }
+    writeln!(prompt)?;
+    Ok(())
 }
 
 /// Inject the full text of pinned documents, skipping any that would push
@@ -179,6 +234,39 @@ mod tests {
         panic!("in-memory DuckDB failed to open: {msg}");
     }
 
+    fn options(mode: ChatMode, pinned: u32) -> PromptOptions {
+        PromptOptions {
+            mode,
+            pinned_token_budget: pinned,
+            context: None,
+            context_max_tokens: 4000,
+        }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn context_is_placed_after_documents_and_truncated_to_budget() {
+        let db = db();
+        db.insert_document("d1", "policy.pdf", "application/pdf", 1, "ready")
+            .unwrap();
+        let mut opts = options(ChatMode::Chat, 100);
+        opts.context = Some(String::from("Amounts are in cents."));
+        let prompt = build_system_prompt(&db, &opts).unwrap();
+        let docs_at = prompt.find("Ingested documents:").unwrap();
+        let ctx_at = prompt.find("Workspace context").unwrap();
+        let perms_at = prompt.find("Permissions:").unwrap();
+        assert!(docs_at < ctx_at && ctx_at < perms_at);
+        assert!(prompt.contains("Amounts are in cents.\n"));
+        assert!(!prompt.contains("truncated"));
+
+        opts.context = Some("x".repeat(100));
+        opts.context_max_tokens = 5;
+        let prompt = build_system_prompt(&db, &opts).unwrap();
+        assert!(prompt.contains(&"x".repeat(20)));
+        assert!(!prompt.contains(&"x".repeat(21)));
+        assert!(prompt.contains("[context truncated at 5 tokens"));
+    }
+
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn prompt_states_mode_and_lists_tables_and_documents() {
@@ -187,12 +275,13 @@ mod tests {
             .unwrap();
         db.insert_document("d1", "policy.pdf", "application/pdf", 1, "ready")
             .unwrap();
-        let chat = build_system_prompt(&db, ChatMode::Chat, 1000).unwrap();
+        let chat = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
         assert!(chat.contains("Mode: chat."));
         assert!(chat.contains("- claims"));
         assert!(chat.contains("- policy.pdf (status: ready"));
         assert!(!chat.contains("Pinned documents"));
-        let query = build_system_prompt(&db, ChatMode::Query, 1000).unwrap();
+        assert!(chat.ends_with("user it needs write permission.\n"));
+        let query = build_system_prompt(&db, &options(ChatMode::Query, 1000)).unwrap();
         assert!(query.contains("Mode: query."));
         assert!(query.contains("Do not answer from memory"));
     }
@@ -226,7 +315,7 @@ mod tests {
         db.set_document_pinned("d1", true).unwrap();
         db.set_document_pinned("d2", true).unwrap();
         // Budget of 20 tokens fits rules.md (~6 tokens) but not big.md (100).
-        let prompt = build_system_prompt(&db, ChatMode::Chat, 20).unwrap();
+        let prompt = build_system_prompt(&db, &options(ChatMode::Chat, 20)).unwrap();
         assert!(
             prompt.contains("--- rules.md ---\nfirst rule\nsecond rule\n--- end rules.md ---"),
             "{prompt}"
@@ -240,7 +329,7 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn empty_workspace_prompt_says_so() {
-        let prompt = build_system_prompt(&db(), ChatMode::Chat, 100).unwrap();
+        let prompt = build_system_prompt(&db(), &options(ChatMode::Chat, 100)).unwrap();
         assert!(prompt.contains("No tables or documents have been ingested yet"));
     }
 }

@@ -14,6 +14,7 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderConfig>,
     pub ingestion: IngestionConfig,
     pub retrieval: RetrievalConfig,
+    pub context: ContextConfig,
     pub analysis: AnalysisConfig,
 }
 
@@ -118,6 +119,20 @@ impl Default for IngestionConfig {
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
         }
+    }
+}
+
+/// Workspace context (the owner-written instructions) settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextConfig {
+    /// Approximate token budget for the context in the system prompt.
+    pub max_tokens: u32,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self { max_tokens: 4000 }
     }
 }
 
@@ -421,6 +436,7 @@ always_retrieve = true
         assert_eq!(config.retrieval.rrf_k, 60);
         assert_eq!(config.retrieval.pinned_token_budget, 8000);
         assert!(!config.retrieval.always_retrieve);
+        assert_eq!(config.context.max_tokens, 4000);
         assert_eq!(config.analysis.threads, 4);
         assert_eq!(config.analysis.max_turns, 10);
         assert_eq!(config.analysis.history_token_budget, 32_000);

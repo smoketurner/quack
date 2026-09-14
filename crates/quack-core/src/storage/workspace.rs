@@ -14,6 +14,7 @@ pub const INTERNAL_TABLES: &[&str] = &[
     "_quack_sessions",
     "_quack_messages",
     "_quack_terms",
+    "_quack_context",
 ];
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
@@ -24,7 +25,7 @@ const BM25_B: f64 = 0.75;
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "4";
+const WORKSPACE_SCHEMA_VERSION: &str = "5";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -302,6 +303,12 @@ impl WorkspaceDb {
             CREATE INDEX IF NOT EXISTS _quack_terms_term_idx ON _quack_terms (term);
             CREATE INDEX IF NOT EXISTS _quack_terms_chunk_idx ON _quack_terms (chunk_id);
             DROP SCHEMA IF EXISTS fts_main__quack_chunks CASCADE;
+            CREATE TABLE IF NOT EXISTS _quack_context (
+                version INTEGER PRIMARY KEY,
+                content TEXT NOT NULL,
+                edited_by TEXT,
+                edited_at TIMESTAMP DEFAULT now()
+            );
             CREATE TABLE IF NOT EXISTS _quack_sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT,

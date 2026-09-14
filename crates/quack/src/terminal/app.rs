@@ -38,6 +38,7 @@ Commands:
   /mode [chat|query] Show or set the answer mode (query = sources only)
   /docs             List ingested documents
   /pin ID, /unpin ID  Pin a document's full text into every prompt
+  /context          Show the workspace context the agent is given
   /clear            Clear messages and chart
   /workspace        Show current workspace and session
   /quit, /exit      Exit quack
@@ -556,6 +557,7 @@ impl App {
             "/new" => self.new_session(),
             "/mode" => self.set_mode(args),
             "/docs" => self.show_documents(),
+            "/context" => self.show_context(),
             "/pin" => self.set_pinned(args, true),
             "/unpin" => self.set_pinned(args, false),
             "/tables" => self.run_direct_sql("SHOW TABLES"),
@@ -740,6 +742,35 @@ impl App {
             Ok(()) => self.messages.push(Message::new(
                 MessageRole::System,
                 format!("Mode set to {mode} for this session."),
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+    }
+
+    fn show_context(&mut self) {
+        let result = match self.db.lock() {
+            Ok(db) => quack_core::storage::context::current(&db),
+            Err(e) => {
+                self.messages.push(Message::new(
+                    MessageRole::Error,
+                    format!("workspace lock poisoned: {e}"),
+                ));
+                return;
+            }
+        };
+        match result {
+            Ok(Some(current)) => self.messages.push(Message::new(
+                MessageRole::System,
+                format!(
+                    "Workspace context (version {}, {}):\n{}",
+                    current.version, current.edited_at, current.content
+                ),
+            )),
+            Ok(None) => self.messages.push(Message::new(
+                MessageRole::System,
+                "No workspace context set. Use `quack context edit` or `quack context import FILE`.",
             )),
             Err(e) => self
                 .messages

@@ -11,6 +11,7 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::llm;
+use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::WorkspaceDb;
@@ -126,6 +127,13 @@ enum Commands {
         pin: bool,
     },
 
+    /// Show, edit, or move the workspace context (the owner's instructions
+    /// and definitions for the agent)
+    Context {
+        #[command(subcommand)]
+        action: Option<ContextAction>,
+    },
+
     /// List ingested documents, or pin and unpin one
     Docs {
         /// Pin a document by id (prefixes accepted)
@@ -139,6 +147,29 @@ enum Commands {
         /// Emit one JSON object per document
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContextAction {
+    /// Print the current context (default)
+    Show,
+    /// Open the context in $EDITOR and store the result as a new version
+    Edit,
+    /// List versions, newest first
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Write the current context to a Markdown file
+    Export {
+        /// Destination path (- for stdout)
+        file: String,
+    },
+    /// Replace the context with the contents of a Markdown file
+    Import {
+        /// Source path (- for stdin)
+        file: String,
     },
 }
 
@@ -247,6 +278,14 @@ async fn main() -> Result<ExitCode> {
                 pin,
             )
             .await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::Context { action }) => {
+            init_logging();
+            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+            let ws_db = WorkspaceDb::open(&config, &workspace.id)
+                .context("failed to open workspace database")?;
+            run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Docs { pin, unpin, json }) => {
@@ -370,6 +409,94 @@ fn resolve_session(
         .chat_model_ref()
         .map_or_else(|_| String::from("unconfigured"), |m| m.to_string());
     Ok(sessions::create_session(db, &model, mode.unwrap_or_default())?.id)
+}
+
+fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    match action {
+        ContextAction::Show => match context::current(db)? {
+            Some(current) => {
+                writeln!(
+                    out,
+                    "# version {} ({}){}",
+                    current.version,
+                    current.edited_at,
+                    current
+                        .edited_by
+                        .as_deref()
+                        .map_or(String::new(), |b| format!(" by {b}"))
+                )?;
+                writeln!(out, "{}", current.content)?;
+            }
+            None => writeln!(
+                out,
+                "No workspace context set. Use `quack context edit` or `quack context import FILE`."
+            )?,
+        },
+        ContextAction::History { limit } => {
+            let versions = context::history(db, limit)?;
+            if versions.is_empty() {
+                writeln!(out, "No versions yet.")?;
+            }
+            for v in versions {
+                let first_line = v.content.lines().next().unwrap_or("").to_owned();
+                writeln!(
+                    out,
+                    "v{:<4} {}  {:<12} {}",
+                    v.version,
+                    v.edited_at,
+                    v.edited_by.as_deref().unwrap_or("-"),
+                    first_line
+                )?;
+            }
+        }
+        ContextAction::Export { file } => {
+            let content = context::current(db)?.map_or(String::new(), |c| c.content);
+            if file == "-" {
+                writeln!(out, "{content}")?;
+            } else {
+                std::fs::write(&file, format!("{content}\n"))
+                    .with_context(|| format!("failed to write {file}"))?;
+                writeln!(out, "wrote {file}")?;
+            }
+        }
+        ContextAction::Import { file } => {
+            let content = if file == "-" {
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&file).with_context(|| format!("failed to read {file}"))?
+            };
+            let stored = context::set(db, &content, None)?;
+            writeln!(out, "context is now version {}", stored.version)?;
+        }
+        ContextAction::Edit => {
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .context("set $EDITOR (or $VISUAL) to edit the context, or use `quack context import FILE`")?;
+            let current = context::current(db)?.map_or(String::new(), |c| c.content);
+            let tmp = tempfile::Builder::new()
+                .prefix("quack-context-")
+                .suffix(".md")
+                .tempfile()
+                .context("failed to create a temporary file")?;
+            std::fs::write(tmp.path(), format!("{current}\n"))?;
+            let status = std::process::Command::new(&editor)
+                .arg(tmp.path())
+                .status()
+                .with_context(|| format!("failed to run {editor}"))?;
+            if !status.success() {
+                anyhow::bail!("{editor} exited with {status}; context unchanged");
+            }
+            let edited = std::fs::read_to_string(tmp.path())?;
+            let stored = context::set(db, &edited, None)?;
+            writeln!(out, "context is now version {}", stored.version)?;
+        }
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// Resolve a full document id or a unique prefix.

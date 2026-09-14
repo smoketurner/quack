@@ -208,10 +208,12 @@ Answer as a claims analyst. Prefer the policy documents over the FAQ when they d
 ```
 
 Edited in the web UI settings page (`member`+, audited), via `PUT .../context`, or with
-`quack context edit` (opens `$EDITOR` on a temp file and writes back). `quack context
-export|import FILE` moves it as Markdown. A `~/.config/quack/context.md` is an unclassified
-global prefix loaded before the workspace context. The agent never writes it. Every edit
-is versioned in `_quack_context` so it can be diffed and restored.
+`quack context edit` (opens `$EDITOR` or `$VISUAL` on a temp file and stores the result).
+`quack context export|import FILE` moves it as Markdown (`-` for stdout or stdin);
+`quack context history` lists versions; `/context` in the terminal shows it. A
+`~/.config/quack/context.md` is an unclassified global prefix loaded before the workspace
+context. The agent never writes it. Every distinct edit is a new version in
+`_quack_context`; importing identical content records nothing.
 
 ### 5.4 `data.duckdb`
 
@@ -1311,7 +1313,8 @@ the time of the last edit.
    stored and replayed; `_quack_context` lands with step 6 and `_quack_audit` with the
    server. Sections 5.3, 5.4, 12.
 3. **Document registry lacks** `sha256`, `source`, `pinned`, `title`. Section 5.4.
-4. **No workspace context.** Section 5.3.
+4. **Context has no `edited_by` in the terminal or CLI yet** (no users until the server);
+   versions record it as null. Section 5.3.
 5. **No stdin-as-data in print mode, no session sharing or `created_by`.** Sections 8,
    11.5. History replays user and assistant text only; tool payloads are not summarized
    into history yet.
@@ -1391,8 +1394,8 @@ deployment for document chat is the end of step 8.
    SQL; print mode with formats and exit codes.~~ Done.
 5. ~~Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
    documents, chat and query modes.~~ Done. DOCX, HTML, PPTX, XLSX parsers are issue #16.
-6. Workspace context (stored, versioned, import/export) and the prompt rewrite; new chart
-   spec and terminal renderer.
+6. ~~Workspace context (stored, versioned, import/export) and the prompt rewrite.~~ Done.
+   New chart spec and terminal renderer: issue #19.
 7. OAuth: `TokenManager`, PKCE and device code, cache, `quack auth`.
 8. `quack serve`: `control.db`, users, tokens, roles, split audit, upload queue; REST API;
    SSE; web UI (workspaces, chat with citations, documents, tables, context editor).

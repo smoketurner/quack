@@ -1,3 +1,4 @@
+pub mod context;
 pub mod control;
 pub mod migrations;
 pub mod queries;
