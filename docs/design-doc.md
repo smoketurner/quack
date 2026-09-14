@@ -1304,30 +1304,30 @@ tenant; desktop app on each platform; air-gapped static binary with bundled exte
 
 ## 17. Gaps Between This Document and the Code
 
-Ordered by risk. Closed items are removed as they land; this list is the honest delta at
-the time of the last edit.
+Every gap is a GitHub issue; this list is the map from the design to the tracker and is
+updated as issues close. Ordered by risk.
 
-1. **No reranking hook, no SHA dedup, no `title` on documents.** Hybrid retrieval,
-   chunk metadata, citations, pinned documents, and chat/query modes are in. Section 6.1.
-2. **Context and audit detail tables do not exist yet.** Sessions and messages are
-   stored and replayed; `_quack_context` lands with step 6 and `_quack_audit` with the
-   server. Sections 5.3, 5.4, 12.
-3. **Document registry lacks** `sha256`, `source`, `pinned`, `title`. Section 5.4.
-4. **Context has no `edited_by` in the terminal or CLI yet** (no users until the server);
-   versions record it as null. Section 5.3.
-5. **No stdin-as-data in print mode, no session sharing or `created_by`.** Sections 8,
-   11.5. History replays user and assistant text only; tool payloads are not summarized
-   into history yet.
-6. **No ontology, no induction, no graph.** Sections 6.3 to 6.5.
-7. **Web UI mapping of the chart spec to ECharts** does not exist yet (no web UI).
-   Section 9.
-8. **No OAuth, no server, no MCP, no desktop window, no web UI.** `auth = "oauth"` parses
-   and is rejected as unimplemented. Sections 10.2, 11, 12.
-9. **DOCX, HTML, PPTX, XLSX unsupported** (tracked as issue #16; XLSX via a Rust
-   reader, not the `excel` extension). Sections 6.1, 6.2.
-10. **No `ATTACH` to external databases.** Needs a Rust-side design now that scanner
-    extensions are out (section 6.2). Step 13.
-11. ~~`text_to_sql` tests are a placeholder.~~ Done.
+1. **Verify agent behavior against a live model** (#20): streaming and the write prompt,
+   citation markers, history replay, chart `kind`. Sections 7, 8, 9.
+2. **No OAuth** (#25). `auth = "oauth"` parses and is rejected. Section 10.2.
+3. **No server, REST API, web UI** (#26); **no MCP** (#29); **no desktop window** (#35).
+   Sections 11, 12.
+4. **No ontology or induction** (#27); **no graph** (#28). Sections 6.3 to 6.5.
+5. **DOCX, HTML, PPTX, XLSX unsupported** (#16; XLSX via a Rust reader). Sections 6.1, 6.2.
+6. **No `ATTACH` to external databases** (#21): needs a Rust-side design now that scanner
+   extensions are out. Section 6.2, step 13.
+7. **Document registry lacks `sha256` dedup, `source`, `title`** (#22). Section 5.4.
+8. **Sessions have no `created_by` or sharing; print mode cannot take stdin as data**
+   (#23). Sections 8, 11.5.
+9. **Context `edited_by` and the `_quack_audit` detail table** wait for users and the
+   server (#24). Sections 5.3, 5.4, 12.
+10. **No release pipeline** (#30). Section 14.
+11. **Print mode reprints the answer when citation validation changes streamed text**
+    (#33). Section 11.5.
+12. **No stemming in keyword search** (#31, deliberately deferred); **no reranking hook**
+    (#34); **large-workspace vector index options** (#32, research). Sections 6.1, 15.
+13. **Web UI mapping of the chart spec to ECharts** arrives with the web UI (#26).
+    Section 9.
 
 ---
 
@@ -1409,8 +1409,8 @@ deployment for document chat is the end of step 8.
 11. Graph: extraction from documents and mapped tables, resolution, provenance, traversal,
     tools, TUI tree, web graph page, stale and provisional handling.
 12. MCP over stdio and SSE.
-13. `/attach`, XLSX, embedding dimension recording, `workspace snapshot`, `extensions
-    bundle`.
+13. External data import (the Rust-side replacement for `ATTACH`), XLSX via a Rust reader,
+    `workspace snapshot`.
 14. Release engineering: musl targets, macOS, Windows, container image, compose.
 15. AnythingLLM import command.
 16. `quack desktop` and installer bundles, last and only if there is demand.
