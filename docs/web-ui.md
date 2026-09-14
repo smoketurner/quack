@@ -1,7 +1,13 @@
 # Embedded server UI
 
-A single self-contained binary: axum serves the routes, rust-embed bakes assets and locale
-catalogs into the executable, fluent localizes per request, and Tailwind builds the CSS.
+Implementation patterns for `quack serve` (design doc sections 11.1, 11.2, and 12): axum
+serves the routes, rust-embed bakes assets into the executable, askama renders the
+templates, htmx drives interactivity and SSE streaming, and Tailwind builds the CSS with
+the standalone binary. Localization via fluent is shown below as an available pattern; it
+is deferred in the design doc and not required for the first release.
+
+The web UI is a client of `quack-core`: handlers call core functions and render their
+results. No behavior lives in this layer.
 
 Crates (from the workspace menu):
 

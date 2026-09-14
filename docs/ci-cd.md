@@ -11,12 +11,14 @@
   without a full commit-SHA pin (`zgosalvez/github-actions-ensure-sha-pinned-actions`).
 - **`.github/dependabot.yml`** — `cargo` + `github-actions`, weekly, grouped, 7-day cooldown.
 
-These cover everything a library/workspace needs. The pieces below produce and ship
-**binaries/containers**. They mirror what `smoketurner/devbox` and `vouch-sh/vouch` do.
+These cover everything the workspace needs today. The pieces below produce and ship
+**binaries and containers** for the release targets in design doc section 14: the static
+`quack` binary for Linux (musl) and macOS, the `quack serve` container image, and later
+the installer bundles around `quack desktop`.
 
-The repo ships them as **samples** that reference placeholder `app-common`/`app-server`/
-`app-cli` crates — they won't build until you rename those to your crates and add the CI
-jobs shown below:
+The repo ships them as **samples** that still reference placeholder `app-common`/
+`app-server`/`app-cli` crates — they won't build until those are renamed to `quack-core`
+and `quack` (the merged binary crate) and the CI jobs shown below are added:
 
 - [`Dockerfile`](../Dockerfile) + [`.dockerignore`](../.dockerignore) — runtime server image
   (static musl binary → distroless).
@@ -79,8 +81,10 @@ crate-named assets, `sha256sum` them, and publish a GitHub release. The publish 
 ## When you add these
 
 1. Rename the placeholder `app-*` paths in the shipped `Dockerfile`, `.dockerignore`,
-   `Dockerfile.build`, `docker-bake.hcl`, and `Dockerfile.build.dockerignore` to your crates,
-   and update the `image.source` label. Keep `.dockerignore` a deny-by-default allowlist so
+   `Dockerfile.build`, `docker-bake.hcl`, and `Dockerfile.build.dockerignore` to
+   `quack-core` and `quack`, set the `image.source` label to this repository, and keep the
+   Rust base-image tag equal to the toolchain in `rust-toolchain.toml`. The runtime image
+   must contain only `/quack` and `/data` (design doc section 14). Keep `.dockerignore` a deny-by-default allowlist so
    the runtime-image context stays small and cache-stable:
 
    ```gitignore

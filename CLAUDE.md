@@ -6,12 +6,23 @@ It also drives the `rust-agents` Claude Code plugin (conventions live in `.claud
 
 ## What this is
 
-A data analysis platform built with Rust. The chosen stack:
+A knowledge engine with many interfaces, built in Rust. A workspace holds documents
+(vectorized), tables (DuckDB), and an ontology-backed knowledge graph; one agent answers
+across all three and shows every action. The core is a library; the web UI, REST API, MCP
+server, terminal session, print mode, and desktop window are thin clients of it, all
+subcommands of one `quack` binary with no Cargo features. The
+design is `docs/design-doc.md`; read it before any non-trivial change, and check its
+section 17 for where the code still lags. The chosen stack:
 
 - **Workspace** of crates under `crates/` (edition 2024, resolver 3, MSRV 1.98.0)
-- **SQLite** (via `sqlx`) for the control plane (workspace metadata, threads, audit log)
-- **DuckDB** (via `duckdb-rs`) for per-workspace analytical databases
-- **sea-query** for type-safe SQL generation in the control plane
+- **DuckDB** (via `duckdb-rs`), one file per workspace, holding everything classified
+  about that workspace: user tables, chunks, graph, ontology, context, sessions, audit
+  detail (all internal tables prefixed `_quack_`)
+- **SQLite** (via `sqlx`) for `control.db` in server mode: users, workspaces, membership,
+  tokens, and the mandatory append-only access audit log; nothing workspace-revealing
+- **sea-query** for type-safe SQL generation against `control.db`; bound parameters for
+  DuckDB internals
+- **rig** for LLM providers (Ollama, OpenAI-compatible, Anthropic) and the agent loop
 - **aws-lc-rs** as the single crypto/TLS provider (never OpenSSL or `ring`)
 
 ## Repository layout
@@ -23,8 +34,8 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.98.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
-crates/               # quack-core, quack-cli — see crates/README.md
-docs/                 # the stack patterns, with code
+crates/               # quack-core, quack-cli, quack-tui — see crates/README.md
+docs/                 # design-doc.md (the product) plus the stack patterns, with code
 .claude/rules/        # branching, commits, continuous-improvement conventions
 ```
 
@@ -41,6 +52,9 @@ docs/                 # the stack patterns, with code
 - **Logging:** `tracing` (`error!`/`warn!`/`info!`/`debug!`), never `println!`.
 - **Date/time:** `jiff`, not `chrono` or `time`.
 - **Database IDs:** UUID v7, client-generated (`uuid::Uuid::now_v7()`) — never v4.
+- **Classification boundary:** anything that can reveal workspace content goes in the
+  workspace DuckDB file, never in `control.db`. Every workspace-touching request writes an
+  access `audit_log` row (including denials) plus a `_quack_audit` detail row.
 - **Types:** newtypes over primitives, enums for state machines, `let...else` for early returns.
 - **Commits:** Conventional Commits (`.claude/rules/commits-and-issues.md`). No AI/co-author
   trailers. Never push to `main` — branch and PR.
@@ -58,6 +72,18 @@ data-layer, crypto, or dependency change:
 - `.claude/rules/branching.md`, `.claude/rules/commits-and-issues.md`,
   `.claude/rules/continuous-improvement.md` — branch/commit/CI conventions for the
   `rust-agents` flow.
+
+## Interfaces today
+
+```bash
+cargo run --bin quack -- query "SELECT 1"           # SQL against a workspace
+cargo run --bin quack -- ingest sales.csv -w ws     # file -> table or chunks
+cargo run --bin quack -- chat "question" -w ws      # agent (needs providers in config)
+cargo run --bin quack-tui -- -w ws                  # terminal session
+```
+
+Target CLI (`quack -p`, `quack serve`, `quack mcp`, `quack ontology propose`, ...) is in
+design doc section 11.
 
 ## Common commands
 

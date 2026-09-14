@@ -25,9 +25,22 @@ and code — this file is the gate, the doc is the detail.
 
 - [ ] **UUID v7 primary keys**, client-generated via `uuid::Uuid::now_v7()` — not v4
       (`gen_random_uuid()`), not `SERIAL`/sequential PKs.
-- [ ] Control plane queries built with sea-query — **no raw SQL in handlers**.
-- [ ] DuckDB workspaces are isolated per workspace ID; user SQL executes only in DuckDB,
-      never against the control plane.
+- [ ] `control.db` queries built with sea-query — **no raw SQL in handlers**.
+- [ ] **The workspace DuckDB file is the classification boundary.** Anything that can
+      reveal workspace content (documents, chunks, graph, ontology, context, sessions,
+      messages, audit detail) lives in that file with a `_quack_` prefix, never in
+      `control.db` (design doc section 5).
+- [ ] `control.db` holds only users, workspaces (name and label), membership, tokens, and
+      the access `audit_log`. `audit_log` is append-only: no `UPDATE`/`DELETE` path.
+- [ ] Every request that touches a workspace writes an `audit_log` row, including denied
+      ones, and a `_quack_audit` detail row inside the workspace under the same UUID v7.
+- [ ] DuckDB internal statements use `duckdb::params!`; identifiers go through
+      `quote_ident`; file paths are bound, never interpolated (design doc section 5.6).
+- [ ] Agent SQL passes read/write classification (`json_serialize_sql`) and the permission
+      layer, runs under `memory_limit`/`threads`/timeout, and is refused if it references
+      `_quack_` tables (design doc section 7.4).
+- [ ] DuckDB workspaces are isolated per workspace; user SQL executes only in DuckDB,
+      never against `control.db`; no `ATTACH` between workspaces.
 
 ## Workspace hygiene → [docs/architecture.md](../../docs/architecture.md)
 

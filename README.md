@@ -1,26 +1,39 @@
 # quack
 
-A data analysis platform built with Rust. Execute SQL queries against isolated DuckDB
-workspaces, with a SQLite control plane managing workspace metadata.
+A knowledge engine with many interfaces, built in Rust. A workspace holds documents
+(vectorized for retrieval), tables (DuckDB analytics), and an ontology-backed knowledge
+graph; one agent answers questions across all three and shows every action it takes.
+The core is a library; the web UI, REST API, MCP server, terminal session, print mode,
+and desktop window are thin clients of it, all subcommands of one `quack` binary.
+
+The full design is in [docs/design-doc.md](docs/design-doc.md). The code currently
+implements an earlier slice of it; section 17 of the design doc lists the gaps.
 
 ## The stack
 
 | Concern | Choice | Why |
 |---|---|---|
 | Workspace | Cargo workspace, crates under `crates/` | Edition 2024, resolver 3 |
-| Control plane | SQLite | Zero-setup, fast metadata store |
-| Analytical DB | DuckDB | Per-workspace analytical engine |
-| Query layer | [`sea-query`](https://crates.io/crates/sea-query) | Type-safe SQL generation for control plane |
-| DB driver | [`sqlx`](https://crates.io/crates/sqlx) | Async SQLite for control plane |
-| Crypto / TLS | [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs) | Preferred over OpenSSL and `ring` |
+| Workspace storage | DuckDB, one file per workspace | The classification boundary: tables, chunks, graph, ontology, context, sessions, and audit detail all live inside it |
+| Access control | SQLite `control.db` (server mode) | Users, membership, tokens, and the mandatory access audit log; nothing that reveals workspace content |
+| Query layer | [`sea-query`](https://crates.io/crates/sea-query) | Type-safe SQL for `control.db`; DuckDB internals use bound parameters |
+| DB driver | [`sqlx`](https://crates.io/crates/sqlx) | Async SQLite for `control.db` |
+| LLM layer | [`rig`](https://crates.io/crates/rig) | Providers: Ollama, OpenAI-compatible, Anthropic; auth none / API key / OAuth PKCE |
+| Crypto / TLS | [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs) | Single provider; OpenSSL and `ring` are banned |
 
-## Quick start
+## Quick start (current code)
 
 ```bash
 cargo run --bin quack -- query "SELECT 1 AS answer"
 cargo run --bin quack -- query "SELECT * FROM generate_series(1, 5) AS t(n)" -f json
-cargo run --bin quack -- query "CREATE TABLE test(id INTEGER, name VARCHAR)" -w myworkspace
+cargo run --bin quack -- ingest sales.csv -w myworkspace
+cargo run --bin quack -- chat "total sales by region" -w myworkspace
+cargo run --bin quack-tui -- -w myworkspace
 ```
+
+`chat` and the TUI need a provider with a chat model and one with an embedding model in
+`~/.config/quack/config.toml`; see the configuration section of the design doc. Set
+`QUACK_DATA_DIR` to keep test data out of `~/.local/share/quack`.
 
 ## What's in the box
 
@@ -33,20 +46,25 @@ cargo run --bin quack -- query "CREATE TABLE test(id INTEGER, name VARCHAR)" -w 
 - **`.github/`** — CI (fmt, clippy, `cargo test`, dependency-review, `cargo-deny`; actions
   SHA-pinned, plus `secure_workflows.yml` enforcing SHA pins) and Dependabot (cargo +
   actions, grouped, 7-day cooldown).
+- **`Dockerfile`, `Dockerfile.build`, `docker-bake.hcl`** — sample container and static-build
+  files to be adapted for `quack serve` (design doc section 14).
 - **`Makefile`** — `build`, `fmt`, `lint`, `test`, `deny`, `help`.
 - **`CLAUDE.md` + `.claude/rules/`** — conventions for Claude Code agents
-  (branching, Conventional Commits, continuous improvement).
-- **`docs/`** — the patterns, with copy-pasteable code (see below).
+  (code standards, development discipline, branching, Conventional Commits, continuous
+  improvement).
+- **`docs/`** — the design and the stack patterns, with copy-pasteable code (see below).
 
 ## Documentation
 
 | Doc | Covers |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | Workspace layout, recommended crate split, lint inheritance |
-| [docs/migrations.md](docs/migrations.md) | SQLite migration patterns |
-| [docs/sea-query.md](docs/sea-query.md) | sea-query schema, `Iden` enums, query building |
+| [docs/design-doc.md](docs/design-doc.md) | The product: substrates, agent, ontology and induction, interfaces, storage boundary, auth, audit, build, gaps, and implementation order |
+| [docs/architecture.md](docs/architecture.md) | Cargo workspace layout, crate layering (current and target), core modules, lint inheritance |
+| [docs/migrations.md](docs/migrations.md) | Schema versioning for `control.db` (sea-query) and the `_quack_` tables in workspace DuckDB files |
+| [docs/sea-query.md](docs/sea-query.md) | sea-query schema, `Iden` enums, query building for `control.db` |
 | [docs/crypto.md](docs/crypto.md) | aws-lc-rs default provider, keeping `ring`/OpenSSL out |
-| [docs/ci-cd.md](docs/ci-cd.md) | CI jobs, and the deferred Docker/build/scan/release patterns |
+| [docs/web-ui.md](docs/web-ui.md) | axum + askama + htmx + Tailwind patterns for `quack serve` |
+| [docs/ci-cd.md](docs/ci-cd.md) | CI jobs, and the Docker/build/scan/release patterns to wire up for releases |
 
 ## License
 

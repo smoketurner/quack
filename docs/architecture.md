@@ -1,6 +1,8 @@
 # Architecture
 
-How the pieces of this project fit together.
+How the pieces of this project fit together. The product design is in
+[design-doc.md](design-doc.md); this file covers the Cargo workspace, the crate layering,
+and the lint baseline.
 
 ## Workspace
 
@@ -18,21 +20,67 @@ root:
 
 ## Layering
 
+Every interface is a thin adapter over the core library. Nothing above the core line owns
+behavior; nothing below it knows about HTTP, terminals, or windows.
+
 ```
-            +-----------------------------+
-            |         quack-cli           |  clap binary, output formatting
-            +--------------+--------------+
-                           | depends on
-            +--------------v--------------+
-            |         quack-core          |  config, error, control plane (SQLite),
-            |                             |  workspace engine (DuckDB), sea-query
-            +-----------------------------+
+      +------------+  +------------+  +------------+  +------------+  +---------------+
+      |  web UI    |  |  REST API  |  |    MCP     |  | TUI/print  |  | quack desktop |
+      |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |  | (Tauri window |
+      |   htmx)    |  |            |  |  SSE)      |  |  clap)     |  |  over serve)  |
+      +------------+  +------------+  +------------+  +------------+  +---------------+
+                        all subcommands of the single `quack` binary
+             \               |               |               |                /
+              +--------------+---------------+---------------+---------------+
+                                             | in-process calls
+                              +--------------v--------------+
+                              |         quack-core          |
+                              +-----------------------------+
 ```
 
-- **`quack-core`** owns config parsing, error types, the SQLite control plane (workspace
-  metadata, threads, audit log), and the DuckDB workspace engine. Queries against the
-  control plane are built with sea-query; user SQL runs directly against DuckDB.
-- **`quack-cli`** owns the clap CLI surface and output formatting (table, JSON).
+**Current crates** (what builds today):
+
+| Crate | Binary | Owns |
+|---|---|---|
+| `quack-core` | — | config, errors, `control.db` (sqlx + sea-query), workspace DuckDB engine, ingestion, chunking, vector search, rig-based agent and tools, chart spec |
+| `quack-cli` | `quack` | `query`, `ingest`, `chat` subcommands; table and JSON output |
+| `quack-tui` | `quack-tui` | ratatui chat session with file ingestion and terminal charts |
+
+**Target crates** (design doc section 4): `quack-cli` and `quack-tui` merge into one
+`quack` crate providing `serve`, `mcp`, the terminal session, print mode, and admin
+subcommands, with `quack desktop` as a later subcommand for the Tauri window. There are
+no Cargo features; every build contains every surface. Provider construction moves from
+the binaries into `quack-core::llm`.
+
+## Core modules
+
+`quack-core` is organized by substrate and by responsibility:
+
+| Module | Responsibility |
+|---|---|
+| `workspace/` | open and create a workspace directory; `.quack/` discovery for the TUI |
+| `storage/` | the workspace DuckDB file (everything classified) and `control.db` (access control and access audit) |
+| `ingestion/` | parsers, chunking with heading and page metadata, embedding, index maintenance |
+| `retrieval/` | vector + full-text fusion, citation metadata, pinned documents |
+| `analytics/` | SQL execution, read/write classification, resource limits, schema introspection |
+| `ontology/` | ontology tables, validation, versions, induction (propose and review) |
+| `graph/` | ontology-guided extraction, entity resolution, provenance, traversal |
+| `agent/` | the tool-calling loop as an event stream, tools, permissions, prompt, chat modes |
+| `llm/` | rig provider construction; auth none / API key / OAuth PKCE with a token manager |
+| `context/` | the stored workspace context; Markdown import and export |
+
+Today's code has `storage/`, `ingestion/`, and `analysis/` (agent, tools, text-to-SQL,
+vector index, chart). The split above is the target; new work should land in the target
+module rather than growing `analysis/`.
+
+## The storage boundary
+
+A workspace is one directory: `data.duckdb` plus `files/`. Everything classified about
+the workspace is inside it, including the sessions, the ontology, the context, and the
+detail of what was done. `control.db` holds only who may open which workspace and the
+access audit (who, what resource by opaque id, outcome, channel, when). See design doc
+sections 5 and 12. When adding a table, ask which side of the boundary it belongs on; if
+it can reveal workspace content, it goes in the DuckDB file with a `_quack_` prefix.
 
 ## Lint inheritance
 
