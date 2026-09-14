@@ -6,14 +6,17 @@
 
 use rig::client::EmbeddingsClient;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
+use std::sync::Arc;
+
 use rig::prelude::*;
 
 use crate::analysis::agent::{self, AgentResponse};
 use crate::analysis::events::EventSink;
 use crate::analysis::policy::WritePolicy;
+use crate::analysis::tools::SharedDb;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::sessions;
 
 /// Embedding model over every provider that supports embeddings.
 #[derive(Clone)]
@@ -207,7 +210,9 @@ pub fn chat_model_display(config: &Config) -> String {
         .map_or_else(|_| String::from("no chat model"), |m| m.to_string())
 }
 
-/// Run one agent turn with the configured chat and embedding models.
+/// Run one agent turn in `session_id` with the configured chat and
+/// embedding models, replaying the session's history to the model and
+/// recording the turn when it completes.
 ///
 /// This is the single dispatch point over provider types; interfaces call it
 /// rather than matching on `provider_type` themselves.
@@ -215,10 +220,11 @@ pub fn chat_model_display(config: &Config) -> String {
 /// # Errors
 ///
 /// Returns an error if no chat model is configured, a provider cannot be
-/// built, or the agent turn fails.
+/// built, the session does not exist, or the agent turn fails.
 pub async fn run_turn(
     config: &Config,
-    db: WorkspaceDb,
+    db: SharedDb,
+    session_id: &str,
     policy: WritePolicy,
     message: &str,
     sink: EventSink,
@@ -226,8 +232,50 @@ pub async fn run_turn(
     let chat = config.chat_model_ref()?;
     let embedding_model = required_embedding_model(config)?;
 
-    tracing::info!(chat_model = %chat, "starting agent turn");
+    let history = {
+        let guard = db
+            .lock()
+            .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
+        sessions::get_session(&guard, session_id)?
+            .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
+        sessions::history_for_model(&guard, session_id, config.analysis.history_token_budget)?
+    };
 
+    tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
+
+    let response = dispatch(
+        config,
+        Arc::clone(&db),
+        chat,
+        embedding_model,
+        policy,
+        history,
+        message,
+        sink,
+    )
+    .await?;
+
+    let guard = db
+        .lock()
+        .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
+    sessions::record_turn(&guard, session_id, message, &response)?;
+    Ok(response)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal dispatch over provider types"
+)]
+async fn dispatch(
+    config: &Config,
+    db: SharedDb,
+    chat: ModelRef<'_>,
+    embedding_model: EmbedModel,
+    policy: WritePolicy,
+    history: Vec<rig::message::Message>,
+    message: &str,
+    sink: EventSink,
+) -> Result<AgentResponse> {
     match chat.provider.provider_type {
         ProviderType::Ollama => {
             let client = build_ollama_client(chat.provider_name, chat.provider)?;
@@ -238,6 +286,7 @@ pub async fn run_turn(
                 &config.analysis,
                 &config.retrieval,
                 policy,
+                history,
                 message,
                 sink,
             )
@@ -252,6 +301,7 @@ pub async fn run_turn(
                 &config.analysis,
                 &config.retrieval,
                 policy,
+                history,
                 message,
                 sink,
             )
@@ -266,6 +316,7 @@ pub async fn run_turn(
                 &config.analysis,
                 &config.retrieval,
                 policy,
+                history,
                 message,
                 sink,
             )

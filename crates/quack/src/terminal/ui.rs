@@ -73,6 +73,11 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(&app.workspace_name, Style::default().fg(Color::Cyan)),
         Span::styled(" \u{00B7} ", Style::default().fg(Color::DarkGray)),
         Span::styled(&app.provider_display, Style::default().fg(Color::DarkGray)),
+        Span::styled(" \u{00B7} session ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.session_id.chars().take(8).collect::<String>(),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
 
     frame.render_widget(Paragraph::new(title), title_area);

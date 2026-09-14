@@ -7,6 +7,7 @@ mod ui;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 
 /// Run the terminal session against a resolved workspace until the user quits.
@@ -19,6 +20,8 @@ pub(crate) fn run(
     config: Config,
     workspace_name: String,
     workspace_id: String,
+    db: SharedDb,
+    session_id: String,
     allow_write: bool,
 ) -> Result<()> {
     config
@@ -43,8 +46,10 @@ pub(crate) fn run(
         workspace_id,
         provider_display,
         config,
+        db,
+        session_id,
         allow_write,
-    );
+    )?;
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     let result = tui_app.run(&mut terminal);

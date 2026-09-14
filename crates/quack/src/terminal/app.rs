@@ -9,8 +9,10 @@ use tokio::sync::mpsc;
 
 use quack_core::analysis::events::{self, AgentEvent, EventStream, PermissionRequest};
 use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion;
+use quack_core::storage::sessions::{self, MessageRole as StoredRole};
 use quack_core::storage::workspace::{WorkspaceDb, looks_like_direct_sql};
 
 use crate::terminal::chart::ChartData;
@@ -30,8 +32,11 @@ Commands:
   /help             Show this help message
   /sql [STATEMENT]  Run SQL directly; with no argument, edit the last query
   /tables           List tables in the workspace
+  /sessions         List recent sessions
+  /resume ID        Switch to a session (id prefix accepted) and replay it
+  /new              Start a fresh session
   /clear            Clear messages and chart
-  /workspace        Show current workspace
+  /workspace        Show current workspace and session
   /quit, /exit      Exit quack
 
 Shortcuts:
@@ -99,6 +104,7 @@ pub(crate) struct App {
     pub(crate) tick: usize,
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
+    pub(crate) session_id: String,
     pub(crate) current_chart: Option<ChartData>,
     /// The write awaiting a decision, while `state` is `AwaitingPermission`.
     pending_permission: Option<PermissionRequest>,
@@ -111,6 +117,7 @@ pub(crate) struct App {
     history_cursor: Option<usize>,
     config: Arc<Config>,
     workspace_id: String,
+    db: SharedDb,
     allow_write: bool,
     agent_events: Option<EventStream>,
     response_rx: mpsc::UnboundedReceiver<BackgroundResult>,
@@ -123,8 +130,10 @@ impl App {
         workspace_id: String,
         provider_display: String,
         config: Arc<Config>,
+        db: SharedDb,
+        session_id: String,
         allow_write: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         let mut textarea = TextArea::default();
         configure_textarea(&mut textarea);
@@ -138,6 +147,7 @@ impl App {
             tick: 0,
             workspace_name,
             provider_display,
+            session_id,
             current_chart: None,
             pending_permission: None,
             open_step: None,
@@ -147,6 +157,7 @@ impl App {
             history_cursor: None,
             config,
             workspace_id,
+            db,
             allow_write,
             agent_events: None,
             response_rx,
@@ -154,7 +165,64 @@ impl App {
         };
         app.messages
             .push(Message::new(MessageRole::System, WELCOME_TEXT));
-        app
+        let current = app.session_id.clone();
+        app.replay_session(&current)?;
+        Ok(app)
+    }
+
+    /// Load a session's stored messages into the transcript.
+    fn replay_session(&mut self, session_id: &str) -> Result<()> {
+        let rows = {
+            let db = self
+                .db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("workspace lock poisoned: {e}"))?;
+            sessions::messages(&db, session_id)?
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.messages.push(Message::new(
+            MessageRole::System,
+            format!(
+                "Resumed session {} ({} messages)",
+                short_id(session_id),
+                rows.len()
+            ),
+        ));
+        for row in rows {
+            match row.role {
+                StoredRole::User => self
+                    .messages
+                    .push(Message::new(MessageRole::User, row.content)),
+                StoredRole::Assistant => {
+                    if let Some(chart) = row.metadata.as_ref().and_then(|m| m.get("chart")) {
+                        self.current_chart = ChartData::from_echart_spec(chart);
+                    }
+                    self.messages
+                        .push(Message::new(MessageRole::Assistant, row.content));
+                }
+                StoredRole::Tool => {
+                    let tool = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("tool"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool");
+                    let ms = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("duration_ms"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    self.messages.push(Message::new(
+                        MessageRole::Step,
+                        format!("> {tool}\n  {}, {ms} ms", row.content),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn run(mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
@@ -182,6 +250,7 @@ impl App {
             }
         }
 
+        self.forget_session_if_empty();
         Ok(())
     }
 
@@ -444,9 +513,15 @@ impl App {
             "/workspace" => {
                 self.messages.push(Message::new(
                     MessageRole::System,
-                    format!("Workspace: {} ({})", self.workspace_name, self.workspace_id),
+                    format!(
+                        "Workspace: {} ({})\nSession: {}",
+                        self.workspace_name, self.workspace_id, self.session_id
+                    ),
                 ));
             }
+            "/sessions" => self.show_sessions(),
+            "/resume" => self.switch_session(args),
+            "/new" => self.new_session(),
             "/tables" => self.run_direct_sql("SHOW TABLES"),
             "/sql" => {
                 if args.is_empty() {
@@ -467,6 +542,140 @@ impl App {
                     format!("unknown command: {other}"),
                 ));
             }
+        }
+    }
+
+    fn show_sessions(&mut self) {
+        let listing = {
+            let db = match self.db.lock() {
+                Ok(db) => db,
+                Err(e) => {
+                    self.messages.push(Message::new(
+                        MessageRole::Error,
+                        format!("workspace lock poisoned: {e}"),
+                    ));
+                    return;
+                }
+            };
+            sessions::list_sessions(&db, 20)
+        };
+        match listing {
+            Ok(rows) if rows.is_empty() => self
+                .messages
+                .push(Message::new(MessageRole::System, "No sessions yet.")),
+            Ok(rows) => {
+                let mut text = String::from("Sessions (most recent first):");
+                for row in rows {
+                    let marker = if row.id == self.session_id { "*" } else { " " };
+                    let line = format!(
+                        "\n{marker} {}  {}  {:>3} msgs  {}",
+                        short_id(&row.id),
+                        row.updated_at,
+                        row.message_count,
+                        row.title.as_deref().unwrap_or("(untitled)")
+                    );
+                    text.push_str(&line);
+                }
+                text.push_str("\nUse /resume ID to switch.");
+                self.messages.push(Message::new(MessageRole::System, text));
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+    }
+
+    fn switch_session(&mut self, prefix: &str) {
+        if prefix.is_empty() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "Usage: /resume SESSION_ID",
+            ));
+            return;
+        }
+        let found = {
+            let db = match self.db.lock() {
+                Ok(db) => db,
+                Err(e) => {
+                    self.messages.push(Message::new(
+                        MessageRole::Error,
+                        format!("workspace lock poisoned: {e}"),
+                    ));
+                    return;
+                }
+            };
+            sessions::list_sessions(&db, 1000).map(|rows| {
+                rows.into_iter()
+                    .filter(|s| s.id.starts_with(prefix))
+                    .collect::<Vec<_>>()
+            })
+        };
+        match found {
+            Ok(matches) if matches.len() == 1 => {
+                let id = matches.into_iter().next().map(|s| s.id).unwrap_or_default();
+                self.forget_session_if_empty();
+                self.messages.clear();
+                self.current_chart = None;
+                self.session_id.clone_from(&id);
+                if let Err(e) = self.replay_session(&id) {
+                    self.messages
+                        .push(Message::new(MessageRole::Error, format!("{e}")));
+                }
+            }
+            Ok(matches) if matches.is_empty() => self.messages.push(Message::new(
+                MessageRole::Error,
+                format!("no session matches '{prefix}'"),
+            )),
+            Ok(matches) => self.messages.push(Message::new(
+                MessageRole::Error,
+                format!(
+                    "'{prefix}' matches {} sessions; use more of the id",
+                    matches.len()
+                ),
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+        self.scroll_offset = 0;
+    }
+
+    fn new_session(&mut self) {
+        let created = {
+            let db = match self.db.lock() {
+                Ok(db) => db,
+                Err(e) => {
+                    self.messages.push(Message::new(
+                        MessageRole::Error,
+                        format!("workspace lock poisoned: {e}"),
+                    ));
+                    return;
+                }
+            };
+            sessions::create_session(&db, &self.provider_display)
+        };
+        match created {
+            Ok(session) => {
+                self.forget_session_if_empty();
+                self.session_id = session.id;
+                self.messages.clear();
+                self.current_chart = None;
+                self.messages.push(Message::new(
+                    MessageRole::System,
+                    format!("New session {}", short_id(&self.session_id)),
+                ));
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+        self.scroll_offset = 0;
+    }
+
+    /// Drop the current session if nothing was ever recorded in it.
+    fn forget_session_if_empty(&self) {
+        if let Ok(db) = self.db.lock() {
+            drop(sessions::delete_if_empty(&db, &self.session_id));
         }
     }
 
@@ -538,11 +747,10 @@ impl App {
         self.last_sql = Some(sql.clone());
         self.state = AppState::RunningSql;
 
-        let config = Arc::clone(&self.config);
-        let workspace_id = self.workspace_id.clone();
+        let db = Arc::clone(&self.db);
         let tx = self.response_tx.clone();
         std::thread::spawn(move || {
-            let result = run_sql_task(&config, &workspace_id, &sql);
+            let result = run_sql_task(&db, &sql);
             drop(tx.send(result));
         });
     }
@@ -563,18 +771,12 @@ impl App {
         self.agent_events = Some(rx);
 
         let config = Arc::clone(&self.config);
-        let workspace_id = self.workspace_id.clone();
+        let db = Arc::clone(&self.db);
+        let session_id = self.session_id.clone();
         tokio::spawn(async move {
-            let db = match WorkspaceDb::open(&config, &workspace_id) {
-                Ok(db) => db,
-                Err(e) => {
-                    drop(sink.send(AgentEvent::Failed(format!("failed to open workspace: {e}"))));
-                    return;
-                }
-            };
             // run_turn emits TurnComplete or Failed itself; the returned
             // value is the same response, so it is not needed here.
-            drop(quack_core::llm::run_turn(&config, db, policy, &message, sink).await);
+            drop(quack_core::llm::run_turn(&config, db, &session_id, policy, &message, sink).await);
         });
     }
 
@@ -604,10 +806,14 @@ fn configure_textarea(textarea: &mut TextArea<'_>) {
     textarea.set_placeholder_text("Ask a question, or type SQL...");
 }
 
-fn run_sql_task(config: &Config, workspace_id: &str, sql: &str) -> BackgroundResult {
-    let db = match WorkspaceDb::open(config, workspace_id) {
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn run_sql_task(db: &SharedDb, sql: &str) -> BackgroundResult {
+    let db = match db.lock() {
         Ok(db) => db,
-        Err(e) => return BackgroundResult::Error(format!("failed to open workspace: {e}")),
+        Err(e) => return BackgroundResult::Error(format!("workspace lock poisoned: {e}")),
     };
     let started = std::time::Instant::now();
     match db.execute_query(sql) {

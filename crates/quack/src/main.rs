@@ -7,14 +7,17 @@ mod terminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::llm;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
+use quack_core::storage::sessions;
 use quack_core::storage::workspace::WorkspaceDb;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 /// Exit status for a usage error (bad flags, no terminal for the session).
 const EXIT_USAGE: u8 = 2;
@@ -57,6 +60,14 @@ struct Cli {
     #[arg(long, global = true)]
     allow_write: bool,
 
+    /// Continue the most recent session in the workspace
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
+    continue_latest: bool,
+
+    /// Resume a specific session by id (prefixes accepted)
+    #[arg(short = 'r', long, value_name = "SESSION_ID")]
+    resume: Option<String>,
+
     /// Print full tool inputs and outputs to stderr in print mode
     #[arg(long, global = true)]
     verbose: bool,
@@ -67,6 +78,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// List sessions in the workspace, most recent first
+    Sessions {
+        /// Emit one JSON object per session
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum number of sessions to show
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+
+    /// Export a session as a runnable .sql file or a Markdown transcript
+    Export {
+        /// Session id (prefixes accepted)
+        session_id: String,
+
+        /// Every executed statement, each preceded by its question
+        #[arg(long, conflicts_with = "markdown")]
+        sql: bool,
+
+        /// Questions, steps, and answers as Markdown (default)
+        #[arg(long)]
+        markdown: bool,
+    },
+
     /// Ingest a file into a workspace
     Ingest {
         /// File path to ingest (use - for stdin)
@@ -123,25 +159,7 @@ async fn main() -> Result<ExitCode> {
     let stdout_is_tty = std::io::stdout().is_terminal();
 
     if let Some(prompt) = cli.prompt.as_deref() {
-        init_logging();
-        let format = match cli.format.unwrap_or(OutputFormat::Text) {
-            OutputFormat::Json => print::PromptFormat::Json,
-            OutputFormat::Text | OutputFormat::Table => print::PromptFormat::Text,
-            OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::Markdown => {
-                tracing::error!("-p accepts only --format text or json");
-                return Ok(ExitCode::from(EXIT_USAGE));
-            }
-        };
-        let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
-        let ws_db = WorkspaceDb::open(&config, &workspace.id)
-            .context("failed to open workspace database")?;
-        let refused =
-            print::run_prompt(&config, ws_db, policy, prompt, format, cli.verbose).await?;
-        return Ok(if refused {
-            ExitCode::from(EXIT_WRITE_REFUSED)
-        } else {
-            ExitCode::SUCCESS
-        });
+        return run_print_mode(&cli, prompt, policy).await;
     }
 
     if let Some(sql) = cli.query.as_deref() {
@@ -154,16 +172,25 @@ async fn main() -> Result<ExitCode> {
     }
 
     match cli.command {
-        None => {
-            if !std::io::stdin().is_terminal() || !stdout_is_tty {
-                init_logging();
-                tracing::error!(
-                    "the interactive session needs a terminal; use `quack -p PROMPT` or `quack -q SQL` in pipelines"
-                );
-                return Ok(ExitCode::from(EXIT_USAGE));
-            }
-            let (config, workspace, ws_name) = resolve_workspace(cli.workspace.as_deref()).await?;
-            terminal::run(config, ws_name, workspace.id, cli.allow_write)?;
+        None => run_terminal_session(&cli, stdout_is_tty).await,
+        Some(Commands::Sessions { json, limit }) => {
+            init_logging();
+            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+            let ws_db = WorkspaceDb::open(&config, &workspace.id)
+                .context("failed to open workspace database")?;
+            list_sessions(&ws_db, json, limit)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::Export {
+            session_id,
+            sql,
+            markdown: _,
+        }) => {
+            init_logging();
+            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+            let ws_db = WorkspaceDb::open(&config, &workspace.id)
+                .context("failed to open workspace database")?;
+            export_session(&ws_db, &session_id, sql)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Ingest {
@@ -182,6 +209,148 @@ async fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `quack -p PROMPT`: one turn, answer to stdout, steps to stderr.
+async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<ExitCode> {
+    init_logging();
+    let format = match cli.format.unwrap_or(OutputFormat::Text) {
+        OutputFormat::Json => print::PromptFormat::Json,
+        OutputFormat::Text | OutputFormat::Table => print::PromptFormat::Text,
+        OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::Markdown => {
+            tracing::error!("-p accepts only --format text or json");
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
+    };
+    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let ws_db =
+        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let session_id = resolve_session(&config, &ws_db, cli.continue_latest, cli.resume.as_deref())?;
+    let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let outcome = print::run_prompt(
+        &config,
+        Arc::clone(&db),
+        &session_id,
+        policy,
+        prompt,
+        format,
+        cli.verbose,
+    )
+    .await;
+    if outcome.is_err()
+        && let Ok(guard) = db.lock()
+    {
+        drop(sessions::delete_if_empty(&guard, &session_id));
+    }
+    let refused = outcome?;
+    Ok(if refused {
+        ExitCode::from(EXIT_WRITE_REFUSED)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// No arguments: the interactive session, which needs a terminal.
+async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode> {
+    if !std::io::stdin().is_terminal() || !stdout_is_tty {
+        init_logging();
+        tracing::error!(
+            "the interactive session needs a terminal; use `quack -p PROMPT` or `quack -q SQL` in pipelines"
+        );
+        return Ok(ExitCode::from(EXIT_USAGE));
+    }
+    let (config, workspace, ws_name) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let ws_db =
+        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let session_id = resolve_session(&config, &ws_db, cli.continue_latest, cli.resume.as_deref())?;
+    terminal::run(
+        config,
+        ws_name,
+        workspace.id,
+        Arc::new(Mutex::new(ws_db)),
+        session_id,
+        cli.allow_write,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Pick the session for this run: the latest with `--continue`, a specific
+/// one with `--resume`, otherwise a new one for the configured chat model.
+fn resolve_session(
+    config: &Config,
+    db: &WorkspaceDb,
+    continue_latest: bool,
+    resume: Option<&str>,
+) -> Result<String> {
+    if let Some(prefix) = resume {
+        return find_session(db, prefix).map(|s| s.id);
+    }
+    if continue_latest && let Some(latest) = sessions::latest_session(db)? {
+        return Ok(latest.id);
+    }
+    let model = config
+        .chat_model_ref()
+        .map_or_else(|_| String::from("unconfigured"), |m| m.to_string());
+    Ok(sessions::create_session(db, &model)?.id)
+}
+
+/// Resolve a full id or a unique prefix to a session.
+fn find_session(db: &WorkspaceDb, prefix: &str) -> Result<sessions::SessionRow> {
+    if let Some(exact) = sessions::get_session(db, prefix)? {
+        return Ok(exact);
+    }
+    let matches: Vec<sessions::SessionRow> = sessions::list_sessions(db, 1000)?
+        .into_iter()
+        .filter(|s| s.id.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => anyhow::bail!("no session matches '{prefix}'; run `quack sessions`"),
+        1 => matches.into_iter().next().context("session vanished"),
+        n => anyhow::bail!("'{prefix}' matches {n} sessions; use more of the id"),
+    }
+}
+
+fn list_sessions(db: &WorkspaceDb, json: bool, limit: u32) -> Result<()> {
+    let rows = sessions::list_sessions(db, limit)?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    if json {
+        for row in &rows {
+            serde_json::to_writer(&mut out, row)?;
+            writeln!(out)?;
+        }
+    } else if rows.is_empty() {
+        writeln!(out, "No sessions yet.")?;
+    } else {
+        for row in &rows {
+            writeln!(
+                out,
+                "{}  {}  {:>3} msgs  {}  {}",
+                row.id,
+                row.updated_at,
+                row.message_count,
+                row.model,
+                row.title.as_deref().unwrap_or("(untitled)")
+            )?;
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn export_session(db: &WorkspaceDb, prefix: &str, as_sql: bool) -> Result<()> {
+    let session = find_session(db, prefix)?;
+    let rows = sessions::messages(db, &session.id)?;
+    let text = if as_sql {
+        sessions::export_sql(&rows)?
+    } else {
+        sessions::export_markdown(&session, &rows)?
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    write!(out, "{text}")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Log to stderr for the non-interactive paths. The terminal session owns

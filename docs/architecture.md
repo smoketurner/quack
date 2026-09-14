@@ -56,7 +56,7 @@ every surface.
 | Module | Responsibility |
 |---|---|
 | `workspace/` | open and create a workspace directory; `.quack/` discovery for the TUI |
-| `storage/` | the workspace DuckDB file (everything classified) and `control.db` (access control and access audit) |
+| `storage/` | the workspace DuckDB file (everything classified, including `sessions.rs` for conversations) and `control.db` (access control and access audit) |
 | `ingestion/` | parsers, chunking with heading and page metadata, embedding, index maintenance |
 | `retrieval/` | vector + full-text fusion, citation metadata, pinned documents |
 | `analytics/` | SQL execution, read/write classification, resource limits, schema introspection |

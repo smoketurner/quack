@@ -39,6 +39,8 @@ Workspace members are auto-detected from `Cargo.toml`. Track these logical subsy
 
 - Print mode: `cargo run --bin quack -- -p "question" [-f text|json]`; SQL: `-q "..." [-f ...]`
 - Ingest: `cargo run --bin quack -- ingest FILE`
+- Sessions: `cargo run --bin quack -- sessions [--json]`, `export ID [--sql|--markdown]`,
+  `-p ... -c` / `-r ID`
 - TUI: `cargo run --bin quack -- -w <workspace>` (no arguments, needs a TTY)
 - Target (design doc section 11): `quack serve`, `quack mcp`, `quack desktop`
 
@@ -51,6 +53,8 @@ Features prone to silent breakage — live-test before any PR that touches them:
 - Classification boundary: nothing workspace-revealing written outside the workspace file
 - Agent SQL read/write classification and the terminal permission prompt (y/n/a)
 - Event stream ordering: every tool call emits started then finished; `-p` steps on stderr only
+- Session recording: user, one tool message per step, assistant, in that order; a failed
+  first turn leaves no empty session behind
 - Citation validation (every `[n]` maps to a chunk retrieved in that turn)
 - Embedding dimension recorded per workspace and checked on open
 - DuckDB workspace isolation (each workspace gets its own database file)

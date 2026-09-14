@@ -1292,13 +1292,14 @@ the time of the last edit.
 1. **Vector-only retrieval, no citations.** No FTS index, no fusion, no page or heading
    metadata on chunks, no citation validation. `search_documents` returns numbered chunks
    with filename and distance, which is the seed for citations. Section 6.1.
-2. **Sessions and audit detail are not stored anywhere yet.** `control.db` no longer
-   holds content, but `_quack_sessions`, `_quack_messages`, `_quack_context`, and
-   `_quack_audit` do not exist; every turn is stateless. Sections 5.4, 8, 12.
+2. **Context and audit detail tables do not exist yet.** Sessions and messages are
+   stored and replayed; `_quack_context` lands with step 6 and `_quack_audit` with the
+   server. Sections 5.3, 5.4, 12.
 3. **Document registry lacks** `sha256`, `source`, `pinned`, `title`. Section 5.4.
 4. **No workspace context, no chat modes.** Sections 5.3, 7.5.
-5. **No `--continue` / `--resume`, no stdin-as-data in print mode.** Both wait on the
-   session tables. Sections 8, 11.5.
+5. **No stdin-as-data in print mode, no session sharing or `created_by`.** Sections 8,
+   11.5. History replays user and assistant text only; tool payloads are not summarized
+   into history yet.
 6. **No ontology, no induction, no graph.** Sections 6.3 to 6.5.
 7. **Chart spec is ECharts JSON** re-parsed by the TUI. Section 9.
 8. **No OAuth, no server, no MCP, no desktop window, no web UI.** `auth = "oauth"` parses
@@ -1364,12 +1365,12 @@ deployment for document chat is the end of step 8.
 1. ~~Limits and classification, real `search_documents`, crypto install.~~ Done.
 2. ~~Merge binaries into `quack`; `quack-core::llm`; strict config with
    `chat_model`/`embedding_model`/`auth`.~~ Done.
-3. Storage consolidation: `_quack_` prefix, `_quack_meta`, dimension check, and
-   `control.db` reduced to access control are done; sessions, messages, context, and audit
-   detail tables remain and land with steps 4 and 6.
+3. ~~Storage consolidation: `_quack_` prefix, `_quack_meta`, dimension check,
+   `control.db` reduced to access control, sessions and messages with `--continue`,
+   `--resume`, `quack sessions`, and `export`.~~ Done. Context lands with step 6, audit
+   detail with the server.
 4. ~~Agent loop as an event stream; TUI streaming, inline steps, permission prompt, direct
-   SQL; print mode with formats and exit codes.~~ Done. `--continue`/`--resume` and export
-   move to step 3's remainder (they need the session tables).
+   SQL; print mode with formats and exit codes.~~ Done.
 5. Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
    documents, chat and query modes; DOCX, HTML, PPTX parsers.
 6. Workspace context (stored, versioned, import/export) and the prompt rewrite; new chart

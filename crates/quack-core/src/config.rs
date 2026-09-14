@@ -152,6 +152,8 @@ pub struct AnalysisConfig {
     pub threads: u32,
     /// Maximum model round-trips (tool calls) per turn.
     pub max_turns: u32,
+    /// Approximate token budget for prior messages replayed to the model.
+    pub history_token_budget: u32,
 }
 
 impl Default for AnalysisConfig {
@@ -162,6 +164,7 @@ impl Default for AnalysisConfig {
             memory_limit_mb: 256,
             threads: 4,
             max_turns: 10,
+            history_token_budget: 32_000,
         }
     }
 }
@@ -412,6 +415,7 @@ always_retrieve = true
         assert!(!config.retrieval.always_retrieve);
         assert_eq!(config.analysis.threads, 4);
         assert_eq!(config.analysis.max_turns, 10);
+        assert_eq!(config.analysis.history_token_budget, 32_000);
     }
 
     #[test]

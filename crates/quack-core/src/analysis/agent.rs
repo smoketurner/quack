@@ -6,7 +6,6 @@ use rig::streaming::StreamedAssistantContent;
 
 use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::error::{Error, Result};
-use crate::storage::workspace::WorkspaceDb;
 
 use super::events::{AgentEvent, EventSink, ToolStep, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
@@ -29,7 +28,9 @@ pub struct AgentResponse {
 }
 
 /// Run the rig agent with all analysis tools for a single user question,
-/// emitting `AgentEvent`s on `sink` as the turn progresses.
+/// emitting `AgentEvent`s on `sink` as the turn progresses. `history` is
+/// the prior conversation to replay to the model (see
+/// `storage::sessions::history_for_model`).
 ///
 /// Text streams as `TextDelta`; every tool call is bracketed by
 /// `ToolStarted`/`ToolFinished`; a write under `WritePolicy::Ask` pauses on
@@ -45,12 +46,13 @@ pub struct AgentResponse {
     reason = "one entry point per turn; the interfaces call llm::run_turn, which packs config"
 )]
 pub async fn run_analysis<M>(
-    db: WorkspaceDb,
+    db: SharedDb,
     completion_model: impl rig::completion::CompletionModel + 'static,
     embedding_model: M,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     write_policy: WritePolicy,
+    history: Vec<rig::message::Message>,
     user_message: &str,
     sink: EventSink,
 ) -> Result<AgentResponse>
@@ -65,6 +67,7 @@ where
         analysis_config,
         retrieval_config,
         write_policy,
+        history,
         user_message,
         &recorder,
     )
@@ -83,20 +86,25 @@ where
 
 #[expect(clippy::too_many_arguments, reason = "mirrors run_analysis")]
 async fn run_inner<M>(
-    db: WorkspaceDb,
+    shared_db: SharedDb,
     completion_model: impl rig::completion::CompletionModel + 'static,
     embedding_model: M,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     write_policy: WritePolicy,
+    history: Vec<rig::message::Message>,
     user_message: &str,
     recorder: &TurnRecorder,
 ) -> Result<AgentResponse>
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    let system_prompt = text_to_sql::build_system_prompt(&db)?;
-    let shared_db: SharedDb = Arc::new(Mutex::new(db));
+    let system_prompt = {
+        let db = shared_db
+            .lock()
+            .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
+        text_to_sql::build_system_prompt(&db)?
+    };
     let chart_spec: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
     let refused = RefusalFlag::default();
 
@@ -146,7 +154,10 @@ where
     let max_turns = usize::try_from(analysis_config.max_turns)
         .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
 
-    let mut stream = agent.stream_prompt(user_message).max_turns(max_turns).await;
+    let mut stream = agent
+        .stream_chat(user_message, history)
+        .max_turns(max_turns)
+        .await;
 
     let mut streamed = String::new();
     let mut final_text: Option<String> = None;

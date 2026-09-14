@@ -9,9 +9,9 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use quack_core::analysis::events::{self, AgentEvent, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::llm;
-use quack_core::storage::workspace::WorkspaceDb;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptFormat {
@@ -19,10 +19,12 @@ pub(crate) enum PromptFormat {
     Json,
 }
 
-/// Run one turn and print it. Returns whether a write was refused.
+/// Run one turn in `session_id` and print it. Returns whether a write was
+/// refused.
 pub(crate) async fn run_prompt(
     config: &Config,
-    db: WorkspaceDb,
+    db: SharedDb,
+    session_id: &str,
     policy: WritePolicy,
     prompt: &str,
     format: PromptFormat,
@@ -31,9 +33,10 @@ pub(crate) async fn run_prompt(
     let (sink, mut events) = events::channel();
 
     let turn = tokio::spawn({
-        let config_snapshot = config.clone();
+        let config = config.clone();
         let prompt = prompt.to_owned();
-        async move { llm::run_turn(&config_snapshot, db, policy, &prompt, sink).await }
+        let session_id = session_id.to_owned();
+        async move { llm::run_turn(&config, db, &session_id, policy, &prompt, sink).await }
     });
 
     let stderr = std::io::stderr();
@@ -85,12 +88,14 @@ pub(crate) async fn run_prompt(
                 "steps": response.steps,
                 "chart": response.chart_spec,
                 "write_refused": response.write_refused,
+                "session_id": session_id,
             });
             serde_json::to_writer_pretty(&mut out, &object)?;
             writeln!(out)?;
         }
     }
     out.flush()?;
+    writeln!(err, "session {session_id}")?;
 
     Ok(response.write_refused)
 }

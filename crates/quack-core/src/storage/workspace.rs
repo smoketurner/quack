@@ -7,13 +7,19 @@ use crate::config::Config;
 
 /// Tables quack manages inside a workspace database. Hidden from the agent's
 /// table listing and refused in agent SQL.
-pub const INTERNAL_TABLES: &[&str] = &["_quack_meta", "_quack_documents", "_quack_chunks"];
+pub const INTERNAL_TABLES: &[&str] = &[
+    "_quack_meta",
+    "_quack_documents",
+    "_quack_chunks",
+    "_quack_sessions",
+    "_quack_messages",
+];
 
 /// Every internal table carries this prefix; anything starting with it is hidden.
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "1";
+const WORKSPACE_SCHEMA_VERSION: &str = "2";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -286,6 +292,26 @@ impl WorkspaceDb {
                 content TEXT NOT NULL,
                 embedding FLOAT[{dim}],
                 token_count INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS _quack_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                mode TEXT NOT NULL DEFAULT 'chat',
+                model TEXT NOT NULL,
+                created_by TEXT,
+                shared BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMP DEFAULT now(),
+                updated_at TIMESTAMP DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS _quack_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata JSON,
+                created_at TIMESTAMP DEFAULT now(),
+                UNIQUE (session_id, seq)
             );"
         );
         self.conn.execute_batch(&sql)?;

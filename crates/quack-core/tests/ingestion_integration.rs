@@ -682,7 +682,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("1"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("2"));
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("4")

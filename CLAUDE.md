@@ -80,7 +80,12 @@ cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # S
 cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table or chunks
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
+cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 ```
+
+Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
+file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model, trimmed
+to `[analysis].history_token_budget`.
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes

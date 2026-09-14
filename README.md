@@ -30,7 +30,14 @@ cargo run --bin quack -- ingest sales.csv -w myworkspace
 cargo run --bin quack -- -p "total sales by region" -w myworkspace   # answer to stdout, steps to stderr
 cargo run --bin quack -- -p "total sales by region" -f json           # {answer, steps, chart}
 cargo run --bin quack -- -w myworkspace                               # interactive terminal session
+cargo run --bin quack -- -p "and by month?" -c                        # continue the latest session
+cargo run --bin quack -- sessions                                     # list sessions
+cargo run --bin quack -- export 01a0a0e1 --sql                        # replay a session's SQL
 ```
+
+Every turn is recorded in the workspace's own database. `-c` continues the latest session,
+`-r ID` resumes one (id prefixes work), and `export` writes a session as a runnable `.sql`
+file or a Markdown transcript.
 
 `-q` prints a table on a terminal and ndjson when piped; `-f` selects table, json, ndjson, csv,
 or markdown. Exit codes: 0 ok, 1 error, 2 usage, 3 write refused.
