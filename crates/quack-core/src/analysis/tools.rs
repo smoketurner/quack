@@ -227,9 +227,51 @@ pub struct SearchDocumentsArgs {
     pub query: String,
     /// Number of chunks to return (default from config)
     pub top_k: Option<u32>,
-    /// Restrict the search to these document ids (from `list_documents`)
+    /// Restrict the search to these documents: ids from `list_documents`
+    /// (prefixes accepted) or exact file names
     #[serde(default)]
     pub document_ids: Vec<String>,
+}
+
+/// Map what the model passed (an id, an id prefix, or a file name) to
+/// document ids. Anything that matches nothing is an error naming the
+/// documents that exist, so the model retries instead of getting an empty
+/// result it reads as "the workspace has nothing on this".
+fn resolve_document_ids(
+    db: &crate::storage::workspace::WorkspaceDb,
+    wanted: &[String],
+) -> Result<Vec<String>, ToolError> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let documents = db
+        .list_documents()
+        .map_err(|e| ToolError::Query(e.to_string()))?;
+    let mut resolved = Vec::with_capacity(wanted.len());
+    for want in wanted {
+        let want = want.trim();
+        let found = documents
+            .iter()
+            .find(|d| d.id == want || d.filename == want)
+            .or_else(|| {
+                documents
+                    .iter()
+                    .find(|d| !want.is_empty() && d.id.starts_with(want))
+            });
+        let Some(d) = found else {
+            let known: Vec<String> = documents
+                .iter()
+                .map(|d| format!("{} ({})", d.id, d.filename))
+                .collect();
+            return Err(ToolError::Query(format!(
+                "no document matches '{want}'; pass an id from list_documents or omit \
+                 document_ids to search everything. Documents: {}",
+                known.join(", ")
+            )));
+        };
+        resolved.push(d.id.clone());
+    }
+    Ok(resolved)
 }
 
 impl<M> Tool for SearchDocumentsTool<M>
@@ -259,7 +301,12 @@ where
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.recorder.start(Self::NAME, &args.query);
+        let detail = if args.document_ids.is_empty() {
+            args.query.clone()
+        } else {
+            format!("{} (in {})", args.query, args.document_ids.join(", "))
+        };
+        let step = self.recorder.start(Self::NAME, &detail);
         let embedding = match self.embedding_model.embed_text(&args.query).await {
             Ok(e) => e,
             Err(e) => {
@@ -278,14 +325,10 @@ where
 
         let results = {
             let db = lock(&self.db)?;
-            db.search_hybrid_chunks(
-                &args.query,
-                &query_vec,
-                top_k,
-                self.rrf_k,
-                &args.document_ids,
-            )
-            .map_err(|e| ToolError::Query(e.to_string()))
+            resolve_document_ids(&db, &args.document_ids).and_then(|ids| {
+                db.search_hybrid_chunks(&args.query, &query_vec, top_k, self.rrf_k, &ids)
+                    .map_err(|e| ToolError::Query(e.to_string()))
+            })
         };
         match results {
             Ok(results) => {
@@ -673,6 +716,38 @@ impl Tool for CreateChartTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail_test(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    #[test]
+    fn document_ids_resolve_by_id_prefix_or_filename() {
+        let db = crate::storage::workspace::WorkspaceDb::open_in_memory(4)
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(
+            db.insert_document("01a0-first", "policy.pdf", "application/pdf", 1, "ready")
+                .is_ok()
+        );
+        assert!(
+            db.insert_document("01b0-second", "notes.md", "text/markdown", 1, "ready")
+                .is_ok()
+        );
+        let by_name = resolve_document_ids(&db, &[String::from("policy.pdf")]);
+        assert!(by_name.is_ok_and(|ids| ids == ["01a0-first"]));
+        let by_prefix = resolve_document_ids(&db, &[String::from("01b0")]);
+        assert!(by_prefix.is_ok_and(|ids| ids == ["01b0-second"]));
+        let by_id =
+            resolve_document_ids(&db, &[String::from("01a0-first"), String::from("notes.md")]);
+        assert!(by_id.is_ok_and(|ids| ids == ["01a0-first", "01b0-second"]));
+        assert!(resolve_document_ids(&db, &[]).is_ok_and(|ids| ids.is_empty()));
+        let err = resolve_document_ids(&db, &[String::from("missing.pdf")]).err();
+        assert!(err.is_some_and(|e| {
+            let text = e.to_string();
+            text.contains("no document matches 'missing.pdf'") && text.contains("policy.pdf")
+        }));
+    }
 
     fn hit(n: u32, filename: &str, content: &str) -> ChunkSearchResult {
         ChunkSearchResult {
