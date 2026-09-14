@@ -1286,33 +1286,29 @@ tenant; desktop app on each platform; air-gapped static binary with bundled exte
 
 ## 17. Gaps Between This Document and the Code
 
-Ordered by risk.
+Ordered by risk. Closed items are removed as they land; this list is the honest delta at
+the time of the last edit.
 
-1. **Agent SQL is unrestricted.** No classification, memory limit, or timeout;
-   `AnalysisConfig` values are unread. Section 7.4.
-2. **The prompt names a tool that does not exist.** `search_documents` is described to the
-   model but retrieval is wired through rig's `dynamic_context`. Register the tool, drop
-   `dynamic_context`, add citation metadata. Sections 6.1, 7.3.
-3. **Crypto provider is never installed.** Section 10.3.
-4. **Vector-only retrieval, no citations.** No FTS index, no fusion, no page or heading
-   metadata on chunks, no citation validation. Section 6.1.
-5. **Classified content outside the boundary.** `control.db` today creates `threads`,
-   `messages`, and `audit_log` with detail; the design puts those inside the workspace
-   database and reduces `control.db` to access control. Sections 5.4, 5.5, 12.
-6. **Two binaries** with duplicated provider construction. Merge into `quack`; move
-   `EmbedModel` and client builders to `quack-core::llm`. Section 4.
-7. **Document registry lacks** `sha256`, `source`, `pinned`, `title`. Section 5.4.
-8. **No workspace context, no chat modes.** Sections 5.3, 7.5.
-9. **No event stream, no streaming, no tool visibility** in TUI or CLI. Section 7.1, 7.6.
-10. **No ontology, no induction, no graph.** Sections 6.3 to 6.5.
-11. **`format!` SQL in the DuckDB layer** with an unescaped file path in `read_csv_auto`.
-    Section 5.6.
-12. **Config accepts unknown keys** and picks "first provider with a model". Section 13.
-13. **Chart spec is ECharts JSON** re-parsed by the TUI. Section 9.
-14. **Embedding dimension defaults to 1024** and is not recorded per workspace. Section 5.4.
-15. **No OAuth, no server, no MCP, no desktop app, no web UI.** Sections 10.2, 11, 12.
-16. **DOCX, HTML, XLSX unsupported.** Sections 6.1, 6.2.
-17. **`text_to_sql` tests are a placeholder.** Section 16.
+1. **Vector-only retrieval, no citations.** No FTS index, no fusion, no page or heading
+   metadata on chunks, no citation validation. `search_documents` returns numbered chunks
+   with filename and distance, which is the seed for citations. Section 6.1.
+2. **Sessions and audit detail are not stored anywhere yet.** `control.db` no longer
+   holds content, but `_quack_sessions`, `_quack_messages`, `_quack_context`, and
+   `_quack_audit` do not exist; every turn is stateless. Sections 5.4, 8, 12.
+3. **Document registry lacks** `sha256`, `source`, `pinned`, `title`. Section 5.4.
+4. **No workspace context, no chat modes.** Sections 5.3, 7.5.
+5. **No event stream, no streaming, no tool visibility** in TUI or CLI, and the terminal
+   cannot prompt for a write: the `Ask` policy exists in the core, but both interfaces use
+   `--allow-write` (Allow) or refuse (Deny) until the event stream lands. Sections 7.1,
+   7.4, 7.6.
+6. **No ontology, no induction, no graph.** Sections 6.3 to 6.5.
+7. **Chart spec is ECharts JSON** re-parsed by the TUI. Section 9.
+8. **No OAuth, no server, no MCP, no desktop window, no web UI.** `auth = "oauth"` parses
+   and is rejected as unimplemented. Sections 10.2, 11, 12.
+9. **DOCX, HTML, PPTX, XLSX unsupported.** Sections 6.1, 6.2.
+10. **No print mode flags** (`-p`, `-f ndjson|csv|markdown`, stdin as data); `chat` and
+    `query` cover the basics with exit codes 2 and 3 in place. Section 11.5.
+11. **`text_to_sql` tests are a placeholder.** Section 16.
 
 ---
 
@@ -1369,12 +1365,12 @@ Ordered by risk.
 Each step leaves the tool working. The first milestone that can replace the current
 deployment for document chat is the end of step 8.
 
-1. Close gaps 1, 2, 3 (limits and classification, real `search_documents`, crypto install).
-2. Merge binaries into `quack`; `quack-core::llm` with `ChatModel`/`EmbedModel`;
-   config with `chat_model`/`embedding_model`/`auth` and `deny_unknown_fields`.
-3. Storage consolidation: document registry, sessions, messages, context, and audit detail
-   as `_quack_` tables in the workspace database; `control.db` reduced to access control;
-   `_quack_` tables hidden and refused to the agent.
+1. ~~Limits and classification, real `search_documents`, crypto install.~~ Done.
+2. ~~Merge binaries into `quack`; `quack-core::llm`; strict config with
+   `chat_model`/`embedding_model`/`auth`.~~ Done.
+3. Storage consolidation: `_quack_` prefix, `_quack_meta`, dimension check, and
+   `control.db` reduced to access control are done; sessions, messages, context, and audit
+   detail tables remain and land with steps 4 and 6.
 4. Agent loop as an event stream; TUI streaming, inline steps, permission prompt, direct
    SQL; print mode with formats and exit codes; `--continue`/`--resume`; export.
 5. Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
