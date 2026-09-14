@@ -10,6 +10,7 @@ mod state;
 mod tests;
 mod web;
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,6 +101,69 @@ pub(crate) fn router(app: App) -> Router {
         .with_state(app)
 }
 
+/// The startup banner: what this server is and how it is configured.
+fn banner(
+    config: &Config,
+    addr: SocketAddr,
+    local: bool,
+    users: usize,
+    workspaces: usize,
+) -> String {
+    let chat = config.chat_model_ref().map_or_else(
+        |_| String::from("none (set [general].chat_model)"),
+        |m| m.to_string(),
+    );
+    let embedding = config.embedding_model_ref().ok().flatten().map_or_else(
+        || String::from("none (documents stored without vectors)"),
+        |m| m.to_string(),
+    );
+    let providers: Vec<String> = config
+        .providers
+        .iter()
+        .map(|(name, p)| {
+            let auth = match p.auth {
+                quack_core::config::AuthMode::None => "no auth",
+                quack_core::config::AuthMode::ApiKey => "api key",
+                quack_core::config::AuthMode::Oauth => "oauth",
+            };
+            format!("{name} ({}, {auth})", p.provider_type)
+        })
+        .collect();
+    let providers = if providers.is_empty() {
+        String::from("none configured")
+    } else {
+        providers.join(", ")
+    };
+    let mode = if local {
+        String::from("local: no login, one implicit owner")
+    } else {
+        format!("password and token login, {users} user(s)")
+    };
+    format!(
+        r"
+     __
+   <(o )___     quack {version}
+    ( ._> /     knowledge engine: documents, tables, graph
+     `---'
+
+  listening      http://{addr}/
+  mode           {mode}
+  data dir       {data}
+  workspaces     {workspaces}
+  chat model     {chat}
+  embeddings     {embedding}
+  providers      {providers}
+  uploads        up to {upload} MB, {workers} worker(s) per workspace
+  api            http://{addr}/api/v1
+
+",
+        version = env!("CARGO_PKG_VERSION"),
+        data = config.data_dir().display(),
+        upload = config.ingestion.upload_max_mb,
+        workers = config.server.workers_per_workspace,
+    )
+}
+
 /// Bind and serve until Ctrl-C.
 pub(crate) async fn serve(config: Config, bind: Option<String>, local: bool) -> anyhow::Result<()> {
     let local = local || config.server.local;
@@ -115,10 +179,18 @@ pub(crate) async fn serve(config: Config, bind: Option<String>, local: bool) -> 
     let control = ControlPlane::open(&config)
         .await
         .context("failed to open control plane")?;
-    if !local && control.list_users().await?.is_empty() {
+    let users = control.list_users().await?.len();
+    let workspaces = control.list_workspaces().await?.len();
+    if !local && users == 0 {
         tracing::warn!(
             "no users exist; nobody can log in until `quack user add NAME --admin` runs"
         );
+    }
+    {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        write!(out, "{}", banner(&config, addr, local, users, workspaces))?;
+        out.flush()?;
     }
     let app = Arc::new(AppState::new(config, control, local));
     let listener = tokio::net::TcpListener::bind(addr)
