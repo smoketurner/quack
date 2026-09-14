@@ -6,6 +6,7 @@ use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::error::{Error, Result};
 use crate::storage::workspace::WorkspaceDb;
 
+use super::policy::{RefusalFlag, WritePolicy};
 use super::text_to_sql;
 use super::tools::{
     CreateChartTool, DescribeTableTool, ListDocumentsTool, ListTablesTool, RunSqlTool,
@@ -17,6 +18,8 @@ use super::vector_index::DuckDbVectorIndex;
 pub struct AgentResponse {
     pub content: String,
     pub chart_spec: Option<serde_json::Value>,
+    /// At least one mutating statement was refused during this turn.
+    pub write_refused: bool,
 }
 
 /// Run the rig agent with all analysis tools for a single user question.
@@ -35,6 +38,7 @@ pub async fn run_analysis<M>(
     embedding_model: M,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
+    write_policy: WritePolicy,
     user_message: &str,
 ) -> Result<AgentResponse>
 where
@@ -43,6 +47,7 @@ where
     let system_prompt = text_to_sql::build_system_prompt(&db)?;
     let shared_db: SharedDb = Arc::new(Mutex::new(db));
     let chart_spec: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let refused = RefusalFlag::default();
 
     let mut builder = completion_model
         .into_agent_builder()
@@ -55,6 +60,8 @@ where
         .tool(RunSqlTool::new(
             Arc::clone(&shared_db),
             analysis_config.max_query_rows,
+            write_policy,
+            refused.clone(),
         ))
         .tool(DescribeTableTool::new(Arc::clone(&shared_db)))
         .tool(ListTablesTool::new(Arc::clone(&shared_db)))
@@ -88,5 +95,6 @@ where
     Ok(AgentResponse {
         content,
         chart_spec: chart,
+        write_refused: refused.was_refused(),
     })
 }

@@ -17,6 +17,10 @@ struct Cli {
     /// Workspace name (defaults to config value)
     #[arg(long, short = 'w')]
     workspace: Option<String>,
+
+    /// Let the agent run statements that modify the workspace
+    #[arg(long)]
+    allow_write: bool,
 }
 
 #[tokio::main]
@@ -57,7 +61,13 @@ async fn main() -> Result<()> {
     let provider_display = providers::provider_display_name(&config);
     let config = Arc::new(config);
 
-    let tui_app = app::App::new(ws_name, workspace.id.clone(), provider_display, config);
+    let tui_app = app::App::new(
+        ws_name,
+        workspace.id.clone(),
+        provider_display,
+        config,
+        cli.allow_write,
+    );
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     let result = tui_app.run(&mut terminal);

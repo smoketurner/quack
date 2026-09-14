@@ -8,7 +8,7 @@ use quack_core::config::{
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
-use quack_core::storage::workspace::WorkspaceDb;
+use quack_core::storage::workspace::{StatementKind, WorkspaceDb};
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
 const TEST_DIM: usize = 4;
@@ -518,4 +518,141 @@ fn workspace_db_search_similar_chunks() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Statement classification, internal-table refusal, limits, timeout (#7)
+// ---------------------------------------------------------------------------
+
+fn kind(db: &WorkspaceDb, sql: &str) -> StatementKind {
+    db.classify_statement(sql).unwrap()
+}
+
+#[test]
+fn classify_select_shapes_as_read() {
+    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    db.execute_statement("CREATE TABLE t(a INT, b INT)")
+        .unwrap();
+    for sql in [
+        "SELECT 1",
+        "select a, sum(b) from t group by 1",
+        "WITH x AS (SELECT a FROM t) SELECT * FROM x",
+        "FROM t SELECT a",
+        "SELECT * FROM t QUALIFY row_number() OVER () = 1",
+        "DESCRIBE t",
+        "SHOW TABLES",
+        "SUMMARIZE t",
+        "PIVOT t ON a USING sum(b)",
+        "EXPLAIN SELECT 1",
+        "  describe t ;  ",
+    ] {
+        assert_eq!(kind(&db, sql), StatementKind::Read, "{sql}");
+    }
+}
+
+#[test]
+fn classify_mutations_and_escapes_as_write() {
+    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    for sql in [
+        "CREATE TABLE t(a INT)",
+        "DROP TABLE t",
+        "INSERT INTO t VALUES (1)",
+        "UPDATE t SET a = 2",
+        "DELETE FROM t",
+        "ALTER TABLE t ADD COLUMN b INT",
+        "COPY t TO '/tmp/x.csv'",
+        "ATTACH 'other.duckdb' AS other",
+        "SET memory_limit = '10GB'",
+        "INSTALL httpfs",
+        "LOAD httpfs",
+        "PRAGMA enable_progress_bar",
+        "CALL pragma_version()",
+        "SELECT 1; DROP TABLE t",
+        "DESCRIBE t; DROP TABLE t",
+        "CREATE TABLE u AS SELECT 1",
+    ] {
+        assert_eq!(kind(&db, sql), StatementKind::Write, "{sql}");
+    }
+}
+
+#[test]
+fn classify_syntax_errors_as_invalid() {
+    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    assert!(matches!(kind(&db, "SELEC 1"), StatementKind::Invalid(_)));
+    assert!(matches!(kind(&db, ""), StatementKind::Invalid(_)));
+}
+
+#[test]
+fn internal_tables_are_detected_in_parsed_and_unparsed_statements() {
+    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    db.execute_statement("CREATE TABLE sales(a INT)").unwrap();
+    assert!(
+        db.references_internal_table("SELECT * FROM chunks")
+            .unwrap()
+    );
+    assert!(
+        db.references_internal_table("SELECT content FROM main.\"Chunks\" c")
+            .unwrap()
+    );
+    assert!(
+        db.references_internal_table("SELECT * FROM sales JOIN documents d ON true")
+            .unwrap()
+    );
+    assert!(db.references_internal_table("DESCRIBE documents").unwrap());
+    assert!(db.references_internal_table("DROP TABLE chunks").unwrap());
+    assert!(!db.references_internal_table("SELECT * FROM sales").unwrap());
+    assert!(
+        !db.references_internal_table("SELECT 'documents' AS label")
+            .unwrap()
+    );
+    assert!(
+        !db.list_tables()
+            .unwrap()
+            .iter()
+            .any(|t| t == "chunks" || t == "documents")
+    );
+}
+
+#[test]
+fn long_running_statement_is_interrupted_at_timeout() {
+    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32)
+        .unwrap()
+        .with_query_timeout(std::time::Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let result = db.execute_query(
+        "SELECT count(*) FROM range(100000000) a, range(100000000) b WHERE a.range = b.range + 1",
+    );
+    let elapsed = started.elapsed();
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string().to_lowercase().contains("interrupt"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "took {elapsed:?}"
+    );
+
+    // The connection is still usable afterwards.
+    let ok = db.execute_query("SELECT 1 AS one").unwrap();
+    assert_eq!(ok.rows.len(), 1);
+}
+
+#[test]
+fn open_applies_memory_and_thread_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.analysis.memory_limit_mb = 123;
+    config.analysis.threads = 2;
+    let db = WorkspaceDb::open(&config, "ws-limits").unwrap();
+    let rows = db
+        .execute_query("SELECT current_setting('memory_limit'), current_setting('threads')")
+        .unwrap();
+    let row = rows.rows.first().unwrap();
+    let mem = row.first().unwrap().to_string();
+    assert!(
+        mem.contains("123") || mem.contains("117"),
+        "memory_limit was {mem}"
+    );
+    assert_eq!(row.last().unwrap().to_string().trim_matches('"'), "2");
 }

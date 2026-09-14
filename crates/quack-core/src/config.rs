@@ -88,6 +88,7 @@ pub struct AnalysisConfig {
     pub max_query_rows: u32,
     pub query_timeout_seconds: u32,
     pub memory_limit_mb: u32,
+    pub threads: u32,
 }
 
 impl Default for AnalysisConfig {
@@ -96,6 +97,7 @@ impl Default for AnalysisConfig {
             max_query_rows: 100,
             query_timeout_seconds: 30,
             memory_limit_mb: 256,
+            threads: 4,
         }
     }
 }

@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use rig::client::CompletionClient;
 
 use quack_core::analysis::agent;
+use quack_core::analysis::policy::WritePolicy;
 use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -33,6 +34,10 @@ Commands:
   /clear            Clear messages and chart
   /quit, /exit      Exit quack
   /workspace        Show current workspace
+
+Writes:
+  The agent may run SELECT queries freely. Statements that modify the
+  workspace are refused unless quack-tui was started with --allow-write.
 
 Shortcuts:
   Enter             Send message
@@ -118,6 +123,7 @@ pub(crate) struct App {
     history_cursor: Option<usize>,
     config: Arc<Config>,
     workspace_id: String,
+    allow_write: bool,
     response_rx: mpsc::UnboundedReceiver<BackgroundResult>,
     response_tx: mpsc::UnboundedSender<BackgroundResult>,
 }
@@ -128,6 +134,7 @@ impl App {
         workspace_id: String,
         provider_display: String,
         config: Arc<Config>,
+        allow_write: bool,
     ) -> Self {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         let mut textarea = TextArea::default();
@@ -147,6 +154,7 @@ impl App {
             history_cursor: None,
             config,
             workspace_id,
+            allow_write,
             response_rx,
             response_tx,
         };
@@ -342,9 +350,14 @@ impl App {
         } else {
             self.messages.push(Message::user(trimmed.clone()));
             self.state = AppState::Thinking;
+            let policy = if self.allow_write {
+                WritePolicy::Allow
+            } else {
+                WritePolicy::Deny
+            };
 
             tokio::spawn(async move {
-                let result = run_agent_task(config, workspace_id, trimmed).await;
+                let result = run_agent_task(config, workspace_id, policy, trimmed).await;
                 drop(tx.send(result));
             });
         }
@@ -388,9 +401,10 @@ fn configure_textarea(textarea: &mut TextArea<'_>) {
 async fn run_agent_task(
     config: Arc<Config>,
     workspace_id: String,
+    policy: WritePolicy,
     message: String,
 ) -> BackgroundResult {
-    match run_agent_inner(&config, &workspace_id, &message).await {
+    match run_agent_inner(&config, &workspace_id, policy, &message).await {
         Ok((content, chart_spec)) => BackgroundResult::Chat {
             content,
             chart_spec,
@@ -402,6 +416,7 @@ async fn run_agent_task(
 async fn run_agent_inner(
     config: &Config,
     workspace_id: &str,
+    policy: WritePolicy,
     message: &str,
 ) -> Result<(String, Option<serde_json::Value>)> {
     let ws_db = WorkspaceDb::open(config, workspace_id)
@@ -429,6 +444,7 @@ async fn run_agent_inner(
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                policy.clone(),
                 message,
             )
             .await
@@ -443,6 +459,7 @@ async fn run_agent_inner(
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                policy.clone(),
                 message,
             )
             .await
@@ -457,6 +474,7 @@ async fn run_agent_inner(
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                policy.clone(),
                 message,
             )
             .await

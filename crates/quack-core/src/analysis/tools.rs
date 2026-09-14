@@ -7,9 +7,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::storage::workspace::{ChunkSearchResult, WorkspaceDb};
+use crate::storage::workspace::{ChunkSearchResult, StatementKind, WorkspaceDb};
 
 use super::chart;
+use super::policy::{Decision, RefusalFlag, WritePolicy};
 use super::text_to_sql;
 
 pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
@@ -39,11 +40,63 @@ impl From<std::fmt::Error> for ToolError {
 pub struct RunSqlTool {
     db: SharedDb,
     max_query_rows: u32,
+    policy: WritePolicy,
+    refused: RefusalFlag,
 }
 
 impl RunSqlTool {
-    pub fn new(db: SharedDb, max_query_rows: u32) -> Self {
-        Self { db, max_query_rows }
+    pub fn new(
+        db: SharedDb,
+        max_query_rows: u32,
+        policy: WritePolicy,
+        refused: RefusalFlag,
+    ) -> Self {
+        Self {
+            db,
+            max_query_rows,
+            policy,
+            refused,
+        }
+    }
+}
+
+/// Message returned to the model when a write is refused.
+pub const WRITE_REFUSED: &str = "This statement would modify the workspace and was not permitted. \
+Do not retry it. Tell the user it needs write permission (re-run with --allow-write).";
+
+/// Message returned to the model when a statement touches internal tables.
+pub const INTERNAL_TABLE_REFUSED: &str =
+    "This statement references quack's internal tables, which are not available to queries.";
+
+/// Gate a statement: classify it, refuse internal tables, apply the write
+/// policy. Returns `Ok(None)` when the statement may run and `Ok(Some(msg))`
+/// with the text to hand back to the model otherwise.
+fn gate_statement(
+    db: &WorkspaceDb,
+    sql: &str,
+    policy: &WritePolicy,
+    refused: &RefusalFlag,
+) -> Result<Option<String>, ToolError> {
+    if db
+        .references_internal_table(sql)
+        .map_err(|e| ToolError::Query(e.to_string()))?
+    {
+        return Ok(Some(String::from(INTERNAL_TABLE_REFUSED)));
+    }
+    match db
+        .classify_statement(sql)
+        .map_err(|e| ToolError::Query(e.to_string()))?
+    {
+        StatementKind::Read => Ok(None),
+        StatementKind::Invalid(msg) => Ok(Some(format!("SQL syntax error: {msg}"))),
+        StatementKind::Write => match policy.decide(sql) {
+            Decision::Run => Ok(None),
+            Decision::Refused => {
+                refused.set();
+                tracing::warn!(sql, "refused write statement from agent");
+                Ok(Some(String::from(WRITE_REFUSED)))
+            }
+        },
     }
 }
 
@@ -61,7 +114,9 @@ impl Tool for RunSqlTool {
 
     fn description(&self) -> String {
         String::from(
-            "Execute a read-only SQL query against the workspace DuckDB database. Returns up to 100 rows as a formatted table.",
+            "Execute a SQL query against the workspace DuckDB database. SELECT queries always run; \
+             statements that modify data need the user's write permission and may be refused. \
+             Returns up to 100 rows as a formatted table.",
         )
     }
 
@@ -83,6 +138,9 @@ impl Tool for RunSqlTool {
             .db
             .lock()
             .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
+        if let Some(message) = gate_statement(&db, &args.query, &self.policy, &self.refused)? {
+            return Ok(message);
+        }
         let results = db
             .execute_query(&args.query)
             .map_err(|e| ToolError::Query(e.to_string()))?;
@@ -459,6 +517,11 @@ impl Tool for CreateChartTool {
                 .db
                 .lock()
                 .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))?;
+            if let Some(message) =
+                gate_statement(&db, &args.sql, &WritePolicy::Deny, &RefusalFlag::default())?
+            {
+                return Ok(format!("Chart query rejected. {message}"));
+            }
             db.execute_query(&args.sql)
                 .map_err(|e| ToolError::Query(e.to_string()))?
         };

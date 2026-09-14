@@ -4,6 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::agent;
+use quack_core::analysis::policy::WritePolicy;
 use quack_core::config::{self, Config, ProviderConfig};
 use quack_core::ingestion;
 use quack_core::storage::control::ControlPlane;
@@ -12,6 +13,7 @@ use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use rig::prelude::*;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(name = "quack", version, about = "Data analysis platform")]
@@ -62,8 +64,15 @@ enum Commands {
         /// Workspace name (defaults to config value)
         #[arg(long, short = 'w')]
         workspace: Option<String>,
+
+        /// Let the agent run statements that modify the workspace
+        #[arg(long)]
+        allow_write: bool,
     },
 }
+
+/// Exit status when the agent needed a write that was not permitted.
+const EXIT_WRITE_REFUSED: u8 = 3;
 
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
@@ -116,7 +125,7 @@ impl EmbeddingModel for EmbedModel {
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -134,14 +143,36 @@ async fn main() -> Result<()> {
             sql,
             workspace,
             format,
-        } => run_query(&sql, workspace.as_deref(), &format).await,
+        } => {
+            run_query(&sql, workspace.as_deref(), &format).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Ingest {
             file,
             workspace,
             filename,
             no_embed,
-        } => run_ingest(&file, workspace.as_deref(), filename.as_deref(), no_embed).await,
-        Commands::Chat { message, workspace } => run_chat(&message, workspace.as_deref()).await,
+        } => {
+            run_ingest(&file, workspace.as_deref(), filename.as_deref(), no_embed).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Chat {
+            message,
+            workspace,
+            allow_write,
+        } => {
+            let policy = if allow_write {
+                WritePolicy::Allow
+            } else {
+                WritePolicy::Deny
+            };
+            let refused = run_chat(&message, workspace.as_deref(), policy).await?;
+            Ok(if refused {
+                ExitCode::from(EXIT_WRITE_REFUSED)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
     }
 }
 
@@ -270,7 +301,11 @@ fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, S
     }
 }
 
-async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
+async fn run_chat(
+    message: &str,
+    workspace_name: Option<&str>,
+    policy: WritePolicy,
+) -> Result<bool> {
     let config = Config::load().context("failed to load configuration")?;
 
     let control = ControlPlane::open(&config)
@@ -319,6 +354,7 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                policy.clone(),
                 message,
             )
             .await
@@ -332,6 +368,7 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                policy.clone(),
                 message,
             )
             .await
@@ -345,6 +382,7 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                policy.clone(),
                 message,
             )
             .await
@@ -369,7 +407,7 @@ async fn run_chat(message: &str, workspace_name: Option<&str>) -> Result<()> {
     }
 
     out.flush()?;
-    Ok(())
+    Ok(response.write_refused)
 }
 
 // ---------------------------------------------------------------------------

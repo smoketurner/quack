@@ -1,6 +1,35 @@
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::config::Config;
+
+/// Tables quack manages inside a workspace database. Hidden from the agent's
+/// table listing and refused in agent SQL.
+pub const INTERNAL_TABLES: &[&str] = &["documents", "chunks"];
+
+/// What a SQL statement would do if executed, decided by the `DuckDB` parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementKind {
+    /// A `SELECT` (or an equivalent read-only statement such as `DESCRIBE`).
+    Read,
+    /// Anything that could mutate state, load code, or reach outside the
+    /// workspace: DDL, DML, `COPY`, `ATTACH`, `SET`, `INSTALL`, `LOAD`, ...
+    Write,
+    /// The `DuckDB` parser rejected it; execution will report the syntax error.
+    Invalid(String),
+}
+
+/// Read-only statements `DuckDB` cannot serialize to JSON but which never mutate.
+const READ_ONLY_KEYWORDS: &[&str] = &[
+    "DESCRIBE",
+    "SHOW",
+    "SUMMARIZE",
+    "PIVOT",
+    "UNPIVOT",
+    "EXPLAIN",
+];
 
 /// Query result set from a `DuckDB` workspace database.
 #[derive(Debug)]
@@ -13,6 +42,7 @@ pub struct QueryResults {
 pub struct WorkspaceDb {
     conn: duckdb::Connection,
     embedding_dimension: u32,
+    query_timeout: Duration,
 }
 
 impl WorkspaceDb {
@@ -26,9 +56,17 @@ impl WorkspaceDb {
         let db = Self {
             conn,
             embedding_dimension,
+            query_timeout: Duration::from_secs(30),
         };
         db.create_internal_tables()?;
         Ok(db)
+    }
+
+    /// Override the per-statement timeout (tests and callers with special needs).
+    #[must_use]
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
+        self
     }
 
     /// Open (or create) the `DuckDB` database for a workspace.
@@ -59,10 +97,115 @@ impl WorkspaceDb {
         let db = Self {
             conn,
             embedding_dimension,
+            query_timeout: Duration::from_secs(u64::from(config.analysis.query_timeout_seconds)),
         };
+        db.apply_resource_limits(config)?;
         db.load_vss();
         db.create_internal_tables()?;
         Ok(db)
+    }
+
+    /// Cap memory and parallelism for every statement on this connection.
+    fn apply_resource_limits(&self, config: &Config) -> crate::error::Result<()> {
+        let memory_limit = format!("{}MB", config.analysis.memory_limit_mb);
+        self.conn
+            .execute("SET memory_limit = ?", duckdb::params![memory_limit])?;
+        self.conn.execute(
+            "SET threads = ?",
+            duckdb::params![i64::from(config.analysis.threads.max(1))],
+        )?;
+        Ok(())
+    }
+
+    /// Classify a statement as read, write, or invalid using `DuckDB`'s parser.
+    ///
+    /// `json_serialize_sql` succeeds only for `SELECT`-shaped statements; a
+    /// "not implemented" error means some other statement type (or several
+    /// statements) and is treated as a write. A short allowlist of read-only
+    /// keywords (`DESCRIBE`, `SHOW`, `SUMMARIZE`, `PIVOT`, `UNPIVOT`,
+    /// `EXPLAIN`) covers statements `DuckDB` cannot serialize but which never
+    /// mutate, and only when the input is a single statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the classification query itself fails.
+    pub fn classify_statement(&self, sql: &str) -> crate::error::Result<StatementKind> {
+        let serialized: String = self.conn.query_row(
+            "SELECT json_serialize_sql(?::VARCHAR)",
+            duckdb::params![sql],
+            |row| row.get(0),
+        )?;
+        let parsed: serde_json::Value = serde_json::from_str(&serialized)?;
+        let is_error = parsed
+            .get("error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if !is_error {
+            let statement_count = parsed
+                .get("statements")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            return Ok(if statement_count == 0 {
+                StatementKind::Invalid(String::from("empty statement"))
+            } else {
+                StatementKind::Read
+            });
+        }
+        let error_type = parsed
+            .get("error_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if error_type == "parser" {
+            let message = parsed
+                .get("error_message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("syntax error");
+            return Ok(StatementKind::Invalid(message.to_owned()));
+        }
+        Ok(if is_single_read_only_statement(sql) {
+            StatementKind::Read
+        } else {
+            StatementKind::Write
+        })
+    }
+
+    /// Names of tables a statement references, as `DuckDB` parsed them, or
+    /// `None` when `DuckDB` cannot serialize the statement.
+    fn referenced_base_tables(&self, sql: &str) -> crate::error::Result<Option<Vec<String>>> {
+        let serialized: String = self.conn.query_row(
+            "SELECT json_serialize_sql(?::VARCHAR)",
+            duckdb::params![sql],
+            |row| row.get(0),
+        )?;
+        let parsed: serde_json::Value = serde_json::from_str(&serialized)?;
+        let is_error = parsed
+            .get("error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if is_error {
+            return Ok(None);
+        }
+        let mut names = Vec::new();
+        collect_table_names(&parsed, &mut names);
+        Ok(Some(names))
+    }
+
+    /// Whether a statement touches any of quack's internal tables.
+    ///
+    /// Uses the parsed table references when `DuckDB` can serialize the
+    /// statement, so string literals do not count; falls back to a
+    /// conservative token scan for everything else.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the classification query fails.
+    pub fn references_internal_table(&self, sql: &str) -> crate::error::Result<bool> {
+        match self.referenced_base_tables(sql)? {
+            Some(names) => Ok(names
+                .iter()
+                .any(|n| INTERNAL_TABLES.iter().any(|t| t.eq_ignore_ascii_case(n)))),
+            None => Ok(mentions_internal_table_token(sql)),
+        }
     }
 
     fn load_vss(&self) {
@@ -272,6 +415,7 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the SQL is invalid or execution fails.
     pub fn execute_query(&self, sql: &str) -> crate::error::Result<QueryResults> {
+        let _guard = self.arm_timeout();
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
 
@@ -313,8 +457,32 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the SQL is invalid or execution fails.
     pub fn execute_statement(&self, sql: &str) -> crate::error::Result<()> {
+        let _guard = self.arm_timeout();
         self.conn.execute(sql, [])?;
         Ok(())
+    }
+
+    /// Start a watchdog that interrupts the connection if the statement runs
+    /// past the configured timeout. Dropping the guard disarms it.
+    fn arm_timeout(&self) -> TimeoutGuard {
+        let done = Arc::new(AtomicBool::new(false));
+        let handle = self.conn.interrupt_handle();
+        let timeout = self.query_timeout;
+        let done_for_thread = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < timeout {
+                if done_for_thread.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !done_for_thread.load(Ordering::Acquire) {
+                tracing::warn!(?timeout, "statement exceeded timeout; interrupting");
+                handle.interrupt();
+            }
+        });
+        TimeoutGuard { done }
     }
 
     /// List all user-created tables in the workspace (excludes internal tables).
@@ -323,13 +491,19 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn list_tables(&self) -> crate::error::Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_name NOT IN ('documents', 'chunks')")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name",
+        )?;
         let mut rows = stmt.query([])?;
         let mut tables = Vec::new();
         while let Some(row) = rows.next()? {
-            tables.push(row.get::<_, String>(0)?);
+            let name: String = row.get(0)?;
+            if !INTERNAL_TABLES
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&name))
+            {
+                tables.push(name);
+            }
         }
         Ok(tables)
     }
@@ -425,6 +599,68 @@ pub struct ChunkSearchResult {
     pub chunk_index: u32,
     pub filename: String,
     pub distance: f64,
+}
+
+struct TimeoutGuard {
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for TimeoutGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+/// True when `sql` is one statement that starts with a read-only keyword
+/// `DuckDB` cannot serialize. A semicolon anywhere but the very end disqualifies
+/// it, so `DESCRIBE t; DROP TABLE t` is not read-only.
+fn is_single_read_only_statement(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if trimmed.contains(';') {
+        return false;
+    }
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    READ_ONLY_KEYWORDS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(first))
+}
+
+/// Walk a serialized statement tree collecting `table_name` values from
+/// base-table references.
+fn collect_table_names(node: &serde_json::Value, out: &mut Vec<String>) {
+    match node {
+        serde_json::Value::Object(map) => {
+            let is_base_table = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t == "BASE_TABLE");
+            if is_base_table
+                && let Some(name) = map.get("table_name").and_then(serde_json::Value::as_str)
+            {
+                out.push(name.to_owned());
+            }
+            for child in map.values() {
+                collect_table_names(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_table_names(item, out);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+/// Conservative token scan used for statements the parser will not serialize.
+fn mentions_internal_table_token(sql: &str) -> bool {
+    sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|tok| INTERNAL_TABLES.iter().any(|t| t.eq_ignore_ascii_case(tok)))
 }
 
 fn format_embedding(embedding: &[f32]) -> String {
