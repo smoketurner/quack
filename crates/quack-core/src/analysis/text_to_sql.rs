@@ -17,9 +17,9 @@ pub fn build_system_prompt(db: &WorkspaceDb) -> Result<String> {
          3. Explain the results in natural language\n\
          4. If the user asks for a visualization, use create_chart\n\n\
          When answering questions about document content:\n\
-         1. Use search_documents to find relevant text chunks\n\
-         2. Synthesize an answer from the retrieved chunks\n\
-         3. Cite the source documents\n\n\
+         1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
+         2. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
+         3. Cite each claim with the chunk's [n] marker and name the source file\n\n\
          DuckDB SQL dialect notes:\n\
          - Use LIMIT for row limits\n\
          - Supports LIST, STRUCT, MAP types\n\

@@ -43,7 +43,7 @@ where
             let db = self.db.lock().map_err(|_| {
                 VectorStoreError::datastore(std::io::Error::other("mutex poisoned"))
             })?;
-            db.search_similar_chunks(&query_vec, samples)
+            db.search_similar_chunks(&query_vec, samples, &[])
                 .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?
         };
 
@@ -54,6 +54,7 @@ where
                 let value = json!({
                     "content": chunk.content,
                     "source_document": chunk.document_id,
+                    "filename": chunk.filename,
                 });
                 let doc: T = serde_json::from_value(value)?;
                 Ok((score, chunk.id, doc))
@@ -79,7 +80,7 @@ where
             let db = self.db.lock().map_err(|_| {
                 VectorStoreError::datastore(std::io::Error::other("mutex poisoned"))
             })?;
-            db.search_similar_chunks(&query_vec, samples)
+            db.search_similar_chunks(&query_vec, samples, &[])
                 .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?
         };
 

@@ -2,17 +2,16 @@ use std::sync::{Arc, Mutex};
 
 use rig::prelude::*;
 
-use crate::config::AnalysisConfig;
+use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::error::{Error, Result};
 use crate::storage::workspace::WorkspaceDb;
 
 use super::text_to_sql;
 use super::tools::{
-    CreateChartTool, DescribeTableTool, ListDocumentsTool, ListTablesTool, RunSqlTool, SharedDb,
+    CreateChartTool, DescribeTableTool, ListDocumentsTool, ListTablesTool, RunSqlTool,
+    SearchDocumentsTool, SharedDb,
 };
 use super::vector_index::DuckDbVectorIndex;
-
-const RAG_TOP_K: usize = 5;
 
 #[derive(Debug)]
 pub struct AgentResponse {
@@ -22,9 +21,10 @@ pub struct AgentResponse {
 
 /// Run the rig agent with all analysis tools for a single user question.
 ///
-/// Document context is automatically retrieved via rig's `.dynamic_context()`
-/// RAG pattern, while structured data tools (SQL, tables, charts) remain as
-/// explicit tool calls the LLM chooses to invoke.
+/// Document retrieval is the `search_documents` tool, which the model calls
+/// when a question is about document content. When
+/// `retrieval.always_retrieve` is set, the top chunks are additionally
+/// injected on every turn via rig's `dynamic_context`.
 ///
 /// # Errors
 ///
@@ -34,21 +34,24 @@ pub async fn run_analysis<M>(
     completion_model: impl rig::completion::CompletionModel + 'static,
     embedding_model: M,
     analysis_config: &AnalysisConfig,
+    retrieval_config: &RetrievalConfig,
     user_message: &str,
 ) -> Result<AgentResponse>
 where
-    M: rig::embeddings::EmbeddingModel + Send + Sync + 'static,
+    M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
     let system_prompt = text_to_sql::build_system_prompt(&db)?;
     let shared_db: SharedDb = Arc::new(Mutex::new(db));
     let chart_spec: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
 
-    let vector_index = DuckDbVectorIndex::new(Arc::clone(&shared_db), embedding_model);
-
-    let agent = completion_model
+    let mut builder = completion_model
         .into_agent_builder()
         .preamble(&system_prompt)
-        .dynamic_context(RAG_TOP_K, vector_index)
+        .tool(SearchDocumentsTool::new(
+            Arc::clone(&shared_db),
+            embedding_model.clone(),
+            retrieval_config.top_k,
+        ))
         .tool(RunSqlTool::new(
             Arc::clone(&shared_db),
             analysis_config.max_query_rows,
@@ -61,8 +64,16 @@ where
             Arc::clone(&chart_spec),
         ))
         .temperature(0.1)
-        .default_max_turns(10)
-        .build();
+        .default_max_turns(10);
+
+    if retrieval_config.always_retrieve {
+        let samples = usize::try_from(retrieval_config.top_k)
+            .map_err(|e| Error::Analysis(format!("top_k overflow: {e}")))?;
+        let vector_index = DuckDbVectorIndex::new(Arc::clone(&shared_db), embedding_model);
+        builder = builder.dynamic_context(samples, vector_index);
+    }
+
+    let agent = builder.build();
 
     let content = agent
         .prompt(user_message)

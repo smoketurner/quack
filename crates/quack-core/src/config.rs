@@ -9,6 +9,7 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     pub ingestion: IngestionConfig,
+    pub retrieval: RetrievalConfig,
     pub analysis: AnalysisConfig,
 }
 
@@ -55,6 +56,28 @@ impl Default for IngestionConfig {
             chunk_overlap_tokens: 64,
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
+        }
+    }
+}
+
+/// Document retrieval settings.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct RetrievalConfig {
+    /// Default number of chunks returned by `search_documents`.
+    pub top_k: u32,
+    /// Also inject the top chunks for every user message via rig's
+    /// `dynamic_context`, in addition to the `search_documents` tool.
+    /// Off by default: retrieval should be a visible tool call the model
+    /// chooses, not an invisible prefix on every turn.
+    pub always_retrieve: bool,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            top_k: 8,
+            always_retrieve: false,
         }
     }
 }
@@ -201,6 +224,22 @@ mod tests {
         assert_eq!(config.ingestion.chunk_overlap_tokens, 64);
         assert_eq!(config.ingestion.embedding_batch_size, 64);
         assert_eq!(config.ingestion.tokenizer_encoding, "cl100k_base");
+        assert_eq!(config.retrieval.top_k, 8);
+        assert!(!config.retrieval.always_retrieve);
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn retrieval_section_parses() {
+        let config: Config = toml::from_str(
+            "[retrieval]
+top_k = 3
+always_retrieve = true
+",
+        )
+        .unwrap();
+        assert_eq!(config.retrieval.top_k, 3);
+        assert!(config.retrieval.always_retrieve);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use quack_core::config::{Config, ProviderConfig};
 use rig::client::EmbeddingsClient;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
+#[derive(Clone)]
 pub(crate) enum EmbedModel {
     Ollama(rig::providers::ollama::EmbeddingModel),
     OpenAi(
