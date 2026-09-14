@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, AppState, MessageRole};
+use crate::chart;
 
 const SPINNER: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -12,18 +13,48 @@ const SPINNER: &[&str] = &[
 ];
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let [header_area, messages_area, input_area, status_area] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(3),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let chart_height = app
+        .current_chart
+        .as_ref()
+        .map_or(0, chart::ChartData::height);
 
-    draw_header(frame, header_area, app);
-    draw_messages(frame, messages_area, app);
-    draw_input(frame, input_area, app);
-    draw_status(frame, status_area, app);
+    if chart_height > 0 {
+        let [
+            header_area,
+            messages_area,
+            chart_area,
+            input_area,
+            status_area,
+        ] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(chart_height),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        draw_header(frame, header_area, app);
+        draw_messages(frame, messages_area, app);
+        if let Some(chart_data) = &app.current_chart {
+            chart::render_chart(frame, chart_area, chart_data);
+        }
+        draw_input(frame, input_area, app);
+        draw_status(frame, status_area, app);
+    } else {
+        let [header_area, messages_area, input_area, status_area] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        draw_header(frame, header_area, app);
+        draw_messages(frame, messages_area, app);
+        draw_input(frame, input_area, app);
+        draw_status(frame, status_area, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -116,6 +147,13 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" send", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " \u{00B7} \u{2191}\u{2193}",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" history", Style::default().fg(Color::DarkGray)),
         Span::styled(
             " \u{00B7} ctrl+l",
             Style::default()

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 mod app;
+mod chart;
 mod providers;
 mod ui;
 

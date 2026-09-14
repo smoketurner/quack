@@ -14,6 +14,7 @@ use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::storage::workspace::WorkspaceDb;
 
+use crate::chart::ChartData;
 use crate::providers;
 use crate::ui;
 
@@ -24,7 +25,22 @@ Welcome to quack!
 
 Ask questions about your data or type SQL queries directly.
 Drop a file here to load it (CSV, JSON, Parquet, PDF, TXT, MD).
-Results will appear here as the agent processes your request.";
+Type /help for available commands.";
+
+const HELP_TEXT: &str = "\
+Commands:
+  /help             Show this help message
+  /clear            Clear messages and chart
+  /quit, /exit      Exit quack
+  /workspace        Show current workspace
+
+Shortcuts:
+  Enter             Send message
+  Up/Down           Browse input history
+  PageUp/PageDown   Scroll messages
+  Ctrl+U            Clear input line
+  Ctrl+L            Clear screen
+  Ctrl+C            Quit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppState {
@@ -97,6 +113,9 @@ pub(crate) struct App {
     pub(crate) tick: usize,
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
+    pub(crate) current_chart: Option<ChartData>,
+    input_history: Vec<String>,
+    history_cursor: Option<usize>,
     config: Arc<Config>,
     workspace_id: String,
     response_rx: mpsc::UnboundedReceiver<BackgroundResult>,
@@ -123,6 +142,9 @@ impl App {
             tick: 0,
             workspace_name,
             provider_display,
+            current_chart: None,
+            input_history: Vec::new(),
+            history_cursor: None,
             config,
             workspace_id,
             response_rx,
@@ -167,16 +189,22 @@ impl App {
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 self.messages.clear();
                 self.messages.push(Message::system(WELCOME_TEXT));
+                self.current_chart = None;
                 self.scroll_offset = 0;
+            }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) if self.state == AppState::Idle => {
+                self.textarea = TextArea::default();
+                configure_textarea(&mut self.textarea);
+                self.history_cursor = None;
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.state == AppState::Idle => {
                 self.submit_message();
             }
-            (KeyCode::Up, KeyModifiers::NONE) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            (KeyCode::Up, KeyModifiers::NONE) if self.state == AppState::Idle => {
+                self.history_up();
             }
-            (KeyCode::Down, KeyModifiers::NONE) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+            (KeyCode::Down, KeyModifiers::NONE) if self.state == AppState::Idle => {
+                self.history_down();
             }
             (KeyCode::PageUp, _) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(15);
@@ -187,8 +215,82 @@ impl App {
             _ if self.state == AppState::Idle => {
                 self.textarea
                     .input(crossterm::event::KeyEvent::new(code, modifiers));
+                self.history_cursor = None;
             }
             _ => {}
+        }
+    }
+
+    fn history_up(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let next = match self.history_cursor {
+            None => self.input_history.len().saturating_sub(1),
+            Some(i) => i.saturating_sub(1),
+        };
+        if let Some(entry) = self.input_history.get(next) {
+            let text = entry.clone();
+            self.history_cursor = Some(next);
+            self.set_textarea_content(&text);
+        }
+    }
+
+    fn history_down(&mut self) {
+        let Some(current) = self.history_cursor else {
+            return;
+        };
+        let next = current.saturating_add(1);
+        if next >= self.input_history.len() {
+            self.history_cursor = None;
+            self.textarea = TextArea::default();
+            configure_textarea(&mut self.textarea);
+        } else if let Some(entry) = self.input_history.get(next) {
+            let text = entry.clone();
+            self.history_cursor = Some(next);
+            self.set_textarea_content(&text);
+        }
+    }
+
+    fn set_textarea_content(&mut self, text: &str) {
+        self.textarea = TextArea::default();
+        configure_textarea(&mut self.textarea);
+        for ch in text.chars() {
+            self.textarea.input(crossterm::event::KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            ));
+        }
+    }
+
+    fn handle_slash_command(&mut self, input: &str) {
+        let (cmd, _args) = input
+            .split_once(' ')
+            .map_or((input, ""), |(c, a)| (c, a.trim()));
+
+        match cmd {
+            "/quit" | "/exit" | "/q" => {
+                self.should_quit = true;
+            }
+            "/clear" => {
+                self.messages.clear();
+                self.messages.push(Message::system(WELCOME_TEXT));
+                self.current_chart = None;
+                self.scroll_offset = 0;
+            }
+            "/help" | "/?" => {
+                self.messages.push(Message::system(HELP_TEXT));
+            }
+            "/workspace" => {
+                self.messages.push(Message::system(&format!(
+                    "Workspace: {} ({})",
+                    self.workspace_name, self.workspace_id
+                )));
+            }
+            other => {
+                self.messages
+                    .push(Message::error(format!("unknown command: {other}")));
+            }
         }
     }
 
@@ -199,9 +301,16 @@ impl App {
             return;
         }
 
+        self.input_history.push(trimmed.clone());
+        self.history_cursor = None;
         self.textarea = TextArea::default();
         configure_textarea(&mut self.textarea);
         self.scroll_offset = 0;
+
+        if trimmed.starts_with('/') {
+            self.handle_slash_command(&trimmed);
+            return;
+        }
 
         let config = Arc::clone(&self.config);
         let workspace_id = self.workspace_id.clone();
@@ -247,11 +356,13 @@ impl App {
                 content,
                 chart_spec,
             } => {
-                self.messages.push(Message::assistant(content));
-                if chart_spec.is_some() {
-                    self.messages.push(Message::system(
-                        "(Chart spec generated — view in web UI for rendering)",
-                    ));
+                if let Some(spec) = chart_spec {
+                    self.current_chart = ChartData::from_echart_spec(&spec);
+                    if self.current_chart.is_none() {
+                        self.messages.push(Message::assistant(content));
+                    }
+                } else {
+                    self.messages.push(Message::assistant(content));
                 }
             }
             BackgroundResult::Ingested { summary } => {
