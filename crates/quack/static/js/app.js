@@ -60,8 +60,35 @@
     article.appendChild(details);
     var body = el("div", "mt-2 whitespace-pre-wrap");
     article.appendChild(body);
+    var working = el("div", "mt-2 flex items-center gap-2 text-sm text-slate-500");
+    var dot = el("span", "inline-block h-2.5 w-2.5 animate-pulse rounded-full bg-blue-600");
+    working.appendChild(dot);
+    working.appendChild(el("span", null, "Thinking…"));
+    article.appendChild(working);
     messages.appendChild(article);
-    return { article: article, details: details, summary: summary, steps: steps, body: body, count: 0 };
+    article.scrollIntoView({ block: "end" });
+    return { article: article, details: details, summary: summary, steps: steps, body: body, working: working, count: 0 };
+  }
+
+  function setWorking(view, text) {
+    if (!view.working) return;
+    view.working.lastChild.textContent = text;
+  }
+
+  function finishWorking(view) {
+    if (view.working && view.working.parentNode) view.working.parentNode.removeChild(view.working);
+    view.working = null;
+  }
+
+  function setBusy(form, busy) {
+    var button = form.querySelector("button[type=submit]");
+    if (button) {
+      button.disabled = busy;
+      button.textContent = busy ? "Working…" : "Send";
+      button.classList.toggle("opacity-50", busy);
+      button.classList.toggle("cursor-not-allowed", busy);
+    }
+    form.prompt.disabled = busy;
   }
 
   function parseSse(buffer, onEvent) {
@@ -90,7 +117,8 @@
     messages.appendChild(user);
     form.prompt.value = "";
     var view = startAssistant(messages);
-    status.textContent = "Thinking…";
+    setBusy(form, true);
+    status.textContent = "";
     var body = { prompt: prompt, mode: form.mode.value };
     if (chat.getAttribute("data-session")) body.session_id = chat.getAttribute("data-session");
     if (form.allow_write && form.allow_write.checked) body.allow_write = true;
@@ -115,15 +143,19 @@
       }
       return pump();
     }).catch(function (err) {
-      status.textContent = "";
       view.body.textContent = "Error: " + err.message;
       view.article.classList.add("border-red-300");
+    }).then(function () {
+      finishWorking(view);
+      setBusy(form, false);
+      form.prompt.focus();
     });
   }
 
   function handle(event, data, view, chat, status) {
     if (event === "text") {
       view.body.textContent += data;
+      setWorking(view, "Answering…");
     } else if (event === "tool_started") {
       var s = JSON.parse(data);
       view.count += 1;
@@ -134,7 +166,7 @@
       li.appendChild(document.createTextNode(s.detail));
       li.setAttribute("data-pending", "1");
       view.steps.appendChild(li);
-      status.textContent = "Running " + s.tool + "…";
+      setWorking(view, "Running " + s.tool + "…");
     } else if (event === "tool_finished") {
       var f = JSON.parse(data);
       var pending = view.steps.querySelector("li[data-pending]");
@@ -168,11 +200,11 @@
         chat.setAttribute("data-session", r.session_id);
         history.replaceState(null, "", "?session=" + r.session_id);
       }
-      status.textContent = "";
+      finishWorking(view);
     } else if (event === "error") {
       view.body.textContent = "Error: " + data;
       view.article.classList.add("border-red-300");
-      status.textContent = "";
+      finishWorking(view);
     } else if (event === "permission_denied") {
       status.textContent = data;
     }
