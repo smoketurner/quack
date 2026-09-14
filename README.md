@@ -28,10 +28,10 @@ cargo run --bin quack -- query "SELECT 1 AS answer"
 cargo run --bin quack -- query "SELECT * FROM generate_series(1, 5) AS t(n)" -f json
 cargo run --bin quack -- ingest sales.csv -w myworkspace
 cargo run --bin quack -- chat "total sales by region" -w myworkspace
-cargo run --bin quack-tui -- -w myworkspace
+cargo run --bin quack -- -w myworkspace          # interactive terminal session
 ```
 
-`chat` and the TUI need a provider with a chat model and one with an embedding model in
+`chat` and the terminal session need a provider with a chat model and one with an embedding model in
 `~/.config/quack/config.toml`; see the configuration section of the design doc. Set
 `QUACK_DATA_DIR` to keep test data out of `~/.local/share/quack`.
 

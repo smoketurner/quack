@@ -34,7 +34,7 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.98.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
-crates/               # quack-core, quack-cli, quack-tui — see crates/README.md
+crates/               # quack-core (engine), quack (the binary) — see crates/README.md
 docs/                 # design-doc.md (the product) plus the stack patterns, with code
 .claude/rules/        # branching, commits, continuous-improvement conventions
 ```
@@ -78,12 +78,14 @@ data-layer, crypto, or dependency change:
 ```bash
 cargo run --bin quack -- query "SELECT 1"           # SQL against a workspace
 cargo run --bin quack -- ingest sales.csv -w ws     # file -> table or chunks
-cargo run --bin quack -- chat "question" -w ws      # agent (needs providers in config)
-cargo run --bin quack-tui -- -w ws                  # terminal session
+cargo run --bin quack -- chat "question" -w ws      # one agent turn (needs providers in config)
+cargo run --bin quack -- -w ws                      # interactive terminal session (needs a TTY)
 ```
 
-Target CLI (`quack -p`, `quack serve`, `quack mcp`, `quack ontology propose`, ...) is in
-design doc section 11.
+`--allow-write` lets the agent run mutating SQL; without it writes are refused and `chat`
+exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
+clients themselves. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
+`quack ontology propose`, ...) is in design doc section 11.
 
 ## Common commands
 

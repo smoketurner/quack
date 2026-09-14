@@ -7,13 +7,13 @@ Your workspace members live here. The root `Cargo.toml` picks up every crate via
 
 | Crate | Responsibility | Key deps (from the workspace menu) |
 |---|---|---|
-| `quack-core` | Config, error types, SQLite control plane, DuckDB workspace management | `sqlx`, `duckdb`, `sea-query`, `serde`, `toml`, `thiserror`, `tracing`, `uuid` |
-| `quack-cli` | `quack` binary with `query`, `ingest`, `chat` subcommands | `quack-core`, `clap`, `anyhow`, `tokio`, `rig`, `tracing-subscriber`, `mimalloc` |
-| `quack-tui` | `quack-tui` binary: ratatui chat session | `quack-core`, `ratatui`, `ratatui-textarea`, `crossterm`, `rig`, `tokio` |
+| `quack-core` | Config, errors, crypto provider, `control.db`, DuckDB workspaces, ingestion, retrieval, agent and tools, write policy, rig providers (`llm`) | `sqlx`, `duckdb`, `sea-query`, `rig`, `rustls`, `serde`, `toml`, `thiserror`, `tracing`, `uuid` |
+| `quack` | The one binary: interactive terminal session (no subcommand), `query`, `ingest`, `chat` | `quack-core`, `clap`, `ratatui`, `ratatui-textarea`, `crossterm`, `anyhow`, `tokio`, `mimalloc` |
 
-Target layout (design doc section 4): `quack-cli` and `quack-tui` merge into a single
-`quack` crate (terminal, print mode, `serve`, `mcp`, admin, and later `desktop`). Two
-crates, no Cargo features. Provider construction moves into `quack-core::llm`.
+Two crates, no Cargo features. `quack-core::llm` owns provider construction and the
+per-turn dispatch (`llm::run_turn`); the binary never touches rig directly. Later
+subcommands (`serve`, `mcp`, `desktop`, admin) are added to `quack`, not as new crates
+(design doc section 4).
 
 ## Adding a crate
 

@@ -5284,14 +5284,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "quack-cli"
+name = "quack"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossterm 0.29.0",
+ "dirs",
  "mimalloc",
  "quack-core",
- "rig",
+ "ratatui",
+ "ratatui-textarea",
  "serde_json",
  "tokio",
  "tracing",
@@ -5319,24 +5322,6 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "quack-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm 0.29.0",
- "dirs",
- "mimalloc",
- "quack-core",
- "ratatui",
- "ratatui-textarea",
- "rig",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]

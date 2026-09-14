@@ -42,15 +42,12 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 
 | Crate | Binary | Owns |
 |---|---|---|
-| `quack-core` | — | config, errors, `control.db` (sqlx + sea-query), workspace DuckDB engine, ingestion, chunking, vector search, rig-based agent and tools, chart spec |
-| `quack-cli` | `quack` | `query`, `ingest`, `chat` subcommands; table and JSON output |
-| `quack-tui` | `quack-tui` | ratatui chat session with file ingestion and terminal charts |
+| `quack-core` | — | config, errors, crypto provider install, `control.db` (sqlx + sea-query), workspace DuckDB engine with statement classification and limits, ingestion, chunking, vector search, rig-based agent, tools, write policy, `llm` provider construction and `run_turn` dispatch, chart spec |
+| `quack` | `quack` | interactive terminal session when run with no subcommand; `query`, `ingest`, `chat` subcommands; `--allow-write` |
 
-**Target crates** (design doc section 4): `quack-cli` and `quack-tui` merge into one
-`quack` crate providing `serve`, `mcp`, the terminal session, print mode, and admin
-subcommands, with `quack desktop` as a later subcommand for the Tauri window. There are
-no Cargo features; every build contains every surface. Provider construction moves from
-the binaries into `quack-core::llm`.
+`serve`, `mcp`, print mode (`-p`), admin, and later `desktop` are added to `quack` as
+subcommands (design doc section 4). There are no Cargo features; every build contains
+every surface.
 
 ## Core modules
 
@@ -69,9 +66,9 @@ the binaries into `quack-core::llm`.
 | `llm/` | rig provider construction; auth none / API key / OAuth PKCE with a token manager |
 | `context/` | the stored workspace context; Markdown import and export |
 
-Today's code has `storage/`, `ingestion/`, and `analysis/` (agent, tools, text-to-SQL,
-vector index, chart). The split above is the target; new work should land in the target
-module rather than growing `analysis/`.
+Today's code has `storage/`, `ingestion/`, `analysis/` (agent, tools, policy, text-to-SQL,
+vector index, chart), `llm/`, and `crypto`. The split above is the target; new work should
+land in the target module rather than growing `analysis/`.
 
 ## The storage boundary
 

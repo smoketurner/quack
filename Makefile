@@ -5,7 +5,7 @@ export
 
 CARGO ?= cargo
 
-BIN ?= quack-tui
+BIN ?= quack
 
 # Name of the server crate used by the CSS targets. Override once you create it:
 #   make css-build SERVER_CRATE=my-server
@@ -63,7 +63,7 @@ css-build: ## Build minified Tailwind CSS for the server crate
 
 ##@ Run
 
-run: build ## Build and run a binary: make run [BIN=quack-tui] [ARGS="..."]
+run: build ## Build and run a binary: make run [BIN=quack] [ARGS="..."]
 	$(CARGO) run --release --bin $(BIN) -- $(ARGS)
 
 ##@ Help

@@ -4,8 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::{App, AppState, MessageRole};
-use crate::chart;
+use crate::terminal::app::{App, AppState, MessageRole};
+use crate::terminal::chart;
 
 const SPINNER: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",

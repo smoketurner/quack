@@ -7,17 +7,13 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc;
 
-use rig::client::CompletionClient;
-
-use quack_core::analysis::agent;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::config::Config;
 use quack_core::ingestion;
 use quack_core::storage::workspace::WorkspaceDb;
 
-use crate::chart::ChartData;
-use crate::providers;
-use crate::ui;
+use crate::terminal::chart::ChartData;
+use crate::terminal::ui;
 
 const TICK_RATE_MS: u64 = 50;
 
@@ -37,7 +33,7 @@ Commands:
 
 Writes:
   The agent may run SELECT queries freely. Statements that modify the
-  workspace are refused unless quack-tui was started with --allow-write.
+  workspace are refused unless quack was started with --allow-write.
 
 Shortcuts:
   Enter             Send message
@@ -422,66 +418,9 @@ async fn run_agent_inner(
     let ws_db = WorkspaceDb::open(config, workspace_id)
         .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
 
-    let (_, chat_config) = config
-        .find_chat_provider()
-        .ok_or_else(|| anyhow::anyhow!("no chat provider configured"))?;
-
-    let chat_model_name = chat_config
-        .model
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("no chat model configured"))?
-        .to_owned();
-
-    let (embedding_model, _) = providers::build_rig_embedding_model(config)?;
-
-    let response = match chat_config.provider_type.as_str() {
-        "ollama" => {
-            let client = providers::build_ollama_client(chat_config)?;
-            let model = client.completion_model(&chat_model_name);
-            agent::run_analysis(
-                ws_db,
-                model,
-                embedding_model,
-                &config.analysis,
-                &config.retrieval,
-                policy.clone(),
-                message,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-        }
-        "openai" => {
-            let client = providers::build_openai_client(chat_config)?;
-            let model = client.completion_model(&chat_model_name);
-            agent::run_analysis(
-                ws_db,
-                model,
-                embedding_model,
-                &config.analysis,
-                &config.retrieval,
-                policy.clone(),
-                message,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-        }
-        "anthropic" => {
-            let client = providers::build_anthropic_client(chat_config)?;
-            let model = client.completion_model(&chat_model_name);
-            agent::run_analysis(
-                ws_db,
-                model,
-                embedding_model,
-                &config.analysis,
-                &config.retrieval,
-                policy.clone(),
-                message,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-        }
-        other => anyhow::bail!("unsupported provider type: {other}"),
-    };
+    let response = quack_core::llm::run_turn(config, ws_db, policy, message)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok((response.content, response.chart_spec))
 }
@@ -549,7 +488,7 @@ async fn run_ingest_inner(
     let ws_db = WorkspaceDb::open(config, workspace_id)
         .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
 
-    let embedding_model = providers::build_embedding_model(config)?;
+    let embedding_model = quack_core::llm::optional_embedding_model(config)?;
 
     let result = ingestion::ingest_file(
         config,
