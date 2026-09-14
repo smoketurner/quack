@@ -7,10 +7,13 @@ CARGO ?= cargo
 
 BIN ?= quack
 
+# Address for `make run-server`.
+BIND ?= 127.0.0.1:8080
+
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack
 
-.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny hooks css-dev css-build run help
+.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny hooks css-dev css-build run run-server help
 
 all: build
 
@@ -64,6 +67,9 @@ css-build: ## Build minified Tailwind CSS for the web UI (commit the result)
 
 run: build ## Build and run a binary: make run [BIN=quack] [ARGS="..."]
 	$(CARGO) run --release --bin $(BIN) -- $(ARGS)
+
+run-server: ## Serve the web UI and API locally without login: make run-server [BIND=127.0.0.1:8080]
+	$(CARGO) run --bin quack -- serve --local --bind $(BIND)
 
 ##@ Help
 
