@@ -222,11 +222,35 @@ pub(crate) async fn serve(config: Config, bind: Option<String>, local: bool) -> 
         listener,
         router(app).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        drop(tokio::signal::ctrl_c().await);
-        tracing::info!("shutting down");
-    })
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server error")?;
+    tracing::info!("stopped");
     Ok(())
+}
+
+/// Resolve on Ctrl-C or, on Unix, SIGTERM (what containers and systemd
+/// send). In-flight requests finish; new connections are refused.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        drop(tokio::signal::ctrl_c().await);
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C stops the server");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => tracing::info!("received Ctrl-C; finishing in-flight requests"),
+        () = terminate => tracing::info!("received SIGTERM; finishing in-flight requests"),
+    }
 }
