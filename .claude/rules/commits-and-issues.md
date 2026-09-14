@@ -88,15 +88,29 @@ BREAKING CHANGE: removed smol dependency, applications must now use tokio runtim
 
 ## Issue Guidelines
 
-### Severity Labels
+### Type and Priority
 
-| Severity | Label | Description | Action |
-|----------|-------|-------------|--------|
-| Critical | P0 | Broken core functionality, data loss, security | File immediately, dedicate fix session |
-| High | P1 | Degraded UX, incorrect non-destructive behavior | File and prioritize for next PR |
-| Medium | P2 | Suboptimal behavior, minor inconsistency | File with `bug` or `enhancement` |
-| Low | P3 | Cosmetic, edge case unlikely in practice | Backlog |
-| Nice-to-have | P4 | Research ideas, future enhancements | File with `research` label |
+Issues carry a GitHub **issue type** (Bug, Feature, Task) and the organization's
+**Priority** field (Urgent, High, Medium, Low) instead of labels. Set both when filing.
+
+| Priority | Description | Action |
+|----------|-------------|--------|
+| Urgent | Broken core functionality, data loss, security | File immediately, dedicate fix session |
+| High | Degraded UX, incorrect non-destructive behavior | File and prioritize for next PR |
+| Medium | Suboptimal behavior, minor inconsistency, planned features | File with type Feature or Bug |
+| Low | Cosmetic, edge case, research ideas, far-future work | Backlog; type Task for research |
+
+Set them from the CLI:
+
+```bash
+gh issue edit <n> --type Bug|Feature|Task
+# Priority is an org issue field; set it with the GraphQL mutation
+gh api graphql -f query='mutation($issue: ID!, $opt: ID!) {
+  setIssueFieldValue(input: {issueId: $issue,
+    issueFields: {fieldId: "IFSS_kgDOABXRoA", singleSelectOptionId: $opt}}) { clientMutationId } }' \
+  -f issue="$(gh issue view <n> --json id --jq .id)" -f opt=<option id>
+# option ids: Urgent IFSSO_kgDOACYZmQ, High IFSSO_kgDOACYZmg, Medium IFSSO_kgDOACYZmw, Low IFSSO_kgDOACYZnA
+```
 
 ### Filing Protocol
 
@@ -108,7 +122,8 @@ BREAKING CHANGE: removed smol dependency, applications must now use tokio runtim
 3. **File** via `gh issue create` with:
    - Title: short imperative description of the problem (not the fix)
    - Body: use the template below
-   - Labels: priority label (P0–P4) + category (`bug`, `enhancement`, `research`)
+   - Then set the issue type and the Priority field (see above); no priority or
+     category labels
 4. **Link** related issues when they share a root cause
 
 ### Issue Title Conventions
