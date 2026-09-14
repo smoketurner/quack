@@ -792,3 +792,53 @@ async fn control_db_migrates_to_v2_and_drops_content_tables() {
         .unwrap();
     assert_eq!(again.schema_version().await.unwrap(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Bound parameters and quoted identifiers (#10)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ingest_csv_with_quote_in_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let workspace_id = "ws-quote";
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+
+    let filename = "it's a file.csv";
+    let files_dir = config.workspace_files_dir(workspace_id);
+    std::fs::create_dir_all(&files_dir).unwrap();
+    std::fs::write(files_dir.join(filename), "a,b\n1,2\n3,4\n").unwrap();
+
+    let result = ingestion::ingest_file(
+        &config,
+        &db,
+        workspace_id,
+        filename,
+        b"a,b\n1,2\n3,4\n",
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.table_name.as_deref(), Some("it_s_a_file"));
+    let rows = db
+        .execute_query("SELECT sum(a) AS s FROM it_s_a_file")
+        .unwrap();
+    assert_eq!(rows.rows.first().unwrap().first().unwrap().to_string(), "4");
+}
+
+#[test]
+fn describe_table_handles_quoted_identifier() {
+    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    db.execute_statement("CREATE TABLE \"odd \"\"name\"\"\" (x INT)")
+        .unwrap();
+    db.execute_statement("INSERT INTO \"odd \"\"name\"\"\" VALUES (7)")
+        .unwrap();
+    let desc = db.describe_table("odd \"name\"").unwrap();
+    assert_eq!(desc.columns.first().unwrap().name, "x");
+    assert_eq!(desc.sample_rows.rows.len(), 1);
+    let err = db.describe_table("nope\"; DROP TABLE x; --").err().unwrap();
+    assert!(
+        err.to_string().contains("does not exist") || err.to_string().contains("Catalog"),
+        "{err}"
+    );
+}

@@ -435,14 +435,15 @@ impl WorkspaceDb {
     ) -> crate::error::Result<()> {
         match embedding {
             Some(emb) => {
-                let emb_str = format_embedding(emb);
-                let dim = self.embedding_dimension;
                 let sql = format!(
                     "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, embedding) \
-                     VALUES (?, ?, ?, ?, {emb_str}::FLOAT[{dim}])"
+                     VALUES (?, ?, ?, ?, ?::{})",
+                    self.vector_type()
                 );
-                self.conn
-                    .execute(&sql, duckdb::params![id, document_id, chunk_index, content])?;
+                self.conn.execute(
+                    &sql,
+                    duckdb::params![id, document_id, chunk_index, content, format_embedding(emb)],
+                )?;
             }
             None => {
                 self.conn.execute(
@@ -465,15 +466,22 @@ impl WorkspaceDb {
         chunk_index: u32,
         embedding: &[f32],
     ) -> crate::error::Result<()> {
-        let emb_str = format_embedding(embedding);
-        let dim = self.embedding_dimension;
         let sql = format!(
-            "UPDATE _quack_chunks SET embedding = {emb_str}::FLOAT[{dim}] \
-             WHERE document_id = ? AND chunk_index = ?"
+            "UPDATE _quack_chunks SET embedding = ?::{} \
+             WHERE document_id = ? AND chunk_index = ?",
+            self.vector_type()
         );
-        self.conn
-            .execute(&sql, duckdb::params![document_id, chunk_index])?;
+        self.conn.execute(
+            &sql,
+            duckdb::params![format_embedding(embedding), document_id, chunk_index],
+        )?;
         Ok(())
+    }
+
+    /// The `FLOAT[N]` type of this workspace's embedding column. `N` is a
+    /// validated integer, the only value ever interpolated into vector SQL.
+    fn vector_type(&self) -> String {
+        format!("FLOAT[{}]", self.embedding_dimension)
     }
 
     /// Create an HNSW index on the chunks embedding column for cosine similarity.
@@ -511,8 +519,6 @@ impl WorkspaceDb {
         top_k: u32,
         document_ids: &[String],
     ) -> crate::error::Result<Vec<ChunkSearchResult>> {
-        let emb_str = format_embedding(query_embedding);
-        let dim = self.embedding_dimension;
         let filter = if document_ids.is_empty() {
             String::new()
         } else {
@@ -521,19 +527,25 @@ impl WorkspaceDb {
         };
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, \
-                    array_cosine_distance(c.embedding, {emb_str}::FLOAT[{dim}]) AS distance \
+                    array_cosine_distance(c.embedding, ?::{}) AS distance \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL{filter} \
              ORDER BY distance ASC \
-             LIMIT {top_k}"
+             LIMIT ?",
+            self.vector_type()
         );
 
+        let query_literal = format_embedding(query_embedding);
+        let limit = i64::from(top_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(document_ids.len());
+        let mut params: Vec<&dyn duckdb::ToSql> =
+            Vec::with_capacity(document_ids.len().saturating_add(2));
+        params.push(&query_literal);
         for id in document_ids {
             params.push(id);
         }
+        params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
         let mut results = Vec::new();
 
@@ -599,8 +611,21 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the SQL is invalid or execution fails.
     pub fn execute_statement(&self, sql: &str) -> crate::error::Result<()> {
+        self.execute_with_params(sql, [])
+    }
+
+    /// Execute a parameterized statement that does not return rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid or execution fails.
+    pub fn execute_with_params<P: duckdb::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> crate::error::Result<()> {
         let _guard = self.arm_timeout();
-        self.conn.execute(sql, [])?;
+        self.conn.execute(sql, params)?;
         Ok(())
     }
 
@@ -653,7 +678,7 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the table does not exist or the query fails.
     pub fn describe_table(&self, table_name: &str) -> crate::error::Result<TableDescription> {
-        let describe_sql = format!("DESCRIBE \"{table_name}\"");
+        let describe_sql = format!("DESCRIBE {}", quote_ident(table_name));
         let mut stmt = self.conn.prepare(&describe_sql)?;
         let mut rows = stmt.query([])?;
         let mut columns = Vec::new();
@@ -664,7 +689,7 @@ impl WorkspaceDb {
             });
         }
 
-        let sample_sql = format!("SELECT * FROM \"{table_name}\" LIMIT 3");
+        let sample_sql = format!("SELECT * FROM {} LIMIT 3", quote_ident(table_name));
         let sample = self.execute_query(&sample_sql)?;
 
         Ok(TableDescription {
@@ -806,6 +831,15 @@ fn mentions_internal_table_token(sql: &str) -> bool {
         .any(is_internal_name)
 }
 
+/// Quote a SQL identifier for `DuckDB`: wrap in double quotes and double
+/// any embedded double quote. This is the only way identifiers enter SQL.
+#[must_use]
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Render a vector as the string literal `DuckDB` casts to `FLOAT[N]`. The
+/// result is always bound as a parameter, never interpolated.
 fn format_embedding(embedding: &[f32]) -> String {
     let inner: Vec<String> = embedding.iter().map(|v| format!("{v}")).collect();
     format!("[{}]", inner.join(","))
@@ -945,6 +979,13 @@ impl QueryResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_ident_wraps_and_escapes() {
+        assert_eq!(quote_ident("sales"), "\"sales\"");
+        assert_eq!(quote_ident("odd name"), "\"odd name\"");
+        assert_eq!(quote_ident("x\"y"), "\"x\"\"y\"");
+    }
 
     #[test]
     fn format_embedding_multiple_values() {

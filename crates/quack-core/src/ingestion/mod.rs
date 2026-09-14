@@ -5,7 +5,7 @@ use rig::embeddings::EmbeddingModel;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -109,28 +109,25 @@ fn ingest_structured(
     }
 
     let table_name = sanitize_table_name(filename);
-    let path_str = dest.to_string_lossy();
+    let path = dest.to_string_lossy();
 
-    let create_sql = match file_type {
-        parser::FileType::Csv => {
-            format!(
-                "CREATE OR REPLACE TABLE \"{table_name}\" AS SELECT * FROM read_csv_auto('{path_str}')"
-            )
+    let reader = match file_type {
+        parser::FileType::Csv => "read_csv_auto",
+        parser::FileType::Parquet => "read_parquet",
+        parser::FileType::Json => "read_json_auto",
+        parser::FileType::Pdf
+        | parser::FileType::Text
+        | parser::FileType::Markdown
+        | parser::FileType::Unknown => {
+            return Err(Error::Ingestion("not a structured file type".into()));
         }
-        parser::FileType::Parquet => {
-            format!(
-                "CREATE OR REPLACE TABLE \"{table_name}\" AS SELECT * FROM read_parquet('{path_str}')"
-            )
-        }
-        parser::FileType::Json => {
-            format!(
-                "CREATE OR REPLACE TABLE \"{table_name}\" AS SELECT * FROM read_json_auto('{path_str}')"
-            )
-        }
-        _ => return Err(Error::Ingestion("not a structured file type".into())),
     };
 
-    db.execute_statement(&create_sql)?;
+    let create_sql = format!(
+        "CREATE OR REPLACE TABLE {} AS SELECT * FROM {reader}(?)",
+        quote_ident(&table_name)
+    );
+    db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
     tracing::info!(table = %table_name, file = %filename, "created table from structured file");
 
     Ok(table_name)
