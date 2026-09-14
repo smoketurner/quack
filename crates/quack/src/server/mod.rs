@@ -29,7 +29,7 @@ use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
 use state::{App, AppState};
 
@@ -93,10 +93,24 @@ pub(crate) fn router(app: App) -> Router {
         .nest("/api/v1", api)
         .merge(web::router())
         .layer(DefaultBodyLimit::max(upload_limit))
-        // One span per request; the response event carries status and latency.
+        // One span per request, carrying the id the request-id layer set
+        // (it is the outer layer, so the header exists here); the response
+        // event carries status and latency.
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                .make_span_with(|request: &Request<axum::body::Body>| {
+                    let request_id = request
+                        .headers()
+                        .get(auth::REQUEST_ID_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        request_id
+                    )
+                })
                 .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
         )
         .layer(TimeoutLayer::with_status_code(
