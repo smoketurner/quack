@@ -29,6 +29,7 @@ use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
 use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 
 use state::{App, AppState};
 
@@ -92,6 +93,12 @@ pub(crate) fn router(app: App) -> Router {
         .nest("/api/v1", api)
         .merge(web::router())
         .layer(DefaultBodyLimit::max(upload_limit))
+        // One span per request; the response event carries status and latency.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
+        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             REQUEST_TIMEOUT,

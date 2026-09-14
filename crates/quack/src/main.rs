@@ -376,7 +376,8 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Serve { bind, local } => {
-            init_logging();
+            // The server logs each request at info; other commands stay quiet.
+            init_logging_at("info,sqlx=warn,hyper=warn,h2=warn");
             let config = Config::load().context("failed to load configuration")?;
             server::serve(config, bind, local).await?;
             Ok(ExitCode::SUCCESS)
@@ -911,11 +912,16 @@ fn export_session(db: &WorkspaceDb, prefix: &str, as_sql: bool) -> Result<()> {
 /// Log to stderr for the non-interactive paths. The terminal session owns
 /// the screen, so it does not install a subscriber.
 fn init_logging() {
+    init_logging_at("warn");
+}
+
+/// Log to stderr at `default` unless `RUST_LOG` says otherwise.
+fn init_logging_at(default: &str) {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
         )
         .init();
 }
