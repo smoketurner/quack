@@ -88,7 +88,7 @@ async fn gate_statement(
                 Ok(Gate::Run)
             } else {
                 refused.set();
-                tracing::warn!(sql, "refused write statement from agent");
+                tracing::info!(sql, "refused write statement from agent");
                 Ok(Gate::Reject(String::from(WRITE_REFUSED)))
             }
         }
@@ -315,7 +315,9 @@ pub fn format_search_results(
             "No relevant chunks found. Tell the user the documents do not appear to cover this.",
         ));
     }
-    let mut out = String::new();
+    let mut out = String::from(
+        "Retrieved chunks. Cite each fact you use with the chunk's [n] marker at the end of the sentence.\n\n",
+    );
     for (i, chunk) in results.iter().enumerate() {
         let n = first_marker.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
         let page = chunk.page.map_or(String::new(), |p| format!(", page {p}"));
@@ -697,11 +699,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            out.starts_with(
-                "[1] policy.pdf, page 12, under \"Exclusions\" (document_id: doc-1, chunk 0, score 0.1250)\n"
+            out.contains(
+                "\n[1] policy.pdf, page 12, under \"Exclusions\" (document_id: doc-1, chunk 0, score 0.1250)\n"
             ),
             "{out}"
         );
+        assert!(out.starts_with("Retrieved chunks. Cite"));
         assert!(out.contains("\nFlood is excluded.\n"));
         assert!(out.contains("[2] faq.md (document_id: doc-1, chunk 1, score 0.1250)\n"));
         assert!(out.contains("Claims close in 30 days."));
@@ -711,7 +714,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn format_search_results_continues_numbering() {
         let out = format_search_results(&[hit(0, "a.md", "x")], 5).unwrap();
-        assert!(out.starts_with("[5] a.md"), "{out}");
+        assert!(out.contains("\n[5] a.md"), "{out}");
     }
 
     #[test]

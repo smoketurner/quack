@@ -1307,8 +1307,10 @@ tenant; desktop app on each platform; air-gapped static binary with bundled exte
 Every gap is a GitHub issue; this list is the map from the design to the tracker and is
 updated as issues close. Ordered by risk.
 
-1. **Verify agent behavior against a live model** (#20): streaming and the write prompt,
-   citation markers, history replay, chart `kind`. Sections 7, 8, 9.
+1. **Terminal session unverified against a live model** (#20): print mode is verified
+   (SQL, citations in both modes, chart `kind`, refused and allowed writes, history
+   replay, context, pinned documents) with gpt-oss:20b on Ollama; the interactive
+   streaming and the y/n/a prompt still need a person at a terminal. Sections 7, 8, 9.
 2. **No OAuth** (#25). `auth = "oauth"` parses and is rejected. Section 10.2.
 3. **No server, REST API, web UI** (#26); **no MCP** (#29); **no desktop window** (#35).
    Sections 11, 12.
@@ -1322,11 +1324,9 @@ updated as issues close. Ordered by risk.
 9. **Context `edited_by` and the `_quack_audit` detail table** wait for users and the
    server (#24). Sections 5.3, 5.4, 12.
 10. **No release pipeline** (#30). Section 14.
-11. **Print mode reprints the answer when citation validation changes streamed text**
-    (#33). Section 11.5.
-12. **No stemming in keyword search** (#31, deliberately deferred); **no reranking hook**
+11. **No stemming in keyword search** (#31, deliberately deferred); **no reranking hook**
     (#34); **large-workspace vector index options** (#32, research). Sections 6.1, 15.
-13. **Web UI mapping of the chart spec to ECharts** arrives with the web UI (#26).
+12. **Web UI mapping of the chart spec to ECharts** arrives with the web UI (#26).
     Section 9.
 
 ---

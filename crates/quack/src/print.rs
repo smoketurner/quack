@@ -39,24 +39,30 @@ pub(crate) async fn run_prompt(
         async move { llm::run_turn(&config, db, &session_id, policy, &prompt, sink).await }
     });
 
-    let stderr = std::io::stderr();
-    let stdout = std::io::stdout();
-    let mut err = stderr.lock();
-    let mut out = stdout.lock();
+    // Never hold the stdout or stderr locks across an await: the tracing
+    // subscriber writes to stderr from the agent's threads, and holding the
+    // lock here deadlocks the turn the moment a tool logs anything.
+    let mut err = std::io::stderr();
+    let mut out = std::io::stdout();
     let mut streamed_any = false;
-    let mut streamed_text = String::new();
+    // Once a search has run, the answer may carry [n] markers that citation
+    // validation renumbers after the stream ends, so buffer instead of
+    // printing text that would then need to be reprinted.
+    let mut searched = false;
 
     while let Some(event) = events.recv().await {
         match event {
             AgentEvent::TextDelta(text) => {
-                if format == PromptFormat::Text {
+                if format == PromptFormat::Text && !searched {
                     write!(out, "{text}")?;
                     out.flush()?;
                     streamed_any = true;
-                    streamed_text.push_str(&text);
                 }
             }
             AgentEvent::ToolStarted { tool, detail } => {
+                if tool == "search_documents" {
+                    searched = true;
+                }
                 write_started(&mut err, &tool, &detail, verbose)?;
             }
             AgentEvent::ToolFinished(step) => {
@@ -78,12 +84,6 @@ pub(crate) async fn run_prompt(
     match format {
         PromptFormat::Text => {
             if !streamed_any {
-                write!(out, "{}", response.content)?;
-            } else if streamed_text != response.content {
-                // Citation validation renumbered or stripped markers after
-                // the text was already streamed; show the final form.
-                writeln!(out)?;
-                writeln!(out, "---")?;
                 write!(out, "{}", response.content)?;
             }
             if !response.content.ends_with('\n') {

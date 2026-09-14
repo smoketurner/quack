@@ -76,6 +76,12 @@ impl CitationRegistry {
 /// from 1 so the footer reads naturally.
 #[must_use]
 pub fn validate(answer: &str, registered: &[Citation]) -> (String, Vec<Citation>) {
+    // Some models emit fullwidth brackets (【1】) or superscript-style
+    // `[^1]`; normalize to `[1]` before scanning.
+    let answer = answer
+        .replace('【', "[")
+        .replace('】', "]")
+        .replace("[^", "[");
     let mut out = String::with_capacity(answer.len());
     let mut cited: Vec<Citation> = Vec::new();
 
@@ -183,6 +189,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "c"), (2, "a"), (3, "b")]
         );
+    }
+
+    #[test]
+    fn validate_accepts_fullwidth_and_footnote_brackets() {
+        let registry = CitationRegistry::default();
+        assert_eq!(registry.register(&[hit("a", "p.pdf", 0)]), 1);
+        let (text, cited) = validate("Renews in March【1】 and again[^1].", &registry.all());
+        assert_eq!(text, "Renews in March[1] and again[1].");
+        assert_eq!(cited.len(), 1);
     }
 
     #[test]

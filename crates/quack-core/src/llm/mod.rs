@@ -241,6 +241,7 @@ pub async fn run_turn(
             .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
         let prompt = PromptOptions {
             mode: session.mode,
+            write_policy: policy,
             pinned_token_budget: config.retrieval.pinned_token_budget,
             context: context::combined(&guard)?,
             context_max_tokens: config.context.max_tokens,

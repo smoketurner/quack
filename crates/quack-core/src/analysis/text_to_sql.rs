@@ -1,3 +1,4 @@
+use crate::analysis::policy::WritePolicy;
 use crate::error::Result;
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::WorkspaceDb;
@@ -7,6 +8,9 @@ use std::fmt::Write;
 #[derive(Debug, Clone)]
 pub struct PromptOptions {
     pub mode: ChatMode,
+    /// What happens to mutating SQL this turn; the model is told so it
+    /// attempts statements through the tool instead of refusing on its own.
+    pub write_policy: WritePolicy,
     /// Budget for pinned document text (four characters per token).
     pub pinned_token_budget: u32,
     /// Global prefix plus workspace context, already joined, if any.
@@ -36,9 +40,12 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
              or a query result, cite it.\n\n",
         ),
         ChatMode::Query => prompt.push_str(
-            "Mode: query. Every factual claim must come from a retrieved chunk (cite its [n] marker) \
-             or from a query you ran this turn. Do not answer from memory. If search and queries \
-             find nothing relevant, say that the workspace does not cover the question and stop.\n\n",
+            "Mode: query. Every factual claim must come from a retrieved chunk or from a query you \
+             ran this turn. Do not answer from memory. If search and queries find nothing \
+             relevant, say that the workspace does not cover the question and stop. Every \
+             sentence that states something from a document MUST end with that chunk's [n] \
+             marker, e.g. \"Flood damage is excluded [2].\" An answer about the documents with \
+             no [n] markers is wrong.\n\n",
         ),
     }
 
@@ -51,7 +58,8 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
          When answering questions about document content:\n\
          1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
          2. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
-         3. Cite each claim with the chunk's [n] marker and name the source file\n\n\
+         3. Cite each claim inline with the chunk's [n] marker, e.g. \"Flood is excluded [2].\"\n\
+         4. Do not write a Sources or References section; one is appended for you from the markers\n\n\
          DuckDB SQL dialect notes:\n\
          - Use LIMIT for row limits\n\
          - Supports LIST, STRUCT, MAP types\n\
@@ -114,13 +122,32 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 
     append_context(&mut prompt, options)?;
 
-    prompt.push_str(
-        "Permissions: SELECT queries always run. A statement that would modify the workspace \
-         is only run if the user allows it; if it is refused, do not retry it and tell the \
-         user it needs write permission.\n",
-    );
+    prompt.push_str(permissions_text(options.write_policy));
 
     Ok(prompt)
+}
+
+/// The permissions paragraph for the write policy in force.
+fn permissions_text(policy: WritePolicy) -> &'static str {
+    match policy {
+        WritePolicy::Allow => {
+            "Permissions: SELECT queries always run. The user has permitted statements that \
+             modify the workspace for this session, so when asked to change data, run the \
+             statement with run_sql rather than asking for confirmation.\n"
+        }
+        WritePolicy::Ask => {
+            "Permissions: SELECT queries always run. When you run a statement that modifies the \
+             workspace, the user is asked to approve it before it executes, so when asked to \
+             change data, run the statement with run_sql rather than asking for confirmation \
+             yourself. If the tool reports it was refused, do not retry it; tell the user.\n"
+        }
+        WritePolicy::Deny => {
+            "Permissions: SELECT queries always run. Statements that modify the workspace are \
+             not permitted in this session; if the user asks for one, still attempt it once \
+             with run_sql so the refusal is recorded, then tell the user it needs write \
+             permission (--allow-write). Do not retry.\n"
+        }
+    }
 }
 
 /// The owner-written context, truncated to `context_max_tokens` with a note
@@ -237,6 +264,7 @@ mod tests {
     fn options(mode: ChatMode, pinned: u32) -> PromptOptions {
         PromptOptions {
             mode,
+            write_policy: WritePolicy::Deny,
             pinned_token_budget: pinned,
             context: None,
             context_max_tokens: 4000,
@@ -280,10 +308,22 @@ mod tests {
         assert!(chat.contains("- claims"));
         assert!(chat.contains("- policy.pdf (status: ready"));
         assert!(!chat.contains("Pinned documents"));
-        assert!(chat.ends_with("user it needs write permission.\n"));
+        assert!(
+            chat.contains("needs write\n             permission")
+                || chat.contains("needs write permission")
+        );
+        let mut allowed = options(ChatMode::Chat, 1000);
+        allowed.write_policy = WritePolicy::Allow;
+        let allowed = build_system_prompt(&db, &allowed).unwrap();
+        assert!(allowed.contains("has permitted statements that"));
+        let mut ask = options(ChatMode::Chat, 1000);
+        ask.write_policy = WritePolicy::Ask;
+        let ask = build_system_prompt(&db, &ask).unwrap();
+        assert!(ask.contains("the user is asked to approve it"));
         let query = build_system_prompt(&db, &options(ChatMode::Query, 1000)).unwrap();
         assert!(query.contains("Mode: query."));
         assert!(query.contains("Do not answer from memory"));
+        assert!(query.contains("MUST end with that chunk's [n]"));
     }
 
     #[test]
