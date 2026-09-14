@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use quack_core::config::{
-    AnalysisConfig, Config, GeneralConfig, IngestionConfig, ProviderConfig, RetrievalConfig,
+    AnalysisConfig, AuthMode, Config, GeneralConfig, IngestionConfig, ProviderConfig, ProviderType,
+    RetrievalConfig,
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
@@ -50,11 +51,10 @@ fn test_config(data_dir: &Path) -> Config {
     providers.insert(
         "mock".into(),
         ProviderConfig {
-            provider_type: "openai-compat".into(),
+            provider_type: ProviderType::Ollama,
+            auth: AuthMode::None,
             base_url: Some("http://localhost:9999".into()),
             api_key_env: None,
-            model: None,
-            embedding_model: Some("mock-model".into()),
             embedding_dimension: Some(TEST_DIM_U32),
         },
     );
@@ -62,6 +62,8 @@ fn test_config(data_dir: &Path) -> Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
             default_workspace: "test".into(),
+            chat_model: None,
+            embedding_model: Some("mock/mock-model".into()),
         },
         providers,
         ingestion: IngestionConfig {
@@ -80,6 +82,8 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
             default_workspace: "test".into(),
+            chat_model: None,
+            embedding_model: None,
         },
         providers: BTreeMap::new(),
         ingestion: IngestionConfig::default(),
@@ -716,8 +720,8 @@ fn dimension_change_with_stored_embeddings_is_an_error() {
     let mut changed = test_config(dir.path());
     if let Some(p) = changed.providers.get_mut("mock") {
         p.embedding_dimension = Some(8);
-        p.embedding_model = Some("other-model".into());
     }
+    changed.general.embedding_model = Some("mock/other-model".into());
     let err = WorkspaceDb::open(&changed, "ws-mismatch").err().unwrap();
     let msg = err.to_string();
     assert!(

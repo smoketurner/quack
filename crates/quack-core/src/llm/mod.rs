@@ -1,7 +1,8 @@
 //! LLM provider construction on top of rig.
 //!
-//! Everything that turns a `[providers.<name>]` config entry into a rig
-//! client lives here, so the interfaces never build providers themselves.
+//! Everything that turns a `[providers.<name>]` config entry plus a
+//! `PROVIDER/MODEL` reference into a rig client lives here, so the interfaces
+//! never build providers themselves.
 
 use rig::client::EmbeddingsClient;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -9,7 +10,7 @@ use rig::prelude::*;
 
 use crate::analysis::agent::{self, AgentResponse};
 use crate::analysis::policy::WritePolicy;
-use crate::config::{Config, ProviderConfig, config_file_path};
+use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
 use crate::storage::workspace::WorkspaceDb;
 
@@ -50,156 +51,169 @@ impl EmbeddingModel for EmbedModel {
     }
 }
 
-fn resolve_api_key(provider_config: &ProviderConfig) -> Option<String> {
-    provider_config
-        .api_key_env
-        .as_ref()
-        .and_then(|env| std::env::var(env).ok())
+/// The API key for a provider, according to its `auth` mode.
+fn api_key(name: &str, provider: &ProviderConfig) -> Result<Option<String>> {
+    match provider.auth {
+        AuthMode::None => Ok(None),
+        AuthMode::ApiKey => {
+            let var = provider.api_key_env.as_deref().ok_or_else(|| {
+                Error::Config(format!(
+                    "provider '{name}' has auth = \"api-key\" but no api_key_env"
+                ))
+            })?;
+            let key = std::env::var(var).map_err(|_| {
+                Error::Config(format!(
+                    "provider '{name}' needs the API key in environment variable {var}, which is not set"
+                ))
+            })?;
+            Ok(Some(key))
+        }
+        AuthMode::Oauth => Err(Error::Config(format!(
+            "provider '{name}': auth = \"oauth\" is not implemented yet"
+        ))),
+    }
 }
 
-fn build_ollama_client(provider_config: &ProviderConfig) -> Result<rig::providers::ollama::Client> {
-    let api_key = resolve_api_key(provider_config)
+fn build_ollama_client(
+    name: &str,
+    provider: &ProviderConfig,
+) -> Result<rig::providers::ollama::Client> {
+    let key = api_key(name, provider)?
         .map(rig::providers::ollama::OllamaApiKey::from)
         .unwrap_or_default();
 
-    let mut builder = rig::providers::ollama::Client::builder().api_key(api_key);
+    let mut builder = rig::providers::ollama::Client::builder().api_key(key);
 
-    if let Some(base_url) = &provider_config.base_url {
+    if let Some(base_url) = &provider.base_url {
         let url = base_url.trim_end_matches("/v1");
         builder = builder.base_url(url);
     }
 
     builder
         .build()
-        .map_err(|e| Error::Llm(format!("failed to build Ollama client: {e}")))
+        .map_err(|e| Error::Llm(format!("failed to build Ollama client for '{name}': {e}")))
 }
 
 fn build_openai_client(
-    provider_config: &ProviderConfig,
+    name: &str,
+    provider: &ProviderConfig,
 ) -> Result<rig::providers::openai::CompletionsClient> {
-    let api_key = resolve_api_key(provider_config).ok_or_else(|| {
-        Error::Config(String::from(
-            "OpenAI provider requires api_key_env to be set",
+    let key = api_key(name, provider)?.ok_or_else(|| {
+        Error::Config(format!(
+            "provider '{name}' (openai) requires auth = \"api-key\" and api_key_env"
         ))
     })?;
 
-    let mut builder = rig::providers::openai::CompletionsClient::builder().api_key(&api_key);
+    let mut builder = rig::providers::openai::CompletionsClient::builder().api_key(&key);
 
-    if let Some(base_url) = &provider_config.base_url {
+    if let Some(base_url) = &provider.base_url {
         builder = builder.base_url(base_url);
     }
 
     builder
         .build()
-        .map_err(|e| Error::Llm(format!("failed to build OpenAI client: {e}")))
+        .map_err(|e| Error::Llm(format!("failed to build OpenAI client for '{name}': {e}")))
 }
 
 fn build_anthropic_client(
-    provider_config: &ProviderConfig,
+    name: &str,
+    provider: &ProviderConfig,
 ) -> Result<rig::providers::anthropic::Client> {
-    let api_key = resolve_api_key(provider_config).ok_or_else(|| {
-        Error::Config(String::from(
-            "Anthropic provider requires api_key_env to be set",
+    let key = api_key(name, provider)?.ok_or_else(|| {
+        Error::Config(format!(
+            "provider '{name}' (anthropic) requires auth = \"api-key\" and api_key_env"
         ))
     })?;
 
-    let mut builder = rig::providers::anthropic::Client::builder().api_key(&api_key);
+    let mut builder = rig::providers::anthropic::Client::builder().api_key(&key);
 
-    if let Some(base_url) = &provider_config.base_url {
+    if let Some(base_url) = &provider.base_url {
         builder = builder.base_url(base_url);
     }
 
-    builder
-        .build()
-        .map_err(|e| Error::Llm(format!("failed to build Anthropic client: {e}")))
+    builder.build().map_err(|e| {
+        Error::Llm(format!(
+            "failed to build Anthropic client for '{name}': {e}"
+        ))
+    })
 }
 
-fn build_embed_model_from(embed_config: &ProviderConfig) -> Result<EmbedModel> {
-    let model_name = embed_config.embedding_model.as_deref().ok_or_else(|| {
-        Error::Config(String::from(
-            "embedding provider has no embedding_model configured",
-        ))
-    })?;
-
-    let ndims = embed_config.embedding_dimension.ok_or_else(|| {
-        Error::Config(String::from(
-            "embedding provider has no embedding_dimension configured",
+fn build_embed_model(model: ModelRef<'_>) -> Result<EmbedModel> {
+    let ndims = model.provider.embedding_dimension.ok_or_else(|| {
+        Error::Config(format!(
+            "provider '{}' is used for embeddings but has no embedding_dimension",
+            model.provider_name
         ))
     })?;
     let ndims = usize::try_from(ndims)
         .map_err(|e| Error::Config(format!("embedding_dimension overflow: {e}")))?;
 
-    match embed_config.provider_type.as_str() {
-        "ollama" => {
-            let client = build_ollama_client(embed_config)?;
+    match model.provider.provider_type {
+        ProviderType::Ollama => {
+            let client = build_ollama_client(model.provider_name, model.provider)?;
             Ok(EmbedModel::Ollama(
-                client.embedding_model_with_ndims(model_name, ndims),
+                client.embedding_model_with_ndims(model.model, ndims),
             ))
         }
-        "openai" => {
-            let client = build_openai_client(embed_config)?;
+        ProviderType::Openai => {
+            let client = build_openai_client(model.provider_name, model.provider)?;
             Ok(EmbedModel::OpenAi(
-                client.embedding_model_with_ndims(model_name, ndims),
+                client.embedding_model_with_ndims(model.model, ndims),
             ))
         }
-        other => Err(Error::Config(format!(
-            "provider type '{other}' does not support embeddings — use 'ollama' or 'openai'"
+        ProviderType::Anthropic => Err(Error::Config(format!(
+            "embedding_model '{model}': anthropic does not serve embeddings"
         ))),
     }
 }
 
-/// The configured embedding model, or `None` when no provider declares one.
+/// The configured embedding model, or `None` when `[general].embedding_model`
+/// is unset.
 ///
 /// # Errors
 ///
-/// Returns an error if a provider is configured but incomplete.
+/// Returns an error if the reference or provider is invalid.
 pub fn optional_embedding_model(config: &Config) -> Result<Option<EmbedModel>> {
-    let Some((name, embed_config)) = config.find_embedding_provider() else {
-        tracing::info!("no embedding provider configured");
+    let Some(model) = config.embedding_model_ref()? else {
+        tracing::info!("no embedding model configured");
         return Ok(None);
     };
-    tracing::info!(provider = %name, "using embedding provider");
-    build_embed_model_from(embed_config).map(Some)
+    tracing::info!(model = %model, "using embedding model");
+    build_embed_model(model).map(Some)
 }
 
 /// The configured embedding model, required.
 ///
 /// # Errors
 ///
-/// Returns an error if no provider declares an embedding model or the
-/// provider is incomplete.
+/// Returns an error if `[general].embedding_model` is unset or invalid.
 pub fn required_embedding_model(config: &Config) -> Result<EmbedModel> {
-    let (name, embed_config) = config.find_embedding_provider().ok_or_else(|| {
+    let model = config.embedding_model_ref()?.ok_or_else(|| {
         Error::Config(format!(
-            "no embedding provider configured — add a [providers.<name>] section \
-             with 'embedding_model' set in {}",
-            config_file_path().display()
+            "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
+            crate::config::config_file_path().display()
         ))
     })?;
-    tracing::info!(provider = %name, "using embedding provider");
-    build_embed_model_from(embed_config)
+    tracing::info!(model = %model, "using embedding model");
+    build_embed_model(model)
 }
 
-/// `provider_type/model` for status lines, or a placeholder.
+/// `provider/model` for status lines, or a placeholder.
 #[must_use]
 pub fn chat_model_display(config: &Config) -> String {
-    config.find_chat_provider().map_or_else(
-        || String::from("no provider"),
-        |(_, c)| {
-            let model = c.model.as_deref().unwrap_or("unknown");
-            format!("{}/{model}", c.provider_type)
-        },
-    )
+    config
+        .chat_model_ref()
+        .map_or_else(|_| String::from("no chat model"), |m| m.to_string())
 }
 
-/// Run one agent turn with the configured chat and embedding providers.
+/// Run one agent turn with the configured chat and embedding models.
 ///
 /// This is the single dispatch point over provider types; interfaces call it
 /// rather than matching on `provider_type` themselves.
 ///
 /// # Errors
 ///
-/// Returns an error if no chat provider is configured, a provider cannot be
+/// Returns an error if no chat model is configured, a provider cannot be
 /// built, or the agent turn fails.
 pub async fn run_turn(
     config: &Config,
@@ -207,32 +221,17 @@ pub async fn run_turn(
     policy: WritePolicy,
     message: &str,
 ) -> Result<AgentResponse> {
-    let (_, chat_config) = config.find_chat_provider().ok_or_else(|| {
-        Error::Config(format!(
-            "no LLM provider configured with a chat model — \
-             add a [providers.<name>] section with 'model' set in {}",
-            config_file_path().display()
-        ))
-    })?;
-    let chat_model_name = chat_config
-        .model
-        .as_deref()
-        .ok_or_else(|| Error::Config(String::from("chat provider has no model configured")))?;
-
+    let chat = config.chat_model_ref()?;
     let embedding_model = required_embedding_model(config)?;
 
-    tracing::info!(
-        chat_model = %chat_model_name,
-        provider_type = %chat_config.provider_type,
-        "starting agent turn"
-    );
+    tracing::info!(chat_model = %chat, "starting agent turn");
 
-    match chat_config.provider_type.as_str() {
-        "ollama" => {
-            let client = build_ollama_client(chat_config)?;
+    match chat.provider.provider_type {
+        ProviderType::Ollama => {
+            let client = build_ollama_client(chat.provider_name, chat.provider)?;
             agent::run_analysis(
                 db,
-                client.completion_model(chat_model_name),
+                client.completion_model(chat.model),
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
@@ -241,11 +240,11 @@ pub async fn run_turn(
             )
             .await
         }
-        "openai" => {
-            let client = build_openai_client(chat_config)?;
+        ProviderType::Openai => {
+            let client = build_openai_client(chat.provider_name, chat.provider)?;
             agent::run_analysis(
                 db,
-                client.completion_model(chat_model_name),
+                client.completion_model(chat.model),
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
@@ -254,11 +253,11 @@ pub async fn run_turn(
             )
             .await
         }
-        "anthropic" => {
-            let client = build_anthropic_client(chat_config)?;
+        ProviderType::Anthropic => {
+            let client = build_anthropic_client(chat.provider_name, chat.provider)?;
             agent::run_analysis(
                 db,
-                client.completion_model(chat_model_name),
+                client.completion_model(chat.model),
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
@@ -267,47 +266,35 @@ pub async fn run_turn(
             )
             .await
         }
-        other => Err(Error::Config(format!(
-            "unsupported provider type '{other}' — expected 'ollama', 'openai', or 'anthropic'"
-        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
-    fn provider(kind: &str, model: Option<&str>, embed: Option<&str>) -> ProviderConfig {
-        ProviderConfig {
-            provider_type: kind.to_owned(),
-            base_url: None,
-            api_key_env: None,
-            model: model.map(str::to_owned),
-            embedding_model: embed.map(str::to_owned),
-            embedding_dimension: embed.map(|_| 4),
+    fn parse(toml_text: &str) -> Config {
+        match Config::parse(toml_text) {
+            Ok(c) => c,
+            Err(e) => panic_config(&e.to_string()),
         }
     }
 
-    fn config_with(providers: Vec<(&str, ProviderConfig)>) -> Config {
-        Config {
-            providers: providers
-                .into_iter()
-                .map(|(n, p)| (n.to_owned(), p))
-                .collect::<BTreeMap<_, _>>(),
-            ..Config::default()
-        }
+    #[expect(clippy::panic, reason = "test helper: config fixtures must parse")]
+    fn panic_config(msg: &str) -> Config {
+        panic!("fixture config failed to parse: {msg}");
     }
 
     #[test]
-    fn display_name_reports_provider_and_model() {
-        let config = config_with(vec![("o", provider("ollama", Some("llama3"), None))]);
-        assert_eq!(chat_model_display(&config), "ollama/llama3");
-        assert_eq!(chat_model_display(&Config::default()), "no provider");
+    fn display_name_reports_model_ref_or_placeholder() {
+        let config =
+            parse("[general]\nchat_model = \"o/llama3\"\n[providers.o]\ntype = \"ollama\"\n");
+        assert_eq!(chat_model_display(&config), "o/llama3");
+        assert_eq!(chat_model_display(&Config::default()), "no chat model");
     }
 
     #[test]
-    fn optional_embedding_model_is_none_without_provider() {
+    fn optional_embedding_model_is_none_when_unset() {
         assert!(matches!(
             optional_embedding_model(&Config::default()),
             Ok(None)
@@ -315,28 +302,25 @@ mod tests {
     }
 
     #[test]
-    fn required_embedding_model_errors_without_provider() {
+    fn required_embedding_model_errors_when_unset() {
         let err = required_embedding_model(&Config::default()).err();
-        assert!(err.is_some_and(|e| e.to_string().contains("no embedding provider")));
+        assert!(err.is_some_and(|e| e.to_string().contains("embedding_model")));
     }
 
     #[test]
-    fn anthropic_cannot_embed() {
-        let config = config_with(vec![("a", provider("anthropic", None, Some("x")))]);
+    fn api_key_mode_requires_the_env_var_to_be_set() {
+        let config = parse(
+            "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"QUACK_TEST_KEY_THAT_IS_UNSET\"\nembedding_dimension = 4\n",
+        );
         let err = required_embedding_model(&config).err();
-        assert!(err.is_some_and(|e| e.to_string().contains("does not support embeddings")));
-    }
-
-    #[test]
-    fn openai_requires_an_api_key_env() {
-        let config = config_with(vec![("o", provider("openai", None, Some("x")))]);
-        let err = required_embedding_model(&config).err();
-        assert!(err.is_some_and(|e| e.to_string().contains("api_key_env")));
+        assert!(err.is_some_and(|e| e.to_string().contains("QUACK_TEST_KEY_THAT_IS_UNSET")));
     }
 
     #[test]
     fn ollama_embedding_model_builds_without_a_key() {
-        let config = config_with(vec![("o", provider("ollama", None, Some("nomic")))]);
+        let config = parse(
+            "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n",
+        );
         let model = required_embedding_model(&config);
         assert!(model.is_ok_and(|m| m.ndims() == 4));
     }

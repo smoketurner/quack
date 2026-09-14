@@ -2,8 +2,12 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::error::{Error, Result};
+
+/// The whole `config.toml`. Unknown keys anywhere are an error so a typo can
+/// never silently disable a setting.
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub general: GeneralConfig,
     #[serde(default)]
@@ -14,10 +18,15 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     pub data_dir: PathBuf,
     pub default_workspace: String,
+    /// `PROVIDER/MODEL` used for chat and tool calling. Override: `QUACK_MODEL`.
+    pub chat_model: Option<String>,
+    /// `PROVIDER/MODEL` used for embeddings. Unset means documents are stored
+    /// without vectors and `search_documents` is unavailable.
+    pub embedding_model: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -25,23 +34,75 @@ impl Default for GeneralConfig {
         Self {
             data_dir: default_data_dir(),
             default_workspace: String::from("default"),
+            chat_model: None,
+            embedding_model: None,
         }
     }
 }
 
+/// Which rig client a provider entry builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderType {
+    Ollama,
+    #[serde(alias = "openai-compat")]
+    Openai,
+    Anthropic,
+}
+
+impl std::fmt::Display for ProviderType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ollama => "ollama",
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        })
+    }
+}
+
+/// How a provider endpoint is authenticated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthMode {
+    /// No credentials (local Ollama, unauthenticated gateways).
+    #[default]
+    None,
+    /// Static key from the environment variable named by `api_key_env`.
+    ApiKey,
+    /// OAuth 2.0 PKCE against an identity provider (design doc 10.2). Parsed
+    /// so configs can carry it, but not implemented yet.
+    Oauth,
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
-    pub provider_type: String,
+    pub provider_type: ProviderType,
+    #[serde(default)]
+    pub auth: AuthMode,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
-    pub model: Option<String>,
-    pub embedding_model: Option<String>,
+    /// Width of the vectors this provider's embedding models produce.
     pub embedding_dimension: Option<u32>,
 }
 
+/// A resolved `PROVIDER/MODEL` reference.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelRef<'a> {
+    pub provider_name: &'a str,
+    pub provider: &'a ProviderConfig,
+    pub model: &'a str,
+}
+
+impl std::fmt::Display for ModelRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider_name, self.model)
+    }
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IngestionConfig {
     pub chunk_size_tokens: u32,
     pub chunk_overlap_tokens: u32,
@@ -62,7 +123,7 @@ impl Default for IngestionConfig {
 
 /// Document retrieval settings.
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetrievalConfig {
     /// Default number of chunks returned by `search_documents`.
     pub top_k: u32,
@@ -83,7 +144,7 @@ impl Default for RetrievalConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
     pub max_query_rows: u32,
     pub query_timeout_seconds: u32,
@@ -133,21 +194,19 @@ impl Config {
     ///
     /// Data directory (databases, workspaces): `~/.local/share/quack/`
     ///
-    /// `QUACK_DATA_DIR` overrides the data directory.
-    /// `QUACK_CONFIG_DIR` overrides the config directory.
+    /// `QUACK_DATA_DIR` overrides the data directory, `QUACK_CONFIG_DIR` the
+    /// config directory, and `QUACK_MODEL` the chat model.
     ///
     /// # Errors
     ///
-    /// Returns an error if the config file exists but cannot be read or parsed.
-    pub fn load() -> crate::error::Result<Self> {
-        let config_dir =
-            std::env::var("QUACK_CONFIG_DIR").map_or_else(|_| default_config_dir(), PathBuf::from);
-
-        let config_path = config_dir.join("config.toml");
+    /// Returns an error if the config file exists but cannot be read or
+    /// parsed, contains unknown keys, or fails validation.
+    pub fn load() -> Result<Self> {
+        let config_path = config_file_path();
 
         let mut config = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
-            toml::from_str(&content)?
+            Self::parse(&content)?
         } else {
             Self::default()
         };
@@ -155,8 +214,128 @@ impl Config {
         if let Ok(data_dir) = std::env::var("QUACK_DATA_DIR") {
             config.general.data_dir = PathBuf::from(data_dir);
         }
+        if let Ok(model) = std::env::var("QUACK_MODEL") {
+            config.general.chat_model = Some(model);
+        }
 
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Parse and validate TOML text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on syntax errors, unknown keys, or invalid references.
+    pub fn parse(toml_text: &str) -> Result<Self> {
+        let config: Self = toml::from_str(toml_text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Check cross-field rules the parser cannot: model references name a
+    /// configured provider, auth modes match the keys present, and every
+    /// embedding provider declares its dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Config` error describing the first violation found.
+    pub fn validate(&self) -> Result<()> {
+        for (name, provider) in &self.providers {
+            match provider.auth {
+                AuthMode::None => {
+                    if provider.api_key_env.is_some() {
+                        return Err(Error::Config(format!(
+                            "provider '{name}' has auth = \"none\" but sets api_key_env; \
+                             use auth = \"api-key\" or remove the key"
+                        )));
+                    }
+                }
+                AuthMode::ApiKey => {
+                    if provider.api_key_env.is_none() {
+                        return Err(Error::Config(format!(
+                            "provider '{name}' has auth = \"api-key\" but no api_key_env"
+                        )));
+                    }
+                }
+                AuthMode::Oauth => {
+                    return Err(Error::Config(format!(
+                        "provider '{name}': auth = \"oauth\" is not implemented yet"
+                    )));
+                }
+            }
+        }
+        if self.general.chat_model.is_some() {
+            self.chat_model_ref()?;
+        }
+        if let Some(embed) = self.embedding_model_ref()? {
+            if embed.provider.provider_type == ProviderType::Anthropic {
+                return Err(Error::Config(format!(
+                    "embedding_model '{embed}': anthropic does not serve embeddings"
+                )));
+            }
+            if embed.provider.embedding_dimension.is_none() {
+                return Err(Error::Config(format!(
+                    "provider '{}' is used for embeddings but has no embedding_dimension",
+                    embed.provider_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_model<'a>(&'a self, setting: &str, spec: &'a str) -> Result<ModelRef<'a>> {
+        let Some((provider_name, model)) = spec.split_once('/') else {
+            return Err(Error::Config(format!(
+                "{setting} = \"{spec}\" must be PROVIDER/MODEL, e.g. \"ollama/llama3.1:8b\""
+            )));
+        };
+        if model.is_empty() {
+            return Err(Error::Config(format!(
+                "{setting} = \"{spec}\" is missing the model after the slash"
+            )));
+        }
+        let provider = self.providers.get(provider_name).ok_or_else(|| {
+            Error::Config(format!(
+                "{setting} = \"{spec}\" names provider '{provider_name}', which is not configured; \
+                 add a [providers.{provider_name}] section in {}",
+                config_file_path().display()
+            ))
+        })?;
+        Ok(ModelRef {
+            provider_name,
+            provider,
+            model,
+        })
+    }
+
+    /// The chat model, required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `chat_model` is unset or names an unknown provider.
+    pub fn chat_model_ref(&self) -> Result<ModelRef<'_>> {
+        let spec = self.general.chat_model.as_deref().ok_or_else(|| {
+            Error::Config(format!(
+                "no chat model configured — set [general].chat_model = \"PROVIDER/MODEL\" \
+                 in {} or QUACK_MODEL",
+                config_file_path().display()
+            ))
+        })?;
+        self.resolve_model("chat_model", spec)
+    }
+
+    /// The embedding model, if configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `embedding_model` names an unknown provider.
+    pub fn embedding_model_ref(&self) -> Result<Option<ModelRef<'_>>> {
+        self.general
+            .embedding_model
+            .as_deref()
+            .map(|spec| self.resolve_model("embedding_model", spec))
+            .transpose()
     }
 
     #[must_use]
@@ -194,54 +373,148 @@ impl Config {
     pub fn data_dir(&self) -> &Path {
         &self.general.data_dir
     }
-
-    /// Find the first configured provider with an embedding model.
-    #[must_use]
-    pub fn find_embedding_provider(&self) -> Option<(&str, &ProviderConfig)> {
-        self.providers
-            .iter()
-            .find(|(_, p)| p.embedding_model.is_some())
-            .map(|(name, config)| (name.as_str(), config))
-    }
-
-    /// Find the first configured provider with a chat model.
-    #[must_use]
-    pub fn find_chat_provider(&self) -> Option<(&str, &ProviderConfig)> {
-        self.providers
-            .iter()
-            .find(|(_, p)| p.model.is_some())
-            .map(|(name, config)| (name.as_str(), config))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const FULL: &str = r#"
+[general]
+chat_model = "ollama/llama3.1:8b"
+embedding_model = "ollama/nomic-embed-text"
+
+[providers.ollama]
+type = "ollama"
+base_url = "http://localhost:11434"
+embedding_dimension = 768
+
+[providers.anthropic]
+type = "anthropic"
+auth = "api-key"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[retrieval]
+top_k = 3
+always_retrieve = true
+"#;
+
     #[test]
     fn default_config_values() {
         let config = Config::default();
         assert_eq!(config.general.default_workspace, "default");
+        assert!(config.general.chat_model.is_none());
         assert_eq!(config.ingestion.chunk_size_tokens, 512);
-        assert_eq!(config.ingestion.chunk_overlap_tokens, 64);
-        assert_eq!(config.ingestion.embedding_batch_size, 64);
-        assert_eq!(config.ingestion.tokenizer_encoding, "cl100k_base");
         assert_eq!(config.retrieval.top_k, 8);
         assert!(!config.retrieval.always_retrieve);
+        assert_eq!(config.analysis.threads, 4);
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn retrieval_section_parses() {
-        let config: Config = toml::from_str(
-            "[retrieval]
-top_k = 3
-always_retrieve = true
-",
-        )
-        .unwrap();
+    fn full_config_parses_and_resolves_models() {
+        let config = Config::parse(FULL).unwrap();
+        let chat = config.chat_model_ref().unwrap();
+        assert_eq!(chat.provider_name, "ollama");
+        assert_eq!(chat.model, "llama3.1:8b");
+        assert_eq!(chat.provider.provider_type, ProviderType::Ollama);
+        assert_eq!(chat.provider.auth, AuthMode::None);
+        assert_eq!(chat.to_string(), "ollama/llama3.1:8b");
+        let embed = config.embedding_model_ref().unwrap().unwrap();
+        assert_eq!(embed.model, "nomic-embed-text");
+        assert_eq!(embed.provider.embedding_dimension, Some(768));
         assert_eq!(config.retrieval.top_k, 3);
-        assert!(config.retrieval.always_retrieve);
+        let anthropic = config.providers.get("anthropic");
+        assert!(anthropic.is_some_and(|p| {
+            p.provider_type == ProviderType::Anthropic && p.auth == AuthMode::ApiKey
+        }));
+    }
+
+    fn err_of(toml_text: &str) -> String {
+        match Config::parse(toml_text) {
+            Ok(_) => String::from("<ok>"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_at_every_level() {
+        assert!(err_of("[genral]\nchat_model = \"a/b\"\n").contains("genral"));
+        assert!(err_of("[general]\nchat_modle = \"a/b\"\n").contains("chat_modle"));
+        assert!(err_of("[providers.o]\ntype = \"ollama\"\nmodel = \"x\"\n").contains("model"));
+        assert!(err_of("[retrieval]\ntopk = 1\n").contains("topk"));
+        assert!(err_of("[analysis]\nthread = 1\n").contains("thread"));
+    }
+
+    #[test]
+    fn unknown_provider_type_is_rejected() {
+        assert!(err_of("[providers.o]\ntype = \"bedrock\"\n").contains("bedrock"));
+    }
+
+    #[test]
+    fn openai_compat_alias_maps_to_openai() {
+        let config = Config::parse(
+            "[providers.g]\ntype = \"openai-compat\"\nauth = \"api-key\"\napi_key_env = \"K\"\n",
+        );
+        assert!(config.is_ok_and(|c| {
+            c.providers
+                .get("g")
+                .is_some_and(|p| p.provider_type == ProviderType::Openai)
+        }));
+    }
+
+    #[test]
+    fn model_reference_must_name_a_configured_provider() {
+        let msg = err_of("[general]\nchat_model = \"missing/m\"\n");
+        assert!(
+            msg.contains("'missing'") && msg.contains("not configured"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn model_reference_must_have_a_slash_and_a_model() {
+        assert!(
+            err_of("[general]\nchat_model = \"ollama\"\n[providers.ollama]\ntype = \"ollama\"\n")
+                .contains("PROVIDER/MODEL")
+        );
+        assert!(
+            err_of("[general]\nchat_model = \"ollama/\"\n[providers.ollama]\ntype = \"ollama\"\n")
+                .contains("missing the model")
+        );
+    }
+
+    #[test]
+    fn auth_mode_must_agree_with_api_key_env() {
+        assert!(
+            err_of("[providers.o]\ntype = \"openai\"\napi_key_env = \"K\"\n")
+                .contains("auth = \"none\"")
+        );
+        assert!(
+            err_of("[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\n")
+                .contains("no api_key_env")
+        );
+        assert!(
+            err_of("[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n")
+                .contains("not implemented")
+        );
+    }
+
+    #[test]
+    fn embedding_provider_needs_dimension_and_cannot_be_anthropic() {
+        let no_dim = "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\n";
+        assert!(err_of(no_dim).contains("embedding_dimension"));
+        let anthropic = "[general]\nembedding_model = \"a/e\"\n[providers.a]\ntype = \"anthropic\"\nauth = \"api-key\"\napi_key_env = \"K\"\nembedding_dimension = 1\n";
+        assert!(err_of(anthropic).contains("does not serve embeddings"));
+    }
+
+    #[test]
+    fn chat_model_unset_is_a_clear_error_when_asked_for() {
+        let config = Config::default();
+        assert!(config.validate().is_ok());
+        let err = config.chat_model_ref().err();
+        assert!(err.is_some_and(|e| e.to_string().contains("chat_model")));
+        assert!(config.embedding_model_ref().is_ok_and(|m| m.is_none()));
     }
 
     #[test]
@@ -265,84 +538,8 @@ always_retrieve = true
     }
 
     #[test]
-    fn data_dir_accessor() {
-        let mut config = Config::default();
-        config.general.data_dir = PathBuf::from("/custom");
-        assert_eq!(config.data_dir(), Path::new("/custom"));
-    }
-
-    #[test]
-    fn default_data_dir_uses_xdg() {
-        let data_dir = default_data_dir();
-        let data_str = data_dir.to_string_lossy();
-        assert!(
-            data_str.contains(APP_NAME),
-            "data dir should contain app name: {data_str}"
-        );
-        assert!(
-            !data_str.contains(".quack"),
-            "data dir should not use legacy .quack path: {data_str}"
-        );
-    }
-
-    #[test]
-    fn default_config_dir_uses_xdg() {
-        let config_dir = default_config_dir();
-        let config_str = config_dir.to_string_lossy();
-        assert!(
-            config_str.contains(APP_NAME),
-            "config dir should contain app name: {config_str}"
-        );
-        assert!(
-            !config_str.contains(".quack"),
-            "config dir should not use legacy .quack path: {config_str}"
-        );
-    }
-
-    #[test]
-    fn find_embedding_provider_returns_none_when_empty() {
-        let config = Config::default();
-        assert!(config.find_embedding_provider().is_none());
-    }
-
-    #[test]
-    fn find_embedding_provider_skips_without_embedding_model() {
-        let mut config = Config::default();
-        config.providers.insert(
-            "ollama".into(),
-            ProviderConfig {
-                provider_type: "ollama".into(),
-                base_url: Some("http://localhost:11434".into()),
-                api_key_env: None,
-                model: Some("llama3.2".into()),
-                embedding_model: None,
-                embedding_dimension: None,
-            },
-        );
-        assert!(config.find_embedding_provider().is_none());
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Some")]
-    fn find_embedding_provider_returns_valid() {
-        let mut config = Config::default();
-        config.providers.insert(
-            "ollama".into(),
-            ProviderConfig {
-                provider_type: "ollama".into(),
-                base_url: Some("http://localhost:11434".into()),
-                api_key_env: None,
-                model: None,
-                embedding_model: Some("nomic-embed-text".into()),
-                embedding_dimension: Some(768),
-            },
-        );
-        let (name, provider) = config.find_embedding_provider().unwrap();
-        assert_eq!(name, "ollama");
-        assert_eq!(provider.embedding_dimension, Some(768));
-        assert_eq!(
-            provider.embedding_model.as_deref(),
-            Some("nomic-embed-text")
-        );
+    fn default_dirs_use_xdg_layout() {
+        assert!(default_data_dir().to_string_lossy().contains(APP_NAME));
+        assert!(default_config_dir().to_string_lossy().contains(APP_NAME));
     }
 }

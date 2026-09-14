@@ -97,9 +97,9 @@ impl WorkspaceDb {
         let files_dir = config.workspace_files_dir(workspace_id);
         std::fs::create_dir_all(&files_dir)?;
 
-        let provider = config.find_embedding_provider().map(|(_, p)| p);
-        let configured_dimension = provider.and_then(|p| p.embedding_dimension);
-        let configured_model = provider.and_then(|p| p.embedding_model.as_deref());
+        let embedding = config.embedding_model_ref()?;
+        let configured_dimension = embedding.and_then(|m| m.provider.embedding_dimension);
+        let configured_model = embedding.map(|m| m.model);
 
         let conn = duckdb::Connection::open(&db_path)?;
 

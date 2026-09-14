@@ -31,9 +31,21 @@ cargo run --bin quack -- chat "total sales by region" -w myworkspace
 cargo run --bin quack -- -w myworkspace          # interactive terminal session
 ```
 
-`chat` and the terminal session need a provider with a chat model and one with an embedding model in
-`~/.config/quack/config.toml`; see the configuration section of the design doc. Set
-`QUACK_DATA_DIR` to keep test data out of `~/.local/share/quack`.
+`chat` and the terminal session need `[general].chat_model` and `[general].embedding_model`
+set to `PROVIDER/MODEL` references in `~/.config/quack/config.toml`, with a matching
+`[providers.<name>]` section for each (see the configuration section of the design doc).
+Unknown keys are rejected. `QUACK_MODEL` overrides the chat model; `QUACK_DATA_DIR` keeps
+test data out of `~/.local/share/quack`. A minimal offline config:
+
+```toml
+[general]
+chat_model = "ollama/llama3.1:8b"
+embedding_model = "ollama/nomic-embed-text"
+
+[providers.ollama]
+type = "ollama"
+embedding_dimension = 768
+```
 
 ## What's in the box
 

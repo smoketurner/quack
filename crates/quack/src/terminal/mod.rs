@@ -21,17 +21,16 @@ pub(crate) fn run(
     workspace_id: String,
     allow_write: bool,
 ) -> Result<()> {
-    if config.find_chat_provider().is_none() {
+    config
+        .chat_model_ref()
+        .context("the terminal session needs a chat model")?;
+    if config
+        .embedding_model_ref()
+        .context("invalid embedding model")?
+        .is_none()
+    {
         anyhow::bail!(
-            "no LLM provider configured — add a [providers.<name>] section \
-             with 'model' set in {}",
-            quack_core::config::config_file_path().display()
-        );
-    }
-    if config.find_embedding_provider().is_none() {
-        anyhow::bail!(
-            "no embedding provider configured — add a [providers.<name>] section \
-             with 'embedding_model' set in {}",
+            "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
             quack_core::config::config_file_path().display()
         );
     }
