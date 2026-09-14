@@ -186,6 +186,11 @@ enum Commands {
         #[arg(long, value_name = "DOCUMENT_ID")]
         unpin: Option<String>,
 
+        /// Delete a document by id (prefixes accepted), with its chunks and
+        /// the table it was loaded as
+        #[arg(long, value_name = "DOCUMENT_ID")]
+        delete: Option<String>,
+
         /// Emit one JSON object per document
         #[arg(long)]
         json: bool,
@@ -391,12 +396,23 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_admin(&config, cli.workspace.as_deref(), command).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Docs { pin, unpin, json } => {
+        Commands::Docs {
+            pin,
+            unpin,
+            delete,
+            json,
+        } => {
             init_logging();
             let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
             let ws_db = WorkspaceDb::open(&config, &workspace.id)
                 .context("failed to open workspace database")?;
-            run_docs(&ws_db, pin.as_deref(), unpin.as_deref(), json)?;
+            run_docs(
+                &ws_db,
+                pin.as_deref(),
+                unpin.as_deref(),
+                delete.as_deref(),
+                json,
+            )?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -785,8 +801,14 @@ fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
     Ok(())
 }
 
-/// `quack docs [--pin ID] [--unpin ID]`: change pins, then list.
-fn run_docs(db: &WorkspaceDb, pin: Option<&str>, unpin: Option<&str>, json: bool) -> Result<()> {
+/// `quack docs [--pin ID] [--unpin ID] [--delete ID]`: apply changes, then list.
+fn run_docs(
+    db: &WorkspaceDb,
+    pin: Option<&str>,
+    unpin: Option<&str>,
+    delete: Option<&str>,
+    json: bool,
+) -> Result<()> {
     if let Some(prefix) = pin {
         let id = find_document(db, prefix)?;
         db.set_document_pinned(&id, true)?;
@@ -794,6 +816,17 @@ fn run_docs(db: &WorkspaceDb, pin: Option<&str>, unpin: Option<&str>, json: bool
     if let Some(prefix) = unpin {
         let id = find_document(db, prefix)?;
         db.set_document_pinned(&id, false)?;
+    }
+    if let Some(prefix) = delete {
+        let id = find_document(db, prefix)?;
+        let filename = db
+            .document(&id)?
+            .map(|d| d.filename)
+            .context("document vanished")?;
+        let table = ingestion::parser::detect_file_type(&filename)
+            .is_structured()
+            .then(|| ingestion::table_name_for(&filename));
+        db.delete_document(&id, table.as_deref())?;
     }
     list_documents(db, json)
 }

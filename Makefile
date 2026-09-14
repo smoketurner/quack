@@ -10,10 +10,13 @@ BIN ?= quack
 # Address for `make run-server`.
 BIND ?= 127.0.0.1:8080
 
+# Workspace `make demo-data` fills.
+WORKSPACE ?= demo
+
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack
 
-.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny hooks css-dev css-build run run-server help
+.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny hooks css-dev css-build run run-server demo-data help
 
 all: build
 
@@ -70,6 +73,10 @@ run: build ## Build and run a binary: make run [BIN=quack] [ARGS="..."]
 
 run-server: ## Serve the web UI and API locally without login: make run-server [BIND=127.0.0.1:8080]
 	$(CARGO) run --bin quack -- serve --local --bind $(BIND)
+
+demo-data: ## Load public sample tables and a document into a workspace: make demo-data [WORKSPACE=demo]
+	$(CARGO) build --bin quack
+	scripts/demo-data.sh $(WORKSPACE)
 
 ##@ Help
 
