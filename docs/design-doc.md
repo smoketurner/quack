@@ -566,9 +566,10 @@ the `mentions` relation (`entity` to `entity`) so extraction never has to invent
 are `snake_case` and stable; a rename is a new id plus a migration of nodes and edges.
 
 **Interchange format.** `quack ontology export` and `import`, `GET/PUT .../ontology`, and
-the web editor's "download" and "upload" move the ontology as YAML or JSON. This is how a
-domain pack (an insurance ontology, a legal ontology) is shared between workspaces, diffed
-in review, or seeded into a new workspace. The file is never the source of truth.
+the web editor's "download" and "save" move the ontology as JSON (the same shape as the
+stored snapshot). This is how a domain pack (an insurance ontology, a legal ontology) is
+shared between workspaces, diffed in review, or seeded into a new workspace. The file is
+never the source of truth. The example below is that shape written as YAML for brevity.
 
 ```yaml
 version: 3
@@ -1326,7 +1327,10 @@ updated as issues close. Ordered by risk.
    SQL, context editor, settings with members and tokens, admin users and audit). The
    graph and ontology pages arrive with #27 and #28. **No MCP** (#29); **no desktop
    window** (#35). Sections 11, 12.
-4. **No ontology or induction** (#27); **no graph** (#28). Sections 6.3 to 6.5.
+4. **Ontology** (#27): the model, validation, versions with diff and restore, the
+   built-in default, JSON import and export, the CLI, API, and web page are in;
+   induction with the candidate queue is in progress. YAML was dropped: JSON is the only
+   interchange form. **No graph** (#28). Sections 6.3 to 6.5.
 5. **DOCX, HTML, PPTX, XLSX unsupported** (#16; XLSX via a Rust reader). Sections 6.1, 6.2.
 6. **No `ATTACH` to external databases** (#21): needs a Rust-side design now that scanner
    extensions are out. Section 6.2, step 13.

@@ -88,6 +88,61 @@ pub struct QueryResults {
     pub rows: Vec<Vec<serde_json::Value>>,
 }
 
+/// The ontology tables (design doc 5.4), created with the other internal
+/// tables.
+const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontology_versions (
+                version INTEGER PRIMARY KEY,
+                snapshot JSON NOT NULL,
+                author TEXT,
+                note TEXT,
+                created_at TIMESTAMP DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS _quack_ontology_classes (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                label TEXT NOT NULL,
+                description TEXT,
+                key_property TEXT,
+                since_version INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS _quack_ontology_relations (
+                id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                description TEXT,
+                domain_class TEXT NOT NULL,
+                range_class TEXT NOT NULL,
+                since_version INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS _quack_ontology_properties (
+                id TEXT NOT NULL,
+                class_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                type TEXT NOT NULL,
+                enum_values JSON,
+                since_version INTEGER NOT NULL,
+                PRIMARY KEY (id, class_id)
+            );
+            CREATE TABLE IF NOT EXISTS _quack_ontology_mappings (
+                id TEXT PRIMARY KEY,
+                table_name TEXT NOT NULL,
+                class_id TEXT NOT NULL,
+                key_column TEXT NOT NULL,
+                property_map JSON NOT NULL,
+                relation_map JSON NOT NULL,
+                since_version INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS _quack_ontology_candidates (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                proposal JSON NOT NULL,
+                evidence JSON NOT NULL,
+                confidence FLOAT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                proposed_by TEXT NOT NULL,
+                decided_by TEXT,
+                decided_at TIMESTAMP
+            );";
+
 /// Wraps a `DuckDB` connection for a single workspace.
 pub struct WorkspaceDb {
     conn: duckdb::Connection,
@@ -338,6 +393,7 @@ impl WorkspaceDb {
             );"
         );
         self.conn.execute_batch(&sql)?;
+        self.conn.execute_batch(ONTOLOGY_DDL)?;
         let recorded = self
             .meta("schema_version")?
             .and_then(|v| v.parse::<u32>().ok())

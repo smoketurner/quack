@@ -18,6 +18,8 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use quack_core::ontology::store as ontology_store;
+use quack_core::ontology::{Ontology, OntologyDiff};
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditEntry, AuditFilter, AuditRow, Channel, MemberRow, Outcome, ProviderAllowList, Role, Scope,
@@ -250,6 +252,25 @@ struct ContextPage {
     versions: Vec<context::ContextVersion>,
 }
 
+struct ClassRow {
+    depth: usize,
+    id: String,
+    key: Option<String>,
+    properties: String,
+}
+
+#[derive(Template)]
+#[template(path = "ontology.html")]
+struct OntologyPage {
+    page: Page,
+    ontology: Option<Ontology>,
+    classes: Vec<ClassRow>,
+    json: String,
+    versions: Vec<ontology_store::VersionRow>,
+    diff: Option<OntologyDiff>,
+    error: Option<String>,
+}
+
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsPage {
@@ -302,6 +323,9 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
         .route("/w/{id}/sql.csv", get(sql_csv))
         .route("/w/{id}/context", get(context_page).post(context_save))
+        .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
+        .route("/w/{id}/ontology/init", post(ontology_init))
+        .route("/w/{id}/ontology/{v}/restore", post(ontology_restore))
         .route("/w/{id}/settings", get(settings).post(settings_save))
         .route("/w/{id}/members", post(member_add))
         .route("/w/{id}/members/{user}/remove", post(member_remove))
@@ -962,6 +986,169 @@ fn csv_field(value: &str) -> String {
     } else {
         value.to_owned()
     }
+}
+
+fn class_rows(ontology: &Ontology) -> Vec<ClassRow> {
+    fn walk(ontology: &Ontology, parent: &str, depth: usize, out: &mut Vec<ClassRow>) {
+        for class in ontology.classes.iter().filter(|c| c.parent == parent) {
+            out.push(ClassRow {
+                depth,
+                id: class.id.clone(),
+                key: class.key.clone(),
+                properties: ontology
+                    .class_properties(&class.id)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+            walk(ontology, &class.id, depth.saturating_add(1), out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(ontology, quack_core::ontology::ROOT_CLASS, 0, &mut out);
+    out
+}
+
+async fn ontology_page(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+    Query(q): Query<FlashQuery>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    let db = app.workspace_db(&id).await?;
+    let (ontology, versions, diff) = with_db(db, |db| {
+        let current = ontology_store::current(db)?;
+        let versions = ontology_store::versions(db, 20)?;
+        let diff = match &current {
+            Some(c) if c.version > 1 => ontology_store::version(db, c.version.saturating_sub(1))?
+                .map(|older| c.diff(&older)),
+            _ => None,
+        };
+        Ok((current, versions, diff))
+    })
+    .await?;
+    let json = match &ontology {
+        Some(o) => o.to_json()?,
+        None => String::new(),
+    };
+    html(&OntologyPage {
+        page: page(&app, &access.identity, "Ontology", Some(&access)),
+        classes: ontology.as_ref().map(class_rows).unwrap_or_default(),
+        ontology,
+        json,
+        versions,
+        diff,
+        error: q.error,
+    })
+}
+
+#[derive(Deserialize)]
+struct OntologyForm {
+    json: String,
+}
+
+async fn ontology_import(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+    Form(form): Form<OntologyForm>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let ontology = match Ontology::from_json(&form.json) {
+        Ok(o) => o,
+        Err(e) => {
+            let target = format!("/w/{id}/ontology?error={}", urlencoded(&e.to_string()));
+            return Ok(Redirect::to(&target).into_response());
+        }
+    };
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let saved = with_db(db, move |db| {
+        ontology_store::save(db, &ontology, Some(&author), Some("edited in the web UI"))
+    })
+    .await;
+    match saved {
+        Ok(stored) => {
+            access
+                .audit(
+                    &app,
+                    "ontology",
+                    Some(("ontology_version", &stored.version.to_string())),
+                    Outcome::Allowed,
+                    Some(serde_json::json!({ "version": stored.version })),
+                )
+                .await?;
+            Ok(Redirect::to(&format!("/w/{id}/ontology")).into_response())
+        }
+        Err(e) => {
+            let target = format!("/w/{id}/ontology?error={}", urlencoded(&e.message));
+            Ok(Redirect::to(&target).into_response())
+        }
+    }
+}
+
+async fn ontology_init(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let saved = with_db(db, move |db| {
+        if ontology_store::latest_version(db)? > 0 {
+            return Err(quack_core::error::Error::Ontology(String::from(
+                "an ontology already exists",
+            )));
+        }
+        ontology_store::save(
+            db,
+            &Ontology::builtin_default(),
+            Some(&author),
+            Some("built-in default"),
+        )
+    })
+    .await;
+    if let Ok(stored) = &saved {
+        access
+            .audit(
+                &app,
+                "ontology",
+                Some(("ontology_version", &stored.version.to_string())),
+                Outcome::Allowed,
+                None,
+            )
+            .await?;
+    }
+    let target = match saved {
+        Ok(_) => format!("/w/{id}/ontology"),
+        Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
+}
+
+async fn ontology_restore(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, v)): Path<(String, u32)>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let stored = with_db(db, move |db| ontology_store::restore(db, v, Some(&author)))
+        .await
+        .map_err(|e| ApiError::not_found(e.message))?;
+    access
+        .audit(
+            &app,
+            "ontology",
+            Some(("ontology_version", &stored.version.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "restored": v })),
+        )
+        .await?;
+    Ok(Redirect::to(&format!("/w/{id}/ontology")).into_response())
 }
 
 async fn context_page(

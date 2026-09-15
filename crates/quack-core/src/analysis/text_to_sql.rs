@@ -112,6 +112,11 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 
     append_pinned_documents(&mut prompt, db, options.pinned_token_budget)?;
 
+    if let Some(ontology) = crate::ontology::store::current(db)? {
+        prompt.push_str(&ontology.render_for_prompt());
+        writeln!(prompt)?;
+    }
+
     if tables.is_empty() && docs.is_empty() {
         writeln!(
             prompt,

@@ -1055,6 +1055,144 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ontology_is_versioned_over_the_api_and_the_web_page() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let viewer = h.user("viewer", false).await;
+    let ws = h.workspace("o", &owner).await;
+    h.app
+        .control
+        .set_member(&ws, &viewer, Role::Viewer)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let owner_token = h.login("owner").await;
+    let viewer_token = h.login("viewer").await;
+    let base = format!("/api/v1/workspaces/{ws}/ontology");
+
+    let (status, _) = h.get(&base, &viewer_token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h
+        .post(
+            &format!("{base}/init"),
+            &viewer_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = h
+        .post(&format!("{base}/init"), &owner_token, serde_json::json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 1);
+    assert_eq!(body["classes"].as_array().map(Vec::len), Some(7));
+    let (status, _) = h
+        .post(&format!("{base}/init"), &owner_token, serde_json::json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let mut edited = body.clone();
+    if let Some(classes) = edited["classes"].as_array_mut() {
+        classes.push(serde_json::json!({ "id": "vendor", "parent": "organization" }));
+    }
+    let (status, body) = h
+        .call(Method::PUT, &base, Some(&owner_token), Some(edited.clone()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 2);
+    let mut broken = edited.clone();
+    if let Some(classes) = broken["classes"].as_array_mut() {
+        classes.push(serde_json::json!({ "id": "Bad Id" }));
+    }
+    let (status, body) = h
+        .call(Method::PUT, &base, Some(&owner_token), Some(broken))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("snake_case")
+    );
+    let (status, _) = h
+        .call(Method::PUT, &base, Some(&viewer_token), Some(edited))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = h.get(&format!("{base}/versions"), &viewer_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["versions"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["versions"][0]["author"], "owner");
+    let (status, body) = h.get(&format!("{base}/versions/2"), &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["diff"]["classes"]["added"],
+        serde_json::json!(["vendor"])
+    );
+    let (status, _) = h.get(&format!("{base}/versions/9"), &viewer_token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = h
+        .post(
+            &format!("{base}/versions/1/restore"),
+            &owner_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 3);
+    assert!(
+        body["classes"]
+            .as_array()
+            .is_some_and(|c| !c.iter().any(|x| x["id"] == "vendor"))
+    );
+    let writes = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(writes.len(), 3);
+
+    // The web page renders the tree and the version list.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    let (status, html, _) = h.page(&format!("/w/{ws}/ontology"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("works_at: person → organization") && html.contains("v3"),
+        "{html}"
+    );
+    assert!(html.contains("restored version 1"), "{html}");
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology"),
+            Some(&cookie),
+            "json=%7B%22classes%22%3A%5B%7B%22id%22%3A%22Bad%22%7D%5D%7D",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        location(&headers).contains("error="),
+        "{}",
+        location(&headers)
+    );
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/ontology/2/restore"), Some(&cookie), "")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/ontology"));
+    let (status, html, _) = h.page(&format!("/w/{ws}/ontology"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("vendor") && html.contains("v4"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_endpoints_manage_users_and_read_the_audit() {
     let h = harness(false).await;
     h.user("root", true).await;

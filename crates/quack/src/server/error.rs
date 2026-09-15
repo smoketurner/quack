@@ -59,7 +59,9 @@ impl From<CoreError> for ApiError {
         let status = match &err {
             CoreError::AuthRequired { .. } => StatusCode::SERVICE_UNAVAILABLE,
             CoreError::WorkspaceNotFound(_) => StatusCode::NOT_FOUND,
-            CoreError::Config(_) | CoreError::UnsupportedFileType(_) => StatusCode::BAD_REQUEST,
+            CoreError::Config(_) | CoreError::UnsupportedFileType(_) | CoreError::Ontology(_) => {
+                StatusCode::BAD_REQUEST
+            }
             CoreError::Analysis(_) => StatusCode::UNPROCESSABLE_ENTITY,
             CoreError::Sqlite(_)
             | CoreError::DuckDb(_)

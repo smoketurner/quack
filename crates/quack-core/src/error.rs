@@ -30,6 +30,9 @@ pub enum Error {
     #[error("ingestion error: {0}")]
     Ingestion(String),
 
+    #[error("ontology error: {0}")]
+    Ontology(String),
+
     #[error("unsupported file type: {0}")]
     UnsupportedFileType(String),
 

@@ -7,6 +7,7 @@ mod auth;
 mod context;
 pub(crate) mod documents;
 mod members;
+mod ontology;
 pub(crate) mod query;
 pub(crate) mod sessions;
 mod tables;
@@ -52,6 +53,23 @@ pub(crate) fn router() -> Router<App> {
             get(context::show).put(context::replace),
         )
         .route("/workspaces/{id}/context/versions", get(context::versions))
+        .route(
+            "/workspaces/{id}/ontology",
+            get(ontology::show).put(ontology::replace),
+        )
+        .route("/workspaces/{id}/ontology/init", post(ontology::init))
+        .route(
+            "/workspaces/{id}/ontology/versions",
+            get(ontology::versions),
+        )
+        .route(
+            "/workspaces/{id}/ontology/versions/{v}",
+            get(ontology::version),
+        )
+        .route(
+            "/workspaces/{id}/ontology/versions/{v}/restore",
+            post(ontology::restore),
+        )
         .route("/workspaces/{id}/sessions", get(sessions::list))
         .route(
             "/workspaces/{id}/sessions/{sid}",

@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
+mod ontology_cli;
 mod print;
 mod server;
 mod terminal;
@@ -176,6 +177,12 @@ enum Commands {
         local: bool,
     },
 
+    /// Show, install, import, export, diff, or restore the ontology
+    Ontology {
+        #[command(subcommand)]
+        action: ontology_cli::OntologyAction,
+    },
+
     /// List ingested documents, or pin and unpin one
     Docs {
         /// Pin a document by id (prefixes accepted)
@@ -323,10 +330,7 @@ async fn main() -> Result<ExitCode> {
 async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
     match command {
         Commands::Sessions { json, limit } => {
-            init_logging();
-            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
-            let ws_db = WorkspaceDb::open(&config, &workspace.id)
-                .context("failed to open workspace database")?;
+            let ws_db = open_workspace(cli).await?;
             list_sessions(&ws_db, json, limit)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -335,10 +339,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             sql,
             markdown: _,
         } => {
-            init_logging();
-            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
-            let ws_db = WorkspaceDb::open(&config, &workspace.id)
-                .context("failed to open workspace database")?;
+            let ws_db = open_workspace(cli).await?;
             export_session(&ws_db, &session_id, sql)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -366,11 +367,13 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             outcome?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Ontology { action } => {
+            let ws_db = open_workspace(cli).await?;
+            ontology_cli::run(&ws_db, action)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Context { action } => {
-            init_logging();
-            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
-            let ws_db = WorkspaceDb::open(&config, &workspace.id)
-                .context("failed to open workspace database")?;
+            let ws_db = open_workspace(cli).await?;
             run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
             Ok(ExitCode::SUCCESS)
         }
@@ -402,10 +405,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             delete,
             json,
         } => {
-            init_logging();
-            let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
-            let ws_db = WorkspaceDb::open(&config, &workspace.id)
-                .context("failed to open workspace database")?;
+            let ws_db = open_workspace(cli).await?;
             run_docs(
                 &ws_db,
                 pin.as_deref(),
@@ -469,6 +469,13 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     })
 }
 
+/// Logging, then the workspace database for the workspace-local subcommands.
+async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
+    init_logging();
+    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")
+}
+
 /// `quack user|token|member|audit`: server administration from the shell.
 async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) -> Result<()> {
     match command {
@@ -480,6 +487,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Export { .. }
         | Commands::Ingest { .. }
         | Commands::Context { .. }
+        | Commands::Ontology { .. }
         | Commands::Auth { .. }
         | Commands::Serve { .. }
         | Commands::Docs { .. } => Ok(()),

@@ -81,6 +81,7 @@ cargo run --bin quack -- ingest sales.csv -w ws                                #
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
+cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI and REST API under /api/v1
@@ -106,6 +107,13 @@ clients themselves. OAuth providers (`quack_core::llm::oauth`) hand out a bearer
 one shared `TokenManager` per provider: PKCE or device-code login via `quack auth`, an
 AES-256-GCM cache under `<data_dir>/tokens/` keyed from the OS keychain or a 0600 key file,
 silent refresh, and `Error::AuthRequired` (exit 4 in `-p` and `ingest`) when no flow can run.
+The ontology (`quack_core::ontology`, design doc 6.3) is classes with single inheritance
+from `entity`, relations with a domain and a range, typed properties, and table mappings.
+It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, checks
+mapped tables and columns against the workspace, and writes a new version with a JSON
+snapshot, `since_version` carried over for items that already existed. JSON is the only
+interchange form (export, import, `PUT /ontology`); a file is never the source of truth.
+The system prompt carries a compact rendering when an ontology exists.
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
 `Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<h1 class="text-xl font-semibold">Ontology</h1>
+<p class="mt-1 text-sm text-slate-600">The schema of the knowledge graph: classes with single inheritance from <code>entity</code>, relations with a domain and a range, typed properties, and table mappings. Every accepted change is a new version.</p>
+{% if let Some(error) = error %}<p class="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{{ error }}</p>{% endif %}
+{% if let Some(o) = ontology %}
+<div class="mt-4 grid gap-6 md:grid-cols-2">
+  <section>
+    <h2 class="text-sm font-semibold uppercase text-slate-500">Classes (version {{ o.version }})</h2>
+    <ul class="mt-2 space-y-1 text-sm">
+      {% for c in classes %}<li style="padding-left: {{ c.depth * 16 }}px"><span class="font-mono">{{ c.id }}</span>{% if let Some(k) = c.key %} <span class="text-slate-500">key {{ k }}</span>{% endif %}{% if !c.properties.is_empty() %} <span class="text-slate-500">{ {{ c.properties }} }</span>{% endif %}</li>{% endfor %}
+    </ul>
+    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Relations</h2>
+    <ul class="mt-2 space-y-1 font-mono text-sm">
+      {% for r in o.relations %}<li>{{ r.id }}: {{ r.domain }} → {{ r.range }}</li>{% endfor %}
+      <li class="text-slate-500">mentions: entity → entity (implicit)</li>
+    </ul>
+    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Properties</h2>
+    <ul class="mt-2 space-y-1 font-mono text-sm">
+      {% for p in o.properties %}<li>{{ p.id }}: {{ p.kind.as_str() }}{% if !p.values.is_empty() %} [{{ p.values.join(", ") }}]{% endif %}</li>{% endfor %}
+    </ul>
+    {% if !o.mappings.is_empty() %}
+    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Mapped tables</h2>
+    <ul class="mt-2 space-y-1 font-mono text-sm">
+      {% for m in o.mappings %}<li>{{ m.table }} → {{ m.class }} (key {{ m.key }})</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  <section>
+    <h2 class="text-sm font-semibold uppercase text-slate-500">Edit as JSON</h2>
+    <form method="post" action="/w/{{ ws.id }}/ontology" class="mt-2">
+      <textarea name="json" rows="24" class="w-full rounded border border-slate-300 px-3 py-2 font-mono text-xs" {% if !ws.can_write %}readonly{% endif %}>{{ json }}</textarea>
+      <div class="mt-2 flex items-center gap-3 text-sm">
+        {% if ws.can_write %}<button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Save as new version</button>{% endif %}
+        <a class="text-blue-700 hover:underline" href="/api/v1/workspaces/{{ ws.id }}/ontology" download="ontology.json">Download JSON</a>
+      </div>
+    </form>
+    {% if let Some(d) = diff %}
+    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Changes from version {{ d.from }}</h2>
+    <pre class="mt-2 rounded border border-slate-200 bg-white p-3 font-mono text-xs">{{ d }}</pre>
+    {% endif %}
+    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Versions</h2>
+    <table class="mt-2 w-full text-sm"><tbody>
+      {% for v in versions %}<tr class="border-b border-slate-200"><td class="py-1 font-mono">v{{ v.version }}</td><td class="text-slate-500">{{ v.created_at }}</td><td>{{ v.author.as_deref().unwrap_or("-") }}</td><td>{{ v.note.as_deref().unwrap_or("") }}</td><td class="text-right">{% if ws.can_write && v.version != o.version %}<form method="post" action="/w/{{ ws.id }}/ontology/{{ v.version }}/restore"><button class="text-blue-700 hover:underline">Restore</button></form>{% endif %}</td></tr>{% endfor %}
+    </tbody></table>
+  </section>
+</div>
+{% else %}
+<div class="mt-4 rounded border border-slate-200 bg-white p-4">
+  <p class="text-slate-700">No ontology yet.</p>
+  {% if ws.can_write %}
+  <form method="post" action="/w/{{ ws.id }}/ontology/init" class="mt-3"><button type="submit" class="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-700">Install the built-in ontology</button></form>
+  <p class="mt-3 text-sm text-slate-600">Or paste one as JSON:</p>
+  <form method="post" action="/w/{{ ws.id }}/ontology" class="mt-2">
+    <textarea name="json" rows="12" class="w-full rounded border border-slate-300 px-3 py-2 font-mono text-xs" placeholder='{"classes": [...], "relations": [...], "properties": [...], "mappings": [...]}'></textarea>
+    <button type="submit" class="mt-2 rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-700">Save as version 1</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+{% endif %}
+{% endblock %}
