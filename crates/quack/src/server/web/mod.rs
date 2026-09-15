@@ -18,8 +18,9 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::ontology::store as ontology_store;
-use quack_core::ontology::{Ontology, OntologyDiff};
+use quack_core::ontology::{Ontology, OntologyDiff, candidates};
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditEntry, AuditFilter, AuditRow, Channel, MemberRow, Outcome, ProviderAllowList, Role, Scope,
@@ -259,6 +260,15 @@ struct ClassRow {
     properties: String,
 }
 
+struct CandidateView {
+    id: String,
+    kind: String,
+    proposal_id: String,
+    confidence: String,
+    evidence: String,
+    detail: String,
+}
+
 #[derive(Template)]
 #[template(path = "ontology.html")]
 struct OntologyPage {
@@ -268,6 +278,8 @@ struct OntologyPage {
     json: String,
     versions: Vec<ontology_store::VersionRow>,
     diff: Option<OntologyDiff>,
+    queue: Vec<CandidateView>,
+    has_tables: bool,
     error: Option<String>,
 }
 
@@ -325,6 +337,8 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/context", get(context_page).post(context_save))
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
+        .route("/w/{id}/ontology/propose", post(ontology_propose))
+        .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
         .route("/w/{id}/ontology/{v}/restore", post(ontology_restore))
         .route("/w/{id}/settings", get(settings).post(settings_save))
         .route("/w/{id}/members", post(member_add))
@@ -1017,7 +1031,7 @@ async fn ontology_page(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     let db = app.workspace_db(&id).await?;
-    let (ontology, versions, diff) = with_db(db, |db| {
+    let (ontology, versions, diff, queue, has_tables) = with_db(db, |db| {
         let current = ontology_store::current(db)?;
         let versions = ontology_store::versions(db, 20)?;
         let diff = match &current {
@@ -1025,9 +1039,12 @@ async fn ontology_page(
                 .map(|older| c.diff(&older)),
             _ => None,
         };
-        Ok((current, versions, diff))
+        let queue = candidates::pending(db)?;
+        let has_tables = !db.list_tables()?.is_empty();
+        Ok((current, versions, diff, queue, has_tables))
     })
     .await?;
+    let queue = queue.into_iter().map(candidate_view).collect();
     let json = match &ontology {
         Some(o) => o.to_json()?,
         None => String::new(),
@@ -1039,8 +1056,200 @@ async fn ontology_page(
         json,
         versions,
         diff,
+        queue,
+        has_tables,
         error: q.error,
     })
+}
+
+fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
+    use quack_core::ontology::induction::Proposal;
+    let e = &c.evidence;
+    let get = |k: &str| {
+        e.get(k)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default()
+    };
+    let (evidence, detail) = match c.kind.as_str() {
+        "class" => (
+            format!(
+                "table {} · {} rows · key {}",
+                get("table"),
+                get("rows"),
+                get("key_column")
+            ),
+            String::new(),
+        ),
+        "property" => (
+            format!(
+                "{}.{} · {} · {} distinct of {} · e.g. {}",
+                get("table"),
+                get("column"),
+                get("duckdb_type"),
+                get("distinct"),
+                get("rows"),
+                get("samples")
+            ),
+            match &c.proposal {
+                Proposal::Property { class, property } => {
+                    let values = if property.values.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", property.values.join(", "))
+                    };
+                    format!("{}: {}{values}", class, property.kind.as_str())
+                }
+                _ => String::new(),
+            },
+        ),
+        "relation" => (
+            format!(
+                "{}.{} matches {}.{} for {} of values",
+                get("table"),
+                get("column"),
+                get("target_table"),
+                get("target_key"),
+                get("overlap")
+            ),
+            match &c.proposal {
+                Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
+                _ => String::new(),
+            },
+        ),
+        _ => (
+            format!("table {}", get("table")),
+            match &c.proposal {
+                Proposal::Mapping(m) => format!(
+                    "{} → {} (key {}, {} relations)",
+                    m.table,
+                    m.class,
+                    m.key,
+                    m.relations.len()
+                ),
+                _ => String::new(),
+            },
+        ),
+    };
+    CandidateView {
+        id: c.id,
+        kind: c.kind,
+        proposal_id: c.proposal.id().to_owned(),
+        confidence: format!("{:.2}", c.confidence),
+        evidence,
+        detail,
+    }
+}
+
+#[derive(Deserialize)]
+struct ProposeForm {
+    #[serde(default)]
+    extend: bool,
+    #[serde(default)]
+    auto_accept: bool,
+}
+
+async fn ontology_propose(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+    Form(form): Form<ProposeForm>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let options = app.config.ontology.table_evidence();
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let outcome = with_db(db, move |db| {
+        let current = ontology_store::current(db)?;
+        let base = if form.extend { current.as_ref() } else { None };
+        let proposals = propose_from_tables(db, base.or(current.as_ref()), &options)?;
+        if proposals.is_empty() {
+            return Ok((0, None));
+        }
+        let run = candidates::store_run(db, &proposals)?;
+        if form.auto_accept {
+            candidates::accept_all(db, Some(&author))?;
+        }
+        Ok((proposals.len(), Some(run)))
+    })
+    .await;
+    let target = match outcome {
+        Ok((0, _)) => {
+            format!("/w/{id}/ontology?error=nothing+to+propose%3A+the+tables+are+already+covered")
+        }
+        Ok((count, run)) => {
+            access
+                .audit(
+                    &app,
+                    "propose",
+                    run.as_deref().map(|r| ("induction_run", r)),
+                    Outcome::Allowed,
+                    Some(serde_json::json!({ "candidates": count })),
+                )
+                .await?;
+            format!("/w/{id}/ontology")
+        }
+        Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
+}
+
+#[derive(Deserialize)]
+struct DecideForm {
+    action: String,
+    #[serde(default)]
+    target: String,
+}
+
+async fn ontology_decide(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, cid)): Path<(String, String)>,
+    Form(form): Form<DecideForm>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let target = form.target.trim().to_owned();
+    let decision = match form.action.as_str() {
+        "accept" => Some(Decision::Accept),
+        "rename" if !target.is_empty() => Some(Decision::Rename(target)),
+        "merge_into" if !target.is_empty() => Some(Decision::MergeInto(target)),
+        "reparent" if !target.is_empty() => Some(Decision::Reparent(target)),
+        "reject" => None,
+        _ => {
+            let target = format!("/w/{id}/ontology?error=that+action+needs+a+target");
+            return Ok(Redirect::to(&target).into_response());
+        }
+    };
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let candidate_id = cid.clone();
+    let outcome = with_db(db, move |db| {
+        if let Some(decision) = decision {
+            let stored = candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
+            return Ok(Some(stored.version));
+        }
+        candidates::reject(db, &[candidate_id], Some(&author))?;
+        Ok(None)
+    })
+    .await;
+    let target = match outcome {
+        Ok(version) => {
+            access
+                .audit(
+                    &app,
+                    "ontology",
+                    Some(("candidate", &cid)),
+                    Outcome::Allowed,
+                    Some(serde_json::json!({ "action": form.action, "version": version })),
+                )
+                .await?;
+            format!("/w/{id}/ontology")
+        }
+        Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
 }
 
 #[derive(Deserialize)]

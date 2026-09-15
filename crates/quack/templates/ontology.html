@@ -4,6 +4,48 @@
 <h1 class="text-xl font-semibold">Ontology</h1>
 <p class="mt-1 text-sm text-slate-600">The schema of the knowledge graph: classes with single inheritance from <code>entity</code>, relations with a domain and a range, typed properties, and table mappings. Every accepted change is a new version.</p>
 {% if let Some(error) = error %}<p class="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{{ error }}</p>{% endif %}
+{% if ws.can_write && has_tables %}
+<form method="post" action="/w/{{ ws.id }}/ontology/propose" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-200 bg-white p-3 text-sm">
+  <span class="font-medium">Propose from the tables</span>
+  <span class="text-slate-500">classes, typed properties, keys, relations, and mappings; no model calls</span>
+  {% if ontology.is_some() %}<label class="inline-flex items-center gap-1"><input type="checkbox" name="extend" value="true" checked> only what is missing</label>{% endif %}
+  <label class="inline-flex items-center gap-1"><input type="checkbox" name="auto_accept" value="true"> accept everything at once</label>
+  <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Propose</button>
+</form>
+{% endif %}
+{% if !queue.is_empty() %}
+<section class="mt-4">
+  <h2 class="text-sm font-semibold uppercase text-slate-500">Review queue ({{ queue.len() }} pending)</h2>
+  <table class="mt-2 w-full text-sm">
+    <thead><tr class="border-b border-slate-300 text-left text-xs uppercase text-slate-500"><th class="py-1">Kind</th><th>Proposal</th><th>Evidence</th><th>Conf.</th><th></th></tr></thead>
+    <tbody>
+    {% for c in queue %}
+    <tr class="border-b border-slate-200 align-top">
+      <td class="py-2">{{ c.kind }}</td>
+      <td class="font-mono">{{ c.proposal_id }}{% if !c.detail.is_empty() %}<div class="text-xs text-slate-500">{{ c.detail }}</div>{% endif %}</td>
+      <td class="text-slate-600">{{ c.evidence }}</td>
+      <td>{{ c.confidence }}</td>
+      <td class="text-right whitespace-nowrap">
+        {% if ws.can_write %}
+        <form method="post" action="/w/{{ ws.id }}/ontology/candidates/{{ c.id }}" class="inline-flex items-center gap-1">
+          <select name="action" class="rounded border border-slate-300 px-1 py-0.5 text-xs">
+            <option value="accept">accept</option>
+            <option value="rename">rename to</option>
+            <option value="merge_into">merge into</option>
+            {% if c.kind == "class" %}<option value="reparent">under parent</option>{% endif %}
+            <option value="reject">reject</option>
+          </select>
+          <input name="target" placeholder="id" class="w-28 rounded border border-slate-300 px-1 py-0.5 text-xs">
+          <button type="submit" class="rounded bg-slate-900 px-2 py-0.5 text-xs text-white hover:bg-slate-700">Go</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
 {% if let Some(o) = ontology %}
 <div class="mt-4 grid gap-6 md:grid-cols-2">
   <section>

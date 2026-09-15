@@ -5,7 +5,7 @@ use std::path::Path;
 
 use quack_core::config::{
     AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, IngestionConfig,
-    ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
+    OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
@@ -78,6 +78,7 @@ fn test_config(data_dir: &Path) -> Config {
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
         server: ServerConfig::default(),
+        ontology: OntologyConfig::default(),
     }
 }
 
@@ -95,6 +96,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
         server: ServerConfig::default(),
+        ontology: OntologyConfig::default(),
     }
 }
 

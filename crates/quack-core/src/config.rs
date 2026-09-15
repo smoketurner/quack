@@ -17,6 +17,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub analysis: AnalysisConfig,
     pub server: ServerConfig,
+    pub ontology: OntologyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +155,39 @@ impl Default for IngestionConfig {
             embedding_batch_size: 64,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
+        }
+    }
+}
+
+/// Ontology induction settings (design doc 6.5 and 13).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OntologyConfig {
+    /// Share of a column's distinct values that must appear in another
+    /// table's key column for a relation to be proposed.
+    pub key_overlap_threshold: f64,
+    /// A text column with at most this many distinct values is proposed as
+    /// an enum property.
+    pub enum_max_values: u32,
+}
+
+impl Default for OntologyConfig {
+    fn default() -> Self {
+        Self {
+            key_overlap_threshold: 0.8,
+            enum_max_values: 12,
+        }
+    }
+}
+
+impl OntologyConfig {
+    /// The induction tuning as the core module takes it.
+    #[must_use]
+    pub fn table_evidence(&self) -> crate::ontology::induction::TableEvidenceOptions {
+        crate::ontology::induction::TableEvidenceOptions {
+            key_overlap_threshold: self.key_overlap_threshold,
+            enum_max_values: self.enum_max_values,
+            ..crate::ontology::induction::TableEvidenceOptions::default()
         }
     }
 }
@@ -528,6 +562,9 @@ always_retrieve = true
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(!config.server.local);
         assert_eq!(config.server.workers_per_workspace, 1);
+        assert!((config.ontology.key_overlap_threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(config.ontology.enum_max_values, 12);
+        assert!(err_of("[ontology]\nsample = 1\n").contains("sample"));
     }
 
     #[test]

@@ -1193,6 +1193,192 @@ async fn ontology_is_versioned_over_the_api_and_the_web_page() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
+    let h = harness(true).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "p" })),
+        )
+        .await;
+    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    for sql in [
+        "CREATE TABLE vendors (vendor_id INTEGER, name TEXT)",
+        "INSERT INTO vendors SELECT i, 'V' || i FROM range(30) t(i)",
+        "CREATE TABLE orders (order_id INTEGER, vendor_id INTEGER, mode TEXT)",
+        "INSERT INTO orders SELECT i, i % 30, CASE WHEN i % 2 = 0 THEN 'air' ELSE 'sea' END FROM range(60) t(i)",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let base = format!("/api/v1/workspaces/{ws}/ontology");
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["candidates"], 10, "{body}");
+    let (status, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let queue = body["candidates"].as_array().cloned().unwrap_or_default();
+    assert_eq!(queue.len(), 10);
+    let relation = queue
+        .iter()
+        .find(|c| c["kind"] == "relation")
+        .unwrap_or_else(|| fail("no relation"));
+    assert_eq!(relation["proposal"]["domain"], "order");
+    let mode = queue
+        .iter()
+        .find(|c| c["kind"] == "property" && c["proposal"]["property"]["id"] == "mode")
+        .unwrap_or_else(|| fail("no mode"));
+    assert_eq!(mode["proposal"]["property"]["type"], "enum");
+
+    let rid = relation["id"].as_str().unwrap_or_default().to_owned();
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("{base}/candidates/{rid}"),
+            None,
+            Some(serde_json::json!({ "action": "rename", "target": "placed_with" })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a relation alone cannot validate before its classes: {body}"
+    );
+    let (status, _) = h
+        .call(
+            Method::PUT,
+            &format!(
+                "{base}/candidates/{}",
+                mode["id"].as_str().unwrap_or_default()
+            ),
+            None,
+            Some(serde_json::json!({ "action": "reject" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .call(
+            Method::PUT,
+            &format!("{base}/candidates/{rid}"),
+            None,
+            Some(serde_json::json!({ "action": "rename" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "rename needs a target");
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "mode": "sideways" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Accept the rest one by one in queue order (classes, properties,
+    // relations, mappings), each write a version; the rejected one stays out.
+    let (_, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    let remaining = body["candidates"].as_array().cloned().unwrap_or_default();
+    assert_eq!(remaining.len(), 9);
+    for c in &remaining {
+        let cid = c["id"].as_str().unwrap_or_default();
+        let (status, body) = h
+            .call(
+                Method::PUT,
+                &format!("{base}/candidates/{cid}"),
+                None,
+                Some(serde_json::json!({ "action": "accept" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = h.call(Method::GET, &base, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 9);
+    let classes: Vec<&str> = body["classes"]
+        .as_array()
+        .map(|c| c.iter().filter_map(|x| x["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(classes, ["order", "vendor"]);
+    assert!(
+        body["properties"]
+            .as_array()
+            .is_some_and(|p| !p.iter().any(|x| x["id"] == "mode")),
+        "rejected stays out: {body}"
+    );
+    assert_eq!(body["mappings"].as_array().map(Vec::len), Some(2));
+    let (status, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["candidates"], serde_json::json!([]));
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "mode": "extend" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["candidates"], 1,
+        "only the rejected property is missing now: {body}"
+    );
+    let (status, html, _) = h.page(&format!("/w/{ws}/ontology"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Review queue (1 pending)") && html.contains("orders.mode"),
+        "{html}"
+    );
+    // The page's form with auto-accept takes the remaining proposal straight in.
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/propose"),
+            None,
+            "extend=true&auto_accept=true",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/ontology"));
+    let (_, body) = h.call(Method::GET, &base, None, None).await;
+    assert_eq!(body["version"], 10);
+    assert!(
+        body["properties"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|x| x["id"] == "mode"))
+    );
+    let proposes = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("propose")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(proposes.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_endpoints_manage_users_and_read_the_audit() {
     let h = harness(false).await;
     h.user("root", true).await;

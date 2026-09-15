@@ -82,6 +82,7 @@ cargo run --bin quack -- -p "question" -w ws [-f text|json]                    #
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
+cargo run --bin quack -- ontology propose [--extend] [--auto-accept] | review | accept ID.. | reject ID..
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI and REST API under /api/v1
@@ -113,7 +114,13 @@ It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, c
 mapped tables and columns against the workspace, and writes a new version with a JSON
 snapshot, `since_version` carried over for items that already existed. JSON is the only
 interchange form (export, import, `PUT /ontology`); a file is never the source of truth.
-The system prompt carries a compact rendering when an ontology exists.
+The system prompt carries a compact rendering when an ontology exists. Induction from
+tables (`ontology::induction::propose_from_tables`, no model calls) proposes a class per
+table, typed properties per column (enum, date, number, boolean, string), the unique
+non-null column as key, a relation where a column's values overlap another table's key,
+and a mapping; proposals sit in `_quack_ontology_candidates` (`ontology::candidates`)
+until accepted, renamed, merged, reparented, or rejected, and accepting writes a new
+version. Document-evidence induction (open extraction with the model) is still open.
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
 `Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content

@@ -1,13 +1,15 @@
 //! `quack ontology`: show, install the default, export and import JSON,
-//! list versions, diff, and restore. The ontology lives in the workspace
-//! file; a file on disk is only ever a copy.
+//! list versions, diff, restore, and propose and review candidates. The
+//! ontology lives in the workspace file; a file on disk is only ever a copy.
 
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use quack_core::config::Config;
 use quack_core::ontology::Ontology;
-use quack_core::ontology::store;
+use quack_core::ontology::induction::{Decision, propose_from_tables};
+use quack_core::ontology::{candidates, store};
 use quack_core::storage::workspace::WorkspaceDb;
 
 #[derive(Subcommand)]
@@ -33,9 +35,36 @@ pub(crate) enum OntologyAction {
     Diff { from: Option<u32>, to: Option<u32> },
     /// Store an earlier version as the newest one
     Restore { version: u32 },
+    /// Propose classes, properties, keys, relations, and mappings from the
+    /// tables into the review queue (no model calls)
+    Propose {
+        /// Propose only what the current ontology lacks
+        #[arg(long)]
+        extend: bool,
+        /// Accept every proposal at once and write the version
+        #[arg(long)]
+        auto_accept: bool,
+    },
+    /// List pending candidates with their evidence
+    Review,
+    /// Accept candidates by id (prefixes accepted), as proposed or changed
+    Accept {
+        ids: Vec<String>,
+        /// Accept under this id (one candidate only)
+        #[arg(long, conflicts_with_all = ["merge_into", "parent"])]
+        rename: Option<String>,
+        /// Treat the candidate as this existing class, relation, or property
+        #[arg(long)]
+        merge_into: Option<String>,
+        /// Accept a class under this parent
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// Reject candidates by id (prefixes accepted)
+    Reject { ids: Vec<String> },
 }
 
-pub(crate) fn run(db: &WorkspaceDb, action: OntologyAction) -> Result<()> {
+pub(crate) fn run(config: &Config, db: &WorkspaceDb, action: OntologyAction) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     match action {
@@ -122,9 +151,177 @@ pub(crate) fn run(db: &WorkspaceDb, action: OntologyAction) -> Result<()> {
                 stored.version
             )?;
         }
+        review @ (OntologyAction::Propose { .. }
+        | OntologyAction::Review
+        | OntologyAction::Accept { .. }
+        | OntologyAction::Reject { .. }) => run_review(config, db, review, &mut out)?,
     }
     out.flush()?;
     Ok(())
+}
+
+/// The induction and review commands.
+fn run_review(
+    config: &Config,
+    db: &WorkspaceDb,
+    action: OntologyAction,
+    out: &mut impl Write,
+) -> Result<()> {
+    match action {
+        OntologyAction::Propose {
+            extend,
+            auto_accept,
+        } => propose(config, db, extend, auto_accept, out)?,
+        OntologyAction::Review => {
+            let pending = candidates::pending(db)?;
+            if pending.is_empty() {
+                writeln!(out, "No pending candidates. Run `quack ontology propose`.")?;
+            }
+            for c in &pending {
+                writeln!(
+                    out,
+                    "{}  {:<9} {:<28} {:.2}  {}",
+                    c.id,
+                    c.kind,
+                    c.proposal.id(),
+                    c.confidence,
+                    evidence_line(c)
+                )?;
+            }
+        }
+        OntologyAction::Accept {
+            ids,
+            rename,
+            merge_into,
+            parent,
+        } => {
+            if ids.is_empty() {
+                anyhow::bail!("give at least one candidate id");
+            }
+            if ids.len() > 1 && (rename.is_some() || merge_into.is_some() || parent.is_some()) {
+                anyhow::bail!(
+                    "--rename, --merge-into, and --parent apply to one candidate at a time"
+                );
+            }
+            let decision = if let Some(new_id) = rename {
+                Decision::Rename(new_id)
+            } else if let Some(target) = merge_into {
+                Decision::MergeInto(target)
+            } else if let Some(parent) = parent {
+                Decision::Reparent(parent)
+            } else {
+                Decision::Accept
+            };
+            let decisions: Vec<(String, Decision)> =
+                ids.into_iter().map(|id| (id, decision.clone())).collect();
+            let stored = candidates::accept(db, &decisions, None)?;
+            writeln!(
+                out,
+                "accepted {} candidate(s); ontology is now version {}",
+                decisions.len(),
+                stored.version
+            )?;
+        }
+        OntologyAction::Reject { ids } => {
+            let count = candidates::reject(db, &ids, None)?;
+            writeln!(out, "rejected {count} candidate(s)")?;
+        }
+        OntologyAction::Show { .. }
+        | OntologyAction::Init
+        | OntologyAction::Export { .. }
+        | OntologyAction::Import { .. }
+        | OntologyAction::Versions { .. }
+        | OntologyAction::Diff { .. }
+        | OntologyAction::Restore { .. } => {}
+    }
+    Ok(())
+}
+
+/// `quack ontology propose`: table evidence into the queue, or straight
+/// into a version with `--auto-accept`.
+fn propose(
+    config: &Config,
+    db: &WorkspaceDb,
+    extend: bool,
+    auto_accept: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let current = store::current(db)?;
+    let base = if extend { current.as_ref() } else { None };
+    let proposals = propose_from_tables(
+        db,
+        base.or(current.as_ref()),
+        &config.ontology.table_evidence(),
+    )?;
+    if proposals.is_empty() {
+        writeln!(out, "Nothing to propose: the tables are already covered.")?;
+    } else if auto_accept {
+        candidates::store_run(db, &proposals)?;
+        let stored = candidates::accept_all(db, None)?;
+        writeln!(
+            out,
+            "accepted {} proposals; ontology is now version {}",
+            proposals.len(),
+            stored.version
+        )?;
+    } else {
+        candidates::store_run(db, &proposals)?;
+        let by_kind = |kind: &str| {
+            proposals
+                .iter()
+                .filter(|c| c.proposal.kind() == kind)
+                .count()
+        };
+        writeln!(
+            out,
+            "{} candidates queued: {} classes, {} properties, {} relations, {} mappings. Run `quack ontology review`.",
+            proposals.len(),
+            by_kind("class"),
+            by_kind("property"),
+            by_kind("relation"),
+            by_kind("mapping")
+        )?;
+    }
+    Ok(())
+}
+
+/// One line of evidence for the review listing.
+fn evidence_line(c: &candidates::CandidateRow) -> String {
+    let e = &c.evidence;
+    let get = |k: &str| {
+        e.get(k)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default()
+    };
+    match c.kind.as_str() {
+        "class" => format!(
+            "table {} ({} rows, key {})",
+            get("table"),
+            get("rows"),
+            get("key_column")
+        ),
+        "property" => format!(
+            "{}.{} {} distinct {} of {} e.g. {}",
+            get("table"),
+            get("column"),
+            get("duckdb_type"),
+            get("distinct"),
+            get("rows"),
+            get("samples")
+        ),
+        "relation" => format!(
+            "{}.{} matches {}.{} for {} of values",
+            get("table"),
+            get("column"),
+            get("target_table"),
+            get("target_key"),
+            get("overlap")
+        ),
+        _ => format!("table {}", get("table")),
+    }
 }
 
 /// A readable rendering: the class tree, then relations, properties, mappings.

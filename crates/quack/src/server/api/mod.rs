@@ -58,6 +58,15 @@ pub(crate) fn router() -> Router<App> {
             get(ontology::show).put(ontology::replace),
         )
         .route("/workspaces/{id}/ontology/init", post(ontology::init))
+        .route("/workspaces/{id}/ontology/propose", post(ontology::propose))
+        .route(
+            "/workspaces/{id}/ontology/candidates",
+            get(ontology::list_candidates),
+        )
+        .route(
+            "/workspaces/{id}/ontology/candidates/{cid}",
+            axum::routing::put(ontology::decide),
+        )
         .route(
             "/workspaces/{id}/ontology/versions",
             get(ontology::versions),

@@ -3,8 +3,8 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use quack_core::ontology::Ontology;
-use quack_core::ontology::store;
+use quack_core::ontology::induction::{Decision, propose_from_tables};
+use quack_core::ontology::{Ontology, candidates, store};
 use quack_core::storage::control::Outcome;
 use serde::Deserialize;
 
@@ -163,4 +163,129 @@ pub(crate) async fn restore(
         )
         .await?;
     Ok(Json(serde_json::to_value(stored)?))
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ProposeRequest {
+    /// `full` (default) or `extend`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub auto_accept: bool,
+}
+
+/// Propose from table evidence into the review queue. Deterministic and
+/// fast, so it answers 200 with the count rather than 202.
+pub(crate) async fn propose(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    body: Option<Json<ProposeRequest>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let request = body.map(|b| b.0).unwrap_or_default();
+    let extend = match request.mode.as_deref() {
+        None | Some("full") => false,
+        Some("extend") => true,
+        Some(other) => return Err(ApiError::bad_request(format!("unknown mode '{other}'"))),
+    };
+    let options = app.config.ontology.table_evidence();
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let outcome = with_db(db, move |db| {
+        let current = store::current(db)?;
+        let base = if extend { current.as_ref() } else { None };
+        let proposals = propose_from_tables(db, base.or(current.as_ref()), &options)?;
+        if proposals.is_empty() {
+            return Ok((0, None, None));
+        }
+        let run = candidates::store_run(db, &proposals)?;
+        let version = if request.auto_accept {
+            Some(candidates::accept_all(db, Some(&author))?.version)
+        } else {
+            None
+        };
+        Ok((proposals.len(), Some(run), version))
+    })
+    .await?;
+    let (count, run, version) = outcome;
+    access
+        .audit(
+            &app,
+            "propose",
+            run.as_deref().map(|r| ("induction_run", r)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "candidates": count, "auto_accept": request.auto_accept, "version": version })),
+        )
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "candidates": count, "run": run, "version": version }),
+    ))
+}
+
+pub(crate) async fn list_candidates(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _access = access(&app, identity, &id, Need::READ).await?;
+    let db = app.workspace_db(&id).await?;
+    let rows = with_db(db, candidates::pending).await?;
+    Ok(Json(serde_json::json!({ "candidates": rows })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DecideRequest {
+    /// `accept`, `rename`, `merge_into`, `reparent`, or `reject`.
+    pub action: String,
+    /// The new id for `rename`, the target for `merge_into`, or the parent for `reparent`.
+    pub target: Option<String>,
+}
+
+pub(crate) async fn decide(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, cid)): Path<(String, String)>,
+    Json(body): Json<DecideRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let target = || {
+        body.target
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| ApiError::bad_request("this action needs a target"))
+    };
+    let decision = match body.action.as_str() {
+        "accept" => Some(Decision::Accept),
+        "rename" => Some(Decision::Rename(target()?)),
+        "merge_into" => Some(Decision::MergeInto(target()?)),
+        "reparent" => Some(Decision::Reparent(target()?)),
+        "reject" => None,
+        other => return Err(ApiError::bad_request(format!("unknown action '{other}'"))),
+    };
+    let candidate_id = cid.clone();
+    let version = with_db(db, move |db| {
+        if let Some(decision) = decision {
+            let stored = candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
+            return Ok(Some(stored.version));
+        }
+        candidates::reject(db, &[candidate_id], Some(&author))?;
+        Ok(None)
+    })
+    .await
+    .map_err(|e| ApiError::bad_request(e.message))?;
+    access
+        .audit(
+            &app,
+            "ontology",
+            Some(("candidate", &cid)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "action": body.action, "version": version })),
+        )
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "candidate": cid, "action": body.action, "version": version }),
+    ))
 }

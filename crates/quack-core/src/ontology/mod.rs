@@ -7,6 +7,8 @@
 //! and the JSON form export and import move between workspaces. A file is
 //! never the source of truth.
 
+pub mod candidates;
+pub mod induction;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
