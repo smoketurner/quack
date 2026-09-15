@@ -8,6 +8,7 @@
 //! never the source of truth.
 
 pub mod candidates;
+pub mod documents;
 pub mod induction;
 pub mod store;
 

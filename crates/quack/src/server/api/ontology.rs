@@ -172,6 +172,14 @@ pub(crate) struct ProposeRequest {
     pub mode: Option<String>,
     #[serde(default)]
     pub auto_accept: bool,
+    /// Also run open extraction over a sample of the documents. This costs
+    /// one model call per sampled chunk and runs in the background: the
+    /// response is 202 with the estimate, and the candidates appear in the
+    /// queue when the run finishes.
+    #[serde(default)]
+    pub documents: bool,
+    /// Chunks to sample (default from config).
+    pub sample: Option<u32>,
 }
 
 /// Propose from table evidence into the review queue. Deterministic and
@@ -181,7 +189,7 @@ pub(crate) async fn propose(
     identity: Identity,
     Path(id): Path<String>,
     body: Option<Json<ProposeRequest>>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     let extend = match request.mode.as_deref() {
@@ -189,6 +197,10 @@ pub(crate) async fn propose(
         Some("extend") => true,
         Some(other) => return Err(ApiError::bad_request(format!("unknown mode '{other}'"))),
     };
+    if request.documents {
+        let started = start_document_run(&app, &access, &id, extend, request.sample).await?;
+        return Ok((axum::http::StatusCode::ACCEPTED, started));
+    }
     let options = app.config.ontology.table_evidence();
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
@@ -218,8 +230,9 @@ pub(crate) async fn propose(
             Some(serde_json::json!({ "candidates": count, "auto_accept": request.auto_accept, "version": version })),
         )
         .await?;
-    Ok(Json(
-        serde_json::json!({ "candidates": count, "run": run, "version": version }),
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "candidates": count, "run": run, "version": version })),
     ))
 }
 
@@ -287,5 +300,95 @@ pub(crate) async fn decide(
         .await?;
     Ok(Json(
         serde_json::json!({ "candidate": cid, "action": body.action, "version": version }),
+    ))
+}
+
+/// The document pass: answer 202 with the cost, then sample, extract, and
+/// queue the candidates in a background task. The end of the run is
+/// audited under the same run id.
+pub(crate) async fn start_document_run(
+    app: &App,
+    access: &crate::server::auth::Access,
+    id: &str,
+    extend: bool,
+    sample: Option<u32>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut options = app.config.ontology.document_evidence();
+    if let Some(n) = sample {
+        options.sample_chunks = n;
+    }
+    // Fail now, not in the background, when no model can be built.
+    let extractor = quack_core::llm::chat_extractor(&app.config).await?;
+    let embeddings = quack_core::llm::optional_embedding_model(&app.config).await?;
+    let db = app.workspace_db(id).await?;
+    let (cost, chunks, current) = with_db(std::sync::Arc::clone(&db), move |db| {
+        let cost = quack_core::ontology::documents::estimate(db, &options)?;
+        let chunks = quack_core::ontology::documents::sample_chunks(db, options.sample_chunks)?;
+        Ok((cost, chunks, store::current(db)?))
+    })
+    .await?;
+    if chunks.is_empty() {
+        return Err(ApiError::bad_request("no ready documents to sample"));
+    }
+    let run = uuid::Uuid::now_v7().to_string();
+    access
+        .audit(
+            app,
+            "propose",
+            Some(("induction_run", &run)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "documents": true, "cost": cost })),
+        )
+        .await?;
+    let app = std::sync::Arc::clone(app);
+    let access = access.clone();
+    let run_id = run.clone();
+    tokio::spawn(async move {
+        let base = if extend { current.as_ref() } else { None };
+        let outcome = quack_core::ontology::documents::run(
+            chunks,
+            extractor.as_ref(),
+            base.or(current.as_ref()),
+            &options,
+            embeddings.as_ref(),
+        )
+        .await;
+        let result = match outcome {
+            Ok((found, summary)) => with_db(db, move |db| {
+                candidates::store_run(db, &found)?;
+                Ok(summary)
+            })
+            .await
+            .map_err(|e| e.message),
+            Err(e) => Err(e.to_string()),
+        };
+        let (outcome, detail) = match &result {
+            Ok(summary) => (
+                Outcome::Allowed,
+                serde_json::json!({ "finished": true, "summary": summary }),
+            ),
+            Err(e) => (
+                Outcome::Error,
+                serde_json::json!({ "finished": true, "error": e }),
+            ),
+        };
+        if let Err(e) = access
+            .audit(
+                &app,
+                "propose",
+                Some(("induction_run", &run_id)),
+                outcome,
+                Some(detail),
+            )
+            .await
+        {
+            tracing::error!(error = %e.message, "audit write failed after the document pass");
+        }
+        if let Err(e) = result {
+            tracing::warn!(run = %run_id, error = %e, "document induction failed");
+        }
+    });
+    Ok(Json(
+        serde_json::json!({ "run": run, "cost": cost, "status": "running" }),
     ))
 }

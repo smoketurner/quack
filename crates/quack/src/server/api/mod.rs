@@ -7,7 +7,7 @@ mod auth;
 mod context;
 pub(crate) mod documents;
 mod members;
-mod ontology;
+pub(crate) mod ontology;
 pub(crate) mod query;
 pub(crate) mod sessions;
 mod tables;

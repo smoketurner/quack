@@ -98,6 +98,114 @@ impl EmbeddingModel for EmbedModel {
     }
 }
 
+/// Open extraction through a rig completion model: one prompt per chunk,
+/// the answer parsed as JSON.
+struct RigExtractor<M> {
+    model: M,
+}
+
+impl<M> crate::ontology::documents::Extractor for RigExtractor<M>
+where
+    M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
+{
+    fn extract<'a>(&'a self, text: &'a str) -> crate::ontology::documents::ExtractFuture<'a> {
+        Box::pin(async move {
+            let response = self
+                .model
+                .completion_request(text)
+                .preamble(String::from(crate::ontology::documents::EXTRACTION_PROMPT))
+                .temperature(0.0)
+                .send()
+                .await
+                .map_err(|e| Error::Llm(format!("extraction call failed: {e}")))?;
+            let answer: String = response
+                .choice
+                .iter()
+                .filter_map(|c| match c {
+                    rig::completion::AssistantContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            crate::ontology::documents::parse_extraction(&answer)
+        })
+    }
+}
+
+/// The configured chat model as an extractor for ontology induction.
+///
+/// # Errors
+///
+/// Returns an error when no chat model is configured or the provider
+/// cannot be built (a missing key, a needed login).
+pub async fn chat_extractor(
+    config: &Config,
+) -> Result<Box<dyn crate::ontology::documents::Extractor>> {
+    let chat = config.chat_model_ref()?;
+    Ok(match chat.provider.provider_type {
+        ProviderType::Ollama => Box::new(RigExtractor {
+            model: build_ollama_client(config, chat.provider_name, chat.provider)
+                .await?
+                .completion_model(chat.model),
+        }),
+        ProviderType::Openai => Box::new(RigExtractor {
+            model: build_openai_client(config, chat.provider_name, chat.provider)
+                .await?
+                .completion_model(chat.model),
+        }),
+        ProviderType::Anthropic => Box::new(RigExtractor {
+            model: build_anthropic_client(config, chat.provider_name, chat.provider)
+                .await?
+                .completion_model(chat.model),
+        }),
+    })
+}
+
+/// A similarity check over the embedding model for clustering type and
+/// relation names: cosine at or above `threshold`.
+///
+/// # Errors
+///
+/// Returns an error when embedding fails.
+pub async fn name_similarity(
+    model: &EmbedModel,
+    names: &[String],
+    threshold: f64,
+) -> Result<std::collections::HashMap<(String, String), bool>> {
+    let mut out = std::collections::HashMap::new();
+    if names.len() < 2 {
+        return Ok(out);
+    }
+    let embeddings = model
+        .embed_texts(names.iter().map(|n| n.replace('_', " ")))
+        .await
+        .map_err(|e| Error::Embedding(e.to_string()))?;
+    let vectors: Vec<Vec<f64>> = embeddings.into_iter().map(|e| e.vec).collect();
+    for (i, a) in names.iter().enumerate() {
+        for (j, b) in names.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let (Some(va), Some(vb)) = (vectors.get(i), vectors.get(j)) else {
+                continue;
+            };
+            out.insert((a.clone(), b.clone()), cosine(va, vb) >= threshold);
+        }
+    }
+    Ok(out)
+}
+
+fn cosine(a: &[f64], b: &[f64]) -> f64 {
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
 /// Embed one query string as `f32`s, the width stored in the workspace.
 ///
 /// # Errors

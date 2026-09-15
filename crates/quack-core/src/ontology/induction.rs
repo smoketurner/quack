@@ -73,6 +73,10 @@ pub struct Candidate {
     pub proposal: Proposal,
     pub evidence: serde_json::Value,
     pub confidence: f64,
+    /// Below the document support threshold: stored, but not shown in the
+    /// main proposal (design doc 6.5).
+    #[serde(default)]
+    pub low_support: bool,
 }
 
 struct ColumnProfile {
@@ -372,6 +376,7 @@ fn propose_table(
                 } else {
                     0.9
                 },
+                low_support: false,
             });
         }
         if !is_key {
@@ -405,6 +410,7 @@ fn propose_table(
                 "key_column": profile.key,
             }),
             confidence: 1.0,
+            low_support: false,
         });
     }
     if let Some(key) = &profile.key
@@ -420,6 +426,7 @@ fn propose_table(
             }),
             evidence: serde_json::json!({ "table": profile.name, "rows": profile.rows }),
             confidence: 1.0,
+            low_support: false,
         });
     }
     Ok(())
@@ -475,6 +482,7 @@ fn propose_relations(
                     "distinct": column.distinct,
                 }),
                 confidence: share,
+                low_support: false,
             });
         }
     }

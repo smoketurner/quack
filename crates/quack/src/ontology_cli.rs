@@ -9,7 +9,7 @@ use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{Decision, propose_from_tables};
-use quack_core::ontology::{candidates, store};
+use quack_core::ontology::{candidates, documents, store};
 use quack_core::storage::workspace::WorkspaceDb;
 
 #[derive(Subcommand)]
@@ -36,7 +36,8 @@ pub(crate) enum OntologyAction {
     /// Store an earlier version as the newest one
     Restore { version: u32 },
     /// Propose classes, properties, keys, relations, and mappings from the
-    /// tables into the review queue (no model calls)
+    /// tables (no model calls) and, with --documents, from a sample of the
+    /// documents (one model call per chunk) into the review queue
     Propose {
         /// Propose only what the current ontology lacks
         #[arg(long)]
@@ -44,6 +45,19 @@ pub(crate) enum OntologyAction {
         /// Accept every proposal at once and write the version
         #[arg(long)]
         auto_accept: bool,
+        /// Also run open extraction over a sample of the documents
+        #[arg(long)]
+        documents: bool,
+        /// Chunks to sample with --documents (default from config)
+        #[arg(long)]
+        sample: Option<u32>,
+        /// Do not ask before spending the model calls
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Seed from a JSON ontology first (stored as a new version), then
+        /// propose only what it lacks
+        #[arg(long, value_name = "FILE")]
+        from: Option<String>,
     },
     /// List pending candidates with their evidence
     Review,
@@ -64,9 +78,24 @@ pub(crate) enum OntologyAction {
     Reject { ids: Vec<String> },
 }
 
-pub(crate) fn run(config: &Config, db: &WorkspaceDb, action: OntologyAction) -> Result<()> {
+pub(crate) async fn run(config: &Config, db: &WorkspaceDb, action: OntologyAction) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    match action {
+        propose_action @ OntologyAction::Propose { .. } => {
+            run_propose(config, db, propose_action, &mut out).await?;
+        }
+        review @ (OntologyAction::Review
+        | OntologyAction::Accept { .. }
+        | OntologyAction::Reject { .. }) => run_review(db, review, &mut out)?,
+        manage => run_manage(db, manage, &mut out)?,
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Show, init, export, import, versions, diff, restore.
+fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) -> Result<()> {
     match action {
         OntologyAction::Show { json } => match store::current(db)? {
             None => writeln!(
@@ -151,27 +180,52 @@ pub(crate) fn run(config: &Config, db: &WorkspaceDb, action: OntologyAction) -> 
                 stored.version
             )?;
         }
-        review @ (OntologyAction::Propose { .. }
+        OntologyAction::Propose { .. }
         | OntologyAction::Review
         | OntologyAction::Accept { .. }
-        | OntologyAction::Reject { .. }) => run_review(config, db, review, &mut out)?,
+        | OntologyAction::Reject { .. } => {}
     }
-    out.flush()?;
     Ok(())
 }
 
-/// The induction and review commands.
-fn run_review(
+/// `propose`, with optional seeding from a file.
+async fn run_propose(
     config: &Config,
     db: &WorkspaceDb,
     action: OntologyAction,
     out: &mut impl Write,
 ) -> Result<()> {
-    match action {
-        OntologyAction::Propose {
-            extend,
+    let OntologyAction::Propose {
+        extend,
+        auto_accept,
+        documents,
+        sample,
+        yes,
+        from,
+    } = action
+    else {
+        return Ok(());
+    };
+    let seeded = seed(db, from.as_deref(), out)?;
+    let pass = documents.then_some(DocumentPass {
+        sample,
+        assume_yes: yes,
+    });
+    propose(
+        config,
+        db,
+        ProposeArgs {
+            extend: extend || seeded,
             auto_accept,
-        } => propose(config, db, extend, auto_accept, out)?,
+            documents: pass,
+        },
+        out,
+    )
+    .await
+}
+/// The review commands.
+fn run_review(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) -> Result<()> {
+    match action {
         OntologyAction::Review => {
             let pending = candidates::pending(db)?;
             if pending.is_empty() {
@@ -226,7 +280,8 @@ fn run_review(
             let count = candidates::reject(db, &ids, None)?;
             writeln!(out, "rejected {count} candidate(s)")?;
         }
-        OntologyAction::Show { .. }
+        OntologyAction::Propose { .. }
+        | OntologyAction::Show { .. }
         | OntologyAction::Init
         | OntologyAction::Export { .. }
         | OntologyAction::Import { .. }
@@ -237,25 +292,72 @@ fn run_review(
     Ok(())
 }
 
-/// `quack ontology propose`: table evidence into the queue, or straight
-/// into a version with `--auto-accept`.
-fn propose(
-    config: &Config,
-    db: &WorkspaceDb,
+/// The document pass, when asked for.
+struct DocumentPass {
+    sample: Option<u32>,
+    assume_yes: bool,
+}
+
+struct ProposeArgs {
     extend: bool,
     auto_accept: bool,
+    documents: Option<DocumentPass>,
+}
+
+/// `--from FILE`: store the file as a new version so the proposal only
+/// adds what it lacks. Returns whether a seed was applied.
+fn seed(db: &WorkspaceDb, from: Option<&str>, out: &mut impl Write) -> Result<bool> {
+    let Some(file) = from else {
+        return Ok(false);
+    };
+    let text = std::fs::read_to_string(file).with_context(|| format!("failed to read {file}"))?;
+    let ontology = Ontology::from_json(&text)?;
+    let stored = store::save(db, &ontology, None, Some(&format!("seeded from {file}")))?;
+    writeln!(out, "seeded version {} from {file}", stored.version)?;
+    Ok(true)
+}
+
+/// `quack ontology propose`: table evidence, plus document evidence when
+/// asked, into the queue, or straight into a version with `--auto-accept`.
+async fn propose(
+    config: &Config,
+    db: &WorkspaceDb,
+    args: ProposeArgs,
     out: &mut impl Write,
 ) -> Result<()> {
     let current = store::current(db)?;
-    let base = if extend { current.as_ref() } else { None };
-    let proposals = propose_from_tables(
+    let base = if args.extend { current.as_ref() } else { None };
+    let mut proposals = propose_from_tables(
         db,
         base.or(current.as_ref()),
         &config.ontology.table_evidence(),
     )?;
+    if let Some(pass) = &args.documents {
+        let mut options = config.ontology.document_evidence();
+        if let Some(n) = pass.sample {
+            options.sample_chunks = n;
+        }
+        let cost = documents::estimate(db, &options)?;
+        writeln!(
+            out,
+            "Document evidence: {} chunks sampled across {} documents, {} model calls to {}.",
+            cost.chunks,
+            cost.documents,
+            cost.model_calls,
+            quack_core::llm::chat_model_display(config)
+        )?;
+        if cost.chunks == 0 {
+            writeln!(out, "No ready documents to sample.")?;
+        } else if !pass.assume_yes && !confirm(out)? {
+            writeln!(out, "Skipped the document pass.")?;
+        } else {
+            let from_documents = run_documents(config, db, current.as_ref(), &options, out).await?;
+            proposals.extend(from_documents);
+        }
+    }
     if proposals.is_empty() {
         writeln!(out, "Nothing to propose: the tables are already covered.")?;
-    } else if auto_accept {
+    } else if args.auto_accept {
         candidates::store_run(db, &proposals)?;
         let stored = candidates::accept_all(db, None)?;
         writeln!(
@@ -272,9 +374,10 @@ fn propose(
                 .filter(|c| c.proposal.kind() == kind)
                 .count()
         };
+        let low = proposals.iter().filter(|c| c.low_support).count();
         writeln!(
             out,
-            "{} candidates queued: {} classes, {} properties, {} relations, {} mappings. Run `quack ontology review`.",
+            "{} candidates queued: {} classes, {} properties, {} relations, {} mappings ({low} with low support, kept aside). Run `quack ontology review`.",
             proposals.len(),
             by_kind("class"),
             by_kind("property"),
@@ -283,6 +386,50 @@ fn propose(
         )?;
     }
     Ok(())
+}
+
+/// Sample, extract with the chat model, and propose.
+async fn run_documents(
+    config: &Config,
+    db: &WorkspaceDb,
+    current: Option<&Ontology>,
+    options: &documents::DocumentEvidenceOptions,
+    out: &mut impl Write,
+) -> Result<Vec<quack_core::ontology::induction::Candidate>> {
+    let sample = documents::sample_chunks(db, options.sample_chunks)?;
+    let extractor = quack_core::llm::chat_extractor(config).await?;
+    let embeddings = quack_core::llm::optional_embedding_model(config).await?;
+    let (candidates, summary) = documents::run(
+        sample,
+        extractor.as_ref(),
+        current,
+        options,
+        embeddings.as_ref(),
+    )
+    .await?;
+    writeln!(
+        out,
+        "extracted from {} chunks ({} failed): {} candidates, {} with low support",
+        summary.sampled_chunks, summary.failed_chunks, summary.candidates, summary.low_support
+    )?;
+    Ok(candidates)
+}
+
+/// Ask on the terminal; a non-terminal stdin means no.
+fn confirm(out: &mut impl Write) -> Result<bool> {
+    use std::io::{BufRead, IsTerminal};
+    if !std::io::stdin().is_terminal() {
+        writeln!(
+            out,
+            "Pass --yes to run the document pass without a terminal."
+        )?;
+        return Ok(false);
+    }
+    write!(out, "Proceed? [y/N] ")?;
+    out.flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
 /// One line of evidence for the review listing.

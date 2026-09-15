@@ -1327,11 +1327,12 @@ updated as issues close. Ordered by risk.
    SQL, context editor, settings with members and tokens, admin users and audit). The
    graph and ontology pages arrive with #27 and #28. **No MCP** (#29); **no desktop
    window** (#35). Sections 11, 12.
-4. **Ontology** (#27): the model, validation, versions with diff and restore, the
-   built-in default, JSON import and export, table-evidence induction with the review
-   queue (accept, rename, merge, reparent, reject, auto-accept, extend mode), and the
-   CLI, API, and web page are in. Still open in #27: document-evidence induction (open
-   extraction on a sample, vocabulary normalization, drift counting, `--from PACK`).
+4. ~~No ontology or induction~~ (#27, closed): the model, validation, versions with
+   diff and restore, the built-in default, JSON import and export, table and document
+   evidence into the review queue (accept, rename, merge, reparent, reject, auto-accept,
+   extend mode, `--from` seeding, low-support candidates), and the CLI, API, and web
+   page. Two deviations from 6.5: cluster names are chosen by frequency rather than a
+   model naming pass, and drift counting arrives with constrained extraction in #28.
    YAML was dropped: JSON is the only interchange form. **No graph** (#28). Sections
    6.3 to 6.5.
 5. **DOCX, HTML, PPTX, XLSX unsupported** (#16; XLSX via a Rust reader). Sections 6.1, 6.2.

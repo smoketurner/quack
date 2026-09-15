@@ -82,7 +82,7 @@ cargo run --bin quack -- -p "question" -w ws [-f text|json]                    #
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
-cargo run --bin quack -- ontology propose [--extend] [--auto-accept] | review | accept ID.. | reject ID..
+cargo run --bin quack -- ontology propose [--extend] [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI and REST API under /api/v1
@@ -120,7 +120,15 @@ table, typed properties per column (enum, date, number, boolean, string), the un
 non-null column as key, a relation where a column's values overlap another table's key,
 and a mapping; proposals sit in `_quack_ontology_candidates` (`ontology::candidates`)
 until accepted, renamed, merged, reparented, or rejected, and accepting writes a new
-version. Document-evidence induction (open extraction with the model) is still open.
+version. Document evidence (`ontology::documents`) samples chunks evenly across ready
+documents, runs open extraction through an `Extractor` (the chat model via
+`llm::chat_extractor`; tests use a canned one), normalizes type and relation names
+(snake_case, singular, near-synonyms clustered by embedding cosine when an embedding model
+exists), infers hierarchy from co-labelled mentions and domain and range from endpoints,
+turns recurring attributes into typed properties, and marks candidates under
+`[ontology].min_support_documents` as `low_support`. `quack ontology propose --documents`
+shows the cost and asks first; the API's `{"documents": true}` answers 202 and runs in the
+background, auditing the run's end under the same run id.
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
 `Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content

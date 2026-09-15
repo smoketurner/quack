@@ -370,7 +370,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Ontology { action } => {
             let ws_db = open_workspace(cli).await?;
             let config = Config::load().context("failed to load configuration")?;
-            ontology_cli::run(&config, &ws_db, action)?;
+            ontology_cli::run(&config, &ws_db, action).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Context { action } => {

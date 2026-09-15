@@ -10,6 +10,7 @@
   <span class="text-slate-500">classes, typed properties, keys, relations, and mappings; no model calls</span>
   {% if ontology.is_some() %}<label class="inline-flex items-center gap-1"><input type="checkbox" name="extend" value="true" checked> only what is missing</label>{% endif %}
   <label class="inline-flex items-center gap-1"><input type="checkbox" name="auto_accept" value="true"> accept everything at once</label>
+  <label class="inline-flex items-center gap-1"><input type="checkbox" name="documents" value="true"> also from the documents (one model call per sampled chunk; runs in the background)</label>
   <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Propose</button>
 </form>
 {% endif %}

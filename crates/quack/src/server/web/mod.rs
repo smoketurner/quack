@@ -1149,6 +1149,8 @@ struct ProposeForm {
     extend: bool,
     #[serde(default)]
     auto_accept: bool,
+    #[serde(default)]
+    documents: bool,
 }
 
 async fn ontology_propose(
@@ -1158,6 +1160,23 @@ async fn ontology_propose(
     Form(form): Form<ProposeForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
+    if form.documents {
+        let target = match super::api::ontology::start_document_run(
+            &app,
+            &access,
+            &id,
+            form.extend,
+            None,
+        )
+        .await
+        {
+            Ok(_) => format!(
+                "/w/{id}/ontology?error=document+pass+started%3B+candidates+appear+here+when+it+finishes"
+            ),
+            Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
+        };
+        return Ok(Redirect::to(&target).into_response());
+    }
     let options = app.config.ontology.table_evidence();
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();

@@ -145,7 +145,7 @@ pub fn reject(db: &WorkspaceDb, ids: &[String], decided_by: Option<&str>) -> Res
     let mut count: usize = 0;
     for id in ids {
         let row = find(db, id)?;
-        if row.status != "pending" {
+        if row.status != "pending" && row.status != "low_support" {
             return Err(Error::Ontology(format!(
                 "candidate {} is already {}",
                 row.id, row.status
@@ -176,7 +176,7 @@ pub fn accept(
     let mut resolved = Vec::with_capacity(decisions.len());
     for (id, decision) in decisions {
         let row = find(db, id)?;
-        if row.status != "pending" {
+        if row.status != "pending" && row.status != "low_support" {
             return Err(Error::Ontology(format!(
                 "candidate {} is already {}",
                 row.id, row.status

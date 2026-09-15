@@ -169,6 +169,11 @@ pub struct OntologyConfig {
     /// A text column with at most this many distinct values is proposed as
     /// an enum property.
     pub enum_max_values: u32,
+    /// Chunks sampled across documents for open extraction.
+    pub propose_sample_chunks: u32,
+    /// Distinct documents a document-evidence candidate needs to be shown
+    /// in the main proposal.
+    pub min_support_documents: u32,
 }
 
 impl Default for OntologyConfig {
@@ -176,11 +181,23 @@ impl Default for OntologyConfig {
         Self {
             key_overlap_threshold: 0.8,
             enum_max_values: 12,
+            propose_sample_chunks: 200,
+            min_support_documents: 3,
         }
     }
 }
 
 impl OntologyConfig {
+    /// The document-evidence tuning as the core module takes it.
+    #[must_use]
+    pub fn document_evidence(&self) -> crate::ontology::documents::DocumentEvidenceOptions {
+        crate::ontology::documents::DocumentEvidenceOptions {
+            sample_chunks: self.propose_sample_chunks,
+            min_support_documents: self.min_support_documents,
+            ..crate::ontology::documents::DocumentEvidenceOptions::default()
+        }
+    }
+
     /// The induction tuning as the core module takes it.
     #[must_use]
     pub fn table_evidence(&self) -> crate::ontology::induction::TableEvidenceOptions {
@@ -564,6 +581,8 @@ always_retrieve = true
         assert_eq!(config.server.workers_per_workspace, 1);
         assert!((config.ontology.key_overlap_threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(config.ontology.enum_max_values, 12);
+        assert_eq!(config.ontology.propose_sample_chunks, 200);
+        assert_eq!(config.ontology.min_support_documents, 3);
         assert!(err_of("[ontology]\nsample = 1\n").contains("sample"));
     }
 

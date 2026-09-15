@@ -1292,6 +1292,21 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "documents": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no chat model: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("chat_model")
+    );
 
     // Accept the rest one by one in queue order (classes, properties,
     // relations, mappings), each write a version; the rejected one stays out.
