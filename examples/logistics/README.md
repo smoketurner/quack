@@ -7,8 +7,8 @@ countries, Incoterms, shipment modes) for the ontology and knowledge graph.
 
 ```bash
 make demo-data                                     # load into the workspace named "logistics"
-examples/logistics/load.sh NAME                    # load into the workspace named NAME (created if missing)
-examples/logistics/load.sh NAME --reset            # delete every document in NAME first, then load
+examples/logistics/load.sh WORKSPACE               # load into the workspace named WORKSPACE (created if missing)
+examples/logistics/load.sh WORKSPACE --reset       # delete every document in WORKSPACE first, then load
 ```
 
 Loading is idempotent: a file whose name is already in the workspace is skipped, so
