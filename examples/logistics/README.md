@@ -6,10 +6,13 @@ real entity graph (shipments, purchase orders, vendors, manufacturing sites, pro
 countries, Incoterms, shipment modes) for the ontology and knowledge graph.
 
 ```bash
-make demo-data                          # into workspace "logistics"
-examples/logistics/load.sh mine         # into another workspace
-examples/logistics/load.sh mine --reset # clear its documents first
+make demo-data                                     # load into the workspace named "logistics"
+examples/logistics/load.sh NAME                    # load into the workspace named NAME (created if missing)
+examples/logistics/load.sh NAME --reset            # delete every document in NAME first, then load
 ```
+
+Loading is idempotent: a file whose name is already in the workspace is skipped, so
+re-running adds nothing. Use `--reset` to start the workspace over.
 
 Then ask:
 
