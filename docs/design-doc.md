@@ -1349,6 +1349,10 @@ updated as issues close. Ordered by risk.
     (#34); **large-workspace vector index options** (#32, research). Sections 6.1, 15.
 12. ~~Web UI mapping of the chart spec to ECharts~~ (#26, closed): `static/js/app.js`
     maps the spec to an ECharts option. Section 9.
+13. **Open Knowledge Format export and import** (#36): a workspace as an OKF bundle
+    (tables, ontology, documents, context, and, after #28, one concept per graph node)
+    and a bundle as ingestible evidence. Filed after the ontology landed; depends on #28
+    for the entity concepts.
 
 ---
 
