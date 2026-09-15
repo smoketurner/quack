@@ -4,7 +4,8 @@
 //! goes to stderr so pipelines stay clean. `--format json` collects the
 //! whole turn into one object instead of streaming.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use quack_core::analysis::events::{self, AgentEvent, ToolStep};
@@ -50,13 +51,32 @@ pub(crate) async fn run_prompt(
     // printing text that would then need to be reprinted.
     let mut searched = false;
 
-    while let Some(event) = events.recv().await {
+    // On a terminal, show what the turn is waiting on (the model, or a
+    // tool) with the elapsed time, and erase it before any real output.
+    let mut spinner = Spinner::new(std::io::stderr().is_terminal());
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            _ = ticker.tick(), if spinner.active() => {
+                spinner.draw(&mut err)?;
+                continue;
+            }
+        };
+        spinner.clear(&mut err)?;
         match event {
             AgentEvent::TextDelta(text) => {
                 if format == PromptFormat::Text && !searched {
                     write!(out, "{text}")?;
                     out.flush()?;
                     streamed_any = true;
+                    spinner.stop();
+                } else {
+                    spinner.set("answering");
                 }
             }
             AgentEvent::ToolStarted { tool, detail } => {
@@ -64,17 +84,20 @@ pub(crate) async fn run_prompt(
                     searched = true;
                 }
                 write_started(&mut err, &tool, &detail, verbose)?;
+                spinner.set(&format!("running {tool}"));
             }
             AgentEvent::ToolFinished(step) => {
                 write_finished(&mut err, &step)?;
+                spinner.set("thinking");
             }
             AgentEvent::PermissionRequired(request) => {
                 // Print mode never prompts; the policy is Allow or Deny.
                 request.deny();
             }
-            AgentEvent::TurnComplete(_) | AgentEvent::Failed(_) => {}
+            AgentEvent::TurnComplete(_) | AgentEvent::Failed(_) => spinner.stop(),
         }
     }
+    spinner.clear(&mut err)?;
 
     let response = turn
         .await
@@ -114,6 +137,72 @@ pub(crate) async fn run_prompt(
     writeln!(err, "session {session_id}")?;
 
     Ok(response.write_refused)
+}
+
+/// A one-line progress indicator on stderr: `⠋ thinking 4s`. Inactive when
+/// stderr is not a terminal, so pipelines see only the step lines.
+struct Spinner {
+    enabled: bool,
+    running: bool,
+    stage: String,
+    started: Instant,
+    frame: usize,
+    drawn: bool,
+}
+
+impl Spinner {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            running: true,
+            stage: String::from("thinking"),
+            started: Instant::now(),
+            frame: 0,
+            drawn: false,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.enabled && self.running
+    }
+
+    fn set(&mut self, stage: &str) {
+        stage.clone_into(&mut self.stage);
+        self.running = true;
+    }
+
+    fn stop(&mut self) {
+        self.running = false;
+    }
+
+    fn draw(&mut self, err: &mut impl Write) -> Result<()> {
+        let glyph = Self::FRAMES.get(self.frame).copied().unwrap_or('.');
+        self.frame = self.frame.wrapping_add(1);
+        if self.frame >= Self::FRAMES.len() {
+            self.frame = 0;
+        }
+        write!(
+            err,
+            "\r\x1b[2K{glyph} {} {}s",
+            self.stage,
+            self.started.elapsed().as_secs()
+        )?;
+        err.flush()?;
+        self.drawn = true;
+        Ok(())
+    }
+
+    /// Erase the indicator line so the next write starts clean.
+    fn clear(&mut self, err: &mut impl Write) -> Result<()> {
+        if self.drawn {
+            write!(err, "\r\x1b[2K")?;
+            err.flush()?;
+            self.drawn = false;
+        }
+        Ok(())
+    }
 }
 
 fn write_started(err: &mut impl Write, tool: &str, detail: &str, verbose: bool) -> Result<()> {
