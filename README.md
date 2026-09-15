@@ -41,13 +41,17 @@ cargo run --bin quack -- user add alice --admin                       # server u
 cargo run --bin quack -- token create -w myworkspace --user alice --name ci --scopes read,write
 cargo run --bin quack -- audit --outcome denied --csv
 cargo run --bin quack -- serve --local                                # web UI and REST API on 127.0.0.1:8080, no login
-make demo-data                                                        # public sample tables and a document in workspace "demo"
+make demo-data                                                        # public supply chain sample data in workspace "logistics"
 ```
 
-`make demo-data` downloads a few permissively licensed datasets once (Palmer penguins,
-Gapminder, restaurant tips, and NIST SP 800-63B as a PDF), ingests them into the `demo`
-workspace, and sets a workspace context describing them, so `quack -w demo -p "..."` and
-the web UI have something real to answer about.
+`make demo-data` loads one coherent, public-domain dataset: USAID's supply chain delivery
+history (10,324 shipment line items with purchase orders, vendors, manufacturing sites,
+products, countries, Incoterms, shipment modes, milestone dates, freight and insurance),
+plus documents in the same vocabulary (a data dictionary, an Incoterms guide, and CBP's
+guide to importing into the United States), and a workspace context that names the
+entities and relations. The same vendors, order numbers, and terms then appear in SQL,
+vector and keyword search, and the knowledge graph. `scripts/demo-data.sh WS --reset`
+clears a workspace's documents first.
 
 The workspace context is the owner's instructions for the agent: persona, what columns
 mean, how metrics are defined, known data problems. It is stored and versioned inside the
