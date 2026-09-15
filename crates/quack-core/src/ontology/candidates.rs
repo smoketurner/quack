@@ -39,7 +39,7 @@ pub fn store_run(db: &WorkspaceDb, candidates: &[Candidate]) -> Result<String> {
         };
         conn.execute(
             "UPDATE _quack_ontology_candidates SET status = 'superseded' \
-             WHERE status = 'pending' AND kind = ? AND coalesce( \
+             WHERE status IN ('pending', 'low_support') AND kind = ? AND coalesce( \
                  json_extract_string(proposal, '$.id'), \
                  json_extract_string(proposal, '$.property.id'), \
                  json_extract_string(proposal, '$.table')) = ? \
@@ -48,13 +48,18 @@ pub fn store_run(db: &WorkspaceDb, candidates: &[Candidate]) -> Result<String> {
         )?;
         conn.execute(
             "INSERT INTO _quack_ontology_candidates (id, kind, proposal, evidence, confidence, status, proposed_by) \
-             VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 uuid::Uuid::now_v7().to_string(),
                 candidate.proposal.kind(),
                 serde_json::to_string(&candidate.proposal)?,
                 serde_json::to_string(&candidate.evidence)?,
                 candidate.confidence,
+                if candidate.low_support {
+                    "low_support"
+                } else {
+                    "pending"
+                },
                 run
             ],
         )?;
@@ -100,6 +105,25 @@ pub fn pending(db: &WorkspaceDb) -> Result<Vec<CandidateRow>> {
     let sql = format!(
         "SELECT {COLUMNS} FROM _quack_ontology_candidates WHERE status = 'pending' \
          ORDER BY CASE kind WHEN 'class' THEN 0 WHEN 'property' THEN 1 WHEN 'relation' THEN 2 ELSE 3 END, id"
+    );
+    let mut stmt = db.connection().prepare(&sql)?;
+    let rows = stmt.query_map([], row_from)?;
+    Ok(rows
+        .filter_map(std::result::Result::ok)
+        .map(|(r, _)| r)
+        .collect())
+}
+
+/// Candidates below the document support threshold, kept aside from the
+/// main proposal but reviewable the same way.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn low_support(db: &WorkspaceDb) -> Result<Vec<CandidateRow>> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM _quack_ontology_candidates WHERE status = 'low_support' \
+         ORDER BY confidence DESC, id"
     );
     let mut stmt = db.connection().prepare(&sql)?;
     let rows = stmt.query_map([], row_from)?;
@@ -219,12 +243,39 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
 
 #[cfg(test)]
 mod tests {
-    use super::super::induction::{TableEvidenceOptions, propose_from_tables};
+    use super::super::induction::{Candidate, TableEvidenceOptions, propose_from_tables};
     use super::*;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    #[test]
+    fn low_support_candidates_are_kept_aside_but_reviewable() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let thin = Candidate {
+            proposal: Proposal::Class(super::super::Class {
+                id: String::from("rumor"),
+                parent: String::from(super::super::ROOT_CLASS),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "documents", "documents": 1 }),
+            confidence: 0.2,
+            low_support: true,
+        };
+        assert!(store_run(&db, std::slice::from_ref(&thin)).is_ok());
+        assert!(pending(&db).is_ok_and(|p| p.is_empty()));
+        let aside = low_support(&db).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(aside.len(), 1);
+        let id = aside.first().map(|c| c.id.clone()).unwrap_or_default();
+        let stored =
+            accept(&db, &[(id, Decision::Accept)], None).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(stored.class("rumor").is_some());
+        assert!(low_support(&db).is_ok_and(|p| p.is_empty()));
     }
 
     #[test]

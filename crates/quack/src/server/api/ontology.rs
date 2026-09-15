@@ -236,14 +236,29 @@ pub(crate) async fn propose(
     ))
 }
 
+#[derive(Deserialize, Default)]
+pub(crate) struct CandidatesQuery {
+    /// `pending` (default) or `low_support`.
+    pub status: Option<String>,
+}
+
 pub(crate) async fn list_candidates(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<String>,
+    Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _access = access(&app, identity, &id, Need::READ).await?;
     let db = app.workspace_db(&id).await?;
-    let rows = with_db(db, candidates::pending).await?;
+    let rows = match q.status.as_deref() {
+        None | Some("pending") => with_db(db, candidates::pending).await?,
+        Some("low_support") => with_db(db, candidates::low_support).await?,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "status must be pending or low_support, not '{other}'"
+            )));
+        }
+    };
     Ok(Json(serde_json::json!({ "candidates": rows })))
 }
 

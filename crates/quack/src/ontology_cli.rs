@@ -60,7 +60,11 @@ pub(crate) enum OntologyAction {
         from: Option<String>,
     },
     /// List pending candidates with their evidence
-    Review,
+    Review {
+        /// Show the candidates kept aside for low document support instead
+        #[arg(long)]
+        low_support: bool,
+    },
     /// Accept candidates by id (prefixes accepted), as proposed or changed
     Accept {
         ids: Vec<String>,
@@ -85,7 +89,7 @@ pub(crate) async fn run(config: &Config, db: &WorkspaceDb, action: OntologyActio
         propose_action @ OntologyAction::Propose { .. } => {
             run_propose(config, db, propose_action, &mut out).await?;
         }
-        review @ (OntologyAction::Review
+        review @ (OntologyAction::Review { .. }
         | OntologyAction::Accept { .. }
         | OntologyAction::Reject { .. }) => run_review(db, review, &mut out)?,
         manage => run_manage(db, manage, &mut out)?,
@@ -181,7 +185,7 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
             )?;
         }
         OntologyAction::Propose { .. }
-        | OntologyAction::Review
+        | OntologyAction::Review { .. }
         | OntologyAction::Accept { .. }
         | OntologyAction::Reject { .. } => {}
     }
@@ -226,10 +230,27 @@ async fn run_propose(
 /// The review commands.
 fn run_review(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) -> Result<()> {
     match action {
-        OntologyAction::Review => {
-            let pending = candidates::pending(db)?;
-            if pending.is_empty() {
-                writeln!(out, "No pending candidates. Run `quack ontology propose`.")?;
+        OntologyAction::Review { low_support } => {
+            let pending = if low_support {
+                candidates::low_support(db)?
+            } else {
+                candidates::pending(db)?
+            };
+            if pending.is_empty() && low_support {
+                writeln!(out, "No low-support candidates.")?;
+            } else if pending.is_empty() {
+                let aside = candidates::low_support(db)?.len();
+                writeln!(
+                    out,
+                    "No pending candidates. Run `quack ontology propose`.{}",
+                    if aside > 0 {
+                        format!(
+                            " {aside} low-support candidates: `quack ontology review --low-support`."
+                        )
+                    } else {
+                        String::new()
+                    }
+                )?;
             }
             for c in &pending {
                 writeln!(
@@ -443,6 +464,33 @@ fn evidence_line(c: &candidates::CandidateRow) -> String {
             })
             .unwrap_or_default()
     };
+    if e.get("source").and_then(|v| v.as_str()) == Some("documents") {
+        let examples = e
+            .get("examples")
+            .and_then(|x| x.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| {
+                        x.get("mention")
+                            .or_else(|| x.get("subject"))
+                            .or_else(|| x.get("value"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!(
+            "{} mentions in {} documents{} e.g. {examples}",
+            get("occurrences"),
+            get("documents"),
+            if c.status == "low_support" {
+                " (low support)"
+            } else {
+                ""
+            }
+        );
+    }
     match c.kind.as_str() {
         "class" => format!(
             "table {} ({} rows, key {})",

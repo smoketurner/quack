@@ -98,37 +98,67 @@ impl EmbeddingModel for EmbedModel {
     }
 }
 
-/// Open extraction through a rig completion model: one prompt per chunk,
-/// the answer parsed as JSON.
-struct RigExtractor<M> {
-    model: M,
+/// Open extraction through a rig agent: one streamed prompt per chunk,
+/// the text collected and parsed as JSON. Streaming is the path the chat
+/// agent uses and the one Ollama answers reliably; a chunk that produces
+/// nothing within [`EXTRACTION_TIMEOUT`] is an error the run skips.
+struct RigExtractor {
+    agent: rig::agent::Agent,
 }
 
-impl<M> crate::ontology::documents::Extractor for RigExtractor<M>
+/// How long one chunk's extraction may take.
+const EXTRACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl crate::ontology::documents::Extractor for RigExtractor {
+    fn extract<'a>(&'a self, text: &'a str) -> crate::ontology::documents::ExtractFuture<'a> {
+        Box::pin(async move {
+            use futures::StreamExt;
+            use rig::streaming::StreamedAssistantContent;
+            let collect = async {
+                let mut stream = self
+                    .agent
+                    .stream_chat(text, Vec::<rig::message::Message>::new())
+                    .await;
+                let mut answer = String::new();
+                let mut final_text: Option<String> = None;
+                while let Some(item) = stream.next().await {
+                    match item.map_err(|e| Error::Llm(format!("extraction call failed: {e}")))? {
+                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Text(t),
+                        ) => answer.push_str(&t.text),
+                        rig::agent::MultiTurnStreamItem::FinalResponse(r) => {
+                            final_text = Some(r.output);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok::<String, Error>(match final_text {
+                    Some(t) if answer.trim().is_empty() => t,
+                    _ => answer,
+                })
+            };
+            let answer = tokio::time::timeout(EXTRACTION_TIMEOUT, collect)
+                .await
+                .map_err(|_| {
+                    Error::Llm(format!(
+                        "extraction call produced nothing within {} s",
+                        EXTRACTION_TIMEOUT.as_secs()
+                    ))
+                })??;
+            crate::ontology::documents::parse_extraction(&answer)
+        })
+    }
+}
+
+fn extraction_agent<M>(model: M) -> RigExtractor
 where
     M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
 {
-    fn extract<'a>(&'a self, text: &'a str) -> crate::ontology::documents::ExtractFuture<'a> {
-        Box::pin(async move {
-            let response = self
-                .model
-                .completion_request(text)
-                .preamble(String::from(crate::ontology::documents::EXTRACTION_PROMPT))
-                .temperature(0.0)
-                .send()
-                .await
-                .map_err(|e| Error::Llm(format!("extraction call failed: {e}")))?;
-            let answer: String = response
-                .choice
-                .iter()
-                .filter_map(|c| match c {
-                    rig::completion::AssistantContent::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            crate::ontology::documents::parse_extraction(&answer)
-        })
+    RigExtractor {
+        agent: rig::agent::AgentBuilder::new(model)
+            .preamble(crate::ontology::documents::EXTRACTION_PROMPT)
+            .temperature(0.0)
+            .build(),
     }
 }
 
@@ -143,21 +173,21 @@ pub async fn chat_extractor(
 ) -> Result<Box<dyn crate::ontology::documents::Extractor>> {
     let chat = config.chat_model_ref()?;
     Ok(match chat.provider.provider_type {
-        ProviderType::Ollama => Box::new(RigExtractor {
-            model: build_ollama_client(config, chat.provider_name, chat.provider)
+        ProviderType::Ollama => Box::new(extraction_agent(
+            build_ollama_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
-        }),
-        ProviderType::Openai => Box::new(RigExtractor {
-            model: build_openai_client(config, chat.provider_name, chat.provider)
+        )),
+        ProviderType::Openai => Box::new(extraction_agent(
+            build_openai_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
-        }),
-        ProviderType::Anthropic => Box::new(RigExtractor {
-            model: build_anthropic_client(config, chat.provider_name, chat.provider)
+        )),
+        ProviderType::Anthropic => Box::new(extraction_agent(
+            build_anthropic_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
-        }),
+        )),
     })
 }
 

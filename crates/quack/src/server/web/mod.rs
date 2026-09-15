@@ -1062,6 +1062,31 @@ async fn ontology_page(
     })
 }
 
+/// "N mentions in M documents, e.g. ..." for a document-evidence candidate.
+fn document_evidence(e: &serde_json::Value) -> String {
+    let get = |k: &str| e.get(k).map(ToString::to_string).unwrap_or_default();
+    let examples = e
+        .get("examples")
+        .and_then(|x| x.as_array())
+        .map(|xs| {
+            xs.iter()
+                .filter_map(|x| {
+                    x.get("mention")
+                        .or_else(|| x.get("subject"))
+                        .or_else(|| x.get("value"))
+                        .and_then(|v| v.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    format!(
+        "{} mentions in {} documents · e.g. {examples}",
+        get("occurrences"),
+        get("documents")
+    )
+}
+
 fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
     use quack_core::ontology::induction::Proposal;
     let e = &c.evidence;
@@ -1073,7 +1098,19 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
             })
             .unwrap_or_default()
     };
+    let from_documents = e.get("source").and_then(|v| v.as_str()) == Some("documents");
     let (evidence, detail) = match c.kind.as_str() {
+        _ if from_documents => (
+            document_evidence(e),
+            match &c.proposal {
+                Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
+                Proposal::Class(cl) => format!("parent {}", cl.parent),
+                Proposal::Property { class, property } => {
+                    format!("{}: {}", class, property.kind.as_str())
+                }
+                Proposal::Mapping(_) => String::new(),
+            },
+        ),
         "class" => (
             format!(
                 "table {} · {} rows · key {}",

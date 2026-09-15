@@ -32,7 +32,7 @@ serde_json    = { workspace = true, features = ["std"] }
 sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
-tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml          = { workspace = true, features = ["std", "parse", "serde"] }
 tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
