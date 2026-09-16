@@ -39,6 +39,10 @@ fn lock(db: &SharedDb) -> Result<std::sync::MutexGuard<'_, WorkspaceDb>, ToolErr
         .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))
 }
 
+/// Prefix of a `run_sql` or `describe_table` result that carries a `DuckDB`
+/// error instead of rows. The model reads what follows and retries.
+pub const SQL_ERROR_PREFIX: &str = "SQL error: ";
+
 /// Message returned to the model when a write is refused.
 pub const WRITE_REFUSED: &str = "This statement would modify the workspace and was not permitted. \
 Do not retry it. Tell the user it needs write permission (re-run with --allow-write).";
@@ -173,7 +177,6 @@ impl Tool for RunSqlTool {
                 let results = {
                     let db = lock(&self.db)?;
                     db.execute_query(&args.query)
-                        .map_err(|e| ToolError::Query(e.to_string()))
                 };
                 match results {
                     Ok(results) => {
@@ -181,9 +184,13 @@ impl Tool for RunSqlTool {
                         text_to_sql::format_query_result(&results, self.max_query_rows)
                             .map_err(|e| ToolError::Query(e.to_string()))
                     }
+                    // A failed statement is a result, not a tool failure: rig
+                    // hides a tool error's message from the model, but DuckDB's
+                    // text (candidate bindings, the missing table) is exactly
+                    // what it needs to fix the statement and retry.
                     Err(e) => {
                         step.finish(format!("error: {e}"));
-                        Err(e)
+                        Ok(format!("{SQL_ERROR_PREFIX}{e}"))
                     }
                 }
             }
@@ -427,19 +434,26 @@ impl Tool for DescribeTableTool {
         let step = self.recorder.start(Self::NAME, &args.table_name);
         let desc = {
             let db = lock(&self.db)?;
-            db.describe_table(&args.table_name)
-                .map_err(|e| ToolError::Query(e.to_string()))
-        };
-        let desc = match desc {
-            Ok(d) => d,
-            Err(e) => {
-                step.finish(format!("error: {e}"));
-                return Err(e);
+            match db.describe_table(&args.table_name) {
+                Ok(d) => d,
+                Err(e) => {
+                    step.finish(format!("error: {e}"));
+                    let tables = db.list_tables().unwrap_or_default();
+                    return Ok(format!(
+                        "{SQL_ERROR_PREFIX}{e}\nTables in this workspace: {}",
+                        if tables.is_empty() {
+                            String::from("none")
+                        } else {
+                            tables.join(", ")
+                        }
+                    ));
+                }
             }
         };
 
         let mut output = String::new();
         writeln!(output, "Table: {}", desc.table_name)?;
+        writeln!(output, "Rows: {}", desc.row_count)?;
         writeln!(output, "Columns:")?;
         for col in &desc.columns {
             writeln!(output, "  - {} ({})", col.name, col.column_type)?;
@@ -513,7 +527,14 @@ impl Tool for ListTablesTool {
         }
         let mut output = String::from("Tables:\n");
         for table in &tables {
-            writeln!(output, "- {table}")?;
+            let count = {
+                let db = lock(&self.db)?;
+                db.count_rows(table).ok()
+            };
+            match count {
+                Some(n) => writeln!(output, "- {table} ({n} rows)")?,
+                None => writeln!(output, "- {table}")?,
+            }
         }
         Ok(output)
     }
@@ -829,6 +850,79 @@ mod tests {
             Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
         ));
         assert!(!refused.was_refused());
+    }
+
+    /// The retry loop the prompt promises: a binder error, with `DuckDB`'s
+    /// candidate bindings, comes back as tool text the model can act on
+    /// rather than as a tool failure whose message rig withholds.
+    #[tokio::test]
+    async fn run_sql_hands_duckdb_errors_to_the_model_with_candidate_bindings() {
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let db = shared_db();
+        {
+            let guard = lock(&db).unwrap_or_else(|e| fail_test(&e.to_string()));
+            assert!(
+                guard
+                    .execute_statement("CREATE TABLE trips(trip_distance DOUBLE)")
+                    .is_ok()
+            );
+        }
+        let tool = RunSqlTool::new(
+            Arc::clone(&db),
+            100,
+            WritePolicy::Deny,
+            RefusalFlag::default(),
+            recorder.clone(),
+        );
+        let out = tool
+            .call(
+                &mut ToolContext::new(),
+                RunSqlArgs {
+                    query: String::from("SELECT count(*) FROM trips WHERE distance > 10"),
+                },
+            )
+            .await;
+        let text = match out {
+            Ok(text) => text,
+            Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
+        };
+        assert!(text.starts_with(SQL_ERROR_PREFIX), "{text}");
+        assert!(text.contains("Candidate bindings"), "{text}");
+        assert!(text.contains("trip_distance"), "{text}");
+        let last = recorder.steps().last().map(|s| s.summary.clone());
+        assert!(
+            last.as_deref().is_some_and(|d| d.starts_with("error: ")),
+            "{last:?}"
+        );
+
+        // A missing table names the tables that do exist.
+        let describe = DescribeTableTool::new(Arc::clone(&db), recorder.clone());
+        let out = describe
+            .call(
+                &mut ToolContext::new(),
+                DescribeTableArgs {
+                    table_name: String::from("trip"),
+                },
+            )
+            .await;
+        let text = match out {
+            Ok(text) => text,
+            Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
+        };
+        assert!(text.starts_with(SQL_ERROR_PREFIX), "{text}");
+        assert!(text.contains("Tables in this workspace: trips"), "{text}");
+
+        // And a good statement still returns rows, with the count in the step.
+        let out = tool
+            .call(
+                &mut ToolContext::new(),
+                RunSqlArgs {
+                    query: String::from("SELECT count(*) AS n FROM trips WHERE trip_distance > 10"),
+                },
+            )
+            .await;
+        assert!(out.is_ok_and(|t| t.contains('n') && !t.starts_with(SQL_ERROR_PREFIX)));
     }
 
     #[tokio::test]

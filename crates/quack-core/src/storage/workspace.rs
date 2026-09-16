@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -163,6 +164,7 @@ impl WorkspaceDb {
             embedding_dimension,
             query_timeout: Duration::from_secs(30),
         };
+        db.confine_to(None)?;
         db.create_internal_tables()?;
         Ok(db)
     }
@@ -204,6 +206,8 @@ impl WorkspaceDb {
             query_timeout: Duration::from_secs(u64::from(config.analysis.query_timeout_seconds)),
         };
         db.apply_resource_limits(config)?;
+        let workspace_dir = std::fs::canonicalize(config.workspace_dir(workspace_id))?;
+        db.confine_to(Some(&workspace_dir))?;
         db.rename_legacy_tables()?;
         db.reconcile_embedding_dimension(configured_dimension, configured_model)
             .or_else(|e| match e {
@@ -226,6 +230,38 @@ impl WorkspaceDb {
         self.conn.execute(
             "SET threads = ?",
             duckdb::params![i64::from(config.analysis.threads.max(1))],
+        )?;
+        Ok(())
+    }
+
+    /// Confine every statement on this connection to the workspace (design
+    /// doc 7.4). `DuckDB`'s file readers, replacement scans (`FROM 'x.csv'`),
+    /// `COPY`, `ATTACH`, `INSTALL`, and `LOAD` may touch nothing outside
+    /// `allowed_dir` (the workspace directory, whose `files/` holds the
+    /// ingested originals), secrets never persist, and the configuration is
+    /// then locked so no later statement, agent-written or user-typed, can
+    /// widen it or lift the resource limits. Read classification alone does
+    /// not cover this: `SELECT * FROM read_text('/etc/passwd')` is a read.
+    ///
+    /// The allow-list must be set while external access is still enabled,
+    /// and the lock must come last; `DuckDB` refuses both in any other order.
+    fn confine_to(&self, allowed_dir: Option<&Path>) -> crate::error::Result<()> {
+        match allowed_dir {
+            Some(dir) => {
+                let dir = dir.to_string_lossy();
+                self.conn.execute(
+                    "SET allowed_directories = [?]",
+                    duckdb::params![dir.as_ref()],
+                )?;
+            }
+            None => {
+                self.conn.execute("SET allowed_directories = []", [])?;
+            }
+        }
+        self.conn.execute_batch(
+            "SET enable_external_access = false;\n\
+             SET allow_persistent_secrets = false;\n\
+             SET lock_configuration = true;",
         )?;
         Ok(())
     }
@@ -1044,12 +1080,40 @@ impl WorkspaceDb {
 
         let sample_sql = format!("SELECT * FROM {} LIMIT 3", quote_ident(table_name));
         let sample = self.execute_query(&sample_sql)?;
+        let row_count = self.count_rows(table_name)?;
 
         Ok(TableDescription {
             table_name: table_name.to_owned(),
             columns,
+            row_count,
             sample_rows: sample,
         })
+    }
+
+    /// Exact row count of one table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the query fails.
+    pub fn count_rows(&self, table_name: &str) -> crate::error::Result<i64> {
+        let sql = format!("SELECT count(*) FROM {}", quote_ident(table_name));
+        let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// The version of the `DuckDB` library compiled into this binary, such as
+    /// `v1.5.0`; the system prompt pins its dialect notes to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version query fails.
+    pub fn duckdb_version(&self) -> crate::error::Result<String> {
+        let version: String =
+            self.conn
+                .query_row("SELECT library_version FROM pragma_version()", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(version)
     }
 
     /// List all ingested documents with their status.
@@ -1087,6 +1151,8 @@ pub struct ColumnInfo {
 pub struct TableDescription {
     pub table_name: String,
     pub columns: Vec<ColumnInfo>,
+    /// Exact row count at describe time.
+    pub row_count: i64,
     pub sample_rows: QueryResults,
 }
 
@@ -1518,6 +1584,110 @@ impl QueryResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    fn config_in(dir: &Path) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.general.data_dir = dir.join("data");
+        config
+    }
+
+    /// Design doc 7.4: a read-classified statement may still name a file, so
+    /// the connection itself is confined to the workspace directory and then
+    /// locked, for agent SQL and user SQL alike.
+    #[test]
+    fn workspace_connection_is_confined_to_its_directory_and_locked() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+
+        let outside = dir.path().join("outside.csv");
+        std::fs::write(&outside, "a\n1\n").unwrap_or_else(|e| fail(&e.to_string()));
+        let inside = config.workspace_files_dir("ws").join("inside.csv");
+        std::fs::write(&inside, "a\n1\n2\n").unwrap_or_else(|e| fail(&e.to_string()));
+
+        for sql in [
+            format!("SELECT * FROM read_csv_auto('{}')", outside.display()),
+            format!("SELECT * FROM read_text('{}')", outside.display()),
+            format!("SELECT * FROM '{}'", outside.display()),
+            format!(
+                "ATTACH '{}' AS other",
+                dir.path().join("other.duckdb").display()
+            ),
+            String::from("INSTALL httpfs"),
+            String::from("SET memory_limit = '8GB'"),
+            String::from("SET enable_external_access = true"),
+            String::from("SET allowed_directories = ['/']"),
+        ] {
+            let err = db.execute_query(&sql).err();
+            assert!(err.is_some(), "ran outside the sandbox: {sql}");
+            let text = err.map(|e| e.to_string()).unwrap_or_default();
+            // Replacement scans are simply gone, so `FROM 'file'` is a
+            // catalog miss; everything else is a permission or lock error.
+            assert!(
+                text.contains("Permission Error")
+                    || text.contains("locked")
+                    || text.contains("Catalog Error"),
+                "{sql}: {text}"
+            );
+        }
+
+        // Ingestion's own reads under files/ still work, through the same reader.
+        let rows = db
+            .execute_query(&format!(
+                "SELECT count(*) FROM read_csv_auto('{}')",
+                inside.display()
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(
+            rows.rows.first().and_then(|r| r.first()),
+            Some(&serde_json::Value::Number(2.into()))
+        );
+        // Ordinary statements are untouched.
+        assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
+        assert!(db.execute_query("SELECT * FROM t").is_ok());
+    }
+
+    #[test]
+    fn in_memory_connection_reads_no_files_at_all() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let file = dir.path().join("x.csv");
+        std::fs::write(&file, "a\n1\n").unwrap_or_else(|e| fail(&e.to_string()));
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let err = db
+            .execute_query(&format!(
+                "SELECT * FROM read_csv_auto('{}')",
+                file.display()
+            ))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("Permission Error"), "{err}");
+        assert!(db.execute_statement("SET threads = 1").is_err());
+    }
+
+    #[test]
+    fn describe_table_reports_the_exact_row_count() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
+        assert!(
+            db.execute_statement("INSERT INTO t VALUES (1), (2), (3)")
+                .is_ok()
+        );
+        let desc = db
+            .describe_table("t")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(desc.row_count, 3);
+        assert_eq!(desc.sample_rows.rows.len(), 3);
+        assert!(db.count_rows("missing").is_err());
+        let version = db.duckdb_version().unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(version.starts_with('v'), "{version}");
+    }
 
     fn sample() -> QueryResults {
         QueryResults {
