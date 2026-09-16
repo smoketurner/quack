@@ -43,6 +43,12 @@ and code — this file is the gate, the doc is the detail.
       never against `control.db`; no `ATTACH` between workspaces.
 - [ ] **No `INSTALL` or `LOAD` of DuckDB extensions anywhere.** The static binary cannot
       load them; only what `libduckdb-sys` compiles in (`json`, `parquet`) may be used.
+- [ ] **The workspace connection is confined at open** (`WorkspaceDb::confine_to`, design
+      doc section 7.4): `allowed_directories` is the workspace directory only,
+      `enable_external_access` and `allow_persistent_secrets` are off, and
+      `lock_configuration` is on before any user or agent statement runs. Nothing may open
+      a second, unconfined connection to a workspace file, and every `SET` the code needs
+      goes before the lock.
 
 ## Workspace hygiene → [docs/architecture.md](../../docs/architecture.md)
 

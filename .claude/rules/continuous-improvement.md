@@ -57,6 +57,9 @@ Features prone to silent breakage — live-test before any PR that touches them:
   first turn leaves no empty session behind
 - Term index (`_quack_terms`) written on every chunk insert; no runtime DuckDB extension
   is installed or loaded anywhere (static musl cannot dlopen)
+- Workspace connection confinement: a read-classified `SELECT` over `read_text`,
+  `read_csv`, or `FROM 'file'` outside the workspace directory fails, `SET` fails after
+  open, and CSV ingestion from `files/` still works
 - Citation validation: `[n]` markers (also `【n】` and `[^n]`) not registered this turn are
   stripped; the rest are renumbered from 1 and listed as sources
 - Print mode must never hold the stdout or stderr lock across an await: the tracing

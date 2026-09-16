@@ -4,6 +4,40 @@ use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::WorkspaceDb;
 use std::fmt::Write;
 
+/// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to
+/// what the confined workspace connection (design doc 7.4) can run: nothing
+/// here needs a file, an extension, or a `SET`. Revisit when the bundled
+/// `DuckDB` version changes; the prompt states that version above this block.
+const DIALECT_REFERENCE: &str = "\
+- The tables listed below are all the data. File reads (FROM 'x.csv', read_csv, \
+read_parquet, read_text), ATTACH, INSTALL, LOAD, and SET are blocked on this connection; \
+never try them\n\
+- FROM-first: FROM t WHERE x > 10 (implicit SELECT *); LIMIT n caps rows; count() needs no \
+argument\n\
+- GROUP BY ALL groups by every non-aggregate column; ORDER BY ALL orders by every column\n\
+- SELECT * EXCLUDE (a, b) drops columns; SELECT * REPLACE (round(x) AS x) rewrites one in \
+place\n\
+- COLUMNS(*) or COLUMNS('regex') applies one expression across columns: SELECT min(COLUMNS(*)) \
+FROM t\n\
+- Column aliases are reusable in WHERE, GROUP BY, HAVING, and later select items: SELECT a + 1 \
+AS b, b * 2 AS c\n\
+- Conditional aggregation: count() FILTER (WHERE x > 10); top n per group: \
+arg_max(name, score, 3) or max(score, 3) return lists\n\
+- GROUPING SETS, CUBE, and ROLLUP for multi-level totals; PIVOT t ON col USING sum(v) and \
+UNPIVOT reshape between wide and long\n\
+- DESCRIBE t shows columns and types; SUMMARIZE t profiles every column\n\
+- Joins: ASOF JOIN matches the nearest earlier key, POSITIONAL JOIN pairs rows by position, \
+LATERAL correlates a subquery with the rows before it\n\
+- Lists and structs: [1, 2, 3] is a list, l[1] is its first element and l[-1] its last, \
+{'a': 1} is a struct read as s.a, [x * 2 FOR x IN l] is a comprehension, UNNEST(l) explodes\n\
+- Strings: || concatenates, ILIKE is case-insensitive, 'text'.upper() chains a function with \
+a dot, s[1:3] slices, regexp_matches(s, 'pat') tests a pattern\n\
+- Dates and times: date_trunc('month', ts), strftime(ts, '%Y-%m-%d'), ts + INTERVAL 7 DAY, \
+CAST('2024-01-31' AS DATE), current_date\n\
+- Identifiers with spaces or capitals need double quotes; string literals use single quotes\n\
+- Writes, when permitted: CREATE OR REPLACE TABLE t AS SELECT ..., INSERT INTO t BY NAME \
+SELECT ..., INSERT OR REPLACE INTO t ...\n";
+
 /// Everything that shapes the system prompt besides the workspace itself.
 #[derive(Debug, Clone)]
 pub struct PromptOptions {
@@ -51,49 +85,32 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 
     prompt.push_str(
         "When answering analytical questions about structured data:\n\
-         1. First use list_tables or describe_table to understand the available data\n\
+         1. First use list_tables or describe_table to understand the available data; run \
+         SUMMARIZE <table> when you need min, max, null share, or distinct counts per column \
+         before choosing a filter\n\
          2. Write and execute SQL queries using run_sql\n\
-         3. Explain the results in natural language\n\
-         4. If the user asks for a visualization, use create_chart\n\n\
+         3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
+         misspelled one and describe_table shows the real names. Fix the statement and run \
+         it again; do not give up after one error and do not ask the user to correct SQL\n\
+         4. Explain the results in natural language\n\
+         5. If the user asks for a visualization, use create_chart\n\n\
          When answering questions about document content:\n\
          1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
          2. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
          3. Cite each claim inline with the chunk's [n] marker, e.g. \"Flood is excluded [2].\"\n\
-         4. Do not write a Sources or References section; one is appended for you from the markers\n\n\
-         DuckDB SQL dialect notes:\n\
-         - Use LIMIT for row limits\n\
-         - Supports LIST, STRUCT, MAP types\n\
-         - EXCLUDE clause on SELECT *\n\
-         - String concatenation with || operator\n\
-         - ILIKE for case-insensitive matching\n\
-         - Use double quotes for identifiers with special characters\n\n",
+         4. Do not write a Sources or References section; one is appended for you from the markers\n\n",
     );
 
-    let tables = db.list_tables()?;
-    if !tables.is_empty() {
-        writeln!(prompt, "Available tables:")?;
-        for table in &tables {
-            writeln!(prompt, "- {table}")?;
-            if let Ok(desc) = db.describe_table(table) {
-                writeln!(prompt, "  Columns:")?;
-                for col in &desc.columns {
-                    writeln!(prompt, "    - {} ({})", col.name, col.column_type)?;
-                }
-                if !desc.sample_rows.rows.is_empty() {
-                    writeln!(prompt, "  Sample data:")?;
-                    let mut buf = Vec::new();
-                    if desc.sample_rows.write_table(&mut buf).is_ok()
-                        && let Ok(text) = String::from_utf8(buf)
-                    {
-                        for line in text.lines() {
-                            writeln!(prompt, "    {line}")?;
-                        }
-                    }
-                }
-            }
-        }
-        writeln!(prompt)?;
-    }
+    let version = db.duckdb_version()?;
+    writeln!(
+        prompt,
+        "DuckDB {version} SQL reference. This is DuckDB's dialect, not Postgres, MySQL, or \
+         SQLite; prefer these idioms:"
+    )?;
+    prompt.push_str(DIALECT_REFERENCE);
+    prompt.push('\n');
+
+    let tables = append_tables(&mut prompt, db)?;
 
     let docs = db.list_documents()?;
     if !docs.is_empty() {
@@ -130,6 +147,40 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
     prompt.push_str(permissions_text(options.write_policy));
 
     Ok(prompt)
+}
+
+/// The tables block: every user table with its row count, columns, and three
+/// sample rows. Returns the table names so the caller knows whether the
+/// workspace is empty.
+fn append_tables(prompt: &mut String, db: &WorkspaceDb) -> Result<Vec<String>> {
+    let tables = db.list_tables()?;
+    if !tables.is_empty() {
+        writeln!(prompt, "Available tables:")?;
+        for table in &tables {
+            let Ok(desc) = db.describe_table(table) else {
+                writeln!(prompt, "- {table}")?;
+                continue;
+            };
+            writeln!(prompt, "- {table} ({} rows)", desc.row_count)?;
+            writeln!(prompt, "  Columns:")?;
+            for col in &desc.columns {
+                writeln!(prompt, "    - {} ({})", col.name, col.column_type)?;
+            }
+            if !desc.sample_rows.rows.is_empty() {
+                writeln!(prompt, "  Sample data:")?;
+                let mut buf = Vec::new();
+                if desc.sample_rows.write_table(&mut buf).is_ok()
+                    && let Ok(text) = String::from_utf8(buf)
+                {
+                    for line in text.lines() {
+                        writeln!(prompt, "    {line}")?;
+                    }
+                }
+            }
+        }
+        writeln!(prompt)?;
+    }
+    Ok(tables)
 }
 
 /// The permissions paragraph for the write policy in force.
@@ -310,7 +361,11 @@ mod tests {
             .unwrap();
         let chat = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
         assert!(chat.contains("Mode: chat."));
-        assert!(chat.contains("- claims"));
+        assert!(chat.contains("- claims (0 rows)"));
+        db.execute_statement("INSERT INTO claims VALUES (1, 10), (2, 20)")
+            .unwrap();
+        let counted = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
+        assert!(counted.contains("- claims (2 rows)"), "{counted}");
         assert!(chat.contains("- policy.pdf (status: ready"));
         assert!(!chat.contains("Pinned documents"));
         assert!(
@@ -369,6 +424,40 @@ mod tests {
             prompt.contains("--- big.md (omitted: pinned text exceeds the 20-token budget) ---")
         );
         assert!(db.set_document_pinned("missing", true).is_err());
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn dialect_reference_is_pinned_to_the_bundled_duckdb_and_stays_in_the_sandbox() {
+        let db = db();
+        let prompt = build_system_prompt(&db, &options(ChatMode::Chat, 100)).unwrap();
+        let version = db.duckdb_version().unwrap();
+        assert!(version.starts_with('v'), "{version}");
+        assert!(prompt.contains(&format!("DuckDB {version} SQL reference")));
+        for idiom in [
+            "GROUP BY ALL",
+            "SUMMARIZE t profiles every column",
+            "EXCLUDE (a, b)",
+            "count() FILTER",
+            "ASOF JOIN",
+            "arg_max(name, score, 3)",
+        ] {
+            assert!(prompt.contains(idiom), "missing {idiom}");
+        }
+        // The retry rule and the sandbox note are what the error loop relies on.
+        assert!(prompt.contains("Fix the statement and run it again"));
+        assert!(prompt.contains("ATTACH, INSTALL, LOAD, and SET are blocked"));
+        // Nothing in the reference needs an extension the static binary lacks.
+        for banned in ["httpfs", "read_xlsx", "st_read", "SET VARIABLE", "INSTALL "] {
+            assert!(
+                !DIALECT_REFERENCE.contains(banned),
+                "reference mentions {banned}"
+            );
+        }
+        let tools_at = prompt.find("When answering analytical questions").unwrap();
+        let dialect_at = prompt.find("SQL reference").unwrap();
+        let perms_at = prompt.find("Permissions:").unwrap();
+        assert!(tools_at < dialect_at && dialect_at < perms_at);
     }
 
     #[test]

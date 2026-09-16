@@ -760,7 +760,11 @@ writes them to stderr. `max_turns` 10, temperature 0.1.
 1. Role and behavior for the mode (7.5): retrieve before answering, cite with `[n]`, run
    SQL rather than estimate, state assumptions, ask one clarifying question when the
    request is ambiguous.
-2. Tool guidance and DuckDB dialect notes.
+2. Tool guidance, the error rule (read a `run_sql` error, fix the statement, run it
+   again), and a Friendly SQL reference pinned to the bundled DuckDB version, which the
+   prompt states. The reference carries only what the confined connection (7.4) can
+   run: no file reads, extensions, or `SET`, and it says so, since the tables block is
+   all the data there is.
 3. Tables block: user-facing tables and views with columns, types, row count, three sample
    rows.
 4. Documents block: count, and titles of pinned documents with their full text.
@@ -811,6 +815,15 @@ reference `_quack_` tables are refused for the agent regardless.
 config. Queries execute on a dedicated thread; the caller takes
 `Connection::interrupt_handle()` first and a timer calls `interrupt()` after
 `query_timeout_seconds`. User SQL has the same limits.
+
+**Confinement.** Classification is not enough: `SELECT * FROM read_text('/etc/passwd')`
+is a read. So the workspace connection is confined when it opens, before any user or
+agent statement: `allowed_directories` is the workspace directory alone (ingestion reads
+the originals it copied under `files/`, and a future `export` writes there),
+`enable_external_access` is off, so file readers, replacement scans, `COPY`, `ATTACH`,
+`INSTALL`, and `LOAD` fail anywhere else, `allow_persistent_secrets` is off, and
+`lock_configuration` is on, so no later `SET` can widen any of it or lift the limits
+above. The in-memory test database gets the same treatment with an empty allow-list.
 
 ### 7.5 Chat modes
 
