@@ -2107,9 +2107,10 @@ impl QueryResults {
     /// Returns an error if serialization or writing fails.
     pub fn write_ndjson(&self, out: &mut impl Write) -> Result<()> {
         // Written by hand so keys keep column order; serde_json's map sorts.
+        let keys = self.json_keys();
         for row in &self.rows {
-            let mut fields = Vec::with_capacity(self.columns.len());
-            for (column, value) in self.columns.iter().zip(row) {
+            let mut fields = Vec::with_capacity(keys.len());
+            for (column, value) in keys.iter().zip(row) {
                 fields.push(format!(
                     "{}:{}",
                     serde_json::to_string(column)?,
@@ -2180,12 +2181,12 @@ impl QueryResults {
     ///
     /// Returns an error if writing to `out` or JSON serialization fails.
     pub fn write_json(&self, out: &mut impl Write) -> Result<()> {
+        let keys = self.json_keys();
         let json_rows: Vec<serde_json::Map<String, serde_json::Value>> = self
             .rows
             .iter()
             .map(|row| {
-                self.columns
-                    .iter()
+                keys.iter()
                     .zip(row.iter())
                     .map(|(col, val)| (col.clone(), val.clone()))
                     .collect()
@@ -2195,6 +2196,25 @@ impl QueryResults {
         serde_json::to_writer_pretty(&mut *out, &json_rows)?;
         writeln!(out)?;
         Ok(())
+    }
+
+    /// The column names as object keys: a repeated name gets a numeric
+    /// suffix (`a`, `a_1`, `a_2`) the way `DuckDB` itself writes JSON,
+    /// so a self-join keeps every column (issue #65).
+    #[must_use]
+    pub fn json_keys(&self) -> Vec<String> {
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut keys = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let mut key = column.clone();
+            let mut n: u32 = 0;
+            while !taken.insert(key.clone()) {
+                n = n.saturating_add(1);
+                key = format!("{column}_{n}");
+            }
+            keys.push(key);
+        }
+        keys
     }
 }
 
@@ -2384,6 +2404,43 @@ mod tests {
             .execute_query("SELECT range AS n FROM range(10)")
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(all.rows.len(), 10);
+    }
+
+    /// Columns that share a name keep every value under suffixed keys in
+    /// both JSON shapes; CSV, table, and markdown already kept them
+    /// (issue #65).
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn json_writers_keep_columns_that_share_a_name() {
+        let results = QueryResults {
+            columns: vec![
+                String::from("a"),
+                String::from("a"),
+                String::from("a_1"),
+                String::from("a"),
+            ],
+            rows: vec![vec![
+                serde_json::Value::from(1),
+                serde_json::Value::from(2),
+                serde_json::Value::from(3),
+                serde_json::Value::from(4),
+            ]],
+        };
+        assert_eq!(results.json_keys(), ["a", "a_1", "a_1_1", "a_2"]);
+        let mut buf = Vec::new();
+        results.write_ndjson(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "{\"a\":1,\"a_1\":2,\"a_1_1\":3,\"a_2\":4}\n"
+        );
+        let mut buf = Vec::new();
+        results.write_json(&mut buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([{ "a": 1, "a_1": 2, "a_1_1": 3, "a_2": 4 }])
+        );
+        assert_eq!(sample().json_keys(), ["name", "n"]);
     }
 
     #[test]
