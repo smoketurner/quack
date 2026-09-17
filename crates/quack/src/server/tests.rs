@@ -2370,3 +2370,188 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
         .await;
     assert!(searches.len() >= 4, "{searches:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
+    let h = harness(true).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "okf" })),
+        )
+        .await;
+    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let (status, _) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            None,
+            Some(serde_json::json!({ "sql": "CREATE TABLE sales AS SELECT 'north' AS region, 10 AS total" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/context"),
+            None,
+            Some(serde_json::json!({ "content": "Totals are in USD." })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/ontology/init"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Export: a tar of Markdown files with front matter.
+    let request = Request::builder()
+        .uri(format!("/api/v1/workspaces/{ws}/okf"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/x-tar")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let bundle = quack_core::okf::Bundle::from_tar(&bytes).unwrap_or_else(|e| fail(&e.to_string()));
+    let paths: Vec<&str> = bundle.files.iter().map(|f| f.path.as_str()).collect();
+    assert!(
+        paths.contains(&"index.md")
+            && paths.contains(&"tables/sales.md")
+            && paths.contains(&"log.md"),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"ontology/classes/organization.md"),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"ontology/relations/works-at.md"),
+        "{paths:?}"
+    );
+    let index = bundle.index().unwrap_or_else(|| fail("no index"));
+    assert!(
+        index.content.starts_with("---\ntype: index\n"),
+        "{}",
+        index.content
+    );
+    assert!(index.content.contains("Totals are in USD."));
+    let table = bundle
+        .files
+        .iter()
+        .find(|f| f.path == "tables/sales.md")
+        .unwrap_or_else(|| fail("no table file"));
+    assert!(
+        table.content.contains("type: DuckDB Table")
+            && table.content.contains("| region | VARCHAR |"),
+        "{}",
+        table.content
+    );
+    let exports = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("export")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(exports.len(), 1);
+
+    // Import into a fresh workspace: concept files become documents, types
+    // and links become candidates, index.md comes back as context.
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "okf2" })),
+        )
+        .await;
+    let ws2 = body["id"].as_str().unwrap_or_default().to_owned();
+    let mut incoming = quack_core::okf::Bundle::default();
+    incoming.files.push(quack_core::okf::BundleFile {
+        path: String::from("index.md"),
+        content: String::from("---\ntype: index\n---\n# Shipping\n\nAll weights in kg.\n"),
+    });
+    incoming.files.push(quack_core::okf::BundleFile {
+        path: String::from("vendors/orgenics.md"),
+        content: String::from(
+            "---\ntype: Vendor\ntitle: Orgenics\n---\nShips to [Kenya](../countries/kenya.md).\n",
+        ),
+    });
+    incoming.files.push(quack_core::okf::BundleFile {
+        path: String::from("countries/kenya.md"),
+        content: String::from("---\ntype: Country\ntitle: Kenya\n---\nEast Africa.\n"),
+    });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws2}/documents"))
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .body(Body::from(
+            incoming.to_tar().unwrap_or_else(|e| fail(&e.to_string())),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(
+        body["documents"].as_array().map(Vec::len),
+        Some(2),
+        "{body}"
+    );
+    assert_eq!(
+        body["candidates"], 3,
+        "vendor, country, vendor_links_country: {body}"
+    );
+    assert_eq!(body["context"], "# Shipping\n\nAll weights in kg.");
+    let first = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let ready = h.wait_ready(&ws2, &first, "").await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(ready["title"], "Orgenics");
+    let (_, body) = h
+        .get(&format!("/api/v1/workspaces/{ws2}/ontology/candidates"), "")
+        .await;
+    let ids: Vec<&str> = body["candidates"]
+        .as_array()
+        .map(|c| {
+            c.iter()
+                .filter_map(|c| c["proposal"]["id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        ids.contains(&"vendor") && ids.contains(&"vendor_links_country"),
+        "{ids:?}"
+    );
+
+    // A body that is not a tar is a 400.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws2}/documents"))
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .body(Body::from("nope"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

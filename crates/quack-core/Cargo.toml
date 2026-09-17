@@ -35,6 +35,7 @@ secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
 sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+tar           = { workspace = true }
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

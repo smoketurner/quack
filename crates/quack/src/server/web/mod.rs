@@ -1174,6 +1174,37 @@ async fn ontology_page(
     })
 }
 
+/// The one-line detail of a model- or bundle-sourced proposal.
+fn proposal_detail(proposal: &quack_core::ontology::induction::Proposal) -> String {
+    use quack_core::ontology::induction::Proposal;
+    match proposal {
+        Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
+        Proposal::Class(cl) => format!("parent {}", cl.parent),
+        Proposal::Property { class, property } => {
+            format!("{}: {}", class, property.kind.as_str())
+        }
+        Proposal::Mapping(_) => String::new(),
+    }
+}
+
+/// "N bundle files, e.g. ..." for an OKF-bundle candidate.
+fn bundle_evidence(e: &serde_json::Value) -> String {
+    let examples = e
+        .get("examples")
+        .and_then(|x| x.as_array())
+        .map(|xs| {
+            xs.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    format!(
+        "{} bundle files · e.g. {examples}",
+        e.get("files").map(ToString::to_string).unwrap_or_default()
+    )
+}
+
 /// "N mentions in M documents, e.g. ..." for a document-evidence candidate.
 fn document_evidence(e: &serde_json::Value) -> String {
     let get = |k: &str| e.get(k).map(ToString::to_string).unwrap_or_default();
@@ -1210,19 +1241,12 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
             })
             .unwrap_or_default()
     };
-    let from_documents = e.get("source").and_then(|v| v.as_str()) == Some("documents");
+    let source = e.get("source").and_then(|v| v.as_str());
+    let from_documents = source == Some("documents");
+    let from_bundle = source == Some("okf");
     let (evidence, detail) = match c.kind.as_str() {
-        _ if from_documents => (
-            document_evidence(e),
-            match &c.proposal {
-                Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
-                Proposal::Class(cl) => format!("parent {}", cl.parent),
-                Proposal::Property { class, property } => {
-                    format!("{}: {}", class, property.kind.as_str())
-                }
-                Proposal::Mapping(_) => String::new(),
-            },
-        ),
+        _ if from_bundle => (bundle_evidence(e), proposal_detail(&c.proposal)),
+        _ if from_documents => (document_evidence(e), proposal_detail(&c.proposal)),
         "class" => (
             format!(
                 "table {} · {} rows · key {}",

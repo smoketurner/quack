@@ -64,6 +64,14 @@ pub(crate) async fn upload(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    if content_type.starts_with("application/x-tar") {
+        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let bundle = quack_core::okf::Bundle::from_tar(&bytes)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        return import_bundle(&app, &access, bundle).await;
+    }
     let files = if content_type.starts_with("multipart/form-data") {
         let multipart = Multipart::from_request(request, &app)
             .await
@@ -86,7 +94,54 @@ pub(crate) async fn upload(
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "documents": queued })),
-    ))
+    )
+        .into_response())
+}
+
+/// An OKF bundle: every concept file is queued as a Markdown document, the
+/// front matter and links go to the ontology review queue, and the
+/// `index.md` body is returned as `context` for the caller to apply.
+async fn import_bundle(
+    app: &App,
+    access: &Access,
+    bundle: quack_core::okf::Bundle,
+) -> ApiResult<axum::response::Response> {
+    let files: Vec<(String, Vec<u8>)> = bundle
+        .concepts()
+        .map(|f| {
+            (
+                quack_core::okf::document_name(&f.path),
+                f.content.as_bytes().to_vec(),
+            )
+        })
+        .collect();
+    let queued = enqueue(app, access, DocumentSource::Upload, files).await?;
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let for_candidates = bundle.clone();
+    let candidates = with_db(db, move |db| {
+        let current = quack_core::ontology::store::current(db)?;
+        let candidates = quack_core::okf::propose(&for_candidates, current.as_ref());
+        if !candidates.is_empty() {
+            quack_core::ontology::candidates::store_run(db, &candidates)?;
+        }
+        Ok(candidates.len())
+    })
+    .await?;
+    let context = bundle.index().map(|index| {
+        quack_core::okf::parse_front_matter(&index.content)
+            .1
+            .trim()
+            .to_owned()
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "documents": queued,
+            "candidates": candidates,
+            "context": context,
+        })),
+    )
+        .into_response())
 }
 
 /// Every part that carries a file name, as `(name, bytes)`.

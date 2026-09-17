@@ -203,6 +203,12 @@ enum Commands {
         action: graph_cli::GraphAction,
     },
 
+    /// Move the workspace as an Open Knowledge Format bundle
+    Okf {
+        #[command(subcommand)]
+        action: OkfAction,
+    },
+
     /// List ingested documents, or pin and unpin one
     Docs {
         /// Pin a document by id (prefixes accepted)
@@ -221,6 +227,17 @@ enum Commands {
         /// Emit one JSON object per document
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OkfAction {
+    /// Write the workspace as a bundle: index.md from the context, one
+    /// Markdown file per table, class, relation, property, document, and
+    /// graph node, and log.md
+    Export {
+        /// Directory to write (created), or - for a tar archive on stdout
+        dir: String,
     },
 }
 
@@ -395,12 +412,10 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             ontology_cli::run(&config, &ws_db, action).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Graph { action } => {
-            let ws_db = open_workspace(cli).await?;
-            let config = Config::load().context("failed to load configuration")?;
-            graph_cli::run(&config, &ws_db, action).await?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Commands::Graph { action } => run_graph(cli, action).await,
+        Commands::Okf {
+            action: OkfAction::Export { dir },
+        } => run_okf_export(cli, &dir).await,
         Commands::Context { action } => {
             let ws_db = open_workspace(cli).await?;
             run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
@@ -542,11 +557,41 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Context { .. }
         | Commands::Ontology { .. }
         | Commands::Graph { .. }
+        | Commands::Okf { .. }
         | Commands::Auth { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
         | Commands::Docs { .. } => Ok(()),
     }
+}
+
+/// `quack graph ...`: the knowledge graph from the shell.
+async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode> {
+    let ws_db = open_workspace(cli).await?;
+    let config = Config::load().context("failed to load configuration")?;
+    graph_cli::run(&config, &ws_db, action).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `quack okf export DIR`: the workspace as an Open Knowledge Format
+/// bundle, a directory of Markdown files or a tar on stdout.
+async fn run_okf_export(cli: &Cli, dir: &str) -> Result<ExitCode> {
+    init_logging();
+    let (config, workspace, name) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let ws_db =
+        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let bundle = quack_core::okf::export(&ws_db, &name)?;
+    if dir == "-" {
+        let mut out = std::io::stdout().lock();
+        out.write_all(&bundle.to_tar()?)?;
+        out.flush()?;
+    } else {
+        bundle.write_to(&PathBuf::from(dir))?;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        writeln!(out, "wrote {} files to {dir}", bundle.files.len())?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `quack mcp`: the workspace as an MCP server on stdin and stdout.
@@ -1100,6 +1145,9 @@ async fn run_ingest(
 ) -> Result<()> {
     let (config, workspace, _) = resolve_workspace(workspace_name).await?;
 
+    if file != "-" && PathBuf::from(file).is_dir() {
+        return ingest_bundle(&config, &workspace.id, file, no_embed).await;
+    }
     let (data, effective_filename) = read_input(file, filename_override)?;
 
     let ws_db =
@@ -1167,6 +1215,101 @@ async fn run_ingest(
         }
     }
 
+    out.flush()?;
+    Ok(())
+}
+
+/// `quack ingest DIR`: an OKF bundle. Every concept file becomes a
+/// Markdown document, its front matter and links feed the ontology review
+/// queue, and `index.md` is offered as the workspace context.
+async fn ingest_bundle(
+    config: &Config,
+    workspace_id: &str,
+    dir: &str,
+    no_embed: bool,
+) -> Result<()> {
+    let bundle = quack_core::okf::Bundle::from_dir(&PathBuf::from(dir))?;
+    let ws_db =
+        WorkspaceDb::open(config, workspace_id).context("failed to open workspace database")?;
+    let embedding_model = if no_embed {
+        None
+    } else {
+        llm::optional_embedding_model(config)
+            .await
+            .context("failed to build embedding model")?
+    };
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut stored = 0usize;
+    let mut skipped = 0usize;
+    for file in bundle.concepts() {
+        let (front, _) = quack_core::okf::parse_front_matter(&file.content);
+        let name = quack_core::okf::document_name(&file.path);
+        let outcome = ingestion::ingest_file(
+            config,
+            &ws_db,
+            workspace_id,
+            &NewFile::new(&name, file.content.as_bytes()).title(front.get("title")),
+            embedding_model.as_ref(),
+        )
+        .await
+        .with_context(|| format!("ingesting {}", file.path))?;
+        match outcome {
+            IngestOutcome::Ingested(_) => stored = stored.saturating_add(1),
+            IngestOutcome::Duplicate(_) => skipped = skipped.saturating_add(1),
+        }
+    }
+    writeln!(
+        out,
+        "Ingested {stored} concept files from {dir}{}.",
+        if skipped > 0 {
+            format!(" ({skipped} already present)")
+        } else {
+            String::new()
+        }
+    )?;
+    let current = quack_core::ontology::store::current(&ws_db)?;
+    let candidates = quack_core::okf::propose(&bundle, current.as_ref());
+    if !candidates.is_empty() {
+        quack_core::ontology::candidates::store_run(&ws_db, &candidates)?;
+        writeln!(
+            out,
+            "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
+            candidates.len()
+        )?;
+    }
+    if let Some(index) = bundle.index() {
+        let (_, body) = quack_core::okf::parse_front_matter(&index.content);
+        let body = body.trim();
+        if !body.is_empty() {
+            let existing = context::current(&ws_db)?.map(|c| c.content);
+            if existing.as_deref() == Some(body) {
+                writeln!(out, "index.md already is the workspace context.")?;
+            } else {
+                write!(
+                    out,
+                    "index.md can become the workspace context{}. Apply it? [y/N] ",
+                    if existing.is_some() {
+                        " (replacing the current one)"
+                    } else {
+                        ""
+                    }
+                )?;
+                out.flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if matches!(answer.trim(), "y" | "Y" | "yes") {
+                    let stored = context::set(&ws_db, body, None)?;
+                    writeln!(out, "context is now version {}", stored.version)?;
+                } else {
+                    writeln!(
+                        out,
+                        "Left the context alone; `quack context import {dir}/index.md` applies it later."
+                    )?;
+                }
+            }
+        }
+    }
     out.flush()?;
     Ok(())
 }

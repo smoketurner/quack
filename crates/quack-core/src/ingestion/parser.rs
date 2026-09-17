@@ -143,10 +143,16 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
             title: None,
             sections: extract_pdf_sections(data)?,
         }),
-        FileType::Markdown => Ok(Extracted {
-            title: None,
-            sections: markdown_sections(&utf8(data)?),
-        }),
+        FileType::Markdown => {
+            let text = utf8(data)?;
+            // YAML front matter (Obsidian, Jekyll, OKF) is metadata, not
+            // prose: its `title` is the document's, the rest is dropped.
+            let (front, body) = crate::okf::parse_front_matter(&text);
+            Ok(Extracted {
+                title: front.get("title").map(str::to_owned),
+                sections: markdown_sections(body),
+            })
+        }
         FileType::Text => Ok(Extracted {
             title: None,
             sections: vec![Section {
@@ -299,6 +305,21 @@ fn is_setext_underline(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_front_matter_gives_the_title_and_is_not_chunked() {
+        let extracted = extract(
+            &FileType::Markdown,
+            b"---\ntitle: Renewal Guide\ntags: [a]\n---\n\n# Terms\n\nThirty days.\n",
+        )
+        .unwrap_or_else(|_| Extracted {
+            title: None,
+            sections: Vec::new(),
+        });
+        assert_eq!(extracted.title(), Some("Renewal Guide"));
+        assert_eq!(extracted.sections.len(), 1);
+        assert!(extracted.sections.iter().all(|s| !s.text.contains("tags:")));
+    }
 
     #[test]
     fn title_is_the_first_heading_when_there_is_one() {

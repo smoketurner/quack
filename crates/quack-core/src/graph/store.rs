@@ -215,6 +215,23 @@ pub(crate) fn edge_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Edge> {
     })
 }
 
+/// Every node id, ordered by class then label.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn all_node_ids(db: &WorkspaceDb) -> Result<Vec<String>> {
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT id FROM _quack_graph_nodes ORDER BY class_id, label, id")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
 /// One node by id.
 ///
 /// # Errors

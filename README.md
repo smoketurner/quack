@@ -39,6 +39,7 @@ cargo run --bin quack -- -p "what is excluded?" --mode query          # sources 
 cargo run --bin quack -- context edit                                 # definitions the agent follows
 cargo run --bin quack -- ontology propose                             # draft the graph schema from the tables, then review
 cargo run --bin quack -- graph extract -y && cargo run --bin quack -- graph search Kenya   # build the knowledge graph, walk it
+cargo run --bin quack -- okf export ./bundle                          # the workspace as an Open Knowledge Format bundle (ingest DIR imports one)
 cargo run --bin quack -- auth login azure                             # OAuth sign-in for a provider
 cargo run --bin quack -- user add alice --admin                       # server users, tokens, members, audit
 cargo run --bin quack -- token create -w myworkspace --user alice --name ci --scopes read,write

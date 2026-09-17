@@ -464,6 +464,19 @@ fn evidence_line(c: &candidates::CandidateRow) -> String {
             })
             .unwrap_or_default()
     };
+    if e.get("source").and_then(|v| v.as_str()) == Some("okf") {
+        let examples = e
+            .get("examples")
+            .and_then(|x| x.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!("{} bundle files, e.g. {examples}", get("files"));
+    }
     if e.get("source").and_then(|v| v.as_str()) == Some("documents") {
         let examples = e
             .get("examples")

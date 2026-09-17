@@ -5,5 +5,6 @@ pub mod error;
 pub mod graph;
 pub mod ingestion;
 pub mod llm;
+pub mod okf;
 pub mod ontology;
 pub mod storage;

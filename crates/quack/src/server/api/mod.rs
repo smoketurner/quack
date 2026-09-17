@@ -8,6 +8,7 @@ mod context;
 pub(crate) mod documents;
 pub(crate) mod graph;
 mod members;
+pub(crate) mod okf;
 pub(crate) mod ontology;
 pub(crate) mod query;
 pub(crate) mod sessions;
@@ -80,6 +81,7 @@ pub(crate) fn router() -> Router<App> {
             "/workspaces/{id}/ontology/versions/{v}/restore",
             post(ontology::restore),
         )
+        .route("/workspaces/{id}/okf", get(okf::export))
         .route("/workspaces/{id}/graph/search", get(graph::search))
         .route("/workspaces/{id}/graph/path", get(graph::path))
         .route("/workspaces/{id}/graph/status", get(graph::status))

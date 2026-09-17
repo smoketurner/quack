@@ -491,8 +491,9 @@ names, the `name` column is the directory name and a display name lives in `_qua
 ### 6.1 Documents and vectorization
 
 **Sources.** File upload (web, REST, desktop), paste (web: a text box that becomes a
-document), path (TUI, CLI), stdin (print mode). URL, GitHub, and Confluence connectors are
-deferred (section 18).
+document), path (TUI, CLI), stdin (print mode), and an OKF bundle as a directory or a tar
+(every concept file a document, section 17 item 13). URL, GitHub, and Confluence
+connectors are deferred (section 18).
 
 **Parsing.**
 
@@ -1422,10 +1423,18 @@ updated as issues close. Ordered by risk.
     6.1, 15.
 12. ~~Web UI mapping of the chart spec to ECharts~~ (#26, closed): `static/js/app.js`
     maps the spec to an ECharts option. Section 9.
-13. **Open Knowledge Format export and import** (#36): a workspace as an OKF bundle
-    (tables, ontology, documents, context, and, after #28, one concept per graph node)
-    and a bundle as ingestible evidence. Filed after the ontology landed; depends on #28
-    for the entity concepts.
+13. ~~Open Knowledge Format export and import~~ (#36, closed): `quack okf export DIR`
+    (or `-` for a tar on stdout) and `GET /api/v1/workspaces/{id}/okf` (a tar, audited as
+    `export`) write `index.md` from the context, one Markdown file with YAML front matter
+    per table (schema, sample rows, mapping links), class, relation, property, document,
+    and graph node (properties, links per edge, provenance per chunk and row), and
+    `log.md` from the ontology versions and the audit detail. `quack ingest DIR` on a
+    bundle and `POST .../documents` with an `application/x-tar` body ingest every concept
+    file as a Markdown document, turn front-matter types into class candidates, links
+    between typed concepts into relation candidates (`<source>_links_<target>`), and
+    `resource` into a document property candidate, all in the ontology review queue; the
+    CLI offers `index.md` as the workspace context and the API returns it as `context`.
+    `quack_core::okf`.
 
 ---
 

@@ -1,0 +1,49 @@
+//! The workspace as an Open Knowledge Format bundle: `GET .../okf` answers
+//! a tar archive of Markdown files, audited as `export` because it moves
+//! content across the boundary. Import is `POST .../documents` with a tar
+//! body (see `documents::upload`).
+
+use axum::extract::{Path, State};
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use quack_core::storage::control::Outcome;
+
+use crate::server::auth::{Identity, Need, access};
+use crate::server::error::ApiResult;
+use crate::server::state::{App, with_db};
+
+pub(crate) async fn export(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    let db = app.workspace_db(&id).await?;
+    let name = access.workspace.name.clone();
+    let (bytes, files) = with_db(db, move |db| {
+        let bundle = quack_core::okf::export(db, &name)?;
+        Ok((bundle.to_tar()?, bundle.files.len()))
+    })
+    .await?;
+    access
+        .audit(
+            &app,
+            "export",
+            Some(("workspace", &id)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "format": "okf", "files": files })),
+        )
+        .await?;
+    let filename = format!("{}.okf.tar", quack_core::okf::slug(&access.workspace.name));
+    Ok((
+        [
+            (header::CONTENT_TYPE, String::from("application/x-tar")),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
