@@ -376,7 +376,8 @@ impl WorkspaceDb {
                 error_message TEXT,
                 pinned BOOLEAN NOT NULL DEFAULT false,
                 chunk_count INTEGER,
-                ingested_by TEXT
+                ingested_by TEXT,
+                tables JSON
             );
             CREATE TABLE IF NOT EXISTS _quack_chunks (
                 id TEXT PRIMARY KEY,
@@ -394,6 +395,7 @@ impl WorkspaceDb {
             ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
             ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
             ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
+            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
             CREATE TABLE IF NOT EXISTS _quack_terms (
@@ -631,6 +633,21 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Record the tables a structured document loaded into, so deleting
+    /// the document drops them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_tables(&self, id: &str, tables: &[String]) -> crate::error::Result<()> {
+        let json = serde_json::to_string(tables)?;
+        self.conn.execute(
+            "UPDATE _quack_documents SET tables = ? WHERE id = ?",
+            duckdb::params![json, id],
+        )?;
+        Ok(())
+    }
+
     /// Record how many chunks a processed document produced.
     ///
     /// # Errors
@@ -685,9 +702,10 @@ impl WorkspaceDb {
         }
     }
 
-    /// Remove a document with its chunks and term index. When it was loaded
-    /// as a table, the table (named by `table_name`) is dropped too. Returns
-    /// whether the document existed.
+    /// Remove a document with its chunks and term index. The tables it
+    /// loaded into are dropped too: those recorded on the row, or for rows
+    /// from before that was recorded, `fallback_table`. Returns whether the
+    /// document existed.
     ///
     /// # Errors
     ///
@@ -695,10 +713,14 @@ impl WorkspaceDb {
     pub fn delete_document(
         &self,
         id: &str,
-        table_name: Option<&str>,
+        fallback_table: Option<&str>,
     ) -> crate::error::Result<bool> {
-        let Some(_doc) = self.document(id)? else {
+        let Some(doc) = self.document(id)? else {
             return Ok(false);
+        };
+        let tables: Vec<String> = match doc.tables {
+            Some(tables) => tables,
+            None => fallback_table.map(str::to_owned).into_iter().collect(),
         };
         self.conn.execute(
             "DELETE FROM _quack_terms WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
@@ -712,7 +734,7 @@ impl WorkspaceDb {
             "DELETE FROM _quack_documents WHERE id = ?",
             duckdb::params![id],
         )?;
-        if let Some(table) = table_name {
+        for table in &tables {
             self.conn
                 .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
         }
@@ -1238,6 +1260,9 @@ pub struct DocumentInfo {
     pub chunk_count: Option<i64>,
     /// Server user who uploaded it; `None` from the CLI.
     pub ingested_by: Option<String>,
+    /// Tables a structured document loaded into; `None` until processed
+    /// and for rows written before this was recorded.
+    pub tables: Option<Vec<String>>,
     pub ingested_at: String,
 }
 
@@ -1331,7 +1356,7 @@ impl<'a> NewDocument<'a> {
 
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
-     ingested_by FROM _quack_documents";
+     ingested_by, CAST(tables AS VARCHAR) FROM _quack_documents";
 
 fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
     Ok(DocumentInfo {
@@ -1348,6 +1373,9 @@ fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
         source: DocumentSource::from_column(row.get::<_, Option<String>>(10)?.as_deref()),
         chunk_count: row.get(11)?,
         ingested_by: row.get(12)?,
+        tables: row
+            .get::<_, Option<String>>(13)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -1944,34 +1972,6 @@ mod tests {
     }
 
     #[test]
-    fn describe_table_reports_the_exact_row_count() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
-        assert!(
-            db.execute_statement("INSERT INTO t VALUES (1), (2), (3)")
-                .is_ok()
-        );
-        let desc = db
-            .describe_table("t")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(desc.row_count, 3);
-        assert_eq!(desc.sample_rows.rows.len(), 3);
-        assert!(db.count_rows("missing").is_err());
-        let version = db.duckdb_version().unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(version.starts_with('v'), "{version}");
-    }
-
-    fn sample() -> QueryResults {
-        QueryResults {
-            columns: vec![String::from("name"), String::from("n")],
-            rows: vec![
-                vec![
-                    serde_json::Value::String(String::from("a,b")),
-                    serde_json::Value::Number(1.into()),
-                ],
-                vec![
-                    serde_json::Value::String(String::from("say \"hi\"")),
-    #[test]
     fn query_values_keep_fractions_dates_and_nested_types() {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
         let results = db
@@ -2004,6 +2004,34 @@ mod tests {
         assert_eq!(serde_json::Value::Array(row.clone()), expected);
     }
 
+    #[test]
+    fn describe_table_reports_the_exact_row_count() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
+        assert!(
+            db.execute_statement("INSERT INTO t VALUES (1), (2), (3)")
+                .is_ok()
+        );
+        let desc = db
+            .describe_table("t")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(desc.row_count, 3);
+        assert_eq!(desc.sample_rows.rows.len(), 3);
+        assert!(db.count_rows("missing").is_err());
+        let version = db.duckdb_version().unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(version.starts_with('v'), "{version}");
+    }
+
+    fn sample() -> QueryResults {
+        QueryResults {
+            columns: vec![String::from("name"), String::from("n")],
+            rows: vec![
+                vec![
+                    serde_json::Value::String(String::from("a,b")),
+                    serde_json::Value::Number(1.into()),
+                ],
+                vec![
+                    serde_json::Value::String(String::from("say \"hi\"")),
                     serde_json::Value::Null,
                 ],
             ],

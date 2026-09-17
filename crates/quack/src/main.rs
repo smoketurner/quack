@@ -1116,7 +1116,7 @@ async fn run_ingest(
         writeln!(out, "  Pinned: yes")?;
     }
 
-    if let Some(table) = &result.table_name {
+    for table in &result.tables {
         writeln!(out, "  Table: {table}")?;
     }
     if result.chunks_stored > 0 {

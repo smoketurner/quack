@@ -500,8 +500,9 @@ deferred (section 18).
 |------|--------|--------------------|
 | PDF | `pdf-extract` | page numbers |
 | Markdown, plain text | direct | headings (ATX and setext) |
-| HTML | `scraper` or `html2text` | headings, title |
-| DOCX, PPTX | `docx-rs` / zip + XML | headings (from styles) |
+| HTML | `scraper` (html5ever) | headings, `<title>` |
+| DOCX | `zip` + `quick-xml` | headings from `Heading N` and `Title` styles, core title |
+| PPTX | `zip` + `quick-xml` | one section per slide, slide title as heading, slide number as page |
 | CSV, Parquet, JSON, JSONL, XLSX | DuckDB (section 6.2) | become tables, not chunks |
 
 Scanned PDFs (no text layer) are detected and reported as `error: no extractable text`;
@@ -540,7 +541,7 @@ each turn (subject to the history token budget) rather than retrieved.
 | Type | Mechanism | Result |
 |------|-----------|--------|
 | CSV, TSV, Parquet, JSON, JSONL | `read_csv_auto` / `read_parquet` / `read_json_auto` | Table in `data.duckdb` (server, desktop); view over the file in place (TUI in a `.quack/` directory) |
-| Excel `.xlsx` | `excel` extension, `read_xlsx` | One table per sheet |
+| Excel `.xlsx`, `.xls`, `.ods` | `calamine` (pure Rust) writes each sheet as CSV under `files/` for `read_csv_auto` | One table per data sheet: `<stem>` for one sheet, `<stem>_<sheet>` otherwise; recorded on the document row so deleting it drops them |
 | stdin (print mode) | sniffed | Temporary table `stdin` |
 | Postgres, SQLite, S3/HTTP Parquet | Deferred: the scanner and httpfs extensions cannot be compiled into the static binary (section 15); a Rust-side importer is the candidate design | — |
 
@@ -1357,7 +1358,9 @@ updated as issues close. Ordered by risk.
    model naming pass, and drift counting arrives with constrained extraction in #28.
    YAML was dropped: JSON is the only interchange form. **No graph** (#28). Sections
    6.3 to 6.5.
-5. **DOCX, HTML, PPTX, XLSX unsupported** (#16; XLSX via a Rust reader). Sections 6.1, 6.2.
+5. ~~DOCX, HTML, PPTX, XLSX unsupported~~ (#16, closed): HTML through `scraper`, DOCX and
+   PPTX through `zip` + `quick-xml`, workbooks through `calamine` as one table per sheet,
+   each format carrying its own title. Sections 6.1, 6.2.
 6. **No `ATTACH` to external databases** (#21): needs a Rust-side design now that scanner
    extensions are out. Section 6.2, step 13.
 7. ~~Document registry lacks `sha256` dedup, `source`, `title`~~ (#22, closed): identical

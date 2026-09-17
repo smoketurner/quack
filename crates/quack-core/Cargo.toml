@@ -13,18 +13,22 @@ workspace = true
 argon2        = { workspace = true, features = ["alloc", "password-hash", "getrandom"] }
 aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
 base64        = { workspace = true, features = ["std"] }
+calamine      = { workspace = true }
 dirs          = { workspace = true }
 duckdb        = { workspace = true, features = ["bundled", "json"] }
+ego-tree      = { workspace = true }
 futures       = { workspace = true, features = ["std"] }
 http          = { workspace = true, features = ["std"] }
 jiff          = { workspace = true, features = ["std", "serde"] }
 keyring-core  = { workspace = true }
 oauth2        = { workspace = true }
 pdf-extract   = { workspace = true }
+quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
 rustls        = { workspace = true, features = ["aws_lc_rs", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
+scraper       = { workspace = true }
 sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
@@ -36,6 +40,7 @@ tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sy
 toml          = { workspace = true, features = ["std", "parse", "serde"] }
 tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
+zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, features = ["keychain"] }
@@ -48,3 +53,4 @@ windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+zip      = { workspace = true, features = ["deflate-flate2-zlib-rs"] }

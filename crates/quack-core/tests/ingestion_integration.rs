@@ -128,7 +128,7 @@ async fn ingest_text_without_embeddings() {
     assert_eq!(result.filename, "test.txt");
     assert_eq!(result.file_type, FileType::Text);
     assert!(result.chunks_stored > 0);
-    assert!(result.table_name.is_none());
+    assert!(result.tables.is_empty());
 
     let qr = db
         .execute_query("SELECT COUNT(*) AS cnt FROM _quack_chunks")
@@ -197,7 +197,7 @@ async fn ingest_csv_structured() {
 
     assert_eq!(result.file_type, FileType::Csv);
     assert_eq!(result.chunks_stored, 0);
-    assert_eq!(result.table_name.as_deref(), Some("people"));
+    assert_eq!(result.tables, ["people"]);
 
     let qr = db
         .execute_query("SELECT COUNT(*) AS cnt FROM people")
@@ -232,7 +232,7 @@ async fn ingest_json_structured() {
     .unwrap();
 
     assert_eq!(result.file_type, FileType::Json);
-    assert_eq!(result.table_name.as_deref(), Some("scores"));
+    assert_eq!(result.tables, ["scores"]);
 
     let qr = db
         .execute_query("SELECT COUNT(*) AS cnt FROM scores")
@@ -900,7 +900,7 @@ async fn ingest_csv_with_quote_in_filename() {
     .unwrap()
     .ingested()
     .unwrap();
-    assert_eq!(result.table_name.as_deref(), Some("it_s_a_file"));
+    assert_eq!(result.tables, ["it_s_a_file"]);
     let rows = db
         .execute_query("SELECT sum(a) AS s FROM it_s_a_file")
         .unwrap();
@@ -1270,5 +1270,154 @@ fn piped_bytes_load_as_a_temporary_stdin_table() {
             .list_tables()
             .unwrap()
             .contains(&String::from("stdin"))
+    );
+}
+
+/// A minimal two-sheet workbook with inline strings, enough for calamine.
+fn tiny_xlsx() -> Vec<u8> {
+    use std::io::Write as _;
+    let parts: [(&str, &str); 6] = [
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/workbook.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sales Q1" sheetId="1" r:id="rId1"/><sheet name="Notes" sheetId="2" r:id="rId2"/></sheets></workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>region</t></is></c><c r="B1" t="inlineStr"><is><t>total</t></is></c><c r="C1" t="inlineStr"><is><t>when</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>north</t></is></c><c r="B2"><v>10</v></c><c r="C2" s="1"><v>45000</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>south, east</t></is></c><c r="B3"><v>20.5</v></c><c r="C3" s="1"><v>45001</v></c></row></sheetData></worksheet>"#,
+        ),
+        (
+            "xl/worksheets/sheet2.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>note</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>only one column</t></is></c></row></sheetData></worksheet>"#,
+        ),
+    ];
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in parts {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+#[tokio::test]
+async fn workbook_loads_one_table_per_sheet_and_delete_drops_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-xlsx").unwrap();
+    let bytes = tiny_xlsx();
+    let result = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-xlsx",
+        &ingestion::NewFile::new("Region Sales.xlsx", &bytes),
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(result.file_type, FileType::Xlsx);
+    assert_eq!(
+        result.tables,
+        ["Region_Sales_Sales_Q1", "Region_Sales_Notes"]
+    );
+    let mut tables = db.list_tables().unwrap();
+    tables.sort();
+    assert_eq!(tables, ["Region_Sales_Notes", "Region_Sales_Sales_Q1"]);
+
+    let rows = db
+        .execute_query("SELECT region, total FROM Region_Sales_Sales_Q1 ORDER BY total")
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![serde_json::json!("north"), serde_json::json!(10.0)],
+            vec![serde_json::json!("south, east"), serde_json::json!(20.5)],
+        ]
+    );
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(
+        doc.tables.as_deref(),
+        Some(
+            &[
+                "Region_Sales_Sales_Q1".to_owned(),
+                "Region_Sales_Notes".to_owned()
+            ][..]
+        )
+    );
+
+    assert!(db.delete_document(&result.document_id, None).unwrap());
+    assert!(db.list_tables().unwrap().is_empty());
+    assert!(db.document(&result.document_id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn office_and_html_documents_are_chunked_with_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-office").unwrap();
+    let page = b"<html><head><title>Renewal Guide</title></head><body><h1>Terms</h1><p>Thirty days.</p></body></html>";
+    let result = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-office",
+        &ingestion::NewFile::new("guide.html", page),
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(result.file_type, FileType::Html);
+    assert_eq!(result.chunks_stored, 1);
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.title.as_deref(), Some("Renewal Guide"));
+    let chunk = db
+        .execute_query("SELECT heading, content FROM _quack_chunks")
+        .unwrap();
+    assert_eq!(
+        chunk.rows,
+        vec![vec![
+            serde_json::json!("Terms"),
+            serde_json::json!("Thirty days.")
+        ]]
+    );
+
+    let failed = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-office",
+        &ingestion::NewFile::new("deck.pptx", b"not a package"),
+        None::<&MockEmbeddingModel>,
+    )
+    .await;
+    assert!(failed.is_err());
+    let errored = db
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.filename == "deck.pptx")
+        .unwrap();
+    assert!(
+        errored
+            .error_message
+            .is_some_and(|m| m.contains("not a PPTX"))
     );
 }

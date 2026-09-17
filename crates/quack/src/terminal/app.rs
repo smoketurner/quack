@@ -1131,10 +1131,11 @@ async fn run_ingest_inner(
         }
     };
 
-    let table_part = result
-        .table_name
-        .as_ref()
-        .map_or(String::new(), |t| format!(" as table \"{t}\""));
+    let table_part = match result.tables.as_slice() {
+        [] => String::new(),
+        [table] => format!(" as table \"{table}\""),
+        tables => format!(" as tables {}", tables.join(", ")),
+    };
     let chunks_part = if result.chunks_stored > 0 {
         let embed = if embedding_model.is_some() {
             " with embeddings"

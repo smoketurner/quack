@@ -1,5 +1,8 @@
 pub mod chunker;
+pub mod html;
+pub mod office;
 pub mod parser;
+pub mod xlsx;
 
 use std::sync::{Arc, Mutex};
 
@@ -46,7 +49,8 @@ pub struct IngestResult {
     pub filename: String,
     pub file_type: parser::FileType,
     pub chunks_stored: u32,
-    pub table_name: Option<String>,
+    /// Tables a structured file loaded into: one, or one per workbook sheet.
+    pub tables: Vec<String>,
 }
 
 /// What `ingest_file` did: stored the file, or skipped it because a
@@ -213,6 +217,7 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     match &outcome {
         Ok(result) => db.with(|db| {
             db.set_document_chunk_count(doc_id, result.chunks_stored)?;
+            db.set_document_tables(doc_id, &result.tables)?;
             db.update_document_status(doc_id, "ready")
         })?,
         Err(e) => db.with(|db| db.mark_document_error(doc_id, &e.to_string()))?,
@@ -240,14 +245,30 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 filename: filename.to_owned(),
                 file_type,
                 chunks_stored: 0,
-                table_name: Some(table_name),
+                tables: vec![table_name],
             })
         }
-        parser::FileType::Pdf | parser::FileType::Text | parser::FileType::Markdown => {
-            let sections = parser::extract_sections(&file_type, data)?;
-            if let Some(title) = parser::title_of(&sections) {
+        parser::FileType::Xlsx => {
+            let tables = db.with(|db| ingest_workbook(config, db, workspace_id, filename, data))?;
+            Ok(IngestResult {
+                document_id: doc_id.to_owned(),
+                filename: filename.to_owned(),
+                file_type,
+                chunks_stored: 0,
+                tables,
+            })
+        }
+        parser::FileType::Pdf
+        | parser::FileType::Text
+        | parser::FileType::Markdown
+        | parser::FileType::Html
+        | parser::FileType::Docx
+        | parser::FileType::Pptx => {
+            let extracted = parser::extract(&file_type, data)?;
+            if let Some(title) = extracted.title() {
                 db.with(|db| db.set_document_title_if_empty(doc_id, title))?;
             }
+            let sections = extracted.sections;
             let chunks = chunker::chunk_sections(
                 &sections,
                 config.ingestion.chunk_size_tokens,
@@ -260,7 +281,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 filename: filename.to_owned(),
                 file_type,
                 chunks_stored: chunk_count,
-                table_name: None,
+                tables: Vec::new(),
             })
         }
         parser::FileType::Unknown => Err(Error::UnsupportedFileType(filename.to_owned())),
@@ -352,9 +373,13 @@ fn ingest_structured(
         parser::FileType::Csv => "read_csv_auto",
         parser::FileType::Parquet => "read_parquet",
         parser::FileType::Json => "read_json_auto",
-        parser::FileType::Pdf
+        parser::FileType::Xlsx
+        | parser::FileType::Pdf
         | parser::FileType::Text
         | parser::FileType::Markdown
+        | parser::FileType::Html
+        | parser::FileType::Docx
+        | parser::FileType::Pptx
         | parser::FileType::Unknown => {
             return Err(Error::Ingestion("not a structured file type".into()));
         }
@@ -368,6 +393,43 @@ fn ingest_structured(
     tracing::info!(table = %table_name, file = %filename, "created table from structured file");
 
     Ok(table_name)
+}
+
+/// Every data sheet of a workbook as its own table: `<stem>` for a single
+/// sheet, `<stem>_<sheet>` otherwise. The sheets pass through `files/` as
+/// CSV for `DuckDB`'s reader (the `excel` extension is not in the static
+/// binary).
+fn ingest_workbook(
+    config: &Config,
+    db: &WorkspaceDb,
+    workspace_id: &str,
+    filename: &str,
+    data: &[u8],
+) -> Result<Vec<String>> {
+    let sheets = xlsx::sheets(data)?;
+    let files_dir = config.workspace_files_dir(workspace_id);
+    std::fs::create_dir_all(&files_dir)?;
+    let stem = sanitize_table_name(filename);
+    let single = sheets.len() == 1;
+    let mut tables = Vec::with_capacity(sheets.len());
+    for sheet in sheets {
+        let table_name = if single {
+            stem.clone()
+        } else {
+            format!("{stem}_{}", sanitize_identifier(&sheet.sheet))
+        };
+        let dest = files_dir.join(format!("{table_name}.csv"));
+        std::fs::write(&dest, &sheet.csv)?;
+        let path = dest.to_string_lossy();
+        let create_sql = format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT * FROM read_csv_auto(?, header = true)",
+            quote_ident(&table_name)
+        );
+        db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
+        tracing::info!(table = %table_name, sheet = %sheet.sheet, rows = sheet.rows, file = %filename, "created table from workbook sheet");
+        tables.push(table_name);
+    }
+    Ok(tables)
 }
 
 async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
@@ -450,8 +512,11 @@ fn sanitize_table_name(filename: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("imported");
+    sanitize_identifier(stem)
+}
 
-    stem.chars()
+fn sanitize_identifier(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '_' {
                 c

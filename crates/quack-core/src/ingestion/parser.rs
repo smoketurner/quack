@@ -8,9 +8,13 @@ pub enum FileType {
     Csv,
     Parquet,
     Json,
+    Xlsx,
     Pdf,
     Text,
     Markdown,
+    Html,
+    Docx,
+    Pptx,
     Unknown,
 }
 
@@ -21,16 +25,32 @@ impl FileType {
             Self::Csv => "text/csv",
             Self::Parquet => "application/vnd.apache.parquet",
             Self::Json => "application/json",
+            Self::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             Self::Pdf => "application/pdf",
             Self::Text => "text/plain",
             Self::Markdown => "text/markdown",
+            Self::Html => "text/html",
+            Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            Self::Pptx => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            }
             Self::Unknown => "application/octet-stream",
         }
     }
 
+    /// Loaded as tables rather than chunked.
     #[must_use]
     pub fn is_structured(&self) -> bool {
-        matches!(self, Self::Csv | Self::Parquet | Self::Json)
+        match self {
+            Self::Csv | Self::Parquet | Self::Json | Self::Xlsx => true,
+            Self::Pdf
+            | Self::Text
+            | Self::Markdown
+            | Self::Html
+            | Self::Docx
+            | Self::Pptx
+            | Self::Unknown => false,
+        }
     }
 }
 
@@ -40,12 +60,36 @@ impl std::fmt::Display for FileType {
             Self::Csv => "CSV",
             Self::Parquet => "Parquet",
             Self::Json => "JSON",
+            Self::Xlsx => "Excel",
             Self::Pdf => "PDF",
             Self::Text => "Text",
             Self::Markdown => "Markdown",
+            Self::Html => "HTML",
+            Self::Docx => "Word",
+            Self::Pptx => "PowerPoint",
             Self::Unknown => "Unknown",
         };
         f.write_str(label)
+    }
+}
+
+/// What a parse yields: the document's own title when the format carries
+/// one (`<title>`, Office core properties), and its sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extracted {
+    pub title: Option<String>,
+    pub sections: Vec<Section>,
+}
+
+impl Extracted {
+    /// The title: the document's own, else the first section's heading.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .or_else(|| title_of(&self.sections))
     }
 }
 
@@ -69,37 +113,66 @@ pub fn detect_file_type(filename: &str) -> FileType {
         .to_ascii_lowercase();
 
     match ext.as_str() {
-        "csv" => FileType::Csv,
+        "csv" | "tsv" => FileType::Csv,
         "parquet" | "pq" => FileType::Parquet,
         "json" | "jsonl" | "ndjson" => FileType::Json,
+        "xlsx" | "xlsm" | "xls" | "ods" => FileType::Xlsx,
         "pdf" => FileType::Pdf,
         "md" | "markdown" => FileType::Markdown,
         "txt" | "text" | "log" => FileType::Text,
+        "html" | "htm" | "xhtml" => FileType::Html,
+        "docx" => FileType::Docx,
+        "pptx" => FileType::Pptx,
         _ => FileType::Unknown,
     }
 }
 
-/// Extract an unstructured file as sections carrying heading and page
-/// metadata: PDFs one section per page, Markdown one per heading, plain
-/// text a single section.
+/// Extract an unstructured file: PDFs one section per page, Markdown one
+/// per heading, HTML one per heading with the `<title>`, DOCX one per
+/// heading style with the core title, PPTX one per slide, plain text a
+/// single section.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be parsed, or if a PDF has no text
-/// layer at all (scanned pages need OCR, which is not supported).
-pub fn extract_sections(file_type: &FileType, data: &[u8]) -> Result<Vec<Section>> {
+/// Returns an error if the file cannot be parsed, or if it has no text at
+/// all (a scanned PDF without a text layer needs OCR, which is not
+/// supported).
+pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
     match file_type {
-        FileType::Pdf => extract_pdf_sections(data),
-        FileType::Markdown => Ok(markdown_sections(&utf8(data)?)),
-        FileType::Text => Ok(vec![Section {
-            heading: None,
-            page: None,
-            text: utf8(data)?,
-        }]),
-        other => Err(Error::Ingestion(format!(
-            "cannot extract text from {other} files"
-        ))),
+        FileType::Pdf => Ok(Extracted {
+            title: None,
+            sections: extract_pdf_sections(data)?,
+        }),
+        FileType::Markdown => Ok(Extracted {
+            title: None,
+            sections: markdown_sections(&utf8(data)?),
+        }),
+        FileType::Text => Ok(Extracted {
+            title: None,
+            sections: vec![Section {
+                heading: None,
+                page: None,
+                text: utf8(data)?,
+            }],
+        }),
+        FileType::Html => super::html::html(&utf8(data)?),
+        FileType::Docx => super::office::docx(data),
+        FileType::Pptx => super::office::pptx(data),
+        FileType::Csv | FileType::Parquet | FileType::Json | FileType::Xlsx | FileType::Unknown => {
+            Err(Error::Ingestion(format!(
+                "cannot extract text from {file_type} files"
+            )))
+        }
     }
+}
+
+/// The sections of an unstructured file; see [`extract`].
+///
+/// # Errors
+///
+/// As [`extract`].
+pub fn extract_sections(file_type: &FileType, data: &[u8]) -> Result<Vec<Section>> {
+    extract(file_type, data).map(|e| e.sections)
 }
 
 /// The document title a parse yields: the first section's heading when
