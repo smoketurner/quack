@@ -440,12 +440,23 @@ pub(crate) async fn start_document_run(
     let run_id = run.clone();
     tokio::spawn(async move {
         let base = if extend { current.as_ref() } else { None };
+        let progress = |done: quack_core::progress::ChunkDone| {
+            tracing::info!(
+                run = %run_id,
+                done = done.done,
+                total = done.total,
+                failed = done.failed,
+                "document evidence progress"
+            );
+        };
         let outcome = documents::run(
             chunks,
             extractor.as_ref(),
             base.or(current.as_ref()),
             &options,
             embeddings.as_ref(),
+            app.config.analysis.extraction_concurrency,
+            &progress,
         )
         .await;
         let result = match outcome {

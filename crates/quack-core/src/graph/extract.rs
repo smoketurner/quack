@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,7 @@ use super::store::{self, NewNode, Source};
 use crate::error::{Error, Result};
 use crate::ingestion::DbHandle;
 use crate::ontology::{self, Ontology};
+use crate::progress::{ChunkDone, Progress};
 use crate::storage::workspace::WorkspaceDb;
 
 /// What the model returns for one chunk.
@@ -269,8 +271,10 @@ pub struct RunSummary {
 /// Confidence recorded for model-extracted provenance.
 const MODEL_CONFIDENCE: f64 = 0.8;
 
-/// Run constrained extraction over `chunks` and store what fits. A failed
-/// chunk is logged and skipped; only every chunk failing is an error.
+/// Run constrained extraction over `chunks`, up to `concurrency` at a
+/// time, and store what fits; each finished chunk goes to `progress`. A
+/// failed chunk is logged and skipped; only every chunk failing is an
+/// error.
 ///
 /// # Errors
 ///
@@ -281,17 +285,38 @@ pub async fn run(
     extractor: &dyn GraphExtractor,
     ontology: &Ontology,
     provisional: bool,
+    concurrency: u32,
+    progress: Progress<'_>,
 ) -> Result<RunSummary> {
+    use futures::StreamExt as _;
+    let started = Instant::now();
     let mut summary = RunSummary {
         chunks: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
         ..RunSummary::default()
     };
-    for chunk in chunks {
-        let extraction = match extractor.extract(&chunk.text).await {
+    // Collected first: an iterator closure held across the awaits fails
+    // the Send check when the run is inside a spawned task.
+    let calls: Vec<_> = chunks.iter().map(|chunk| timed(extractor, chunk)).collect();
+    let mut calls =
+        futures::stream::iter(calls).buffered(usize::try_from(concurrency.max(1)).unwrap_or(1));
+    let mut done: u32 = 0;
+    while let Some((chunk, outcome, took)) = calls.next().await {
+        done = done.saturating_add(1);
+        let report = |summary: &RunSummary| {
+            progress(ChunkDone {
+                done,
+                total: summary.chunks,
+                failed: summary.failed_chunks,
+                took,
+                elapsed: started.elapsed(),
+            });
+        };
+        let extraction = match outcome {
             Ok(extraction) => extraction,
             Err(e) => {
                 tracing::warn!(chunk = %chunk.chunk_id, error = %e, "extraction failed; skipping chunk");
                 summary.failed_chunks = summary.failed_chunks.saturating_add(1);
+                report(&summary);
                 continue;
             }
         };
@@ -323,7 +348,9 @@ pub async fn run(
         }
         summary.nodes = summary.nodes.saturating_add(nodes);
         summary.edges = summary.edges.saturating_add(edges);
+        report(&summary);
     }
+    drop(calls);
     if summary.chunks > 0 && summary.failed_chunks == summary.chunks {
         return Err(Error::Llm(String::from(
             "every chunk failed extraction; check the model and provider",
@@ -331,6 +358,16 @@ pub async fn run(
     }
     db.with(|db| store::record_drift(db, &summary.drift, false))?;
     Ok(summary)
+}
+
+/// One chunk's extraction with how long it took.
+async fn timed<'a>(
+    extractor: &'a dyn GraphExtractor,
+    chunk: &'a ChunkText,
+) -> (&'a ChunkText, Result<Extraction>, Duration) {
+    let began = Instant::now();
+    let outcome = extractor.extract(&chunk.text).await;
+    (chunk, outcome, began.elapsed())
 }
 
 /// Store one validated extraction with `source` as provenance; returns the

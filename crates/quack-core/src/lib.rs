@@ -8,4 +8,5 @@ pub mod ingestion;
 pub mod llm;
 pub mod okf;
 pub mod ontology;
+pub mod progress;
 pub mod storage;

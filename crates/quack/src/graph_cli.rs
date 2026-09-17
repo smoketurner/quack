@@ -298,10 +298,19 @@ async fn run_extract(
                 "Document extraction: {} chunks, one model call each to {chat}.",
                 chunks.len()
             )?;
+            out.flush()?;
             if args.yes || confirm(out)? {
                 let extractor = llm::graph_extractor(config, &ontology).await?;
-                let summary =
-                    extract::run(db, chunks, extractor.as_ref(), &ontology, provisional).await?;
+                let summary = extract::run(
+                    db,
+                    chunks,
+                    extractor.as_ref(),
+                    &ontology,
+                    provisional,
+                    config.analysis.extraction_concurrency,
+                    &crate::ontology_cli::chunk_progress,
+                )
+                .await?;
                 writeln!(
                     out,
                     "Extracted {} nodes and {} edges from {} chunks ({} failed, {} edges did not fit).",

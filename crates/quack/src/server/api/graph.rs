@@ -352,7 +352,25 @@ fn spawn_document_extraction(app: App, access: Access, run_id: String, job: Docu
             options,
             slot,
         } = job;
-        let outcome = extract::run(&db, chunks, extractor.as_ref(), &ontology, provisional).await;
+        let progress = |done: quack_core::progress::ChunkDone| {
+            tracing::info!(
+                run = %run_id,
+                done = done.done,
+                total = done.total,
+                failed = done.failed,
+                "graph extraction progress"
+            );
+        };
+        let outcome = extract::run(
+            &db,
+            chunks,
+            extractor.as_ref(),
+            &ontology,
+            provisional,
+            app.config.analysis.extraction_concurrency,
+            &progress,
+        )
+        .await;
         let version = ontology.version;
         let result = match outcome {
             Ok(summary) => {

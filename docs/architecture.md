@@ -50,6 +50,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `ontology` | the model, validation, versions (`store`), induction from tables and documents (`induction`, `documents`), the review queue (`candidates`) | 6.3, 6.5 |
 | `graph` | the knowledge graph: `store`, `tables` (mapping extraction), `extract` (constrained model extraction with drift), `resolve` (merges), `traverse` | 6.4 |
 | `okf` | Open Knowledge Format bundles in and out | 17 |
+| `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
 | `llm` | rig provider construction, `run_turn`, extractors and the reranker over the chat model, OAuth token management (`oauth`) | 10 |
 
 ## `quack`

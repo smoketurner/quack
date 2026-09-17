@@ -372,6 +372,9 @@ async fn propose(
             cost.model_calls,
             quack_core::llm::chat_model_display(config)
         )?;
+        // Shown before the model calls, ahead of the progress lines on
+        // stderr.
+        out.flush()?;
         if cost.chunks == 0 {
             writeln!(out, "No ready documents to sample.")?;
         } else if !pass.assume_yes && !confirm(out)? {
@@ -414,6 +417,24 @@ async fn propose(
     Ok(())
 }
 
+/// One progress line per extracted chunk on stderr, for the ontology and
+/// graph document passes (issue #67): stdout keeps the summary.
+pub(crate) fn chunk_progress(done: quack_core::progress::ChunkDone) {
+    let failed = if done.failed > 0 {
+        format!(", {} failed", done.failed)
+    } else {
+        String::new()
+    };
+    drop(writeln!(
+        std::io::stderr(),
+        "chunk {}/{} done in {} s{failed}; {} s elapsed",
+        done.done,
+        done.total,
+        done.took.as_secs(),
+        done.elapsed.as_secs()
+    ));
+}
+
 /// Sample, extract with the chat model, and propose.
 async fn run_documents(
     config: &Config,
@@ -431,6 +452,8 @@ async fn run_documents(
         current,
         options,
         embeddings.as_ref(),
+        config.analysis.extraction_concurrency,
+        &chunk_progress,
     )
     .await?;
     writeln!(

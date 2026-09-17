@@ -381,6 +381,12 @@ pub struct AnalysisConfig {
     /// Ollama's own default is 4,096 and it truncates silently past it.
     /// Other providers size their own window.
     pub max_context_tokens: u32,
+    /// How long one extraction call (ontology document evidence, graph
+    /// extraction) may run before the chunk is skipped.
+    pub extraction_timeout_seconds: u64,
+    /// Chunks extracted at once. Ollama serves one request at a time
+    /// unless `OLLAMA_NUM_PARALLEL` is raised, so more only queues there.
+    pub extraction_concurrency: u32,
 }
 
 impl Default for AnalysisConfig {
@@ -393,6 +399,8 @@ impl Default for AnalysisConfig {
             max_turns: 10,
             history_token_budget: 32_000,
             max_context_tokens: 32_768,
+            extraction_timeout_seconds: 120,
+            extraction_concurrency: 1,
         }
     }
 }

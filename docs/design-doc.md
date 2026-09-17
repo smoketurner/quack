@@ -734,7 +734,10 @@ nothing changes the live ontology until a candidate is accepted.
 1. Take a stratified sample of chunks across documents (default 200, configurable), so
    every document contributes.
 2. Run extraction unconstrained: free-form entity types, free-form relation names,
-   observed attributes with values.
+   observed attributes with values. Chunks run `[analysis].extraction_concurrency` at a
+   time, each call bounded by `[analysis].extraction_timeout_seconds` (a chunk that
+   times out is skipped and counted), and every finished chunk is reported: a line on
+   stderr in the CLI, a log line in the server. Graph extraction (6.4) runs the same way.
 3. Normalize the vocabulary. Types and relation names are embedded and clustered; each
    cluster is sent to the model once with its members and examples to choose a canonical
    `snake_case` id, a label, and a one-line description.
@@ -1327,6 +1330,8 @@ max_rows = 1000000
 max_download_mb = 512
 timeout_seconds = 300
 allow_local_files = false               # quack serve with logins: sqlite: paths on the server's disk
+extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
+extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
 allow_private_hosts = false             # quack serve with logins: loopback, private, link-local hosts
 
 [graph]

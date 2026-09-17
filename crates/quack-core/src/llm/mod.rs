@@ -105,18 +105,23 @@ impl EmbeddingModel for EmbedModel {
 /// Open extraction through a rig agent: one streamed prompt per chunk,
 /// the text collected and parsed as JSON. Streaming is the path the chat
 /// agent uses and the one Ollama answers reliably; a chunk that produces
-/// nothing within [`EXTRACTION_TIMEOUT`] is an error the run skips.
+/// nothing within `timeout` (`[analysis].extraction_timeout_seconds`) is
+/// an error the run skips.
 struct RigExtractor {
     agent: rig::agent::Agent,
+    timeout: std::time::Duration,
 }
 
-/// How long one chunk's extraction may take.
-const EXTRACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// `[analysis].extraction_timeout_seconds` as a duration, at least one
+/// second.
+fn extraction_timeout(config: &Config) -> std::time::Duration {
+    std::time::Duration::from_secs(config.analysis.extraction_timeout_seconds.max(1))
+}
 
 impl documents::Extractor for RigExtractor {
     fn extract<'a>(&'a self, text: &'a str) -> documents::ExtractFuture<'a> {
         Box::pin(async move {
-            let answer = stream_answer(&self.agent, text, EXTRACTION_TIMEOUT, "extraction").await?;
+            let answer = stream_answer(&self.agent, text, self.timeout, "extraction").await?;
             documents::parse_extraction(&answer)
         })
     }
@@ -168,7 +173,7 @@ pub async fn stream_answer(
     })?
 }
 
-fn extraction_agent<M>(model: M) -> RigExtractor
+fn extraction_agent<M>(model: M, timeout: std::time::Duration) -> RigExtractor
 where
     M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
 {
@@ -177,6 +182,7 @@ where
             .preamble(documents::EXTRACTION_PROMPT)
             .temperature(0.0)
             .build(),
+        timeout,
     }
 }
 
@@ -184,20 +190,20 @@ where
 /// whose preamble carries the ontology.
 struct RigGraphExtractor {
     agent: rig::agent::Agent,
+    timeout: std::time::Duration,
 }
 
 impl graph_extract::GraphExtractor for RigGraphExtractor {
     fn extract<'a>(&'a self, text: &'a str) -> graph_extract::ExtractFuture<'a> {
         Box::pin(async move {
-            let answer =
-                stream_answer(&self.agent, text, EXTRACTION_TIMEOUT, "graph extraction").await?;
+            let answer = stream_answer(&self.agent, text, self.timeout, "graph extraction").await?;
             tracing::debug!(answer = %answer, "graph extraction answer");
             graph_extract::parse_extraction(&answer)
         })
     }
 }
 
-fn graph_agent<M>(model: M, ontology: &Ontology) -> RigGraphExtractor
+fn graph_agent<M>(model: M, ontology: &Ontology, timeout: std::time::Duration) -> RigGraphExtractor
 where
     M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
 {
@@ -206,6 +212,7 @@ where
             .preamble(&graph_extract::prompt_for(ontology))
             .temperature(0.0)
             .build(),
+        timeout,
     }
 }
 
@@ -226,18 +233,21 @@ pub async fn graph_extractor(
                 .await?
                 .completion_model(chat.model),
             ontology,
+            extraction_timeout(config),
         )),
         ProviderType::Openai => Box::new(graph_agent(
             build_openai_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
             ontology,
+            extraction_timeout(config),
         )),
         ProviderType::Anthropic => Box::new(graph_agent(
             build_anthropic_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
             ontology,
+            extraction_timeout(config),
         )),
     })
 }
@@ -255,16 +265,19 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn documents::Extrac
             build_ollama_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
+            extraction_timeout(config),
         )),
         ProviderType::Openai => Box::new(extraction_agent(
             build_openai_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
+            extraction_timeout(config),
         )),
         ProviderType::Anthropic => Box::new(extraction_agent(
             build_anthropic_client(config, chat.provider_name, chat.provider)
                 .await?
                 .completion_model(chat.model),
+            extraction_timeout(config),
         )),
     })
 }

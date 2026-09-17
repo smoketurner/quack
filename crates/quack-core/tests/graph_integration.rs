@@ -444,7 +444,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     // failed chunk is skipped, Kenya merges with the table's Kenya.
     let chunks = extract::chunks(&db, None).unwrap();
     assert_eq!(chunks.len(), 2);
-    let summary = extract::run(&db, chunks, &Canned, &current, false)
+    let summary = extract::run(&db, chunks, &Canned, &current, false, 2, &|_| {})
         .await
         .unwrap();
     // Both chunks are on record (the failed one is not), so the next run

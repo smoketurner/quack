@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,7 @@ use super::induction::{Candidate, Proposal, snake_id};
 use super::{Class, Ontology, Property, PropertyType, Relation};
 use crate::error::{Error, Result};
 use crate::llm::{EmbedModel, name_similarity};
+use crate::progress::{ChunkDone, Progress};
 use crate::storage::workspace::WorkspaceDb;
 
 /// What open extraction returns for one chunk.
@@ -241,9 +243,11 @@ pub async fn run(
     current: Option<&Ontology>,
     options: &DocumentEvidenceOptions,
     embeddings: Option<&EmbedModel>,
+    concurrency: u32,
+    progress: Progress<'_>,
 ) -> Result<(Vec<Candidate>, RunSummary)> {
     let sampled = u32::try_from(sample.len()).unwrap_or(u32::MAX);
-    let (observations, failed) = observe(extractor, &sample).await?;
+    let (observations, failed) = observe(extractor, &sample, concurrency, progress).await?;
     let table = match embeddings {
         Some(model) => {
             let mut names: BTreeSet<String> = BTreeSet::new();
@@ -287,8 +291,9 @@ pub struct Observation {
     pub extraction: OpenExtraction,
 }
 
-/// Run the extractor over the sample. Failed chunks are skipped and
-/// counted, so one bad answer does not sink the run.
+/// Run the extractor over the sample, up to `concurrency` chunks at a
+/// time, reporting each finished chunk to `progress`. Failed chunks are
+/// skipped and counted, so one bad answer does not sink the run.
 ///
 /// # Errors
 ///
@@ -296,11 +301,22 @@ pub struct Observation {
 pub async fn observe(
     extractor: &dyn Extractor,
     chunks: &[SampledChunk],
+    concurrency: u32,
+    progress: Progress<'_>,
 ) -> Result<(Vec<Observation>, u32)> {
+    use futures::StreamExt as _;
+    let started = Instant::now();
+    let total = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+    // Collected first: an iterator closure held across the awaits fails
+    // the Send check when the run is inside a spawned task.
+    let calls: Vec<_> = chunks.iter().map(|chunk| timed(extractor, chunk)).collect();
+    let mut calls =
+        futures::stream::iter(calls).buffered(usize::try_from(concurrency.max(1)).unwrap_or(1));
     let mut observations = Vec::with_capacity(chunks.len());
     let mut failures: u32 = 0;
-    for chunk in chunks {
-        match extractor.extract(&chunk.content).await {
+    let mut done: u32 = 0;
+    while let Some((chunk, outcome, took)) = calls.next().await {
+        match outcome {
             Ok(extraction) => observations.push(Observation {
                 chunk_id: chunk.id.clone(),
                 document_id: chunk.document_id.clone(),
@@ -311,7 +327,16 @@ pub async fn observe(
                 tracing::warn!(chunk = %chunk.id, error = %e, "extraction failed for a chunk");
             }
         }
+        done = done.saturating_add(1);
+        progress(ChunkDone {
+            done,
+            total,
+            failed: failures,
+            took,
+            elapsed: started.elapsed(),
+        });
     }
+    drop(calls);
     if observations.is_empty() && !chunks.is_empty() {
         return Err(Error::Ontology(format!(
             "extraction failed for all {} sampled chunks",
@@ -319,6 +344,16 @@ pub async fn observe(
         )));
     }
     Ok((observations, failures))
+}
+
+/// One chunk's extraction with how long it took.
+async fn timed<'a>(
+    extractor: &'a dyn Extractor,
+    chunk: &'a SampledChunk,
+) -> (&'a SampledChunk, Result<OpenExtraction>, Duration) {
+    let began = Instant::now();
+    let outcome = extractor.extract(&chunk.content).await;
+    (chunk, outcome, began.elapsed())
 }
 
 /// A canonical id per raw name. Exact `snake_case` ids and their plurals
@@ -865,7 +900,7 @@ mod tests {
     async fn observations_become_classes_relations_hierarchy_and_properties() {
         let db = workspace_with_docs();
         let sample = sample_chunks(&db, 8).unwrap_or_else(|e| fail(&e.to_string()));
-        let (observations, failures) = observe(&Canned, &sample)
+        let (observations, failures) = observe(&Canned, &sample, 1, &|_| {})
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!((observations.len(), failures), (8, 0));
@@ -960,17 +995,29 @@ mod tests {
                 content: String::from("Fine passage"),
             },
         ];
-        let (observations, failures) = observe(&Canned, &chunks)
+        let seen = std::sync::Mutex::new(Vec::new());
+        let progress = |done: ChunkDone| {
+            if let Ok(mut seen) = seen.lock() {
+                seen.push((done.done, done.total, done.failed));
+            }
+        };
+        let (observations, failures) = observe(&Canned, &chunks, 2, &progress)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!((observations.len(), failures), (1, 1));
+        // Every chunk reports once, in order, with the failure count so
+        // far (issue #67: the run was silent until the end).
+        assert_eq!(
+            seen.lock().map(|s| s.clone()).unwrap_or_default(),
+            [(1, 2, 1), (2, 2, 1)]
+        );
         let all_bad = vec![SampledChunk {
             id: String::from("a"),
             document_id: String::from("d"),
             filename: String::from("f"),
             content: String::from("FAIL"),
         }];
-        assert!(observe(&Canned, &all_bad).await.is_err());
+        assert!(observe(&Canned, &all_bad, 1, &|_| {}).await.is_err());
     }
 
     #[test]
