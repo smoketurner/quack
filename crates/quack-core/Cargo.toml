@@ -34,7 +34,7 @@ sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
-sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "any", "tls-rustls-aws-lc-rs"] }
 tar           = { workspace = true }
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
@@ -54,5 +54,6 @@ linux-keyutils-keyring-store = { workspace = true }
 windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
+sqlx     = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 tempfile = { workspace = true }
 zip      = { workspace = true, features = ["deflate-flate2-zlib-rs"] }

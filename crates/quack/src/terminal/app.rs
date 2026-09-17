@@ -42,6 +42,7 @@ Commands:
   /context          Show the workspace context the agent is given
   /graph ENTITY [HOPS], /graph --class CLASS   Walk the knowledge graph
   /path FROM -> TO  Shortest relation chain between two entities
+  /import URL TABLE [SOURCE_TABLE]  Pull rows from Postgres, SQLite, or a URL into a table
   /clear            Clear messages and chart
   /workspace        Show current workspace and session
   /quit, /exit      Exit quack
@@ -576,6 +577,7 @@ impl App {
             "/unpin" => self.set_pinned(args, false),
             "/tables" => self.run_direct_sql("SHOW TABLES"),
             "/graph" => self.show_graph(args),
+            "/import" => self.start_import(args),
             "/path" => self.show_path(args),
             "/sql" => {
                 if args.is_empty() {
@@ -1035,6 +1037,49 @@ impl App {
         self.start_agent_turn(trimmed);
     }
 
+    /// `/import URL TABLE [SOURCE_TABLE]`: rows from an external source
+    /// as a workspace table, on the ingest thread.
+    fn start_import(&mut self, args: &str) {
+        let mut parts = args.split_whitespace();
+        let (Some(url), Some(table)) = (parts.next(), parts.next()) else {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "Usage: /import URL TABLE [SOURCE_TABLE]",
+            ));
+            return;
+        };
+        let request = quack_core::import::ImportRequest {
+            url: url.to_owned(),
+            table: table.to_owned(),
+            query: None,
+            source_table: parts.next().map(str::to_owned),
+            limit: None,
+        };
+        let config = Arc::clone(&self.config);
+        let workspace_id = self.workspace_id.clone();
+        let tx = self.response_tx.clone();
+        self.messages.push(Message::new(
+            MessageRole::System,
+            format!("Importing from {}", quack_core::import::redact(url)),
+        ));
+        self.state = AppState::Ingesting;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match rt {
+                Ok(rt) => rt.block_on(async {
+                    match run_import_inner(&config, &workspace_id, &request).await {
+                        Ok(summary) => BackgroundResult::Ingested { summary },
+                        Err(e) => BackgroundResult::Error(format!("{e:#}")),
+                    }
+                }),
+                Err(e) => BackgroundResult::Error(format!("runtime: {e}")),
+            };
+            drop(tx.send(result));
+        });
+    }
+
     fn start_ingest(&mut self, path: PathBuf) {
         let config = Arc::clone(&self.config);
         let workspace_id = self.workspace_id.clone();
@@ -1205,6 +1250,31 @@ async fn run_ingest_task(
         Ok(summary) => BackgroundResult::Ingested { summary },
         Err(e) => BackgroundResult::Error(format!("{e:#}")),
     }
+}
+
+async fn run_import_inner(
+    config: &Config,
+    workspace_id: &str,
+    request: &quack_core::import::ImportRequest,
+) -> Result<String> {
+    let ws_db = WorkspaceDb::open(config, workspace_id)
+        .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
+    let embedding_model = quack_core::llm::optional_embedding_model(config).await?;
+    let summary = quack_core::import::import(
+        config,
+        &ws_db,
+        workspace_id,
+        request,
+        embedding_model.as_ref(),
+    )
+    .await?;
+    Ok(format!(
+        "Imported {} rows from {} as table \"{}\" ({} columns).\nYou can now ask questions about this data.",
+        summary.rows,
+        summary.source,
+        summary.table,
+        summary.columns.len()
+    ))
 }
 
 async fn run_ingest_inner(

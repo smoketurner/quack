@@ -2555,3 +2555,114 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
     let (status, _, _) = h.send(request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_redacted() {
+    let h = harness(true).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "imp" })),
+        )
+        .await;
+    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let source_path = h.app.config.general.data_dir.join("source.db");
+    {
+        use sqlx::Connection as _;
+        use sqlx::Executor as _;
+        let url = format!("sqlite://{}?mode=rwc", source_path.display());
+        let mut conn = sqlx::SqliteConnection::connect(&url)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        conn.execute("CREATE TABLE vendors (id INTEGER, name TEXT)")
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        conn.execute("INSERT INTO vendors VALUES (1, 'Orgenics'), (2, 'Aurobindo')")
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let url = format!("sqlite://{}", source_path.display());
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/import"),
+            None,
+            Some(serde_json::json!({ "url": url, "table": "vendors", "source_table": "vendors" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"], 2);
+    assert_eq!(body["table"], "vendors");
+    let (_, body) = h.get(&format!("/api/v1/workspaces/{ws}/tables"), "").await;
+    assert_eq!(body["tables"], serde_json::json!(["vendors"]));
+
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/import"),
+            None,
+            Some(serde_json::json!({ "url": "ftp://x/y", "table": "t", "source_table": "t" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/import"),
+            None,
+            Some(serde_json::json!({ "url": url, "table": "t", "query": "SELECT * FROM nope" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // The web form lands on the new table; a failure comes back as a flash.
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/import"),
+            None,
+            &format!(
+                "url={}&table=vendors2&query={}",
+                urlencode(&url),
+                urlencode("SELECT * FROM vendors WHERE id = 1")
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/tables/vendors2"));
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/import"),
+            None,
+            "url=nope&table=t&source_table=t",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location(&headers).contains("/tables?error="));
+
+    let imports = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("import")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        imports.len(),
+        3,
+        "two allowed and the failed query; the bad URL never reaches the audit"
+    );
+    assert_eq!(imports.iter().filter(|r| r.outcome == "error").count(), 1);
+}
+
+fn urlencode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                char::from(b).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}

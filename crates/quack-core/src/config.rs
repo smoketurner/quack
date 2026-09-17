@@ -19,6 +19,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub ontology: OntologyConfig,
     pub graph: GraphConfig,
+    pub import: ImportConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +207,25 @@ impl OntologyConfig {
             key_overlap_threshold: self.key_overlap_threshold,
             enum_max_values: self.enum_max_values,
             ..crate::ontology::induction::TableEvidenceOptions::default()
+        }
+    }
+}
+
+/// External data import (`quack import`, design doc 6.2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImportConfig {
+    /// Rows an import pulls at most.
+    pub max_rows: u64,
+    /// How long a source may take to connect and answer.
+    pub timeout_seconds: u64,
+}
+
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: 1_000_000,
+            timeout_seconds: 300,
         }
     }
 }
@@ -646,6 +666,8 @@ rerank = "model"
         assert_eq!(Config::default().graph.max_traversal_depth, 3);
         assert_eq!(Config::default().graph.max_nodes, 200);
         assert!(err_of("[graph]\nenabled = true\n").contains("enabled"));
+        assert_eq!(Config::default().import.max_rows, 1_000_000);
+        assert!(err_of("[import]\nmax = 1\n").contains("max"));
     }
 
     #[test]

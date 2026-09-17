@@ -203,6 +203,26 @@ enum Commands {
         action: graph_cli::GraphAction,
     },
 
+    /// Pull rows from Postgres, SQLite, or a data file over HTTP(S) into
+    /// a workspace table (the Rust-side replacement for ATTACH)
+    Import {
+        /// A Postgres URL (user, password, host, database), a SQLite path
+        /// as `sqlite:PATH`, or an http(s) URL of a data file
+        url: String,
+        /// The workspace table to create (replaced when it exists)
+        #[arg(long)]
+        table: String,
+        /// A query to run on the source
+        #[arg(long, conflicts_with = "from")]
+        query: Option<String>,
+        /// Pull a whole source table instead of a query
+        #[arg(long, value_name = "SOURCE_TABLE")]
+        from: Option<String>,
+        /// Rows to pull at most (capped by `[import].max_rows`)
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+
     /// Move the workspace as an Open Knowledge Format bundle
     Okf {
         #[command(subcommand)]
@@ -366,20 +386,12 @@ async fn main() -> Result<ExitCode> {
 /// dispatched by `main` itself.
 async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
     match command {
-        Commands::Sessions { json, limit } => {
-            let ws_db = open_workspace(cli).await?;
-            list_sessions(&ws_db, json, limit)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Commands::Sessions { json, limit } => run_sessions(cli, json, limit).await,
         Commands::Export {
             session_id,
             sql,
             markdown: _,
-        } => {
-            let ws_db = open_workspace(cli).await?;
-            export_session(&ws_db, &session_id, sql)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        } => run_export(cli, &session_id, sql).await,
         Commands::Ingest {
             file,
             filename,
@@ -416,6 +428,13 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Okf {
             action: OkfAction::Export { dir },
         } => run_okf_export(cli, &dir).await,
+        Commands::Import {
+            url,
+            table,
+            query,
+            from,
+            limit,
+        } => run_import(cli, url, table, query, from, limit).await,
         Commands::Context { action } => {
             let ws_db = open_workspace(cli).await?;
             run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
@@ -558,6 +577,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Ontology { .. }
         | Commands::Graph { .. }
         | Commands::Okf { .. }
+        | Commands::Import { .. }
         | Commands::Auth { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
@@ -565,11 +585,75 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
     }
 }
 
+/// `quack sessions`: the session list.
+async fn run_sessions(cli: &Cli, json: bool, limit: u32) -> Result<ExitCode> {
+    let ws_db = open_workspace(cli).await?;
+    list_sessions(&ws_db, json, limit)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `quack export SESSION`: a session as SQL or Markdown.
+async fn run_export(cli: &Cli, session_id: &str, sql: bool) -> Result<ExitCode> {
+    let ws_db = open_workspace(cli).await?;
+    export_session(&ws_db, session_id, sql)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `quack graph ...`: the knowledge graph from the shell.
 async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
     let config = Config::load().context("failed to load configuration")?;
     graph_cli::run(&config, &ws_db, action).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `quack import URL --table NAME`: rows from an external source as a
+/// workspace table.
+async fn run_import(
+    cli: &Cli,
+    url: String,
+    table: String,
+    query: Option<String>,
+    from: Option<String>,
+    limit: Option<u64>,
+) -> Result<ExitCode> {
+    init_logging();
+    let request = &quack_core::import::ImportRequest {
+        url,
+        table,
+        query,
+        source_table: from,
+        limit,
+    };
+    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let ws_db =
+        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let embedding_model = llm::optional_embedding_model(&config).await?;
+    let summary = quack_core::import::import(
+        &config,
+        &ws_db,
+        &workspace.id,
+        request,
+        embedding_model.as_ref(),
+    )
+    .await;
+    if let Err(e) = &summary
+        && let Some(code) = auth_exit_code(&anyhow::anyhow!(e.to_string()))
+    {
+        return Ok(code);
+    }
+    let summary = summary.context("import failed")?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(
+        out,
+        "Imported {} rows from {} as table \"{}\" ({} columns: {}).",
+        summary.rows,
+        summary.source,
+        summary.table,
+        summary.columns.len(),
+        summary.columns.join(", ")
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 

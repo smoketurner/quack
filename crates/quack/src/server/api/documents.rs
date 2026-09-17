@@ -219,7 +219,10 @@ pub(crate) async fn enqueue(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(str::to_owned),
-            DocumentSource::Upload | DocumentSource::Path | DocumentSource::Stdin => None,
+            DocumentSource::Upload
+            | DocumentSource::Path
+            | DocumentSource::Stdin
+            | DocumentSource::Import => None,
         };
         let registration = with_db(Arc::clone(&db), move |db| {
             ingestion::register_document(

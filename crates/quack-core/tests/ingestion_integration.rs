@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use quack_core::config::{
-    AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, GraphConfig, IngestionConfig,
-    OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
+    AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, GraphConfig, ImportConfig,
+    IngestionConfig, OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
@@ -80,6 +80,7 @@ fn test_config(data_dir: &Path) -> Config {
         server: ServerConfig::default(),
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
+        import: ImportConfig::default(),
     }
 }
 
@@ -99,6 +100,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         server: ServerConfig::default(),
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
+        import: ImportConfig::default(),
     }
 }
 
@@ -1435,5 +1437,193 @@ async fn office_and_html_documents_are_chunked_with_titles() {
         errored
             .error_message
             .is_some_and(|m| m.contains("not a PPTX"))
+    );
+}
+
+#[tokio::test]
+async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-import").unwrap();
+    let source_path = dir.path().join("source.db");
+    {
+        use sqlx::Connection as _;
+        use sqlx::Executor as _;
+        let url = format!("sqlite://{}?mode=rwc", source_path.display());
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, region TEXT, total REAL, placed TEXT)")
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO orders VALUES (1, 'north', 10.5, '2024-01-02'), (2, 'south, east', 20, NULL), (3, 'west', 7.25, '2024-03-04')",
+        )
+        .await
+        .unwrap();
+    }
+    let url = format!("sqlite://{}", source_path.display());
+    let request = quack_core::import::ImportRequest {
+        url: url.clone(),
+        table: String::from("Orders Import"),
+        query: None,
+        source_table: Some(String::from("orders")),
+        limit: None,
+    };
+    let summary = quack_core::import::import(
+        &config,
+        &db,
+        "ws-import",
+        &request,
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.table, "Orders_Import");
+    assert_eq!(summary.rows, 3);
+    assert_eq!(summary.columns, ["id", "region", "total", "placed"]);
+    assert_eq!(summary.source, url);
+    let rows = db
+        .execute_query("SELECT region, total, placed FROM Orders_Import ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                serde_json::json!("north"),
+                serde_json::json!(10.5),
+                serde_json::json!("2024-01-02")
+            ],
+            vec![
+                serde_json::json!("south, east"),
+                serde_json::json!(20.0),
+                serde_json::Value::Null
+            ],
+            vec![
+                serde_json::json!("west"),
+                serde_json::json!(7.25),
+                serde_json::json!("2024-03-04")
+            ],
+        ]
+    );
+    let doc = db.document(&summary.document_id).unwrap().unwrap();
+    assert_eq!(
+        doc.source,
+        quack_core::storage::workspace::DocumentSource::Import
+    );
+    assert_eq!(doc.title.as_deref(), Some(url.as_str()));
+    assert_eq!(
+        doc.tables.as_deref(),
+        Some(&[String::from("Orders_Import")][..])
+    );
+
+    // A query with a limit, into another table.
+    let request = quack_core::import::ImportRequest {
+        url: url.clone(),
+        table: String::from("big"),
+        query: Some(String::from(
+            "SELECT region, total * 2 AS doubled FROM orders ORDER BY id",
+        )),
+        source_table: None,
+        limit: Some(2),
+    };
+    let summary = quack_core::import::import(
+        &config,
+        &db,
+        "ws-import",
+        &request,
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap();
+    assert_eq!((summary.rows, summary.columns.len()), (2, 2));
+}
+
+#[tokio::test]
+async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-import-errors").unwrap();
+    let source_path = dir.path().join("source.db");
+    {
+        use sqlx::Connection as _;
+        use sqlx::Executor as _;
+        let url = format!("sqlite://{}?mode=rwc", source_path.display());
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, region TEXT)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 'north')")
+            .await
+            .unwrap();
+    }
+    let url = format!("sqlite://{}", source_path.display());
+    let first = quack_core::import::ImportRequest {
+        url: url.clone(),
+        table: String::from("Orders Import"),
+        query: None,
+        source_table: Some(String::from("orders")),
+        limit: None,
+    };
+    let summary = quack_core::import::import(
+        &config,
+        &db,
+        "ws-import-errors",
+        &first,
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.rows, 1);
+    // The same rows again are a duplicate; a bad query and a bad URL are errors.
+    let again = quack_core::import::import(
+        &config,
+        &db,
+        "ws-import-errors",
+        &quack_core::import::ImportRequest {
+            url: url.clone(),
+            table: String::from("Orders Import"),
+            query: None,
+            source_table: Some(String::from("orders")),
+            limit: None,
+        },
+        None::<&MockEmbeddingModel>,
+    )
+    .await;
+    assert!(again.is_err_and(|e| e.to_string().contains("identical")));
+    let bad = quack_core::import::import(
+        &config,
+        &db,
+        "ws-import-errors",
+        &quack_core::import::ImportRequest {
+            url,
+            table: String::from("x"),
+            query: Some(String::from("SELECT * FROM nope")),
+            source_table: None,
+            limit: None,
+        },
+        None::<&MockEmbeddingModel>,
+    )
+    .await;
+    assert!(bad.is_err_and(|e| e.to_string().contains("rejected the query")));
+    let unsupported = quack_core::import::import(
+        &config,
+        &db,
+        "ws-import-errors",
+        &quack_core::import::ImportRequest {
+            url: String::from("mysql://h/db"),
+            table: String::from("x"),
+            query: None,
+            source_table: Some(String::from("t")),
+            limit: None,
+        },
+        None::<&MockEmbeddingModel>,
+    )
+    .await;
+    assert!(unsupported.is_err());
+    // Delete through the document row drops the imported table.
+    assert!(db.delete_document(&summary.document_id, None).unwrap());
+    assert!(
+        !db.list_tables()
+            .unwrap()
+            .contains(&String::from("Orders_Import"))
     );
 }

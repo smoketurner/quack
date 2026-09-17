@@ -3,6 +3,7 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod graph;
+pub mod import;
 pub mod ingestion;
 pub mod llm;
 pub mod okf;

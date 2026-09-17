@@ -1365,6 +1365,8 @@ pub enum DocumentSource {
     Path,
     /// Bytes piped into the CLI.
     Stdin,
+    /// Rows pulled from an external database or a URL (`quack import`).
+    Import,
 }
 
 impl DocumentSource {
@@ -1375,6 +1377,7 @@ impl DocumentSource {
             Self::Paste => "paste",
             Self::Path => "path",
             Self::Stdin => "stdin",
+            Self::Import => "import",
         }
     }
 
@@ -1383,6 +1386,7 @@ impl DocumentSource {
             Some("paste") => Self::Paste,
             Some("path") => Self::Path,
             Some("stdin") => Self::Stdin,
+            Some("import") => Self::Import,
             _ => Self::Upload,
         }
     }

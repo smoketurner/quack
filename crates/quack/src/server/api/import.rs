@@ -1,0 +1,78 @@
+//! `POST .../import`: rows from Postgres, SQLite, or a data file over
+//! HTTP(S) as a workspace table. Needs the write permission; audited as
+//! `import` with the redacted source (the password never lands anywhere).
+
+use axum::Json;
+use axum::extract::{Path, State};
+use quack_core::import::{ImportRequest, ImportSummary};
+use quack_core::llm;
+use quack_core::storage::control::Outcome;
+use serde::Deserialize;
+
+use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::error::{ApiError, ApiResult};
+use crate::server::state::App;
+
+#[derive(Deserialize)]
+pub(crate) struct ImportBody {
+    pub url: String,
+    pub table: String,
+    pub query: Option<String>,
+    pub source_table: Option<String>,
+    pub limit: Option<u64>,
+}
+
+pub(crate) async fn import(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Json(body): Json<ImportBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let request = ImportRequest {
+        url: body.url,
+        table: body.table,
+        query: body.query,
+        source_table: body.source_table,
+        limit: body.limit,
+    };
+    let summary = run_import(&app, &access, &request).await?;
+    Ok(Json(serde_json::to_value(summary)?))
+}
+
+/// The import the API and the web form share: run it, audit it either way.
+pub(crate) async fn run_import(
+    app: &App,
+    access: &Access,
+    request: &ImportRequest,
+) -> ApiResult<ImportSummary> {
+    let source = quack_core::import::redact(&request.url);
+    quack_core::import::source_kind(&request.url)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let embeddings = llm::optional_embedding_model(&app.config).await?;
+    let outcome = quack_core::import::import(
+        &app.config,
+        &db,
+        &access.workspace.id,
+        request,
+        embeddings.as_ref(),
+    )
+    .await;
+    let detail = serde_json::json!({
+        "source": source,
+        "table": request.table,
+        "query": request.query,
+        "source_table": request.source_table,
+        "rows": outcome.as_ref().ok().map(|s| s.rows),
+    });
+    let audit_outcome = if outcome.is_ok() {
+        Outcome::Allowed
+    } else {
+        Outcome::Error
+    };
+    access
+        .audit(app, "import", None, audit_outcome, Some(detail))
+        .await?;
+    outcome.map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+}

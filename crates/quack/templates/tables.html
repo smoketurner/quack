@@ -27,6 +27,20 @@
     {% else %}
     <p class="text-slate-600">Pick a table to see its schema and sample rows.</p>
     {% endif %}
+    {% if ws.can_write %}
+    <form method="post" action="/w/{{ ws.id }}/import" class="mt-6 rounded border border-slate-200 bg-white p-3 text-sm">
+      <h2 class="font-medium">Import from a database or a URL</h2>
+      <p class="mt-1 text-xs text-slate-500">postgres://user:password@host/db, sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). The password is used once and never stored.</p>
+      {% if let Some(error) = error %}<p class="mt-2 rounded border border-red-200 bg-red-50 px-2 py-1 text-red-800">{{ error }}</p>{% endif %}
+      <div class="mt-2 grid gap-2 md:grid-cols-2">
+        <input name="url" placeholder="source URL" required class="rounded border border-slate-300 px-2 py-1 md:col-span-2">
+        <input name="table" placeholder="workspace table name" required class="rounded border border-slate-300 px-2 py-1">
+        <input name="source_table" placeholder="source table (or leave empty and give a query)" class="rounded border border-slate-300 px-2 py-1">
+        <textarea name="query" rows="2" placeholder="SELECT ... (optional)" class="rounded border border-slate-300 px-2 py-1 font-mono text-xs md:col-span-2"></textarea>
+      </div>
+      <button type="submit" class="mt-2 rounded bg-slate-900 px-3 py-1 text-white hover:bg-slate-700">Import</button>
+    </form>
+    {% endif %}
   </section>
 </div>
 {% endif %}

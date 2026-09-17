@@ -224,6 +224,7 @@ struct TablesPage {
     page: Page,
     tables: Vec<String>,
     selected: Option<TableView>,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -383,6 +384,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
         .route("/w/{id}/tables", get(tables))
+        .route("/w/{id}/import", post(import_submit))
         .route("/w/{id}/tables/{name}", get(table))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
         .route("/w/{id}/sql.csv", get(sql_csv))
@@ -944,6 +946,7 @@ async fn tables(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
+    Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     let db = app.workspace_db(&id).await?;
@@ -952,7 +955,39 @@ async fn tables(
         page: page(&app, &access.identity, "Tables", Some(&access)),
         tables: list,
         selected: None,
+        error: q.error,
     })
+}
+
+#[derive(Deserialize)]
+struct ImportForm {
+    url: String,
+    table: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    source_table: String,
+}
+
+async fn import_submit(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+    Form(form): Form<ImportForm>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let request = quack_core::import::ImportRequest {
+        url: form.url,
+        table: form.table,
+        query: (!form.query.trim().is_empty()).then(|| form.query.clone()),
+        source_table: (!form.source_table.trim().is_empty()).then(|| form.source_table.clone()),
+        limit: None,
+    };
+    let target = match super::api::import::run_import(&app, &access, &request).await {
+        Ok(summary) => format!("/w/{id}/tables/{}", summary.table),
+        Err(e) => format!("/w/{id}/tables?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
 }
 
 fn cell(value: &serde_json::Value) -> String {
@@ -988,6 +1023,7 @@ async fn table(
     html(&TablesPage {
         page: page(&app, &access.identity, &name, Some(&access)),
         tables: list,
+        error: None,
         selected: Some(TableView {
             name: described.table_name,
             columns: described

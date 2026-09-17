@@ -87,6 +87,7 @@ cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore 
 cargo run --bin quack -- ontology propose [--extend] [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
 cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate | review | merges | merge ID..
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
+cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}
@@ -167,6 +168,13 @@ The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `s
 `quack mcp` serves it on stdio (unaudited, like the CLI) and `server/mcp_http.rs` serves it
 at `/mcp/v1/{workspace}` behind `access()`, one transport per workspace, user, and write
 permission, audited with channel `mcp`.
+
+External data comes in through `quack_core::import` (`quack import`, `POST .../import`, the
+Tables page form, `/import` in the terminal): a Postgres or SQLite query runs on the source
+with every column cast to text through sqlx (`tls-rustls-aws-lc-rs`), or a CSV, Parquet,
+JSON, or workbook file is fetched over HTTP(S), and the rows load through the normal
+ingestion path as a document with source `import` and the redacted URL as title. No
+`ATTACH`: the workspace never reaches out at query time.
 
 `quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`,
