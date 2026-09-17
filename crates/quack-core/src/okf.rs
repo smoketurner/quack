@@ -943,42 +943,55 @@ pub fn propose(bundle: &Bundle, current: Option<&Ontology>) -> Vec<Candidate> {
     candidates
 }
 
-/// Relation candidates from links between typed concepts.
+/// Relation candidates from links between typed concepts. A link on a
+/// `- name: [..](..)` line (the shape quack's own entity files write)
+/// carries its relation id; a bare link is `<source>_links_<target>`.
+/// Nothing is proposed when the ontology already has the id, or any
+/// relation between the two classes or their ancestors (issue #70).
 fn propose_links(
     type_of: &BTreeMap<&str, String>,
     bodies: &[(&str, &str)],
     current: Option<&Ontology>,
     candidates: &mut Vec<Candidate>,
 ) {
-    let mut link_counts: BTreeMap<(String, String), (u32, Vec<String>)> = BTreeMap::new();
+    let mut link_counts: BTreeMap<(String, String, String), (u32, Vec<String>)> = BTreeMap::new();
     for (path, body) in bodies {
         let Some(source) = type_of.get(path) else {
             continue;
         };
-        for target in links(path, body) {
-            let Some(target_type) = type_of.get(target.as_str()) else {
-                continue;
-            };
-            if target_type == source {
-                continue;
-            }
-            let entry = link_counts
-                .entry((source.clone(), target_type.clone()))
-                .or_default();
-            entry.0 = entry.0.saturating_add(1);
-            if entry.1.len() < 5 {
-                entry.1.push(format!("{path} -> {target}"));
+        for line in body.lines() {
+            let named = labelled_link(line);
+            for target in links(path, line) {
+                let Some(target_type) = type_of.get(target.as_str()) else {
+                    continue;
+                };
+                if target_type == source {
+                    continue;
+                }
+                let id =
+                    named.map_or_else(|| format!("{source}_links_{target_type}"), str::to_owned);
+                let entry = link_counts
+                    .entry((source.clone(), target_type.clone(), id))
+                    .or_default();
+                entry.0 = entry.0.saturating_add(1);
+                if entry.1.len() < 5 {
+                    entry.1.push(format!("{path} -> {target}"));
+                }
             }
         }
     }
-    for ((source, target), (count, samples)) in &link_counts {
-        let id = format!("{source}_links_{target}");
-        if current.is_some_and(|o| o.relation(&id).is_some()) {
+    for ((source, target, id), (count, samples)) in &link_counts {
+        if current.is_some_and(|o| {
+            o.relation(id).is_some()
+                || o.relations.iter().any(|r| {
+                    o.is_subclass_of(source, &r.domain) && o.is_subclass_of(target, &r.range)
+                })
+        }) {
             continue;
         }
         candidates.push(Candidate {
             proposal: Proposal::Relation(Relation {
-                id,
+                id: id.clone(),
                 label: None,
                 description: Some(format!(
                     "OKF links from {source} concepts to {target} concepts"
@@ -995,6 +1008,21 @@ fn propose_links(
             low_support: false,
         });
     }
+}
+
+/// The relation id a `- <id>: [label](path)` line names, when the id is
+/// an identifier (`snake_case`, as the ontology requires).
+fn labelled_link(line: &str) -> Option<&str> {
+    let (label, rest) = line.trim_start().strip_prefix("- ")?.split_once(':')?;
+    if label.is_empty()
+        || !label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        || !rest.trim_start().starts_with('[')
+    {
+        return None;
+    }
+    Some(label)
 }
 
 /// Types a quack export uses for its own structure; they describe the
@@ -1261,5 +1289,71 @@ mod tests {
         });
         let again = propose(&bundle, Some(&current));
         assert!(again.iter().all(|c| c.proposal.id() != "vendor"));
+    }
+
+    /// A `- id: [..](..)` link proposes that id; a relation the ontology
+    /// already has between the two classes, under any id or on an
+    /// ancestor, proposes nothing (issue #70: re-importing quack's own
+    /// bundle queued every link again).
+    #[test]
+    fn named_links_keep_their_id_and_covered_relations_are_skipped() {
+        let mut bundle = Bundle::default();
+        bundle.push(
+            "entities/a.md",
+            String::from(
+                "---\ntype: vendor\ntitle: A\ngenerator: quack\n---\n## Links\n\n- ships_to: [K](../entities/k.md)\n- Note: [K](../entities/k.md)\n",
+            ),
+        );
+        bundle.push(
+            "entities/k.md",
+            String::from("---\ntype: country\ntitle: K\ngenerator: quack\n---\n"),
+        );
+        let ids = |candidates: &[Candidate]| -> Vec<String> {
+            candidates
+                .iter()
+                .filter(|c| c.proposal.kind() == "relation")
+                .map(|c| c.proposal.id().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            ids(&propose(&bundle, None)),
+            ["ships_to", "vendor_links_country"]
+        );
+        let relation = |id: &str, domain: &str, range: &str| Relation {
+            id: String::from(id),
+            label: None,
+            description: None,
+            domain: String::from(domain),
+            range: String::from(range),
+        };
+        let class = |id: &str, parent: &str| Class {
+            id: String::from(id),
+            parent: String::from(parent),
+            label: None,
+            description: None,
+            key: None,
+            properties: Vec::new(),
+        };
+        let mut current = Ontology::default();
+        current
+            .classes
+            .push(class("organisation", ontology::ROOT_CLASS));
+        current.classes.push(class("vendor", "organisation"));
+        current.classes.push(class("country", ontology::ROOT_CLASS));
+        current
+            .relations
+            .push(relation("based_in", "organisation", "country"));
+        assert!(ids(&propose(&bundle, Some(&current))).is_empty());
+        current.relations.clear();
+        current
+            .relations
+            .push(relation("ships_to", "vendor", "vendor"));
+        assert_eq!(
+            ids(&propose(&bundle, Some(&current))),
+            ["vendor_links_country"]
+        );
+        assert_eq!(labelled_link("  - killed_in: [x](y.md)"), Some("killed_in"));
+        assert_eq!(labelled_link("- Killed In: [x](y.md)"), None);
+        assert_eq!(labelled_link("- table [t](../t.md)"), None);
     }
 }

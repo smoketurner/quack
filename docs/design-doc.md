@@ -1554,7 +1554,9 @@ updated as issues close. Ordered by risk.
     `log.md` from the ontology versions and the audit detail. `quack ingest DIR` on a
     bundle and `POST .../documents` with an `application/x-tar` body ingest every concept
     file as a Markdown document, turn front-matter types into class candidates, links
-    between typed concepts into relation candidates (`<source>_links_<target>`), and
+    between typed concepts into relation candidates (the relation named on a
+    `- <relation>: [..](..)` line, else `<source>_links_<target>`; nothing when the
+    ontology already relates the two classes or their ancestors), and
     `resource` into a document property candidate, all in the ontology review queue; the
     CLI offers `index.md` as the workspace context and the API returns it as `context`.
     `quack_core::okf`.
