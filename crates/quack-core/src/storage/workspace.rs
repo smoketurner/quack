@@ -1542,32 +1542,139 @@ fn format_embedding(embedding: &[f32]) -> String {
 }
 
 fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {
-    if let Ok(v) = row.get::<_, Option<i64>>(idx) {
-        return match v {
-            Some(n) => serde_json::Value::Number(n.into()),
-            None => serde_json::Value::Null,
-        };
+    match row.get_ref(idx) {
+        Ok(value) => json_of(duckdb::types::Value::from(value)),
+        Err(_) => serde_json::Value::Null,
     }
-    if let Ok(v) = row.get::<_, Option<f64>>(idx) {
-        return match v {
-            Some(n) => serde_json::Number::from_f64(n)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number),
-            None => serde_json::Value::Null,
-        };
+}
+
+/// A `DuckDB` value as JSON: numbers stay numbers (integers beyond i64 and
+/// decimals keep their digits as strings when they would not round-trip),
+/// dates and times are ISO 8601 text, blobs are base64, and lists, structs,
+/// and maps nest.
+fn json_of(value: duckdb::types::Value) -> serde_json::Value {
+    use duckdb::types::Value;
+    use serde_json::Value as Json;
+    match value {
+        Value::Null => Json::Null,
+        Value::Boolean(b) => Json::Bool(b),
+        Value::TinyInt(n) => Json::from(n),
+        Value::SmallInt(n) => Json::from(n),
+        Value::Int(n) => Json::from(n),
+        Value::BigInt(n) => Json::from(n),
+        Value::UTinyInt(n) => Json::from(n),
+        Value::USmallInt(n) => Json::from(n),
+        Value::UInt(n) => Json::from(n),
+        Value::UBigInt(n) => Json::from(n),
+        Value::HugeInt(n) => match i64::try_from(n) {
+            Ok(n) => Json::from(n),
+            Err(_) => Json::String(n.to_string()),
+        },
+        Value::UHugeInt(n) => match u64::try_from(n) {
+            Ok(n) => Json::from(n),
+            Err(_) => Json::String(n.to_string()),
+        },
+        Value::Float(f) => {
+            serde_json::Number::from_f64(f64::from(f)).map_or(Json::Null, Json::Number)
+        }
+        Value::Double(f) => serde_json::Number::from_f64(f).map_or(Json::Null, Json::Number),
+        Value::Decimal(d) => {
+            let text = d.to_string();
+            text.parse::<serde_json::Number>()
+                .map_or(Json::String(text), Json::Number)
+        }
+        Value::Timestamp(unit, n) => Json::String(timestamp_text(unit, n)),
+        Value::Date32(days) => Json::String(date_text(days)),
+        Value::Time64(unit, n) => Json::String(time_text(unit, n)),
+        Value::Interval {
+            months,
+            days,
+            nanos,
+        } => Json::String(format!("{months} months {days} days {nanos} ns")),
+        Value::Text(s) | Value::Enum(s) => Json::String(s),
+        Value::Blob(bytes) | Value::Geometry(bytes) => {
+            use base64::Engine as _;
+            Json::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        Value::List(items) | Value::Array(items) => {
+            Json::Array(items.into_iter().map(json_of).collect())
+        }
+        Value::Struct(fields) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in fields.iter() {
+                object.insert(key.clone(), json_of(value.clone()));
+            }
+            Json::Object(object)
+        }
+        Value::Map(entries) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in entries.iter() {
+                let key = match json_of(key.clone()) {
+                    Json::String(s) => s,
+                    other => other.to_string(),
+                };
+                object.insert(key, json_of(value.clone()));
+            }
+            Json::Object(object)
+        }
+        Value::Union(inner) => json_of(*inner),
+        // The enum is non-exhaustive; a type this build does not know
+        // renders through Debug rather than silently as null.
+        other => Json::String(format!("{other:?}")),
     }
-    if let Ok(v) = row.get::<_, Option<bool>>(idx) {
-        return match v {
-            Some(b) => serde_json::Value::Bool(b),
-            None => serde_json::Value::Null,
-        };
+}
+
+fn unit_to_nanos(unit: duckdb::types::TimeUnit, n: i64) -> Option<i128> {
+    let n = i128::from(n);
+    match unit {
+        duckdb::types::TimeUnit::Second => n.checked_mul(1_000_000_000),
+        duckdb::types::TimeUnit::Millisecond => n.checked_mul(1_000_000),
+        duckdb::types::TimeUnit::Microsecond => n.checked_mul(1_000),
+        duckdb::types::TimeUnit::Nanosecond => Some(n),
     }
-    if let Ok(v) = row.get::<_, Option<String>>(idx) {
-        return match v {
-            Some(s) => serde_json::Value::String(s),
-            None => serde_json::Value::Null,
-        };
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]`, as `DuckDB` prints a naive timestamp.
+fn timestamp_text(unit: duckdb::types::TimeUnit, n: i64) -> String {
+    let Some(nanos) = unit_to_nanos(unit, n) else {
+        return n.to_string();
+    };
+    let Ok(ts) = jiff::Timestamp::from_nanosecond(nanos) else {
+        return n.to_string();
+    };
+    let civil = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+    if civil.subsec_nanosecond() == 0 {
+        civil.strftime("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        civil.strftime("%Y-%m-%d %H:%M:%S%.6f").to_string()
     }
-    serde_json::Value::Null
+}
+
+fn date_text(days: i32) -> String {
+    jiff::civil::date(1970, 1, 1)
+        .checked_add(jiff::Span::new().days(days))
+        .map_or_else(|_| days.to_string(), |d| d.to_string())
+}
+
+fn time_text(unit: duckdb::types::TimeUnit, n: i64) -> String {
+    let Some(nanos) = unit_to_nanos(unit, n) else {
+        return n.to_string();
+    };
+    let Ok(nanos) = i64::try_from(nanos) else {
+        return n.to_string();
+    };
+    jiff::civil::time(0, 0, 0, 0)
+        .checked_add(jiff::Span::new().nanoseconds(nanos))
+        .map_or_else(
+            |_| n.to_string(),
+            |t| {
+                if t.subsec_nanosecond() == 0 {
+                    t.strftime("%H:%M:%S").to_string()
+                } else {
+                    t.strftime("%H:%M:%S%.6f").to_string()
+                }
+            },
+        )
 }
 
 fn display_json_value(val: &serde_json::Value) -> String {
@@ -1864,6 +1971,39 @@ mod tests {
                 ],
                 vec![
                     serde_json::Value::String(String::from("say \"hi\"")),
+    #[test]
+    fn query_values_keep_fractions_dates_and_nested_types() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let results = db
+            .execute_query(
+                "SELECT 20.5 AS dec, 20.5::DOUBLE AS dbl, 3.25::FLOAT AS flt, \
+                 DATE '2024-01-02' AS d, TIMESTAMP '2024-01-02 03:04:05' AS ts, \
+                 TIMESTAMP '2024-01-02 03:04:05.25' AS tsf, TIME '03:04:05' AS t, \
+                 12345678901234567890::HUGEINT AS big, [1, 2] AS arr, {'a': 1, 'b': 'x'} AS st, \
+                 MAP {'k': 1} AS m, NULL AS n, 'text' AS s, true AS b, 7::UTINYINT AS u",
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let row = results.rows.first().unwrap_or_else(|| fail("no row"));
+        let expected = serde_json::json!([
+            20.5,
+            20.5,
+            3.25,
+            "2024-01-02",
+            "2024-01-02 03:04:05",
+            "2024-01-02 03:04:05.250000",
+            "03:04:05",
+            "12345678901234567890",
+            [1, 2],
+            {"a": 1, "b": "x"},
+            {"k": 1},
+            null,
+            "text",
+            true,
+            7
+        ]);
+        assert_eq!(serde_json::Value::Array(row.clone()), expected);
+    }
+
                     serde_json::Value::Null,
                 ],
             ],
