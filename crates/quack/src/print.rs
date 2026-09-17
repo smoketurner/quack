@@ -126,6 +126,7 @@ pub(crate) async fn run_prompt(
                 "steps": response.steps,
                 "citations": response.citations,
                 "chart": response.chart,
+                "graph": response.graph,
                 "write_refused": response.write_refused,
                 "session_id": session_id,
             });

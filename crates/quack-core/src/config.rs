@@ -18,6 +18,7 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     pub server: ServerConfig,
     pub ontology: OntologyConfig,
+    pub graph: GraphConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,6 +206,46 @@ impl OntologyConfig {
             key_overlap_threshold: self.key_overlap_threshold,
             enum_max_values: self.enum_max_values,
             ..crate::ontology::induction::TableEvidenceOptions::default()
+        }
+    }
+}
+
+/// Knowledge graph traversal and resolution (design doc 6.4 and 13).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GraphConfig {
+    /// Hops a neighborhood or path query may take.
+    pub max_traversal_depth: u32,
+    /// Nodes a traversal or class listing returns at most.
+    pub max_nodes: u32,
+    /// Cosine distance under which two labels of one class are proposed
+    /// as a merge for review.
+    pub merge_threshold: f64,
+    /// Cosine distance under which the merge happens without review.
+    pub auto_merge_threshold: f64,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        let defaults = crate::graph::GraphOptions::default();
+        Self {
+            max_traversal_depth: defaults.max_traversal_depth,
+            max_nodes: defaults.max_nodes,
+            merge_threshold: defaults.merge_threshold,
+            auto_merge_threshold: defaults.auto_merge_threshold,
+        }
+    }
+}
+
+impl GraphConfig {
+    /// The tuning as the core module takes it.
+    #[must_use]
+    pub fn options(&self) -> crate::graph::GraphOptions {
+        crate::graph::GraphOptions {
+            max_traversal_depth: self.max_traversal_depth,
+            max_nodes: self.max_nodes,
+            merge_threshold: self.merge_threshold,
+            auto_merge_threshold: self.auto_merge_threshold,
         }
     }
 }
@@ -602,6 +643,9 @@ rerank = "model"
         assert_eq!(config.ontology.propose_sample_chunks, 200);
         assert_eq!(config.ontology.min_support_documents, 3);
         assert!(err_of("[ontology]\nsample = 1\n").contains("sample"));
+        assert_eq!(Config::default().graph.max_traversal_depth, 3);
+        assert_eq!(Config::default().graph.max_nodes, 200);
+        assert!(err_of("[graph]\nenabled = true\n").contains("enabled"));
     }
 
     #[test]

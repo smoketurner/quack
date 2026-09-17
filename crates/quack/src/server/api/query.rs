@@ -53,6 +53,7 @@ pub(crate) fn response_json(response: &AgentResponse, session_id: &str) -> serde
         "steps": response.steps,
         "graph": serde_json::Value::Null,
         "chart": response.chart,
+        "graph": response.graph,
         "write_refused": response.write_refused,
         "session_id": session_id,
     })

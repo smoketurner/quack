@@ -197,6 +197,19 @@ pub fn accept(
     decisions: &[(String, Decision)],
     decided_by: Option<&str>,
 ) -> Result<Ontology> {
+    accept_with_note(db, decisions, decided_by, "accepted")
+}
+
+/// The note prefix a version written by `--auto-accept` carries; the graph
+/// built from such a version is provisional until someone reviews.
+pub const AUTO_ACCEPT_NOTE: &str = "auto-accepted";
+
+fn accept_with_note(
+    db: &WorkspaceDb,
+    decisions: &[(String, Decision)],
+    decided_by: Option<&str>,
+    verb: &str,
+) -> Result<Ontology> {
     let mut resolved = Vec::with_capacity(decisions.len());
     for (id, decision) in decisions {
         let row = find(db, id)?;
@@ -214,7 +227,7 @@ pub fn accept(
         .map(|(_, p, d)| (p.clone(), d.clone()))
         .collect();
     let next = apply(base.as_ref(), &proposals)?;
-    let note = format!("accepted {} candidate(s)", resolved.len());
+    let note = format!("{verb} {} candidate(s)", resolved.len());
     let stored = store::save(db, &next, decided_by, Some(&note))?;
     for (id, _, _) in &resolved {
         db.connection().execute(
@@ -238,7 +251,7 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
     if ids.is_empty() {
         return Err(Error::Ontology(String::from("no pending candidates")));
     }
-    accept(db, &ids, decided_by)
+    accept_with_note(db, &ids, decided_by, AUTO_ACCEPT_NOTE)
 }
 
 #[cfg(test)]

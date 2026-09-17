@@ -32,6 +32,7 @@ use rust_embed::Embed;
 use serde::Deserialize;
 
 use super::api::documents as docs_api;
+use super::api::graph as graph_api;
 use super::api::query as query_api;
 use super::auth::{Access, Credential, Identity, Need, SESSION_COOKIE, access, require_admin};
 use super::error::ApiError;
@@ -283,6 +284,55 @@ struct OntologyPage {
     error: Option<String>,
 }
 
+/// One node as the graph page's inspector shows it.
+struct GraphNodeView {
+    id: String,
+    label: String,
+    class_id: String,
+    provisional: bool,
+    properties: String,
+    sources: String,
+}
+
+struct GraphEdgeView {
+    source: String,
+    relation: String,
+    target: String,
+    sources: String,
+}
+
+struct GraphResultView {
+    title: String,
+    json: String,
+    nodes: Vec<GraphNodeView>,
+    edges: Vec<GraphEdgeView>,
+}
+
+#[derive(Default)]
+struct GraphQueryView {
+    entity: String,
+    class: String,
+    relation: String,
+    hops: u32,
+    from: String,
+    to: String,
+    max_hops: u32,
+}
+
+#[derive(Template)]
+#[template(path = "graph.html")]
+struct GraphPage {
+    page: Page,
+    status: quack_core::graph::GraphStatus,
+    drift: Vec<String>,
+    has_ontology: bool,
+    chunk_count: usize,
+    merges: Vec<quack_core::graph::resolve::MergeProposal>,
+    query: GraphQueryView,
+    result: Option<GraphResultView>,
+    error: Option<String>,
+}
+
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsPage {
@@ -342,6 +392,11 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/ontology/propose", post(ontology_propose))
         .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
         .route("/w/{id}/ontology/{v}/restore", post(ontology_restore))
+        .route("/w/{id}/graph", get(graph_page))
+        .route("/w/{id}/graph/extract", post(graph_extract))
+        .route("/w/{id}/graph/revalidate", post(graph_revalidate))
+        .route("/w/{id}/graph/review", post(graph_review))
+        .route("/w/{id}/graph/merges/{mid}", post(graph_merge_decide))
         .route("/w/{id}/settings", get(settings).post(settings_save))
         .route("/w/{id}/members", post(member_add))
         .route("/w/{id}/members/{user}/remove", post(member_remove))
@@ -1861,4 +1916,377 @@ mod tests {
         assert_eq!(cell(&serde_json::Value::Null), "");
         assert_eq!(cell(&serde_json::json!(4.5)), "4.5");
     }
+}
+
+// --- graph ----------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct GraphPageQuery {
+    entity: Option<String>,
+    class: Option<String>,
+    relation: Option<String>,
+    hops: Option<u32>,
+    from: Option<String>,
+    to: Option<String>,
+    max_hops: Option<u32>,
+    error: Option<String>,
+}
+
+fn non_empty(value: Option<&String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+async fn graph_page(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+    Query(q): Query<GraphPageQuery>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    let db = app.workspace_db(&id).await?;
+    let options = app.config.graph.options();
+    let query = GraphQueryView {
+        entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
+        class: non_empty(q.class.as_ref()).unwrap_or_default(),
+        relation: non_empty(q.relation.as_ref()).unwrap_or_default(),
+        hops: q.hops.unwrap_or(2).clamp(1, 6),
+        from: non_empty(q.from.as_ref()).unwrap_or_default(),
+        to: non_empty(q.to.as_ref()).unwrap_or_default(),
+        max_hops: q.max_hops.unwrap_or(4).clamp(1, 8),
+    };
+    let embedding = if query.entity.is_empty() {
+        None
+    } else {
+        graph_api::query_embedding_for(&app, &query.entity).await
+    };
+    let path_embeddings: Option<EndEmbeddings> = if query.from.is_empty() || query.to.is_empty() {
+        None
+    } else {
+        Some((
+            graph_api::query_embedding_for(&app, &query.from).await,
+            graph_api::query_embedding_for(&app, &query.to).await,
+        ))
+    };
+    let wanted = GraphQueryView {
+        entity: query.entity.clone(),
+        class: query.class.clone(),
+        relation: query.relation.clone(),
+        hops: query.hops,
+        from: query.from.clone(),
+        to: query.to.clone(),
+        max_hops: query.max_hops,
+    };
+    let (status, has_ontology, chunk_count, merges, result) = with_db(db, move |db| {
+        graph_page_data(
+            db,
+            &wanted,
+            embedding.as_deref(),
+            path_embeddings.as_ref(),
+            options,
+        )
+    })
+    .await?;
+    let result = match result {
+        Some((title, found)) => Some(graph_result_view(title, &found)?),
+        None => None,
+    };
+    let mut drift: Vec<String> = status
+        .drift
+        .classes
+        .keys()
+        .map(|c| format!("class {c}"))
+        .chain(
+            status
+                .drift
+                .relations
+                .keys()
+                .map(|r| format!("relation {r}")),
+        )
+        .collect();
+    drift.sort();
+    html(&GraphPage {
+        page: page(&app, &access.identity, "Graph", Some(&access)),
+        status,
+        drift,
+        has_ontology,
+        chunk_count,
+        merges,
+        query,
+        result,
+        error: q.error,
+    })
+}
+
+type PageData = (
+    quack_core::graph::GraphStatus,
+    bool,
+    usize,
+    Vec<quack_core::graph::resolve::MergeProposal>,
+    Option<(String, quack_core::graph::GraphResult)>,
+);
+
+/// Status, ontology presence, chunk count, merge queue, and the result of
+/// whatever the query asked for.
+/// The embeddings of a path query's two ends, when a model exists.
+type EndEmbeddings = (Option<Vec<f32>>, Option<Vec<f32>>);
+
+fn graph_page_data(
+    db: &quack_core::storage::workspace::WorkspaceDb,
+    wanted: &GraphQueryView,
+    embedding: Option<&[f32]>,
+    path_embeddings: Option<&EndEmbeddings>,
+    options: quack_core::graph::GraphOptions,
+) -> quack_core::error::Result<PageData> {
+    let status = quack_core::graph::store::status(db)?;
+    let ontology = ontology_store::current(db)?;
+    let chunk_count = quack_core::graph::extract::chunks(db, None)?.len();
+    let merges = quack_core::graph::resolve::pending(db)?;
+    let result = if let Some((a, b)) = path_embeddings {
+        let from =
+            quack_core::graph::traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
+        let to = quack_core::graph::traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
+        let found = match (from.first(), to.first()) {
+            (Some(a), Some(b)) => {
+                quack_core::graph::traverse::path(db, a, b, wanted.max_hops, &options)?
+            }
+            _ => quack_core::graph::GraphResult::default(),
+        };
+        Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
+    } else if !wanted.entity.is_empty() {
+        let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
+        let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
+        let roots =
+            quack_core::graph::traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
+        let found =
+            quack_core::graph::traverse::neighborhood(db, &roots, wanted.hops, relation, &options)?;
+        Some((format!("Around {}", wanted.entity), found))
+    } else if !wanted.class.is_empty() {
+        let found = quack_core::graph::traverse::by_class(
+            db,
+            ontology.as_ref(),
+            &wanted.class,
+            options.max_nodes,
+            &options,
+        )?;
+        Some((format!("Entities of class {}", wanted.class), found))
+    } else {
+        None
+    };
+    Ok((status, ontology.is_some(), chunk_count, merges, result))
+}
+
+fn graph_result_view(
+    title: String,
+    result: &quack_core::graph::GraphResult,
+) -> Result<GraphResultView, ApiError> {
+    let sources_of = |subject: &str| -> String {
+        let mut items: Vec<String> = result
+            .provenance
+            .iter()
+            .filter(|p| p.subject_id == subject)
+            .map(|p| match (&p.table_name, &p.document_id) {
+                (Some(table), _) => format!("{table} row {}", p.row_key.as_deref().unwrap_or("?")),
+                (None, Some(document)) => format!("document {}", short_id(document)),
+                (None, None) => String::from("unknown"),
+            })
+            .collect();
+        items.sort();
+        items.dedup();
+        items.join(", ")
+    };
+    let label_of = |id: &str| -> String {
+        result
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map_or_else(|| short_id(id), |n| n.label.clone())
+    };
+    let nodes = result
+        .nodes
+        .iter()
+        .map(|n| GraphNodeView {
+            id: n.id.clone(),
+            label: n.label.clone(),
+            class_id: n.class_id.clone(),
+            provisional: n.provisional,
+            properties: match &n.properties {
+                serde_json::Value::Object(map) if !map.is_empty() => map
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {}", display_json(v)))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                _ => String::new(),
+            },
+            sources: sources_of(&n.id),
+        })
+        .collect();
+    let edges = result
+        .edges
+        .iter()
+        .map(|e| GraphEdgeView {
+            source: label_of(&e.source_node_id),
+            relation: e.relation_id.clone(),
+            target: label_of(&e.target_node_id),
+            sources: sources_of(&e.id),
+        })
+        .collect();
+    Ok(GraphResultView {
+        title,
+        json: serde_json::to_string(result)?,
+        nodes,
+        edges,
+    })
+}
+
+fn display_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+#[derive(Deserialize)]
+struct ExtractForm {
+    #[serde(default)]
+    source: String,
+    sample: Option<String>,
+    #[serde(default)]
+    reset: bool,
+}
+
+async fn graph_extract(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+    Form(form): Form<ExtractForm>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let (do_tables, do_documents) = match form.source.as_str() {
+        "tables" => (true, false),
+        "documents" => (false, true),
+        _ => (true, true),
+    };
+    let sample = form
+        .sample
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let outcome = graph_api::start_extraction(
+        &app,
+        &access,
+        &id,
+        &graph_api::ExtractionPlan {
+            tables: do_tables,
+            documents: do_documents,
+            sample,
+            reset: form.reset,
+        },
+    )
+    .await;
+    let target = match outcome {
+        Ok(body) if body.get("status").and_then(|s| s.as_str()) == Some("running") => format!(
+            "/w/{id}/graph?error={}",
+            urlencoded(
+                "document extraction started in the background; this page shows the graph as it grows"
+            )
+        ),
+        Ok(_) => format!("/w/{id}/graph"),
+        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
+}
+
+async fn graph_revalidate(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let db = app.workspace_db(&id).await?;
+    let outcome = with_db(db, quack_core::graph::store::revalidate).await;
+    let target = match outcome {
+        Ok(r) => {
+            access
+                .audit(
+                    &app,
+                    "graph_revalidate",
+                    None,
+                    Outcome::Allowed,
+                    Some(serde_json::json!({
+                        "dropped_nodes": r.dropped_nodes,
+                        "dropped_edges": r.dropped_edges,
+                        "version": r.version,
+                    })),
+                )
+                .await?;
+            format!(
+                "/w/{id}/graph?error={}",
+                urlencoded(&format!(
+                    "dropped {} nodes and {} edges",
+                    r.dropped_nodes, r.dropped_edges
+                ))
+            )
+        }
+        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
+}
+
+async fn graph_review(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let db = app.workspace_db(&id).await?;
+    with_db(db, quack_core::graph::store::mark_reviewed).await?;
+    access
+        .audit(&app, "graph_review", None, Outcome::Allowed, None)
+        .await?;
+    Ok(Redirect::to(&format!("/w/{id}/graph")).into_response())
+}
+
+#[derive(Deserialize)]
+struct MergeForm {
+    action: String,
+}
+
+async fn graph_merge_decide(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, mid)): Path<(String, String)>,
+    Form(form): Form<MergeForm>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let accept = form.action == "accept";
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let merge_id = mid.clone();
+    let outcome = with_db(db, move |db| {
+        if accept {
+            quack_core::graph::resolve::accept(db, &merge_id, Some(&author))
+        } else {
+            quack_core::graph::resolve::reject(db, &merge_id, Some(&author))
+        }
+    })
+    .await;
+    let target = match outcome {
+        Ok(proposal) => {
+            access
+                .audit(
+                    &app,
+                    "graph_merge",
+                    Some(("graph_merge", &mid)),
+                    Outcome::Allowed,
+                    Some(serde_json::json!({ "accept": accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
+                )
+                .await?;
+            format!("/w/{id}/graph")
+        }
+        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
 }

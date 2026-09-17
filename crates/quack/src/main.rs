@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
+mod graph_cli;
 mod mcp;
 mod ontology_cli;
 mod print;
@@ -196,6 +197,12 @@ enum Commands {
         action: ontology_cli::OntologyAction,
     },
 
+    /// Explore, build, revalidate, and review the knowledge graph
+    Graph {
+        #[command(subcommand)]
+        action: graph_cli::GraphAction,
+    },
+
     /// List ingested documents, or pin and unpin one
     Docs {
         /// Pin a document by id (prefixes accepted)
@@ -388,6 +395,12 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             ontology_cli::run(&config, &ws_db, action).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Graph { action } => {
+            let ws_db = open_workspace(cli).await?;
+            let config = Config::load().context("failed to load configuration")?;
+            graph_cli::run(&config, &ws_db, action).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Context { action } => {
             let ws_db = open_workspace(cli).await?;
             run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
@@ -528,6 +541,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Ingest { .. }
         | Commands::Context { .. }
         | Commands::Ontology { .. }
+        | Commands::Graph { .. }
         | Commands::Auth { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }

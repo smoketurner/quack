@@ -1999,10 +1999,12 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
         names,
         [
             "describe_table",
+            "find_path",
             "list_documents",
             "list_tables",
             "query",
             "search",
+            "search_graph",
             "sql"
         ]
     );
@@ -2155,4 +2157,216 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     );
     assert!(sql_rows.iter().all(|r| r.channel == "mcp"), "{sql_rows:?}");
     assert_eq!(sql_rows.iter().filter(|r| r.outcome == "denied").count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_page() {
+    let h = harness(true).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "g" })),
+        )
+        .await;
+    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    for sql in [
+        "CREATE TABLE shipments (po TEXT, vendor TEXT, country TEXT)",
+        "INSERT INTO shipments VALUES ('PO-1', 'Orgenics', 'Kenya'), ('PO-2', 'Orgenics', 'Uganda'), ('PO-3', 'Aurobindo', 'Kenya')",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let base = format!("/api/v1/workspaces/{ws}/graph");
+
+    // No ontology yet: nothing to build, and the status says so.
+    let (status, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], 0);
+    let (status, _) = h
+        .call(
+            Method::POST,
+            &format!("{base}/extract"),
+            None,
+            Some(serde_json::json!({ "source": "tables" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let ontology = serde_json::json!({
+        "classes": [
+            { "id": "vendor", "key": "name", "properties": ["name"] },
+            { "id": "country", "key": "name", "properties": ["name"] },
+            { "id": "shipment", "key": "po", "properties": ["po"] }
+        ],
+        "relations": [
+            { "id": "supplied_by", "domain": "shipment", "range": "vendor" },
+            { "id": "delivered_to", "domain": "shipment", "range": "country" }
+        ],
+        "properties": [
+            { "id": "name", "type": "string" },
+            { "id": "po", "type": "string" }
+        ],
+        "mappings": [{
+            "table": "shipments", "class": "shipment", "key": "po",
+            "relations": [
+                { "relation": "supplied_by", "column": "vendor", "target_class": "vendor", "target_key": "name" },
+                { "relation": "delivered_to", "column": "country", "target_class": "country", "target_key": "name" }
+            ]
+        }]
+    });
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/ontology"),
+            None,
+            Some(ontology),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Tables only: deterministic, answers 200 with the summary.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/extract"),
+            None,
+            Some(serde_json::json!({ "source": "tables" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "done");
+    assert_eq!(body["tables"][0]["nodes"], 3, "{body}");
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["nodes"], 7, "{body}");
+    assert_eq!(body["edges"], 6);
+    assert_eq!(body["stale"], false);
+    assert_eq!(body["provisional_nodes"], 0);
+
+    // Search, class listing, and path.
+    let (status, body) = h
+        .get(&format!("{base}/search?entity=Kenya&hops=1"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let labels: Vec<&str> = body["nodes"]
+        .as_array()
+        .map(|n| n.iter().filter_map(|n| n["label"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        labels.contains(&"Kenya") && labels.contains(&"PO-1") && labels.contains(&"PO-3"),
+        "{labels:?}"
+    );
+    assert!(!labels.contains(&"Orgenics"));
+    assert!(body["provenance"].as_array().is_some_and(|p| !p.is_empty()));
+    let (status, body) = h.get(&format!("{base}/search?class=vendor"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"].as_array().map(Vec::len), Some(2));
+    let (status, _) = h.get(&format!("{base}/search"), "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = h
+        .get(
+            &format!("{base}/path?from=Uganda&to=Aurobindo&max_hops=6"),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["edges"].as_array().map(Vec::len), Some(6), "{body}");
+    let (_, body) = h
+        .get(
+            &format!("{base}/path?from=Uganda&to=Aurobindo&max_hops=2"),
+            "",
+        )
+        .await;
+    assert_eq!(body["nodes"].as_array().map(Vec::len), Some(0));
+
+    // The ontology loses a class: the graph is stale, revalidate drops it.
+    let (_, current) = h
+        .get(&format!("/api/v1/workspaces/{ws}/ontology"), "")
+        .await;
+    let mut edited = current.clone();
+    if let Some(classes) = edited["classes"].as_array_mut() {
+        classes.retain(|c| c["id"] != "country");
+    }
+    if let Some(relations) = edited["relations"].as_array_mut() {
+        relations.retain(|r| r["id"] != "delivered_to");
+    }
+    if let Some(mapping_relations) = edited["mappings"][0]["relations"].as_array_mut() {
+        mapping_relations.retain(|r| r["target_class"] != "country");
+    }
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/ontology"),
+            None,
+            Some(edited),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], true, "{body}");
+    let (status, body) = h
+        .call(Method::POST, &format!("{base}/revalidate"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dropped_nodes"], 2);
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], false);
+    assert_eq!(body["nodes"], 5);
+    let (_, body) = h.get(&format!("{base}/merges"), "").await;
+    assert_eq!(body["merges"], serde_json::json!([]));
+    let (status, _) = h
+        .call(
+            Method::PUT,
+            &format!("{base}/merges/nope"),
+            None,
+            Some(serde_json::json!({ "action": "accept" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The web page renders the status and a search result.
+    let (status, html, _) = h.page(&format!("/w/{ws}/graph?entity=Kenya"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Knowledge graph"), "{html}");
+    assert!(html.contains("5 nodes, 3 edges"), "{html}");
+    assert!(
+        html.contains("Nothing matched"),
+        "Kenya was dropped: {html}"
+    );
+    let (status, html, _) = h.page(&format!("/w/{ws}/graph?class=vendor"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Orgenics") && html.contains("Aurobindo") && html.contains("data-graph="),
+        "{html}"
+    );
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/graph/extract"), None, "source=tables")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/graph"));
+
+    let audits = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("graph_extract")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(audits.len(), 2, "API and web builds");
+    let searches = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("graph")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(searches.len() >= 4, "{searches:?}");
 }

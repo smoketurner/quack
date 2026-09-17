@@ -1100,7 +1100,10 @@ quack -p "PROMPT" [-w NAME] [-f table|json|ndjson|csv|markdown] [--mode chat|que
       [--allow-write] [--model P/M] [-c | -r SESSION]
 quack -q "SQL" [-w NAME] [-f ...] [--internal]
 quack ingest FILE... [-w NAME] [--as NAME] [--title T] [--pin] [--no-embed] [--extract]
-quack docs | tables | schema TABLE | graph ENTITY [--hops N]
+quack docs | tables | schema TABLE
+quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
+            | path FROM TO [--max-hops N] | status | extract [--tables-only|--documents-only]
+            [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | unmerge ID..
 quack ontology show | propose [--extend|--from PACK] [--sample N] [--auto-accept]
               | review | accept ID... | reject ID... | export FILE | import FILE
               | versions | restore V
@@ -1223,10 +1226,10 @@ history_token_budget = 32000
 default_mode = "chat"                   # default for new workspaces
 
 [graph]
-enabled = false                         # default for new workspaces
 max_traversal_depth = 3
 max_nodes = 200
-merge_threshold = 0.08
+merge_threshold = 0.08                  # cosine distance under which a merge is proposed
+auto_merge_threshold = 0.02             # under which it happens without review
 
 [ontology]
 propose_sample_chunks = 200
@@ -1379,7 +1382,20 @@ updated as issues close. Ordered by risk.
    extend mode, `--from` seeding, low-support candidates), and the CLI, API, and web
    page. Two deviations from 6.5: cluster names are chosen by frequency rather than a
    model naming pass, and drift counting arrives with constrained extraction in #28.
-   YAML was dropped: JSON is the only interchange form. **No graph** (#28). Sections
+   YAML was dropped: JSON is the only interchange form. ~~No graph~~ (#28, closed):
+   `quack_core::graph` with deterministic extraction from mapped tables, constrained
+   extraction from chunks through the chat model (out-of-ontology classes and relations
+   counted as drift), exact merge on normalized label and class plus embedding-based
+   merge proposals, provenance on every node and edge, neighborhood, path, and by-class
+   traversal in plain SQL, the `search_graph` and `find_path` tools (registered only when
+   the graph has nodes; query mode drops provisional results), `quack graph`, `/graph`
+   and `/path` in the terminal, the REST endpoints, the MCP tools, and the web page with
+   an ECharts force graph, inspector, merge queue, and provisional and stale banners.
+   Three deviations from 6.4: merge proposals live in `_quack_graph_merges` (accepting
+   one merges nodes, which is not an ontology change, so they stay out of the ontology
+   candidate queue); "provisional" means the newest ontology version was written by
+   `--auto-accept` and nobody has saved a reviewed version since; and "graph enabled"
+   is simply the graph having nodes rather than a separate `_quack_meta` flag. Sections
    6.3 to 6.5.
 5. ~~DOCX, HTML, PPTX, XLSX unsupported~~ (#16, closed): HTML through `scraper`, DOCX and
    PPTX through `zip` + `quick-xml`, workbooks through `calamine` as one table per sheet,
@@ -1488,9 +1504,9 @@ deployment for document chat is the end of step 8.
 10. Ontology induction: table evidence, document evidence, candidates, review queue,
     extend mode and drift counting, auto-accept with provisional marking; CLI, API, and
     web hooks.
-11. Graph: extraction from documents and mapped tables, resolution, provenance, traversal,
-    tools, TUI tree, web graph page, stale and provisional handling.
-12. MCP over stdio and SSE.
+11. ~~Graph: extraction from documents and mapped tables, resolution, provenance, traversal,
+    tools, TUI tree, web graph page, stale and provisional handling.~~ Done.
+12. ~~MCP over stdio and SSE.~~ Done (streamable HTTP rather than SSE).
 13. External data import (the Rust-side replacement for `ATTACH`), XLSX via a Rust reader,
     `workspace snapshot`.
 14. Release engineering: musl targets, macOS, Windows, container image, compose.

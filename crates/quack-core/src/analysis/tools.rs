@@ -1026,3 +1026,351 @@ mod tests {
         assert!(!refused.was_refused());
     }
 }
+
+// ---------------------------------------------------------------------------
+// search_graph and find_path
+// ---------------------------------------------------------------------------
+
+use crate::graph::{self, GraphResult};
+
+/// The graph results a turn produced, kept for the response.
+pub type GraphResults = Arc<Mutex<Vec<GraphResult>>>;
+
+pub struct SearchGraphTool<M> {
+    db: SharedDb,
+    embedding_model: Option<M>,
+    options: graph::GraphOptions,
+    exclude_provisional: bool,
+    results: GraphResults,
+    recorder: TurnRecorder,
+}
+
+impl<M> SearchGraphTool<M> {
+    pub fn new(
+        db: SharedDb,
+        embedding_model: Option<M>,
+        options: graph::GraphOptions,
+        exclude_provisional: bool,
+        results: GraphResults,
+        recorder: TurnRecorder,
+    ) -> Self {
+        Self {
+            db,
+            embedding_model,
+            options,
+            exclude_provisional,
+            results,
+            recorder,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SearchGraphArgs {
+    /// The entity to start from (its name as it appears in the data); omit
+    /// to list every entity of `class`
+    pub entity: Option<String>,
+    /// Restrict the entry point, or the listing, to this ontology class id
+    pub class: Option<String>,
+    /// Follow only this relation id
+    pub relation: Option<String>,
+    /// How many hops out from the entity (default 2)
+    pub hops: Option<u32>,
+}
+
+/// Embed a label for fuzzy entry-point resolution, when a model exists.
+async fn label_embedding<M: EmbeddingModel>(model: Option<&M>, label: &str) -> Option<Vec<f32>> {
+    let model = model?;
+    let embedding = model.embed_text(label).await.ok()?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 -> f32 is acceptable for embedding vectors"
+    )]
+    Some(embedding.vec.into_iter().map(|v| v as f32).collect())
+}
+
+impl<M> Tool for SearchGraphTool<M>
+where
+    M: EmbeddingModel + Send + Sync,
+{
+    const NAME: &'static str = "search_graph";
+    type Error = ToolError;
+    type Args = SearchGraphArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Explore the knowledge graph: the entities connected to a named entity within a few \
+             hops (optionally along one relation), or every entity of an ontology class. Each \
+             node and edge comes with provenance (the document chunk or table row it was \
+             extracted from), which you cite like search results.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(SearchGraphArgs))
+            .unwrap_or_else(|_| json!({"type": "object"}))
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let entity = args
+            .entity
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty());
+        let class = args
+            .class
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        let detail = match (entity, class) {
+            (Some(e), Some(c)) => format!("{e} ({c})"),
+            (Some(e), None) => e.to_owned(),
+            (None, Some(c)) => format!("class {c}"),
+            (None, None) => String::new(),
+        };
+        let step = self.recorder.start(Self::NAME, &detail);
+        if entity.is_none() && class.is_none() {
+            step.finish("error: nothing to search");
+            return Err(ToolError::Analysis(String::from(
+                "give an entity to start from, a class to list, or both",
+            )));
+        }
+        let embedding = match entity {
+            Some(e) => label_embedding(self.embedding_model.as_ref(), e).await,
+            None => None,
+        };
+        let hops = args.hops.unwrap_or(2).max(1);
+        let relation = args
+            .relation
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        let result = {
+            let db = lock(&self.db)?;
+            let outcome = if let Some(e) = entity {
+                graph::traverse::resolve_entry(&db, e, class, embedding.as_deref()).and_then(
+                    |roots| {
+                        graph::traverse::neighborhood(&db, &roots, hops, relation, &self.options)
+                    },
+                )
+            } else {
+                crate::ontology::store::current(&db).and_then(|o| {
+                    graph::traverse::by_class(
+                        &db,
+                        o.as_ref(),
+                        class.unwrap_or_default(),
+                        self.options.max_nodes,
+                        &self.options,
+                    )
+                })
+            };
+            outcome.map_err(|e| ToolError::Query(e.to_string()))
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                step.finish(format!("error: {e}"));
+                return Err(e);
+            }
+        };
+        let result = if self.exclude_provisional {
+            result.without_provisional()
+        } else {
+            result
+        };
+        step.finish(format!(
+            "{} nodes, {} edges",
+            result.nodes.len(),
+            result.edges.len()
+        ));
+        let text = format_graph_result(&result, &self.recorder, &self.db)?;
+        if let Ok(mut results) = self.results.lock() {
+            results.push(result);
+        }
+        Ok(text)
+    }
+}
+
+pub struct FindPathTool<M> {
+    db: SharedDb,
+    embedding_model: Option<M>,
+    options: graph::GraphOptions,
+    exclude_provisional: bool,
+    results: GraphResults,
+    recorder: TurnRecorder,
+}
+
+impl<M> FindPathTool<M> {
+    pub fn new(
+        db: SharedDb,
+        embedding_model: Option<M>,
+        options: graph::GraphOptions,
+        exclude_provisional: bool,
+        results: GraphResults,
+        recorder: TurnRecorder,
+    ) -> Self {
+        Self {
+            db,
+            embedding_model,
+            options,
+            exclude_provisional,
+            results,
+            recorder,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FindPathArgs {
+    /// The entity to start from
+    pub from: String,
+    /// The entity to reach
+    pub to: String,
+    /// Longest path to consider (default 4)
+    pub max_hops: Option<u32>,
+}
+
+impl<M> Tool for FindPathTool<M>
+where
+    M: EmbeddingModel + Send + Sync,
+{
+    const NAME: &'static str = "find_path";
+    type Error = ToolError;
+    type Args = FindPathArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Find the shortest chain of relations connecting two entities in the knowledge \
+             graph, with provenance for every hop.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(FindPathArgs))
+            .unwrap_or_else(|_| json!({"type": "object"}))
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let from = args.from.trim();
+        let to = args.to.trim();
+        let step = self.recorder.start(Self::NAME, &format!("{from} -> {to}"));
+        if from.is_empty() || to.is_empty() {
+            step.finish("error: both ends are needed");
+            return Err(ToolError::Analysis(String::from("give both entities")));
+        }
+        let from_embedding = label_embedding(self.embedding_model.as_ref(), from).await;
+        let to_embedding = label_embedding(self.embedding_model.as_ref(), to).await;
+        let max_hops = args.max_hops.unwrap_or(4).max(1);
+        let result = {
+            let db = lock(&self.db)?;
+            let outcome =
+                graph::traverse::resolve_entry(&db, from, None, from_embedding.as_deref())
+                    .and_then(|a| {
+                        let b =
+                            graph::traverse::resolve_entry(&db, to, None, to_embedding.as_deref())?;
+                        Ok((a, b))
+                    })
+                    .and_then(|(a, b)| match (a.first(), b.first()) {
+                        (Some(a), Some(b)) => {
+                            graph::traverse::path(&db, a, b, max_hops, &self.options)
+                        }
+                        (None, _) => Err(crate::error::Error::Analysis(format!(
+                            "no entity matches '{from}'"
+                        ))),
+                        (_, None) => Err(crate::error::Error::Analysis(format!(
+                            "no entity matches '{to}'"
+                        ))),
+                    });
+            outcome.map_err(|e| ToolError::Query(e.to_string()))
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                step.finish(format!("error: {e}"));
+                return Err(e);
+            }
+        };
+        let result = if self.exclude_provisional {
+            result.without_provisional()
+        } else {
+            result
+        };
+        if result.nodes.is_empty() {
+            step.finish("no path");
+            return Ok(format!(
+                "No path connects {from} and {to} within {max_hops} hops."
+            ));
+        }
+        step.finish(format!("{} hops", result.edges.len()));
+        let text = format_graph_result(&result, &self.recorder, &self.db)?;
+        if let Ok(mut results) = self.results.lock() {
+            results.push(result);
+        }
+        Ok(text)
+    }
+}
+
+/// Render a graph result for the model: the tree, then the sources each
+/// node and edge came from, registered as citable `[n]` markers (chunks)
+/// or named as table rows.
+fn format_graph_result(
+    result: &GraphResult,
+    recorder: &TurnRecorder,
+    db: &SharedDb,
+) -> Result<String, ToolError> {
+    if result.nodes.is_empty() {
+        return Ok(String::from(
+            "No matching entities in the graph. Tell the user the graph has nothing on this.",
+        ));
+    }
+    let mut out = graph::traverse::render_tree(result);
+    let chunk_ids: Vec<String> = result
+        .provenance
+        .iter()
+        .filter_map(|p| p.chunk_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let chunks = {
+        let db = lock(db)?;
+        db.chunks_by_ids(&chunk_ids)
+            .map_err(|e| ToolError::Query(e.to_string()))?
+    };
+    if !chunks.is_empty() {
+        let first = recorder.citations().register(&chunks);
+        writeln!(out, "\nSources (cite with the [n] marker):")?;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let n = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+            let page = chunk.page.map_or(String::new(), |p| format!(", page {p}"));
+            let excerpt: String = chunk.content.trim().chars().take(200).collect();
+            writeln!(out, "[{n}] {}{page}: {excerpt}", chunk.filename)?;
+        }
+    }
+    let rows: std::collections::BTreeSet<String> = result
+        .provenance
+        .iter()
+        .filter_map(|p| {
+            p.table_name
+                .as_deref()
+                .map(|t| format!("{t} row {}", p.row_key.as_deref().unwrap_or("?")))
+        })
+        .collect();
+    if !rows.is_empty() {
+        writeln!(
+            out,
+            "\nFrom table rows: {}",
+            rows.into_iter().collect::<Vec<_>>().join("; ")
+        )?;
+    }
+    Ok(out)
+}

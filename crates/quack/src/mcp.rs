@@ -116,6 +116,26 @@ pub(crate) struct SqlArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub(crate) struct SearchGraphArgs {
+    /// The entity to start from; omit to list every entity of `class`.
+    pub entity: Option<String>,
+    /// An ontology class id: the entry point's class, or the class to list.
+    pub class: Option<String>,
+    /// Follow only this relation id.
+    pub relation: Option<String>,
+    /// Hops out from the entity (default 2).
+    pub hops: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct FindPathArgs {
+    pub from: String,
+    pub to: String,
+    /// Longest path to consider (default 4).
+    pub max_hops: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub(crate) struct DescribeTableArgs {
     /// A table name from `list_tables`.
     pub table: String,
@@ -244,6 +264,7 @@ impl McpServer {
                     "answer": response.content,
                     "citations": citations,
                     "chart": response.chart,
+                    "graph": response.graph,
                     "steps": response.steps,
                     "session_id": session_id,
                     "write_refused": response.write_refused,
@@ -407,6 +428,130 @@ impl McpServer {
     }
 
     #[tool(
+        name = "search_graph",
+        description = "Explore the knowledge graph: the entities within a few hops of a named entity (optionally along one relation), or every entity of an ontology class. Nodes and edges come with provenance to the chunk or table row they were extracted from."
+    )]
+    async fn search_graph(
+        &self,
+        Parameters(args): Parameters<SearchGraphArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let entity = args
+            .entity
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned);
+        let class = args
+            .class
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
+        if entity.is_none() && class.is_none() {
+            return Ok(failure(
+                "give an entity to start from, a class to list, or both",
+            ));
+        }
+        let embedding = match &entity {
+            Some(e) => self.embed(e).await,
+            None => None,
+        };
+        let hops = args.hops.unwrap_or(2).max(1);
+        let relation = args.relation.clone();
+        let options = self.inner.config.graph.options();
+        let detail = serde_json::json!({ "entity": entity, "class": class, "relation": relation, "hops": hops });
+        let result = self
+            .db(move |db| {
+                if let Some(entity) = entity {
+                    let roots = quack_core::graph::traverse::resolve_entry(
+                        db,
+                        &entity,
+                        class.as_deref(),
+                        embedding.as_deref(),
+                    )?;
+                    return quack_core::graph::traverse::neighborhood(
+                        db,
+                        &roots,
+                        hops,
+                        relation.as_deref(),
+                        &options,
+                    );
+                }
+                let ontology = ontology_store::current(db)?;
+                quack_core::graph::traverse::by_class(
+                    db,
+                    ontology.as_ref(),
+                    class.as_deref().unwrap_or_default(),
+                    options.max_nodes,
+                    &options,
+                )
+            })
+            .await?;
+        self.inner
+            .auditor
+            .record("graph", None, Outcome::Allowed, Some(detail))
+            .await;
+        let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
+        out.content = vec![ContentBlock::text(
+            quack_core::graph::traverse::render_tree(&result),
+        )];
+        Ok(out)
+    }
+
+    #[tool(
+        name = "find_path",
+        description = "The shortest chain of relations connecting two entities in the knowledge graph, with provenance for every hop."
+    )]
+    async fn find_path(
+        &self,
+        Parameters(args): Parameters<FindPathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let from = args.from.trim().to_owned();
+        let to = args.to.trim().to_owned();
+        if from.is_empty() || to.is_empty() {
+            return Ok(failure("both entities are needed"));
+        }
+        let a = self.embed(&from).await;
+        let b = self.embed(&to).await;
+        let max_hops = args.max_hops.unwrap_or(4).max(1);
+        let options = self.inner.config.graph.options();
+        let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
+        let (from_label, to_label) = (from.clone(), to.clone());
+        let result = self
+            .db(move |db| {
+                let from_nodes = quack_core::graph::traverse::resolve_entry(
+                    db,
+                    &from_label,
+                    None,
+                    a.as_deref(),
+                )?;
+                let to_nodes =
+                    quack_core::graph::traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
+                match (from_nodes.first(), to_nodes.first()) {
+                    (Some(a), Some(b)) => {
+                        quack_core::graph::traverse::path(db, a, b, max_hops, &options)
+                    }
+                    _ => Ok(quack_core::graph::GraphResult::default()),
+                }
+            })
+            .await?;
+        self.inner
+            .auditor
+            .record("graph", None, Outcome::Allowed, Some(detail))
+            .await;
+        if result.is_empty() {
+            return Ok(failure(format!(
+                "no path connects {from} and {to} within {max_hops} hops"
+            )));
+        }
+        let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
+        out.content = vec![ContentBlock::text(
+            quack_core::graph::traverse::render_tree(&result),
+        )];
+        Ok(out)
+    }
+
+    #[tool(
         name = "list_documents",
         description = "List the ingested documents with their status, title, and source."
     )]
@@ -419,6 +564,14 @@ impl McpServer {
 }
 
 impl McpServer {
+    /// A label's embedding for fuzzy entity resolution, when a model exists.
+    async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        let model = llm::optional_embedding_model(&self.inner.config)
+            .await
+            .ok()??;
+        llm::embed_query(&model, text).await.ok()
+    }
+
     /// The session `query` turns append to, created on the first call and
     /// owned by the server user when there is one.
     async fn session_id(&self) -> Result<String, McpError> {

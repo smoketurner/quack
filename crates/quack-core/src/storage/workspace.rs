@@ -458,6 +458,7 @@ impl WorkspaceDb {
         );
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
+        self.conn.execute_batch(&crate::graph::ddl(dim))?;
         let recorded = self
             .meta("schema_version")?
             .and_then(|v| v.parse::<u32>().ok())
@@ -516,6 +517,45 @@ impl WorkspaceDb {
             Some(row) => Ok(Some(row.get(0)?)),
             None => Ok(None),
         }
+    }
+
+    /// Write a `_quack_meta` entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub fn set_meta_public(&self, key: &str, value: &str) -> crate::error::Result<()> {
+        self.set_meta(key, value)
+    }
+
+    /// Store a vector in `column` of the row of `table` whose `id` matches.
+    /// `table` and `column` are quack's own identifiers, never user input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_vector(
+        &self,
+        table: &str,
+        column: &str,
+        id: &str,
+        embedding: &[f32],
+    ) -> crate::error::Result<()> {
+        let sql = format!(
+            "UPDATE {} SET {} = ?::{} WHERE id = ?",
+            quote_ident(table),
+            quote_ident(column),
+            self.vector_type()
+        );
+        self.conn
+            .execute(&sql, duckdb::params![format_embedding(embedding), id])?;
+        Ok(())
+    }
+
+    /// The `FLOAT[N]` type of this workspace's vectors.
+    #[must_use]
+    pub fn vector_type_public(&self) -> String {
+        self.vector_type()
     }
 
     fn set_meta(&self, key: &str, value: &str) -> crate::error::Result<()> {
@@ -1010,6 +1050,27 @@ impl WorkspaceDb {
         }
 
         Ok(results)
+    }
+
+    /// Chunks by id, in the order given, with the citation metadata a
+    /// search hit carries (score 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn chunks_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<ChunkSearchResult>> {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id WHERE c.id = ?",
+        )?;
+        for id in ids {
+            let mut rows = stmt.query(duckdb::params![id])?;
+            if let Some(row) = rows.next()? {
+                out.push(chunk_from_row(row, 7)?);
+            }
+        }
+        Ok(out)
     }
 
     /// Pin or unpin a document. Pinned documents are injected in full into
@@ -1588,6 +1649,12 @@ pub fn quote_ident(name: &str) -> String {
 fn format_embedding(embedding: &[f32]) -> String {
     let inner: Vec<String> = embedding.iter().map(|v| format!("{v}")).collect();
     format!("[{}]", inner.join(","))
+}
+
+/// A vector as the list literal `DuckDB` casts to `FLOAT[N]`.
+#[must_use]
+pub fn embedding_literal(embedding: &[f32]) -> String {
+    format_embedding(embedding)
 }
 
 fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {

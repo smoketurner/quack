@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<h1 class="text-xl font-semibold">Knowledge graph</h1>
+<p class="mt-1 text-sm text-slate-600">Entities typed by the ontology's classes, relations between them, and for every node and edge the document chunk or table row it came from.</p>
+{% if let Some(error) = error %}<p class="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{{ error }}</p>{% endif %}
+<p class="mt-3 text-sm text-slate-700">{{ status.nodes }} nodes, {{ status.edges }} edges · ontology version {{ status.ontology_version }}, graph built with {{ status.built_with_version }}</p>
+{% if status.provisional() %}
+<div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+  <span>Provisional: built from an ontology accepted without review. Query mode ignores it until someone reviews.</span>
+  {% if ws.can_write %}<form method="post" action="/w/{{ ws.id }}/graph/review"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Mark reviewed</button></form>{% endif %}
+</div>
+{% endif %}
+{% if status.stale %}
+<div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+  <span>Stale: the ontology changed since the graph was built (version {{ status.built_with_version }} → {{ status.ontology_version }}).</span>
+  {% if ws.can_write %}<form method="post" action="/w/{{ ws.id }}/graph/revalidate"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Revalidate (no model calls)</button></form>{% endif %}
+</div>
+{% endif %}
+{% if !drift.is_empty() %}
+<div class="mt-3 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900">
+  The documents expressed {{ drift.len() }} things the ontology lacks: {{ drift.join(", ") }}. <a class="underline" href="/w/{{ ws.id }}/ontology">Propose extensions on the ontology page.</a>
+</div>
+{% endif %}
+
+<div class="mt-4 grid gap-4 md:grid-cols-2">
+  <form method="get" action="/w/{{ ws.id }}/graph" class="rounded border border-slate-200 bg-white p-3 text-sm">
+    <h2 class="font-medium">Explore</h2>
+    <div class="mt-2 flex flex-wrap items-center gap-2">
+      <input name="entity" value="{{ query.entity }}" placeholder="entity (as named in the data)" class="w-56 rounded border border-slate-300 px-2 py-1">
+      <input name="class" value="{{ query.class }}" placeholder="class" class="w-32 rounded border border-slate-300 px-2 py-1">
+      <input name="relation" value="{{ query.relation }}" placeholder="relation" class="w-32 rounded border border-slate-300 px-2 py-1">
+      <label class="inline-flex items-center gap-1">hops <input name="hops" type="number" min="1" max="6" value="{{ query.hops }}" class="w-14 rounded border border-slate-300 px-2 py-1"></label>
+      <button type="submit" class="rounded bg-slate-900 px-3 py-1 text-white hover:bg-slate-700">Search</button>
+    </div>
+    <p class="mt-1 text-xs text-slate-500">An entity shows its neighbourhood; a class alone lists its entities (subclasses included).</p>
+  </form>
+  <form method="get" action="/w/{{ ws.id }}/graph" class="rounded border border-slate-200 bg-white p-3 text-sm">
+    <h2 class="font-medium">Path</h2>
+    <div class="mt-2 flex flex-wrap items-center gap-2">
+      <input name="from" value="{{ query.from }}" placeholder="from" class="w-40 rounded border border-slate-300 px-2 py-1">
+      <input name="to" value="{{ query.to }}" placeholder="to" class="w-40 rounded border border-slate-300 px-2 py-1">
+      <label class="inline-flex items-center gap-1">max hops <input name="max_hops" type="number" min="1" max="8" value="{{ query.max_hops }}" class="w-14 rounded border border-slate-300 px-2 py-1"></label>
+      <button type="submit" class="rounded bg-slate-900 px-3 py-1 text-white hover:bg-slate-700">Find</button>
+    </div>
+  </form>
+</div>
+
+{% if ws.can_write && has_ontology %}
+<form method="post" action="/w/{{ ws.id }}/graph/extract" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-200 bg-white p-3 text-sm">
+  <span class="font-medium">Build</span>
+  <select name="source" class="rounded border border-slate-300 px-2 py-1">
+    <option value="all">tables and documents</option>
+    <option value="tables">mapped tables only (no model calls)</option>
+    <option value="documents">documents only</option>
+  </select>
+  <label class="inline-flex items-center gap-1">at most <input name="sample" type="number" min="1" placeholder="all" class="w-20 rounded border border-slate-300 px-2 py-1"> chunks</label>
+  <label class="inline-flex items-center gap-1"><input type="checkbox" name="reset" value="true"> start from an empty graph</label>
+  <button type="submit" class="rounded bg-slate-900 px-3 py-1 text-white hover:bg-slate-700">Extract</button>
+  <span class="text-slate-500">Documents cost one model call per chunk ({{ chunk_count }} ready) and run in the background.</span>
+</form>
+{% endif %}
+{% if !has_ontology %}
+<p class="mt-4 text-sm text-slate-600">No ontology yet: the graph needs one. <a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology">Install or propose an ontology first.</a></p>
+{% endif %}
+
+{% if !merges.is_empty() %}
+<section class="mt-6">
+  <h2 class="text-sm font-semibold uppercase text-slate-500">Merge review ({{ merges.len() }} pending)</h2>
+  <table class="mt-2 w-full text-sm">
+    <thead><tr class="border-b border-slate-300 text-left text-xs uppercase text-slate-500"><th class="py-1">Keep</th><th>Fold in</th><th>Distance</th><th></th></tr></thead>
+    <tbody>
+    {% for m in merges %}
+    <tr class="border-b border-slate-200">
+      <td class="py-2">{{ m.keep.label }} <span class="text-slate-500">({{ m.keep.class_id }})</span></td>
+      <td>{{ m.drop.label }}</td>
+      <td>{{ m.distance }}</td>
+      <td class="text-right whitespace-nowrap">
+        {% if ws.can_write %}
+        <form method="post" action="/w/{{ ws.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="accept"><button type="submit" class="rounded bg-slate-900 px-2 py-0.5 text-xs text-white hover:bg-slate-700">Merge</button></form>
+        <form method="post" action="/w/{{ ws.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="reject"><button type="submit" class="ml-1 rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100">Keep apart</button></form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if let Some(r) = result %}
+<section class="mt-6">
+  <h2 class="text-sm font-semibold uppercase text-slate-500">{{ r.title }}</h2>
+  {% if r.nodes.is_empty() %}
+  <p class="mt-2 text-sm text-slate-600">Nothing matched.</p>
+  {% else %}
+  <div class="graph mt-2 h-96 rounded border border-slate-200 bg-white" data-graph='{{ r.json }}'></div>
+  <div class="mt-4 grid gap-4 md:grid-cols-2">
+    <div>
+      <h3 class="text-xs font-semibold uppercase text-slate-500">Nodes</h3>
+      <ul class="mt-1 space-y-2 text-sm">
+        {% for n in r.nodes %}
+        <li id="node-{{ n.id }}" class="rounded border border-slate-200 bg-white p-2">
+          <span class="font-medium">{{ n.label }}</span> <span class="text-slate-500">({{ n.class_id }}){% if n.provisional %} · provisional{% endif %}</span>
+          {% if !n.properties.is_empty() %}<div class="mt-1 font-mono text-xs text-slate-600">{{ n.properties }}</div>{% endif %}
+          {% if !n.sources.is_empty() %}<div class="mt-1 text-xs text-slate-500">from {{ n.sources }}</div>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div>
+      <h3 class="text-xs font-semibold uppercase text-slate-500">Edges</h3>
+      <ul class="mt-1 space-y-1 text-sm">
+        {% for e in r.edges %}<li class="font-mono">{{ e.source }} <span class="text-slate-500">—{{ e.relation }}→</span> {{ e.target }}{% if !e.sources.is_empty() %} <span class="text-xs text-slate-500">from {{ e.sources }}</span>{% endif %}</li>{% endfor %}
+      </ul>
+    </div>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+{% endif %}
+{% endblock %}

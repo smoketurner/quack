@@ -85,6 +85,7 @@ cargo run --bin quack -- -w ws                                                 #
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
 cargo run --bin quack -- ontology propose [--extend] [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
+cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate | review | merges | merge ID..
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}
@@ -135,6 +136,21 @@ turns recurring attributes into typed properties, and marks candidates under
 `[ontology].min_support_documents` as `low_support`. `quack ontology propose --documents`
 shows the cost and asks first; the API's `{"documents": true}` answers 202 and runs in the
 background, auditing the run's end under the same run id.
+The knowledge graph (`quack_core::graph`, design doc 6.4) lives in `_quack_graph_nodes`,
+`_quack_graph_edges`, `_quack_provenance`, and `_quack_graph_merges`. `graph::tables`
+turns mapped rows into nodes and edges deterministically; `graph::extract` sends each
+ready chunk to the chat model (`llm::graph_extractor`, preamble from
+`extract::prompt_for`) and validates the answer against the ontology, counting unknown
+classes and relations as drift in `_quack_meta.graph_drift`; `graph::resolve` embeds
+node labels, merges near-identical labels of one class, and queues the rest as merge
+proposals; `graph::traverse` resolves an entry point (exact label, alias, then embedding)
+and walks neighborhoods, shortest paths, and classes with subclass expansion, bounded by
+`[graph]`. `graph::store::status` reports size, `provisional` (the newest ontology version
+was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,
+and drift; `revalidate` drops what the current ontology no longer allows. The agent
+registers `search_graph` and `find_path` only when the graph has nodes, query mode drops
+provisional results, and every response shape carries the turn's `graph` results.
+
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
 `Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content

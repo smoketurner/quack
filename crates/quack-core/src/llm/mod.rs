@@ -176,6 +176,67 @@ where
     }
 }
 
+/// The chat model as a constrained graph extractor: one tool-less agent
+/// whose preamble carries the ontology.
+struct RigGraphExtractor {
+    agent: rig::agent::Agent,
+}
+
+impl crate::graph::extract::GraphExtractor for RigGraphExtractor {
+    fn extract<'a>(&'a self, text: &'a str) -> crate::graph::extract::ExtractFuture<'a> {
+        Box::pin(async move {
+            let answer =
+                stream_answer(&self.agent, text, EXTRACTION_TIMEOUT, "graph extraction").await?;
+            crate::graph::extract::parse_extraction(&answer)
+        })
+    }
+}
+
+fn graph_agent<M>(model: M, ontology: &crate::ontology::Ontology) -> RigGraphExtractor
+where
+    M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
+{
+    RigGraphExtractor {
+        agent: rig::agent::AgentBuilder::new(model)
+            .preamble(&crate::graph::extract::prompt_for(ontology))
+            .temperature(0.0)
+            .build(),
+    }
+}
+
+/// The configured chat model as a constrained extractor for the graph.
+///
+/// # Errors
+///
+/// Returns an error when no chat model is configured or the provider
+/// cannot be built.
+pub async fn graph_extractor(
+    config: &Config,
+    ontology: &crate::ontology::Ontology,
+) -> Result<Box<dyn crate::graph::extract::GraphExtractor>> {
+    let chat = config.chat_model_ref()?;
+    Ok(match chat.provider.provider_type {
+        ProviderType::Ollama => Box::new(graph_agent(
+            build_ollama_client(config, chat.provider_name, chat.provider)
+                .await?
+                .completion_model(chat.model),
+            ontology,
+        )),
+        ProviderType::Openai => Box::new(graph_agent(
+            build_openai_client(config, chat.provider_name, chat.provider)
+                .await?
+                .completion_model(chat.model),
+            ontology,
+        )),
+        ProviderType::Anthropic => Box::new(graph_agent(
+            build_anthropic_client(config, chat.provider_name, chat.provider)
+                .await?
+                .completion_model(chat.model),
+            ontology,
+        )),
+    })
+}
+
 /// The configured chat model as an extractor for ontology induction.
 ///
 /// # Errors
@@ -537,6 +598,7 @@ async fn dispatch(
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                config.graph.options(),
                 policy,
                 prompt,
                 history,
@@ -553,6 +615,7 @@ async fn dispatch(
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                config.graph.options(),
                 policy,
                 prompt,
                 history,
@@ -569,6 +632,7 @@ async fn dispatch(
                 embedding_model,
                 &config.analysis,
                 &config.retrieval,
+                config.graph.options(),
                 policy,
                 prompt,
                 history,

@@ -135,6 +135,27 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 
     if let Some(ontology) = crate::ontology::store::current(db)? {
         prompt.push_str(&ontology.render_for_prompt());
+        let graph = crate::graph::store::status(db)?;
+        if graph.enabled() {
+            writeln!(
+                prompt,
+                "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}. Use search_graph \
+                 for an entity's neighbourhood or every entity of a class, and find_path for how \
+                 two entities connect; both return provenance to cite.",
+                graph.nodes,
+                graph.edges,
+                if graph.provisional() {
+                    " (provisional: built from an unreviewed ontology; say so when you use it)"
+                } else {
+                    ""
+                },
+                if graph.stale {
+                    " (stale: the ontology changed since it was built)"
+                } else {
+                    ""
+                }
+            )?;
+        }
         writeln!(prompt)?;
     }
 

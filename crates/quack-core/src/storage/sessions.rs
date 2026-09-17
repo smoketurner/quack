@@ -601,6 +601,7 @@ mod tests {
             steps,
             citations: Vec::new(),
             chart: None,
+            graph: Vec::new(),
             write_refused: false,
         }
     }

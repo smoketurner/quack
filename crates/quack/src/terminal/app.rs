@@ -40,6 +40,8 @@ Commands:
   /docs             List ingested documents
   /pin ID, /unpin ID  Pin a document's full text into every prompt
   /context          Show the workspace context the agent is given
+  /graph ENTITY [HOPS], /graph --class CLASS   Walk the knowledge graph
+  /path FROM -> TO  Shortest relation chain between two entities
   /clear            Clear messages and chart
   /workspace        Show current workspace and session
   /quit, /exit      Exit quack
@@ -384,6 +386,12 @@ impl App {
                 if let Some(spec) = &response.chart {
                     self.current_chart = Some(ChartData::from_spec(spec));
                 }
+                for result in response.graph.iter().filter(|r| !r.is_empty()) {
+                    self.messages.push(Message::new(
+                        MessageRole::System,
+                        quack_core::graph::traverse::render_tree(result),
+                    ));
+                }
                 if response.write_refused && !self.allow_write {
                     self.messages.push(Message::new(
                         MessageRole::System,
@@ -567,6 +575,8 @@ impl App {
             "/pin" => self.set_pinned(args, true),
             "/unpin" => self.set_pinned(args, false),
             "/tables" => self.run_direct_sql("SHOW TABLES"),
+            "/graph" => self.show_graph(args),
+            "/path" => self.show_path(args),
             "/sql" => {
                 if args.is_empty() {
                     match self.last_sql.clone() {
@@ -791,6 +801,110 @@ impl App {
             Ok(None) => self.messages.push(Message::new(
                 MessageRole::System,
                 "No workspace context set. Use `quack context edit` or `quack context import FILE`.",
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+    }
+
+    /// `/graph ENTITY [HOPS]` or `/graph --class CLASS`: a tree of the
+    /// neighbourhood or of the class's entities.
+    fn show_graph(&mut self, args: &str) {
+        if args.is_empty() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "Usage: /graph ENTITY [HOPS], or /graph --class CLASS",
+            ));
+            return;
+        }
+        let options = self.config.graph.options();
+        let outcome = match self.db.lock() {
+            Ok(db) => {
+                if let Some(class) = args.strip_prefix("--class ") {
+                    quack_core::ontology::store::current(&db).and_then(|ontology| {
+                        quack_core::graph::traverse::by_class(
+                            &db,
+                            ontology.as_ref(),
+                            class.trim(),
+                            options.max_nodes,
+                            &options,
+                        )
+                    })
+                } else {
+                    let (entity, hops) = match args.rsplit_once(' ') {
+                        Some((entity, hops)) if hops.parse::<u32>().is_ok() => {
+                            (entity.trim(), hops.parse::<u32>().unwrap_or(2))
+                        }
+                        _ => (args, 2),
+                    };
+                    quack_core::graph::traverse::resolve_entry(&db, entity, None, None).and_then(
+                        |roots| {
+                            if roots.is_empty() {
+                                return Err(quack_core::error::Error::Analysis(format!(
+                                    "no entity matches '{entity}'"
+                                )));
+                            }
+                            quack_core::graph::traverse::neighborhood(
+                                &db, &roots, hops, None, &options,
+                            )
+                        },
+                    )
+                }
+            }
+            Err(e) => Err(quack_core::error::Error::Analysis(format!(
+                "workspace lock poisoned: {e}"
+            ))),
+        };
+        match outcome {
+            Ok(result) => self.messages.push(Message::new(
+                MessageRole::System,
+                quack_core::graph::traverse::render_tree(&result),
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+    }
+
+    /// `/path FROM -> TO`: the shortest relation chain.
+    fn show_path(&mut self, args: &str) {
+        let Some((from, to)) = args.split_once("->") else {
+            self.messages
+                .push(Message::new(MessageRole::System, "Usage: /path FROM -> TO"));
+            return;
+        };
+        let (from, to) = (from.trim(), to.trim());
+        let options = self.config.graph.options();
+        let outcome = match self.db.lock() {
+            Ok(db) => {
+                quack_core::graph::traverse::resolve_entry(&db, from, None, None).and_then(|a| {
+                    let b = quack_core::graph::traverse::resolve_entry(&db, to, None, None)?;
+                    match (a.first(), b.first()) {
+                        (Some(a), Some(b)) => {
+                            quack_core::graph::traverse::path(&db, a, b, 4, &options)
+                        }
+                        (None, _) => Err(quack_core::error::Error::Analysis(format!(
+                            "no entity matches '{from}'"
+                        ))),
+                        (_, None) => Err(quack_core::error::Error::Analysis(format!(
+                            "no entity matches '{to}'"
+                        ))),
+                    }
+                })
+            }
+            Err(e) => Err(quack_core::error::Error::Analysis(format!(
+                "workspace lock poisoned: {e}"
+            ))),
+        };
+        match outcome {
+            Ok(result) if result.is_empty() => self.messages.push(Message::new(
+                MessageRole::System,
+                format!("No path connects {from} and {to} within 4 hops."),
+            )),
+            Ok(result) => self.messages.push(Message::new(
+                MessageRole::System,
+                quack_core::graph::traverse::render_tree(&result),
             )),
             Err(e) => self
                 .messages

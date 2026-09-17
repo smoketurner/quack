@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use quack_core::config::{
-    AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, IngestionConfig,
+    AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, GraphConfig, IngestionConfig,
     OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
 };
 use quack_core::ingestion;
@@ -79,6 +79,7 @@ fn test_config(data_dir: &Path) -> Config {
         analysis: AnalysisConfig::default(),
         server: ServerConfig::default(),
         ontology: OntologyConfig::default(),
+        graph: GraphConfig::default(),
     }
 }
 
@@ -97,6 +98,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         analysis: AnalysisConfig::default(),
         server: ServerConfig::default(),
         ontology: OntologyConfig::default(),
+        graph: GraphConfig::default(),
     }
 }
 

@@ -35,6 +35,21 @@ pub fn latest_version(db: &WorkspaceDb) -> Result<u32> {
     Ok(latest.and_then(|v| u32::try_from(v).ok()).unwrap_or(0))
 }
 
+/// Whether the newest version was written by `--auto-accept` and nobody
+/// has saved a reviewed version since: a graph built from it is
+/// provisional.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn current_is_auto_accepted(db: &WorkspaceDb) -> Result<bool> {
+    Ok(versions(db, 1)?.first().is_some_and(|v| {
+        v.note
+            .as_deref()
+            .is_some_and(|n| n.starts_with(super::candidates::AUTO_ACCEPT_NOTE))
+    }))
+}
+
 /// The live ontology, or `None` when no version has been saved.
 ///
 /// # Errors

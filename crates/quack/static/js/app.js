@@ -35,6 +35,53 @@
     });
   }
 
+  // A GraphResult ({nodes, edges, roots}) as an ECharts force graph, nodes
+  // coloured by class; clicking a node scrolls its inspector entry into view.
+  function graphOption(result) {
+    var classes = [];
+    result.nodes.forEach(function (n) { if (classes.indexOf(n.class_id) < 0) classes.push(n.class_id); });
+    var roots = result.roots || [];
+    return {
+      tooltip: { formatter: function (p) { return p.dataType === "edge" ? p.data.label.formatter : p.data.name + " (" + classes[p.data.category] + ")"; } },
+      legend: [{ data: classes, bottom: 0 }],
+      series: [{
+        type: "graph",
+        layout: "force",
+        roam: true,
+        draggable: true,
+        force: { repulsion: 220, edgeLength: 90 },
+        categories: classes.map(function (c) { return { name: c }; }),
+        label: { show: true, position: "right", fontSize: 11 },
+        edgeSymbol: ["none", "arrow"],
+        edgeSymbolSize: 7,
+        edgeLabel: { show: true, fontSize: 9, formatter: "{c}" },
+        lineStyle: { color: "#94a3b8", curveness: 0.1 },
+        data: result.nodes.map(function (n) {
+          return { id: n.id, name: n.label, category: classes.indexOf(n.class_id), symbolSize: roots.indexOf(n.id) >= 0 ? 26 : 14, itemStyle: n.provisional ? { opacity: 0.5 } : {} };
+        }),
+        links: result.edges.map(function (e) {
+          return { source: e.source_node_id, target: e.target_node_id, value: e.relation_id, label: { formatter: e.relation_id } };
+        })
+      }]
+    };
+  }
+
+  function renderGraphs() {
+    document.querySelectorAll(".graph[data-graph]").forEach(function (el) {
+      if (!window.echarts) return;
+      var result;
+      try { result = JSON.parse(el.getAttribute("data-graph")); } catch (e) { return; }
+      var chart = window.echarts.init(el);
+      chart.setOption(graphOption(result));
+      chart.on("click", function (p) {
+        if (p.dataType !== "node") return;
+        var row = document.getElementById("node-" + p.data.id);
+        if (row) { row.scrollIntoView({ block: "center", behavior: "smooth" }); row.classList.add("ring-2", "ring-blue-400"); }
+      });
+      window.addEventListener("resize", function () { chart.resize(); });
+    });
+  }
+
   function el(tag, cls, text) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -244,6 +291,7 @@
 
   document.addEventListener("DOMContentLoaded", function () {
     renderStoredCharts();
+    renderGraphs();
     var chat = document.getElementById("chat");
     var form = document.getElementById("ask");
     if (chat && form) {

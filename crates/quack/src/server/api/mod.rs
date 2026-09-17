@@ -6,6 +6,7 @@ mod admin;
 mod auth;
 mod context;
 pub(crate) mod documents;
+pub(crate) mod graph;
 mod members;
 pub(crate) mod ontology;
 pub(crate) mod query;
@@ -78,6 +79,17 @@ pub(crate) fn router() -> Router<App> {
         .route(
             "/workspaces/{id}/ontology/versions/{v}/restore",
             post(ontology::restore),
+        )
+        .route("/workspaces/{id}/graph/search", get(graph::search))
+        .route("/workspaces/{id}/graph/path", get(graph::path))
+        .route("/workspaces/{id}/graph/status", get(graph::status))
+        .route("/workspaces/{id}/graph/extract", post(graph::extract))
+        .route("/workspaces/{id}/graph/revalidate", post(graph::revalidate))
+        .route("/workspaces/{id}/graph/review", post(graph::review))
+        .route("/workspaces/{id}/graph/merges", get(graph::merges))
+        .route(
+            "/workspaces/{id}/graph/merges/{mid}",
+            axum::routing::put(graph::decide_merge),
         )
         .route("/workspaces/{id}/sessions", get(sessions::list))
         .route(
