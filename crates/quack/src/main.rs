@@ -362,6 +362,36 @@ async fn main() -> Result<ExitCode> {
     crypto::install_default_provider()
         .context("failed to install the aws-lc-rs crypto provider")?;
 
+    match run().await {
+        // The reader closed the pipe (`quack ... | head -1`): the command
+        // did its job, so stop quietly like `git` and `ls` do (issue #68).
+        Err(e) if is_broken_pipe(&e) => Ok(ExitCode::SUCCESS),
+        outcome => outcome,
+    }
+}
+
+/// Whether an error is a write to a closed stdout or stderr: a bare
+/// `io::Error`, one behind `serde_json`, or either inside core's
+/// transparent `Io` and `Json` variants (which hide them from the chain).
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    use quack_core::error::Error as Core;
+    error.chain().any(|cause| {
+        let kind = if let Some(e) = cause.downcast_ref::<std::io::Error>() {
+            Some(e.kind())
+        } else if let Some(e) = cause.downcast_ref::<serde_json::Error>() {
+            e.io_error_kind()
+        } else {
+            match cause.downcast_ref::<Core>() {
+                Some(Core::Io(e)) => Some(e.kind()),
+                Some(Core::Json(e)) => e.io_error_kind(),
+                _ => None,
+            }
+        };
+        kind == Some(std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+async fn run() -> Result<ExitCode> {
     let mut cli = Cli::parse();
 
     let policy = if cli.allow_write {
@@ -1475,5 +1505,32 @@ fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, S
             .unwrap_or_else(|| String::from("unknown"));
 
         Ok((data, filename))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A closed reader surfaces as an `io::Error`, a `serde_json` error, or
+    /// core's transparent `Io` and `Json` variants; each one ends the
+    /// command quietly (issue #68). Anything else still reports.
+    #[test]
+    fn broken_pipe_is_recognised_through_every_wrapper() {
+        let pipe = || std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(is_broken_pipe(&anyhow::Error::from(pipe())));
+        assert!(is_broken_pipe(
+            &anyhow::Error::from(pipe()).context("failed to print")
+        ));
+        assert!(is_broken_pipe(&anyhow::Error::from(
+            quack_core::error::Error::Io(pipe())
+        )));
+        assert!(is_broken_pipe(&anyhow::Error::from(
+            quack_core::error::Error::Json(serde_json::Error::io(pipe()))
+        )));
+        assert!(!is_broken_pipe(&anyhow::Error::from(std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        ))));
+        assert!(!is_broken_pipe(&anyhow::anyhow!("something else")));
     }
 }
