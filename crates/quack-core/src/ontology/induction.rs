@@ -313,8 +313,8 @@ impl Known<'_> {
         self.0
             .is_some_and(|o| o.class_properties(class).contains(id))
     }
-    fn relation(&self, id: &str) -> bool {
-        self.0.is_some_and(|o| o.relation(id).is_some())
+    fn relation(&self, id: &str) -> Option<&Relation> {
+        self.0.and_then(|o| o.relation(id))
     }
     fn mapping(&self, table: &str) -> bool {
         self.0
@@ -456,15 +456,16 @@ fn propose_relations(
         if share < options.key_overlap_threshold || column.distinct == 0 {
             continue;
         }
-        let relation_id = relation_id_for_column(&column.name);
         let target_class = class_id_for_table(&other.name);
+        let (relation_id, defined) =
+            relation_id_for(&column.name, &class_id, &target_class, known, candidates);
         relations.push(MappingRelation {
             relation: relation_id.clone(),
             column: column.name.clone(),
             target_class: target_class.clone(),
             target_key: snake_id(other_key),
         });
-        if !known.relation(&relation_id) {
+        if !defined {
             candidates.push(Candidate {
                 proposal: Proposal::Relation(Relation {
                     id: relation_id,
@@ -487,6 +488,42 @@ fn propose_relations(
         }
     }
     Ok(())
+}
+
+/// The relation id for a foreign-key-like column, and whether a relation
+/// with that id, domain, and range is already known or proposed.
+///
+/// Two tables that share a column name (`event_id` in both `fatalities` and
+/// `locations`) would otherwise propose one `has_event` with two domains,
+/// which no ontology can hold; the second one is qualified by its domain
+/// (`location_has_event`).
+fn relation_id_for(
+    column: &str,
+    domain: &str,
+    range: &str,
+    known: &Known<'_>,
+    candidates: &[Candidate],
+) -> (String, bool) {
+    let defined = |id: &str| -> Option<Relation> {
+        known.relation(id).cloned().or_else(|| {
+            candidates.iter().find_map(|c| match &c.proposal {
+                Proposal::Relation(r) if r.id == id => Some(r.clone()),
+                Proposal::Relation(_)
+                | Proposal::Class(_)
+                | Proposal::Property { .. }
+                | Proposal::Mapping(_) => None,
+            })
+        })
+    };
+    let plain = relation_id_for_column(column);
+    match defined(&plain) {
+        None => return (plain, false),
+        Some(r) if r.domain == domain && r.range == range => return (plain, true),
+        Some(_) => {}
+    }
+    let qualified = format!("{domain}_{plain}");
+    let same = defined(&qualified).is_some_and(|r| r.domain == domain && r.range == range);
+    (qualified, same)
 }
 
 /// Id renames from rename and merge decisions, by kind, so later proposals
@@ -719,6 +756,52 @@ mod tests {
         assert_eq!(class_id_for_table("bus"), "bus");
         assert_eq!(relation_id_for_column("policy_id"), "has_policy");
         assert_eq!(relation_id_for_column("policy_number"), "has_policy_number");
+    }
+
+    #[test]
+    fn shared_foreign_key_column_names_get_distinct_relations() {
+        let db = db();
+        assert!(
+            db.execute_statement(
+                "CREATE TABLE notes (note_id INTEGER, policy_number VARCHAR, body VARCHAR)"
+            )
+            .is_ok()
+        );
+        for i in 0..40_u32 {
+            assert!(
+                db.execute_statement(&format!(
+                    "INSERT INTO notes VALUES ({i}, 'P{}', 'note {i}')",
+                    i % 25
+                ))
+                .is_ok()
+            );
+        }
+        let candidates = propose_from_tables(&db, None, &TableEvidenceOptions::default())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let relations: Vec<&Relation> = candidates
+            .iter()
+            .filter_map(|c| match &c.proposal {
+                Proposal::Relation(r) => Some(r),
+                Proposal::Class(_) | Proposal::Property { .. } | Proposal::Mapping(_) => None,
+            })
+            .collect();
+        assert_eq!(relations.len(), 2, "one relation per source table");
+        assert!(
+            relations
+                .iter()
+                .any(|r| r.id == "has_policy_number" && r.domain == "claim")
+        );
+        assert!(
+            relations
+                .iter()
+                .any(|r| r.id == "note_has_policy_number" && r.domain == "note")
+        );
+        let accepted: Vec<(Proposal, Decision)> = candidates
+            .iter()
+            .map(|c| (c.proposal.clone(), Decision::Accept))
+            .collect();
+        let ontology = apply(None, &accepted).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(ontology.validate().is_ok());
     }
 
     #[test]
