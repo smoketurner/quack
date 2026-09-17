@@ -21,7 +21,7 @@ use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::citations::Citation;
 use quack_core::error::Error as CoreError;
 use quack_core::graph::traverse;
-use quack_core::import::{self, ImportRequest};
+use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -1338,6 +1338,7 @@ async fn run_import_inner(
         &ws_db,
         workspace_id,
         request,
+        ImportPolicy::owner(),
         embedding_model.as_ref(),
     )
     .await?;

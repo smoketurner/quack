@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
-use quack_core::import::{self, ImportRequest, ImportSummary};
+use quack_core::import::{self, ImportPolicy, ImportRequest, ImportSummary};
 
 #[derive(Deserialize)]
 pub(crate) struct ImportBody {
@@ -50,11 +50,19 @@ pub(crate) async fn run_import(
     import::source_kind(&request.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let db = app.workspace_db(&access.workspace.id).await?;
     let embeddings = llm::optional_embedding_model(&app.config).await?;
+    // `--local` is the owner at a keyboard; anyone else is held to
+    // `[import]`: no files from the server's disk, no private hosts.
+    let policy = if app.local {
+        ImportPolicy::owner()
+    } else {
+        ImportPolicy::server(&app.config)
+    };
     let outcome = import::import(
         &app.config,
         &db,
         &access.workspace.id,
         request,
+        policy,
         embeddings.as_ref(),
     )
     .await;

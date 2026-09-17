@@ -218,17 +218,30 @@ impl OntologyConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImportConfig {
-    /// Rows an import pulls at most.
+    /// Rows an import pulls at most; a larger file is cut to this.
     pub max_rows: u64,
+    /// Bytes an HTTP(S) download may reach at most.
+    pub max_download_mb: u64,
     /// How long a source may take to connect and answer.
     pub timeout_seconds: u64,
+    /// Whether `quack serve` (with logins) may import `sqlite:` files
+    /// from the server's disk. The CLI, the terminal, and `--local` always
+    /// may: they run as the owner.
+    pub allow_local_files: bool,
+    /// Whether `quack serve` (with logins) may download from loopback,
+    /// private, and link-local addresses, including cloud metadata
+    /// endpoints. The CLI, the terminal, and `--local` always may.
+    pub allow_private_hosts: bool,
 }
 
 impl Default for ImportConfig {
     fn default() -> Self {
         Self {
             max_rows: 1_000_000,
+            max_download_mb: 512,
             timeout_seconds: 300,
+            allow_local_files: false,
+            allow_private_hosts: false,
         }
     }
 }

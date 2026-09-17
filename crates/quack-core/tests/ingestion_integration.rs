@@ -1465,6 +1465,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         &db,
         "ws-import",
         &request,
+        quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
     )
     .await
@@ -1519,11 +1520,41 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         &db,
         "ws-import",
         &request,
+        quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
     )
     .await
     .unwrap();
     assert_eq!((summary.rows, summary.columns.len()), (2, 2));
+}
+
+/// The server's default policy keeps a logged-in user off the server's
+/// disk: a `sqlite:` path is refused before anything is opened.
+#[tokio::test]
+async fn server_policy_refuses_local_sqlite_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-import-policy").unwrap();
+    let server_policy = quack_core::import::ImportPolicy::server(&config);
+    assert!(!server_policy.local_files);
+    assert!(!server_policy.private_hosts);
+    let local_file = quack_core::import::import(
+        &config,
+        &db,
+        "ws-import-policy",
+        &quack_core::import::ImportRequest {
+            url: format!("sqlite://{}", dir.path().join("control.db").display()),
+            table: String::from("x"),
+            query: None,
+            source_table: Some(String::from("users")),
+            limit: None,
+        },
+        server_policy,
+        None::<&MockEmbeddingModel>,
+    )
+    .await;
+    assert!(local_file.is_err_and(|e| e.to_string().contains("allow_local_files")));
+    assert!(db.list_tables().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1557,6 +1588,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         &db,
         "ws-import-errors",
         &first,
+        quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
     )
     .await
@@ -1574,6 +1606,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             source_table: Some(String::from("orders")),
             limit: None,
         },
+        quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
     )
     .await;
@@ -1589,6 +1622,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             source_table: None,
             limit: None,
         },
+        quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
     )
     .await;
@@ -1604,6 +1638,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             source_table: Some(String::from("t")),
             limit: None,
         },
+        quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
     )
     .await;

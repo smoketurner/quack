@@ -17,7 +17,7 @@ use quack_core::config::AuthMode;
 use quack_core::config::Config;
 use quack_core::crypto;
 use quack_core::error::Error as CoreError;
-use quack_core::import::{self, ImportRequest};
+use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm;
 use quack_core::llm::oauth::{self, TokenManager};
@@ -642,6 +642,7 @@ async fn run_import(
         &ws_db,
         &workspace.id,
         request,
+        ImportPolicy::owner(),
         embedding_model.as_ref(),
     )
     .await;

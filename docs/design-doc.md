@@ -547,7 +547,7 @@ each turn (subject to the history token budget) rather than retrieved.
 | CSV, TSV, Parquet, JSON, JSONL | `read_csv_auto` / `read_parquet` / `read_json_auto` | Table in `data.duckdb` (server, desktop); view over the file in place (TUI in a `.quack/` directory) |
 | Excel `.xlsx`, `.xls`, `.ods` | `calamine` (pure Rust) writes each sheet as CSV under `files/` for `read_csv_auto` | One table per data sheet: `<stem>` for one sheet, `<stem>_<sheet>` otherwise; recorded on the document row so deleting it drops them |
 | stdin (print mode) | sniffed | Temporary table `stdin` |
-| Postgres, SQLite | `quack import URL --table T (--from SOURCE_TABLE \| --query SQL) [--limit N]`, `POST .../import`, the Tables page form, `/import` in the terminal: sqlx runs the query on the source with every column cast to text, the rows pass through `files/<table>.csv` and `read_csv_auto`, so `DuckDB` sniffs the types and the table is a document (source `import`, title the redacted URL) that can be deleted like any other. The password in the URL is used once and never stored; audit rows carry the redacted URL. Capped by `[import].max_rows` and `timeout_seconds`. | Table in `data.duckdb`, a snapshot of the source at import time |
+| Postgres, SQLite | `quack import URL --table T (--from SOURCE_TABLE \| --query SQL) [--limit N]`, `POST .../import`, the Tables page form, `/import` in the terminal: sqlx runs the query on the source with every column cast to text, the rows pass through `files/<table>.csv` and `read_csv_auto`, so `DuckDB` sniffs the types and the table is a document (source `import`, title the redacted URL) that can be deleted like any other. The password in the URL is used once and never stored; audit rows carry the redacted URL. Capped by `[import].max_rows` (a file is cut to it after the load), `max_download_mb`, and `timeout_seconds`. The CLI, the terminal, and `quack serve --local` run as the owner and reach any source; `quack serve` with logins refuses `sqlite:` paths unless `[import].allow_local_files` is on and, unless `allow_private_hosts` is on, resolves the host first, refuses loopback, private, link-local, and metadata addresses, pins the connection to the checked addresses, and does not follow redirects. | Table in `data.duckdb`, a snapshot of the source at import time |
 | CSV, Parquet, JSON, XLSX over HTTP(S) | The same command with an `http(s)://` URL: reqwest fetches the file and it goes through the usual reader under the requested table name | Table in `data.duckdb` |
 | MySQL, S3 | Not yet: MySQL needs the sqlx driver enabled and its identifier quoting; S3 needs request signing (the `object_store` crate is the candidate). The scanner and httpfs extensions stay out (section 15). | — |
 
@@ -1234,7 +1234,10 @@ default_mode = "chat"                   # default for new workspaces
 
 [import]
 max_rows = 1000000
+max_download_mb = 512
 timeout_seconds = 300
+allow_local_files = false               # quack serve with logins: sqlite: paths on the server's disk
+allow_private_hosts = false             # quack serve with logins: loopback, private, link-local hosts
 
 [graph]
 max_traversal_depth = 3

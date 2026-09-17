@@ -38,7 +38,7 @@ sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "post
 tar           = { workspace = true }
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
-tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 toml          = { workspace = true, features = ["std", "parse", "serde"] }
 tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
