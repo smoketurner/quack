@@ -81,7 +81,7 @@ quack -w sales -p "total sales by region" # one turn; answer to stdout, steps to
 quack -w sales -p "and by month?" -c     # continue the last session
 quack -w sales -p "what is excluded?" --mode query   # answer only from the documents, with citations
 quack -w sales -q "SELECT region, sum(total) FROM sales GROUP BY 1" -f csv   # SQL, no agent
-cat orders.csv | quack -q "SELECT count(*) FROM stdin"   # piped data is the table `stdin`
+cat orders.csv | quack -q "SELECT count(*) FROM stdin"   # piped data is the table `stdin` (--stdin waits for a slow producer)
 ```
 
 Teach the agent your domain:

@@ -33,6 +33,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Exit status for a usage error (bad flags, no terminal for the session).
 const EXIT_USAGE: u8 = 2;
@@ -49,6 +50,10 @@ const EXIT_AUTH_REQUIRED: u8 = 4;
     long_about = "With no arguments, starts the interactive terminal session in a workspace.\n\
                   `-p PROMPT` asks the agent one question and prints the answer; \
                   `-q SQL` runs SQL directly. Both are pipe-friendly."
+)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is an independent command-line switch"
 )]
 struct Cli {
     /// Ask the agent one question, print the answer, and exit
@@ -93,6 +98,12 @@ struct Cli {
     /// Print full tool inputs and outputs to stderr in print mode
     #[arg(long, global = true)]
     verbose: bool,
+
+    /// Wait for piped stdin to close before running (`-p` and `-q` load
+    /// it as the `stdin` table). Without it, a pipe that has nothing to
+    /// read within a second is skipped
+    #[arg(long)]
+    stdin: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -410,7 +421,7 @@ async fn run() -> Result<ExitCode> {
         let format = cli
             .format
             .unwrap_or_else(|| OutputFormat::default_for(stdout_is_tty));
-        run_query(sql, cli.workspace.as_deref(), format).await?;
+        run_query(sql, cli.workspace.as_deref(), format, cli.stdin).await?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -535,7 +546,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    load_piped_stdin(&config, &ws_db, &workspace.id)?;
+    load_piped_stdin(&config, &ws_db, &workspace.id, cli.stdin).await?;
     let session_id = resolve_session(
         &config,
         &ws_db,
@@ -575,8 +586,27 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
 
 /// When stdin is a pipe or file rather than a terminal, its bytes become
 /// the temporary table `stdin` for this invocation (CSV, JSON, or Parquet).
-fn load_piped_stdin(config: &Config, db: &WorkspaceDb, workspace_id: &str) -> Result<()> {
+///
+/// A pipe that stays open with nothing to read (a supervisor's inherited
+/// stdin, `sleep 1000 | quack -q ...`) would block the command forever
+/// (issue #66): unless `wait` (`--stdin`) says so, a pipe gets
+/// [`STDIN_GRACE`] to deliver a byte or close, and is otherwise skipped
+/// with a warning.
+async fn load_piped_stdin(
+    config: &Config,
+    db: &WorkspaceDb,
+    workspace_id: &str,
+    wait: bool,
+) -> Result<()> {
     if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    if !wait && !stdin_has_data().await? {
+        tracing::warn!(
+            "stdin is not a terminal but had nothing to read within {} s; \
+             skipping the `stdin` table (pass --stdin to wait for it)",
+            STDIN_GRACE.as_secs()
+        );
         return Ok(());
     }
     let mut data = Vec::new();
@@ -593,6 +623,38 @@ fn load_piped_stdin(config: &Config, db: &WorkspaceDb, workspace_id: &str) -> Re
         );
     }
     Ok(())
+}
+
+/// How long a non-terminal stdin has to deliver a byte or close.
+const STDIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Whether stdin is worth reading: a pipe or socket is when it becomes
+/// readable (data or end of file) within [`STDIN_GRACE`]; anything else
+/// (a regular file, `/dev/null`) answers a read at once.
+#[cfg(unix)]
+async fn stdin_has_data() -> Result<bool> {
+    use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::unix::fs::FileTypeExt;
+    let stdin = std::io::stdin();
+    let kind = std::fs::File::from(stdin.as_fd().try_clone_to_owned()?)
+        .metadata()
+        .context("failed to inspect stdin")?
+        .file_type();
+    if !kind.is_fifo() && !kind.is_socket() {
+        return Ok(true);
+    }
+    let fd: BorrowedFd<'_> = stdin.as_fd();
+    let watch = tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
+        .context("failed to watch stdin")?;
+    Ok(tokio::time::timeout(STDIN_GRACE, watch.readable())
+        .await
+        .is_ok())
+}
+
+/// Windows has no readiness poll for stdin: read it as before.
+#[cfg(not(unix))]
+async fn stdin_has_data() -> Result<bool> {
+    Ok(true)
 }
 
 /// Logging, then the workspace database for the workspace-local subcommands.
@@ -1249,12 +1311,17 @@ async fn resolve_workspace(workspace_name: Option<&str>) -> Result<(Config, Work
     Ok((config, workspace, ws_name))
 }
 
-async fn run_query(sql: &str, workspace_name: Option<&str>, format: OutputFormat) -> Result<()> {
+async fn run_query(
+    sql: &str,
+    workspace_name: Option<&str>,
+    format: OutputFormat,
+    wait_for_stdin: bool,
+) -> Result<()> {
     let (config, workspace, _) = resolve_workspace(workspace_name).await?;
 
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    load_piped_stdin(&config, &ws_db, &workspace.id)?;
+    load_piped_stdin(&config, &ws_db, &workspace.id, wait_for_stdin).await?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
 

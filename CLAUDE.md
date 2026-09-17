@@ -78,7 +78,7 @@ data-layer, crypto, or dependency change:
 
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
-cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q)
+cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table(s) or chunks
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr

@@ -1191,8 +1191,8 @@ local tabular files in place as views.
 
 ```
 quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
-      [--allow-write] [-c | -r SESSION]
-quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown]
+      [--allow-write] [-c | -r SESSION] [--stdin]
+quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
 quack docs [--pin ID | --unpin ID | --delete ID]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
@@ -1212,9 +1212,15 @@ quack user add|list ; quack token create ; quack member add|remove   (server adm
 ```
 
 stdin that is not a TTY is data for `-p` and `-q`: CSV, JSON, or Parquet loaded as the
-temporary table `stdin` for that invocation (a pasted document is `quack ingest -`);
-stdout carries the answer or result set; stderr carries steps. Exit
-codes: 0 ok, 1 runtime error, 2 usage, 3 write refused, 4 auth required.
+temporary table `stdin` for that invocation (a pasted document is `quack ingest -`). A
+pipe that delivers nothing within a second (a supervisor's inherited stdin) is skipped
+with a warning rather than waited on; `--stdin` waits for it. stdout carries the answer
+or result set; stderr carries steps. In `-f json` and `-f ndjson`, columns that share a
+name keep every value under suffixed keys (`a`, `a_1`). Print mode streams text only on a
+terminal and shows the validated answer when validation changed what streamed; a pipeline
+gets the validated answer alone. Exit codes: 0 ok, 1 runtime error, 2 usage, 3 write
+refused, 4 auth required; a reader that closes stdout early (`| head`) ends the command
+quietly with 0.
 
 ### 11.6 Desktop window (`quack desktop`)
 
@@ -1324,14 +1330,14 @@ threads = 4
 max_turns = 10
 history_token_budget = 32000
 max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
+extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
+extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
 
 [import]
 max_rows = 1000000
 max_download_mb = 512
 timeout_seconds = 300
 allow_local_files = false               # quack serve with logins: sqlite: paths on the server's disk
-extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
-extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
 allow_private_hosts = false             # quack serve with logins: loopback, private, link-local hosts
 
 [graph]
