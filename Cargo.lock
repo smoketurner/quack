@@ -5878,6 +5878,7 @@ dependencies = [
  "quick-xml",
  "reqwest 0.13.5",
  "rig",
+ "rust-stemmers",
  "rustls",
  "schemars 1.2.2",
  "scraper",

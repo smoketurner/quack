@@ -518,7 +518,10 @@ Re-uploading a file with the same SHA-256 is a no-op with a message.
 
 **Hybrid retrieval.** A query runs both an exact cosine scan over `embedding` (core
 `array_cosine_distance`) and a BM25 search over the terms quack tokenized at ingest
-(`_quack_terms`, scored in SQL; no DuckDB extension). Results are fused with reciprocal rank fusion
+(`_quack_terms`, scored in SQL; no DuckDB extension). Tokens are lowercased alphanumeric
+runs passed through the Snowball English stemmer (`rust-stemmers`), so `renewals` meets
+`renewal` on the keyword side while codes and numbers (`POL-8841`) are unchanged; the
+term index is rebuilt on open when a workspace predates the stemmer. Results are fused with reciprocal rank fusion
 (`k = 60`) and the top `k` chunks (default 8) are returned. A reranking hook
 (`analysis::rerank::Reranker`) sits between fusion and the answer: off by default
 (`[retrieval].rerank = "none"`), or `"model"`, which over-fetches `rerank_candidates`
@@ -1274,8 +1277,14 @@ because the system being replaced runs on Postgres.
    for a hundred thousand 768-dimensional chunks and grows linearly; the working set is
    `chunks × dimension × 4` bytes (about 3 GB per million chunks). Past a few hundred
    thousand chunks per workspace, add an approximate index that ships inside the binary
-   (a pure-Rust HNSW crate over the same stored vectors) rather than a DuckDB extension.
-   BM25 is an indexed join on `_quack_terms` and stays fast far beyond that.
+   rather than a DuckDB extension. The decision, recorded so it is not rediscovered
+   (#32): a pure-Rust HNSW crate over the same stored vectors, persisted beside
+   `data.duckdb` and rebuilt from `_quack_chunks` when missing or stale, is the accepted
+   path; the alternative of a custom DuckDB build with `vss` and `fts` statically linked
+   (DuckDB's extension config, `DUCKDB_LIB_DIR` and `DUCKDB_STATIC`) is a C++ build
+   pipeline per release target and is not pursued. Neither is built until a workspace
+   reaches that size. BM25 is an indexed join on `_quack_terms` and stays fast far
+   beyond that.
 3. **One file is the boundary, so one file is the backup unit.** Back up a workspace by
    copying its directory while the server holds no write transaction (`quack workspace
    snapshot NAME` does this via DuckDB's `CHECKPOINT` and a copy). There is no
@@ -1376,9 +1385,11 @@ updated as issues close. Ordered by risk.
    server records the editing user and writes the detail row under the access row's id.
    Sections 5.3, 5.4, 12.
 10. **No release pipeline** (#30). Section 14.
-11. **No stemming in keyword search** (#31, deliberately deferred); ~~no reranking hook~~
-    (#34, closed: `Reranker` trait, `none` or `model`); **large-workspace vector index
-    options** (#32, research). Sections 6.1, 15.
+11. ~~No stemming in keyword search~~ (#31, closed: Snowball English over the same
+    tokenizer, schema version 6 rebuilds older term indexes on open); ~~no reranking
+    hook~~ (#34, closed: `Reranker` trait, `none` or `model`); ~~large-workspace vector
+    index options~~ (#32, closed as a recorded decision in section 15, item 2). Sections
+    6.1, 15.
 12. ~~Web UI mapping of the chart spec to ECharts~~ (#26, closed): `static/js/app.js`
     maps the spec to an ECharts option. Section 9.
 13. **Open Knowledge Format export and import** (#36): a workspace as an OKF bundle

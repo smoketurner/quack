@@ -26,6 +26,7 @@ pdf-extract   = { workspace = true }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
+rust-stemmers = { workspace = true }
 rustls        = { workspace = true, features = ["aws_lc_rs", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
 scraper       = { workspace = true }

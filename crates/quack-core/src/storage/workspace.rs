@@ -26,7 +26,7 @@ const BM25_B: f64 = 0.75;
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "5";
+const WORKSPACE_SCHEMA_VERSION: &str = "6";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -446,7 +446,9 @@ impl WorkspaceDb {
             .meta("schema_version")?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
-        if recorded < 4 && self.chunk_count()? > 0 {
+        // Version 4 introduced the term index; version 6 changed its
+        // tokens (stemming), so older workspaces rebuild it on open.
+        if recorded < 6 && self.chunk_count()? > 0 {
             tracing::info!("indexing existing chunks for keyword search");
             self.reindex_terms()?;
         }
@@ -1424,9 +1426,12 @@ fn chunk_from_row(row: &duckdb::Row<'_>, score_idx: usize) -> duckdb::Result<Chu
 /// queries, so `POL-8841` becomes `pol` and `8841` on both sides.
 #[must_use]
 pub fn tokenize(text: &str) -> Vec<String> {
+    static STEMMER: std::sync::LazyLock<rust_stemmers::Stemmer> = std::sync::LazyLock::new(|| {
+        rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
+    });
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .map(str::to_lowercase)
+        .map(|t| STEMMER.stem(&t.to_lowercase()).into_owned())
         .collect()
 }
 
@@ -2105,16 +2110,15 @@ mod tests {
         assert_eq!(
             tokenize("Policy POL-8841 renews; see \"Exclusions\" (page 12)."),
             vec![
-                "policy",
-                "pol",
-                "8841",
-                "renews",
-                "see",
-                "exclusions",
-                "page",
-                "12"
+                "polici", "pol", "8841", "renew", "see", "exclus", "page", "12"
             ]
         );
+        // Inflections meet at one stem; codes and numbers are untouched.
+        assert_eq!(
+            tokenize("renewal renewals renewing"),
+            vec!["renew", "renew", "renew"]
+        );
+        assert_eq!(tokenize("AB-12X9"), vec!["ab", "12x9"]);
         assert!(tokenize("  --- ").is_empty());
     }
 
@@ -2124,8 +2128,8 @@ mod tests {
         assert_eq!(
             tf,
             vec![
-                (String::from("damage"), 1),
-                (String::from("exclusions"), 1),
+                (String::from("damag"), 1),
+                (String::from("exclus"), 1),
                 (String::from("flood"), 3),
             ]
         );

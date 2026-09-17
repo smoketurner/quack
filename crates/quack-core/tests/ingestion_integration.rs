@@ -732,7 +732,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("5"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("6"));
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("4")
@@ -1002,6 +1002,15 @@ fn keyword_search_finds_exact_tokens_the_vector_misses() {
         .search_keyword_chunks("flood", 5, &[String::from("doc-b")])
         .unwrap();
     assert!(filtered.is_empty());
+    // Stemming: an inflected query finds the base form in the chunk.
+    let stemmed = db.search_keyword_chunks("exclusions", 5, &[]).unwrap();
+    assert!(!stemmed.is_empty());
+    assert!(
+        stemmed
+            .iter()
+            .all(|h| h.content.contains("excluded") || h.heading.as_deref() == Some("Exclusions")),
+        "{stemmed:?}"
+    );
 }
 
 #[test]
@@ -1052,16 +1061,21 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
             embedding: None,
         })
         .unwrap();
-        // Simulate a v3 workspace: no term rows, old version recorded.
+        // Simulate a v5 workspace: unstemmed term rows, old version recorded.
         db.execute_statement("DELETE FROM _quack_terms").unwrap();
-        db.execute_statement("UPDATE _quack_meta SET value = '3' WHERE key = 'schema_version'")
+        db.execute_statement("INSERT INTO _quack_terms VALUES ('c0', 'renewal', 1)")
+            .unwrap();
+        db.execute_statement("UPDATE _quack_meta SET value = '5' WHERE key = 'schema_version'")
             .unwrap();
         assert!(db.search_keyword_chunks("8841", 3, &[]).unwrap().is_empty());
     }
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("5"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("6"));
     let hits = db.search_keyword_chunks("8841", 3, &[]).unwrap();
     assert_eq!(hits.first().map(|h| h.id.as_str()), Some("c0"));
+    // Rebuilt with stems: the inflected query matches now.
+    let renewals = db.search_keyword_chunks("renewals", 3, &[]).unwrap();
+    assert_eq!(renewals.first().map(|h| h.id.as_str()), Some("c0"));
     assert!(
         !db.list_tables()
             .unwrap()
