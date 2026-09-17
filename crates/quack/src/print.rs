@@ -62,7 +62,11 @@ pub(crate) async fn run_prompt(
     // lock here deadlocks the turn the moment a tool logs anything.
     let mut err = std::io::stderr();
     let mut out = std::io::stdout();
-    let mut streamed_any = false;
+    // What went to stdout as it streamed, to compare with the validated
+    // answer at the end. Text streams only on a terminal: a pipeline gets
+    // the validated answer alone (issue #64).
+    let mut streamed = String::new();
+    let stream_live = format == PromptFormat::Text && out.is_terminal();
     // Once a search has run, the answer may carry [n] markers that citation
     // validation renumbers after the stream ends, so buffer instead of
     // printing text that would then need to be reprinted.
@@ -87,10 +91,10 @@ pub(crate) async fn run_prompt(
         spinner.clear(&mut err)?;
         match event {
             AgentEvent::TextDelta(text) => {
-                if format == PromptFormat::Text && !searched {
+                if stream_live && !searched {
                     write!(out, "{text}")?;
                     out.flush()?;
-                    streamed_any = true;
+                    streamed.push_str(&text);
                     spinner.stop();
                 } else {
                     spinner.set("answering");
@@ -123,33 +127,7 @@ pub(crate) async fn run_prompt(
     interrupt.abort();
 
     match format {
-        PromptFormat::Text => {
-            if !streamed_any {
-                write!(out, "{}", response.content)?;
-            }
-            if !response.content.ends_with('\n') {
-                writeln!(out)?;
-            }
-            if let Some(chart) = &response.chart {
-                // The spec itself is in `--format json`; text mode says a
-                // chart exists rather than dropping it.
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "Chart: {} ({} chart, {} points; --format json carries the spec)",
-                    chart.title,
-                    chart.kind.as_str(),
-                    chart.points()
-                )?;
-            }
-            if !response.citations.is_empty() {
-                writeln!(out)?;
-                writeln!(out, "Sources:")?;
-                for citation in &response.citations {
-                    writeln!(out, "  [{}] {}", citation.n, citation.label())?;
-                }
-            }
-        }
+        PromptFormat::Text => write_text_answer(&mut out, &streamed, &response)?,
         PromptFormat::Json => {
             let object = response.to_json(session_id);
             serde_json::to_writer_pretty(&mut out, &object)?;
@@ -161,6 +139,62 @@ pub(crate) async fn run_prompt(
 
     Ok(response.write_refused)
 }
+
+/// The text-mode answer after the turn: the validated content when
+/// nothing streamed, what the turn appended when the stream stands, the
+/// validated content again when validation changed what streamed, then
+/// the chart note and the sources.
+fn write_text_answer(
+    out: &mut impl Write,
+    streamed: &str,
+    response: &quack_core::analysis::agent::AgentResponse,
+) -> Result<()> {
+    if streamed.is_empty() {
+        write!(out, "{}", response.content)?;
+    } else if let Some(rest) = response.content.strip_prefix(streamed) {
+        // What streamed stands; a stopped or cancelled turn appends a note.
+        write!(out, "{rest}")?;
+    } else {
+        // Validation changed the text after it streamed (the model
+        // invented citation markers nothing was retrieved for):
+        // what stands is the validated answer, so show it.
+        if !streamed.ends_with('\n') {
+            writeln!(out)?;
+        }
+        writeln!(out)?;
+        writeln!(out, "{VALIDATED_NOTE}")?;
+        write!(out, "{}", response.content)?;
+    }
+    if !response.content.ends_with('\n') {
+        writeln!(out)?;
+    }
+    if let Some(chart) = &response.chart {
+        // The spec itself is in `--format json`; text mode says a
+        // chart exists rather than dropping it.
+        writeln!(out)?;
+        writeln!(
+            out,
+            "Chart: {} ({} chart, {} points; --format json carries the spec)",
+            chart.title,
+            chart.kind.as_str(),
+            chart.points()
+        )?;
+    }
+    if !response.citations.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Sources:")?;
+        for citation in &response.citations {
+            writeln!(out, "  [{}] {}", citation.n, citation.label())?;
+        }
+    }
+    Ok(())
+}
+
+/// The line printed between streamed text and the validated answer that
+/// replaced it.
+const VALIDATED_NOTE: &str = "(The text above streamed before validation, which removed \
+                              citation markers nothing was retrieved for. The validated \
+                              answer follows.)";
 
 /// A one-line progress indicator on stderr: `⠋ thinking 4s`. Inactive when
 /// stderr is not a terminal, so pipelines see only the step lines.
@@ -258,10 +292,49 @@ fn write_finished(err: &mut impl Write, step: &ToolStep) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quack_core::analysis::agent::AgentResponse;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// What stands on stdout is the validated answer (issue #64): printed
+    /// whole when nothing streamed, not repeated when the stream matched
+    /// it, and printed again after a note when validation changed it.
+    #[test]
+    fn text_answer_is_the_validated_content() {
+        let response = AgentResponse {
+            content: String::from("Top 5: Texas"),
+            ..AgentResponse::default()
+        };
+        let mut nothing = Vec::new();
+        write_text_answer(&mut nothing, "", &response).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(String::from_utf8_lossy(&nothing), "Top 5: Texas\n");
+
+        let mut same = Vec::new();
+        write_text_answer(&mut same, "Top 5: Texas", &response)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(String::from_utf8_lossy(&same), "\n");
+
+        let stopped = AgentResponse {
+            content: String::from("Top 5: Texas\n\n(cancelled)"),
+            ..AgentResponse::default()
+        };
+        let mut appended = Vec::new();
+        write_text_answer(&mut appended, "Top 5: Texas", &stopped)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(String::from_utf8_lossy(&appended), "\n\n(cancelled)\n");
+
+        let mut changed = Vec::new();
+        write_text_answer(&mut changed, "Top 5: Texas [1]\n\nSources: [1]", &response)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let changed = String::from_utf8_lossy(&changed);
+        assert_eq!(
+            changed,
+            format!("\n\n{VALIDATED_NOTE}\nTop 5: Texas\n"),
+            "{changed}"
+        );
     }
 
     /// Steps on stderr fold to the shared preview unless `--verbose`, and
