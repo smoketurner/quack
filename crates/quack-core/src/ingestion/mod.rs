@@ -7,7 +7,10 @@ use rig::embeddings::EmbeddingModel;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::storage::workspace::{NewChunk, WorkspaceDb, quote_ident};
+use crate::storage::control::sha256_hex;
+use crate::storage::workspace::{
+    DocumentInfo, DocumentSource, NewChunk, NewDocument, WorkspaceDb, quote_ident,
+};
 
 /// Access to a workspace database for ingestion: a bare handle, or a
 /// shared one that is locked only around each database step so embedding
@@ -46,9 +49,80 @@ pub struct IngestResult {
     pub table_name: Option<String>,
 }
 
+/// What `ingest_file` did: stored the file, or skipped it because a
+/// document with identical bytes is already in the workspace.
+#[derive(Debug)]
+pub enum IngestOutcome {
+    Ingested(IngestResult),
+    Duplicate(Box<DocumentInfo>),
+}
+
+impl IngestOutcome {
+    /// The result when the file was stored.
+    #[must_use]
+    pub fn ingested(self) -> Option<IngestResult> {
+        match self {
+            Self::Ingested(result) => Some(result),
+            Self::Duplicate(_) => None,
+        }
+    }
+}
+
+/// A file to ingest: its name and bytes, where it came from, an optional
+/// title (else parsed from the content), and the server user uploading it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFile<'a> {
+    pub filename: &'a str,
+    pub data: &'a [u8],
+    pub source: DocumentSource,
+    pub title: Option<&'a str>,
+    pub ingested_by: Option<&'a str>,
+}
+
+impl<'a> NewFile<'a> {
+    /// A file read from a path with no title or uploader.
+    #[must_use]
+    pub fn new(filename: &'a str, data: &'a [u8]) -> Self {
+        Self {
+            filename,
+            data,
+            source: DocumentSource::Path,
+            title: None,
+            ingested_by: None,
+        }
+    }
+
+    #[must_use]
+    pub fn source(mut self, source: DocumentSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    #[must_use]
+    pub fn title(mut self, title: Option<&'a str>) -> Self {
+        self.title = title;
+        self
+    }
+
+    #[must_use]
+    pub fn ingested_by(mut self, user: Option<&'a str>) -> Self {
+        self.ingested_by = user;
+        self
+    }
+}
+
+/// Outcome of registering a file: a new `queued` document id, or the
+/// existing document whose bytes are identical.
+#[derive(Debug)]
+pub enum Registration {
+    New(String),
+    Duplicate(Box<DocumentInfo>),
+}
+
 /// Ingest a file into a workspace, producing either a `DuckDB` table (structured)
 /// or embedded chunks (unstructured). Registers the document and processes
 /// it in one go; the server registers first and processes from its queue.
+/// Identical bytes already in the workspace are skipped.
 ///
 /// # Errors
 ///
@@ -58,43 +132,56 @@ pub async fn ingest_file<M: EmbeddingModel, D: DbHandle>(
     config: &Config,
     db: &D,
     workspace_id: &str,
-    filename: &str,
-    data: &[u8],
+    file: &NewFile<'_>,
     embedding_model: Option<&M>,
-) -> Result<IngestResult> {
-    let doc_id = db.with(|db| register_document(db, filename, data.len()))?;
-    process_document(
+) -> Result<IngestOutcome> {
+    let doc_id = match db.with(|db| register_document(db, file))? {
+        Registration::New(id) => id,
+        Registration::Duplicate(existing) => return Ok(IngestOutcome::Duplicate(existing)),
+    };
+    let result = process_document(
         config,
         db,
         workspace_id,
         &doc_id,
-        filename,
-        data,
+        file.filename,
+        file.data,
         embedding_model,
     )
-    .await
+    .await?;
+    Ok(IngestOutcome::Ingested(result))
 }
 
-/// Insert the document row with status `queued` and return its id. Fails
-/// before writing anything for a file type nothing can parse.
+/// Insert the document row with status `queued` and return its id, or the
+/// document already holding the same bytes (by SHA-256) so the caller can
+/// skip it. Fails before writing anything for a file type nothing can parse.
 ///
 /// # Errors
 ///
 /// Returns `UnsupportedFileType` or a storage error.
-pub fn register_document(db: &WorkspaceDb, filename: &str, size_bytes: usize) -> Result<String> {
-    let file_type = parser::detect_file_type(filename);
+pub fn register_document(db: &WorkspaceDb, file: &NewFile<'_>) -> Result<Registration> {
+    let file_type = parser::detect_file_type(file.filename);
     if matches!(file_type, parser::FileType::Unknown) {
-        return Err(Error::UnsupportedFileType(filename.to_owned()));
+        return Err(Error::UnsupportedFileType(file.filename.to_owned()));
+    }
+    let sha256 = sha256_hex(file.data);
+    if let Some(existing) = db.document_by_sha256(&sha256)? {
+        return Ok(Registration::Duplicate(Box::new(existing)));
     }
     let doc_id = uuid::Uuid::now_v7().to_string();
-    db.insert_document(
-        &doc_id,
-        filename,
-        file_type.mime_type(),
-        size_bytes,
-        "queued",
-    )?;
-    Ok(doc_id)
+    let title = file.title.map(str::trim).filter(|t| !t.is_empty());
+    db.insert_document(&NewDocument {
+        id: &doc_id,
+        filename: file.filename,
+        title,
+        mime_type: file_type.mime_type(),
+        size_bytes: file.data.len(),
+        sha256: &sha256,
+        source: file.source,
+        status: "queued",
+        ingested_by: file.ingested_by,
+    })?;
+    Ok(Registration::New(doc_id))
 }
 
 /// Parse, store, and embed a registered document, moving its status from
@@ -124,7 +211,10 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     )
     .await;
     match &outcome {
-        Ok(_) => db.with(|db| db.update_document_status(doc_id, "ready"))?,
+        Ok(result) => db.with(|db| {
+            db.set_document_chunk_count(doc_id, result.chunks_stored)?;
+            db.update_document_status(doc_id, "ready")
+        })?,
         Err(e) => db.with(|db| db.mark_document_error(doc_id, &e.to_string()))?,
     }
     outcome
@@ -155,6 +245,9 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
         }
         parser::FileType::Pdf | parser::FileType::Text | parser::FileType::Markdown => {
             let sections = parser::extract_sections(&file_type, data)?;
+            if let Some(title) = parser::title_of(&sections) {
+                db.with(|db| db.set_document_title_if_empty(doc_id, title))?;
+            }
             let chunks = chunker::chunk_sections(
                 &sections,
                 config.ingestion.chunk_size_tokens,

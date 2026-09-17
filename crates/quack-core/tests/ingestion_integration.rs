@@ -9,7 +9,7 @@ use quack_core::config::{
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
-use quack_core::storage::workspace::{NewChunk, StatementKind, WorkspaceDb};
+use quack_core::storage::workspace::{NewChunk, NewDocument, StatementKind, WorkspaceDb};
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
 const TEST_DIM: usize = 4;
@@ -117,11 +117,12 @@ async fn ingest_text_without_embeddings() {
         &config,
         &db,
         workspace_id,
-        "test.txt",
-        data,
+        &ingestion::NewFile::new("test.txt", data),
         None,
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
 
     assert_eq!(result.filename, "test.txt");
@@ -151,11 +152,12 @@ async fn ingest_text_with_mock_embeddings() {
         &config,
         &db,
         workspace_id,
-        "embed_test.txt",
-        data,
+        &ingestion::NewFile::new("embed_test.txt", data),
         Some(&model),
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
 
     assert_eq!(result.file_type, FileType::Text);
@@ -185,11 +187,12 @@ async fn ingest_csv_structured() {
         &config,
         &db,
         workspace_id,
-        "people.csv",
-        csv_content,
+        &ingestion::NewFile::new("people.csv", csv_content),
         None,
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
 
     assert_eq!(result.file_type, FileType::Csv);
@@ -220,11 +223,12 @@ async fn ingest_json_structured() {
         &config,
         &db,
         workspace_id,
-        "scores.json",
-        json_content,
+        &ingestion::NewFile::new("scores.json", json_content),
         None,
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
 
     assert_eq!(result.file_type, FileType::Json);
@@ -249,8 +253,7 @@ async fn ingest_unknown_file_type_returns_error() {
         &config,
         &db,
         workspace_id,
-        "image.png",
-        b"fake image data",
+        &ingestion::NewFile::new("image.png", b"fake image data"),
         None,
     )
     .await;
@@ -275,11 +278,12 @@ async fn ingest_empty_text_file() {
         &config,
         &db,
         workspace_id,
-        "empty.txt",
-        b"",
+        &ingestion::NewFile::new("empty.txt", b""),
         None,
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
 
     assert_eq!(result.file_type, FileType::Text);
@@ -299,11 +303,12 @@ async fn ingest_markdown_as_unstructured() {
         &config,
         &db,
         workspace_id,
-        "notes.md",
-        data,
+        &ingestion::NewFile::new("notes.md", data),
         None,
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
 
     assert_eq!(result.file_type, FileType::Markdown);
@@ -322,8 +327,10 @@ fn workspace_db_document_crud() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    db.insert_document("doc-1", "test.txt", "text/plain", 100, "pending")
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-1", "test.txt", "text/plain", 100).with_status("pending"),
+    )
+    .unwrap();
 
     let qr = db
         .execute_query("SELECT id, filename, status FROM _quack_documents WHERE id = 'doc-1'")
@@ -346,8 +353,10 @@ fn workspace_db_chunk_without_embedding() {
     let workspace_id = "ws-chunk-no-emb";
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
-    db.insert_document("doc-1", "test.txt", "text/plain", 100, "ready")
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-1", "test.txt", "text/plain", 100).with_status("ready"),
+    )
+    .unwrap();
 
     db.insert_chunk(&NewChunk {
         id: "c1",
@@ -375,8 +384,10 @@ fn workspace_db_chunk_with_embedding() {
     let workspace_id = "ws-chunk-emb";
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
-    db.insert_document("doc-1", "test.txt", "text/plain", 100, "ready")
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-1", "test.txt", "text/plain", 100).with_status("ready"),
+    )
+    .unwrap();
 
     let embedding = [0.5_f32, 0.3, -0.2, 0.8];
     db.insert_chunk(&NewChunk {
@@ -403,8 +414,10 @@ fn workspace_db_update_chunk_embedding() {
     let workspace_id = "ws-update-emb";
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
-    db.insert_document("doc-1", "test.txt", "text/plain", 100, "ready")
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-1", "test.txt", "text/plain", 100).with_status("ready"),
+    )
+    .unwrap();
 
     db.insert_chunk(&NewChunk {
         id: "c1",
@@ -464,10 +477,14 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-search-filter").unwrap();
 
-    db.insert_document("doc-a", "policy.pdf", "application/pdf", 10, "ready")
-        .unwrap();
-    db.insert_document("doc-b", "faq.md", "text/markdown", 10, "ready")
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-a", "policy.pdf", "application/pdf", 10).with_status("ready"),
+    )
+    .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-b", "faq.md", "text/markdown", 10).with_status("ready"),
+    )
+    .unwrap();
     db.insert_chunk(&NewChunk {
         id: "a0",
         document_id: "doc-a",
@@ -516,8 +533,10 @@ fn workspace_db_search_similar_chunks() {
     let workspace_id = "ws-search";
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
-    db.insert_document("doc-1", "test.txt", "text/plain", 100, "ready")
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-1", "test.txt", "text/plain", 100).with_status("ready"),
+    )
+    .unwrap();
 
     db.insert_chunk(&NewChunk {
         id: "c1",
@@ -743,7 +762,7 @@ fn dimension_change_with_stored_embeddings_is_an_error() {
     let config = test_config(dir.path());
     {
         let db = WorkspaceDb::open(&config, "ws-mismatch").unwrap();
-        db.insert_document("d", "a.txt", "text/plain", 1, "ready")
+        db.insert_document(&NewDocument::new("d", "a.txt", "text/plain", 1).with_status("ready"))
             .unwrap();
         db.insert_chunk(&NewChunk {
             id: "c",
@@ -779,7 +798,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     let config = test_config(dir.path());
     {
         let db = WorkspaceDb::open(&config, "ws-adopt").unwrap();
-        db.insert_document("d", "a.txt", "text/plain", 1, "ready")
+        db.insert_document(&NewDocument::new("d", "a.txt", "text/plain", 1).with_status("ready"))
             .unwrap();
         db.insert_chunk(&NewChunk {
             id: "c",
@@ -874,11 +893,12 @@ async fn ingest_csv_with_quote_in_filename() {
         &config,
         &db,
         workspace_id,
-        filename,
-        b"a,b\n1,2\n3,4\n",
+        &ingestion::NewFile::new(filename, b"a,b\n1,2\n3,4\n"),
         None::<&MockEmbeddingModel>,
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
     assert_eq!(result.table_name.as_deref(), Some("it_s_a_file"));
     let rows = db
@@ -910,10 +930,14 @@ fn describe_table_handles_quoted_identifier() {
 
 fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
     let db = WorkspaceDb::open(config, ws).unwrap();
-    db.insert_document("doc-a", "policy.pdf", "application/pdf", 10, "ready")
-        .unwrap();
-    db.insert_document("doc-b", "faq.md", "text/markdown", 10, "ready")
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-a", "policy.pdf", "application/pdf", 10).with_status("ready"),
+    )
+    .unwrap();
+    db.insert_document(
+        &NewDocument::new("doc-b", "faq.md", "text/markdown", 10).with_status("ready"),
+    )
+    .unwrap();
     db.insert_chunk(&NewChunk {
         id: "a0",
         document_id: "doc-a",
@@ -1016,7 +1040,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     let config = test_config(dir.path());
     {
         let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
-        db.insert_document("d", "a.md", "text/markdown", 1, "ready")
+        db.insert_document(&NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"))
             .unwrap();
         db.insert_chunk(&NewChunk {
             id: "c0",
@@ -1080,11 +1104,12 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
         &config,
         &db,
         "ws-md-meta",
-        "rules.md",
-        md,
+        &ingestion::NewFile::new("rules.md", md),
         None::<&MockEmbeddingModel>,
     )
     .await
+    .unwrap()
+    .ingested()
     .unwrap();
     assert_eq!(result.chunks_stored, 2);
     let rows = db
@@ -1108,4 +1133,92 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
     let pinned = db.pinned_documents().unwrap();
     assert_eq!(pinned.len(), 1);
     assert!(pinned.first().unwrap().1.contains("Flood is excluded."));
+}
+
+#[tokio::test]
+async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-dedup").unwrap();
+    let md = b"# Renewal terms\n\nRenewals close in thirty days.\n";
+    let first = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-dedup",
+        &ingestion::NewFile::new("terms.md", md)
+            .source(quack_core::storage::workspace::DocumentSource::Stdin),
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+
+    let doc = db.document(&first.document_id).unwrap().unwrap();
+    assert_eq!(doc.title.as_deref(), Some("Renewal terms"));
+    assert_eq!(
+        doc.source,
+        quack_core::storage::workspace::DocumentSource::Stdin
+    );
+    assert_eq!(doc.sha256.as_deref().map(str::len), Some(64));
+    assert_eq!(doc.chunk_count, Some(1));
+    assert_eq!(doc.display_name(), "Renewal terms");
+
+    // Same bytes under another name: skipped, naming the existing document.
+    let again = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-dedup",
+        &ingestion::NewFile::new("copy.md", md).title(Some("Copy")),
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap();
+    let existing = match again {
+        ingestion::IngestOutcome::Duplicate(existing) => Some(existing),
+        ingestion::IngestOutcome::Ingested(_) => None,
+    };
+    assert_eq!(existing.map(|d| d.id), Some(first.document_id.clone()));
+    assert_eq!(db.list_documents().unwrap().len(), 1);
+
+    // An explicit title wins over the parsed heading.
+    let titled = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-dedup",
+        &ingestion::NewFile::new("other.md", b"# Heading\n\nBody.\n").title(Some(" Given ")),
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    let doc = db.document(&titled.document_id).unwrap().unwrap();
+    assert_eq!(doc.title.as_deref(), Some("Given"));
+    assert_eq!(
+        doc.source,
+        quack_core::storage::workspace::DocumentSource::Path
+    );
+
+    // A document that failed does not block a retry of the same bytes.
+    let bad = b"%PDF-1.4 not really a pdf";
+    let failed = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-dedup",
+        &ingestion::NewFile::new("scan.pdf", bad),
+        None::<&MockEmbeddingModel>,
+    )
+    .await;
+    assert!(failed.is_err());
+    let errored = db
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.filename == "scan.pdf")
+        .unwrap();
+    assert_eq!(errored.status, "error");
+    let retry =
+        ingestion::register_document(&db, &ingestion::NewFile::new("scan.pdf", bad)).unwrap();
+    assert!(matches!(retry, ingestion::Registration::New(_)));
 }

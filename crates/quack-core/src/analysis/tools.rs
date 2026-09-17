@@ -593,13 +593,18 @@ impl Tool for ListDocumentsTool {
         }
         let mut output = String::from("Documents:\n");
         for doc in &docs {
+            let title = doc
+                .title
+                .as_deref()
+                .map_or(String::new(), |t| format!(", title: {t}"));
             writeln!(
                 output,
-                "- {} (id: {}, status: {}, type: {})",
+                "- {} (id: {}, status: {}, type: {}, source: {}{title})",
                 doc.filename,
                 doc.id,
                 doc.status,
                 doc.mime_type.as_deref().unwrap_or("unknown"),
+                doc.source,
             )?;
         }
         Ok(output)
@@ -737,6 +742,7 @@ impl Tool for CreateChartTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::workspace::NewDocument;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail_test(msg: &str) -> ! {
@@ -748,12 +754,18 @@ mod tests {
         let db = crate::storage::workspace::WorkspaceDb::open_in_memory(4)
             .unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
-            db.insert_document("01a0-first", "policy.pdf", "application/pdf", 1, "ready")
-                .is_ok()
+            db.insert_document(
+                &NewDocument::new("01a0-first", "policy.pdf", "application/pdf", 1)
+                    .with_status("ready")
+            )
+            .is_ok()
         );
         assert!(
-            db.insert_document("01b0-second", "notes.md", "text/markdown", 1, "ready")
-                .is_ok()
+            db.insert_document(
+                &NewDocument::new("01b0-second", "notes.md", "text/markdown", 1)
+                    .with_status("ready")
+            )
+            .is_ok()
         );
         let by_name = resolve_document_ids(&db, &[String::from("policy.pdf")]);
         assert!(by_name.is_ok_and(|ids| ids == ["01a0-first"]));

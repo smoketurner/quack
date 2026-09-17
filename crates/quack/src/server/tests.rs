@@ -620,6 +620,26 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
     assert_eq!(body["documents"][0]["filename"], "policy.md");
     let ready = h.wait_ready(&ws, &text_id, &token).await;
     assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(ready["source"], "paste");
+    assert_eq!(ready["title"], "policy");
+    assert_eq!(
+        ready["ingested_by"].as_str().map(str::is_empty),
+        Some(false)
+    );
+    assert_eq!(ready["sha256"].as_str().map(str::len), Some(64));
+
+    // The same text again is not queued a second time.
+    let (status, body) = h
+        .post(
+            &base,
+            &token,
+            serde_json::json!({ "text": "Flood damage is excluded.", "title": "again" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["documents"][0]["status"], "duplicate");
+    assert_eq!(body["documents"][0]["id"], text_id);
+    assert_eq!(body["documents"][0]["existing_filename"], "policy.md");
 
     let (content_type, bytes) = multipart(
         "sales.csv",
@@ -649,6 +669,8 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
     let (status, body) = h.get(&base, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["documents"].as_array().map(Vec::len), Some(2));
+    assert_eq!(ready["source"], "upload");
+    assert_eq!(ready["title"], serde_json::Value::Null);
     let (status, body) = h
         .call(
             Method::PATCH,
@@ -711,7 +733,7 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(ingests.len(), 2);
+    assert_eq!(ingests.len(), 3, "the duplicate is audited too");
     let deletes = h
         .audit(AuditFilter {
             workspace_id: Some(ws),

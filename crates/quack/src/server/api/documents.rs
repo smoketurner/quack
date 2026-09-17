@@ -14,7 +14,7 @@ use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::UploadJob;
 use crate::server::state::{App, with_db};
-use quack_core::storage::workspace::DocumentInfo;
+use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -77,7 +77,12 @@ pub(crate) async fn upload(
             serde_json::from_slice(&bytes).map_err(|e| ApiError::bad_request(e.to_string()))?;
         vec![pasted_file(&pasted.text, pasted.title.as_deref())?]
     };
-    let queued = enqueue(&app, &access, files).await?;
+    let source = if content_type.starts_with("multipart/form-data") {
+        DocumentSource::Upload
+    } else {
+        DocumentSource::Paste
+    };
+    let queued = enqueue(&app, &access, source, files).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "documents": queued })),
@@ -129,10 +134,14 @@ pub(crate) fn pasted_file(text: &str, title: Option<&str>) -> ApiResult<(String,
 }
 
 /// Register each file with status `queued`, audit it, and hand it to the
-/// workspace's upload lane. Returns `{id, filename, status}` per file.
+/// workspace's upload lane. Returns `{id, filename, status}` per file; a
+/// file identical to a document already in the workspace is not queued
+/// and comes back as `{id, filename, status: "duplicate"}` naming the
+/// existing document. A pasted text's title is its filename stem.
 pub(crate) async fn enqueue(
     app: &App,
     access: &Access,
+    source: DocumentSource,
     files: Vec<(String, Vec<u8>)>,
 ) -> ApiResult<Vec<serde_json::Value>> {
     if files.is_empty() {
@@ -149,10 +158,50 @@ pub(crate) async fn enqueue(
             .ok_or_else(|| ApiError::bad_request("bad file name"))?;
         let size = data.len();
         let name = filename.clone();
-        let document_id = with_db(Arc::clone(&db), move |db| {
-            ingestion::register_document(db, &name, size)
+        let user = access.identity.user_id.clone();
+        let title = match source {
+            DocumentSource::Paste => std::path::Path::new(&filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned),
+            DocumentSource::Upload | DocumentSource::Path | DocumentSource::Stdin => None,
+        };
+        let registration = with_db(Arc::clone(&db), move |db| {
+            ingestion::register_document(
+                db,
+                &ingestion::NewFile::new(&name, &data)
+                    .source(source)
+                    .title(title.as_deref())
+                    .ingested_by(Some(&user)),
+            )
+            .map(|r| (r, data))
         })
         .await?;
+        let (document_id, data) = match registration {
+            (ingestion::Registration::New(id), data) => (id, data),
+            (ingestion::Registration::Duplicate(existing), _) => {
+                access
+                    .audit(
+                        app,
+                        "ingest",
+                        Some(("document", &existing.id)),
+                        Outcome::Allowed,
+                        Some(serde_json::json!({
+                            "filename": filename,
+                            "size_bytes": size,
+                            "duplicate": true,
+                        })),
+                    )
+                    .await?;
+                queued.push(serde_json::json!({
+                    "id": existing.id,
+                    "filename": filename,
+                    "status": "duplicate",
+                    "existing_filename": existing.filename,
+                }));
+                continue;
+            }
+        };
         access
             .audit(
                 app,

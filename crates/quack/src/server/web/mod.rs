@@ -27,7 +27,7 @@ use quack_core::storage::control::{
     TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
-use quack_core::storage::workspace::DocumentInfo;
+use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
 use rust_embed::Embed;
 use serde::Deserialize;
 
@@ -775,15 +775,50 @@ async fn upload(
             }
         }
     }
-    if !text.trim().is_empty() {
-        files.push(docs_api::pasted_file(&text, Some(&title))?);
-    }
-    let outcome = docs_api::enqueue(&app, &access, files).await;
+    let pasted = if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![docs_api::pasted_file(&text, Some(&title))?]
+    };
+    let outcome = enqueue_web(&app, &access, files, pasted).await;
     let target = match outcome {
-        Ok(_) => format!("/w/{id}/documents"),
+        Ok(skipped) if skipped.is_empty() => format!("/w/{id}/documents"),
+        Ok(skipped) => format!(
+            "/w/{id}/documents?error={}",
+            urlencoded(&format!("Already in the workspace: {}", skipped.join(", ")))
+        ),
         Err(e) => format!("/w/{id}/documents?error={}", urlencoded(&e.message)),
     };
     Ok(Redirect::to(&target).into_response())
+}
+
+/// Queue uploaded files and pasted text under their own sources; returns
+/// the names of files skipped as duplicates.
+async fn enqueue_web(
+    app: &App,
+    access: &Access,
+    files: Vec<(String, Vec<u8>)>,
+    pasted: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<String>, ApiError> {
+    if files.is_empty() && pasted.is_empty() {
+        return Err(ApiError::bad_request("no file or text in the request"));
+    }
+    let mut queued = Vec::new();
+    if !files.is_empty() {
+        queued.extend(docs_api::enqueue(app, access, DocumentSource::Upload, files).await?);
+    }
+    if !pasted.is_empty() {
+        queued.extend(docs_api::enqueue(app, access, DocumentSource::Paste, pasted).await?);
+    }
+    let mut skipped = Vec::new();
+    for entry in &queued {
+        if entry.get("status").and_then(serde_json::Value::as_str) == Some("duplicate")
+            && let Some(name) = entry.get("filename").and_then(serde_json::Value::as_str)
+        {
+            skipped.push(name.to_owned());
+        }
+    }
+    Ok(skipped)
 }
 
 fn urlencoded(text: &str) -> String {

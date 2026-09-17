@@ -366,12 +366,17 @@ impl WorkspaceDb {
             CREATE TABLE IF NOT EXISTS _quack_documents (
                 id TEXT PRIMARY KEY,
                 filename TEXT NOT NULL,
+                title TEXT,
                 mime_type TEXT,
                 size_bytes BIGINT,
+                sha256 TEXT,
+                source TEXT,
                 ingested_at TIMESTAMP DEFAULT now(),
                 status TEXT DEFAULT 'pending',
                 error_message TEXT,
-                pinned BOOLEAN NOT NULL DEFAULT false
+                pinned BOOLEAN NOT NULL DEFAULT false,
+                chunk_count INTEGER,
+                ingested_by TEXT
             );
             CREATE TABLE IF NOT EXISTS _quack_chunks (
                 id TEXT PRIMARY KEY,
@@ -384,6 +389,11 @@ impl WorkspaceDb {
                 token_count INTEGER
             );
             ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
+            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
+            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS sha256 TEXT;
+            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
+            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
+            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
             CREATE TABLE IF NOT EXISTS _quack_terms (
@@ -561,25 +571,75 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Insert a document metadata row.
+    /// Register a document row. Ingestion computes the hash and checks for
+    /// a duplicate first; see `ingestion::register_document`.
     ///
     /// # Errors
     ///
     /// Returns an error if the insert fails.
-    pub fn insert_document(
-        &self,
-        id: &str,
-        filename: &str,
-        mime_type: &str,
-        size_bytes: usize,
-        status: &str,
-    ) -> crate::error::Result<()> {
-        let size = i64::try_from(size_bytes)
+    pub fn insert_document(&self, doc: &NewDocument<'_>) -> crate::error::Result<()> {
+        let size = i64::try_from(doc.size_bytes)
             .map_err(|_| crate::error::Error::Ingestion("file size overflow".into()))?;
 
         self.conn.execute(
-            "INSERT INTO _quack_documents (id, filename, mime_type, size_bytes, status) VALUES (?, ?, ?, ?, ?)",
-            duckdb::params![id, filename, mime_type, size, status],
+            "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                doc.id,
+                doc.filename,
+                doc.title,
+                doc.mime_type,
+                size,
+                doc.sha256,
+                doc.source.as_str(),
+                doc.status,
+                doc.ingested_by,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The document whose content hashes to `sha256`, if one was ingested
+    /// and did not fail. Re-uploads of identical bytes are skipped through
+    /// this lookup; a failed document is not a match so it can be retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn document_by_sha256(&self, sha256: &str) -> crate::error::Result<Option<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> 'error' ORDER BY ingested_at, id LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![sha256])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(document_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Set the title parsed from the content, when the caller gave none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_title_if_empty(&self, id: &str, title: &str) -> crate::error::Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET title = ? WHERE id = ? AND title IS NULL",
+            duckdb::params![title, id],
+        )?;
+        Ok(())
+    }
+
+    /// Record how many chunks a processed document produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_chunk_count(&self, id: &str, count: u32) -> crate::error::Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET chunk_count = ? WHERE id = ?",
+            duckdb::params![count, id],
         )?;
         Ok(())
     }
@@ -1161,17 +1221,117 @@ pub struct TableDescription {
 pub struct DocumentInfo {
     pub id: String,
     pub filename: String,
+    /// Given at upload or parsed from the content (first heading, HTML
+    /// title); `None` when neither exists.
+    pub title: Option<String>,
     pub mime_type: Option<String>,
     pub size_bytes: Option<i64>,
+    /// Lowercase hex SHA-256 of the bytes; `None` only for rows written
+    /// before the column existed.
+    pub sha256: Option<String>,
+    pub source: DocumentSource,
     /// `queued`, `processing`, `ready`, or `error`.
     pub status: String,
     pub error_message: Option<String>,
     pub pinned: bool,
+    /// Chunks stored once processed; `None` until then and for tables.
+    pub chunk_count: Option<i64>,
+    /// Server user who uploaded it; `None` from the CLI.
+    pub ingested_by: Option<String>,
     pub ingested_at: String,
 }
 
+impl DocumentInfo {
+    /// The title when one exists, else the filename.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.filename)
+    }
+}
+
+/// How a document reached the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentSource {
+    /// A file sent through the API or web UI.
+    Upload,
+    /// Text pasted through the API or web UI.
+    Paste,
+    /// A file path given to the CLI or terminal.
+    Path,
+    /// Bytes piped into the CLI.
+    Stdin,
+}
+
+impl DocumentSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Paste => "paste",
+            Self::Path => "path",
+            Self::Stdin => "stdin",
+        }
+    }
+
+    fn from_column(value: Option<&str>) -> Self {
+        match value {
+            Some("paste") => Self::Paste,
+            Some("path") => Self::Path,
+            Some("stdin") => Self::Stdin,
+            _ => Self::Upload,
+        }
+    }
+}
+
+impl std::fmt::Display for DocumentSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A document row to insert.
+#[derive(Debug, Clone, Copy)]
+pub struct NewDocument<'a> {
+    pub id: &'a str,
+    pub filename: &'a str,
+    pub title: Option<&'a str>,
+    pub mime_type: &'a str,
+    pub size_bytes: usize,
+    pub sha256: &'a str,
+    pub source: DocumentSource,
+    pub status: &'a str,
+    pub ingested_by: Option<&'a str>,
+}
+
+impl<'a> NewDocument<'a> {
+    /// A `queued` upload with no title, hash, or uploader; the fields are
+    /// public for the rest.
+    #[must_use]
+    pub fn new(id: &'a str, filename: &'a str, mime_type: &'a str, size_bytes: usize) -> Self {
+        Self {
+            id,
+            filename,
+            title: None,
+            mime_type,
+            size_bytes,
+            sha256: "",
+            source: DocumentSource::Upload,
+            status: "queued",
+            ingested_by: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_status(mut self, status: &'a str) -> Self {
+        self.status = status;
+        self
+    }
+}
+
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
-     COALESCE(pinned, false), CAST(ingested_at AS VARCHAR) FROM _quack_documents";
+     COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
+     ingested_by FROM _quack_documents";
 
 fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
     Ok(DocumentInfo {
@@ -1183,6 +1343,11 @@ fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
         error_message: row.get(5)?,
         pinned: row.get(6)?,
         ingested_at: row.get(7)?,
+        title: row.get(8)?,
+        sha256: row.get(9)?,
+        source: DocumentSource::from_column(row.get::<_, Option<String>>(10)?.as_deref()),
+        chunk_count: row.get(11)?,
+        ingested_by: row.get(12)?,
     })
 }
 

@@ -753,6 +753,7 @@ fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::workspace::NewDocument;
 
     struct Canned;
 
@@ -782,8 +783,11 @@ mod tests {
         for d in 1..=4 {
             let doc = format!("doc{d}");
             assert!(
-                db.insert_document(&doc, &format!("{doc}.md"), "text/markdown", 10, "ready")
-                    .is_ok()
+                db.insert_document(
+                    &NewDocument::new(&doc, &format!("{doc}.md"), "text/markdown", 10)
+                        .with_status("ready")
+                )
+                .is_ok()
             );
             for i in 0..5_u32 {
                 let content = format!(
@@ -805,8 +809,10 @@ mod tests {
             }
         }
         assert!(
-            db.insert_document("pending", "p.md", "text/markdown", 1, "queued")
-                .is_ok()
+            db.insert_document(
+                &NewDocument::new("pending", "p.md", "text/markdown", 1).with_status("queued")
+            )
+            .is_ok()
         );
         assert!(
             db.insert_chunk(&crate::storage::workspace::NewChunk {

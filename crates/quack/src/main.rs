@@ -12,13 +12,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
-use quack_core::ingestion;
+use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm;
 use quack_core::llm::oauth::{LoginOptions, LoginPrompt};
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
-use quack_core::storage::workspace::WorkspaceDb;
+use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -123,6 +123,10 @@ enum Commands {
         /// Override the filename (required when reading from stdin)
         #[arg(long)]
         filename: Option<String>,
+
+        /// Title to record; otherwise the first heading, when there is one
+        #[arg(long)]
+        title: Option<String>,
 
         /// Skip embedding generation
         #[arg(long)]
@@ -346,6 +350,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Ingest {
             file,
             filename,
+            title,
             no_embed,
             pin,
         } => {
@@ -354,6 +359,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
                 &file,
                 cli.workspace.as_deref(),
                 filename.as_deref(),
+                title.as_deref(),
                 no_embed,
                 pin,
             )
@@ -866,10 +872,15 @@ fn list_documents(db: &WorkspaceDb, json: bool) -> Result<()> {
                 &serde_json::json!({
                     "id": doc.id,
                     "filename": doc.filename,
+                    "title": doc.title,
                     "mime_type": doc.mime_type,
                     "size_bytes": doc.size_bytes,
+                    "sha256": doc.sha256,
+                    "source": doc.source,
                     "status": doc.status,
                     "pinned": doc.pinned,
+                    "chunk_count": doc.chunk_count,
+                    "ingested_at": doc.ingested_at,
                 }),
             )?;
             writeln!(out)?;
@@ -878,11 +889,16 @@ fn list_documents(db: &WorkspaceDb, json: bool) -> Result<()> {
         writeln!(out, "No documents yet.")?;
     } else {
         for doc in &docs {
+            let title = doc
+                .title
+                .as_deref()
+                .map_or(String::new(), |t| format!("  ({t})"));
             writeln!(
                 out,
-                "{}  {:<10}  {}  {}",
+                "{}  {:<10}  {:<6}  {}  {}{title}",
                 doc.id,
                 doc.status,
+                doc.source,
                 if doc.pinned { "pinned  " } else { "        " },
                 doc.filename
             )?;
@@ -1012,6 +1028,7 @@ async fn run_ingest(
     file: &str,
     workspace_name: Option<&str>,
     filename_override: Option<&str>,
+    title: Option<&str>,
     no_embed: bool,
     pin: bool,
 ) -> Result<()> {
@@ -1030,12 +1047,18 @@ async fn run_ingest(
             .context("failed to build embedding model")?
     };
 
-    let result = ingestion::ingest_file(
+    let source = if file == "-" {
+        DocumentSource::Stdin
+    } else {
+        DocumentSource::Path
+    };
+    let outcome = ingestion::ingest_file(
         &config,
         &ws_db,
         &workspace.id,
-        &effective_filename,
-        &data,
+        &NewFile::new(&effective_filename, &data)
+            .source(source)
+            .title(title),
         embedding_model.as_ref(),
     )
     .await
@@ -1043,6 +1066,19 @@ async fn run_ingest(
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+
+    let result = match outcome {
+        IngestOutcome::Ingested(result) => result,
+        IngestOutcome::Duplicate(existing) => {
+            writeln!(
+                out,
+                "Skipped: {effective_filename} is identical to {} (id: {})",
+                existing.filename, existing.id
+            )?;
+            out.flush()?;
+            return Ok(());
+        }
+    };
 
     if pin {
         ws_db.set_document_pinned(&result.document_id, true)?;

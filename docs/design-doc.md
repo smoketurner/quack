@@ -1017,6 +1017,7 @@ POST   /api/v1/workspaces/{id}/sql                {sql}
 GET    /api/v1/workspaces/{id}/search?q=&k=       hybrid retrieval, no LLM
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
+                                                  (identical bytes: status "duplicate")
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
 PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
 DELETE /api/v1/workspaces/{id}/documents/{doc}
@@ -1076,7 +1077,7 @@ local tabular files in place as views.
 quack -p "PROMPT" [-w NAME] [-f table|json|ndjson|csv|markdown] [--mode chat|query]
       [--allow-write] [--model P/M] [-c | -r SESSION]
 quack -q "SQL" [-w NAME] [-f ...] [--internal]
-quack ingest FILE... [-w NAME] [--as NAME] [--pin] [--no-embed] [--extract]
+quack ingest FILE... [-w NAME] [--as NAME] [--title T] [--pin] [--no-embed] [--extract]
 quack docs | tables | schema TABLE | graph ENTITY [--hops N]
 quack ontology show | propose [--extend|--from PACK] [--sample N] [--auto-accept]
               | review | accept ID... | reject ID... | export FILE | import FILE
@@ -1351,7 +1352,10 @@ updated as issues close. Ordered by risk.
 5. **DOCX, HTML, PPTX, XLSX unsupported** (#16; XLSX via a Rust reader). Sections 6.1, 6.2.
 6. **No `ATTACH` to external databases** (#21): needs a Rust-side design now that scanner
    extensions are out. Section 6.2, step 13.
-7. **Document registry lacks `sha256` dedup, `source`, `title`** (#22). Section 5.4.
+7. ~~Document registry lacks `sha256` dedup, `source`, `title`~~ (#22, closed): identical
+   bytes are skipped everywhere and name the existing document; `source` is `upload`,
+   `paste`, `path`, or `stdin`; the title is given or parsed from the first heading;
+   `chunk_count` and `ingested_by` are recorded. Section 5.4.
 8. **Sessions have no `created_by` or sharing; print mode cannot take stdin as data**
    (#23). Sections 8, 11.5.
 9. ~~Context `edited_by` and the `_quack_audit` detail table~~ (#24, closed): the

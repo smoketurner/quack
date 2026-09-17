@@ -102,6 +102,18 @@ pub fn extract_sections(file_type: &FileType, data: &[u8]) -> Result<Vec<Section
     }
 }
 
+/// The document title a parse yields: the first section's heading when
+/// the source has headings (Markdown's first `#` line, an HTML `<title>`),
+/// else nothing.
+#[must_use]
+pub fn title_of(sections: &[Section]) -> Option<&str> {
+    sections
+        .first()
+        .and_then(|s| s.heading.as_deref())
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+}
+
 /// The whole text of an unstructured file, sections joined.
 ///
 /// # Errors
@@ -214,6 +226,19 @@ fn is_setext_underline(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_is_the_first_heading_when_there_is_one() {
+        let md = markdown_sections("# Renewal terms\n\nBody.\n\n## Detail\n\nMore.\n");
+        assert_eq!(title_of(&md), Some("Renewal terms"));
+        let plain = vec![Section {
+            heading: None,
+            page: None,
+            text: String::from("no headings"),
+        }];
+        assert_eq!(title_of(&plain), None);
+        assert_eq!(title_of(&[]), None);
+    }
 
     #[test]
     fn detects_csv() {

@@ -11,7 +11,7 @@ use quack_core::analysis::events::{self, AgentEvent, EventStream, PermissionRequ
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
-use quack_core::ingestion;
+use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::storage::sessions::{self, ChatMode, MessageRole as StoredRole};
 use quack_core::storage::workspace::{WorkspaceDb, looks_like_direct_sql};
 
@@ -1112,16 +1112,24 @@ async fn run_ingest_inner(
 
     let embedding_model = quack_core::llm::optional_embedding_model(config).await?;
 
-    let result = ingestion::ingest_file(
+    let outcome = ingestion::ingest_file(
         config,
         &ws_db,
         workspace_id,
-        &filename,
-        &data,
+        &NewFile::new(&filename, &data),
         embedding_model.as_ref(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("ingestion failed: {e}"))?;
+    let result = match outcome {
+        IngestOutcome::Ingested(result) => result,
+        IngestOutcome::Duplicate(existing) => {
+            return Ok(format!(
+                "Skipped {filename}: identical to {} (id: {}), already in the workspace.",
+                existing.filename, existing.id
+            ));
+        }
+    };
 
     let table_part = result
         .table_name

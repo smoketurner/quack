@@ -116,9 +116,13 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
     if !docs.is_empty() {
         writeln!(prompt, "Ingested documents:")?;
         for doc in &docs {
+            let title = doc
+                .title
+                .as_deref()
+                .map_or(String::new(), |t| format!(" \"{t}\""));
             writeln!(
                 prompt,
-                "- {} (status: {}, type: {})",
+                "- {}{title} (status: {}, type: {})",
                 doc.filename,
                 doc.status,
                 doc.mime_type.as_deref().unwrap_or("unknown"),
@@ -306,7 +310,7 @@ pub fn format_query_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::workspace::NewChunk;
+    use crate::storage::workspace::{NewChunk, NewDocument};
 
     fn db() -> WorkspaceDb {
         WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
@@ -331,8 +335,10 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn context_is_placed_after_documents_and_truncated_to_budget() {
         let db = db();
-        db.insert_document("d1", "policy.pdf", "application/pdf", 1, "ready")
-            .unwrap();
+        db.insert_document(
+            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+        )
+        .unwrap();
         let mut opts = options(ChatMode::Chat, 100);
         opts.context = Some(String::from("Amounts are in cents."));
         let prompt = build_system_prompt(&db, &opts).unwrap();
@@ -357,8 +363,10 @@ mod tests {
         let db = db();
         db.execute_statement("CREATE TABLE claims(id INT, amount INT)")
             .unwrap();
-        db.insert_document("d1", "policy.pdf", "application/pdf", 1, "ready")
-            .unwrap();
+        db.insert_document(
+            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+        )
+        .unwrap();
         let chat = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
         assert!(chat.contains("Mode: chat."));
         assert!(chat.contains("- claims (0 rows)"));
@@ -390,10 +398,14 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn pinned_documents_are_injected_within_budget() {
         let db = db();
-        db.insert_document("d1", "rules.md", "text/markdown", 1, "ready")
-            .unwrap();
-        db.insert_document("d2", "big.md", "text/markdown", 1, "ready")
-            .unwrap();
+        db.insert_document(
+            &NewDocument::new("d1", "rules.md", "text/markdown", 1).with_status("ready"),
+        )
+        .unwrap();
+        db.insert_document(
+            &NewDocument::new("d2", "big.md", "text/markdown", 1).with_status("ready"),
+        )
+        .unwrap();
         let big = "x".repeat(400);
         let chunks = [
             ("d1", "first rule"),
