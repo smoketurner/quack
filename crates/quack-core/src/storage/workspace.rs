@@ -172,6 +172,9 @@ pub struct WorkspaceDb {
     conn: duckdb::Connection,
     embedding_dimension: u32,
     query_timeout: Duration,
+    /// `files/` under the workspace directory, where ingested files are
+    /// kept; `None` in memory.
+    files_dir: Option<std::path::PathBuf>,
 }
 
 impl WorkspaceDb {
@@ -186,6 +189,7 @@ impl WorkspaceDb {
             conn,
             embedding_dimension,
             query_timeout: Duration::from_secs(30),
+            files_dir: None,
         };
         db.confine_to(None)?;
         db.create_internal_tables()?;
@@ -227,6 +231,7 @@ impl WorkspaceDb {
             conn,
             embedding_dimension: configured_dimension.unwrap_or(DEFAULT_EMBEDDING_DIMENSION),
             query_timeout: Duration::from_secs(u64::from(config.analysis.query_timeout_seconds)),
+            files_dir: Some(files_dir),
         };
         db.apply_resource_limits(config)?;
         let workspace_dir = std::fs::canonicalize(config.workspace_dir(workspace_id))?;
@@ -779,7 +784,9 @@ impl WorkspaceDb {
 
     /// Remove a document with its chunks and term index. The tables it
     /// loaded into are dropped too: those recorded on the row, or for rows
-    /// from before that was recorded, `fallback_table`. Returns whether the
+    /// from before that was recorded, `fallback_table`. Graph nodes and
+    /// edges whose only provenance was the document or its tables go with
+    /// it (issue #43), as do its files under `files/`. Returns whether the
     /// document existed.
     ///
     /// # Errors
@@ -793,6 +800,7 @@ impl WorkspaceDb {
             Some(tables) => tables,
             None => fallback_table.map(str::to_owned).into_iter().collect(),
         };
+        self.forget_graph_provenance(id, &tables)?;
         self.conn.execute(
             "DELETE FROM _quack_terms WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
             duckdb::params![id],
@@ -809,7 +817,88 @@ impl WorkspaceDb {
             self.conn
                 .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
         }
+        self.remove_document_files(&doc.filename, &tables);
         Ok(true)
+    }
+
+    /// Drop the provenance a document and its tables gave the graph, then
+    /// the nodes and edges left without any provenance at all (an edge
+    /// whose endpoint goes falls with it, as `graph::store::delete_nodes`
+    /// does).
+    fn forget_graph_provenance(&self, document_id: &str, tables: &[String]) -> Result<()> {
+        let table_list = sql_text_list(tables);
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT subject_id FROM _quack_provenance \
+             WHERE document_id = ? OR list_contains(?::VARCHAR[], table_name)",
+        )?;
+        let mut rows = stmt.query(duckdb::params![document_id, table_list])?;
+        let mut touched: Vec<String> = Vec::new();
+        while let Some(row) = rows.next()? {
+            touched.push(row.get(0)?);
+        }
+        drop(rows);
+        drop(stmt);
+        if touched.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "DELETE FROM _quack_provenance \
+             WHERE document_id = ? OR list_contains(?::VARCHAR[], table_name)",
+            duckdb::params![document_id, table_list],
+        )?;
+        let touched_list = sql_text_list(&touched);
+        let orphan_nodes = self.conn.execute(
+            "DELETE FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], id) \
+             AND NOT EXISTS (SELECT 1 FROM _quack_provenance p WHERE p.subject_id = _quack_graph_nodes.id)",
+            duckdb::params![touched_list],
+        )?;
+        let orphan_edges = self.conn.execute(
+            "DELETE FROM _quack_graph_edges WHERE (list_contains(?::VARCHAR[], id) \
+             AND NOT EXISTS (SELECT 1 FROM _quack_provenance p WHERE p.subject_id = _quack_graph_edges.id)) \
+             OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = source_node_id) \
+             OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = target_node_id)",
+            duckdb::params![touched_list],
+        )?;
+        self.conn.execute_batch(
+            "DELETE FROM _quack_provenance WHERE NOT EXISTS \
+               (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = subject_id) \
+             AND NOT EXISTS (SELECT 1 FROM _quack_graph_edges e WHERE e.id = subject_id); \
+             DELETE FROM _quack_graph_merges WHERE NOT EXISTS \
+               (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = keep_node_id) \
+             OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = drop_node_id);",
+        )?;
+        tracing::info!(
+            document_id,
+            orphan_nodes,
+            orphan_edges,
+            "removed graph rows that only the deleted document supported"
+        );
+        Ok(())
+    }
+
+    /// Remove what ingestion wrote under `files/` for a document: the file
+    /// itself and, for workbooks and imports, one CSV per table. A missing
+    /// file is fine; any other failure is logged, since the rows are gone.
+    fn remove_document_files(&self, filename: &str, tables: &[String]) {
+        let Some(files_dir) = &self.files_dir else {
+            return;
+        };
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(name) = Path::new(filename).file_name() {
+            candidates.push(files_dir.join(name));
+        }
+        for table in tables {
+            candidates.push(files_dir.join(format!("{table}.csv")));
+        }
+        for path in candidates {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::debug!(path = %path.display(), "removed an ingested file"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "could not remove an ingested file");
+                }
+            }
+        }
     }
 
     /// Insert a text chunk, optionally with an embedding vector, and index
@@ -1675,6 +1764,15 @@ fn is_internal_name(name: &str) -> bool {
 fn mentions_internal_table_token(sql: &str) -> bool {
     sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(is_internal_name)
+}
+
+/// A `DuckDB` list literal of text values, bound as `?::VARCHAR[]`.
+fn sql_text_list(items: &[String]) -> String {
+    let quoted: Vec<String> = items
+        .iter()
+        .map(|item| format!("'{}'", item.replace('\'', "''")))
+        .collect();
+    format!("[{}]", quoted.join(","))
 }
 
 /// Quote a SQL identifier for `DuckDB`: wrap in double quotes and double

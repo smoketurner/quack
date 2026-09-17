@@ -629,7 +629,11 @@ version 1 when the graph is first enabled and no proposal has been accepted.
 full snapshot. `_quack_meta.graph_built_with_ontology_version` records what the graph was
 built with; when it lags, the graph is stale and the interfaces offer re-extract (cost
 shown first) or revalidate (fast; drops nodes and edges that no longer validate). Any
-version can be diffed against another or restored.
+version can be diffed against another or restored. Deleting a document also removes the
+graph nodes and edges whose only provenance was that document or the tables it loaded,
+with their provenance rows and its files under `files/`; a mapping whose table is gone
+stays in the ontology (saves still succeed), extraction skips it, and `graph status`
+lists it under `missing_tables`.
 
 ### 6.4 Knowledge graph
 

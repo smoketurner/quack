@@ -16,14 +16,17 @@ pub struct MappingSummary {
     pub rows: u32,
     pub nodes: u32,
     pub edges: u32,
+    /// Set when the mapping was skipped: the table is no longer in the
+    /// workspace (a deleted document), so nothing was extracted from it.
+    pub skipped: Option<String>,
 }
 
-/// Build nodes and edges from every mapping in the ontology.
+/// Build nodes and edges from every mapping in the ontology. A mapping
+/// whose table is gone is skipped and reported, not fatal.
 ///
 /// # Errors
 ///
-/// Returns an error when a mapped table or column is missing or a write
-/// fails.
+/// Returns an error when a mapped column is missing or a write fails.
 pub fn extract(
     db: &WorkspaceDb,
     ontology: &Ontology,
@@ -42,10 +45,12 @@ fn extract_mapping(
     provisional: bool,
 ) -> Result<MappingSummary> {
     if !db.list_tables()?.iter().any(|t| t == &mapping.table) {
-        return Err(Error::Ontology(format!(
-            "mapped table '{}' does not exist",
-            mapping.table
-        )));
+        tracing::warn!(table = %mapping.table, "mapped table is not in the workspace; skipping");
+        return Ok(MappingSummary {
+            table: mapping.table.clone(),
+            skipped: Some(String::from("the table is not in the workspace")),
+            ..MappingSummary::default()
+        });
     }
     let mut columns: Vec<&str> = vec![mapping.key.as_str()];
     for column in mapping.properties.keys() {

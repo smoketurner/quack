@@ -1373,9 +1373,17 @@ async fn workbook_loads_one_table_per_sheet_and_delete_drops_them() {
         )
     );
 
+    let files_dir = config.workspace_files_dir("ws-xlsx");
+    assert_eq!(
+        std::fs::read_dir(&files_dir).unwrap().count(),
+        2,
+        "one CSV per sheet"
+    );
     assert!(db.delete_document(&result.document_id, None).unwrap());
     assert!(db.list_tables().unwrap().is_empty());
     assert!(db.document(&result.document_id).unwrap().is_none());
+    // The workbook and its per-sheet CSVs are gone from files/ too.
+    assert_eq!(std::fs::read_dir(&files_dir).unwrap().count(), 0);
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use quack_core::graph::extract::{Extraction, GraphExtractor};
+use quack_core::graph::store::NewNode;
 use quack_core::graph::{GraphOptions, extract, resolve, store as graph_store, tables, traverse};
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::storage::workspace::{NewChunk, NewDocument, WorkspaceDb};
@@ -190,6 +191,94 @@ impl GraphExtractor for Canned {
             Ok(extraction)
         })
     }
+}
+
+/// Deleting a document takes with it the nodes and edges only it
+/// supported (issue #43): a document's chunk provenance, then a table's
+/// row provenance when the document that loaded the table goes. What
+/// other sources still support stays, the mapping to the dropped table
+/// is flagged rather than fatal, and the ontology still saves.
+#[test]
+fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, false).unwrap();
+    assert_eq!(graph_store::status(&db).unwrap().nodes, 7);
+
+    // A second document adds one node of its own, one edge of its own,
+    // and a second source for a vendor the table already produced.
+    db.insert_document(
+        &NewDocument::new("doc-2", "extra.md", "text/markdown", 10).with_status("ready"),
+    )
+    .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c3",
+        document_id: "doc-2",
+        chunk_index: 0,
+        content: "Orgenics ships to Nowhere.",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
+    let node = |label: &str, class: &str| NewNode {
+        label: label.to_owned(),
+        class_id: class.to_owned(),
+        properties: serde_json::json!({}),
+        provisional: false,
+    };
+    let source = graph_store::Source::chunk("doc-2", "c3", 0.9);
+    let orgenics = graph_store::upsert_node(&db, &node("Orgenics", "vendor")).unwrap();
+    graph_store::add_provenance(&db, &orgenics, &source).unwrap();
+    let nowhere = graph_store::upsert_node(&db, &node("Nowhere", "country")).unwrap();
+    graph_store::add_provenance(&db, &nowhere, &source).unwrap();
+    let edge = graph_store::upsert_edge(
+        &db,
+        &orgenics,
+        &nowhere,
+        "ships_to",
+        &serde_json::json!({}),
+        false,
+    )
+    .unwrap();
+    graph_store::add_provenance(&db, &edge, &source).unwrap();
+    assert_eq!(graph_store::status(&db).unwrap().nodes, 8);
+
+    assert!(db.delete_document("doc-2", None).unwrap());
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!((status.nodes, status.edges), (7, 6));
+    assert!(graph_store::node(&db, &nowhere).unwrap().is_none());
+    assert!(graph_store::node(&db, &orgenics).unwrap().is_some());
+    assert!(
+        graph_store::provenance_of(&db, std::slice::from_ref(&orgenics))
+            .unwrap()
+            .iter()
+            .all(|p| p.document_id.is_none())
+    );
+
+    // The document that loaded the mapped table: the table drops, and
+    // with it every node and edge the rows supported.
+    db.insert_document(
+        &NewDocument::new("doc-t", "shipments.csv", "text/csv", 10).with_status("ready"),
+    )
+    .unwrap();
+    db.set_document_tables("doc-t", &[String::from("shipments")])
+        .unwrap();
+    assert!(db.delete_document("doc-t", None).unwrap());
+    assert!(db.list_tables().unwrap().is_empty());
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!((status.nodes, status.edges), (0, 0));
+    assert_eq!(status.missing_tables, vec![String::from("shipments")]);
+    let orphans: i64 = db
+        .connection()
+        .query_row("SELECT count(*) FROM _quack_provenance", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(orphans, 0);
+
+    let summaries = tables::extract(&db, &current, false).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries.first().unwrap().skipped.is_some());
+    assert!(store::save(&db, &current, Some("test"), Some("still saves")).is_ok());
 }
 
 #[tokio::test]

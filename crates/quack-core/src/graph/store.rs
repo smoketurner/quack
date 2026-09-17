@@ -415,6 +415,18 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     )?;
     let built_with_version = built_with(db)?;
     let ontology_version = ontology_store::latest_version(db)?;
+    let missing_tables = match ontology_store::current(db)? {
+        Some(ontology) => {
+            let tables = db.list_tables()?;
+            ontology
+                .mappings
+                .iter()
+                .map(|m| m.table.clone())
+                .filter(|t| !tables.contains(t))
+                .collect()
+        }
+        None => Vec::new(),
+    };
     Ok(GraphStatus {
         nodes: u64::try_from(nodes).unwrap_or(0),
         edges: u64::try_from(edges).unwrap_or(0),
@@ -424,6 +436,7 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
         stale: nodes > 0 && built_with_version < ontology_version,
         pending_merges: u64::try_from(pending_merges).unwrap_or(0),
         drift: drift(db)?,
+        missing_tables,
     })
 }
 

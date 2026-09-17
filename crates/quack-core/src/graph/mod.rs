@@ -153,6 +153,11 @@ pub struct GraphStatus {
     pub stale: bool,
     pub pending_merges: u64,
     pub drift: Drift,
+    /// Tables the ontology maps that are no longer in the workspace
+    /// (their document was deleted): extraction skips them until the
+    /// mapping is removed or the data comes back.
+    #[serde(default)]
+    pub missing_tables: Vec<String>,
 }
 
 impl GraphStatus {

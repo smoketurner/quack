@@ -350,7 +350,10 @@ fn read_since(conn: &duckdb::Connection) -> Result<BTreeMap<(&'static str, Strin
     Ok(out)
 }
 
-/// Every mapped table and column must exist in the workspace.
+/// Every mapped column must exist in its table. A mapping whose table is
+/// gone (its document was deleted) is kept and flagged by
+/// `graph::store::status`, so the ontology can still be saved and the
+/// mapping removed at leisure.
 fn check_mappings(db: &WorkspaceDb, ontology: &Ontology) -> Result<()> {
     if ontology.mappings.is_empty() {
         return Ok(());
@@ -358,10 +361,8 @@ fn check_mappings(db: &WorkspaceDb, ontology: &Ontology) -> Result<()> {
     let tables = db.list_tables()?;
     for mapping in &ontology.mappings {
         if !tables.contains(&mapping.table) {
-            return Err(Error::Ontology(format!(
-                "mapping names table '{}', which the workspace does not have",
-                mapping.table
-            )));
+            tracing::warn!(table = %mapping.table, "ontology maps a table the workspace does not have");
+            continue;
         }
         let columns: Vec<String> = db
             .describe_table(&mapping.table)?
@@ -520,13 +521,14 @@ mod tests {
         assert_eq!(live.mappings, saved.mappings);
         assert_eq!(live.mappings.first().map(|m| m.relations.len()), Some(1));
 
-        let mut wrong_table = ontology.clone();
-        wrong_table
+        // A mapping to a table the workspace no longer has (a deleted
+        // document) is kept and flagged by graph status, not refused.
+        let mut gone_table = ontology.clone();
+        gone_table
             .mappings
             .iter_mut()
             .for_each(|m| m.table = String::from("nope"));
-        let wrong = save(&db, &wrong_table, None, None).err();
-        assert!(wrong.is_some_and(|e| e.to_string().contains("does not have")));
+        assert!(save(&db, &gone_table, None, None).is_ok());
         let mut wrong_column = ontology;
         wrong_column
             .mappings
@@ -536,7 +538,7 @@ mod tests {
         assert!(wrong.is_some_and(|e| e.to_string().contains("column 'ghost'")));
         assert_eq!(
             latest_version(&db).unwrap_or(0),
-            1,
+            2,
             "failed saves write nothing"
         );
     }

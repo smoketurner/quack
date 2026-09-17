@@ -268,11 +268,14 @@ async fn run_extract(
             )?;
         } else {
             for summary in tables::extract(db, &ontology, provisional)? {
-                writeln!(
-                    out,
-                    "Table {}: {} rows -> {} nodes, {} edges",
-                    summary.table, summary.rows, summary.nodes, summary.edges
-                )?;
+                match &summary.skipped {
+                    Some(reason) => writeln!(out, "Table {}: skipped, {reason}", summary.table)?,
+                    None => writeln!(
+                        out,
+                        "Table {}: {} rows -> {} nodes, {} edges",
+                        summary.table, summary.rows, summary.nodes, summary.edges
+                    )?,
+                }
             }
         }
     }
@@ -371,6 +374,12 @@ pub(crate) fn status_text(status: &GraphStatus) -> String {
         lines.push(format!(
             "{} merge proposals pending: `quack graph merges`",
             status.pending_merges
+        ));
+    }
+    if !status.missing_tables.is_empty() {
+        lines.push(format!(
+            "Mapped tables no longer in the workspace (extraction skips them): {}",
+            status.missing_tables.join(", ")
         ));
     }
     if status.drift.total() > 0 {
