@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::ontology::Ontology;
-use quack_core::ontology::induction::{Decision, propose_from_tables};
+use quack_core::ontology::induction::{Candidate, Decision, propose_from_tables};
 use quack_core::ontology::{candidates, documents, store};
 use quack_core::storage::workspace::WorkspaceDb;
 
@@ -416,7 +416,7 @@ async fn run_documents(
     current: Option<&Ontology>,
     options: &documents::DocumentEvidenceOptions,
     out: &mut impl Write,
-) -> Result<Vec<quack_core::ontology::induction::Candidate>> {
+) -> Result<Vec<Candidate>> {
     let sample = documents::sample_chunks(db, options.sample_chunks)?;
     let extractor = quack_core::llm::chat_extractor(config).await?;
     let embeddings = quack_core::llm::optional_embedding_model(config).await?;

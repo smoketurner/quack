@@ -1,6 +1,10 @@
 use crate::analysis::policy::WritePolicy;
+use crate::error::Error;
 use crate::error::Result;
+use crate::graph::store as graph_store;
+use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
+use crate::storage::workspace::QueryResults;
 use crate::storage::workspace::WorkspaceDb;
 use std::fmt::Write;
 
@@ -133,9 +137,9 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 
     append_pinned_documents(&mut prompt, db, options.pinned_token_budget)?;
 
-    if let Some(ontology) = crate::ontology::store::current(db)? {
+    if let Some(ontology) = ontology_store::current(db)? {
         prompt.push_str(&ontology.render_for_prompt());
-        let graph = crate::graph::store::status(db)?;
+        let graph = graph_store::status(db)?;
         if graph.enabled() {
             writeln!(
                 prompt,
@@ -304,12 +308,9 @@ fn append_pinned_documents(
 /// # Errors
 ///
 /// Returns an error if formatting fails.
-pub fn format_query_result(
-    results: &crate::storage::workspace::QueryResults,
-    max_rows: u32,
-) -> Result<String> {
+pub fn format_query_result(results: &QueryResults, max_rows: u32) -> Result<String> {
     let max = usize::try_from(max_rows)
-        .map_err(|e| crate::error::Error::Analysis(format!("max_rows overflow: {e}")))?;
+        .map_err(|e| Error::Analysis(format!("max_rows overflow: {e}")))?;
 
     let capped = if results.rows.len() > max {
         let mut capped = results.clone_capped(max_rows);
@@ -325,7 +326,7 @@ pub fn format_query_result(
 
     let mut buf = Vec::new();
     capped.write_table(&mut buf)?;
-    String::from_utf8(buf).map_err(|e| crate::error::Error::Analysis(format!("UTF-8 error: {e}")))
+    String::from_utf8(buf).map_err(|e| Error::Analysis(format!("UTF-8 error: {e}")))
 }
 
 #[cfg(test)]

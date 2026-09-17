@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use super::store::{self, id_list};
 use super::{GraphOptions, Node};
 use crate::error::{Error, Result};
-use crate::storage::workspace::WorkspaceDb;
+use crate::ingestion::DbHandle;
+use crate::storage::workspace::{WorkspaceDb, tokenize};
 
 /// A proposed merge: `drop` folds into `keep`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -36,7 +37,7 @@ pub struct ResolutionSummary {
 ///
 /// Returns an error when embedding or a write fails.
 pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
-    db: &impl crate::ingestion::DbHandle,
+    db: &impl DbHandle,
     model: Option<&M>,
     options: &GraphOptions,
 ) -> Result<ResolutionSummary> {
@@ -150,7 +151,7 @@ fn provenance_count(db: &WorkspaceDb, id: &str) -> Result<i64> {
 #[must_use]
 pub fn share_token(a: &str, b: &str) -> bool {
     let tokens = |s: &str| -> BTreeSet<String> {
-        crate::storage::workspace::tokenize(s)
+        tokenize(s)
             .into_iter()
             .filter(|t| t.chars().count() >= 3)
             .collect()

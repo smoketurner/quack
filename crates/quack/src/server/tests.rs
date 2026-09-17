@@ -16,11 +16,11 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::Config;
-use quack_core::storage::control::{AuditFilter, ControlPlane, Role, Scope};
 use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState};
+use quack_core::storage::control::{AuditFilter, AuditRow, ControlPlane, Role, Scope};
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -147,7 +147,7 @@ impl Harness {
         ws.id
     }
 
-    async fn audit(&self, filter: AuditFilter) -> Vec<quack_core::storage::control::AuditRow> {
+    async fn audit(&self, filter: AuditFilter) -> Vec<AuditRow> {
         self.app
             .control
             .query_audit(&AuditFilter {

@@ -22,7 +22,6 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::routing::get;
 use quack_core::config::Config;
-use quack_core::storage::control::ControlPlane;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::{GovernorError, GovernorLayer};
@@ -32,6 +31,7 @@ use tower_http::request_id::{
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
+use quack_core::storage::control::{ControlPlane, sha256_hex};
 use state::{App, AppState};
 
 /// How long one request may take. Agent turns can be slow.
@@ -66,7 +66,7 @@ impl KeyExtractor for CallerKey {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
         {
-            return Ok(quack_core::storage::control::sha256_hex(token.as_bytes()));
+            return Ok(sha256_hex(token.as_bytes()));
         }
         Ok(req
             .extensions()

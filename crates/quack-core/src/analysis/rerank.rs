@@ -9,6 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
+use crate::llm::stream_answer;
 use crate::storage::workspace::ChunkSearchResult;
 
 /// Boxed future so implementations can be trait objects.
@@ -161,8 +162,7 @@ impl Reranker for ModelReranker {
     fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
         Box::pin(async move {
             let request = rerank_request(query, candidates, PASSAGE_CHARS);
-            let answer =
-                crate::llm::stream_answer(&self.agent, &request, RERANK_TIMEOUT, "rerank").await?;
+            let answer = stream_answer(&self.agent, &request, RERANK_TIMEOUT, "rerank").await?;
             parse_ranking(&answer, candidates.len())
         })
     }

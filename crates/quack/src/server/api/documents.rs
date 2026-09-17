@@ -14,7 +14,10 @@ use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::UploadJob;
 use crate::server::state::{App, with_db};
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
+use quack_core::okf::{self, Bundle};
+use quack_core::ontology::candidates;
+use quack_core::ontology::store as ontology_store;
+use quack_core::storage::workspace::{DocumentInfo, DocumentSource, WorkspaceDb};
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -23,11 +26,7 @@ pub(crate) async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     let _access = access(&app, identity, &id, Need::READ).await?;
     let db = app.workspace_db(&id).await?;
-    let docs = with_db(
-        db,
-        quack_core::storage::workspace::WorkspaceDb::list_documents,
-    )
-    .await?;
+    let docs = with_db(db, WorkspaceDb::list_documents).await?;
     Ok(Json(serde_json::json!({ "documents": docs })))
 }
 
@@ -68,8 +67,7 @@ pub(crate) async fn upload(
         let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        let bundle = quack_core::okf::Bundle::from_tar(&bytes)
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let bundle = Bundle::from_tar(&bytes).map_err(|e| ApiError::bad_request(e.to_string()))?;
         return import_bundle(&app, &access, bundle).await;
     }
     let files = if content_type.starts_with("multipart/form-data") {
@@ -104,35 +102,27 @@ pub(crate) async fn upload(
 async fn import_bundle(
     app: &App,
     access: &Access,
-    bundle: quack_core::okf::Bundle,
+    bundle: Bundle,
 ) -> ApiResult<axum::response::Response> {
     let files: Vec<(String, Vec<u8>)> = bundle
         .concepts()
-        .map(|f| {
-            (
-                quack_core::okf::document_name(&f.path),
-                f.content.as_bytes().to_vec(),
-            )
-        })
+        .map(|f| (okf::document_name(&f.path), f.content.as_bytes().to_vec()))
         .collect();
     let queued = enqueue(app, access, DocumentSource::Upload, files).await?;
     let db = app.workspace_db(&access.workspace.id).await?;
     let for_candidates = bundle.clone();
     let candidates = with_db(db, move |db| {
-        let current = quack_core::ontology::store::current(db)?;
-        let candidates = quack_core::okf::propose(&for_candidates, current.as_ref());
+        let current = ontology_store::current(db)?;
+        let candidates = okf::propose(&for_candidates, current.as_ref());
         if !candidates.is_empty() {
-            quack_core::ontology::candidates::store_run(db, &candidates)?;
+            candidates::store_run(db, &candidates)?;
         }
         Ok(candidates.len())
     })
     .await?;
-    let context = bundle.index().map(|index| {
-        quack_core::okf::parse_front_matter(&index.content)
-            .1
-            .trim()
-            .to_owned()
-    });
+    let context = bundle
+        .index()
+        .map(|index| okf::parse_front_matter(&index.content).1.trim().to_owned());
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({

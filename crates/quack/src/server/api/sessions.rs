@@ -9,7 +9,7 @@ use quack_core::storage::control::Outcome;
 use quack_core::storage::sessions;
 use serde::Deserialize;
 
-use crate::server::auth::{Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 
@@ -43,7 +43,7 @@ pub(crate) async fn list(
 
 async fn visible_session(
     app: &App,
-    access: &crate::server::auth::Access,
+    access: &Access,
     workspace_id: &str,
     session_id: &str,
 ) -> ApiResult<sessions::SessionRow> {
@@ -103,7 +103,7 @@ pub(crate) async fn update(
 /// The shared toggle behind the API and the web button.
 pub(crate) async fn set_shared(
     app: &App,
-    access: &crate::server::auth::Access,
+    access: &Access,
     sid: &str,
     shared: bool,
 ) -> ApiResult<sessions::SessionRow> {
@@ -149,11 +149,7 @@ pub(crate) async fn remove(
 }
 
 /// The shared delete behind the API and the web button.
-pub(crate) async fn delete_session(
-    app: &App,
-    access: &crate::server::auth::Access,
-    sid: &str,
-) -> ApiResult<()> {
+pub(crate) async fn delete_session(app: &App, access: &Access, sid: &str) -> ApiResult<()> {
     let session = visible_session(app, access, &access.workspace.id, sid).await?;
     let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
     if !mine && !access.sees_all_sessions() {

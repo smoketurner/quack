@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::Drift;
 use super::store::{self, NewNode, Source};
 use crate::error::{Error, Result};
+use crate::ingestion::DbHandle;
 use crate::ontology::{self, Ontology};
 use crate::storage::workspace::WorkspaceDb;
 
@@ -219,7 +220,7 @@ const MODEL_CONFIDENCE: f64 = 0.8;
 ///
 /// Returns an error when every chunk fails or a write fails.
 pub async fn run(
-    db: &impl crate::ingestion::DbHandle,
+    db: &impl DbHandle,
     chunks: Vec<ChunkText>,
     extractor: &dyn GraphExtractor,
     ontology: &Ontology,

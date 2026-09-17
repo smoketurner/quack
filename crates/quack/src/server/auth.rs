@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
 use super::state::App;
+use quack_core::storage::audit;
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -269,7 +270,7 @@ impl Access {
             let user = self.identity.user_id.clone();
             let action = action.to_owned();
             super::state::with_db(db, move |db| {
-                quack_core::storage::audit::record(db, &id, Some(&user), &action, &detail)
+                audit::record(db, &id, Some(&user), &action, &detail)
             })
             .await?;
         }

@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
-use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::WorkspaceDb;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::queue::UploadQueue;
+use quack_core::storage::control::{ControlPlane, random_bytes};
 
 pub(crate) struct AppState {
     pub config: Config,
@@ -114,7 +114,7 @@ impl AppState {
 
 fn aws_lc_rs_fill(bytes: &mut [u8]) -> ApiResult<()> {
     // The control plane exposes the random source it uses for tokens.
-    quack_core::storage::control::random_bytes(bytes).map_err(|e| ApiError::internal(e.to_string()))
+    random_bytes(bytes).map_err(|e| ApiError::internal(e.to_string()))
 }
 
 /// Run a closure against the workspace handle on the blocking pool, so a

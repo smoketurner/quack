@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::ingestion::parser::Section;
 
 /// Split text into overlapping chunks by BPE token count.
 ///
@@ -160,7 +161,7 @@ impl Chunk {
 ///
 /// Returns an error if the encoding name is not recognized.
 pub fn chunk_sections(
-    sections: &[crate::ingestion::parser::Section],
+    sections: &[Section],
     chunk_size_tokens: u32,
     overlap_tokens: u32,
     encoding_name: &str,
@@ -186,7 +187,6 @@ pub fn chunk_sections(
 #[cfg(test)]
 mod section_tests {
     use super::*;
-    use crate::ingestion::parser::Section;
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]

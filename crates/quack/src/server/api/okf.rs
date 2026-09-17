@@ -11,6 +11,7 @@ use quack_core::storage::control::Outcome;
 use crate::server::auth::{Identity, Need, access};
 use crate::server::error::ApiResult;
 use crate::server::state::{App, with_db};
+use quack_core::okf;
 
 pub(crate) async fn export(
     State(app): State<App>,
@@ -21,7 +22,7 @@ pub(crate) async fn export(
     let db = app.workspace_db(&id).await?;
     let name = access.workspace.name.clone();
     let (bytes, files) = with_db(db, move |db| {
-        let bundle = quack_core::okf::export(db, &name)?;
+        let bundle = okf::export(db, &name)?;
         Ok((bundle.to_tar()?, bundle.files.len()))
     })
     .await?;
@@ -34,7 +35,7 @@ pub(crate) async fn export(
             Some(serde_json::json!({ "format": "okf", "files": files })),
         )
         .await?;
-    let filename = format!("{}.okf.tar", quack_core::okf::slug(&access.workspace.name));
+    let filename = format!("{}.okf.tar", okf::slug(&access.workspace.name));
     Ok((
         [
             (header::CONTENT_TYPE, String::from("application/x-tar")),

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::okf::parse_front_matter;
 
 /// Recognized file types for ingestion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,7 +148,7 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
             let text = utf8(data)?;
             // YAML front matter (Obsidian, Jekyll, OKF) is metadata, not
             // prose: its `title` is the document's, the rest is dropped.
-            let (front, body) = crate::okf::parse_front_matter(&text);
+            let (front, body) = parse_front_matter(&text);
             Ok(Extracted {
                 title: front.get("title").map(str::to_owned),
                 sections: markdown_sections(body),

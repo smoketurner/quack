@@ -7,6 +7,7 @@ use quack_core::storage::control::Outcome;
 use crate::server::auth::{Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
+use quack_core::storage::workspace::WorkspaceDb;
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -15,7 +16,7 @@ pub(crate) async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     let _access = access(&app, identity, &id, Need::READ).await?;
     let db = app.workspace_db(&id).await?;
-    let tables = with_db(db, quack_core::storage::workspace::WorkspaceDb::list_tables).await?;
+    let tables = with_db(db, WorkspaceDb::list_tables).await?;
     Ok(Json(serde_json::json!({ "tables": tables })))
 }
 

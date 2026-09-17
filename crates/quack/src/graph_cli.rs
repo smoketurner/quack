@@ -7,6 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::graph::{GraphResult, GraphStatus};
 use quack_core::graph::{extract, resolve, store as graph_store, tables, traverse};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
@@ -338,11 +339,7 @@ async fn query_embedding(config: &Config, text: &str) -> Option<Vec<f32>> {
     llm::embed_query(&model, text).await.ok()
 }
 
-fn print_result(
-    out: &mut impl Write,
-    result: &quack_core::graph::GraphResult,
-    json: bool,
-) -> Result<()> {
+fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Result<()> {
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(result)?)?;
     } else {
@@ -352,7 +349,7 @@ fn print_result(
 }
 
 /// The status as `quack graph status` prints it.
-pub(crate) fn status_text(status: &quack_core::graph::GraphStatus) -> String {
+pub(crate) fn status_text(status: &GraphStatus) -> String {
     let mut lines = vec![format!(
         "Graph: {} nodes, {} edges (ontology version {}, built with {}){}{}",
         status.nodes,

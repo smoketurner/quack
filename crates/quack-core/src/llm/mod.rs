@@ -18,8 +18,11 @@ use crate::analysis::events::EventSink;
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::SharedDb;
+use crate::config::config_file_path;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
+use crate::graph::extract as graph_extract;
+use crate::ontology::{Ontology, documents};
 use crate::storage::{context, sessions};
 
 type OpenAiEmbeddingModel =
@@ -109,11 +112,11 @@ struct RigExtractor {
 /// How long one chunk's extraction may take.
 const EXTRACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-impl crate::ontology::documents::Extractor for RigExtractor {
-    fn extract<'a>(&'a self, text: &'a str) -> crate::ontology::documents::ExtractFuture<'a> {
+impl documents::Extractor for RigExtractor {
+    fn extract<'a>(&'a self, text: &'a str) -> documents::ExtractFuture<'a> {
         Box::pin(async move {
             let answer = stream_answer(&self.agent, text, EXTRACTION_TIMEOUT, "extraction").await?;
-            crate::ontology::documents::parse_extraction(&answer)
+            documents::parse_extraction(&answer)
         })
     }
 }
@@ -170,7 +173,7 @@ where
 {
     RigExtractor {
         agent: rig::agent::AgentBuilder::new(model)
-            .preamble(crate::ontology::documents::EXTRACTION_PROMPT)
+            .preamble(documents::EXTRACTION_PROMPT)
             .temperature(0.0)
             .build(),
     }
@@ -182,23 +185,23 @@ struct RigGraphExtractor {
     agent: rig::agent::Agent,
 }
 
-impl crate::graph::extract::GraphExtractor for RigGraphExtractor {
-    fn extract<'a>(&'a self, text: &'a str) -> crate::graph::extract::ExtractFuture<'a> {
+impl graph_extract::GraphExtractor for RigGraphExtractor {
+    fn extract<'a>(&'a self, text: &'a str) -> graph_extract::ExtractFuture<'a> {
         Box::pin(async move {
             let answer =
                 stream_answer(&self.agent, text, EXTRACTION_TIMEOUT, "graph extraction").await?;
-            crate::graph::extract::parse_extraction(&answer)
+            graph_extract::parse_extraction(&answer)
         })
     }
 }
 
-fn graph_agent<M>(model: M, ontology: &crate::ontology::Ontology) -> RigGraphExtractor
+fn graph_agent<M>(model: M, ontology: &Ontology) -> RigGraphExtractor
 where
     M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
 {
     RigGraphExtractor {
         agent: rig::agent::AgentBuilder::new(model)
-            .preamble(&crate::graph::extract::prompt_for(ontology))
+            .preamble(&graph_extract::prompt_for(ontology))
             .temperature(0.0)
             .build(),
     }
@@ -212,8 +215,8 @@ where
 /// cannot be built.
 pub async fn graph_extractor(
     config: &Config,
-    ontology: &crate::ontology::Ontology,
-) -> Result<Box<dyn crate::graph::extract::GraphExtractor>> {
+    ontology: &Ontology,
+) -> Result<Box<dyn graph_extract::GraphExtractor>> {
     let chat = config.chat_model_ref()?;
     Ok(match chat.provider.provider_type {
         ProviderType::Ollama => Box::new(graph_agent(
@@ -243,9 +246,7 @@ pub async fn graph_extractor(
 ///
 /// Returns an error when no chat model is configured or the provider
 /// cannot be built (a missing key, a needed login).
-pub async fn chat_extractor(
-    config: &Config,
-) -> Result<Box<dyn crate::ontology::documents::Extractor>> {
+pub async fn chat_extractor(config: &Config) -> Result<Box<dyn documents::Extractor>> {
     let chat = config.chat_model_ref()?;
     Ok(match chat.provider.provider_type {
         ProviderType::Ollama => Box::new(extraction_agent(
@@ -496,7 +497,7 @@ pub async fn required_embedding_model(config: &Config) -> Result<EmbedModel> {
     let model = config.embedding_model_ref()?.ok_or_else(|| {
         Error::Config(format!(
             "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
-            crate::config::config_file_path().display()
+            config_file_path().display()
         ))
     })?;
     tracing::info!(model = %model, "using embedding model");

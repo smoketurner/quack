@@ -17,7 +17,7 @@ use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::{
     self, Class, Ontology, Property, PropertyType, Relation, store as ontology_store,
 };
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{DocumentInfo, WorkspaceDb};
 use crate::storage::{audit, context};
 
 /// One file of a bundle: a path relative to its root and the text.
@@ -501,7 +501,7 @@ fn export_tables(
 fn export_documents(
     bundle: &mut Bundle,
     index: &mut String,
-    documents: &[crate::storage::workspace::DocumentInfo],
+    documents: &[DocumentInfo],
 ) -> Result<()> {
     for document in documents {
         let path = format!("documents/{}.md", slug(&document.filename));
@@ -686,7 +686,7 @@ fn export_entities(
     db: &WorkspaceDb,
     bundle: &mut Bundle,
     index: &mut String,
-    documents: &[crate::storage::workspace::DocumentInfo],
+    documents: &[DocumentInfo],
 ) -> Result<()> {
     let ids = graph_store::all_node_ids(db)?;
     if ids.is_empty() {

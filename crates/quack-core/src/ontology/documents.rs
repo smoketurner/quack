@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::induction::{Candidate, Proposal, snake_id};
 use super::{Class, Ontology, Property, PropertyType, Relation};
 use crate::error::{Error, Result};
+use crate::llm::{EmbedModel, name_similarity};
 use crate::storage::workspace::WorkspaceDb;
 
 /// What open extraction returns for one chunk.
@@ -239,7 +240,7 @@ pub async fn run(
     extractor: &dyn Extractor,
     current: Option<&Ontology>,
     options: &DocumentEvidenceOptions,
-    embeddings: Option<&crate::llm::EmbedModel>,
+    embeddings: Option<&EmbedModel>,
 ) -> Result<(Vec<Candidate>, RunSummary)> {
     let sampled = u32::try_from(sample.len()).unwrap_or(u32::MAX);
     let (observations, failed) = observe(extractor, &sample).await?;
@@ -255,7 +256,7 @@ pub async fn run(
                 }
             }
             let names: Vec<String> = names.into_iter().collect();
-            Some(crate::llm::name_similarity(model, &names, options.cluster_threshold).await?)
+            Some(name_similarity(model, &names, options.cluster_threshold).await?)
         }
         None => None,
     };
@@ -753,7 +754,7 @@ fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::workspace::NewDocument;
+    use crate::storage::workspace::{NewChunk, NewDocument};
 
     struct Canned;
 
@@ -795,7 +796,7 @@ mod tests {
                 );
                 let id = format!("{doc}-{i}");
                 assert!(
-                    db.insert_chunk(&crate::storage::workspace::NewChunk {
+                    db.insert_chunk(&NewChunk {
                         id: &id,
                         document_id: &doc,
                         chunk_index: i,
@@ -815,7 +816,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            db.insert_chunk(&crate::storage::workspace::NewChunk {
+            db.insert_chunk(&NewChunk {
                 id: "p-0",
                 document_id: "pending",
                 chunk_index: 0,

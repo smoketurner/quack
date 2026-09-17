@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::graph::GraphOptions;
+use crate::ontology::documents::DocumentEvidenceOptions;
+use crate::ontology::induction::TableEvidenceOptions;
 
 /// The whole `config.toml`. Unknown keys anywhere are an error so a typo can
 /// never silently disable a setting.
@@ -192,21 +195,21 @@ impl Default for OntologyConfig {
 impl OntologyConfig {
     /// The document-evidence tuning as the core module takes it.
     #[must_use]
-    pub fn document_evidence(&self) -> crate::ontology::documents::DocumentEvidenceOptions {
-        crate::ontology::documents::DocumentEvidenceOptions {
+    pub fn document_evidence(&self) -> DocumentEvidenceOptions {
+        DocumentEvidenceOptions {
             sample_chunks: self.propose_sample_chunks,
             min_support_documents: self.min_support_documents,
-            ..crate::ontology::documents::DocumentEvidenceOptions::default()
+            ..DocumentEvidenceOptions::default()
         }
     }
 
     /// The induction tuning as the core module takes it.
     #[must_use]
-    pub fn table_evidence(&self) -> crate::ontology::induction::TableEvidenceOptions {
-        crate::ontology::induction::TableEvidenceOptions {
+    pub fn table_evidence(&self) -> TableEvidenceOptions {
+        TableEvidenceOptions {
             key_overlap_threshold: self.key_overlap_threshold,
             enum_max_values: self.enum_max_values,
-            ..crate::ontology::induction::TableEvidenceOptions::default()
+            ..TableEvidenceOptions::default()
         }
     }
 }
@@ -247,7 +250,7 @@ pub struct GraphConfig {
 
 impl Default for GraphConfig {
     fn default() -> Self {
-        let defaults = crate::graph::GraphOptions::default();
+        let defaults = GraphOptions::default();
         Self {
             max_traversal_depth: defaults.max_traversal_depth,
             max_nodes: defaults.max_nodes,
@@ -260,8 +263,8 @@ impl Default for GraphConfig {
 impl GraphConfig {
     /// The tuning as the core module takes it.
     #[must_use]
-    pub fn options(&self) -> crate::graph::GraphOptions {
-        crate::graph::GraphOptions {
+    pub fn options(&self) -> GraphOptions {
+        GraphOptions {
             max_traversal_depth: self.max_traversal_depth,
             max_nodes: self.max_nodes,
             merge_threshold: self.merge_threshold,

@@ -13,10 +13,18 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::SharedDb;
+use quack_core::config::AuthMode;
 use quack_core::config::Config;
+use quack_core::crypto;
+use quack_core::error::Error as CoreError;
+use quack_core::import::{self, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm;
+use quack_core::llm::oauth::{self, TokenManager};
 use quack_core::llm::oauth::{LoginOptions, LoginPrompt};
+use quack_core::okf::{self, Bundle};
+use quack_core::ontology::candidates;
+use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
@@ -351,7 +359,7 @@ impl OutputFormat {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    quack_core::crypto::install_default_provider()
+    crypto::install_default_provider()
         .context("failed to install the aws-lc-rs crypto provider")?;
 
     let mut cli = Cli::parse();
@@ -618,7 +626,7 @@ async fn run_import(
     limit: Option<u64>,
 ) -> Result<ExitCode> {
     init_logging();
-    let request = &quack_core::import::ImportRequest {
+    let request = &ImportRequest {
         url,
         table,
         query,
@@ -629,7 +637,7 @@ async fn run_import(
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     let embedding_model = llm::optional_embedding_model(&config).await?;
-    let summary = quack_core::import::import(
+    let summary = import::import(
         &config,
         &ws_db,
         &workspace.id,
@@ -664,7 +672,7 @@ async fn run_okf_export(cli: &Cli, dir: &str) -> Result<ExitCode> {
     let (config, workspace, name) = resolve_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    let bundle = quack_core::okf::export(&ws_db, &name)?;
+    let bundle = okf::export(&ws_db, &name)?;
     if dir == "-" {
         let mut out = std::io::stdout().lock();
         out.write_all(&bundle.to_tar()?)?;
@@ -701,8 +709,8 @@ fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
     err.chain()
         .any(|cause| {
             matches!(
-                cause.downcast_ref::<quack_core::error::Error>(),
-                Some(quack_core::error::Error::AuthRequired { .. })
+                cause.downcast_ref::<CoreError>(),
+                Some(CoreError::AuthRequired { .. })
             )
         })
         .then_some(ExitCode::from(EXIT_AUTH_REQUIRED))
@@ -738,7 +746,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             let mut names: Vec<&str> = config
                 .providers
                 .iter()
-                .filter(|(_, p)| p.auth == quack_core::config::AuthMode::Oauth)
+                .filter(|(_, p)| p.auth == AuthMode::Oauth)
                 .map(|(name, _)| name.as_str())
                 .collect();
             if let Some(only) = provider.as_deref() {
@@ -778,16 +786,16 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
     Ok(())
 }
 
-fn oauth_manager(config: &Config, name: &str) -> Result<Arc<quack_core::llm::oauth::TokenManager>> {
+fn oauth_manager(config: &Config, name: &str) -> Result<Arc<TokenManager>> {
     let provider = config.providers.get(name).ok_or_else(|| {
         anyhow::anyhow!(
             "provider '{name}' is not configured; add [providers.{name}] with auth = \"oauth\""
         )
     })?;
-    if provider.auth != quack_core::config::AuthMode::Oauth {
+    if provider.auth != AuthMode::Oauth {
         anyhow::bail!("provider '{name}' does not use auth = \"oauth\"");
     }
-    quack_core::llm::oauth::shared_manager(&config.tokens_dir(), name, provider)
+    oauth::shared_manager(&config.tokens_dir(), name, provider)
         .context("failed to prepare the OAuth token manager")
 }
 
@@ -1312,7 +1320,7 @@ async fn ingest_bundle(
     dir: &str,
     no_embed: bool,
 ) -> Result<()> {
-    let bundle = quack_core::okf::Bundle::from_dir(&PathBuf::from(dir))?;
+    let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
     let ws_db =
         WorkspaceDb::open(config, workspace_id).context("failed to open workspace database")?;
     let embedding_model = if no_embed {
@@ -1327,8 +1335,8 @@ async fn ingest_bundle(
     let mut stored = 0usize;
     let mut skipped = 0usize;
     for file in bundle.concepts() {
-        let (front, _) = quack_core::okf::parse_front_matter(&file.content);
-        let name = quack_core::okf::document_name(&file.path);
+        let (front, _) = okf::parse_front_matter(&file.content);
+        let name = okf::document_name(&file.path);
         let outcome = ingestion::ingest_file(
             config,
             &ws_db,
@@ -1352,10 +1360,10 @@ async fn ingest_bundle(
             String::new()
         }
     )?;
-    let current = quack_core::ontology::store::current(&ws_db)?;
-    let candidates = quack_core::okf::propose(&bundle, current.as_ref());
+    let current = ontology_store::current(&ws_db)?;
+    let candidates = okf::propose(&bundle, current.as_ref());
     if !candidates.is_empty() {
-        quack_core::ontology::candidates::store_run(&ws_db, &candidates)?;
+        candidates::store_run(&ws_db, &candidates)?;
         writeln!(
             out,
             "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
@@ -1363,7 +1371,7 @@ async fn ingest_bundle(
         )?;
     }
     if let Some(index) = bundle.index() {
-        let (_, body) = quack_core::okf::parse_front_matter(&index.content);
+        let (_, body) = okf::parse_front_matter(&index.content);
         let body = body.trim();
         if !body.is_empty() {
             let existing = context::current(&ws_db)?.map(|c| c.content);

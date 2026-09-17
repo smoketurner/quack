@@ -4,13 +4,13 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
-use quack_core::ontology::{Ontology, candidates, store};
 use quack_core::storage::control::Outcome;
 use serde::Deserialize;
 
-use crate::server::auth::{Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
+use quack_core::ontology::{Ontology, candidates, documents, store};
 
 pub(crate) async fn show(
     State(app): State<App>,
@@ -323,7 +323,7 @@ pub(crate) async fn decide(
 /// audited under the same run id.
 pub(crate) async fn start_document_run(
     app: &App,
-    access: &crate::server::auth::Access,
+    access: &Access,
     id: &str,
     extend: bool,
     sample: Option<u32>,
@@ -337,8 +337,8 @@ pub(crate) async fn start_document_run(
     let embeddings = quack_core::llm::optional_embedding_model(&app.config).await?;
     let db = app.workspace_db(id).await?;
     let (cost, chunks, current) = with_db(std::sync::Arc::clone(&db), move |db| {
-        let cost = quack_core::ontology::documents::estimate(db, &options)?;
-        let chunks = quack_core::ontology::documents::sample_chunks(db, options.sample_chunks)?;
+        let cost = documents::estimate(db, &options)?;
+        let chunks = documents::sample_chunks(db, options.sample_chunks)?;
         Ok((cost, chunks, store::current(db)?))
     })
     .await?;
@@ -360,7 +360,7 @@ pub(crate) async fn start_document_run(
     let run_id = run.clone();
     tokio::spawn(async move {
         let base = if extend { current.as_ref() } else { None };
-        let outcome = quack_core::ontology::documents::run(
+        let outcome = documents::run(
             chunks,
             extractor.as_ref(),
             base.or(current.as_ref()),

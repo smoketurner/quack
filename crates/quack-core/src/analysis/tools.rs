@@ -14,6 +14,8 @@ use super::events::TurnRecorder;
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, Reranker};
 use super::text_to_sql;
+use crate::error::Error;
+use crate::ontology::store as ontology_store;
 
 pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
 
@@ -258,10 +260,7 @@ pub struct SearchDocumentsArgs {
 /// document ids. Anything that matches nothing is an error naming the
 /// documents that exist, so the model retries instead of getting an empty
 /// result it reads as "the workspace has nothing on this".
-fn resolve_document_ids(
-    db: &crate::storage::workspace::WorkspaceDb,
-    wanted: &[String],
-) -> Result<Vec<String>, ToolError> {
+fn resolve_document_ids(db: &WorkspaceDb, wanted: &[String]) -> Result<Vec<String>, ToolError> {
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
@@ -783,8 +782,7 @@ mod tests {
 
     #[test]
     fn document_ids_resolve_by_id_prefix_or_filename() {
-        let db = crate::storage::workspace::WorkspaceDb::open_in_memory(4)
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
             db.insert_document(
                 &NewDocument::new("01a0-first", "policy.pdf", "application/pdf", 1)
@@ -1159,7 +1157,7 @@ where
                     },
                 )
             } else {
-                crate::ontology::store::current(&db).and_then(|o| {
+                ontology_store::current(&db).and_then(|o| {
                     graph::traverse::by_class(
                         &db,
                         o.as_ref(),
@@ -1284,12 +1282,8 @@ where
                         (Some(a), Some(b)) => {
                             graph::traverse::path(&db, a, b, max_hops, &self.options)
                         }
-                        (None, _) => Err(crate::error::Error::Analysis(format!(
-                            "no entity matches '{from}'"
-                        ))),
-                        (_, None) => Err(crate::error::Error::Analysis(format!(
-                            "no entity matches '{to}'"
-                        ))),
+                        (None, _) => Err(Error::Analysis(format!("no entity matches '{from}'"))),
+                        (_, None) => Err(Error::Analysis(format!("no entity matches '{to}'"))),
                     });
             outcome.map_err(|e| ToolError::Query(e.to_string()))
         };

@@ -18,6 +18,13 @@ use quack_core::storage::workspace::{WorkspaceDb, looks_like_direct_sql};
 use crate::terminal::chart::ChartData;
 use crate::terminal::ui;
 use quack_core::analysis::chart::ChartSpec;
+use quack_core::analysis::citations::Citation;
+use quack_core::error::Error as CoreError;
+use quack_core::graph::traverse;
+use quack_core::import::{self, ImportRequest};
+use quack_core::llm;
+use quack_core::ontology::store as ontology_store;
+use quack_core::storage::context;
 
 const TICK_RATE_MS: u64 = 50;
 
@@ -218,12 +225,7 @@ impl App {
                         .metadata
                         .as_ref()
                         .and_then(|m| m.get("citations"))
-                        .and_then(|c| {
-                            serde_json::from_value::<
-                                    Vec<quack_core::analysis::citations::Citation>,
-                                >(c.clone())
-                                .ok()
-                        })
+                        .and_then(|c| serde_json::from_value::<Vec<Citation>>(c.clone()).ok())
                         && !citations.is_empty()
                     {
                         self.messages.push(Message::new(
@@ -390,7 +392,7 @@ impl App {
                 for result in response.graph.iter().filter(|r| !r.is_empty()) {
                     self.messages.push(Message::new(
                         MessageRole::System,
-                        quack_core::graph::traverse::render_tree(result),
+                        traverse::render_tree(result),
                     ));
                 }
                 if response.write_refused && !self.allow_write {
@@ -783,7 +785,7 @@ impl App {
 
     fn show_context(&mut self) {
         let result = match self.db.lock() {
-            Ok(db) => quack_core::storage::context::current(&db),
+            Ok(db) => context::current(&db),
             Err(e) => {
                 self.messages.push(Message::new(
                     MessageRole::Error,
@@ -824,8 +826,8 @@ impl App {
         let outcome = match self.db.lock() {
             Ok(db) => {
                 if let Some(class) = args.strip_prefix("--class ") {
-                    quack_core::ontology::store::current(&db).and_then(|ontology| {
-                        quack_core::graph::traverse::by_class(
+                    ontology_store::current(&db).and_then(|ontology| {
+                        traverse::by_class(
                             &db,
                             ontology.as_ref(),
                             class.trim(),
@@ -840,28 +842,22 @@ impl App {
                         }
                         _ => (args, 2),
                     };
-                    quack_core::graph::traverse::resolve_entry(&db, entity, None, None).and_then(
-                        |roots| {
-                            if roots.is_empty() {
-                                return Err(quack_core::error::Error::Analysis(format!(
-                                    "no entity matches '{entity}'"
-                                )));
-                            }
-                            quack_core::graph::traverse::neighborhood(
-                                &db, &roots, hops, None, &options,
-                            )
-                        },
-                    )
+                    traverse::resolve_entry(&db, entity, None, None).and_then(|roots| {
+                        if roots.is_empty() {
+                            return Err(CoreError::Analysis(format!(
+                                "no entity matches '{entity}'"
+                            )));
+                        }
+                        traverse::neighborhood(&db, &roots, hops, None, &options)
+                    })
                 }
             }
-            Err(e) => Err(quack_core::error::Error::Analysis(format!(
-                "workspace lock poisoned: {e}"
-            ))),
+            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
         };
         match outcome {
             Ok(result) => self.messages.push(Message::new(
                 MessageRole::System,
-                quack_core::graph::traverse::render_tree(&result),
+                traverse::render_tree(&result),
             )),
             Err(e) => self
                 .messages
@@ -879,25 +875,15 @@ impl App {
         let (from, to) = (from.trim(), to.trim());
         let options = self.config.graph.options();
         let outcome = match self.db.lock() {
-            Ok(db) => {
-                quack_core::graph::traverse::resolve_entry(&db, from, None, None).and_then(|a| {
-                    let b = quack_core::graph::traverse::resolve_entry(&db, to, None, None)?;
-                    match (a.first(), b.first()) {
-                        (Some(a), Some(b)) => {
-                            quack_core::graph::traverse::path(&db, a, b, 4, &options)
-                        }
-                        (None, _) => Err(quack_core::error::Error::Analysis(format!(
-                            "no entity matches '{from}'"
-                        ))),
-                        (_, None) => Err(quack_core::error::Error::Analysis(format!(
-                            "no entity matches '{to}'"
-                        ))),
-                    }
-                })
-            }
-            Err(e) => Err(quack_core::error::Error::Analysis(format!(
-                "workspace lock poisoned: {e}"
-            ))),
+            Ok(db) => traverse::resolve_entry(&db, from, None, None).and_then(|a| {
+                let b = traverse::resolve_entry(&db, to, None, None)?;
+                match (a.first(), b.first()) {
+                    (Some(a), Some(b)) => traverse::path(&db, a, b, 4, &options),
+                    (None, _) => Err(CoreError::Analysis(format!("no entity matches '{from}'"))),
+                    (_, None) => Err(CoreError::Analysis(format!("no entity matches '{to}'"))),
+                }
+            }),
+            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
         };
         match outcome {
             Ok(result) if result.is_empty() => self.messages.push(Message::new(
@@ -906,7 +892,7 @@ impl App {
             )),
             Ok(result) => self.messages.push(Message::new(
                 MessageRole::System,
-                quack_core::graph::traverse::render_tree(&result),
+                traverse::render_tree(&result),
             )),
             Err(e) => self
                 .messages
@@ -971,18 +957,16 @@ impl App {
                     .collect();
                 match matches.as_slice() {
                     [id] => db.set_document_pinned(id, pinned).map(|()| id.clone()),
-                    [] => Err(quack_core::error::Error::Ingestion(format!(
+                    [] => Err(CoreError::Ingestion(format!(
                         "no document matches '{prefix}'"
                     ))),
-                    many => Err(quack_core::error::Error::Ingestion(format!(
+                    many => Err(CoreError::Ingestion(format!(
                         "'{prefix}' matches {} documents; use more of the id",
                         many.len()
                     ))),
                 }
             }),
-            Err(e) => Err(quack_core::error::Error::Analysis(format!(
-                "workspace lock poisoned: {e}"
-            ))),
+            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
         };
         match outcome {
             Ok(id) => self.messages.push(Message::new(
@@ -1048,7 +1032,7 @@ impl App {
             ));
             return;
         };
-        let request = quack_core::import::ImportRequest {
+        let request = ImportRequest {
             url: url.to_owned(),
             table: table.to_owned(),
             query: None,
@@ -1060,7 +1044,7 @@ impl App {
         let tx = self.response_tx.clone();
         self.messages.push(Message::new(
             MessageRole::System,
-            format!("Importing from {}", quack_core::import::redact(url)),
+            format!("Importing from {}", import::redact(url)),
         ));
         self.state = AppState::Ingesting;
         std::thread::spawn(move || {
@@ -1146,7 +1130,7 @@ impl App {
         tokio::spawn(async move {
             // run_turn emits TurnComplete or Failed itself; the returned
             // value is the same response, so it is not needed here.
-            drop(quack_core::llm::run_turn(&config, db, &session_id, policy, &message, sink).await);
+            drop(llm::run_turn(&config, db, &session_id, policy, &message, sink).await);
         });
     }
 
@@ -1176,7 +1160,7 @@ fn configure_textarea(textarea: &mut TextArea<'_>) {
     textarea.set_placeholder_text("Ask a question, or type SQL...");
 }
 
-fn sources_footer(citations: &[quack_core::analysis::citations::Citation]) -> String {
+fn sources_footer(citations: &[Citation]) -> String {
     let lines: Vec<String> = citations
         .iter()
         .map(|c| format!("\n  [{}] {}", c.n, c.label()))
@@ -1255,12 +1239,12 @@ async fn run_ingest_task(
 async fn run_import_inner(
     config: &Config,
     workspace_id: &str,
-    request: &quack_core::import::ImportRequest,
+    request: &ImportRequest,
 ) -> Result<String> {
     let ws_db = WorkspaceDb::open(config, workspace_id)
         .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
-    let embedding_model = quack_core::llm::optional_embedding_model(config).await?;
-    let summary = quack_core::import::import(
+    let embedding_model = llm::optional_embedding_model(config).await?;
+    let summary = import::import(
         config,
         &ws_db,
         workspace_id,
@@ -1294,7 +1278,7 @@ async fn run_ingest_inner(
     let ws_db = WorkspaceDb::open(config, workspace_id)
         .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
 
-    let embedding_model = quack_core::llm::optional_embedding_model(config).await?;
+    let embedding_model = llm::optional_embedding_model(config).await?;
 
     let outcome = ingestion::ingest_file(
         config,

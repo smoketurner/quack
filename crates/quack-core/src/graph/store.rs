@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use super::{Drift, Edge, GraphStatus, Node, Provenance, normalize_label};
 use crate::error::{Error, Result};
 use crate::ontology::{self, Ontology, store as ontology_store};
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{WorkspaceDb, embedding_literal};
 
 const META_BUILT_WITH: &str = "graph_built_with_ontology_version";
 const META_DRIFT: &str = "graph_drift";
@@ -665,7 +665,7 @@ pub fn nearest_nodes(
          WHERE embedding IS NOT NULL AND (? IS NULL OR class_id = ?) ORDER BY d LIMIT ?",
         vt = db.vector_type_public()
     );
-    let literal = crate::storage::workspace::embedding_literal(query);
+    let literal = embedding_literal(query);
     let mut stmt = db.connection().prepare(&sql)?;
     let mut rows = stmt.query(duckdb::params![
         literal,

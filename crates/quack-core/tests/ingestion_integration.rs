@@ -9,7 +9,10 @@ use quack_core::config::{
 };
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
-use quack_core::storage::workspace::{NewChunk, NewDocument, StatementKind, WorkspaceDb};
+use quack_core::storage::control::ControlPlane;
+use quack_core::storage::workspace::{
+    DocumentSource, NewChunk, NewDocument, StatementKind, WorkspaceDb,
+};
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
 const TEST_DIM: usize = 4;
@@ -866,14 +869,10 @@ fn legacy_unprefixed_tables_are_renamed_on_open() {
 async fn control_db_migrates_to_the_latest_version_and_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
-    let control = quack_core::storage::control::ControlPlane::open(&config)
-        .await
-        .unwrap();
+    let control = ControlPlane::open(&config).await.unwrap();
     assert_eq!(control.schema_version().await.unwrap(), 3);
     // Reopening is a no-op.
-    let again = quack_core::storage::control::ControlPlane::open(&config)
-        .await
-        .unwrap();
+    let again = ControlPlane::open(&config).await.unwrap();
     assert_eq!(again.schema_version().await.unwrap(), 3);
 }
 
@@ -1163,8 +1162,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         &config,
         &db,
         "ws-dedup",
-        &ingestion::NewFile::new("terms.md", md)
-            .source(quack_core::storage::workspace::DocumentSource::Stdin),
+        &ingestion::NewFile::new("terms.md", md).source(DocumentSource::Stdin),
         None::<&MockEmbeddingModel>,
     )
     .await
@@ -1174,10 +1172,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
 
     let doc = db.document(&first.document_id).unwrap().unwrap();
     assert_eq!(doc.title.as_deref(), Some("Renewal terms"));
-    assert_eq!(
-        doc.source,
-        quack_core::storage::workspace::DocumentSource::Stdin
-    );
+    assert_eq!(doc.source, DocumentSource::Stdin);
     assert_eq!(doc.sha256.as_deref().map(str::len), Some(64));
     assert_eq!(doc.chunk_count, Some(1));
     assert_eq!(doc.display_name(), "Renewal terms");
@@ -1213,10 +1208,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
     .unwrap();
     let doc = db.document(&titled.document_id).unwrap().unwrap();
     assert_eq!(doc.title.as_deref(), Some("Given"));
-    assert_eq!(
-        doc.source,
-        quack_core::storage::workspace::DocumentSource::Path
-    );
+    assert_eq!(doc.source, DocumentSource::Path);
 
     // A document that failed does not block a retry of the same bytes.
     let bad = b"%PDF-1.4 not really a pdf";
@@ -1505,10 +1497,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         ]
     );
     let doc = db.document(&summary.document_id).unwrap().unwrap();
-    assert_eq!(
-        doc.source,
-        quack_core::storage::workspace::DocumentSource::Import
-    );
+    assert_eq!(doc.source, DocumentSource::Import);
     assert_eq!(doc.title.as_deref(), Some(url.as_str()));
     assert_eq!(
         doc.tables.as_deref(),

@@ -4,7 +4,6 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use quack_core::import::{ImportRequest, ImportSummary};
 use quack_core::llm;
 use quack_core::storage::control::Outcome;
 use serde::Deserialize;
@@ -12,6 +11,7 @@ use serde::Deserialize;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
+use quack_core::import::{self, ImportRequest, ImportSummary};
 
 #[derive(Deserialize)]
 pub(crate) struct ImportBody {
@@ -46,12 +46,11 @@ pub(crate) async fn run_import(
     access: &Access,
     request: &ImportRequest,
 ) -> ApiResult<ImportSummary> {
-    let source = quack_core::import::redact(&request.url);
-    quack_core::import::source_kind(&request.url)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let source = import::redact(&request.url);
+    import::source_kind(&request.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let db = app.workspace_db(&access.workspace.id).await?;
     let embeddings = llm::optional_embedding_model(&app.config).await?;
-    let outcome = quack_core::import::import(
+    let outcome = import::import(
         &app.config,
         &db,
         &access.workspace.id,

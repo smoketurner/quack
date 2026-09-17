@@ -38,6 +38,7 @@ use serde::Deserialize;
 
 use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
+use quack_core::graph::{GraphResult, traverse};
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
 /// server's access log and the workspace detail table for HTTP.
@@ -463,22 +464,16 @@ impl McpServer {
         let result = self
             .db(move |db| {
                 if let Some(entity) = entity {
-                    let roots = quack_core::graph::traverse::resolve_entry(
+                    let roots = traverse::resolve_entry(
                         db,
                         &entity,
                         class.as_deref(),
                         embedding.as_deref(),
                     )?;
-                    return quack_core::graph::traverse::neighborhood(
-                        db,
-                        &roots,
-                        hops,
-                        relation.as_deref(),
-                        &options,
-                    );
+                    return traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options);
                 }
                 let ontology = ontology_store::current(db)?;
-                quack_core::graph::traverse::by_class(
+                traverse::by_class(
                     db,
                     ontology.as_ref(),
                     class.as_deref().unwrap_or_default(),
@@ -492,9 +487,7 @@ impl McpServer {
             .record("graph", None, Outcome::Allowed, Some(detail))
             .await;
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
-        out.content = vec![ContentBlock::text(
-            quack_core::graph::traverse::render_tree(&result),
-        )];
+        out.content = vec![ContentBlock::text(traverse::render_tree(&result))];
         Ok(out)
     }
 
@@ -519,19 +512,11 @@ impl McpServer {
         let (from_label, to_label) = (from.clone(), to.clone());
         let result = self
             .db(move |db| {
-                let from_nodes = quack_core::graph::traverse::resolve_entry(
-                    db,
-                    &from_label,
-                    None,
-                    a.as_deref(),
-                )?;
-                let to_nodes =
-                    quack_core::graph::traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
+                let from_nodes = traverse::resolve_entry(db, &from_label, None, a.as_deref())?;
+                let to_nodes = traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
                 match (from_nodes.first(), to_nodes.first()) {
-                    (Some(a), Some(b)) => {
-                        quack_core::graph::traverse::path(db, a, b, max_hops, &options)
-                    }
-                    _ => Ok(quack_core::graph::GraphResult::default()),
+                    (Some(a), Some(b)) => traverse::path(db, a, b, max_hops, &options),
+                    _ => Ok(GraphResult::default()),
                 }
             })
             .await?;
@@ -545,9 +530,7 @@ impl McpServer {
             )));
         }
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
-        out.content = vec![ContentBlock::text(
-            quack_core::graph::traverse::render_tree(&result),
-        )];
+        out.content = vec![ContentBlock::text(traverse::render_tree(&result))];
         Ok(out)
     }
 

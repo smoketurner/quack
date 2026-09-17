@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::error::{Error, Result};
 
 /// Tables quack manages inside a workspace database. Hidden from the agent's
 /// table listing and refused in agent SQL.
@@ -157,7 +158,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the database cannot be created.
-    pub fn open_in_memory(embedding_dimension: u32) -> crate::error::Result<Self> {
+    pub fn open_in_memory(embedding_dimension: u32) -> Result<Self> {
         let conn = duckdb::Connection::open_in_memory()?;
         let db = Self {
             conn,
@@ -185,7 +186,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the database file cannot be created or opened.
-    pub fn open(config: &Config, workspace_id: &str) -> crate::error::Result<Self> {
+    pub fn open(config: &Config, workspace_id: &str) -> Result<Self> {
         let db_path = config.workspace_db_path(workspace_id);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -212,7 +213,7 @@ impl WorkspaceDb {
         db.reconcile_embedding_dimension(configured_dimension, configured_model)
             .or_else(|e| match e {
                 // A brand-new workspace has no meta table yet; create it first.
-                crate::error::Error::DuckDb(_) => {
+                Error::DuckDb(_) => {
                     db.create_internal_tables()?;
                     db.reconcile_embedding_dimension(configured_dimension, configured_model)
                 }
@@ -223,7 +224,7 @@ impl WorkspaceDb {
     }
 
     /// Cap memory and parallelism for every statement on this connection.
-    fn apply_resource_limits(&self, config: &Config) -> crate::error::Result<()> {
+    fn apply_resource_limits(&self, config: &Config) -> Result<()> {
         let memory_limit = format!("{}MB", config.analysis.memory_limit_mb);
         self.conn
             .execute("SET memory_limit = ?", duckdb::params![memory_limit])?;
@@ -245,7 +246,7 @@ impl WorkspaceDb {
     ///
     /// The allow-list must be set while external access is still enabled,
     /// and the lock must come last; `DuckDB` refuses both in any other order.
-    fn confine_to(&self, allowed_dir: Option<&Path>) -> crate::error::Result<()> {
+    fn confine_to(&self, allowed_dir: Option<&Path>) -> Result<()> {
         match allowed_dir {
             Some(dir) => {
                 let dir = dir.to_string_lossy();
@@ -278,7 +279,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the classification query itself fails.
-    pub fn classify_statement(&self, sql: &str) -> crate::error::Result<StatementKind> {
+    pub fn classify_statement(&self, sql: &str) -> Result<StatementKind> {
         let serialized: String = self.conn.query_row(
             "SELECT json_serialize_sql(?::VARCHAR)",
             duckdb::params![sql],
@@ -320,7 +321,7 @@ impl WorkspaceDb {
 
     /// Names of tables a statement references, as `DuckDB` parsed them, or
     /// `None` when `DuckDB` cannot serialize the statement.
-    fn referenced_base_tables(&self, sql: &str) -> crate::error::Result<Option<Vec<String>>> {
+    fn referenced_base_tables(&self, sql: &str) -> Result<Option<Vec<String>>> {
         let serialized: String = self.conn.query_row(
             "SELECT json_serialize_sql(?::VARCHAR)",
             duckdb::params![sql],
@@ -346,9 +347,9 @@ impl WorkspaceDb {
     ///
     /// Returns `Error::Analysis` when the statement reaches an internal
     /// table, or a storage error when classification fails.
-    pub fn classify_user_statement(&self, sql: &str) -> crate::error::Result<StatementKind> {
+    pub fn classify_user_statement(&self, sql: &str) -> Result<StatementKind> {
         if self.references_internal_table(sql)? {
-            return Err(crate::error::Error::Analysis(String::from(
+            return Err(Error::Analysis(String::from(
                 "internal tables are not accessible",
             )));
         }
@@ -364,14 +365,14 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the classification query fails.
-    pub fn references_internal_table(&self, sql: &str) -> crate::error::Result<bool> {
+    pub fn references_internal_table(&self, sql: &str) -> Result<bool> {
         match self.referenced_base_tables(sql)? {
             Some(names) => Ok(names.iter().any(|n| is_internal_name(n))),
             None => Ok(mentions_internal_table_token(sql)),
         }
     }
 
-    fn create_internal_tables(&self) -> crate::error::Result<()> {
+    fn create_internal_tables(&self) -> Result<()> {
         self.rename_legacy_tables()?;
         let dim = self.embedding_dimension;
         let sql = format!(
@@ -475,7 +476,7 @@ impl WorkspaceDb {
     }
 
     /// Workspaces created before the `_quack_` prefix keep their data.
-    fn rename_legacy_tables(&self) -> crate::error::Result<()> {
+    fn rename_legacy_tables(&self) -> Result<()> {
         for (old, new) in [
             ("documents", "_quack_documents"),
             ("chunks", "_quack_chunks"),
@@ -491,7 +492,7 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    fn table_exists(&self, name: &str) -> crate::error::Result<bool> {
+    fn table_exists(&self, name: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
             duckdb::params![name],
@@ -505,7 +506,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn meta(&self, key: &str) -> crate::error::Result<Option<String>> {
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
         if !self.table_exists("_quack_meta")? {
             return Ok(None);
         }
@@ -524,7 +525,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the write fails.
-    pub fn set_meta_public(&self, key: &str, value: &str) -> crate::error::Result<()> {
+    pub fn set_meta_public(&self, key: &str, value: &str) -> Result<()> {
         self.set_meta(key, value)
     }
 
@@ -534,13 +535,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn set_vector(
-        &self,
-        table: &str,
-        column: &str,
-        id: &str,
-        embedding: &[f32],
-    ) -> crate::error::Result<()> {
+    pub fn set_vector(&self, table: &str, column: &str, id: &str, embedding: &[f32]) -> Result<()> {
         let sql = format!(
             "UPDATE {} SET {} = ?::{} WHERE id = ?",
             quote_ident(table),
@@ -558,7 +553,7 @@ impl WorkspaceDb {
         self.vector_type()
     }
 
-    fn set_meta(&self, key: &str, value: &str) -> crate::error::Result<()> {
+    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO _quack_meta (key, value) VALUES (?, ?)",
             duckdb::params![key, value],
@@ -580,7 +575,7 @@ impl WorkspaceDb {
         &mut self,
         configured: Option<u32>,
         configured_model: Option<&str>,
-    ) -> crate::error::Result<()> {
+    ) -> Result<()> {
         let recorded = self
             .meta("embedding_dimension")?
             .and_then(|v| v.parse::<u32>().ok());
@@ -594,7 +589,7 @@ impl WorkspaceDb {
                     |row| row.get(0),
                 )?;
                 if stored_chunks > 0 {
-                    return Err(crate::error::Error::Config(format!(
+                    return Err(Error::Config(format!(
                         "workspace embeddings are {rec}-dimensional ({}) but the configured \
                          provider produces {conf}-dimensional ({}) vectors; re-ingest the \
                          documents or switch back to the original embedding model",
@@ -637,9 +632,9 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the insert fails.
-    pub fn insert_document(&self, doc: &NewDocument<'_>) -> crate::error::Result<()> {
+    pub fn insert_document(&self, doc: &NewDocument<'_>) -> Result<()> {
         let size = i64::try_from(doc.size_bytes)
-            .map_err(|_| crate::error::Error::Ingestion("file size overflow".into()))?;
+            .map_err(|_| Error::Ingestion("file size overflow".into()))?;
 
         self.conn.execute(
             "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by) \
@@ -666,7 +661,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn document_by_sha256(&self, sha256: &str) -> crate::error::Result<Option<DocumentInfo>> {
+    pub fn document_by_sha256(&self, sha256: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> 'error' ORDER BY ingested_at, id LIMIT 1"
         );
@@ -683,7 +678,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn set_document_title_if_empty(&self, id: &str, title: &str) -> crate::error::Result<()> {
+    pub fn set_document_title_if_empty(&self, id: &str, title: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET title = ? WHERE id = ? AND title IS NULL",
             duckdb::params![title, id],
@@ -697,7 +692,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn set_document_tables(&self, id: &str, tables: &[String]) -> crate::error::Result<()> {
+    pub fn set_document_tables(&self, id: &str, tables: &[String]) -> Result<()> {
         let json = serde_json::to_string(tables)?;
         self.conn.execute(
             "UPDATE _quack_documents SET tables = ? WHERE id = ?",
@@ -711,7 +706,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn set_document_chunk_count(&self, id: &str, count: u32) -> crate::error::Result<()> {
+    pub fn set_document_chunk_count(&self, id: &str, count: u32) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET chunk_count = ? WHERE id = ?",
             duckdb::params![count, id],
@@ -724,7 +719,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn update_document_status(&self, id: &str, status: &str) -> crate::error::Result<()> {
+    pub fn update_document_status(&self, id: &str, status: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET status = ?, error_message = NULL WHERE id = ?",
             duckdb::params![status, id],
@@ -737,7 +732,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn mark_document_error(&self, id: &str, message: &str) -> crate::error::Result<()> {
+    pub fn mark_document_error(&self, id: &str, message: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET status = 'error', error_message = ? WHERE id = ?",
             duckdb::params![message, id],
@@ -750,7 +745,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn document(&self, id: &str) -> crate::error::Result<Option<DocumentInfo>> {
+    pub fn document(&self, id: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!("{DOCUMENT_SELECT} WHERE id = ?");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![id])?;
@@ -768,11 +763,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if any delete fails.
-    pub fn delete_document(
-        &self,
-        id: &str,
-        fallback_table: Option<&str>,
-    ) -> crate::error::Result<bool> {
+    pub fn delete_document(&self, id: &str, fallback_table: Option<&str>) -> Result<bool> {
         let Some(doc) = self.document(id)? else {
             return Ok(false);
         };
@@ -805,7 +796,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the insert fails.
-    pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> crate::error::Result<()> {
+    pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> Result<()> {
         let page = chunk.page.map(i64::from);
         let terms = term_frequencies(chunk.content, chunk.heading);
         let length = term_count(&terms);
@@ -850,7 +841,7 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    fn insert_terms(&self, chunk_id: &str, terms: &[(String, u32)]) -> crate::error::Result<()> {
+    fn insert_terms(&self, chunk_id: &str, terms: &[(String, u32)]) -> Result<()> {
         if terms.is_empty() {
             return Ok(());
         }
@@ -862,7 +853,7 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    fn chunk_count(&self) -> crate::error::Result<i64> {
+    fn chunk_count(&self) -> Result<i64> {
         Ok(self
             .conn
             .query_row("SELECT count(*) FROM _quack_chunks", [], |row| row.get(0))?)
@@ -873,7 +864,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if reading chunks or writing terms fails.
-    pub fn reindex_terms(&self) -> crate::error::Result<()> {
+    pub fn reindex_terms(&self) -> Result<()> {
         self.conn.execute("DELETE FROM _quack_terms", [])?;
         let mut stmt = self
             .conn
@@ -904,7 +895,7 @@ impl WorkspaceDb {
         document_id: &str,
         chunk_index: u32,
         embedding: &[f32],
-    ) -> crate::error::Result<()> {
+    ) -> Result<()> {
         let sql = format!(
             "UPDATE _quack_chunks SET embedding = ?::{} \
              WHERE document_id = ? AND chunk_index = ?",
@@ -935,7 +926,7 @@ impl WorkspaceDb {
         query: &str,
         top_k: u32,
         document_ids: &[String],
-    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+    ) -> Result<Vec<ChunkSearchResult>> {
         let terms: Vec<String> = term_frequencies(query, None)
             .into_iter()
             .map(|(t, _)| t)
@@ -998,7 +989,7 @@ impl WorkspaceDb {
         top_k: u32,
         rrf_k: u32,
         document_ids: &[String],
-    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+    ) -> Result<Vec<ChunkSearchResult>> {
         let candidates = top_k.saturating_mul(2).max(1);
         let vector = self.search_similar_chunks(query_embedding, candidates, document_ids)?;
         let keyword = self.search_keyword_chunks(query_text, candidates, document_ids)?;
@@ -1019,7 +1010,7 @@ impl WorkspaceDb {
         query_embedding: &[f32],
         top_k: u32,
         document_ids: &[String],
-    ) -> crate::error::Result<Vec<ChunkSearchResult>> {
+    ) -> Result<Vec<ChunkSearchResult>> {
         let filter = document_filter(document_ids);
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
@@ -1058,7 +1049,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn chunks_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<ChunkSearchResult>> {
+    pub fn chunks_by_ids(&self, ids: &[String]) -> Result<Vec<ChunkSearchResult>> {
         let mut out = Vec::with_capacity(ids.len());
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
@@ -1079,13 +1070,13 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the document does not exist or the update fails.
-    pub fn set_document_pinned(&self, document_id: &str, pinned: bool) -> crate::error::Result<()> {
+    pub fn set_document_pinned(&self, document_id: &str, pinned: bool) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE _quack_documents SET pinned = ? WHERE id = ?",
             duckdb::params![pinned, document_id],
         )?;
         if changed == 0 {
-            return Err(crate::error::Error::Ingestion(format!(
+            return Err(Error::Ingestion(format!(
                 "document '{document_id}' does not exist"
             )));
         }
@@ -1097,7 +1088,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn pinned_documents(&self) -> crate::error::Result<Vec<(DocumentInfo, String)>> {
+    pub fn pinned_documents(&self) -> Result<Vec<(DocumentInfo, String)>> {
         let mut out = Vec::new();
         for doc in self.list_documents()?.into_iter().filter(|d| d.pinned) {
             let mut stmt = self.conn.prepare(
@@ -1118,7 +1109,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the SQL is invalid or execution fails.
-    pub fn execute_query(&self, sql: &str) -> crate::error::Result<QueryResults> {
+    pub fn execute_query(&self, sql: &str) -> Result<QueryResults> {
         let _guard = self.arm_timeout();
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
@@ -1160,7 +1151,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the SQL is invalid or execution fails.
-    pub fn execute_statement(&self, sql: &str) -> crate::error::Result<()> {
+    pub fn execute_statement(&self, sql: &str) -> Result<()> {
         self.execute_with_params(sql, [])
     }
 
@@ -1169,11 +1160,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the SQL is invalid or execution fails.
-    pub fn execute_with_params<P: duckdb::Params>(
-        &self,
-        sql: &str,
-        params: P,
-    ) -> crate::error::Result<()> {
+    pub fn execute_with_params<P: duckdb::Params>(&self, sql: &str, params: P) -> Result<()> {
         let _guard = self.arm_timeout();
         self.conn.execute(sql, params)?;
         Ok(())
@@ -1207,7 +1194,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn list_tables(&self) -> crate::error::Result<Vec<String>> {
+    pub fn list_tables(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name",
         )?;
@@ -1227,7 +1214,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the table does not exist or the query fails.
-    pub fn describe_table(&self, table_name: &str) -> crate::error::Result<TableDescription> {
+    pub fn describe_table(&self, table_name: &str) -> Result<TableDescription> {
         let describe_sql = format!("DESCRIBE {}", quote_ident(table_name));
         let mut stmt = self.conn.prepare(&describe_sql)?;
         let mut rows = stmt.query([])?;
@@ -1256,7 +1243,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the table does not exist or the query fails.
-    pub fn count_rows(&self, table_name: &str) -> crate::error::Result<i64> {
+    pub fn count_rows(&self, table_name: &str) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM {}", quote_ident(table_name));
         let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
         Ok(count)
@@ -1268,7 +1255,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the version query fails.
-    pub fn duckdb_version(&self) -> crate::error::Result<String> {
+    pub fn duckdb_version(&self) -> Result<String> {
         let version: String =
             self.conn
                 .query_row("SELECT library_version FROM pragma_version()", [], |row| {
@@ -1282,7 +1269,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn list_documents(&self) -> crate::error::Result<Vec<DocumentInfo>> {
+    pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
         let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -1823,7 +1810,7 @@ impl QueryResults {
     /// # Errors
     ///
     /// Returns an error if writing to `out` fails.
-    pub fn write_table(&self, out: &mut impl Write) -> crate::error::Result<()> {
+    pub fn write_table(&self, out: &mut impl Write) -> Result<()> {
         if self.columns.is_empty() {
             writeln!(out, "OK")?;
             return Ok(());
@@ -1880,7 +1867,7 @@ impl QueryResults {
     /// # Errors
     ///
     /// Returns an error if serialization or writing fails.
-    pub fn write_ndjson(&self, out: &mut impl Write) -> crate::error::Result<()> {
+    pub fn write_ndjson(&self, out: &mut impl Write) -> Result<()> {
         // Written by hand so keys keep column order; serde_json's map sorts.
         for row in &self.rows {
             let mut fields = Vec::with_capacity(self.columns.len());
@@ -1902,7 +1889,7 @@ impl QueryResults {
     /// # Errors
     ///
     /// Returns an error if writing fails.
-    pub fn write_csv(&self, out: &mut impl Write) -> crate::error::Result<()> {
+    pub fn write_csv(&self, out: &mut impl Write) -> Result<()> {
         fn field(value: &str) -> String {
             if value.contains([',', '"', '\n', '\r']) {
                 format!("\"{}\"", value.replace('"', "\"\""))
@@ -1930,7 +1917,7 @@ impl QueryResults {
     /// # Errors
     ///
     /// Returns an error if writing fails.
-    pub fn write_markdown(&self, out: &mut impl Write) -> crate::error::Result<()> {
+    pub fn write_markdown(&self, out: &mut impl Write) -> Result<()> {
         fn cell(value: &str) -> String {
             value.replace('|', "\\|").replace('\n', " ")
         }
@@ -1954,7 +1941,7 @@ impl QueryResults {
     /// # Errors
     ///
     /// Returns an error if writing to `out` or JSON serialization fails.
-    pub fn write_json(&self, out: &mut impl Write) -> crate::error::Result<()> {
+    pub fn write_json(&self, out: &mut impl Write) -> Result<()> {
         let json_rows: Vec<serde_json::Map<String, serde_json::Value>> = self
             .rows
             .iter()

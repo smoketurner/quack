@@ -18,7 +18,7 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use axum_extra::extract::cookie::{Cookie, SameSite};
-use quack_core::ontology::induction::{Decision, propose_from_tables};
+use quack_core::ontology::induction::{Decision, Proposal, propose_from_tables};
 use quack_core::ontology::store as ontology_store;
 use quack_core::ontology::{Ontology, OntologyDiff, candidates};
 use quack_core::storage::context;
@@ -37,6 +37,12 @@ use super::api::query as query_api;
 use super::auth::{Access, Credential, Identity, Need, SESSION_COOKIE, access, require_admin};
 use super::error::ApiError;
 use super::state::{App, with_db};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::store as graph_store;
+use quack_core::graph::{GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse};
+use quack_core::import::ImportRequest;
+use quack_core::ontology::ROOT_CLASS;
+use quack_core::storage::workspace::WorkspaceDb;
 
 #[derive(Embed)]
 #[folder = "static/"]
@@ -66,8 +72,8 @@ impl From<ApiError> for HtmlError {
     }
 }
 
-impl From<quack_core::error::Error> for HtmlError {
-    fn from(err: quack_core::error::Error) -> Self {
+impl From<CoreError> for HtmlError {
+    fn from(err: CoreError) -> Self {
         Self(ApiError::from(err))
     }
 }
@@ -324,11 +330,11 @@ struct GraphQueryView {
 #[template(path = "graph.html")]
 struct GraphPage {
     page: Page,
-    status: quack_core::graph::GraphStatus,
+    status: GraphStatus,
     drift: Vec<String>,
     has_ontology: bool,
     chunk_count: usize,
-    merges: Vec<quack_core::graph::resolve::MergeProposal>,
+    merges: Vec<resolve::MergeProposal>,
     query: GraphQueryView,
     result: Option<GraphResultView>,
     error: Option<String>,
@@ -776,11 +782,7 @@ async fn unshare_session(
 
 async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
     let db = app.workspace_db(&access.workspace.id).await?;
-    let documents = with_db(
-        db,
-        quack_core::storage::workspace::WorkspaceDb::list_documents,
-    )
-    .await?;
+    let documents = with_db(db, WorkspaceDb::list_documents).await?;
     let pending = documents
         .iter()
         .any(|d| d.status == "queued" || d.status == "processing");
@@ -950,7 +952,7 @@ async fn tables(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     let db = app.workspace_db(&id).await?;
-    let list = with_db(db, quack_core::storage::workspace::WorkspaceDb::list_tables).await?;
+    let list = with_db(db, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
         page: page(&app, &access.identity, "Tables", Some(&access)),
         tables: list,
@@ -976,7 +978,7 @@ async fn import_submit(
     Form(form): Form<ImportForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let request = quack_core::import::ImportRequest {
+    let request = ImportRequest {
         url: form.url,
         table: form.table,
         query: (!form.query.trim().is_empty()).then(|| form.query.clone()),
@@ -1167,7 +1169,7 @@ fn class_rows(ontology: &Ontology) -> Vec<ClassRow> {
         }
     }
     let mut out = Vec::new();
-    walk(ontology, quack_core::ontology::ROOT_CLASS, 0, &mut out);
+    walk(ontology, ROOT_CLASS, 0, &mut out);
     out
 }
 
@@ -1211,8 +1213,7 @@ async fn ontology_page(
 }
 
 /// The one-line detail of a model- or bundle-sourced proposal.
-fn proposal_detail(proposal: &quack_core::ontology::induction::Proposal) -> String {
-    use quack_core::ontology::induction::Proposal;
+fn proposal_detail(proposal: &Proposal) -> String {
     match proposal {
         Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
         Proposal::Class(cl) => format!("parent {}", cl.parent),
@@ -1267,7 +1268,6 @@ fn document_evidence(e: &serde_json::Value) -> String {
 }
 
 fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
-    use quack_core::ontology::induction::Proposal;
     let e = &c.evidence;
     let get = |k: &str| {
         e.get(k)
@@ -1535,7 +1535,7 @@ async fn ontology_init(
     let author = access.identity.username.clone();
     let saved = with_db(db, move |db| {
         if ontology_store::latest_version(db)? > 0 {
-            return Err(quack_core::error::Error::Ontology(String::from(
+            return Err(CoreError::Ontology(String::from(
                 "an ontology already exists",
             )));
         }
@@ -1809,7 +1809,7 @@ async fn token_create(
         .scopes
         .iter()
         .map(|s| Scope::parse(s))
-        .collect::<quack_core::error::Result<Vec<_>>>()?;
+        .collect::<CoreResult<Vec<_>>>()?;
     let expires_at = form.expires_days.filter(|d| *d > 0).and_then(|days| {
         jiff::Timestamp::now()
             .checked_add(jiff::SignedDuration::from_hours(
@@ -2078,11 +2078,11 @@ async fn graph_page(
 }
 
 type PageData = (
-    quack_core::graph::GraphStatus,
+    GraphStatus,
     bool,
     usize,
-    Vec<quack_core::graph::resolve::MergeProposal>,
-    Option<(String, quack_core::graph::GraphResult)>,
+    Vec<resolve::MergeProposal>,
+    Option<(String, GraphResult)>,
 );
 
 /// Status, ontology presence, chunk count, merge queue, and the result of
@@ -2091,37 +2091,32 @@ type PageData = (
 type EndEmbeddings = (Option<Vec<f32>>, Option<Vec<f32>>);
 
 fn graph_page_data(
-    db: &quack_core::storage::workspace::WorkspaceDb,
+    db: &WorkspaceDb,
     wanted: &GraphQueryView,
     embedding: Option<&[f32]>,
     path_embeddings: Option<&EndEmbeddings>,
-    options: quack_core::graph::GraphOptions,
-) -> quack_core::error::Result<PageData> {
-    let status = quack_core::graph::store::status(db)?;
+    options: GraphOptions,
+) -> CoreResult<PageData> {
+    let status = graph_store::status(db)?;
     let ontology = ontology_store::current(db)?;
-    let chunk_count = quack_core::graph::extract::chunks(db, None)?.len();
-    let merges = quack_core::graph::resolve::pending(db)?;
+    let chunk_count = extract::chunks(db, None)?.len();
+    let merges = resolve::pending(db)?;
     let result = if let Some((a, b)) = path_embeddings {
-        let from =
-            quack_core::graph::traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
-        let to = quack_core::graph::traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
+        let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
+        let to = traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
         let found = match (from.first(), to.first()) {
-            (Some(a), Some(b)) => {
-                quack_core::graph::traverse::path(db, a, b, wanted.max_hops, &options)?
-            }
-            _ => quack_core::graph::GraphResult::default(),
+            (Some(a), Some(b)) => traverse::path(db, a, b, wanted.max_hops, &options)?,
+            _ => GraphResult::default(),
         };
         Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
     } else if !wanted.entity.is_empty() {
         let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
         let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
-        let roots =
-            quack_core::graph::traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
-        let found =
-            quack_core::graph::traverse::neighborhood(db, &roots, wanted.hops, relation, &options)?;
+        let roots = traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
+        let found = traverse::neighborhood(db, &roots, wanted.hops, relation, &options)?;
         Some((format!("Around {}", wanted.entity), found))
     } else if !wanted.class.is_empty() {
-        let found = quack_core::graph::traverse::by_class(
+        let found = traverse::by_class(
             db,
             ontology.as_ref(),
             &wanted.class,
@@ -2135,10 +2130,7 @@ fn graph_page_data(
     Ok((status, ontology.is_some(), chunk_count, merges, result))
 }
 
-fn graph_result_view(
-    title: String,
-    result: &quack_core::graph::GraphResult,
-) -> Result<GraphResultView, ApiError> {
+fn graph_result_view(title: String, result: &GraphResult) -> Result<GraphResultView, ApiError> {
     let sources_of = |subject: &str| -> String {
         let mut items: Vec<String> = result
             .provenance
@@ -2266,7 +2258,7 @@ async fn graph_revalidate(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let db = app.workspace_db(&id).await?;
-    let outcome = with_db(db, quack_core::graph::store::revalidate).await;
+    let outcome = with_db(db, graph_store::revalidate).await;
     let target = match outcome {
         Ok(r) => {
             access
@@ -2302,7 +2294,7 @@ async fn graph_review(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let db = app.workspace_db(&id).await?;
-    with_db(db, quack_core::graph::store::mark_reviewed).await?;
+    with_db(db, graph_store::mark_reviewed).await?;
     access
         .audit(&app, "graph_review", None, Outcome::Allowed, None)
         .await?;
@@ -2327,9 +2319,9 @@ async fn graph_merge_decide(
     let merge_id = mid.clone();
     let outcome = with_db(db, move |db| {
         if accept {
-            quack_core::graph::resolve::accept(db, &merge_id, Some(&author))
+            resolve::accept(db, &merge_id, Some(&author))
         } else {
-            quack_core::graph::resolve::reject(db, &merge_id, Some(&author))
+            resolve::reject(db, &merge_id, Some(&author))
         }
     })
     .await;

@@ -5,17 +5,16 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Json, response::IntoResponse};
 use quack_core::storage::audit;
-use quack_core::storage::control::{Outcome, ProviderAllowList, Role, WorkspaceChanges};
+use quack_core::storage::control::{
+    Outcome, ProviderAllowList, Role, WorkspaceChanges, WorkspaceRow,
+};
 use serde::Deserialize;
 
 use crate::server::auth::{Credential, Identity, Need, access, require_admin};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 
-fn workspace_json(
-    ws: &quack_core::storage::control::WorkspaceRow,
-    role: Option<Role>,
-) -> serde_json::Value {
+fn workspace_json(ws: &WorkspaceRow, role: Option<Role>) -> serde_json::Value {
     let allowed: Option<serde_json::Value> = ws
         .allowed_providers
         .as_deref()

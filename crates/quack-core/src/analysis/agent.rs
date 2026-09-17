@@ -18,7 +18,8 @@ use super::tools::{
     ListTablesTool, RunSqlTool, SearchDocumentsTool, SearchGraphTool, SharedDb,
 };
 use super::vector_index::DuckDbVectorIndex;
-use crate::graph::GraphResult;
+use crate::graph::store as graph_store;
+use crate::graph::{GraphOptions, GraphResult};
 use crate::storage::sessions::ChatMode;
 
 /// Everything a turn produced, delivered with `AgentEvent::TurnComplete` and
@@ -61,7 +62,7 @@ pub async fn run_analysis<M>(
     embedding_model: M,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
-    graph_options: crate::graph::GraphOptions,
+    graph_options: GraphOptions,
     write_policy: WritePolicy,
     prompt: PromptOptions,
     history: Vec<rig::message::Message>,
@@ -130,7 +131,7 @@ async fn run_inner<M>(
     embedding_model: M,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
-    graph_options: crate::graph::GraphOptions,
+    graph_options: GraphOptions,
     write_policy: WritePolicy,
     prompt: PromptOptions,
     history: Vec<rig::message::Message>,
@@ -146,7 +147,7 @@ where
             .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
         (
             text_to_sql::build_system_prompt(&db, &prompt)?,
-            crate::graph::store::status(&db)?.enabled(),
+            graph_store::status(&db)?.enabled(),
         )
     };
     let chart_spec: Arc<Mutex<Option<ChartSpec>>> = Arc::new(Mutex::new(None));
@@ -225,7 +226,7 @@ struct BuildContext<'a> {
     shared_db: SharedDb,
     analysis_config: &'a AnalysisConfig,
     retrieval_config: &'a RetrievalConfig,
-    graph_options: crate::graph::GraphOptions,
+    graph_options: GraphOptions,
     graph_enabled: bool,
     exclude_provisional: bool,
     write_policy: WritePolicy,

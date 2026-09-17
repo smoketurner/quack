@@ -21,6 +21,7 @@ use serde::Deserialize;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
+use crate::server::web::markdown::to_html;
 
 #[derive(Deserialize)]
 pub(crate) struct QueryRequest {
@@ -291,9 +292,7 @@ pub(crate) async fn stream(
                     if let serde_json::Value::Object(map) = &mut payload {
                         map.insert(
                             String::from("answer_html"),
-                            serde_json::Value::String(crate::server::web::markdown::to_html(
-                                &response.content,
-                            )),
+                            serde_json::Value::String(to_html(&response.content)),
                         );
                     }
                     Event::default()

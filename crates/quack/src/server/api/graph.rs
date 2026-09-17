@@ -7,7 +7,9 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use quack_core::graph::{extract, resolve, store as graph_store, tables, traverse};
+use quack_core::graph::{
+    GraphOptions, GraphResult, extract, resolve, store as graph_store, tables, traverse,
+};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::Outcome;
@@ -16,6 +18,8 @@ use serde::Deserialize;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
+use quack_core::analysis::tools::SharedDb;
+use quack_core::ontology::Ontology;
 
 #[derive(Deserialize, Default)]
 pub(crate) struct SearchQuery {
@@ -120,7 +124,7 @@ pub(crate) async fn path(
         let to_nodes = traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
         match (from_nodes.first(), to_nodes.first()) {
             (Some(a), Some(b)) => traverse::path(db, a, b, max_hops, &options),
-            _ => Ok(quack_core::graph::GraphResult::default()),
+            _ => Ok(GraphResult::default()),
         }
     })
     .await?;
@@ -288,13 +292,13 @@ pub(crate) async fn start_extraction(
 
 /// Everything the background document pass needs.
 struct DocumentJob {
-    db: quack_core::analysis::tools::SharedDb,
+    db: SharedDb,
     chunks: Vec<extract::ChunkText>,
     extractor: Box<dyn extract::GraphExtractor>,
-    ontology: quack_core::ontology::Ontology,
+    ontology: Ontology,
     provisional: bool,
     embeddings: Option<llm::EmbedModel>,
-    options: quack_core::graph::GraphOptions,
+    options: GraphOptions,
 }
 
 /// Run the model over the chunks, resolve, record the version, and audit
