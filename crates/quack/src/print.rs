@@ -254,3 +254,59 @@ fn write_finished(err: &mut impl Write, step: &ToolStep) -> Result<()> {
     writeln!(err, "  {}, {} ms", step.summary, step.duration_ms)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    /// Steps on stderr fold to the shared preview unless `--verbose`, and
+    /// a finished step is one line (issue #63: print mode had no tests).
+    #[test]
+    fn steps_fold_to_the_shared_preview_unless_verbose() {
+        let detail = (1..=5)
+            .map(|i| format!("SELECT {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut folded = Vec::new();
+        write_started(&mut folded, "run_sql", &detail, false)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let folded = String::from_utf8_lossy(&folded);
+        assert!(folded.starts_with("> run_sql\n  SELECT 1\n"), "{folded}");
+        assert!(
+            folded.contains("  SELECT 3\n") && !folded.contains("SELECT 4"),
+            "{folded}"
+        );
+        assert!(
+            folded.contains("(2 more lines; --verbose shows them)"),
+            "{folded}"
+        );
+
+        let mut whole = Vec::new();
+        write_started(&mut whole, "run_sql", &detail, true)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(String::from_utf8_lossy(&whole).contains("  SELECT 5\n"));
+
+        let mut empty = Vec::new();
+        write_started(&mut empty, "list_tables", "", false)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(String::from_utf8_lossy(&empty), "> list_tables\n");
+
+        let mut finished = Vec::new();
+        write_finished(
+            &mut finished,
+            &ToolStep {
+                tool: String::from("run_sql"),
+                detail: String::new(),
+                summary: String::from("3 rows"),
+                duration_ms: 12,
+            },
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(String::from_utf8_lossy(&finished), "  3 rows, 12 ms\n");
+    }
+}
