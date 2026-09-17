@@ -13,7 +13,7 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::storage::sessions::{self, ChatMode, MessageRole as StoredRole};
-use quack_core::storage::workspace::{WorkspaceDb, looks_like_direct_sql};
+use quack_core::storage::workspace::{StatementKind, WorkspaceDb, looks_like_direct_sql};
 
 use crate::terminal::chart::ChartData;
 use crate::terminal::ui;
@@ -123,6 +123,9 @@ pub(crate) struct App {
     pub(crate) current_chart: Option<ChartData>,
     /// The write awaiting a decision, while `state` is `AwaitingPermission`.
     pending_permission: Option<PermissionRequest>,
+    /// A `/sql` write awaiting a decision, while `state` is
+    /// `AwaitingPermission` and no agent request is pending.
+    pending_sql: Option<String>,
     /// Index into `messages` of the step line being filled in.
     open_step: Option<usize>,
     /// Whether the assistant message being streamed is the last message.
@@ -165,6 +168,7 @@ impl App {
             session_id,
             current_chart: None,
             pending_permission: None,
+            pending_sql: None,
             open_step: None,
             streaming_assistant: false,
             last_sql: None,
@@ -474,7 +478,7 @@ impl App {
             return;
         };
         let Some(request) = self.pending_permission.take() else {
-            self.state = AppState::Thinking;
+            self.decide_pending_sql(allow, for_session);
             return;
         };
         if allow {
@@ -496,6 +500,28 @@ impl App {
                 .push(Message::new(MessageRole::System, "Refused."));
         }
         self.state = AppState::Thinking;
+    }
+
+    /// The user's answer to a `/sql` write prompt.
+    fn decide_pending_sql(&mut self, allow: bool, for_session: bool) {
+        let Some(sql) = self.pending_sql.take() else {
+            self.state = AppState::Idle;
+            return;
+        };
+        if !allow {
+            self.messages
+                .push(Message::new(MessageRole::System, "Refused."));
+            self.state = AppState::Idle;
+            return;
+        }
+        if for_session {
+            self.allow_write = true;
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "Allowed. Writes are permitted for the rest of this session.",
+            ));
+        }
+        self.execute_direct_sql(sql);
     }
 
     fn history_up(&mut self) {
@@ -577,7 +603,7 @@ impl App {
             "/context" => self.show_context(),
             "/pin" => self.set_pinned(args, true),
             "/unpin" => self.set_pinned(args, false),
-            "/tables" => self.run_direct_sql("SHOW TABLES"),
+            "/tables" => self.show_tables(),
             "/graph" => self.show_graph(args),
             "/import" => self.start_import(args),
             "/path" => self.show_path(args),
@@ -1094,19 +1120,86 @@ impl App {
         });
     }
 
+    /// `/sql`: the same gate the agent's statements pass. Internal tables
+    /// are refused, an invalid statement is reported, and a write asks
+    /// y/n/a unless writes are already allowed for the session.
     fn run_direct_sql(&mut self, sql: &str) {
         let sql = sql.trim().to_owned();
         self.messages
             .push(Message::new(MessageRole::User, sql.clone()));
         self.last_sql = Some(sql.clone());
-        self.state = AppState::RunningSql;
+        let kind = match self.db.lock() {
+            Ok(db) => db.classify_user_statement(&sql),
+            Err(e) => {
+                self.messages.push(Message::new(
+                    MessageRole::Error,
+                    format!("workspace lock poisoned: {e}"),
+                ));
+                return;
+            }
+        };
+        match kind {
+            Ok(StatementKind::Read) => self.execute_direct_sql(sql),
+            Ok(StatementKind::Write) if self.allow_write => self.execute_direct_sql(sql),
+            Ok(StatementKind::Write) => {
+                self.messages.push(Message::new(
+                    MessageRole::System,
+                    "This statement modifies the workspace.\n\
+                     Run it?  y = yes   n = no   a = yes, and allow writes for this session",
+                ));
+                self.pending_sql = Some(sql);
+                self.state = AppState::AwaitingPermission;
+                self.scroll_offset = 0;
+            }
+            Ok(StatementKind::Invalid(message)) => {
+                self.messages
+                    .push(Message::new(MessageRole::Error, message));
+            }
+            Err(e) => {
+                self.messages
+                    .push(Message::new(MessageRole::Error, e.to_string()));
+            }
+        }
+    }
 
+    fn execute_direct_sql(&mut self, sql: String) {
+        self.state = AppState::RunningSql;
         let db = Arc::clone(&self.db);
         let tx = self.response_tx.clone();
+        let max_rows = self.config.analysis.max_query_rows;
         std::thread::spawn(move || {
-            let result = run_sql_task(&db, &sql);
+            let result = run_sql_task(&db, &sql, max_rows);
             drop(tx.send(result));
         });
+    }
+
+    fn show_tables(&mut self) {
+        let listing = match self.db.lock() {
+            Ok(db) => db.list_tables(),
+            Err(e) => {
+                self.messages.push(Message::new(
+                    MessageRole::Error,
+                    format!("workspace lock poisoned: {e}"),
+                ));
+                return;
+            }
+        };
+        match listing {
+            Ok(tables) if tables.is_empty() => self
+                .messages
+                .push(Message::new(MessageRole::System, "No tables yet.")),
+            Ok(tables) => {
+                let mut text = String::from("Tables:");
+                for table in tables {
+                    text.push_str("\n  ");
+                    text.push_str(&table);
+                }
+                self.messages.push(Message::new(MessageRole::System, text));
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, e.to_string())),
+        }
     }
 
     fn start_agent_turn(&mut self, message: String) {
@@ -1172,25 +1265,21 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-fn run_sql_task(db: &SharedDb, sql: &str) -> BackgroundResult {
+fn run_sql_task(db: &SharedDb, sql: &str, max_rows: u32) -> BackgroundResult {
     let db = match db.lock() {
         Ok(db) => db,
         Err(e) => return BackgroundResult::Error(format!("workspace lock poisoned: {e}")),
     };
     let started = std::time::Instant::now();
-    match db.execute_query(sql) {
-        Ok(results) => {
+    match db.execute_query_capped(sql, max_rows) {
+        Ok(capped) => {
             let mut buf = Vec::new();
-            let capped = results.clone_capped(200);
-            if let Err(e) = capped.write_table(&mut buf) {
+            if let Err(e) = capped.results.write_table(&mut buf) {
                 return BackgroundResult::Error(format!("failed to render results: {e}"));
             }
             let mut text = String::from_utf8_lossy(&buf).into_owned();
-            if results.rows.len() > 200 {
-                let omitted = format!(
-                    "... {} more rows not shown\n",
-                    results.rows.len().saturating_sub(200)
-                );
+            if capped.truncated() {
+                let omitted = format!("... {} more rows not shown\n", capped.omitted());
                 text.push_str(&omitted);
             }
             let elapsed = format!("{} ms", started.elapsed().as_millis());

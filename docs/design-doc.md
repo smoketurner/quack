@@ -1087,7 +1087,9 @@ missing table) are tool errors the client model can read. Resources:
 A Claude Code-style single-pane transcript: streaming answers, inline steps, citations
 rendered as footnotes, charts drawn with ratatui, permission prompts answered with `y`/`n`/
 `a`, direct SQL when input starts with `SELECT`/`WITH`/`FROM`/`DESCRIBE`/`SHOW`/`PIVOT`/
-`SUMMARIZE`. Slash commands: `/help`, `/tables`, `/schema`, `/sql`, `/ingest`, `/attach`,
+`SUMMARIZE`; direct SQL and `/sql` pass the same gate as the agent's statements (internal
+tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown). Slash commands:
+`/help`, `/tables`, `/schema`, `/sql`, `/ingest`, `/attach`,
 `/docs`, `/pin`, `/graph`, `/path`, `/ontology` (`propose`, `review`, `export`, `import`),
 `/mode`, `/chart`, `/export`, `/model`, `/context`, `/clear`, `/quit`. Keys: `Enter` send,
 `Shift+Enter` newline, `Up`/`Down` history, `PageUp`/`PageDown` scroll, `Ctrl+C` cancel
