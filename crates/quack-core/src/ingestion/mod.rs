@@ -267,6 +267,58 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
     }
 }
 
+/// The table piped data loads into for one invocation.
+pub const STDIN_TABLE: &str = "stdin";
+
+/// Load bytes piped into the CLI as the temporary table `stdin` on this
+/// connection: JSON when they start with `{` or `[`, Parquet by its magic,
+/// else CSV (delimiter sniffed). The bytes pass through `files/` because
+/// the connection reads nothing outside the workspace directory; the file
+/// is removed once the table is materialized. Empty input loads nothing.
+///
+/// # Errors
+///
+/// Returns an error if the bytes cannot be parsed or written.
+pub fn load_stdin_table(
+    config: &Config,
+    db: &WorkspaceDb,
+    workspace_id: &str,
+    data: &[u8],
+) -> Result<Option<String>> {
+    if data.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let first = data.iter().find(|b| !b.is_ascii_whitespace()).copied();
+    let reader = if data.starts_with(b"PAR1") {
+        "read_parquet"
+    } else if matches!(first, Some(b'{' | b'[')) {
+        "read_json_auto"
+    } else {
+        "read_csv_auto"
+    };
+    let files_dir = config.workspace_files_dir(workspace_id);
+    std::fs::create_dir_all(&files_dir)?;
+    let dest = files_dir.join(format!(".stdin-{}", uuid::Uuid::now_v7()));
+    std::fs::write(&dest, data)?;
+    let path = dest.to_string_lossy();
+    let create_sql = format!(
+        "CREATE OR REPLACE TEMP TABLE {} AS SELECT * FROM {reader}(?)",
+        quote_ident(STDIN_TABLE)
+    );
+    let loaded = db.execute_with_params(&create_sql, duckdb::params![path.as_ref()]);
+    if let Err(e) = std::fs::remove_file(&dest) {
+        tracing::warn!(path = %dest.display(), error = %e, "could not remove the stdin scratch file");
+    }
+    loaded?;
+    tracing::info!(
+        table = STDIN_TABLE,
+        reader,
+        bytes = data.len(),
+        "loaded piped data"
+    );
+    Ok(Some(STDIN_TABLE.to_owned()))
+}
+
 /// The table a structured file loads into: its stem with anything outside
 /// `[A-Za-z0-9_]` replaced by `_`.
 #[must_use]

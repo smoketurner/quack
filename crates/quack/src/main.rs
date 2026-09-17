@@ -439,6 +439,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    load_piped_stdin(&config, &ws_db, &workspace.id)?;
     let session_id = resolve_session(
         &config,
         &ws_db,
@@ -474,6 +475,28 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// When stdin is a pipe or file rather than a terminal, its bytes become
+/// the temporary table `stdin` for this invocation (CSV, JSON, or Parquet).
+fn load_piped_stdin(config: &Config, db: &WorkspaceDb, workspace_id: &str) -> Result<()> {
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    let mut data = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut data)
+        .context("failed to read stdin")?;
+    if let Some(table) = ingestion::load_stdin_table(config, db, workspace_id, &data)
+        .context("failed to load stdin as a table")?
+    {
+        tracing::info!(
+            table,
+            bytes = data.len(),
+            "stdin loaded as a temporary table"
+        );
+    }
+    Ok(())
 }
 
 /// Logging, then the workspace database for the workspace-local subcommands.
@@ -939,12 +962,13 @@ fn list_sessions(db: &WorkspaceDb, json: bool, limit: u32) -> Result<()> {
         for row in &rows {
             writeln!(
                 out,
-                "{}  {}  {:>3} msgs  {}  {}",
+                "{}  {}  {:>3} msgs  {}  {}{}",
                 row.id,
                 row.updated_at,
                 row.message_count,
                 row.model,
-                row.title.as_deref().unwrap_or("(untitled)")
+                row.title.as_deref().unwrap_or("(untitled)"),
+                if row.shared { "  (shared)" } else { "" }
             )?;
         }
     }
@@ -1006,6 +1030,7 @@ async fn run_query(sql: &str, workspace_name: Option<&str>, format: OutputFormat
 
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    load_piped_stdin(&config, &ws_db, &workspace.id)?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
 

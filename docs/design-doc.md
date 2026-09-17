@@ -1037,6 +1037,7 @@ GET    /api/v1/workspaces/{id}/context             current; Markdown or JSON by 
 PUT    /api/v1/workspaces/{id}/context
 GET    /api/v1/workspaces/{id}/context/versions
 GET    /api/v1/workspaces/{id}/sessions[/{sid}]
+PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} (creator or owner; audited as share)
 GET    /api/v1/workspaces/{id}/sessions/{sid}/export?format=sql|markdown
 GET    /api/v1/workspaces/{id}/audit              detail rows, members only
 GET    /api/v1/workspaces/{id}/members  POST/DELETE ...   (owner)
@@ -1090,8 +1091,9 @@ quack mcp [-w NAME]
 quack user add|list ; quack token create ; quack member add|remove   (server admin)
 ```
 
-stdin that is not a TTY is data (loaded as table `stdin`, or as a pasted document with
-`--as-document`); stdout carries the answer or result set; stderr carries steps. Exit
+stdin that is not a TTY is data for `-p` and `-q`: CSV, JSON, or Parquet loaded as the
+temporary table `stdin` for that invocation (a pasted document is `quack ingest -`);
+stdout carries the answer or result set; stderr carries steps. Exit
 codes: 0 ok, 1 runtime error, 2 usage, 3 write refused, 4 auth required.
 
 ### 11.6 Desktop window (`quack desktop`)
@@ -1356,8 +1358,11 @@ updated as issues close. Ordered by risk.
    bytes are skipped everywhere and name the existing document; `source` is `upload`,
    `paste`, `path`, or `stdin`; the title is given or parsed from the first heading;
    `chunk_count` and `ingested_by` are recorded. Section 5.4.
-8. **Sessions have no `created_by` or sharing; print mode cannot take stdin as data**
-   (#23). Sections 8, 11.5.
+8. ~~Sessions have no `created_by` or sharing; print mode cannot take stdin as data~~
+   (#23, closed): `created_by` since the server landed; `shared` is set by the creator or
+   an owner (`PATCH .../sessions/{sid}`, the chat page's toggle), audited as `share`, and
+   opens the session to every member; piped stdin is the temporary table `stdin` in `-p`
+   and `-q`. Sections 8, 11.5.
 9. ~~Context `edited_by` and the `_quack_audit` detail table~~ (#24, closed): the
    server records the editing user and writes the detail row under the access row's id.
    Sections 5.3, 5.4, 12.

@@ -82,6 +82,61 @@ pub(crate) async fn show(
     ))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct UpdateSession {
+    pub shared: bool,
+}
+
+/// Share a session with every member, or take it back. Its creator, or an
+/// owner, may. Audited as `share`.
+pub(crate) async fn update(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, sid)): Path<(String, String)>,
+    Json(body): Json<UpdateSession>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    let session = set_shared(&app, &access, &sid, body.shared).await?;
+    Ok(Json(serde_json::to_value(session)?))
+}
+
+/// The shared toggle behind the API and the web button.
+pub(crate) async fn set_shared(
+    app: &App,
+    access: &crate::server::auth::Access,
+    sid: &str,
+    shared: bool,
+) -> ApiResult<sessions::SessionRow> {
+    let session = visible_session(app, access, &access.workspace.id, sid).await?;
+    let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
+    if !mine && !access.sees_all_sessions() {
+        access
+            .audit(app, "share", Some(("session", sid)), Outcome::Denied, None)
+            .await?;
+        return Err(ApiError::forbidden(
+            "only the session's creator or an owner may share it",
+        ));
+    }
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let session_id = session.id.clone();
+    let updated = with_db(db, move |db| {
+        sessions::set_session_shared(db, &session_id, shared)?;
+        sessions::get_session(db, &session_id)
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found("no such session"))?;
+    access
+        .audit(
+            app,
+            "share",
+            Some(("session", sid)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "shared": shared })),
+        )
+        .await?;
+    Ok(updated)
+}
+
 /// Delete a session: its creator, or an owner, may. Audited as `delete`.
 pub(crate) async fn remove(
     State(app): State<App>,

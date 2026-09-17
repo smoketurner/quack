@@ -10,7 +10,12 @@
     <ul id="sessions" class="mt-2 space-y-1 text-sm">
       {% for s in sessions %}
       <li class="group flex items-start gap-1">
-        <a class="block min-w-0 flex-1 truncate rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/chat?session={{ s.id }}">{{ s.title.as_deref().unwrap_or("(untitled)") }}<span class="block text-xs text-slate-500">{{ s.updated_at }} · {{ s.mode.as_str() }}</span></a>
+        <a class="block min-w-0 flex-1 truncate rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/chat?session={{ s.id }}">{{ s.title.as_deref().unwrap_or("(untitled)") }}<span class="block text-xs text-slate-500">{{ s.updated_at }} · {{ s.mode.as_str() }}{% if s.shared %} · shared{% endif %}{% if s.created_by.is_none() %} · cli{% endif %}</span></a>
+        {% if s.shared %}
+        <form method="post" action="/w/{{ ws.id }}/chat/{{ s.id }}/unshare"><button type="submit" class="rounded px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="Stop sharing" aria-label="Stop sharing">●</button></form>
+        {% else %}
+        <form method="post" action="/w/{{ ws.id }}/chat/{{ s.id }}/share"><button type="submit" class="rounded px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="Share with members" aria-label="Share with members">○</button></form>
+        {% endif %}
         <form method="post" action="/w/{{ ws.id }}/chat/{{ s.id }}/delete" onsubmit="return confirm('Delete this session?')"><button type="submit" class="rounded px-2 py-1 text-slate-400 hover:bg-red-50 hover:text-red-700" title="Delete session" aria-label="Delete session">×</button></form>
       </li>
       {% endfor %}

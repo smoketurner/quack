@@ -26,6 +26,7 @@ implements an earlier slice of it; section 17 of the design doc lists the gaps.
 ```bash
 cargo run --bin quack -- -q "SELECT 1 AS answer"
 cargo run --bin quack -- -q "SELECT * FROM generate_series(1, 5) AS t(n)" -f csv
+cat sales.csv | cargo run --bin quack -- -q "SELECT region, sum(total) FROM stdin GROUP BY 1"   # piped data is the table stdin
 cargo run --bin quack -- ingest sales.csv -w myworkspace
 cargo run --bin quack -- -p "total sales by region" -w myworkspace   # answer to stdout, steps to stderr
 cargo run --bin quack -- -p "total sales by region" -f json           # {answer, steps, chart}

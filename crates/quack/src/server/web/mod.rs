@@ -325,6 +325,8 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}", get(workspace_index))
         .route("/w/{id}/chat", get(chat))
         .route("/w/{id}/chat/{sid}/delete", post(delete_session))
+        .route("/w/{id}/chat/{sid}/share", post(share_session))
+        .route("/w/{id}/chat/{sid}/unshare", post(unshare_session))
         .route("/w/{id}/documents", get(documents).post(upload))
         .route("/w/{id}/documents/rows", get(document_rows))
         .route("/w/{id}/documents/{doc}/pin", post(pin))
@@ -693,6 +695,26 @@ async fn delete_session(
     let access = access(&app, identity, &id, Need::READ).await?;
     super::api::sessions::delete_session(&app, &access, &sid).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat")).into_response())
+}
+
+async fn share_session(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, sid)): Path<(String, String)>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    super::api::sessions::set_shared(&app, &access, &sid, true).await?;
+    Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
+}
+
+async fn unshare_session(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, sid)): Path<(String, String)>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    super::api::sessions::set_shared(&app, &access, &sid, false).await?;
+    Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
 async fn render_rows(app: &App, access: &Access) -> WebResult<String> {

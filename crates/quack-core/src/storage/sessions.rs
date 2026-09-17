@@ -85,6 +85,8 @@ pub struct SessionRow {
     pub model: String,
     /// The server user who started it; `None` from the CLI and TUI.
     pub created_by: Option<String>,
+    /// Visible to every member of the workspace, not only the creator.
+    pub shared: bool,
     pub created_at: String,
     pub updated_at: String,
     pub message_count: i64,
@@ -106,7 +108,8 @@ const TITLE_CHARS: usize = 80;
 
 const SESSION_COLUMNS: &str = "s.id, s.title, s.mode, s.model, CAST(s.created_at AS VARCHAR), \
      CAST(s.updated_at AS VARCHAR), \
-     (SELECT count(*) FROM _quack_messages m WHERE m.session_id = s.id), s.created_by";
+     (SELECT count(*) FROM _quack_messages m WHERE m.session_id = s.id), s.created_by, \
+     COALESCE(s.shared, false)";
 
 fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
     let mode: String = row.get(2)?;
@@ -119,6 +122,7 @@ fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
         updated_at: row.get(5)?,
         message_count: row.get(6)?,
         created_by: row.get(7)?,
+        shared: row.get(8)?,
     })
 }
 
@@ -236,7 +240,23 @@ pub fn list_sessions_for(
 /// is shared or ownerless. Owners bypass this with `sees_all`.
 #[must_use]
 pub fn visible_to(session: &SessionRow, user_id: &str, sees_all: bool) -> bool {
-    sees_all || session.created_by.as_deref().is_none_or(|c| c == user_id)
+    sees_all || session.shared || session.created_by.as_deref().is_none_or(|c| c == user_id)
+}
+
+/// Share a session with every member of the workspace, or take it back.
+///
+/// # Errors
+///
+/// Returns an error if the update fails or the session does not exist.
+pub fn set_session_shared(db: &WorkspaceDb, session_id: &str, shared: bool) -> Result<()> {
+    let changed = db.connection().execute(
+        "UPDATE _quack_sessions SET shared = ? WHERE id = ?",
+        duckdb::params![shared, session_id],
+    )?;
+    if changed == 0 {
+        return Err(Error::Analysis(format!("no session {session_id}")));
+    }
+    Ok(())
 }
 
 /// Append one message and return its sequence number.
@@ -629,6 +649,19 @@ mod tests {
         assert!(visible_to(&mine, "u1", false) && !visible_to(&theirs, "u1", false));
         assert!(visible_to(&theirs, "u1", true) && visible_to(&cli, "u1", false));
         assert_eq!(mine.created_by.as_deref(), Some("u1"));
+        assert!(!mine.shared);
+
+        // Sharing opens the session to other members; unsharing closes it.
+        set_session_shared(&db, &theirs.id, true).unwrap_or_else(|e| fail(&e.to_string()));
+        let theirs = get_session(&db, &theirs.id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("session vanished"));
+        assert!(theirs.shared && visible_to(&theirs, "u1", false));
+        assert!(list_sessions_for(&db, 10, "u1", false).is_ok_and(|v| v.len() == 3));
+        set_session_shared(&db, &theirs.id, false).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(list_sessions_for(&db, 10, "u1", false).is_ok_and(|v| v.len() == 2));
+        assert!(set_session_shared(&db, "missing", true).is_err());
     }
 
     #[expect(clippy::panic, reason = "test failure path")]

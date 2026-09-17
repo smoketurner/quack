@@ -82,7 +82,9 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/sessions", get(sessions::list))
         .route(
             "/workspaces/{id}/sessions/{sid}",
-            get(sessions::show).delete(sessions::remove),
+            get(sessions::show)
+                .patch(sessions::update)
+                .delete(sessions::remove),
         )
         .route(
             "/workspaces/{id}/sessions/{sid}/export",

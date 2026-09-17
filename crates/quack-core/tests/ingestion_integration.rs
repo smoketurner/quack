@@ -1222,3 +1222,53 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         ingestion::register_document(&db, &ingestion::NewFile::new("scan.pdf", bad)).unwrap();
     assert!(matches!(retry, ingestion::Registration::New(_)));
 }
+
+#[test]
+fn piped_bytes_load_as_a_temporary_stdin_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-stdin").unwrap();
+
+    assert_eq!(
+        ingestion::load_stdin_table(&config, &db, "ws-stdin", b"  \n").unwrap(),
+        None
+    );
+
+    let csv = b"region\ttotal\nnorth\t10\nsouth\t20\n";
+    assert_eq!(
+        ingestion::load_stdin_table(&config, &db, "ws-stdin", csv)
+            .unwrap()
+            .as_deref(),
+        Some("stdin")
+    );
+    let rows = db
+        .execute_query("SELECT sum(total) AS s FROM stdin")
+        .unwrap();
+    assert_eq!(
+        rows.rows.first().and_then(|r| r.first()),
+        Some(&serde_json::json!(30))
+    );
+    assert!(db.list_tables().unwrap().contains(&String::from("stdin")));
+    // The scratch file is gone; the table lives on the connection only.
+    let leftovers: Vec<_> = std::fs::read_dir(config.workspace_files_dir("ws-stdin"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    let json = b"[{\"k\": \"a\", \"v\": 1}, {\"k\": \"b\", \"v\": 2}]";
+    ingestion::load_stdin_table(&config, &db, "ws-stdin", json).unwrap();
+    let rows = db.execute_query("SELECT count(*) AS n FROM stdin").unwrap();
+    assert_eq!(
+        rows.rows.first().and_then(|r| r.first()),
+        Some(&serde_json::json!(2))
+    );
+
+    let reopened = WorkspaceDb::open(&config, "ws-stdin").unwrap();
+    assert!(
+        !reopened
+            .list_tables()
+            .unwrap()
+            .contains(&String::from("stdin"))
+    );
+}

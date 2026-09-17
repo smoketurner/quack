@@ -992,6 +992,7 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
     };
     let viewer_token = h.login("viewer").await;
     let owner_token = h.login("owner").await;
+    let other_token = h.login("other").await;
     let (status, _) = h
         .call(
             Method::DELETE,
@@ -1005,6 +1006,72 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         StatusCode::NOT_FOUND,
         "another user's session is invisible"
     );
+
+    // Shared by its creator, the session becomes visible to other members
+    // but stays theirs to delete; unshared, it disappears again.
+    let share = format!("/api/v1/workspaces/{ws}/sessions/{theirs}");
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&viewer_token),
+            Some(serde_json::json!({ "shared": true })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cannot share what one cannot see"
+    );
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&other_token),
+            Some(serde_json::json!({ "shared": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["shared"], true);
+    let (status, body) = h.get(&share, &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["session"]["shared"], true);
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&viewer_token),
+            Some(serde_json::json!({ "shared": false })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a viewer of a shared session cannot unshare it"
+    );
+    let (status, _) = h
+        .call(Method::DELETE, &share, Some(&viewer_token), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&other_token),
+            Some(serde_json::json!({ "shared": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h.get(&share, &viewer_token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let shares = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("share")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(shares.len(), 3, "two allowed and one denied");
     let (status, _) = h
         .call(
             Method::DELETE,
@@ -1043,7 +1110,8 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(deletes.len(), 2);
+    assert_eq!(deletes.len(), 3, "two allowed and the viewer's denied one");
+    assert_eq!(deletes.iter().filter(|r| r.outcome == "denied").count(), 1);
     assert!(
         deletes
             .iter()
