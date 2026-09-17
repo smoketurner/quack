@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::graph::store as graph_store;
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
-use crate::storage::workspace::QueryResults;
+use crate::storage::workspace::CappedResults;
 use crate::storage::workspace::WorkspaceDb;
 use std::fmt::Write;
 
@@ -308,24 +308,17 @@ fn append_pinned_documents(
 /// # Errors
 ///
 /// Returns an error if formatting fails.
-pub fn format_query_result(results: &QueryResults, max_rows: u32) -> Result<String> {
-    let max = usize::try_from(max_rows)
-        .map_err(|e| Error::Analysis(format!("max_rows overflow: {e}")))?;
-
-    let capped = if results.rows.len() > max {
-        let mut capped = results.clone_capped(max_rows);
-        let total = results.rows.len();
-        capped.rows.push(vec![serde_json::Value::String(format!(
+pub fn format_query_result(capped: &CappedResults) -> Result<String> {
+    let mut table = capped.results.clone();
+    if capped.truncated() {
+        table.rows.push(vec![serde_json::Value::String(format!(
             "... ({} more rows not shown)",
-            total.saturating_sub(max)
+            capped.omitted()
         ))]);
-        capped
-    } else {
-        results.clone_capped(u32::MAX)
-    };
+    }
 
     let mut buf = Vec::new();
-    capped.write_table(&mut buf)?;
+    table.write_table(&mut buf)?;
     String::from_utf8(buf).map_err(|e| Error::Analysis(format!("UTF-8 error: {e}")))
 }
 

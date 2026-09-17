@@ -177,14 +177,22 @@ impl Tool for RunSqlTool {
                 Ok(message)
             }
             Gate::Run => {
-                let results = {
-                    let db = lock(&self.db)?;
-                    db.execute_query(&args.query)
-                };
+                // DuckDB blocks for up to the query timeout: keep that off
+                // the async workers, and keep the lock inside the blocking
+                // thread with it.
+                let db = Arc::clone(&self.db);
+                let sql = args.query.clone();
+                let max_rows = self.max_query_rows;
+                let results = tokio::task::spawn_blocking(move || -> Result<_, ToolError> {
+                    let db = lock(&db)?;
+                    Ok(db.execute_query_capped(&sql, max_rows))
+                })
+                .await
+                .map_err(|e| ToolError::Query(format!("query task failed: {e}")))??;
                 match results {
                     Ok(results) => {
-                        step.finish(format!("{} rows", results.rows.len()));
-                        text_to_sql::format_query_result(&results, self.max_query_rows)
+                        step.finish(format!("{} rows", results.total_rows));
+                        text_to_sql::format_query_result(&results)
                             .map_err(|e| ToolError::Query(e.to_string()))
                     }
                     // A failed statement is a result, not a tool failure: rig
@@ -892,6 +900,39 @@ mod tests {
             Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
         ));
         assert!(!refused.was_refused());
+    }
+
+    #[tokio::test]
+    async fn run_sql_caps_rows_and_reports_the_rest() {
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let tool = RunSqlTool::new(
+            shared_db(),
+            2,
+            WritePolicy::Deny,
+            RefusalFlag::default(),
+            recorder.clone(),
+        );
+        let out = tool
+            .call(
+                &mut ToolContext::new(),
+                RunSqlArgs {
+                    query: String::from("SELECT range AS n FROM range(5)"),
+                },
+            )
+            .await;
+        let text = match out {
+            Ok(text) => text,
+            Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
+        };
+        assert!(text.contains("3 more rows not shown"), "{text}");
+        let numeric_rows = text
+            .lines()
+            .filter(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c.is_ascii_digit()))
+            .count();
+        assert_eq!(numeric_rows, 2, "{text}");
+        let last = recorder.steps().last().map(|s| s.summary.clone());
+        assert_eq!(last.as_deref(), Some("5 rows"));
     }
 
     /// The retry loop the prompt promises: a binder error, with `DuckDB`'s

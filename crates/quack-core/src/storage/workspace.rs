@@ -84,10 +84,32 @@ const READ_ONLY_KEYWORDS: &[&str] = &[
 ];
 
 /// Query result set from a `DuckDB` workspace database.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryResults {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+/// Query results with at most a caller's cap of rows kept, plus how many
+/// the statement produced in all.
+#[derive(Debug, Clone)]
+pub struct CappedResults {
+    pub results: QueryResults,
+    pub total_rows: usize,
+}
+
+impl CappedResults {
+    /// Whether rows were dropped to honor the cap.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.total_rows > self.results.rows.len()
+    }
+
+    /// Rows the cap dropped.
+    #[must_use]
+    pub fn omitted(&self) -> usize {
+        self.total_rows.saturating_sub(self.results.rows.len())
+    }
 }
 
 /// The ontology tables (design doc 5.4), created with the other internal
@@ -1104,35 +1126,59 @@ impl WorkspaceDb {
         Ok(out)
     }
 
-    /// Execute an arbitrary SQL statement and return the results.
+    /// Execute an arbitrary SQL statement and return every row.
+    ///
+    /// The owner's tool (`quack -q`): nothing bounds the result. Every
+    /// other caller uses [`Self::execute_query_capped`].
     ///
     /// # Errors
     ///
     /// Returns an error if the SQL is invalid or execution fails.
     pub fn execute_query(&self, sql: &str) -> Result<QueryResults> {
+        Ok(self.read_rows(sql, None)?.results)
+    }
+
+    /// Execute a statement keeping at most `max_rows` rows. Rows past the
+    /// cap are counted, never converted, so a `SELECT *` over a large
+    /// table costs `max_rows` values of memory on the Rust side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid or execution fails.
+    pub fn execute_query_capped(&self, sql: &str, max_rows: u32) -> Result<CappedResults> {
+        self.read_rows(sql, Some(max_rows as usize))
+    }
+
+    fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
         let _guard = self.arm_timeout();
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
 
+        let empty = CappedResults {
+            results: QueryResults {
+                columns: Vec::new(),
+                rows: Vec::new(),
+            },
+            total_rows: 0,
+        };
         let (columns, column_count) = {
             let Some(stmt_ref) = rows.as_ref() else {
-                return Ok(QueryResults {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                });
+                return Ok(empty);
             };
             let count = stmt_ref.column_count();
             if count == 0 {
-                return Ok(QueryResults {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                });
+                return Ok(empty);
             }
             (stmt_ref.column_names(), count)
         };
 
         let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut total_rows: usize = 0;
         while let Some(row) = rows.next()? {
+            total_rows = total_rows.saturating_add(1);
+            if keep.is_some_and(|keep| result_rows.len() >= keep) {
+                continue;
+            }
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
                 values.push(extract_value(row, i));
@@ -1140,9 +1186,12 @@ impl WorkspaceDb {
             result_rows.push(values);
         }
 
-        Ok(QueryResults {
-            columns,
-            rows: result_rows,
+        Ok(CappedResults {
+            results: QueryResults {
+                columns,
+                rows: result_rows,
+            },
+            total_rows,
         })
     }
 
@@ -1795,16 +1844,6 @@ fn display_json_value(val: &serde_json::Value) -> String {
 }
 
 impl QueryResults {
-    /// Return a copy of the results with at most `max_rows` rows.
-    #[must_use]
-    pub fn clone_capped(&self, max_rows: u32) -> Self {
-        let limit = max_rows as usize;
-        Self {
-            columns: self.columns.clone(),
-            rows: self.rows.iter().take(limit).cloned().collect(),
-        }
-    }
-
     /// Write results as a human-readable aligned table.
     ///
     /// # Errors
@@ -2115,6 +2154,37 @@ mod tests {
                 ],
             ],
         }
+    }
+
+    #[test]
+    fn capped_query_keeps_the_cap_and_counts_the_rest() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let capped = db
+            .execute_query_capped("SELECT range AS n FROM range(10)", 3)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(capped.results.columns, vec![String::from("n")]);
+        assert_eq!(capped.results.rows.len(), 3);
+        assert_eq!(capped.total_rows, 10);
+        assert!(capped.truncated());
+        assert_eq!(capped.omitted(), 7);
+
+        let exact = db
+            .execute_query_capped("SELECT range AS n FROM range(3)", 3)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(exact.results.rows.len(), 3);
+        assert!(!exact.truncated());
+        assert_eq!(exact.omitted(), 0);
+
+        let none = db
+            .execute_query_capped("SELECT 1 WHERE false", 3)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(none.total_rows, 0);
+        assert!(!none.truncated());
+
+        let all = db
+            .execute_query("SELECT range AS n FROM range(10)")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(all.rows.len(), 10);
     }
 
     #[test]

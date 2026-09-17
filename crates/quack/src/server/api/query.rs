@@ -371,7 +371,7 @@ pub(crate) async fn execute_sql(
     }
     let sql = statement.to_owned();
     let max_rows = app.config.analysis.max_query_rows;
-    let result = with_db(db, move |db| db.execute_query(&sql)).await;
+    let result = with_db(db, move |db| db.execute_query_capped(&sql, max_rows)).await;
     let outcome = if result.is_ok() {
         Outcome::Allowed
     } else {
@@ -380,15 +380,13 @@ pub(crate) async fn execute_sql(
     access
         .audit(app, "sql", None, outcome, Some(detail))
         .await?;
-    let results = result
+    let capped = result
         .map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.message))?;
-    let total = results.rows.len();
-    let capped = results.clone_capped(max_rows);
     Ok(SqlOutcome {
-        truncated: capped.rows.len() < total,
-        columns: capped.columns,
-        rows: capped.rows,
-        row_count: total,
+        truncated: capped.truncated(),
+        columns: capped.results.columns,
+        rows: capped.results.rows,
+        row_count: capped.total_rows,
     })
 }
 

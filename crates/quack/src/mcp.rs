@@ -372,7 +372,9 @@ impl McpServer {
         }
         let sql = statement.clone();
         let max_rows = self.inner.config.analysis.max_query_rows;
-        let result = self.db(move |db| db.execute_query(&sql)).await;
+        let result = self
+            .db(move |db| db.execute_query_capped(&sql, max_rows))
+            .await;
         let outcome = if result.is_ok() {
             Outcome::Allowed
         } else {
@@ -382,17 +384,15 @@ impl McpServer {
             .auditor
             .record("sql", None, outcome, Some(detail))
             .await;
-        let results = match result {
-            Ok(results) => results,
+        let capped = match result {
+            Ok(capped) => capped,
             Err(e) => return Ok(failure(e.message)),
         };
-        let total = results.rows.len();
-        let capped = results.clone_capped(max_rows);
         Ok(CallToolResult::structured(serde_json::json!({
-            "columns": capped.columns,
-            "rows": capped.rows,
-            "row_count": total,
-            "truncated": capped.rows.len() < total,
+            "columns": capped.results.columns,
+            "rows": capped.results.rows,
+            "row_count": capped.total_rows,
+            "truncated": capped.truncated(),
         })))
     }
 
