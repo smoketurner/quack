@@ -1077,7 +1077,9 @@ GET    /api/v1/workspaces/{id}/context             current; Markdown or JSON by 
 PUT    /api/v1/workspaces/{id}/context
 GET    /api/v1/workspaces/{id}/context/versions
 GET    /api/v1/workspaces/{id}/sessions[/{sid}]
-PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} (creator or owner; audited as share)
+PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} | {mode} (creator or owner; audited as share, mode)
+                                                  a session's mode is set when it is created;
+                                                  `mode` on a later query is ignored
 GET    /api/v1/workspaces/{id}/sessions/{sid}/export?format=sql|markdown
 GET    /api/v1/workspaces/{id}/audit              detail rows, members only
 GET    /api/v1/workspaces/{id}/members  POST/DELETE ...   (owner)

@@ -121,9 +121,9 @@ pub(crate) struct QueryArgs {
     /// A session to continue, from an earlier answer's `session_id`;
     /// omit to start a new one.
     pub session_id: Option<String>,
-    /// `chat` (general knowledge allowed, the default for a new session)
-    /// or `query` (every claim from the workspace). Given with
-    /// `session_id`, it changes that session's mode.
+    /// `chat` (general knowledge allowed, the default) or `query` (every
+    /// claim from the workspace), for a new session; an existing session
+    /// keeps the mode it was created with.
     pub mode: Option<String>,
 }
 
@@ -634,8 +634,8 @@ impl McpServer {
     }
 
     /// The session a `query` call appends to: the requested one when it
-    /// exists and the caller may see it (its mode changed when asked),
-    /// else a new one owned by the server user when there is one.
+    /// exists and the caller may see it, else a new one in `mode` owned
+    /// by the server user when there is one.
     async fn resolve_session(
         &self,
         requested: Option<String>,
@@ -655,9 +655,6 @@ impl McpServer {
                     };
                     if !sessions::visible_to(&session, user.as_deref().unwrap_or(""), sees_all) {
                         return Ok(false);
-                    }
-                    if let Some(mode) = mode {
-                        sessions::set_session_mode(db, &id, mode)?;
                     }
                     Ok(true)
                 })
@@ -1073,7 +1070,8 @@ mod tests {
         let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
         let kept =
             sessions::get_session(&guard, &existing).unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(kept.map(|s| s.mode), Some(ChatMode::Query));
+        // The mode given with an existing session id does not change it.
+        assert_eq!(kept.map(|s| s.mode), Some(ChatMode::Chat));
     }
 
     #[tokio::test(flavor = "multi_thread")]

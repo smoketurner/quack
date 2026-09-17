@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::storage::control::Outcome;
-use quack_core::storage::sessions;
+use quack_core::storage::sessions::{self, ChatMode};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
@@ -85,11 +85,13 @@ pub(crate) async fn show(
 
 #[derive(Deserialize)]
 pub(crate) struct UpdateSession {
-    pub shared: bool,
+    pub shared: Option<bool>,
+    /// `chat` or `query`: the explicit way to change a session's mode.
+    pub mode: Option<String>,
 }
 
-/// Share a session with every member, or take it back. Its creator, or an
-/// owner, may. Audited as `share`.
+/// Share a session with every member or take it back, or change its
+/// mode. Its creator, or an owner, may. Audited as `share` and `mode`.
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
@@ -97,8 +99,57 @@ pub(crate) async fn update(
     Json(body): Json<UpdateSession>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let session = set_shared(&app, &access, &sid, body.shared).await?;
+    if body.shared.is_none() && body.mode.is_none() {
+        return Err(ApiError::bad_request("give shared or mode"));
+    }
+    let mut session = None;
+    if let Some(shared) = body.shared {
+        session = Some(set_shared(&app, &access, &sid, shared).await?);
+    }
+    if let Some(mode) = body.mode.as_deref() {
+        let mode = ChatMode::parse(mode)
+            .ok_or_else(|| ApiError::bad_request("mode must be chat or query"))?;
+        session = Some(set_mode(&app, &access, &sid, mode).await?);
+    }
+    let session = session.ok_or_else(|| ApiError::not_found("no such session"))?;
     Ok(Json(serde_json::to_value(session)?))
+}
+
+/// Change a session's mode: its creator, or an owner, may.
+pub(crate) async fn set_mode(
+    app: &App,
+    access: &Access,
+    sid: &str,
+    mode: ChatMode,
+) -> ApiResult<sessions::SessionRow> {
+    let session = visible_session(app, access, &access.workspace.id, sid).await?;
+    let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
+    if !mine && !access.sees_all_sessions() {
+        access
+            .audit(app, "mode", Some(("session", sid)), Outcome::Denied, None)
+            .await?;
+        return Err(ApiError::forbidden(
+            "only the session's creator or an owner may change its mode",
+        ));
+    }
+    let db = app.workspace_db(&access.workspace.id).await?;
+    let session_id = session.id.clone();
+    let updated = with_db(db, move |db| {
+        sessions::set_session_mode(db, &session_id, mode)?;
+        sessions::get_session(db, &session_id)
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found("no such session"))?;
+    access
+        .audit(
+            app,
+            "mode",
+            Some(("session", sid)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "mode": mode.as_str() })),
+        )
+        .await?;
+    Ok(updated)
 }
 
 /// The shared toggle behind the API and the web button.

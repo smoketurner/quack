@@ -311,8 +311,10 @@
     var chat = document.getElementById("chat");
     var form = document.getElementById("ask");
     if (chat && form) {
+      // A session's mode is fixed when it is created; the selector only
+      // chooses the mode of a new session.
       var mode = chat.getAttribute("data-mode");
-      if (mode) form.mode.value = mode;
+      if (mode) { form.mode.value = mode; form.mode.disabled = true; form.mode.title = "Set when the session was created"; }
       form.addEventListener("submit", function (ev) { ev.preventDefault(); submitAsk(form, chat); });
     }
   });

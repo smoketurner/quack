@@ -1049,6 +1049,45 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         StatusCode::FORBIDDEN,
         "a viewer of a shared session cannot unshare it"
     );
+    // The mode changes only through an explicit PATCH by the creator or
+    // an owner (issue #57); a viewer of a shared session cannot.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&other_token),
+            Some(serde_json::json!({ "mode": "query" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mode"], "query");
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&viewer_token),
+            Some(serde_json::json!({ "mode": "chat" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&other_token),
+            Some(serde_json::json!({ "mode": "loud" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &share,
+            Some(&other_token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = h
         .call(Method::DELETE, &share, Some(&viewer_token), None)
         .await;

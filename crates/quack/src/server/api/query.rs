@@ -113,9 +113,9 @@ async fn prepare(
                     "session '{id}' does not exist"
                 )));
             }
-            if let Some(mode) = mode {
-                sessions::set_session_mode(db, &id, mode)?;
-            }
+            // A session's mode is set when it is created; `mode` on a
+            // later turn is ignored, and PATCH .../sessions/{sid} changes
+            // it explicitly (issue #57).
             Ok(id)
         } else {
             Ok(sessions::create_session(db, &model, mode.unwrap_or_default(), Some(&user))?.id)
