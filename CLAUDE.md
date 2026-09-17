@@ -93,7 +93,9 @@ Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model, trimmed
 to `[analysis].history_token_budget`. Retrieval is hybrid (exact cosine scan plus quack's own
 BM25 over `_quack_terms`, reciprocal rank fusion in `WorkspaceDb::search_hybrid_chunks`;
-no DuckDB extension is ever loaded, see design doc section 14); citations are registered per turn
+no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker
+(`analysis::rerank`, `[retrieval].rerank = "none" | "model"`; `model` over-fetches
+`rerank_candidates` and has the chat model order them); citations are registered per turn
 (`analysis::citations`) and validated before the answer is returned. Sessions have a mode,
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected

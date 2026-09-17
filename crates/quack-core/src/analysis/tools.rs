@@ -12,6 +12,7 @@ use crate::storage::workspace::{ChunkSearchResult, StatementKind, WorkspaceDb};
 use super::chart::{self, ChartSpec};
 use super::events::TurnRecorder;
 use super::policy::{RefusalFlag, WritePolicy};
+use super::rerank::{self, Reranker};
 use super::text_to_sql;
 
 pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
@@ -207,6 +208,8 @@ pub struct SearchDocumentsTool<M> {
     embedding_model: M,
     default_top_k: u32,
     rrf_k: u32,
+    reranker: Option<Arc<dyn Reranker>>,
+    rerank_candidates: u32,
     recorder: TurnRecorder,
 }
 
@@ -223,8 +226,19 @@ impl<M> SearchDocumentsTool<M> {
             embedding_model,
             default_top_k,
             rrf_k,
+            reranker: None,
+            rerank_candidates: 0,
             recorder,
         }
+    }
+
+    /// Over-fetch `candidates` and let `reranker` order them before the
+    /// top `k` are returned.
+    #[must_use]
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>, candidates: u32) -> Self {
+        self.reranker = Some(reranker);
+        self.rerank_candidates = candidates;
+        self
     }
 }
 
@@ -329,25 +343,43 @@ where
         let query_vec: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
 
         let top_k = args.top_k.unwrap_or(self.default_top_k).max(1);
+        let fetch = if self.reranker.is_some() {
+            top_k.max(self.rerank_candidates)
+        } else {
+            top_k
+        };
 
         let results = {
             let db = lock(&self.db)?;
             resolve_document_ids(&db, &args.document_ids).and_then(|ids| {
-                db.search_hybrid_chunks(&args.query, &query_vec, top_k, self.rrf_k, &ids)
+                db.search_hybrid_chunks(&args.query, &query_vec, fetch, self.rrf_k, &ids)
                     .map_err(|e| ToolError::Query(e.to_string()))
             })
         };
-        match results {
-            Ok(results) => {
-                step.finish(format!("{} chunks", results.len()));
-                let first = self.recorder.citations().register(&results);
-                format_search_results(&results, first).map_err(Into::into)
-            }
+        let results = match results {
+            Ok(results) => results,
             Err(e) => {
                 step.finish(format!("error: {e}"));
-                Err(e)
+                return Err(e);
             }
-        }
+        };
+        let (results, note) = match &self.reranker {
+            Some(reranker) => {
+                let keep = usize::try_from(top_k).unwrap_or(usize::MAX);
+                let (kept, outcome) =
+                    rerank::apply(reranker.as_ref(), &args.query, results, keep).await;
+                let note = match outcome {
+                    rerank::RerankOutcome::Skipped => String::new(),
+                    rerank::RerankOutcome::Reranked(name) => format!(", reranked by {name}"),
+                    rerank::RerankOutcome::Failed(_) => String::from(", reranking failed"),
+                };
+                (kept, note)
+            }
+            None => (results, String::new()),
+        };
+        step.finish(format!("{} chunks{note}", results.len()));
+        let first = self.recorder.citations().register(&results);
+        format_search_results(&results, first).map_err(Into::into)
     }
 }
 

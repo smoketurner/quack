@@ -518,8 +518,12 @@ Re-uploading a file with the same SHA-256 is a no-op with a message.
 **Hybrid retrieval.** A query runs both an exact cosine scan over `embedding` (core
 `array_cosine_distance`) and a BM25 search over the terms quack tokenized at ingest
 (`_quack_terms`, scored in SQL; no DuckDB extension). Results are fused with reciprocal rank fusion
-(`k = 60`) and the top `k` chunks (default 8) are returned. A reranking hook accepts an
-optional cross-encoder provider later; it is a no-op at MVP. This is the main retrieval
+(`k = 60`) and the top `k` chunks (default 8) are returned. A reranking hook
+(`analysis::rerank::Reranker`) sits between fusion and the answer: off by default
+(`[retrieval].rerank = "none"`), or `"model"`, which over-fetches `rerank_candidates`
+(24) and has the chat model order them listwise in one tool-less call, so an air-gapped
+deployment gets reranking from the model it already runs. A failed ranking call keeps the
+fused order and the tool step says so. A cross-encoder provider fits the same trait. This is the main retrieval
 quality improvement over the pgvector setup, where keyword-exact questions (part numbers,
 policy IDs) go unanswered.
 
@@ -1179,6 +1183,8 @@ scopes = ["https://cognitiveservices.azure.com/.default", "offline_access"]
 [retrieval]
 top_k = 8
 rrf_k = 60
+rerank = "none"          # or "model": the chat model orders rerank_candidates listwise
+rerank_candidates = 24
 
 [ingestion]
 chunk_size_tokens = 512
@@ -1367,8 +1373,9 @@ updated as issues close. Ordered by risk.
    server records the editing user and writes the detail row under the access row's id.
    Sections 5.3, 5.4, 12.
 10. **No release pipeline** (#30). Section 14.
-11. **No stemming in keyword search** (#31, deliberately deferred); **no reranking hook**
-    (#34); **large-workspace vector index options** (#32, research). Sections 6.1, 15.
+11. **No stemming in keyword search** (#31, deliberately deferred); ~~no reranking hook~~
+    (#34, closed: `Reranker` trait, `none` or `model`); **large-workspace vector index
+    options** (#32, research). Sections 6.1, 15.
 12. ~~Web UI mapping of the chart spec to ECharts~~ (#26, closed): `static/js/app.js`
     maps the spec to an ECharts option. Section 9.
 13. **Open Knowledge Format export and import** (#36): a workspace as an OKF bundle

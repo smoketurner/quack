@@ -260,6 +260,11 @@ pub struct RetrievalConfig {
     /// Off by default: retrieval should be a visible tool call the model
     /// chooses, not an invisible prefix on every turn.
     pub always_retrieve: bool,
+    /// Reranking after hybrid fusion: `none` (the default) or `model`, the
+    /// chat model ordering the candidates listwise.
+    pub rerank: RerankMode,
+    /// Candidates fetched for reranking before the top `k` are kept.
+    pub rerank_candidates: u32,
 }
 
 impl Default for RetrievalConfig {
@@ -269,8 +274,18 @@ impl Default for RetrievalConfig {
             rrf_k: 60,
             pinned_token_budget: 8000,
             always_retrieve: false,
+            rerank: RerankMode::None,
+            rerank_candidates: 24,
         }
     }
+}
+
+/// Which reranker, if any, orders retrieval candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankMode {
+    None,
+    Model,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -559,6 +574,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 [retrieval]
 top_k = 3
 always_retrieve = true
+rerank = "model"
 "#;
 
     #[test]
@@ -571,6 +587,8 @@ always_retrieve = true
         assert_eq!(config.retrieval.rrf_k, 60);
         assert_eq!(config.retrieval.pinned_token_budget, 8000);
         assert!(!config.retrieval.always_retrieve);
+        assert_eq!(config.retrieval.rerank, RerankMode::None);
+        assert_eq!(config.retrieval.rerank_candidates, 24);
         assert_eq!(config.context.max_tokens, 4000);
         assert_eq!(config.analysis.threads, 4);
         assert_eq!(config.analysis.max_turns, 10);
@@ -607,6 +625,7 @@ always_retrieve = true
         assert_eq!(embed.model, "nomic-embed-text");
         assert_eq!(embed.provider.embedding_dimension, Some(768));
         assert_eq!(config.retrieval.top_k, 3);
+        assert_eq!(config.retrieval.rerank, RerankMode::Model);
         let anthropic = config.providers.get("anthropic");
         assert!(anthropic.is_some_and(|p| {
             p.provider_type == ProviderType::Anthropic && p.auth == AuthMode::ApiKey
@@ -626,6 +645,7 @@ always_retrieve = true
         assert!(err_of("[general]\nchat_modle = \"a/b\"\n").contains("chat_modle"));
         assert!(err_of("[providers.o]\ntype = \"ollama\"\nmodel = \"x\"\n").contains("model"));
         assert!(err_of("[retrieval]\ntopk = 1\n").contains("topk"));
+        assert!(err_of("[retrieval]\nrerank = \"bge\"\n").contains("bge"));
         assert!(err_of("[analysis]\nthread = 1\n").contains("thread"));
     }
 

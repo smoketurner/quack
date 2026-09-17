@@ -4,13 +4,14 @@ use futures::StreamExt;
 use rig::prelude::*;
 use rig::streaming::StreamedAssistantContent;
 
-use crate::config::{AnalysisConfig, RetrievalConfig};
+use crate::config::{AnalysisConfig, RerankMode, RetrievalConfig};
 use crate::error::{Error, Result};
 
 use super::chart::ChartSpec;
 use super::citations::{self, Citation};
 use super::events::{AgentEvent, EventSink, ToolStep, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
+use super::rerank::ModelReranker;
 use super::text_to_sql::{self, PromptOptions};
 use super::tools::{
     CreateChartTool, DescribeTableTool, ListDocumentsTool, ListTablesTool, RunSqlTool,
@@ -51,7 +52,7 @@ pub struct AgentResponse {
 )]
 pub async fn run_analysis<M>(
     db: SharedDb,
-    completion_model: impl rig::completion::CompletionModel + 'static,
+    completion_model: impl rig::completion::CompletionModel + Clone + 'static,
     embedding_model: M,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
@@ -90,10 +91,35 @@ where
     }
 }
 
+/// The `search_documents` tool, with the chat model as reranker when
+/// `[retrieval].rerank = "model"`.
+fn search_tool<M>(
+    shared_db: SharedDb,
+    completion_model: &(impl rig::completion::CompletionModel + Clone + 'static),
+    embedding_model: M,
+    retrieval_config: &RetrievalConfig,
+    recorder: &TurnRecorder,
+) -> SearchDocumentsTool<M> {
+    let search = SearchDocumentsTool::new(
+        shared_db,
+        embedding_model,
+        retrieval_config.top_k,
+        retrieval_config.rrf_k,
+        recorder.clone(),
+    );
+    match retrieval_config.rerank {
+        RerankMode::None => search,
+        RerankMode::Model => search.with_reranker(
+            Arc::new(ModelReranker::new(completion_model.clone())),
+            retrieval_config.rerank_candidates,
+        ),
+    }
+}
+
 #[expect(clippy::too_many_arguments, reason = "mirrors run_analysis")]
 async fn run_inner<M>(
     shared_db: SharedDb,
-    completion_model: impl rig::completion::CompletionModel + 'static,
+    completion_model: impl rig::completion::CompletionModel + Clone + 'static,
     embedding_model: M,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
@@ -115,16 +141,17 @@ where
     let chart_spec: Arc<Mutex<Option<ChartSpec>>> = Arc::new(Mutex::new(None));
     let refused = RefusalFlag::default();
 
+    let search = search_tool(
+        Arc::clone(&shared_db),
+        &completion_model,
+        embedding_model.clone(),
+        retrieval_config,
+        recorder,
+    );
     let mut builder = completion_model
         .into_agent_builder()
         .preamble(&system_prompt)
-        .tool(SearchDocumentsTool::new(
-            Arc::clone(&shared_db),
-            embedding_model.clone(),
-            retrieval_config.top_k,
-            retrieval_config.rrf_k,
-            recorder.clone(),
-        ))
+        .tool(search)
         .tool(RunSqlTool::new(
             Arc::clone(&shared_db),
             analysis_config.max_query_rows,

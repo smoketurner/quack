@@ -112,42 +112,56 @@ const EXTRACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 impl crate::ontology::documents::Extractor for RigExtractor {
     fn extract<'a>(&'a self, text: &'a str) -> crate::ontology::documents::ExtractFuture<'a> {
         Box::pin(async move {
-            use futures::StreamExt;
-            use rig::streaming::StreamedAssistantContent;
-            let collect = async {
-                let mut stream = self
-                    .agent
-                    .stream_chat(text, Vec::<rig::message::Message>::new())
-                    .await;
-                let mut answer = String::new();
-                let mut final_text: Option<String> = None;
-                while let Some(item) = stream.next().await {
-                    match item.map_err(|e| Error::Llm(format!("extraction call failed: {e}")))? {
-                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::Text(t),
-                        ) => answer.push_str(&t.text),
-                        rig::agent::MultiTurnStreamItem::FinalResponse(r) => {
-                            final_text = Some(r.output);
-                        }
-                        _ => {}
-                    }
-                }
-                Ok::<String, Error>(match final_text {
-                    Some(t) if answer.trim().is_empty() => t,
-                    _ => answer,
-                })
-            };
-            let answer = tokio::time::timeout(EXTRACTION_TIMEOUT, collect)
-                .await
-                .map_err(|_| {
-                    Error::Llm(format!(
-                        "extraction call produced nothing within {} s",
-                        EXTRACTION_TIMEOUT.as_secs()
-                    ))
-                })??;
+            let answer = stream_answer(&self.agent, text, EXTRACTION_TIMEOUT, "extraction").await?;
             crate::ontology::documents::parse_extraction(&answer)
         })
     }
+}
+
+/// One streamed, tool-less call to `agent` with `text`, collected into the
+/// answer text. Streaming keeps long generations from tripping the HTTP
+/// client's read timeout; `what` names the call in errors.
+///
+/// # Errors
+///
+/// Returns an error when the call fails or produces nothing within
+/// `timeout`.
+pub async fn stream_answer(
+    agent: &rig::agent::Agent,
+    text: &str,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<String> {
+    use futures::StreamExt;
+    use rig::streaming::StreamedAssistantContent;
+    let collect = async {
+        let mut stream = agent
+            .stream_chat(text, Vec::<rig::message::Message>::new())
+            .await;
+        let mut answer = String::new();
+        let mut final_text: Option<String> = None;
+        while let Some(item) = stream.next().await {
+            match item.map_err(|e| Error::Llm(format!("{what} call failed: {e}")))? {
+                rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Text(t),
+                ) => answer.push_str(&t.text),
+                rig::agent::MultiTurnStreamItem::FinalResponse(r) => {
+                    final_text = Some(r.output);
+                }
+                _ => {}
+            }
+        }
+        Ok::<String, Error>(match final_text {
+            Some(t) if answer.trim().is_empty() => t,
+            _ => answer,
+        })
+    };
+    tokio::time::timeout(timeout, collect).await.map_err(|_| {
+        Error::Llm(format!(
+            "{what} call produced nothing within {} s",
+            timeout.as_secs()
+        ))
+    })?
 }
 
 fn extraction_agent<M>(model: M) -> RigExtractor

@@ -3,6 +3,7 @@ pub mod chart;
 pub mod citations;
 pub mod events;
 pub mod policy;
+pub mod rerank;
 pub mod text_to_sql;
 pub mod tools;
 pub mod vector_index;
