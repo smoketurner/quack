@@ -377,6 +377,12 @@ pub fn record_turn(
     if response.write_refused {
         metadata.insert(String::from("write_refused"), serde_json::Value::Bool(true));
     }
+    if !response.graph.is_empty() {
+        metadata.insert(
+            String::from("graph"),
+            serde_json::to_value(&response.graph)?,
+        );
+    }
     let metadata = if metadata.is_empty() {
         None
     } else {

@@ -66,19 +66,32 @@
     };
   }
 
+  function renderGraph(el, result) {
+    if (!window.echarts) return;
+    var chart = window.echarts.init(el);
+    chart.setOption(graphOption(result));
+    chart.on("click", function (p) {
+      if (p.dataType !== "node") return;
+      var row = document.getElementById("node-" + p.data.id);
+      if (row) { row.scrollIntoView({ block: "center", behavior: "smooth" }); row.classList.add("ring-2", "ring-blue-400"); }
+    });
+    window.addEventListener("resize", function () { chart.resize(); });
+  }
+
   function renderGraphs() {
     document.querySelectorAll(".graph[data-graph]").forEach(function (el) {
-      if (!window.echarts) return;
       var result;
       try { result = JSON.parse(el.getAttribute("data-graph")); } catch (e) { return; }
-      var chart = window.echarts.init(el);
-      chart.setOption(graphOption(result));
-      chart.on("click", function (p) {
-        if (p.dataType !== "node") return;
-        var row = document.getElementById("node-" + p.data.id);
-        if (row) { row.scrollIntoView({ block: "center", behavior: "smooth" }); row.classList.add("ring-2", "ring-blue-400"); }
-      });
-      window.addEventListener("resize", function () { chart.resize(); });
+      renderGraph(el, result);
+    });
+  }
+
+  // The body may be JSON ({error}) or, from the timeout or rate-limit
+  // layers, plain text: either way the message is what the user sees.
+  function errorMessage(res) {
+    return res.text().then(function (text) {
+      try { var j = JSON.parse(text); if (j && j.error) return j.error; } catch (e) { }
+      return text.trim() || (res.status + " " + res.statusText);
     });
   }
 
@@ -212,7 +225,9 @@
       credentials: "same-origin",
       signal: controller.signal
     }).then(function (res) {
-      if (!res.ok) return res.json().then(function (j) { throw new Error(j.error || res.statusText); });
+      if (!res.ok) return errorMessage(res).then(function (message) { throw new Error(message); });
+      var empty = document.getElementById("empty");
+      if (empty && empty.parentNode) empty.parentNode.removeChild(empty);
       var reader = res.body.getReader();
       var decoder = new TextDecoder();
       var buffer = "";
@@ -276,6 +291,11 @@
         view.article.appendChild(c);
         renderChart(c, r.chart);
       }
+      (r.graph || []).forEach(function (result) {
+        var g = el("div", "graph mt-3 h-72 rounded border border-slate-200");
+        view.article.appendChild(g);
+        renderGraph(g, result);
+      });
       if (r.citations && r.citations.length) {
         var ol = el("ol", "mt-3 space-y-1 text-sm text-slate-600");
         r.citations.forEach(function (cit) {
@@ -316,6 +336,13 @@
       var mode = chat.getAttribute("data-mode");
       if (mode) { form.mode.value = mode; form.mode.disabled = true; form.mode.title = "Set when the session was created"; }
       form.addEventListener("submit", function (ev) { ev.preventDefault(); submitAsk(form, chat); });
+      // Enter sends; Shift+Enter adds a line.
+      form.prompt.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+          ev.preventDefault();
+          if (!form.prompt.disabled) submitAsk(form, chat);
+        }
+      });
     }
   });
 })();

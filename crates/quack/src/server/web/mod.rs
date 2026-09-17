@@ -176,6 +176,8 @@ struct MessageView {
     steps: Vec<StepView>,
     citations: Vec<CitationView>,
     chart_json: Option<String>,
+    /// One JSON `GraphResult` per graph tool call the turn made.
+    graphs: Vec<String>,
 }
 
 struct StepView {
@@ -198,6 +200,9 @@ struct ChatPage {
     sessions: Vec<SessionRow>,
     current: Option<SessionRow>,
     messages: Vec<MessageView>,
+    /// What the workspace holds, for the empty state before any session.
+    tables: Vec<String>,
+    documents: Vec<DocumentInfo>,
 }
 
 #[derive(Template)]
@@ -206,6 +211,7 @@ struct DocumentsPage {
     page: Page,
     rows: String,
     error: Option<String>,
+    notice: Option<String>,
 }
 
 #[derive(Template)]
@@ -296,6 +302,7 @@ struct OntologyPage {
     low_support_total: usize,
     has_tables: bool,
     error: Option<String>,
+    notice: Option<String>,
 }
 
 /// Candidates shown per review page.
@@ -304,6 +311,7 @@ const CANDIDATES_PER_PAGE: usize = 50;
 #[derive(Deserialize, Default)]
 struct OntologyQuery {
     error: Option<String>,
+    notice: Option<String>,
     /// `pending` (default) or `low_support`.
     status: Option<String>,
     page: Option<usize>,
@@ -366,6 +374,7 @@ struct GraphPage {
     query: GraphQueryView,
     result: Option<GraphResultView>,
     error: Option<String>,
+    notice: Option<String>,
 }
 
 #[derive(Template)]
@@ -559,6 +568,8 @@ async fn logout(
 #[derive(Deserialize)]
 struct FlashQuery {
     error: Option<String>,
+    /// A success message: the same flash slot, green.
+    notice: Option<String>,
 }
 
 async fn workspaces(
@@ -718,6 +729,11 @@ fn message_view(row: &sessions::MessageRow) -> Option<MessageView> {
         .get("chart")
         .filter(|c| !c.is_null())
         .map(ToString::to_string);
+    let graphs = meta
+        .get("graph")
+        .and_then(|g| g.as_array())
+        .map(|gs| gs.iter().map(ToString::to_string).collect())
+        .unwrap_or_default();
     let content_html = if row.role == MessageRole::Assistant {
         markdown::to_html(&row.content)
     } else {
@@ -731,6 +747,7 @@ fn message_view(row: &sessions::MessageRow) -> Option<MessageView> {
         steps,
         citations,
         chart_json,
+        graphs,
     })
 }
 
@@ -771,11 +788,20 @@ async fn chat(
             )
             .await?;
     }
+    // The empty state says what there is to ask about.
+    let (tables, documents) = if messages.is_empty() {
+        let db = app.workspace_db(&id).await?;
+        with_db(db, |db| Ok((db.list_tables()?, db.list_documents()?))).await?
+    } else {
+        (Vec::new(), Vec::new())
+    };
     html(&ChatPage {
         page: page(&app, &access.identity, "Chat", Some(&access)),
         sessions: sessions_list,
         current,
         messages: messages.iter().filter_map(message_view).collect(),
+        tables,
+        documents,
     })
 }
 
@@ -837,6 +863,7 @@ async fn documents(
         page: page(&app, &access.identity, "Documents", Some(&access)),
         rows,
         error: q.error,
+        notice: q.notice,
     })
 }
 
@@ -1278,6 +1305,7 @@ async fn ontology_page(
         low_support_total,
         has_tables,
         error: q.error,
+        notice: q.notice,
     })
 }
 
@@ -1522,7 +1550,7 @@ async fn ontology_propose(
         .await
         {
             Ok(_) => format!(
-                "/w/{id}/ontology?error=document+pass+started%3B+candidates+appear+here+when+it+finishes"
+                "/w/{id}/ontology?notice=document+pass+started%3B+candidates+appear+here+when+it+finishes"
             ),
             Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
         };
@@ -1547,7 +1575,7 @@ async fn ontology_propose(
     .await;
     let target = match outcome {
         Ok((0, _)) => {
-            format!("/w/{id}/ontology?error=nothing+to+propose%3A+the+tables+are+already+covered")
+            format!("/w/{id}/ontology?notice=nothing+to+propose%3A+the+tables+are+already+covered")
         }
         Ok((count, run)) => {
             access
@@ -2134,6 +2162,7 @@ struct GraphPageQuery {
     to: Option<String>,
     max_hops: Option<u32>,
     error: Option<String>,
+    notice: Option<String>,
 }
 
 fn non_empty(value: Option<&String>) -> Option<String> {
@@ -2219,6 +2248,7 @@ async fn graph_page(
         query,
         result,
         error: q.error,
+        notice: q.notice,
     })
 }
 
@@ -2385,7 +2415,7 @@ async fn graph_extract(
     .await;
     let target = match outcome {
         Ok(body) if body.get("status").and_then(|s| s.as_str()) == Some("running") => format!(
-            "/w/{id}/graph?error={}",
+            "/w/{id}/graph?notice={}",
             urlencoded(
                 "document extraction started in the background; this page shows the graph as it grows"
             )
@@ -2420,7 +2450,7 @@ async fn graph_revalidate(
                 )
                 .await?;
             format!(
-                "/w/{id}/graph?error={}",
+                "/w/{id}/graph?notice={}",
                 urlencoded(&format!(
                     "dropped {} nodes and {} edges",
                     r.dropped_nodes, r.dropped_edges

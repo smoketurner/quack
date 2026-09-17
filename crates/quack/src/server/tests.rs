@@ -1750,6 +1750,12 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         "{html}"
     );
     assert!(html.contains("Allow the agent to change tables"));
+    // The empty state names what there is to ask about (issue #59): nothing
+    // yet, then the pasted document below.
+    assert!(
+        html.contains("id=\"empty\"") && html.contains("upload documents or tables"),
+        "{html}"
+    );
 
     // Documents: paste through the form, then the polled rows fragment.
     let boundary = "webform";

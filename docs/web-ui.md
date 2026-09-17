@@ -36,7 +36,10 @@ current workspace with its role and what the caller may do), which `base.html` r
 header and the workspace tabs: chat, documents, tables (with the import form), SQL, context,
 ontology, graph, settings. Fragments that htmx swaps (`documents_rows.html`,
 `sql_result.html`) are their own structs, rendered to a string and inserted with `|safe`.
-askama escapes everything else.
+askama escapes everything else. Redirects carry outcomes in the query string: `?error=` renders
+red, `?notice=` green, so a started background pass or a revalidation count is not styled as
+a failure. The documents list polls its rows fragment only while a row is still processing
+(the fragment marks that with `data-pending`).
 
 ## Assets
 

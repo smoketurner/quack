@@ -4,6 +4,7 @@
 <h1 class="text-xl font-semibold">Knowledge graph</h1>
 <p class="mt-1 text-sm text-slate-600">Entities typed by the ontology's classes, relations between them, and for every node and edge the document chunk or table row it came from.</p>
 {% if let Some(error) = error %}<p class="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{{ error }}</p>{% endif %}
+{% if let Some(notice) = notice %}<p class="mt-3 rounded border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-800">{{ notice }}</p>{% endif %}
 <p class="mt-3 text-sm text-slate-700">{{ status.nodes }} nodes, {{ status.edges }} edges · ontology version {{ status.ontology_version }}, graph built with {{ status.built_with_version }}</p>
 {% if status.provisional() %}
 <div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
