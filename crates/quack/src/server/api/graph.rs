@@ -210,6 +210,12 @@ pub(crate) async fn start_extraction(
 ) -> ApiResult<serde_json::Value> {
     let (do_tables, do_documents, sample, reset) =
         (plan.tables, plan.documents, plan.sample, plan.reset);
+    let slot = app.begin_extraction(id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "a graph extraction is already running for this workspace",
+        )
+    })?;
     let db = app.workspace_db(id).await?;
     let (ontology, provisional) = with_db(Arc::clone(&db), |db| {
         Ok((
@@ -221,18 +227,14 @@ pub(crate) async fn start_extraction(
     let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
     let options = app.config.graph.options();
     let embeddings = llm::optional_embedding_model(&app.config).await?;
-    let ontology_for_tables = ontology.clone();
-    let table_summaries = with_db(Arc::clone(&db), move |db| {
-        if reset {
-            graph_store::clear(db)?;
-        }
-        if do_tables && !ontology_for_tables.mappings.is_empty() {
-            tables::extract(db, &ontology_for_tables, provisional)
-        } else {
-            Ok(Vec::new())
-        }
-    })
-    .await?;
+    if reset {
+        with_db(Arc::clone(&db), graph_store::clear).await?;
+    }
+    let table_summaries = if do_tables {
+        extract_tables_in_batches(&db, &ontology, provisional).await?
+    } else {
+        Vec::new()
+    };
     let chunks = if do_documents {
         with_db(Arc::clone(&db), move |db| extract::chunks(db, sample)).await?
     } else {
@@ -282,12 +284,44 @@ pub(crate) async fn start_extraction(
             ontology,
             provisional,
             embeddings,
+            slot,
             options,
         },
     );
     Ok(
         serde_json::json!({ "tables": table_summaries, "cost": cost, "run": run, "status": "running" }),
     )
+}
+
+/// Table extraction one batch per lock hold, so other requests to the
+/// workspace get in between batches of a large table (issue #48).
+async fn extract_tables_in_batches(
+    db: &SharedDb,
+    ontology: &Ontology,
+    provisional: bool,
+) -> ApiResult<Vec<tables::MappingSummary>> {
+    let mut summaries = Vec::with_capacity(ontology.mappings.len());
+    for mapping in &ontology.mappings {
+        let mut total = tables::MappingSummary {
+            table: mapping.table.clone(),
+            ..tables::MappingSummary::default()
+        };
+        let mut offset = 0;
+        loop {
+            let mapping = mapping.clone();
+            let (batch, more) = with_db(Arc::clone(db), move |db| {
+                tables::extract_batch(db, &mapping, provisional, offset)
+            })
+            .await?;
+            total.absorb(&batch);
+            if !more {
+                break;
+            }
+            offset = offset.saturating_add(u64::from(tables::BATCH_ROWS));
+        }
+        summaries.push(total);
+    }
+    Ok(summaries)
 }
 
 /// Everything the background document pass needs.
@@ -298,6 +332,8 @@ struct DocumentJob {
     ontology: Ontology,
     provisional: bool,
     embeddings: Option<llm::EmbedModel>,
+    /// Freed when the pass ends.
+    slot: crate::server::state::ExtractionSlot,
     options: GraphOptions,
 }
 
@@ -313,6 +349,7 @@ fn spawn_document_extraction(app: App, access: Access, run_id: String, job: Docu
             provisional,
             embeddings,
             options,
+            slot,
         } = job;
         let outcome = extract::run(&db, chunks, extractor.as_ref(), &ontology, provisional).await;
         let version = ontology.version;
@@ -356,6 +393,7 @@ fn spawn_document_extraction(app: App, access: Access, run_id: String, job: Docu
         if let Err(e) = result {
             tracing::warn!(run = %run_id, error = %e, "graph extraction failed");
         }
+        drop(slot);
     });
 }
 

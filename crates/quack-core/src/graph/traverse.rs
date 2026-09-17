@@ -83,34 +83,44 @@ pub fn neighborhood(
     }
     let depth = hops.min(options.max_traversal_depth);
     let root_ids: Vec<String> = roots.iter().map(|n| n.id.clone()).collect();
-    let mut stmt = db.connection().prepare(
-        "WITH RECURSIVE hops AS ( \
-            SELECT id, 0 AS depth, [id] AS path FROM _quack_graph_nodes \
-            WHERE list_contains(?::VARCHAR[], id) \
-            UNION ALL \
-            SELECT n.id, h.depth + 1, list_append(h.path, n.id) \
-            FROM hops h \
-            JOIN _quack_graph_edges e ON h.id = e.source_node_id OR h.id = e.target_node_id \
-            JOIN _quack_graph_nodes n \
-              ON n.id = CASE WHEN e.source_node_id = h.id THEN e.target_node_id ELSE e.source_node_id END \
-            WHERE h.depth < ? AND NOT list_contains(h.path, n.id) \
-              AND (? IS NULL OR e.relation_id = ?) \
-        ) \
-        SELECT id, min(depth) AS depth FROM hops GROUP BY id ORDER BY depth, id LIMIT ?",
-    )?;
-    let mut rows = stmt.query(duckdb::params![
-        id_list(&root_ids),
-        i64::from(depth),
-        relation,
-        relation,
-        i64::from(options.max_nodes)
-    ])?;
-    let mut ids = Vec::new();
-    while let Some(row) = rows.next()? {
-        ids.push(row.get::<_, String>(0)?);
+    // Breadth-first, one query per frontier, never more than `max_nodes`
+    // visited: a recursive CTE would enumerate every simple path out of a
+    // hub before its LIMIT applied (issue #48).
+    let max_visited = usize::try_from(options.max_nodes).unwrap_or(usize::MAX);
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for id in &root_ids {
+        if seen.insert(id.clone()) && ids.len() < max_visited {
+            ids.push(id.clone());
+        }
     }
-    drop(rows);
-    drop(stmt);
+    let mut frontier: Vec<String> = ids.clone();
+    for _ in 0..depth {
+        if frontier.is_empty() || ids.len() >= max_visited {
+            break;
+        }
+        let mut next: Vec<String> = Vec::new();
+        let mut edges = store::edges_touching(db, &frontier)?;
+        if let Some(relation) = relation {
+            edges.retain(|e| e.relation_id == relation);
+        }
+        for edge in edges {
+            let there = if frontier.contains(&edge.source_node_id) {
+                edge.target_node_id
+            } else {
+                edge.source_node_id
+            };
+            if !seen.insert(there.clone()) {
+                continue;
+            }
+            ids.push(there.clone());
+            next.push(there);
+            if ids.len() >= max_visited {
+                break;
+            }
+        }
+        frontier = next;
+    }
     let mut result = collect(db, &ids)?;
     if let Some(relation) = relation {
         result.edges.retain(|e| e.relation_id == relation);

@@ -657,6 +657,14 @@ are never paired (WEST VIRGINIA is not VIRGINIA), a pair with one keyed side is 
 proposed with the keyed node kept, and auto-merge applies to two extracted nodes only.
 Each merge runs in one transaction. Aliases are kept in `properties.aliases`.
 
+**Extraction from tables** runs in batches of 5,000 keyed rows: each batch is staged in
+Rust (nodes, edges, and row provenance deduplicated, ids minted as UUID v7) and written
+with one statement per kind through scratch `_quack_tmp_graph_*` tables, inside one
+transaction under the statement timeout; the server releases the workspace lock between
+batches and runs one extraction per workspace at a time (a second `POST .../graph/extract`
+answers 409). Neighbourhood walks are breadth-first, one query per frontier, and never
+visit more than `[graph].max_nodes`.
+
 **Provenance.** Every node and edge has at least one `_quack_provenance` row. Answers from
 the graph cite the source chunk or row the same way document answers cite chunks.
 

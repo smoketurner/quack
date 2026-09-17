@@ -193,6 +193,47 @@ impl GraphExtractor for Canned {
     }
 }
 
+/// A mapped table larger than one batch is extracted whole, in key
+/// order across batches, and a neighbourhood walk never visits more than
+/// `max_nodes` (issue #48).
+#[test]
+fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
+    let db = WorkspaceDb::open_in_memory(4).unwrap();
+    let rows = tables::BATCH_ROWS * 2 + 1;
+    db.execute_statement(&format!(
+        "CREATE TABLE shipments AS SELECT 'PO-' || lpad(range::VARCHAR, 5, '0') AS po, \
+         'V' || (range % 3) AS vendor, 'C' || (range % 2) AS country, 'Air' AS mode \
+         FROM range({rows})"
+    ))
+    .unwrap();
+    store::save(&db, &ontology(), Some("test"), Some("fixture")).unwrap();
+    let current = store::current(&db).unwrap().unwrap();
+    let summaries = tables::extract(&db, &current, false).unwrap();
+    let first = summaries.first().unwrap();
+    assert_eq!(
+        (first.rows, first.nodes, first.edges),
+        (rows, rows, rows * 2)
+    );
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.nodes, u64::from(rows) + 3 + 2);
+    // Re-running stays idempotent across batches.
+    tables::extract(&db, &current, false).unwrap();
+    assert_eq!(
+        graph_store::status(&db).unwrap().nodes,
+        u64::from(rows) + 3 + 2
+    );
+
+    // Vendor V0 is a hub with about a third of the shipments: a bounded
+    // walk out of it returns at most max_nodes.
+    let options = GraphOptions {
+        max_nodes: 7,
+        ..GraphOptions::default()
+    };
+    let hub = traverse::resolve_entry(&db, "V0", Some("vendor"), None).unwrap();
+    let found = traverse::neighborhood(&db, &hub, 3, None, &options).unwrap();
+    assert_eq!(found.nodes.len(), 7, "{}", found.nodes.len());
+}
+
 /// Resolution respects provenance (issue #41): two nodes from keyed rows
 /// are never merged or proposed however close their labels; a keyed node
 /// and an extracted look-alike are proposed for review, never

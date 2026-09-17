@@ -2159,6 +2159,19 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     assert_eq!(sql_rows.iter().filter(|r| r.outcome == "denied").count(), 1);
 }
 
+/// One graph extraction per workspace at a time (issue #48): the slot
+/// is held until the run ends and freed when it drops.
+#[tokio::test]
+async fn extraction_slots_are_exclusive_per_workspace() {
+    let h = harness(true).await;
+    let first = h.app.begin_extraction("ws-a");
+    assert!(first.is_some());
+    assert!(h.app.begin_extraction("ws-a").is_none());
+    assert!(h.app.begin_extraction("ws-b").is_some());
+    drop(first);
+    assert!(h.app.begin_extraction("ws-a").is_some());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_page() {
     let h = harness(true).await;

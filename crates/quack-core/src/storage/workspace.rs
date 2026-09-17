@@ -1304,6 +1304,19 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Run `f` under the statement watchdog: if it is still going after
+    /// the configured query timeout, the connection is interrupted and
+    /// the statement inside fails. For multi-statement work (a graph
+    /// batch) that would otherwise run unbounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error, including the interruption.
+    pub fn under_timeout<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        let _guard = self.arm_timeout();
+        f(self)
+    }
+
     /// Start a watchdog that interrupts the connection if the statement runs
     /// past the configured timeout. Dropping the guard disarms it.
     fn arm_timeout(&self) -> TimeoutGuard {
