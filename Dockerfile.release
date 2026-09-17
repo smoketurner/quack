@@ -6,7 +6,7 @@
 # multi-arch image from this file without compiling anything. Same
 # runtime as Dockerfile: distroless static, nonroot, /quack and /data.
 
-FROM alpine:3.22 AS stage
+FROM alpine:3.24 AS stage
 ARG TARGETARCH
 COPY dist/linux-${TARGETARCH}/quack /quack
 RUN chmod 0755 /quack && mkdir -p /data && chown 65532:65532 /data
