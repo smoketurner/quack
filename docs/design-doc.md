@@ -1194,7 +1194,11 @@ roadmap and may never be built.
   (section 5.5): who, which workspace, which resource by opaque id, what action, the
   outcome, the channel, the client address, and when. The same UUID v7 id keys a
   `_quack_audit` row inside the workspace holding the content detail (the SQL, the file
-  names, the context diff, the proposal accepted). An admin sees who accessed what and
+  names, the table name, the context diff, the proposal accepted); both rows are written
+  for every audited action, listings and page views included (`list`, `page`, `open`),
+  and a failed audit write fails the request. Table names are content and never appear in
+  `control.db`. Over MCP the auditor is re-pointed at each request's identity, so a
+  shared transport audits the caller, not whoever opened it. An admin sees who accessed what and
   when across every workspace; a member sees what was done inside theirs. Export and
   import of context or ontology, and session export, are audited because they move content
   across the boundary. Logins, failed logins, token use, and membership changes are audited

@@ -31,7 +31,7 @@ pub(crate) async fn handle(
         if can_write { "rw" } else { "ro" }
     );
     let db = app.workspace_db(&access.workspace.id).await?;
-    let transport = app
+    let (transport, server) = app
         .mcp_transport(&key, || {
             McpServer::new(
                 app.config.clone(),
@@ -45,11 +45,14 @@ pub(crate) async fn handle(
                 Some(access.identity.user_id.clone()),
                 Auditor::Server(Box::new(ServerAuditor {
                     app: std::sync::Arc::clone(&app),
-                    access,
+                    access: std::sync::Mutex::new(access.clone()),
                 })),
             )
         })
         .await;
+    // Every request is audited as the identity that made it, not the one
+    // that first opened this transport.
+    server.set_access(access);
     let response = transport
         .oneshot(request)
         .await

@@ -139,7 +139,8 @@ pub(crate) async fn status(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "graph_status").await?;
     let db = app.workspace_db(&id).await?;
     let status = with_db(db, graph_store::status).await?;
     Ok(Json(serde_json::to_value(status)?))
@@ -442,7 +443,8 @@ pub(crate) async fn merges(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "graph_merges").await?;
     let db = app.workspace_db(&id).await?;
     let pending = with_db(db, resolve::pending).await?;
     Ok(Json(serde_json::json!({ "merges": pending })))

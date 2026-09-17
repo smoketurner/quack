@@ -14,7 +14,8 @@ pub(crate) async fn list(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "tables").await?;
     let db = app.workspace_db(&id).await?;
     let tables = with_db(db, WorkspaceDb::list_tables).await?;
     Ok(Json(serde_json::json!({ "tables": tables })))
@@ -39,8 +40,16 @@ pub(crate) async fn describe(
     })
     .await?;
     let described = described.ok_or_else(|| ApiError::not_found("no such table"))?;
+    // The table name is user content: it goes in the workspace detail,
+    // not in control.db.
     access
-        .audit(&app, "open", Some(("table", &name)), Outcome::Allowed, None)
+        .audit(
+            &app,
+            "open",
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({ "table": name })),
+        )
         .await?;
     let columns: Vec<serde_json::Value> = described
         .columns

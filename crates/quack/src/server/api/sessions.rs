@@ -30,6 +30,7 @@ pub(crate) async fn list(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "sessions").await?;
     let db = app.workspace_db(&id).await?;
     let user = access.identity.user_id.clone();
     let sees_all = access.sees_all_sessions();

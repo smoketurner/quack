@@ -17,7 +17,8 @@ pub(crate) async fn show(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "ontology").await?;
     let db = app.workspace_db(&id).await?;
     let current = with_db(db, store::current).await?;
     let ontology = current.ok_or_else(|| ApiError::not_found("no ontology yet"))?;
@@ -103,7 +104,8 @@ pub(crate) async fn versions(
     Path(id): Path<String>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "ontology_versions").await?;
     let db = app.workspace_db(&id).await?;
     let limit = q.limit;
     let rows = with_db(db, move |db| store::versions(db, limit)).await?;
@@ -122,7 +124,16 @@ pub(crate) async fn version(
     Path((id, v)): Path<(String, u32)>,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access
+        .audit(
+            &app,
+            "open",
+            Some(("ontology_version", &v.to_string())),
+            Outcome::Allowed,
+            None,
+        )
+        .await?;
     let db = app.workspace_db(&id).await?;
     let against = q.against.unwrap_or(v.saturating_sub(1));
     let (snapshot, older) = with_db(db, move |db| {
@@ -248,7 +259,10 @@ pub(crate) async fn list_candidates(
     Path(id): Path<String>,
     Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, "list", "ontology_candidates")
+        .await?;
     let db = app.workspace_db(&id).await?;
     let rows = match q.status.as_deref() {
         None | Some("pending") => with_db(db, candidates::pending).await?,

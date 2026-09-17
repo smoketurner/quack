@@ -18,7 +18,8 @@ pub(crate) async fn show(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "context").await?;
     let db = app.workspace_db(&id).await?;
     let current = with_db(db, context::current).await?;
     let wants_markdown = headers
@@ -79,7 +80,8 @@ pub(crate) async fn versions(
     Path(id): Path<String>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _access = access(&app, identity, &id, Need::READ).await?;
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "list", "context_versions").await?;
     let db = app.workspace_db(&id).await?;
     let limit = q.limit;
     let history = with_db(db, move |db| context::history(db, limit)).await?;

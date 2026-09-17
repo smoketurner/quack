@@ -26,7 +26,7 @@ pub(crate) struct AppState {
     pub queue: UploadQueue,
     /// One MCP transport per workspace, user, and write permission; each
     /// carries its own MCP sessions. See `server::mcp_http`.
-    mcp: tokio::sync::Mutex<HashMap<String, McpTransport>>,
+    mcp: tokio::sync::Mutex<HashMap<String, (McpTransport, crate::mcp::McpServer)>>,
     /// Workspaces with a graph extraction in flight: one at a time each,
     /// so a reset cannot clear a run part way (issue #48).
     extractions: Mutex<HashSet<String>>,
@@ -82,14 +82,15 @@ impl AppState {
         &self,
         key: &str,
         make: impl FnOnce() -> crate::mcp::McpServer,
-    ) -> McpTransport {
+    ) -> (McpTransport, crate::mcp::McpServer) {
         let mut open = self.mcp.lock().await;
-        if let Some(transport) = open.get(key) {
-            return transport.clone();
+        if let Some(entry) = open.get(key) {
+            return entry.clone();
         }
         let server = make();
+        let factory = server.clone();
         let transport = StreamableHttpService::new(
-            move || Ok(server.clone()),
+            move || Ok(factory.clone()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 // The server may sit behind any host name; bearer auth,
@@ -97,8 +98,8 @@ impl AppState {
                 .with_allowed_hosts(Vec::<String>::new())
                 .with_json_response(true),
         );
-        open.insert(key.to_owned(), transport.clone());
-        transport
+        open.insert(key.to_owned(), (transport.clone(), server.clone()));
+        (transport, server)
     }
 
     /// The shared handle for a workspace, opening the file on first use.

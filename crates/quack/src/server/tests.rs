@@ -2159,6 +2159,96 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     assert_eq!(sql_rows.iter().filter(|r| r.outcome == "denied").count(), 1);
 }
 
+/// Every allowed workspace read writes its access row and its detail row
+/// under one id, and a table name never reaches control.db (issue #54).
+#[tokio::test(flavor = "multi_thread")]
+async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("data", &owner).await;
+    let token = h.login("owner").await;
+    let (status, _) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &token,
+            serde_json::json!({ "sql": "CREATE TABLE customer_secrets AS SELECT 1 AS a" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for path in [
+        "tables",
+        "tables/customer_secrets",
+        "documents",
+        "sessions",
+        "ontology/versions",
+        "graph/status",
+        "context",
+        "members",
+    ] {
+        let (status, body) = h
+            .get(&format!("/api/v1/workspaces/{ws}/{path}"), &token)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    let (status, _, _) = h
+        .page(&format!("/w/{ws}/tables/customer_secrets"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            outcome: Some(String::from("allowed")),
+            ..AuditFilter::default()
+        })
+        .await;
+    let lists = rows.iter().filter(|r| r.action == "list").count();
+    assert!(lists >= 7, "{rows:?}");
+    // The API's describe and the web table page: two opens, neither
+    // naming the table in control.db.
+    assert_eq!(
+        rows.iter().filter(|r| r.action == "open").count(),
+        2,
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r.resource_id.as_deref() != Some("customer_secrets")),
+        "{rows:?}"
+    );
+    // Both halves, under the same ids: the workspace detail names the
+    // table the control row does not.
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let details = super::state::with_db(db, |db| quack_core::storage::audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let ids: std::collections::BTreeSet<&str> = details.iter().map(|d| d.id.as_str()).collect();
+    assert!(rows.iter().all(|r| ids.contains(r.id.as_str())), "{rows:?}");
+    assert!(
+        details.iter().any(|d| {
+            d.action == "open"
+                && d.detail
+                    .as_ref()
+                    .and_then(|v| v.get("table"))
+                    .and_then(|t| t.as_str())
+                    == Some("customer_secrets")
+        }),
+        "{details:?}"
+    );
+}
+
 /// One graph extraction per workspace at a time (issue #48): the slot
 /// is held until the run ends and freed when it drops.
 #[tokio::test]

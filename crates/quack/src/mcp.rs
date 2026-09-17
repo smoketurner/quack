@@ -48,29 +48,49 @@ pub(crate) enum Auditor {
 }
 
 /// The server's audit path: the app for `control.db` and the caller's
-/// `Access` for the identity and workspace.
+/// `Access` for the identity and workspace. The transport outlives one
+/// request, so `access` is replaced on every request (issue #54): the
+/// rows carry the token and address that made the call.
 pub(crate) struct ServerAuditor {
     pub app: App,
-    pub access: Access,
+    pub access: std::sync::Mutex<Access>,
 }
 
 impl Auditor {
+    /// Write the audit rows; a failed write fails the call, so nothing
+    /// audited proceeds unlogged.
     async fn record(
         &self,
         action: &str,
         resource: Option<(&str, &str)>,
         outcome: Outcome,
         detail: Option<serde_json::Value>,
-    ) {
+    ) -> Result<(), McpError> {
         let Self::Server(server) = self else {
-            return;
+            return Ok(());
         };
-        if let Err(e) = server
+        let access = server
             .access
+            .lock()
+            .map_err(|e| internal(format!("auditor poisoned: {e}")))?
+            .clone();
+        access
             .audit(&server.app, action, resource, outcome, detail)
             .await
-        {
-            tracing::warn!(error = %e.message, action, "audit write failed");
+            .map_err(|e| {
+                tracing::error!(error = %e.message, action, "audit write failed");
+                internal(format!("audit write failed: {}", e.message))
+            })?;
+        Ok(())
+    }
+
+    fn sees_all_sessions(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Server(server) => server
+                .access
+                .lock()
+                .is_ok_and(|access| access.sees_all_sessions()),
         }
     }
 }
@@ -189,6 +209,15 @@ impl McpServer {
         }
     }
 
+    /// Point the auditor at the request now being served.
+    pub(crate) fn set_access(&self, access: Access) {
+        if let Auditor::Server(server) = &self.inner.auditor
+            && let Ok(mut current) = server.access.lock()
+        {
+            *current = access;
+        }
+    }
+
     async fn db<T, F>(&self, f: F) -> Result<T, McpError>
     where
         T: Send + 'static,
@@ -251,7 +280,7 @@ impl McpServer {
                         Outcome::Allowed,
                         Some(detail),
                     )
-                    .await;
+                    .await?;
                 let citations: Vec<serde_json::Value> = response
                     .citations
                     .iter()
@@ -303,7 +332,7 @@ impl McpServer {
                         Outcome::Error,
                         Some(detail),
                     )
-                    .await;
+                    .await?;
                 // A turn that never recorded a message leaves no session
                 // behind; the next call starts afresh.
                 if session.created {
@@ -359,7 +388,7 @@ impl McpServer {
                 Outcome::Allowed,
                 Some(serde_json::json!({ "q": query })),
             )
-            .await;
+            .await?;
         Ok(CallToolResult::structured(
             serde_json::json!({ "chunks": hits }),
         ))
@@ -391,7 +420,7 @@ impl McpServer {
             self.inner
                 .auditor
                 .record("sql", None, Outcome::Denied, Some(detail))
-                .await;
+                .await?;
             return Ok(failure(
                 "this statement modifies data and this connection cannot write",
             ));
@@ -409,7 +438,7 @@ impl McpServer {
         self.inner
             .auditor
             .record("sql", None, outcome, Some(detail))
-            .await;
+            .await?;
         let capped = match result {
             Ok(capped) => capped,
             Err(e) => return Ok(failure(e.message)),
@@ -427,6 +456,15 @@ impl McpServer {
         description = "List the tables in the workspace."
     )]
     async fn list_tables(&self) -> Result<CallToolResult, McpError> {
+        self.inner
+            .auditor
+            .record(
+                "list",
+                None,
+                Outcome::Allowed,
+                Some(serde_json::json!({ "what": "tables" })),
+            )
+            .await?;
         let tables = self.db(WorkspaceDb::list_tables).await?;
         Ok(CallToolResult::structured(
             serde_json::json!({ "tables": tables }),
@@ -446,8 +484,13 @@ impl McpServer {
             Some(description) => {
                 self.inner
                     .auditor
-                    .record("open", Some(("table", &name)), Outcome::Allowed, None)
-                    .await;
+                    .record(
+                        "open",
+                        None,
+                        Outcome::Allowed,
+                        Some(serde_json::json!({ "table": name })),
+                    )
+                    .await?;
                 Ok(CallToolResult::structured(description))
             }
             None => Ok(failure(format!("no table named '{name}'"))),
@@ -511,7 +554,7 @@ impl McpServer {
         self.inner
             .auditor
             .record("graph", None, Outcome::Allowed, Some(detail))
-            .await;
+            .await?;
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
         out.content = vec![ContentBlock::text(traverse::render_tree(&result))];
         Ok(out)
@@ -549,7 +592,7 @@ impl McpServer {
         self.inner
             .auditor
             .record("graph", None, Outcome::Allowed, Some(detail))
-            .await;
+            .await?;
         if result.is_empty() {
             return Ok(failure(format!(
                 "no path connects {from} and {to} within {max_hops} hops"
@@ -565,6 +608,15 @@ impl McpServer {
         description = "List the ingested documents with their status, title, and source."
     )]
     async fn list_documents(&self) -> Result<CallToolResult, McpError> {
+        self.inner
+            .auditor
+            .record(
+                "list",
+                None,
+                Outcome::Allowed,
+                Some(serde_json::json!({ "what": "documents" })),
+            )
+            .await?;
         let documents = self.db(WorkspaceDb::list_documents).await?;
         Ok(CallToolResult::structured(
             serde_json::json!({ "documents": documents }),
@@ -590,10 +642,7 @@ impl McpServer {
         mode: Option<ChatMode>,
     ) -> Result<Result<ResolvedSession, String>, McpError> {
         let user = self.inner.user_id.clone();
-        let sees_all = match &self.inner.auditor {
-            Auditor::None => true,
-            Auditor::Server(server) => server.access.sees_all_sessions(),
-        };
+        let sees_all = self.inner.auditor.sees_all_sessions();
         if let Some(id) = requested
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty())
@@ -772,6 +821,15 @@ impl ServerHandler for McpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri;
+        self.inner
+            .auditor
+            .record(
+                "open",
+                Some(("resource", &uri)),
+                Outcome::Allowed,
+                Some(serde_json::json!({ "uri": uri })),
+            )
+            .await?;
         let Some(text) = self.resource_text(&uri).await? else {
             return Err(McpError::resource_not_found(
                 format!("no resource at {uri}"),

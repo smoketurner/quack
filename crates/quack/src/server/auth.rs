@@ -247,8 +247,11 @@ impl Access {
         }
     }
 
-    /// Record an access-audit row for this workspace, and its content
-    /// detail inside the workspace when `detail` is given.
+    /// Record an access-audit row for this workspace and its content
+    /// detail inside the workspace under the same id (issue #54: both
+    /// halves, every time; a failed write fails the request). `resource`
+    /// carries an opaque id only, never a table name or content; those
+    /// go in `detail`, which stays inside the workspace.
     pub(crate) async fn audit(
         &self,
         app: &App,
@@ -264,17 +267,30 @@ impl Access {
             entry.resource_id = Some(id.to_owned());
         }
         app.control.record_audit(&entry).await?;
-        if let Some(detail) = detail {
-            let db = app.workspace_db(&self.workspace.id).await?;
-            let id = entry.id.clone();
-            let user = self.identity.user_id.clone();
-            let action = action.to_owned();
-            super::state::with_db(db, move |db| {
-                audit::record(db, &id, Some(&user), &action, &detail)
-            })
-            .await?;
-        }
+        let detail = detail.unwrap_or_else(|| serde_json::json!({}));
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let id = entry.id.clone();
+        let user = self.identity.user_id.clone();
+        let action = action.to_owned();
+        super::state::with_db(db, move |db| {
+            audit::record(db, &id, Some(&user), &action, &detail)
+        })
+        .await?;
         Ok(entry.id)
+    }
+
+    /// The allowed row for a read that returns a listing or a page:
+    /// action `list` or `page`, what was read in the detail.
+    pub(crate) async fn audit_read(&self, app: &App, action: &str, what: &str) -> ApiResult<()> {
+        self.audit(
+            app,
+            action,
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({ "what": what })),
+        )
+        .await?;
+        Ok(())
     }
 }
 

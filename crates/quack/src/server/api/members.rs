@@ -19,7 +19,8 @@ pub(crate) async fn list(
         admin_ok: true,
         ..Need::READ
     };
-    let _access = access(&app, identity, &id, need).await?;
+    let access = access(&app, identity, &id, need).await?;
+    access.audit_read(&app, "list", "members").await?;
     let members = app.control.list_members(&id).await?;
     Ok(Json(serde_json::json!({ "members": members })))
 }

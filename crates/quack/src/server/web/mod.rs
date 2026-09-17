@@ -802,6 +802,7 @@ async fn documents(
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "documents").await?;
     let rows = render_rows(&app, &access).await?;
     html(&DocumentsPage {
         page: page(&app, &access.identity, "Documents", Some(&access)),
@@ -816,6 +817,7 @@ async fn document_rows(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "document_rows").await?;
     Ok(Html(render_rows(&app, &access).await?).into_response())
 }
 
@@ -951,6 +953,7 @@ async fn tables(
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "tables").await?;
     let db = app.workspace_db(&id).await?;
     let list = with_db(db, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
@@ -1020,7 +1023,13 @@ async fn table(
     .await?;
     let described = described.ok_or_else(|| ApiError::not_found("no such table"))?;
     access
-        .audit(&app, "open", Some(("table", &name)), Outcome::Allowed, None)
+        .audit(
+            &app,
+            "open",
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({ "table": name })),
+        )
         .await?;
     html(&TablesPage {
         page: page(&app, &access.identity, &name, Some(&access)),
@@ -1050,6 +1059,7 @@ async fn sql_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "sql").await?;
     html(&SqlPage {
         page: page(&app, &access.identity, "SQL", Some(&access)),
         sql: String::new(),
@@ -1180,6 +1190,7 @@ async fn ontology_page(
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "ontology").await?;
     let db = app.workspace_db(&id).await?;
     let (ontology, versions, diff, queue, has_tables) = with_db(db, |db| {
         let current = ontology_store::current(db)?;
@@ -1594,6 +1605,7 @@ async fn context_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "context").await?;
     let db = app.workspace_db(&id).await?;
     let (current, versions) = with_db(db, |db| {
         Ok((context::current(db)?, context::history(db, 20)?))
@@ -1691,6 +1703,7 @@ async fn settings(
         ..Need::READ
     };
     let access = access(&app, identity, &id, need).await?;
+    access.audit_read(&app, "page", "settings").await?;
     settings_view(&app, &access, q.token, q.error).await
 }
 
@@ -2003,6 +2016,7 @@ async fn graph_page(
     Query(q): Query<GraphPageQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "graph").await?;
     let db = app.workspace_db(&id).await?;
     let options = app.config.graph.options();
     let query = GraphQueryView {
