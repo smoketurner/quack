@@ -6,7 +6,7 @@ real entity graph (shipments, purchase orders, vendors, manufacturing sites, pro
 countries, Incoterms, shipment modes) for the ontology and knowledge graph.
 
 ```bash
-make demo-data                                     # load into the workspace named "logistics"
+make demo-data EXAMPLE=logistics WORKSPACE=logistics   # load into the workspace named "logistics"
 examples/logistics/load.sh WORKSPACE               # load into the workspace named WORKSPACE (created if missing)
 examples/logistics/load.sh WORKSPACE --reset       # delete every document in WORKSPACE first, then load
 ```
@@ -55,5 +55,6 @@ untouched. Downloads are cached under `~/.cache/quack/examples/logistics/`.
 ## Adding an example
 
 Make a directory under `examples/` with a `README.md` like this one, a `load.sh` that is
-idempotent and takes `[WORKSPACE] [--reset]`, the documents it writes as real files, and a
-`context.md`. Only use data whose license allows redistribution, and say what it is.
+idempotent and takes `[WORKSPACE] [--reset]`, the documents it writes as real files, a
+`context.md`, and an `ontology.json` when the tables have keys worth mapping. Only use
+data whose license allows redistribution, and say what it is.

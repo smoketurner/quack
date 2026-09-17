@@ -63,9 +63,11 @@ quack mcp -w sales                                   # MCP server on stdio, for 
 quack user add alice --admin                         # server users, tokens, members, and the audit log
 ```
 
-`examples/logistics` is a ready-made workspace: USAID's shipment history as a table plus a
-data dictionary, an Incoterms guide, and an importing guide in the same vocabulary, so the
-same entities appear in SQL, search, and the graph. `make demo-data` loads it.
+`examples/storms` is a ready-made workspace that uses all of this: NOAA's 2024 Storm
+Events Database as three linked tables, Census population figures imported over HTTPS,
+the NWS documents that define every code in the tables, a pinned glossary, a shipped
+ontology, and a knowledge graph built from the mapped rows. `make demo-data` loads it;
+`examples/logistics` is a smaller supply-chain workspace.
 
 **What every interface shares.** Retrieval is hybrid (an exact cosine scan plus quack's own
 BM25 index with stemming, fused by reciprocal rank fusion, an optional reranker) and every

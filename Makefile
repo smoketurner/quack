@@ -11,8 +11,8 @@ BIN ?= quack
 BIND ?= 127.0.0.1:8080
 
 # Example under examples/ that `make demo-data` loads, and the workspace it fills.
-EXAMPLE ?= logistics
-WORKSPACE ?= logistics
+EXAMPLE ?= storms
+WORKSPACE ?= storms
 
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack
@@ -84,7 +84,7 @@ run: build ## Build and run a binary: make run [BIN=quack] [ARGS="..."]
 run-server: ## Serve the web UI and API locally without login: make run-server [BIND=127.0.0.1:8080]
 	$(CARGO) run --bin quack -- serve --local --bind $(BIND)
 
-demo-data: ## Load an example into a workspace: make demo-data [EXAMPLE=logistics] [WORKSPACE=logistics]
+demo-data: ## Load an example into a workspace: make demo-data [EXAMPLE=storms] [WORKSPACE=storms]
 	$(CARGO) build --bin quack
 	examples/$(EXAMPLE)/load.sh $(WORKSPACE)
 
