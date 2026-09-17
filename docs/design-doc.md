@@ -1272,12 +1272,16 @@ tick_rate_ms = 50
 - **mimalloc** (`secure`) as the global allocator.
 - **Crypto:** rustls + aws-lc-rs; `fips` as a build-time option; `cargo tree -i ring` and
   `-i openssl-sys` are release gates.
-- **Container image** for `quack serve`: CSS stage with the standalone Tailwind binary
-  (checksum verified), `rust:<MSRV>-alpine` with cargo-chef for the musl build (`cmake`,
-  `clang`, `go` for aws-lc), `distroless/static` `nonroot` runtime with `/quack` and
-  `/data`. `docker buildx bake` for `amd64` and `arm64`. The Rust image tag must track
-  `rust-toolchain.toml`. A compose file runs `quack serve` beside Ollama with the model
-  volume pre-populated; the image tarball is `docker load`ed on air-gapped hosts.
+- **Container image** for `quack serve`: `Dockerfile` builds from source (CSS stage with
+  the standalone Tailwind binary, checksum verified; `rust:<MSRV>-alpine` with cargo-chef
+  for the musl build, `cmake`, `clang`, `g++`, `perl` for DuckDB and aws-lc;
+  `distroless/static` `nonroot` runtime with `/quack` and `/data`, `QUACK_DATA_DIR=/data`,
+  `QUACK_CONFIG_DIR=/config`, port 8080); `Dockerfile.release` builds the same runtime
+  from the prebuilt musl binaries so the release job never compiles under emulation.
+  The Rust image tag must track `rust-toolchain.toml`. `docker-compose.yml` runs
+  `quack serve` beside Ollama with `deploy/config.toml` mounted at `/config`; the
+  per-architecture image tarballs from a release are `docker load`ed on air-gapped
+  hosts.
 - **Dependencies** follow the workspace rules in `CLAUDE.md`. New entries this design
   needs, versions looked up when added: `argon2`, an MCP crate,
   `docx-rs`, `scraper` or `html2text`, `serde_yaml` or `serde_yml` for ontology
@@ -1426,7 +1430,18 @@ updated as issues close. Ordered by risk.
 9. ~~Context `edited_by` and the `_quack_audit` detail table~~ (#24, closed): the
    server records the editing user and writes the detail row under the access row's id.
    Sections 5.3, 5.4, 12.
-10. **No release pipeline** (#30). Section 14.
+10. ~~No release pipeline~~ (#30, closed): `.github/workflows/release.yml` runs only on a
+    `v*` tag (or by hand): the gates (fmt, clippy, tests, `make release-gates` for the
+    ring and OpenSSL runtime-tree checks, cargo deny), reproducible static musl binaries
+    for x86_64 and aarch64 with CycloneDX SBOMs through `Dockerfile.build` and
+    `docker-bake.hcl` on native runners, native macOS (arm64, x86_64) and Windows
+    binaries, the `quack serve` image for amd64 and arm64 on GHCR built from the
+    prebuilt binaries (`Dockerfile.release`) plus per-architecture image tarballs for
+    `docker load` on air-gapped hosts, `SHA256SUMS`, a Homebrew formula
+    (`scripts/release/homebrew-formula.sh`, for a tap), and the GitHub release.
+    `Dockerfile` builds the same image from source for `make image` and
+    `docker-compose.yml`, which runs it beside Ollama with `deploy/config.toml`.
+    Section 14.
 11. ~~No stemming in keyword search~~ (#31, closed: Snowball English over the same
     tokenizer, schema version 6 rebuilds older term indexes on open); ~~no reranking
     hook~~ (#34, closed: `Reranker` trait, `none` or `model`); ~~large-workspace vector
@@ -1529,6 +1544,6 @@ deployment for document chat is the end of step 8.
 12. ~~MCP over stdio and SSE.~~ Done (streamable HTTP rather than SSE).
 13. ~~External data import (the Rust-side replacement for `ATTACH`), XLSX via a Rust
     reader~~ Done. `workspace snapshot` is still open.
-14. Release engineering: musl targets, macOS, Windows, container image, compose.
+14. ~~Release engineering: musl targets, macOS, Windows, container image, compose.~~ Done.
 15. AnythingLLM import command.
 16. `quack desktop` and installer bundles, last and only if there is demand.

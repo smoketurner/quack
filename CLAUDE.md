@@ -199,6 +199,8 @@ make fmt       # cargo fmt --all
 make lint      # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test      # cargo test --workspace --all-features
 make deny      # cargo deny check
+make release-gates   # no ring or OpenSSL in the runtime tree, then cargo deny (the release job runs it)
+make image     # the quack serve container image from source (docker buildx)
 make help      # list targets
 ```
 
@@ -211,6 +213,15 @@ cargo test --workspace <test_name>   # name filter across the workspace
 ```
 
 > Coverage and mutation testing are local-only: `make test-coverage`, `make test-mutants`.
+
+## Releases
+
+`.github/workflows/release.yml` runs on a `v*` tag only: gates, reproducible static musl
+binaries (`Dockerfile.build`, `docker-bake.hcl`), native macOS and Windows binaries, the
+multi-arch `quack serve` image on GHCR from the prebuilt binaries (`Dockerfile.release`)
+plus image tarballs for air-gapped hosts, `SHA256SUMS`, and a Homebrew formula
+(`scripts/release/`). `docker-compose.yml` with `deploy/config.toml` runs the image beside
+Ollama. Cut a release by pushing an annotated `vX.Y.Z` tag after the branch is pushed.
 
 ## Where to read more
 

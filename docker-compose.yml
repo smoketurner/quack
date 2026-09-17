@@ -1,0 +1,40 @@
+# `quack serve` beside Ollama, for a single host. On an air-gapped host,
+# `docker load` the image tarballs from a release, copy the models into the
+# `ollama` volume once, and `docker compose up -d`.
+#
+#   docker compose up -d
+#   docker compose exec quack /quack user add alice --admin
+#
+# The web UI and REST API answer on http://localhost:8080; the MCP endpoint is
+# /mcp/v1/{workspace}. deploy/config.toml points the chat and embedding models
+# at the ollama service; pull them once with:
+#   docker compose exec ollama ollama pull gpt-oss:20b
+#   docker compose exec ollama ollama pull qwen3-embedding:0.6b
+
+services:
+  quack:
+    image: ghcr.io/smoketurner/quack:latest
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      RUST_LOG: info
+      QUACK_DATA_DIR: /data
+      QUACK_CONFIG_DIR: /config
+      QUACK_BIND: 0.0.0.0:8080
+    volumes:
+      - quack-data:/data
+      - ./deploy:/config:ro
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.12.3
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  quack-data:
+  ollama:

@@ -1,0 +1,14 @@
+# quack configuration for the compose deployment: mounted at /config.
+# Models come from the `ollama` service; pull them once (see docker-compose.yml).
+
+[general]
+chat_model = "ollama/gpt-oss:20b"
+embedding_model = "ollama/qwen3-embedding:0.6b"
+
+[providers.ollama]
+type = "ollama"
+base_url = "http://ollama:11434"
+embedding_dimension = 1024
+
+[server]
+bind = "0.0.0.0:8080"

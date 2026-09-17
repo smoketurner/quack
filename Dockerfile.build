@@ -1,33 +1,29 @@
 # syntax=docker/dockerfile:1
 #
-# Sample Dockerfile for producing reproducible static musl binaries.
-# Driven by docker-bake.hcl (targets: ci, cli, server) and, in CI, a build
-# matrix that sets TARGET per runner architecture. This does NOT replace the
-# runtime server image in `Dockerfile`.
+# Reproducible static musl binaries of `quack`, driven by docker-bake.hcl
+# and, in the release workflow, a matrix that sets TARGET per runner
+# architecture. This does not replace the runtime image in `Dockerfile`.
 #
-# Uses cargo-chef so dependency compilation is cached: only workspace crates
-# recompile when source changes, as long as Cargo.toml/Cargo.lock are stable.
-#
-# Placeholder crates: `app-common`, `app-server`, `app-cli` — rename to yours.
-# The server binary embeds CSS via rust-embed; there is no Tailwind stage here,
-# so run `make css-build` before baking a target that builds `app-server`.
+# cargo-chef caches dependency compilation (DuckDB, aws-lc): only the
+# workspace crates recompile when the source changes, as long as
+# Cargo.toml and Cargo.lock are stable. The web UI's CSS is committed
+# (`make css-build`), so there is no Tailwind stage here.
 
 # Keep this Rust version in sync with rust-toolchain.toml.
 FROM rust:1.98.0-alpine AS base
-# Build dependencies to compile aws-lc-rs from source on musl. No openssl:
-# this stack uses aws-lc-rs exclusively (deny.toml bans openssl/ring).
-RUN apk add --no-cache musl-dev pkgconfig cmake make perl clang linux-headers
+# DuckDB (C++) and aws-lc-rs build from source on musl. No openssl: aws-lc-rs
+# is the only crypto provider (deny.toml bans openssl and ring).
+RUN apk add --no-cache musl-dev pkgconfig cmake make perl clang linux-headers g++
 
-# Install cargo-chef (cached with the base OS layer)
 RUN cargo install cargo-chef --locked
 
-# --- Planner: compute the dependency recipe ---
+# --- Planner: the dependency recipe ---
 FROM base AS planner
 WORKDIR /app
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# --- Builder: cook dependencies, then build workspace crates ---
+# --- Builder: cook the dependencies, then build the workspace ---
 FROM base AS builder
 
 ARG TARGET
@@ -35,39 +31,27 @@ ARG TARGET
 WORKDIR /app
 RUN rustup target add "${TARGET}"
 
-# Cook dependencies from the recipe (cached when only source files change)
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --locked --target "${TARGET}" --recipe-path recipe.json
+RUN cargo chef cook --release --locked --target "${TARGET}" --package quack --recipe-path recipe.json
 
-# Copy source and build workspace crates (only these recompile)
 COPY . .
 
-# Declare build-time ARGs after the cook layer so changes don't bust the cache
+# Declared after the cook layer so changes do not bust the cache.
 ARG SOURCE_DATE_EPOCH=0
 ARG GENERATE_SBOM=false
-ARG CARGO_PACKAGES="-p app-cli -p app-server"
 
-# Touch entry-point files for reproducible builds
-RUN touch -d "@${SOURCE_DATE_EPOCH}" \
-      crates/app-common/src/lib.rs \
-      crates/app-cli/src/main.rs \
-      crates/app-server/src/main.rs
+RUN touch -d "@${SOURCE_DATE_EPOCH}" crates/quack-core/src/lib.rs crates/quack/src/main.rs
 
-RUN cargo build --release --locked --target "${TARGET}" ${CARGO_PACKAGES}
+RUN cargo build --release --locked --target "${TARGET}" --package quack
 
-# Generate an SBOM if requested
 RUN if [ "${GENERATE_SBOM}" = "true" ]; then \
-      cargo install cargo-cyclonedx --version 0.5.6 \
+      cargo install cargo-cyclonedx --version 0.5.6 --locked \
       && cargo cyclonedx --target "${TARGET}" --format json; \
     fi
 
-# Collect only release binaries and SBOMs into /out
+# Only the binary and any SBOM go to /out.
 RUN mkdir -p "/out/target/${TARGET}/release" \
-    && for bin in app-cli app-server; do \
-         if [ -f "target/${TARGET}/release/${bin}" ]; then \
-           cp "target/${TARGET}/release/${bin}" "/out/target/${TARGET}/release/"; \
-         fi; \
-       done \
+    && cp "target/${TARGET}/release/quack" "/out/target/${TARGET}/release/" \
     && find crates/ -name "*cdx.json" 2>/dev/null | while read -r f; do \
          mkdir -p "/out/$(dirname "$f")"; \
          cp "$f" "/out/$f"; \

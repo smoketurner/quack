@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+#
+# The `quack serve` image from prebuilt static binaries: the release
+# workflow builds the musl binaries once per architecture and lays them
+# out as dist/linux-amd64/quack and dist/linux-arm64/quack, then bakes a
+# multi-arch image from this file without compiling anything. Same
+# runtime as Dockerfile: distroless static, nonroot, /quack and /data.
+
+FROM alpine:3.22 AS stage
+ARG TARGETARCH
+COPY dist/linux-${TARGETARCH}/quack /quack
+RUN chmod 0755 /quack && mkdir -p /data && chown 65532:65532 /data
+
+FROM gcr.io/distroless/static-debian13:nonroot
+
+WORKDIR /
+
+LABEL org.opencontainers.image.source=https://github.com/smoketurner/quack
+LABEL org.opencontainers.image.description="quack: an air-gapped knowledge engine (documents, tables, graph) with a web UI, REST API, and MCP server"
+LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
+
+COPY --from=stage /quack /quack
+COPY --from=stage --chown=nonroot:nonroot /data /data
+
+ENV RUST_LOG=info
+ENV QUACK_DATA_DIR=/data
+ENV QUACK_CONFIG_DIR=/config
+ENV QUACK_BIND=0.0.0.0:8080
+
+EXPOSE 8080
+
+ENTRYPOINT ["/quack"]
+CMD ["serve"]

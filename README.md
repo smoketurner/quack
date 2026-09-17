@@ -125,8 +125,13 @@ embedding_dimension = 768
 - **`.github/`** — CI (fmt, clippy, `cargo test`, dependency-review, `cargo-deny`; actions
   SHA-pinned, plus `secure_workflows.yml` enforcing SHA pins) and Dependabot (cargo +
   actions, grouped, 7-day cooldown).
-- **`Dockerfile`, `Dockerfile.build`, `docker-bake.hcl`** — sample container and static-build
-  files to be adapted for `quack serve` (design doc section 14).
+- **`Dockerfile`, `Dockerfile.release`, `Dockerfile.build`, `docker-bake.hcl`,
+  `docker-compose.yml`, `deploy/`** — the `quack serve` image (from source, and from the
+  release binaries), the reproducible static musl build, and a compose file that runs the
+  image beside Ollama (design doc section 14).
+- **`.github/workflows/release.yml`, `scripts/release/`** — the tag-triggered release:
+  binaries for Linux (musl), macOS, and Windows, the multi-arch image and its tarballs for
+  air-gapped hosts, checksums, and a Homebrew formula.
 - **`Makefile`** — `build`, `fmt`, `lint`, `test`, `deny`, `help`.
 - **`CLAUDE.md` + `.claude/rules/`** — conventions for Claude Code agents
   (code standards, development discipline, branching, Conventional Commits, continuous
@@ -143,7 +148,7 @@ embedding_dimension = 768
 | [docs/sea-query.md](docs/sea-query.md) | sea-query schema, `Iden` enums, query building for `control.db` |
 | [docs/crypto.md](docs/crypto.md) | aws-lc-rs default provider, keeping `ring`/OpenSSL out |
 | [docs/web-ui.md](docs/web-ui.md) | axum + askama + htmx + Tailwind patterns for `quack serve` |
-| [docs/ci-cd.md](docs/ci-cd.md) | CI jobs, and the Docker/build/scan/release patterns to wire up for releases |
+| [docs/ci-cd.md](docs/ci-cd.md) | CI jobs, the release workflow, the container images, and the compose deployment |
 
 ## License
 
