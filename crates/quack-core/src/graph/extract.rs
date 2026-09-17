@@ -170,7 +170,11 @@ pub struct ChunkText {
     pub text: String,
 }
 
-/// Chunks of ready documents, oldest document first, at most `limit`.
+/// Chunks of ready documents not yet extracted under any ontology
+/// version, sampled evenly across documents when `limit` is given
+/// (issue #60: the first N chunks by ingest order were one document's
+/// front matter). A run records each chunk it processed, so the next run
+/// sends only what is new; `graph extract --reset` clears the record.
 ///
 /// # Errors
 ///
@@ -179,24 +183,76 @@ pub fn chunks(db: &WorkspaceDb, limit: Option<u32>) -> Result<Vec<ChunkText>> {
     let mut stmt = db.connection().prepare(
         "SELECT c.id, c.document_id, c.content, c.heading FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = 'ready' ORDER BY d.ingested_at, d.id, c.chunk_index LIMIT ?",
+         WHERE d.status = 'ready' \
+           AND NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id) \
+         ORDER BY d.ingested_at, d.id, c.chunk_index",
     )?;
-    let limit = limit.map_or(i64::MAX, i64::from);
-    let mut rows = stmt.query(duckdb::params![limit])?;
-    let mut out = Vec::new();
+    let mut rows = stmt.query([])?;
+    let mut by_document: BTreeMap<String, Vec<ChunkText>> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
     while let Some(row) = rows.next()? {
         let heading: Option<String> = row.get(3)?;
         let content: String = row.get(2)?;
-        out.push(ChunkText {
-            chunk_id: row.get(0)?,
-            document_id: row.get(1)?,
-            text: match heading {
-                Some(h) => format!("{h}\n\n{content}"),
-                None => content,
-            },
-        });
+        let document_id: String = row.get(1)?;
+        if !by_document.contains_key(&document_id) {
+            order.push(document_id.clone());
+        }
+        by_document
+            .entry(document_id.clone())
+            .or_default()
+            .push(ChunkText {
+                chunk_id: row.get(0)?,
+                document_id,
+                text: match heading {
+                    Some(h) => format!("{h}\n\n{content}"),
+                    None => content,
+                },
+            });
     }
-    Ok(out)
+    let Some(limit) = limit else {
+        return Ok(order
+            .into_iter()
+            .filter_map(|id| by_document.remove(&id))
+            .flatten()
+            .collect());
+    };
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    if limit == 0 || order.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Every document gets an equal quota, spaced evenly through it.
+    let quota = limit.div_ceil(order.len()).max(1);
+    let mut chosen = Vec::with_capacity(limit);
+    for id in &order {
+        let Some(mut chunks) = by_document.remove(id) else {
+            continue;
+        };
+        let take = quota.min(chunks.len());
+        let mut positions: Vec<usize> = (0..take)
+            .map(|k| {
+                k.saturating_mul(chunks.len())
+                    .checked_div(take)
+                    .unwrap_or(0)
+                    .min(chunks.len().saturating_sub(1))
+            })
+            .collect();
+        positions.dedup();
+        // Highest first, so removing by index leaves the lower ones valid.
+        for position in positions.into_iter().rev() {
+            if position < chunks.len() {
+                chosen.push(chunks.remove(position));
+            }
+        }
+    }
+    chosen.sort_by(|a, b| {
+        order
+            .iter()
+            .position(|d| d == &a.document_id)
+            .cmp(&order.iter().position(|d| d == &b.document_id))
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+    chosen.truncate(limit);
+    Ok(chosen)
 }
 
 /// What an extraction run did.
@@ -239,19 +295,32 @@ pub async fn run(
                 continue;
             }
         };
+        tracing::debug!(
+            chunk = %chunk.chunk_id,
+            nodes = extraction.nodes.len(),
+            edges = extraction.edges.len(),
+            "graph extraction parsed"
+        );
         let validated = validate(ontology, extraction);
         summary.invalid_edges = summary
             .invalid_edges
             .saturating_add(validated.invalid_edges);
         summary.drift.absorb(&validated.drift);
         let (nodes, edges) = db.with(|db| {
-            store_validated(
-                db,
-                &validated,
-                &Source::chunk(&chunk.document_id, &chunk.chunk_id, MODEL_CONFIDENCE),
-                provisional,
-            )
+            db.under_timeout(|db| {
+                let counts = store_validated(
+                    db,
+                    &validated,
+                    &Source::chunk(&chunk.document_id, &chunk.chunk_id, MODEL_CONFIDENCE),
+                    provisional,
+                )?;
+                store::record_extracted(db, &chunk.chunk_id, ontology.version, counts)?;
+                Ok(counts)
+            })
         })?;
+        if nodes == 0 && edges == 0 {
+            tracing::debug!(chunk = %chunk.chunk_id, "graph extraction kept nothing from this chunk");
+        }
         summary.nodes = summary.nodes.saturating_add(nodes);
         summary.edges = summary.edges.saturating_add(edges);
     }

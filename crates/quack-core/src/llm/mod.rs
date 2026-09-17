@@ -191,6 +191,7 @@ impl graph_extract::GraphExtractor for RigGraphExtractor {
         Box::pin(async move {
             let answer =
                 stream_answer(&self.agent, text, EXTRACTION_TIMEOUT, "graph extraction").await?;
+            tracing::debug!(answer = %answer, "graph extraction answer");
             graph_extract::parse_extraction(&answer)
         })
     }

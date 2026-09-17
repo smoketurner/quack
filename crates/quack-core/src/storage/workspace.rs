@@ -666,6 +666,10 @@ impl WorkspaceDb {
     /// Returns an error if a delete fails.
     pub fn discard_chunks(&self, document_id: &str) -> Result<()> {
         self.conn.execute(
+            "DELETE FROM _quack_graph_extracted WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
+            duckdb::params![document_id],
+        )?;
+        self.conn.execute(
             "DELETE FROM _quack_terms WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
             duckdb::params![document_id],
         )?;
@@ -893,6 +897,10 @@ impl WorkspaceDb {
             None => fallback_table.map(str::to_owned).into_iter().collect(),
         };
         self.forget_graph_provenance(id, &tables)?;
+        self.conn.execute(
+            "DELETE FROM _quack_graph_extracted WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
+            duckdb::params![id],
+        )?;
         self.conn.execute(
             "DELETE FROM _quack_terms WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
             duckdb::params![id],

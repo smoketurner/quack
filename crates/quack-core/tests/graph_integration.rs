@@ -234,6 +234,36 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
     assert_eq!(found.nodes.len(), 7, "{}", found.nodes.len());
 }
 
+/// Sampling spreads across documents (issue #60): a second, longer
+/// document contributes as many chunks as the first to a sample of 2.
+#[test]
+fn extraction_samples_evenly_across_documents() {
+    let db = workspace();
+    db.insert_document(
+        &NewDocument::new("doc-2", "long.md", "text/markdown", 10).with_status("ready"),
+    )
+    .unwrap();
+    for i in 0..4 {
+        db.insert_chunk(&NewChunk {
+            id: &format!("l{i}"),
+            document_id: "doc-2",
+            chunk_index: i,
+            content: "Filler text about nothing in particular.",
+            heading: None,
+            page: None,
+            embedding: None,
+        })
+        .unwrap();
+    }
+    let sampled = extract::chunks(&db, Some(2)).unwrap();
+    let docs: std::collections::BTreeSet<&str> =
+        sampled.iter().map(|c| c.document_id.as_str()).collect();
+    assert_eq!(sampled.len(), 2, "{sampled:?}");
+    assert_eq!(docs.len(), 2, "one chunk from each document: {sampled:?}");
+    assert_eq!(extract::chunks(&db, Some(0)).unwrap().len(), 0);
+    assert_eq!(extract::chunks(&db, None).unwrap().len(), 6);
+}
+
 /// Resolution respects provenance (issue #41): two nodes from keyed rows
 /// are never merged or proposed however close their labels; a keyed node
 /// and an extracted look-alike are proposed for review, never
@@ -417,6 +447,12 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     let summary = extract::run(&db, chunks, &Canned, &current, false)
         .await
         .unwrap();
+    // Both chunks are on record (the failed one is not), so the next run
+    // sends only the failed one again.
+    assert_eq!(graph_store::extracted_chunks(&db).unwrap(), 1);
+    let remaining = extract::chunks(&db, None).unwrap();
+    assert_eq!(remaining.len(), 1, "{remaining:?}");
+    assert_eq!(remaining.first().map(|c| c.chunk_id.as_str()), Some("c2"));
     assert_eq!(
         (
             summary.chunks,

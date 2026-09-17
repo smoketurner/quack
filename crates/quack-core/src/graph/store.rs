@@ -449,10 +449,45 @@ pub fn clear(db: &WorkspaceDb) -> Result<()> {
     let conn = db.connection();
     conn.execute_batch(
         "DELETE FROM _quack_provenance; DELETE FROM _quack_graph_edges; \
-         DELETE FROM _quack_graph_nodes; DELETE FROM _quack_graph_merges;",
+         DELETE FROM _quack_graph_nodes; DELETE FROM _quack_graph_merges; \
+         DELETE FROM _quack_graph_extracted;",
     )?;
     db.set_meta_public(META_DRIFT, "{}")?;
     db.set_meta_public(META_BUILT_WITH, "0")
+}
+
+/// Note that a chunk was extracted under an ontology version, with what
+/// it yielded, so incremental runs skip it (issue #60).
+///
+/// # Errors
+///
+/// Returns an error if the write fails.
+pub fn record_extracted(
+    db: &WorkspaceDb,
+    chunk_id: &str,
+    ontology_version: u32,
+    (nodes, edges): (u32, u32),
+) -> Result<()> {
+    db.connection().execute(
+        "INSERT OR REPLACE INTO _quack_graph_extracted (chunk_id, ontology_version, nodes, edges) \
+         VALUES (?, ?, ?, ?)",
+        duckdb::params![chunk_id, ontology_version, nodes, edges],
+    )?;
+    Ok(())
+}
+
+/// How many chunks the record says were extracted.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn extracted_chunks(db: &WorkspaceDb) -> Result<u64> {
+    let count: i64 =
+        db.connection()
+            .query_row("SELECT count(*) FROM _quack_graph_extracted", [], |r| {
+                r.get(0)
+            })?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 /// Mark every node and edge reviewed (no longer provisional).

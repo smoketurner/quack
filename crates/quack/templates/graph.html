@@ -63,7 +63,7 @@
   <label class="inline-flex items-center gap-1">at most <input name="sample" type="number" min="1" placeholder="all" class="w-20 rounded border border-slate-300 px-2 py-1"> chunks</label>
   <label class="inline-flex items-center gap-1"><input type="checkbox" name="reset" value="true"> start from an empty graph</label>
   <button type="submit" class="rounded bg-slate-900 px-3 py-1 text-white hover:bg-slate-700">Extract</button>
-  <span class="text-slate-500">Documents cost one model call per chunk ({{ chunk_count }} ready) and run in the background.</span>
+  <span class="text-slate-500">Documents cost one model call per chunk ({{ chunk_count }} not yet extracted) and run in the background.</span>
 </form>
 {% endif %}
 {% if !has_ontology %}

@@ -282,7 +282,10 @@ async fn run_extract(
     if args.sources != Sources::Tables {
         let chunks = extract::chunks(db, args.sample)?;
         if chunks.is_empty() {
-            writeln!(out, "No ready documents to extract from.")?;
+            writeln!(
+                out,
+                "No chunks left to extract: every chunk of every ready document is on record (`--reset` starts over)."
+            )?;
         } else {
             let chat = config.chat_model_ref()?;
             writeln!(

@@ -240,6 +240,13 @@ pub fn ddl(dimension: u32) -> String {
             confidence DOUBLE,
             PRIMARY KEY (subject_id, chunk_id, table_name, row_key)
         );
+        CREATE TABLE IF NOT EXISTS _quack_graph_extracted (
+            chunk_id TEXT PRIMARY KEY,
+            ontology_version INTEGER NOT NULL,
+            nodes INTEGER NOT NULL,
+            edges INTEGER NOT NULL,
+            extracted_at TIMESTAMP DEFAULT now()
+        );
         CREATE TABLE IF NOT EXISTS _quack_graph_merges (
             id TEXT PRIMARY KEY,
             keep_node_id TEXT NOT NULL,

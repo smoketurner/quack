@@ -668,6 +668,12 @@ are never paired (WEST VIRGINIA is not VIRGINIA), a pair with one keyed side is 
 proposed with the keyed node kept, and auto-merge applies to two extracted nodes only.
 Each merge runs in one transaction. Aliases are kept in `properties.aliases`.
 
+**Extraction from documents** sends each chunk of a ready document to the chat model once:
+`_quack_graph_extracted` records every chunk processed (with the ontology version and what
+it yielded), so a later run sends only new chunks and `--reset` starts over; a sample of N
+takes chunks spaced evenly across documents rather than the first N by ingest order; the
+model's raw answer and the parse outcome are logged at debug level.
+
 **Extraction from tables** runs in batches of 5,000 keyed rows: each batch is staged in
 Rust (nodes, edges, and row provenance deduplicated, ids minted as UUID v7) and written
 with one statement per kind through scratch `_quack_tmp_graph_*` tables, inside one
