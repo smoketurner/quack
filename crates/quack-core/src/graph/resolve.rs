@@ -76,63 +76,106 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
     Ok(summary)
 }
 
+/// Nearest same-class neighbours considered per node; bounds the work
+/// and the proposals a big class can generate.
+const NEIGHBOURS_PER_NODE: u32 = 5;
+
+/// A pair worth looking at: close embeddings, same class.
+struct Candidate {
+    a_id: String,
+    a_label: String,
+    b_id: String,
+    b_label: String,
+    distance: f64,
+    /// Whether each side comes from a keyed table row.
+    a_keyed: bool,
+    b_keyed: bool,
+}
+
 /// Compare every embedded node with its nearest same-class neighbours;
 /// returns (auto-merged, proposed).
+///
+/// Two nodes that both come from keyed table rows are distinct by
+/// construction (different keys), so they are never candidates, however
+/// alike their labels (issue #41: WEST VIRGINIA is not VIRGINIA). A pair
+/// with one keyed side is only ever proposed; auto-merge is reserved for
+/// two model-extracted nodes.
 fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)> {
     let mut stmt = db.connection().prepare(
-        "SELECT a.id, a.label, a.class_id, b.id, b.label, array_cosine_distance(a.embedding, b.embedding) AS d \
-         FROM _quack_graph_nodes a JOIN _quack_graph_nodes b \
-           ON a.class_id = b.class_id AND a.id < b.id \
-         WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL \
-           AND array_cosine_distance(a.embedding, b.embedding) <= ? \
-         ORDER BY d, a.id, b.id",
+        "WITH keyed AS (SELECT DISTINCT subject_id FROM _quack_provenance WHERE table_name <> ''), \
+         pairs AS ( \
+           SELECT a.id AS a_id, a.label AS a_label, b.id AS b_id, b.label AS b_label, \
+                  array_cosine_distance(a.embedding, b.embedding) AS d, \
+                  EXISTS (SELECT 1 FROM keyed k WHERE k.subject_id = a.id) AS a_keyed, \
+                  EXISTS (SELECT 1 FROM keyed k WHERE k.subject_id = b.id) AS b_keyed \
+           FROM _quack_graph_nodes a JOIN _quack_graph_nodes b \
+             ON a.class_id = b.class_id AND a.id < b.id \
+           WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL \
+             AND array_cosine_distance(a.embedding, b.embedding) <= ? \
+           QUALIFY row_number() OVER (PARTITION BY a.id ORDER BY d, b.id) <= ? \
+         ) \
+         SELECT a_id, a_label, b_id, b_label, d, a_keyed, b_keyed FROM pairs \
+         WHERE NOT (a_keyed AND b_keyed) \
+         ORDER BY d, a_id, b_id",
     )?;
-    let mut rows = stmt.query(duckdb::params![options.merge_threshold])?;
-    let mut candidates: Vec<(String, String, String, String, f64)> = Vec::new();
+    let mut rows = stmt.query(duckdb::params![
+        options.merge_threshold,
+        NEIGHBOURS_PER_NODE
+    ])?;
+    let mut candidates: Vec<Candidate> = Vec::new();
     while let Some(row) = rows.next()? {
-        candidates.push((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-        ));
+        candidates.push(Candidate {
+            a_id: row.get(0)?,
+            a_label: row.get(1)?,
+            b_id: row.get(2)?,
+            b_label: row.get(3)?,
+            distance: row.get(4)?,
+            a_keyed: row.get(5)?,
+            b_keyed: row.get(6)?,
+        });
     }
     drop(rows);
     drop(stmt);
     let mut auto = 0u32;
     let mut proposed = 0u32;
     let mut gone: BTreeSet<String> = BTreeSet::new();
-    for (a_id, a_label, b_id, b_label, distance) in candidates {
-        if gone.contains(&a_id) || gone.contains(&b_id) || !share_token(&a_label, &b_label) {
+    for candidate in candidates {
+        if gone.contains(&candidate.a_id)
+            || gone.contains(&candidate.b_id)
+            || !share_token(&candidate.a_label, &candidate.b_label)
+        {
             continue;
         }
-        // Keep the node with more provenance; on a tie the earlier id.
-        let (keep, drop) = if provenance_count(db, &b_id)? > provenance_count(db, &a_id)? {
-            (b_id, a_id)
-        } else {
-            (a_id, b_id)
+        // Keep the keyed node, else the one with more provenance, else
+        // the earlier id.
+        let prefer_b = match (candidate.a_keyed, candidate.b_keyed) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => provenance_count(db, &candidate.b_id)? > provenance_count(db, &candidate.a_id)?,
         };
-        if distance <= options.auto_merge_threshold {
+        let (keep, drop) = if prefer_b {
+            (candidate.b_id, candidate.a_id)
+        } else {
+            (candidate.a_id, candidate.b_id)
+        };
+        let extracted_only = !candidate.a_keyed && !candidate.b_keyed;
+        if extracted_only && candidate.distance <= options.auto_merge_threshold {
             merge_nodes(db, &keep, &drop)?;
             gone.insert(drop);
             auto = auto.saturating_add(1);
             continue;
         }
-        let already: Option<String> = db
-            .connection()
-            .query_row(
-                "SELECT status FROM _quack_graph_merges WHERE keep_node_id = ? AND drop_node_id = ?",
-                duckdb::params![keep, drop],
-                |r| r.get(0),
-            )
-            .ok();
-        if already.is_some() {
+        let already: i64 = db.connection().query_row(
+            "SELECT count(*) FROM _quack_graph_merges WHERE keep_node_id = ? AND drop_node_id = ?",
+            duckdb::params![keep, drop],
+            |r| r.get(0),
+        )?;
+        if already > 0 {
             continue;
         }
         db.connection().execute(
             "INSERT INTO _quack_graph_merges (id, keep_node_id, drop_node_id, distance) VALUES (?, ?, ?, ?)",
-            duckdb::params![uuid::Uuid::now_v7().to_string(), keep, drop, distance],
+            duckdb::params![uuid::Uuid::now_v7().to_string(), keep, drop, candidate.distance],
         )?;
         proposed = proposed.saturating_add(1);
     }
@@ -161,11 +204,21 @@ pub fn share_token(a: &str, b: &str) -> bool {
 
 /// Fold `drop` into `keep`: edges are repointed (duplicates removed),
 /// provenance moves over, the dropped label joins `properties.aliases`.
+/// The steps run in one transaction, so a failure part way leaves both
+/// nodes as they were.
 ///
 /// # Errors
 ///
 /// Returns an error when either node is missing or a write fails.
 pub fn merge_nodes(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
+    let conn = db.connection();
+    let tx = conn.unchecked_transaction()?;
+    merge_nodes_in(db, keep, drop)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn merge_nodes_in(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
     let keep_node =
         store::node(db, keep)?.ok_or_else(|| Error::Analysis(format!("no node {keep}")))?;
     let drop_node =

@@ -649,9 +649,13 @@ deterministically, with provenance `table_name` and `row_key`. Re-running is ide
 
 **Entity resolution.** Nodes are merged on `(normalized_label, class_id)`. A second pass
 proposes merges for nodes of the same class whose label embeddings are within a cosine
-threshold (default 0.08) and whose labels share a token; proposals above a confidence
-threshold merge automatically, others land in `_quack_ontology_candidates` with
-`kind = 'merge'` for review. Aliases are kept in `properties.aliases`.
+threshold (default 0.08) and whose labels share a token, looking at each node's five
+nearest neighbours; proposals above a confidence threshold merge automatically, others
+land in `_quack_ontology_candidates` with `kind = 'merge'` for review. Provenance rules
+the pass: two nodes that both come from keyed table rows are distinct by construction and
+are never paired (WEST VIRGINIA is not VIRGINIA), a pair with one keyed side is only ever
+proposed with the keyed node kept, and auto-merge applies to two extracted nodes only.
+Each merge runs in one transaction. Aliases are kept in `properties.aliases`.
 
 **Provenance.** Every node and edge has at least one `_quack_provenance` row. Answers from
 the graph cite the source chunk or row the same way document answers cite chunks.

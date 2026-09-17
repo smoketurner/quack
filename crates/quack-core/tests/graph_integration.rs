@@ -193,6 +193,75 @@ impl GraphExtractor for Canned {
     }
 }
 
+/// Resolution respects provenance (issue #41): two nodes from keyed rows
+/// are never merged or proposed however close their labels; a keyed node
+/// and an extracted look-alike are proposed for review, never
+/// auto-merged; two extracted look-alikes still auto-merge.
+#[tokio::test]
+async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, false).unwrap();
+    let node = |label: &str| NewNode {
+        label: label.to_owned(),
+        class_id: String::from("country"),
+        properties: serde_json::json!({}),
+        provisional: false,
+    };
+    // "Kenya" (from the table) and "Kenya Coast" embed identically under
+    // LetterEmbedding (same first letter, same length mod 3) and share a
+    // token: the old pass auto-merged such pairs.
+    let coast = graph_store::upsert_node(&db, &node("Kenya Coast")).unwrap();
+    graph_store::add_provenance(&db, &coast, &graph_store::Source::row("places", "KC")).unwrap();
+    // An extracted look-alike of a keyed node, and two extracted
+    // look-alikes of each other.
+    let doc = |chunk: &str| graph_store::Source::chunk("doc-1", chunk, 0.9);
+    let kenya_ltd = graph_store::upsert_node(&db, &node("Kenya Ltd")).unwrap();
+    graph_store::add_provenance(&db, &kenya_ltd, &doc("c1")).unwrap();
+    let uganda_north = graph_store::upsert_node(&db, &node("Uganda North")).unwrap();
+    graph_store::add_provenance(&db, &uganda_north, &doc("c1")).unwrap();
+    let uganda_south = graph_store::upsert_node(&db, &node("Uganda South")).unwrap();
+    graph_store::add_provenance(&db, &uganda_south, &doc("c2")).unwrap();
+    let before = graph_store::status(&db).unwrap().nodes;
+
+    let options = GraphOptions {
+        merge_threshold: 0.5,
+        auto_merge_threshold: 0.05,
+        ..GraphOptions::default()
+    };
+    let resolved = resolve::resolve(&db, Some(&LetterEmbedding), &options)
+        .await
+        .unwrap();
+    assert_eq!(resolved.auto_merged, 1, "{resolved:?}");
+    assert_eq!(graph_store::status(&db).unwrap().nodes, before - 1);
+    // Both keyed Kenyas survive.
+    assert!(graph_store::node(&db, &coast).unwrap().is_some());
+    let pending = resolve::pending(&db).unwrap();
+    let pairs: Vec<(String, String)> = pending
+        .iter()
+        .map(|m| (m.keep.label.clone(), m.drop.label.clone()))
+        .collect();
+    // Kenya and Kenya Coast (both keyed) are never paired with each other.
+    assert!(
+        !pairs.iter().any(|(k, d)| {
+            (k == "Kenya" && d == "Kenya Coast") || (k == "Kenya Coast" && d == "Kenya")
+        }),
+        "{pairs:?}"
+    );
+    // The keyed node is the one kept; the extracted look-alike would drop.
+    assert!(
+        pairs.contains(&(String::from("Kenya"), String::from("Kenya Ltd"))),
+        "{pairs:?}"
+    );
+    assert!(graph_store::node(&db, &kenya_ltd).unwrap().is_some());
+    // The two Ugandas from documents merged on their own.
+    let ugandas = [uganda_north, uganda_south]
+        .iter()
+        .filter(|id| graph_store::node(&db, id).unwrap().is_some())
+        .count();
+    assert_eq!(ugandas, 1);
+}
+
 /// Deleting a document takes with it the nodes and edges only it
 /// supported (issue #43): a document's chunk provenance, then a table's
 /// row provenance when the document that loaded the table goes. What
