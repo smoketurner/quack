@@ -3,7 +3,7 @@
 //! share a token are proposed as merges; the closest merge on their own,
 //! the rest wait in `_quack_graph_merges` for review.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::store::{self, id_list};
 use super::{GraphOptions, Node};
@@ -70,7 +70,10 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
             .embedded
             .saturating_add(u32::try_from(pending.len()).unwrap_or(u32::MAX));
     }
-    let (auto_merged, proposed) = db.with(|db| propose_merges(db, options))?;
+    let (auto_merged, proposed) = db.with(|db| {
+        log_memory(db, "before merge proposals");
+        propose_merges(db, options)
+    })?;
     summary.auto_merged = auto_merged;
     summary.proposed = proposed;
     Ok(summary)
@@ -101,33 +104,41 @@ struct Candidate {
 /// with one keyed side is only ever proposed; auto-merge is reserved for
 /// two model-extracted nodes.
 fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)> {
+    // The keyed flag is computed per node before the join: a correlated
+    // EXISTS per pair row, or a window over the pairs, made DuckDB run
+    // out of its 256 MiB on 3,667 nodes, while this streams in seconds.
+    // The per-node cap is applied below, in candidate order.
     let mut stmt = db.connection().prepare(
-        "WITH keyed AS (SELECT DISTINCT subject_id FROM _quack_provenance WHERE table_name <> ''), \
-         pairs AS ( \
-           SELECT a.id AS a_id, a.label AS a_label, b.id AS b_id, b.label AS b_label, \
-                  array_cosine_distance(a.embedding, b.embedding) AS d, \
-                  EXISTS (SELECT 1 FROM keyed k WHERE k.subject_id = a.id) AS a_keyed, \
-                  EXISTS (SELECT 1 FROM keyed k WHERE k.subject_id = b.id) AS b_keyed \
-           FROM _quack_graph_nodes a JOIN _quack_graph_nodes b \
-             ON a.class_id = b.class_id AND a.id < b.id \
-           WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL \
-             AND array_cosine_distance(a.embedding, b.embedding) <= ? \
-           QUALIFY row_number() OVER (PARTITION BY a.id ORDER BY d, b.id) <= ? \
-         ) \
-         SELECT a_id, a_label, b_id, b_label, d, a_keyed, b_keyed FROM pairs \
-         WHERE NOT (a_keyed AND b_keyed) \
-         ORDER BY d, a_id, b_id",
+        "WITH n AS ( \
+           SELECT id, label, class_id, embedding, \
+                  EXISTS (SELECT 1 FROM _quack_provenance p \
+                          WHERE p.subject_id = _quack_graph_nodes.id AND p.table_name <> '') AS keyed \
+           FROM _quack_graph_nodes WHERE embedding IS NOT NULL) \
+         SELECT a.id, a.label, b.id, b.label, \
+                array_cosine_distance(a.embedding, b.embedding) AS d, a.keyed, b.keyed \
+         FROM n a JOIN n b ON a.class_id = b.class_id AND a.id < b.id \
+         WHERE NOT (a.keyed AND b.keyed) \
+           AND array_cosine_distance(a.embedding, b.embedding) <= ? \
+         ORDER BY d, a.id, b.id",
     )?;
-    let mut rows = stmt.query(duckdb::params![
-        options.merge_threshold,
-        NEIGHBOURS_PER_NODE
-    ])?;
+    let mut rows = stmt.query(duckdb::params![options.merge_threshold])?;
     let mut candidates: Vec<Candidate> = Vec::new();
+    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
     while let Some(row) = rows.next()? {
+        let a_id: String = row.get(0)?;
+        let b_id: String = row.get(2)?;
+        // Each node keeps its NEIGHBOURS_PER_NODE closest candidates.
+        let a_seen = seen.get(&a_id).copied().unwrap_or(0);
+        let b_seen = seen.get(&b_id).copied().unwrap_or(0);
+        if a_seen >= NEIGHBOURS_PER_NODE || b_seen >= NEIGHBOURS_PER_NODE {
+            continue;
+        }
+        seen.insert(a_id.clone(), a_seen.saturating_add(1));
+        seen.insert(b_id.clone(), b_seen.saturating_add(1));
         candidates.push(Candidate {
-            a_id: row.get(0)?,
+            a_id,
             a_label: row.get(1)?,
-            b_id: row.get(2)?,
+            b_id,
             b_label: row.get(3)?,
             distance: row.get(4)?,
             a_keyed: row.get(5)?,
@@ -180,6 +191,29 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
         proposed = proposed.saturating_add(1);
     }
     Ok((auto, proposed))
+}
+
+/// `DuckDB`'s own account of its memory, at debug level, for the moments
+/// the pass gets near `[analysis].memory_limit_mb`.
+fn log_memory(db: &WorkspaceDb, moment: &str) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let Ok(mut stmt) = db
+        .connection()
+        .prepare("SELECT tag, memory_usage_bytes, temporary_storage_bytes FROM duckdb_memory() WHERE memory_usage_bytes > 0 ORDER BY memory_usage_bytes DESC")
+    else {
+        return;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        let tag: String = row.get(0).unwrap_or_default();
+        let used: i64 = row.get(1).unwrap_or_default();
+        let temp: i64 = row.get(2).unwrap_or_default();
+        tracing::debug!(moment, tag, used, temp, "duckdb memory");
+    }
 }
 
 fn provenance_count(db: &WorkspaceDb, id: &str) -> Result<i64> {
