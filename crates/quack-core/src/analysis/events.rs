@@ -14,6 +14,20 @@ use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
 
 /// One tool invocation, recorded for the transcript and the final response.
+/// Lines of a step's detail every interface shows before folding the
+/// rest (the terminal's `/steps` and print mode's `--verbose` show all).
+pub const STEP_PREVIEW_LINES: usize = 3;
+
+/// The first `STEP_PREVIEW_LINES` lines of a detail and how many follow.
+#[must_use]
+pub fn preview_detail(detail: &str) -> (Vec<&str>, usize) {
+    let total = detail.lines().count();
+    (
+        detail.lines().take(STEP_PREVIEW_LINES).collect(),
+        total.saturating_sub(STEP_PREVIEW_LINES),
+    )
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolStep {
     pub tool: String,

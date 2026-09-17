@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::terminal::app::{App, AppState, MessageRole};
 use crate::terminal::chart;
@@ -88,17 +88,18 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let lines = format_messages(app);
+    // Lines are wrapped here, to the real width, so the scroll range is
+    // computed on what is drawn and the newest content is reachable
+    // (issue #49); the paragraph itself does no wrapping.
+    let lines = format_messages(app, usize::from(area.width));
     let total_lines = lines.len();
     let visible = usize::from(area.height);
     let max_scroll = total_lines.saturating_sub(visible);
-    let effective_scroll = max_scroll.saturating_sub(app.scroll_offset);
+    let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
     let scroll_u16 = u16::try_from(effective_scroll).unwrap_or(u16::MAX);
 
     let text = Text::from(lines);
-    let paragraph = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_u16, 0));
+    let paragraph = Paragraph::new(text).scroll((scroll_u16, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -194,7 +195,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(status), area);
 }
 
-fn format_messages(app: &App) -> Vec<Line<'static>> {
+pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for msg in &app.messages {
@@ -206,7 +207,6 @@ fn format_messages(app: &App) -> Vec<Line<'static>> {
             MessageRole::System => ("   ", Style::default().fg(Color::DarkGray)),
             MessageRole::Error => ("   ", Style::default().fg(Color::Red)),
         };
-
         let prompt_style = if msg.role == MessageRole::User {
             Style::default()
                 .fg(Color::Green)
@@ -214,24 +214,40 @@ fn format_messages(app: &App) -> Vec<Line<'static>> {
         } else {
             style
         };
-
+        let body: Vec<Vec<Span<'static>>> = match msg.role {
+            MessageRole::Assistant => markdown::render(&msg.content),
+            MessageRole::Step => step_body(msg, app.expand_steps, style),
+            _ => msg
+                .content
+                .lines()
+                .map(|l| vec![Span::styled(l.to_owned(), style)])
+                .collect(),
+        };
         let mut first = true;
-        for line_text in msg.content.lines() {
+        for spans in body {
             let p = if first {
                 first = false;
                 prefix
-            } else if msg.role == MessageRole::User {
-                "   "
             } else {
-                prefix
+                "   "
             };
-
-            lines.push(Line::from(vec![
-                Span::styled(p.to_owned(), prompt_style),
-                Span::styled(line_text.to_owned(), style),
-            ]));
+            for row in wrap::wrap(&spans, width.saturating_sub(p.chars().count())) {
+                let mut with_prefix = vec![Span::styled(p.to_owned(), prompt_style)];
+                with_prefix.extend(row);
+                lines.push(Line::from(with_prefix));
+            }
         }
-
+        if let Some(chart) = &msg.chart {
+            let note = vec![Span::styled(
+                format!("[chart: {}; /chart shows it]", chart.title),
+                Style::default().fg(Color::Magenta),
+            )];
+            for row in wrap::wrap(&note, width.saturating_sub(3)) {
+                let mut with_prefix = vec![Span::raw("   ")];
+                with_prefix.extend(row);
+                lines.push(Line::from(with_prefix));
+            }
+        }
         lines.push(Line::from(""));
     }
 
@@ -248,6 +264,42 @@ fn format_messages(app: &App) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// A step: its header and outcome, then the detail in full when expanded
+/// or its first lines with a count of the rest.
+fn step_body(
+    msg: &crate::terminal::app::Message,
+    expanded: bool,
+    style: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let mut rows: Vec<Vec<Span<'static>>> = msg
+        .content
+        .lines()
+        .map(|l| vec![Span::styled(l.to_owned(), style)])
+        .collect();
+    let Some(detail) = msg.detail.as_deref().filter(|d| !d.trim().is_empty()) else {
+        return rows;
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let (shown, more): (Vec<&str>, usize) = if expanded {
+        (detail.lines().collect(), 0)
+    } else {
+        quack_core::analysis::events::preview_detail(detail)
+    };
+    let at = rows.len().min(1);
+    let mut detail_rows: Vec<Vec<Span<'static>>> = shown
+        .into_iter()
+        .map(|l| vec![Span::styled(format!("  {l}"), dim)])
+        .collect();
+    if more > 0 {
+        detail_rows.push(vec![Span::styled(
+            format!("  ({more} more lines; /steps expands)"),
+            dim,
+        )]);
+    }
+    rows.splice(at..at, detail_rows);
+    rows
 }
 
 fn state_label(state: &AppState) -> &'static str {
@@ -272,4 +324,228 @@ fn spinner_frame(tick: usize) -> &'static str {
 fn separator_line(width: u16) -> Line<'static> {
     let w = usize::from(width);
     Line::styled("\u{2500}".repeat(w), Style::default().fg(Color::DarkGray))
+}
+
+/// Wrapping of styled spans to a width, by characters, breaking at the
+/// last space when one is near.
+pub(crate) mod wrap {
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+
+    pub(crate) fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+        let width = width.max(1);
+        let chars: Vec<(char, Style)> = spans
+            .iter()
+            .flat_map(|s| {
+                let style = s.style;
+                s.content
+                    .chars()
+                    .map(move |c| (c, style))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if chars.is_empty() {
+            return vec![Vec::new()];
+        }
+        let mut rows = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let mut end = start.saturating_add(width).min(chars.len());
+            if end < chars.len() {
+                // Prefer the last space in the row, if it is not too early.
+                if let Some(space) = chars
+                    .get(start..end)
+                    .and_then(|row| row.iter().rposition(|(c, _)| *c == ' '))
+                    .filter(|pos| pos.saturating_mul(2) > width)
+                {
+                    end = start.saturating_add(space).saturating_add(1);
+                }
+            }
+            rows.push(regroup(chars.get(start..end).unwrap_or(&[])));
+            start = end;
+        }
+        rows
+    }
+
+    /// Consecutive characters of one style back into spans.
+    fn regroup(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut current = String::new();
+        let mut current_style: Option<Style> = None;
+        for (c, style) in chars {
+            if current_style != Some(*style) {
+                if let Some(s) = current_style
+                    && !current.is_empty()
+                {
+                    spans.push(Span::styled(std::mem::take(&mut current), s));
+                }
+                current_style = Some(*style);
+            }
+            current.push(*c);
+        }
+        if let Some(s) = current_style
+            && !current.is_empty()
+        {
+            spans.push(Span::styled(current, s));
+        }
+        spans
+    }
+}
+
+/// A light Markdown rendering for the transcript: headings bold, bullets
+/// as dots, fenced code dim and verbatim, `**bold**`, `*italic*`, and
+/// `` `code` `` inline. Tables pass through as their source lines.
+pub(crate) mod markdown {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Span;
+
+    pub(crate) fn render(content: &str) -> Vec<Vec<Span<'static>>> {
+        let mut rows = Vec::new();
+        let mut in_fence = false;
+        for line in content.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                rows.push(vec![Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(Color::Cyan),
+                )]);
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if let Some(heading) = trimmed.strip_prefix('#') {
+                let text = heading.trim_start_matches('#').trim();
+                rows.push(vec![Span::styled(
+                    text.to_owned(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]);
+                continue;
+            }
+            let indent = line.len().saturating_sub(trimmed.len());
+            let (bullet, rest) = match trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                Some(rest) => ("\u{2022} ", rest),
+                None => ("", trimmed),
+            };
+            let mut spans = Vec::new();
+            if indent > 0 || !bullet.is_empty() {
+                spans.push(Span::raw(format!("{}{bullet}", " ".repeat(indent))));
+            }
+            spans.extend(inline(rest));
+            rows.push(spans);
+        }
+        if rows.is_empty() {
+            rows.push(Vec::new());
+        }
+        rows
+    }
+
+    /// Inline `**bold**`, `*italic*`, and `` `code` `` runs.
+    fn inline(text: &str) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        let mut plain = String::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("**")
+                && let Some(end) = after.find("**")
+            {
+                flush(&mut spans, &mut plain, Style::default());
+                spans.push(Span::styled(
+                    after.get(..end).unwrap_or("").to_owned(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                rest = after.get(end.saturating_add(2)..).unwrap_or("");
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix('`')
+                && let Some(end) = after.find('`')
+            {
+                flush(&mut spans, &mut plain, Style::default());
+                spans.push(Span::styled(
+                    after.get(..end).unwrap_or("").to_owned(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                rest = after.get(end.saturating_add(1)..).unwrap_or("");
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix('*')
+                && !after.starts_with(' ')
+                && let Some(end) = after.find('*')
+                && end > 0
+            {
+                flush(&mut spans, &mut plain, Style::default());
+                spans.push(Span::styled(
+                    after.get(..end).unwrap_or("").to_owned(),
+                    Style::default().add_modifier(Modifier::ITALIC),
+                ));
+                rest = after.get(end.saturating_add(1)..).unwrap_or("");
+                continue;
+            }
+            let mut chars = rest.chars();
+            if let Some(c) = chars.next() {
+                plain.push(c);
+            }
+            rest = chars.as_str();
+        }
+        flush(&mut spans, &mut plain, Style::default());
+        spans
+    }
+
+    fn flush(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
+        if !plain.is_empty() {
+            spans.push(Span::styled(std::mem::take(plain), style));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(rows: &[Vec<Span<'static>>]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn wrapping_breaks_at_spaces_and_keeps_every_character() {
+        let rows = wrap::wrap(&[Span::raw("the quick brown fox jumps over")], 10);
+        let lines = text_of(&rows);
+        assert_eq!(lines, ["the quick ", "brown fox ", "jumps over"]);
+        let long = wrap::wrap(&[Span::raw("abcdefghijkl")], 5);
+        assert_eq!(text_of(&long), ["abcde", "fghij", "kl"]);
+        assert_eq!(wrap::wrap(&[], 5).len(), 1, "an empty line is one row");
+    }
+
+    #[test]
+    fn markdown_renders_headings_bullets_fences_and_inline_marks() {
+        let rows = markdown::render(
+            "## Deadliest\n- **Tornado** in `Texas`\n```sql\nSELECT 1\n```\n| a | b |",
+        );
+        let lines = text_of(&rows);
+        assert_eq!(
+            lines,
+            [
+                "Deadliest",
+                "\u{2022} Tornado in Texas",
+                "  SELECT 1",
+                "| a | b |"
+            ]
+        );
+        assert!(
+            rows.first()
+                .and_then(|r| r.first())
+                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(
+            rows.get(1)
+                .and_then(|r| r.get(1))
+                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
 }

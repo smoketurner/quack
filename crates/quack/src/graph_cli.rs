@@ -79,12 +79,17 @@ pub(crate) enum GraphAction {
     Reject { ids: Vec<String> },
 }
 
-pub(crate) async fn run(config: &Config, db: &WorkspaceDb, action: GraphAction) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+/// Run one graph action, writing what the user should see to `out`
+/// (stdout for the CLI, the transcript for the terminal session).
+pub(crate) async fn run(
+    config: &Config,
+    db: &WorkspaceDb,
+    action: GraphAction,
+    out: &mut impl Write,
+) -> Result<()> {
     match action {
-        search @ GraphAction::Search { .. } => run_search(config, db, &mut out, search).await?,
-        path @ GraphAction::Path { .. } => run_path(config, db, &mut out, path).await?,
+        search @ GraphAction::Search { .. } => run_search(config, db, out, search).await?,
+        path @ GraphAction::Path { .. } => run_path(config, db, out, path).await?,
         GraphAction::Status { json } => {
             let status = graph_store::status(db)?;
             if json {
@@ -110,7 +115,7 @@ pub(crate) async fn run(config: &Config, db: &WorkspaceDb, action: GraphAction) 
             run_extract(
                 config,
                 db,
-                &mut out,
+                out,
                 ExtractArgs {
                     sources,
                     sample,

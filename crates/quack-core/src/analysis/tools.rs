@@ -216,7 +216,9 @@ impl Tool for RunSqlTool {
 
 pub struct SearchDocumentsTool<M> {
     db: SharedDb,
-    embedding_model: M,
+    /// `None` runs keyword search alone: a workspace without an embedding
+    /// provider still answers from its documents.
+    embedding_model: Option<M>,
     default_top_k: u32,
     rrf_k: u32,
     reranker: Option<Arc<dyn Reranker>>,
@@ -227,7 +229,7 @@ pub struct SearchDocumentsTool<M> {
 impl<M> SearchDocumentsTool<M> {
     pub fn new(
         db: SharedDb,
-        embedding_model: M,
+        embedding_model: Option<M>,
         default_top_k: u32,
         rrf_k: u32,
         recorder: TurnRecorder,
@@ -336,19 +338,23 @@ where
             format!("{} (in {})", args.query, args.document_ids.join(", "))
         };
         let step = self.recorder.start(Self::NAME, &detail);
-        let embedding = match self.embedding_model.embed_text(&args.query).await {
-            Ok(e) => e,
-            Err(e) => {
-                step.finish(format!("error: {e}"));
-                return Err(ToolError::Embedding(e.to_string()));
-            }
+        let query_vec: Option<Vec<f32>> = match &self.embedding_model {
+            None => None,
+            Some(model) => match model.embed_text(&args.query).await {
+                Ok(embedding) => {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
+                    )]
+                    let vector: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
+                    Some(vector)
+                }
+                Err(e) => {
+                    step.finish(format!("error: {e}"));
+                    return Err(ToolError::Embedding(e.to_string()));
+                }
+            },
         };
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
-        )]
-        let query_vec: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
 
         let top_k = args.top_k.unwrap_or(self.default_top_k).max(1);
         let fetch = if self.reranker.is_some() {
@@ -360,8 +366,13 @@ where
         let results = {
             let db = lock(&self.db)?;
             resolve_document_ids(&db, &args.document_ids).and_then(|ids| {
-                db.search_hybrid_chunks(&args.query, &query_vec, fetch, self.rrf_k, &ids)
-                    .map_err(|e| ToolError::Query(e.to_string()))
+                match &query_vec {
+                    Some(vector) => {
+                        db.search_hybrid_chunks(&args.query, vector, fetch, self.rrf_k, &ids)
+                    }
+                    None => db.search_keyword_chunks(&args.query, fetch, &ids),
+                }
+                .map_err(|e| ToolError::Query(e.to_string()))
             })
         };
         let results = match results {
@@ -901,6 +912,113 @@ mod tests {
             Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
         ));
         assert!(!refused.was_refused());
+    }
+
+    /// Without an embedding model the search tool answers from the term
+    /// index alone (issue #58); with a reranker the fused order is handed
+    /// to it and the step says so (issue #63).
+    #[tokio::test]
+    async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker() {
+        use crate::storage::workspace::{NewChunk, NewDocument};
+        struct Reverse;
+        impl Reranker for Reverse {
+            fn rank<'a>(
+                &'a self,
+                _q: &'a str,
+                c: &'a [ChunkSearchResult],
+            ) -> rerank::RankFuture<'a> {
+                Box::pin(async move { Ok((0..c.len()).rev().collect()) })
+            }
+            fn name(&self) -> &'static str {
+                "reverse"
+            }
+        }
+        let db = shared_db();
+        {
+            let guard = lock(&db).unwrap_or_else(|e| fail_test(&e.to_string()));
+            guard
+                .insert_document(
+                    &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
+                )
+                .unwrap_or_else(|e| fail_test(&e.to_string()));
+            for (i, text) in [
+                "Hail fell on Denver.",
+                "Hail and hail again in Denver county.",
+            ]
+            .iter()
+            .enumerate()
+            {
+                guard
+                    .insert_chunk(&NewChunk {
+                        id: &format!("c{i}"),
+                        document_id: "d",
+                        chunk_index: u32::try_from(i).unwrap_or(0),
+                        content: text,
+                        heading: None,
+                        page: None,
+                        embedding: None,
+                    })
+                    .unwrap_or_else(|e| fail_test(&e.to_string()));
+            }
+        }
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+            Arc::clone(&db),
+            None,
+            5,
+            60,
+            recorder.clone(),
+        );
+        let text = tool
+            .call(
+                &mut ToolContext::new(),
+                SearchDocumentsArgs {
+                    query: String::from("hail"),
+                    top_k: None,
+                    document_ids: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(text.contains("Denver"), "{text}");
+        let first_plain = text.find("hail again").unwrap_or(usize::MAX);
+        let second_plain = text.find("Hail fell").unwrap_or(usize::MAX);
+        assert!(
+            first_plain < second_plain,
+            "BM25 puts the denser chunk first: {text}"
+        );
+
+        let reranked = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+            Arc::clone(&db),
+            None,
+            5,
+            60,
+            recorder.clone(),
+        )
+        .with_reranker(Arc::new(Reverse), 5);
+        let text = reranked
+            .call(
+                &mut ToolContext::new(),
+                SearchDocumentsArgs {
+                    query: String::from("hail"),
+                    top_k: None,
+                    document_ids: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(
+            text.find("Hail fell").unwrap_or(usize::MAX)
+                < text.find("hail again").unwrap_or(usize::MAX),
+            "the reranker reversed the order: {text}"
+        );
+        let last = recorder.steps().last().map(|s| s.summary.clone());
+        assert!(
+            last.as_deref()
+                .is_some_and(|s| s.contains("reranked by reverse")),
+            "{last:?}"
+        );
     }
 
     #[tokio::test]

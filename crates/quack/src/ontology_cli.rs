@@ -82,17 +82,22 @@ pub(crate) enum OntologyAction {
     Reject { ids: Vec<String> },
 }
 
-pub(crate) async fn run(config: &Config, db: &WorkspaceDb, action: OntologyAction) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+/// Run one ontology action, writing what the user should see to `out`
+/// (stdout for the CLI, the transcript for the terminal session).
+pub(crate) async fn run(
+    config: &Config,
+    db: &WorkspaceDb,
+    action: OntologyAction,
+    out: &mut impl Write,
+) -> Result<()> {
     match action {
         propose_action @ OntologyAction::Propose { .. } => {
-            run_propose(config, db, propose_action, &mut out).await?;
+            run_propose(config, db, propose_action, out).await?;
         }
         review @ (OntologyAction::Review { .. }
         | OntologyAction::Accept { .. }
-        | OntologyAction::Reject { .. }) => run_review(db, review, &mut out)?,
-        manage => run_manage(db, manage, &mut out)?,
+        | OntologyAction::Reject { .. }) => run_review(db, review, out)?,
+        manage => run_manage(db, manage, out)?,
     }
     out.flush()?;
     Ok(())

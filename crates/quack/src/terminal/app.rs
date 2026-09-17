@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc;
 
@@ -23,8 +24,12 @@ use quack_core::error::Error as CoreError;
 use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::llm::{self, CancellationToken};
+use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
+
+use crate::graph_cli::GraphAction;
+use crate::ontology_cli::OntologyAction;
 
 const TICK_RATE_MS: u64 = 50;
 
@@ -41,24 +46,35 @@ Commands:
   /help             Show this help message
   /sql [STATEMENT]  Run SQL directly; with no argument, edit the last query
   /tables           List tables in the workspace
+  /schema TABLE     Columns, types, and sample rows of a table
+  /ingest PATH      Load a file (a bare path typed at the prompt does the same)
+  /import URL TABLE [SOURCE_TABLE] [--query SQL]  Pull rows from Postgres, SQLite, or a URL
+  /docs             List ingested documents
+  /pin ID, /unpin ID  Pin a document's full text into every prompt
+  /delete ID        Delete a document with its chunks, table, and graph rows
+  /ontology ...     quack ontology: show, init, propose, review, accept, reject, export, import, versions, restore
+  /graph ...        quack graph: status, extract, revalidate, review, merges, merge, reject
+  /graph ENTITY [HOPS], /graph --class CLASS   Walk the knowledge graph
+  /path FROM -> TO  Shortest relation chain between two entities
+  /context [import FILE | export FILE]  Show, replace, or save the workspace context
+  /okf DIR          Export the workspace as an Open Knowledge Format bundle
   /sessions         List recent sessions
   /resume ID        Switch to a session (id prefix accepted) and replay it
   /new              Start a fresh session
   /mode [chat|query] Show or set the answer mode (query = sources only)
-  /docs             List ingested documents
-  /pin ID, /unpin ID  Pin a document's full text into every prompt
-  /context          Show the workspace context the agent is given
-  /graph ENTITY [HOPS], /graph --class CLASS   Walk the knowledge graph
-  /path FROM -> TO  Shortest relation chain between two entities
-  /import URL TABLE [SOURCE_TABLE]  Pull rows from Postgres, SQLite, or a URL into a table
+  /share, /unshare  Share this session with every member, or take it back
+  /export [--sql|--markdown] [FILE]  Save this session
+  /chart [N]        Show the chart of the Nth chart-bearing answer (default: the last)
+  /steps            Expand or collapse the tool call details
+  /model            Show the chat and embedding models in use
   /clear            Clear messages and chart
   /workspace        Show current workspace and session
   /quit, /exit      Exit quack
 
 Shortcuts:
   Enter             Send message
-  Up/Down           Browse input history
-  PageUp/PageDown   Scroll messages
+  Up/Down           Browse input history (kept across sessions)
+  PageUp/PageDown, mouse wheel   Scroll messages; Home/End jump
   Ctrl+U            Clear input line
   Ctrl+L            Clear screen
   Esc or Ctrl+C     Cancel the running turn
@@ -94,6 +110,11 @@ pub(crate) enum MessageRole {
 pub(crate) struct Message {
     pub(crate) role: MessageRole,
     pub(crate) content: String,
+    /// The chart an assistant answer produced (design doc 9: charts belong
+    /// to messages); `/chart N` brings it into the chart pane.
+    pub(crate) chart: Option<ChartData>,
+    /// A step's full tool detail, shown whole when steps are expanded.
+    pub(crate) detail: Option<String>,
 }
 
 impl Message {
@@ -101,6 +122,8 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            chart: None,
+            detail: None,
         }
     }
 }
@@ -130,8 +153,8 @@ pub(crate) struct App {
     pending_sql: Option<String>,
     /// Index into `messages` of the step line being filled in.
     open_step: Option<usize>,
-    /// Whether the assistant message being streamed is the last message.
-    streaming_assistant: bool,
+    /// Index of the assistant message text is streaming into, if any.
+    streaming: Option<usize>,
     last_sql: Option<String>,
     input_history: Vec<String>,
     history_cursor: Option<usize>,
@@ -143,6 +166,10 @@ pub(crate) struct App {
     /// Cancels the running turn; set while `state` is `Thinking` or
     /// `AwaitingPermission` for an agent request.
     turn_cancel: Option<CancellationToken>,
+    /// `/steps`: show tool details whole instead of a preview.
+    pub(crate) expand_steps: bool,
+    /// Where typed input is kept across sessions.
+    history_path: PathBuf,
     response_rx: mpsc::UnboundedReceiver<BackgroundResult>,
     response_tx: mpsc::UnboundedSender<BackgroundResult>,
 }
@@ -161,6 +188,7 @@ impl App {
         let mut textarea = TextArea::default();
         configure_textarea(&mut textarea);
 
+        let history_path = config.data_dir().join("terminal_history");
         let mut app = Self {
             messages: Vec::new(),
             textarea,
@@ -175,7 +203,7 @@ impl App {
             pending_permission: None,
             pending_sql: None,
             open_step: None,
-            streaming_assistant: false,
+            streaming: None,
             last_sql: None,
             input_history: Vec::new(),
             history_cursor: None,
@@ -185,9 +213,12 @@ impl App {
             allow_write,
             agent_events: None,
             turn_cancel: None,
+            expand_steps: false,
+            history_path,
             response_rx,
             response_tx,
         };
+        app.input_history = load_history(&app.history_path);
         app.messages
             .push(Message::new(MessageRole::System, WELCOME_TEXT));
         let current = app.session_id.clone();
@@ -221,16 +252,18 @@ impl App {
                     .messages
                     .push(Message::new(MessageRole::User, row.content)),
                 StoredRole::Assistant => {
+                    let mut message = Message::new(MessageRole::Assistant, row.content);
                     if let Some(spec) = row
                         .metadata
                         .as_ref()
                         .and_then(|m| m.get("chart"))
                         .and_then(|c| serde_json::from_value::<ChartSpec>(c.clone()).ok())
                     {
-                        self.current_chart = Some(ChartData::from_spec(&spec));
+                        let chart = ChartData::from_spec(&spec);
+                        self.current_chart = Some(chart.clone());
+                        message.chart = Some(chart);
                     }
-                    self.messages
-                        .push(Message::new(MessageRole::Assistant, row.content));
+                    self.messages.push(message);
                     if let Some(citations) = row
                         .metadata
                         .as_ref()
@@ -257,10 +290,17 @@ impl App {
                         .and_then(|m| m.get("duration_ms"))
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0);
-                    self.messages.push(Message::new(
-                        MessageRole::Step,
-                        format!("> {tool}\n  {}, {ms} ms", row.content),
-                    ));
+                    // The stored row is the summary; the detail (the SQL,
+                    // the search text) sits in its metadata.
+                    let detail = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("detail"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    self.messages
+                        .push(step_message(tool, &detail, &row.content, ms));
                 }
             }
         }
@@ -278,11 +318,22 @@ impl App {
             }
             self.drain_agent_events();
 
-            if event::poll(tick_rate)?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.handle_key_event(key.code, key.modifiers);
+            if event::poll(tick_rate)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        self.handle_key_event(key.code, key.modifiers);
+                    }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            self.scroll_offset = self.scroll_offset.saturating_add(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
             }
 
             self.tick = self.tick.wrapping_add(1);
@@ -326,29 +377,22 @@ impl App {
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => {
-                if self.streaming_assistant
-                    && let Some(last) = self.messages.last_mut()
-                    && last.role == MessageRole::Assistant
+                if let Some(idx) = self.streaming
+                    && let Some(target) = self.messages.get_mut(idx)
                 {
-                    last.content.push_str(&text);
+                    target.content.push_str(&text);
                 } else {
                     self.messages
                         .push(Message::new(MessageRole::Assistant, text));
-                    self.streaming_assistant = true;
+                    self.streaming = Some(self.messages.len().saturating_sub(1));
                 }
                 self.scroll_offset = 0;
             }
             AgentEvent::ToolStarted { tool, detail } => {
-                self.streaming_assistant = false;
-                let mut content = format!("> {tool}");
-                for line in detail.lines().take(12) {
-                    content.push_str("\n  ");
-                    content.push_str(line);
-                }
-                if detail.lines().count() > 12 {
-                    content.push_str("\n  ...");
-                }
-                self.messages.push(Message::new(MessageRole::Step, content));
+                self.streaming = None;
+                let mut message = Message::new(MessageRole::Step, format!("> {tool}"));
+                message.detail = Some(detail);
+                self.messages.push(message);
                 self.open_step = Some(self.messages.len().saturating_sub(1));
                 self.scroll_offset = 0;
             }
@@ -359,14 +403,16 @@ impl App {
                 {
                     msg.content.push_str(&line);
                 } else {
-                    self.messages.push(Message::new(
-                        MessageRole::Step,
-                        format!("> {}{line}", step.tool),
+                    self.messages.push(step_message(
+                        &step.tool,
+                        &step.detail,
+                        &step.summary,
+                        step.duration_ms,
                     ));
                 }
             }
             AgentEvent::PermissionRequired(request) => {
-                self.streaming_assistant = false;
+                self.streaming = None;
                 self.messages.push(Message::new(
                     MessageRole::System,
                     format!(
@@ -380,12 +426,11 @@ impl App {
                 self.scroll_offset = 0;
             }
             AgentEvent::TurnComplete(response) => {
-                if self.streaming_assistant
-                    && let Some(last) = self.messages.last_mut()
-                    && last.role == MessageRole::Assistant
+                if let Some(idx) = self.streaming
+                    && let Some(target) = self.messages.get_mut(idx)
                 {
                     // Citation validation may have renumbered or stripped markers.
-                    last.content.clone_from(&response.content);
+                    target.content.clone_from(&response.content);
                 } else if !response.content.trim().is_empty() {
                     self.messages
                         .push(Message::new(MessageRole::Assistant, response.content));
@@ -397,7 +442,16 @@ impl App {
                     ));
                 }
                 if let Some(spec) = &response.chart {
-                    self.current_chart = Some(ChartData::from_spec(spec));
+                    let chart = ChartData::from_spec(spec);
+                    self.current_chart = Some(chart.clone());
+                    if let Some(last) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.role == MessageRole::Assistant)
+                    {
+                        last.chart = Some(chart);
+                    }
                 }
                 for result in response.graph.iter().filter(|r| !r.is_empty()) {
                     self.messages.push(Message::new(
@@ -422,7 +476,7 @@ impl App {
 
     fn finish_turn(&mut self) {
         self.state = AppState::Idle;
-        self.streaming_assistant = false;
+        self.streaming = None;
         self.open_step = None;
         self.pending_permission = None;
         self.turn_cancel = None;
@@ -488,6 +542,12 @@ impl App {
             }
             (KeyCode::PageDown, _) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(15);
+            }
+            (KeyCode::Home, _) if self.state != AppState::Idle || self.textarea.is_empty() => {
+                self.scroll_offset = usize::MAX;
+            }
+            (KeyCode::End, _) if self.state != AppState::Idle || self.textarea.is_empty() => {
+                self.scroll_offset = 0;
             }
             _ if self.state == AppState::Idle => {
                 self.textarea
@@ -635,11 +695,36 @@ impl App {
             "/new" => self.new_session(),
             "/mode" => self.set_mode(args),
             "/docs" => self.show_documents(),
-            "/context" => self.show_context(),
+            "/context" => match args.split_once(' ') {
+                Some(("import", file)) => {
+                    self.run_job(
+                        CliJob::ContextImport(file.trim().to_owned()),
+                        "Importing the context",
+                    );
+                }
+                Some(("export", file)) => {
+                    self.run_job(
+                        CliJob::ContextExport(file.trim().to_owned()),
+                        "Exporting the context",
+                    );
+                }
+                _ => self.show_context(),
+            },
             "/pin" => self.set_pinned(args, true),
             "/unpin" => self.set_pinned(args, false),
             "/tables" => self.show_tables(),
+            "/schema" => self.show_schema(args),
+            "/ingest" | "/attach" => match detect_file_path(args) {
+                Some(path) => self.start_ingest(path),
+                None => self.messages.push(Message::new(
+                    MessageRole::Error,
+                    format!("'{args}' is not a file quack can ingest"),
+                )),
+            },
+            "/graph" if is_graph_subcommand(args) => self.run_graph_command(args),
             "/graph" => self.show_graph(args),
+            "/ontology" => self.run_ontology_command(args),
+            "/delete" => self.delete_document(args),
             "/import" => self.start_import(args),
             "/path" => self.show_path(args),
             "/sql" => {
@@ -655,6 +740,44 @@ impl App {
                     self.run_direct_sql(args);
                 }
             }
+            other => self.handle_session_command(other, args),
+        }
+    }
+
+    /// The session, chart, and view commands.
+    fn handle_session_command(&mut self, cmd: &str, args: &str) {
+        match cmd {
+            "/share" => self.set_shared(true),
+            "/unshare" => self.set_shared(false),
+            "/export" => self.export_session(args),
+            "/okf" => self.run_job(CliJob::Okf(args.to_owned()), "Exporting the bundle"),
+            "/chart" => self.show_chart(args),
+            "/steps" => {
+                self.expand_steps = !self.expand_steps;
+                self.messages.push(Message::new(
+                    MessageRole::System,
+                    if self.expand_steps {
+                        "Tool call details expanded."
+                    } else {
+                        "Tool call details collapsed."
+                    },
+                ));
+            }
+            "/model" => self.messages.push(Message::new(
+                MessageRole::System,
+                format!(
+                    "Chat model: {}\nEmbedding model: {}",
+                    self.provider_display,
+                    self.config
+                        .embedding_model_ref()
+                        .ok()
+                        .flatten()
+                        .map_or_else(
+                            || String::from("none (keyword search only)"),
+                            |m| m.to_string()
+                        )
+                ),
+            )),
             other => {
                 self.messages.push(Message::new(
                     MessageRole::Error,
@@ -841,6 +964,201 @@ impl App {
             Err(e) => self
                 .messages
                 .push(Message::new(MessageRole::Error, format!("{e}"))),
+        }
+    }
+
+    /// `/ontology ARGS`: the CLI's `quack ontology` verbs, parsed the same
+    /// way, run in the background with the answer in the transcript.
+    fn run_ontology_command(&mut self, args: &str) {
+        match OntologyArgs::try_parse_from(split_args(args)) {
+            Ok(parsed) => {
+                let mut action = parsed.action;
+                // The terminal owns stdin: nothing may prompt there.
+                if let OntologyAction::Propose { yes, .. } = &mut action {
+                    *yes = true;
+                }
+                self.run_job(CliJob::Ontology(action), "Running ontology command");
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, e.to_string())),
+        }
+    }
+
+    /// `/graph status|extract|...`: the CLI's `quack graph` verbs.
+    fn run_graph_command(&mut self, args: &str) {
+        match GraphArgs::try_parse_from(split_args(args)) {
+            Ok(parsed) => {
+                let mut action = parsed.action;
+                if let GraphAction::Extract { yes, .. } = &mut action {
+                    *yes = true;
+                }
+                self.run_job(CliJob::Graph(action), "Running graph command");
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, e.to_string())),
+        }
+    }
+
+    /// Run a job on its own thread and runtime (the workspace is opened
+    /// again there, as ingestion does) and show what it printed.
+    fn run_job(&mut self, job: CliJob, label: &str) {
+        let config = Arc::clone(&self.config);
+        let workspace_id = self.workspace_id.clone();
+        let workspace_name = self.workspace_name.clone();
+        let tx = self.response_tx.clone();
+        self.messages
+            .push(Message::new(MessageRole::System, format!("{label}…")));
+        self.state = AppState::Ingesting;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match rt {
+                Ok(rt) => rt.block_on(async {
+                    match run_job_inner(&config, &workspace_id, &workspace_name, job).await {
+                        Ok(text) => BackgroundResult::Ingested { summary: text },
+                        Err(e) => BackgroundResult::Error(format!("{e:#}")),
+                    }
+                }),
+                Err(e) => BackgroundResult::Error(format!("runtime: {e}")),
+            };
+            drop(tx.send(result));
+        });
+    }
+
+    fn show_schema(&mut self, table: &str) {
+        let table = table.trim();
+        if table.is_empty() {
+            self.messages
+                .push(Message::new(MessageRole::System, "Usage: /schema TABLE"));
+            return;
+        }
+        let described = match self.db.lock() {
+            Ok(db) => db.list_tables().and_then(|tables| {
+                if tables.iter().any(|t| t == table) {
+                    db.describe_table(table)
+                } else {
+                    Err(CoreError::Analysis(format!("no table named '{table}'")))
+                }
+            }),
+            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
+        };
+        match described {
+            Ok(d) => {
+                let mut text = format!("{} ({} rows)\n", d.table_name, d.row_count);
+                for column in &d.columns {
+                    let line = format!("  {} {}\n", column.name, column.column_type);
+                    text.push_str(&line);
+                }
+                let mut buf = Vec::new();
+                if d.sample_rows.write_table(&mut buf).is_ok() {
+                    text.push_str(&String::from_utf8_lossy(&buf));
+                }
+                self.messages.push(Message::new(MessageRole::Sql, text));
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, e.to_string())),
+        }
+    }
+
+    fn delete_document(&mut self, prefix: &str) {
+        let prefix = prefix.trim();
+        if prefix.is_empty() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "Usage: /delete DOCUMENT_ID",
+            ));
+            return;
+        }
+        let outcome = match self.db.lock() {
+            Ok(db) => resolve_document(&db, prefix).and_then(|doc| {
+                let table = ingestion::parser::detect_file_type(&doc.filename)
+                    .is_structured()
+                    .then(|| ingestion::table_name_for(&doc.filename));
+                db.delete_document(&doc.id, table.as_deref())
+                    .map(|_| doc.filename)
+            }),
+            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
+        };
+        match outcome {
+            Ok(filename) => self.messages.push(Message::new(
+                MessageRole::System,
+                format!("Deleted {filename} with its chunks, tables, and graph rows."),
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, e.to_string())),
+        }
+    }
+
+    fn set_shared(&mut self, shared: bool) {
+        let outcome = match self.db.lock() {
+            Ok(db) => sessions::set_session_shared(&db, &self.session_id, shared),
+            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
+        };
+        match outcome {
+            Ok(()) => self.messages.push(Message::new(
+                MessageRole::System,
+                if shared {
+                    "This session is shared with every member of the workspace."
+                } else {
+                    "This session is yours alone again."
+                },
+            )),
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, e.to_string())),
+        }
+    }
+
+    /// `/export [--sql|--markdown] [FILE]`: the session as SQL or
+    /// Markdown, to a file or into the transcript.
+    fn export_session(&mut self, args: &str) {
+        let mut sql = false;
+        let mut file: Option<String> = None;
+        for token in args.split_whitespace() {
+            match token {
+                "--sql" => sql = true,
+                "--markdown" => sql = false,
+                other => file = Some(other.to_owned()),
+            }
+        }
+        let text = match self.db.lock() {
+            Ok(db) => sessions::get_session(&db, &self.session_id).and_then(|session| {
+                let rows = sessions::messages(&db, &self.session_id)?;
+                if sql {
+                    sessions::export_sql(&rows)
+                } else {
+                    let session = session
+                        .ok_or_else(|| CoreError::Analysis(String::from("session vanished")))?;
+                    sessions::export_markdown(&session, &rows)
+                }
+            }),
+            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(e) => {
+                self.messages
+                    .push(Message::new(MessageRole::Error, e.to_string()));
+                return;
+            }
+        };
+        match file {
+            Some(path) => match std::fs::write(&path, &text) {
+                Ok(()) => self.messages.push(Message::new(
+                    MessageRole::System,
+                    format!("Wrote the session to {path}."),
+                )),
+                Err(e) => self.messages.push(Message::new(
+                    MessageRole::Error,
+                    format!("cannot write {path}: {e}"),
+                )),
+            },
+            None => self.messages.push(Message::new(MessageRole::Sql, text)),
         }
     }
 
@@ -1045,6 +1363,47 @@ impl App {
     }
 
     /// Drop the current session if nothing was ever recorded in it.
+    /// `/chart [N]`: the Nth chart-bearing answer's chart into the pane
+    /// (the last one without N).
+    fn show_chart(&mut self, args: &str) {
+        let charts: Vec<ChartData> = self
+            .messages
+            .iter()
+            .filter_map(|m| m.chart.clone())
+            .collect();
+        if charts.is_empty() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "No chart in this session yet; ask for one.",
+            ));
+            return;
+        }
+        let wanted = match args.trim() {
+            "" => charts.len(),
+            n => match n.parse::<usize>() {
+                Ok(n) if (1..=charts.len()).contains(&n) => n,
+                _ => {
+                    self.messages.push(Message::new(
+                        MessageRole::Error,
+                        format!("/chart takes a number from 1 to {}", charts.len()),
+                    ));
+                    return;
+                }
+            },
+        };
+        if let Some(chart) = charts.get(wanted.saturating_sub(1)) {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!(
+                    "Showing chart {wanted} of {}: {}",
+                    charts.len(),
+                    chart.title
+                ),
+            ));
+            self.current_chart = Some(chart.clone());
+        }
+    }
+
     fn forget_session_if_empty(&self) {
         if let Ok(db) = self.db.lock() {
             drop(sessions::delete_if_empty(&db, &self.session_id));
@@ -1059,6 +1418,7 @@ impl App {
         }
 
         self.input_history.push(trimmed.clone());
+        save_history(&self.history_path, &self.input_history);
         self.history_cursor = None;
         self.textarea = TextArea::default();
         configure_textarea(&mut self.textarea);
@@ -1085,19 +1445,30 @@ impl App {
     /// `/import URL TABLE [SOURCE_TABLE]`: rows from an external source
     /// as a workspace table, on the ingest thread.
     fn start_import(&mut self, args: &str) {
-        let mut parts = args.split_whitespace();
-        let (Some(url), Some(table)) = (parts.next(), parts.next()) else {
+        let tokens = split_args(args);
+        let mut positional: Vec<String> = Vec::new();
+        let mut query: Option<String> = None;
+        let mut tokens = tokens.into_iter();
+        while let Some(token) = tokens.next() {
+            if token == "--query" {
+                query = tokens.next();
+            } else {
+                positional.push(token);
+            }
+        }
+        let mut positional = positional.into_iter();
+        let (Some(url), Some(table)) = (positional.next(), positional.next()) else {
             self.messages.push(Message::new(
                 MessageRole::System,
-                "Usage: /import URL TABLE [SOURCE_TABLE]",
+                "Usage: /import URL TABLE [SOURCE_TABLE] [--query \"SQL\"]",
             ));
             return;
         };
         let request = ImportRequest {
-            url: url.to_owned(),
-            table: table.to_owned(),
-            query: None,
-            source_table: parts.next().map(str::to_owned),
+            url: url.clone(),
+            table,
+            query,
+            source_table: positional.next(),
             limit: None,
         };
         let config = Arc::clone(&self.config);
@@ -1105,7 +1476,7 @@ impl App {
         let tx = self.response_tx.clone();
         self.messages.push(Message::new(
             MessageRole::System,
-            format!("Importing from {}", import::redact(url)),
+            format!("Importing from {}", import::redact(&url)),
         ));
         self.state = AppState::Ingesting;
         std::thread::spawn(move || {
@@ -1241,7 +1612,7 @@ impl App {
         self.messages
             .push(Message::new(MessageRole::User, message.clone()));
         self.state = AppState::Thinking;
-        self.streaming_assistant = false;
+        self.streaming = None;
         self.open_step = None;
 
         let policy = if self.allow_write {
@@ -1279,6 +1650,184 @@ impl App {
         }
         self.state = AppState::Idle;
         self.scroll_offset = 0;
+    }
+}
+
+/// `/ontology` and `/graph` arguments, parsed as the CLI parses them.
+#[derive(Parser)]
+#[command(name = "/ontology", no_binary_name = true, disable_help_flag = false)]
+struct OntologyArgs {
+    #[command(subcommand)]
+    action: OntologyAction,
+}
+
+#[derive(Parser)]
+#[command(name = "/graph", no_binary_name = true)]
+struct GraphArgs {
+    #[command(subcommand)]
+    action: GraphAction,
+}
+
+/// Whitespace-split with single or double quotes kept together.
+fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in args.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            (_, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Whether `/graph ARGS` names a `quack graph` verb rather than an entity.
+fn is_graph_subcommand(args: &str) -> bool {
+    matches!(
+        args.split_whitespace().next(),
+        Some(
+            "status"
+                | "extract"
+                | "revalidate"
+                | "review"
+                | "merges"
+                | "merge"
+                | "reject"
+                | "search"
+                | "path"
+                | "help"
+                | "--help"
+                | "-h"
+        )
+    )
+}
+
+/// The document whose id starts with `prefix`, when exactly one does.
+fn resolve_document(
+    db: &WorkspaceDb,
+    prefix: &str,
+) -> quack_core::error::Result<quack_core::storage::workspace::DocumentInfo> {
+    let matches: Vec<_> = db
+        .list_documents()?
+        .into_iter()
+        .filter(|d| d.id.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        1 => matches
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Ingestion(String::from("document vanished"))),
+        0 => Err(CoreError::Ingestion(format!(
+            "no document matches '{prefix}'"
+        ))),
+        n => Err(CoreError::Ingestion(format!(
+            "'{prefix}' matches {n} documents; use more of the id"
+        ))),
+    }
+}
+
+/// Work the terminal hands to a background thread with its own runtime.
+enum CliJob {
+    Ontology(OntologyAction),
+    Graph(GraphAction),
+    Okf(String),
+    ContextImport(String),
+    ContextExport(String),
+}
+
+async fn run_job_inner(
+    config: &Config,
+    workspace_id: &str,
+    workspace_name: &str,
+    job: CliJob,
+) -> Result<String> {
+    let ws_db = WorkspaceDb::open(config, workspace_id)
+        .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
+    let mut out: Vec<u8> = Vec::new();
+    match job {
+        CliJob::Ontology(action) => {
+            crate::ontology_cli::run(config, &ws_db, action, &mut out).await?;
+        }
+        CliJob::Graph(action) => {
+            crate::graph_cli::run(config, &ws_db, action, &mut out).await?;
+        }
+        CliJob::Okf(dir) => {
+            let dir = dir.trim();
+            if dir.is_empty() {
+                anyhow::bail!("Usage: /okf DIR");
+            }
+            let bundle = okf::export(&ws_db, workspace_name)?;
+            bundle.write_to(std::path::Path::new(dir))?;
+            std::io::Write::write_all(
+                &mut out,
+                format!("Wrote {} files to {dir}.", bundle.files.len()).as_bytes(),
+            )?;
+        }
+        CliJob::ContextImport(file) => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+            let stored = context::set(&ws_db, text.trim(), None)?;
+            std::io::Write::write_all(
+                &mut out,
+                format!("Context is now version {}.", stored.version).as_bytes(),
+            )?;
+        }
+        CliJob::ContextExport(file) => {
+            let current = context::current(&ws_db)?
+                .ok_or_else(|| anyhow::anyhow!("no workspace context to export"))?;
+            std::fs::write(&file, &current.content)
+                .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
+            std::io::Write::write_all(
+                &mut out,
+                format!("Wrote context version {} to {file}.", current.version).as_bytes(),
+            )?;
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+}
+
+/// A finished step as one transcript message: the header line, the
+/// summary, and the full detail kept aside for `/steps`.
+fn step_message(tool: &str, detail: &str, summary: &str, duration_ms: u64) -> Message {
+    let mut message = Message::new(
+        MessageRole::Step,
+        format!("> {tool}\n  {summary}, {duration_ms} ms"),
+    );
+    message.detail = Some(detail.to_owned());
+    message
+}
+
+/// Lines typed before, newest last; kept per data directory.
+const HISTORY_LINES: usize = 500;
+
+fn load_history(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+fn save_history(path: &std::path::Path, history: &[String]) {
+    let start = history.len().saturating_sub(HISTORY_LINES);
+    let text = history
+        .get(start..)
+        .unwrap_or(history)
+        .iter()
+        .filter(|line| !line.contains('\n'))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Err(e) = std::fs::write(path, text) {
+        tracing::debug!(path = %path.display(), error = %e, "could not save the input history");
     }
 }
 
@@ -1339,10 +1888,8 @@ fn detect_file_path(input: &str) -> Option<PathBuf> {
         PathBuf::from(cleaned)
     };
 
-    if !path.is_absolute() && !cleaned.starts_with("./") {
-        return None;
-    }
-
+    // A relative path that exists is a file too (issue #58); anything else
+    // is a question for the model.
     let file_type = ingestion::parser::detect_file_type(cleaned);
     if file_type == ingestion::parser::FileType::Unknown {
         return None;
@@ -1447,4 +1994,231 @@ async fn run_ingest_inner(
     );
 
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use quack_core::analysis::agent::AgentResponse;
+    use quack_core::analysis::events::ToolStep;
+
+    use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    /// An app over a real workspace file (the background jobs open it
+    /// again by id), driven without a terminal.
+    fn app(dir: &std::path::Path) -> App {
+        let mut config = Config::default();
+        config.general.data_dir = dir.to_path_buf();
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        App::new(
+            String::from("ws"),
+            String::from("ws"),
+            String::from("o/m"),
+            Arc::new(config),
+            Arc::new(Mutex::new(db)),
+            session.id,
+            false,
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()))
+    }
+
+    /// Wait for the background result a command posted and apply it.
+    fn settle(app: &mut App) {
+        for _ in 0..200 {
+            if let Ok(result) = app.response_rx.try_recv() {
+                app.handle_background_result(result);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        fail("no background result arrived");
+    }
+
+    fn last(app: &App) -> &Message {
+        app.messages.last().unwrap_or_else(|| fail("no messages"))
+    }
+
+    #[test]
+    fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+
+        // A write asks first; `y` runs it on the background thread.
+        app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a, 'x' AS b");
+        assert_eq!(app.state, AppState::AwaitingPermission);
+        assert!(app.pending_sql.is_some());
+        app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(app.state, AppState::RunningSql);
+        settle(&mut app);
+        assert_eq!(app.state, AppState::Idle);
+        assert_eq!(last(&app).role, MessageRole::Sql);
+
+        app.handle_slash_command("/tables");
+        assert!(last(&app).content.contains('t'), "{}", last(&app).content);
+        app.handle_slash_command("/schema t");
+        assert_eq!(last(&app).role, MessageRole::Sql);
+        assert!(
+            last(&app).content.contains("a INTEGER"),
+            "{}",
+            last(&app).content
+        );
+        app.handle_slash_command("/schema nope");
+        assert_eq!(last(&app).role, MessageRole::Error);
+
+        // Internal tables stay refused, a read runs without asking.
+        app.handle_slash_command("/sql SELECT * FROM _quack_documents");
+        assert_eq!(last(&app).role, MessageRole::Error);
+        app.handle_slash_command("/sql SELECT a FROM t");
+        assert_eq!(app.state, AppState::RunningSql);
+        settle(&mut app);
+
+        // The CLI verbs: clap parses them, background jobs answer.
+        app.handle_slash_command("/ontology --help");
+        assert!(
+            last(&app).content.contains("Usage"),
+            "{}",
+            last(&app).content
+        );
+        app.handle_slash_command("/graph status");
+        assert_eq!(app.state, AppState::Ingesting);
+        settle(&mut app);
+        assert!(
+            last(&app).content.contains("Graph: 0 nodes"),
+            "{}",
+            last(&app).content
+        );
+        app.handle_slash_command("/ontology init");
+        settle(&mut app);
+        app.handle_slash_command("/ontology show");
+        settle(&mut app);
+        assert!(
+            last(&app).content.contains("entity"),
+            "{}",
+            last(&app).content
+        );
+
+        app.handle_slash_command("/export --markdown");
+        assert_eq!(last(&app).role, MessageRole::Sql);
+        app.handle_slash_command("/share");
+        assert!(last(&app).content.contains("shared"));
+        app.handle_slash_command("/model");
+        assert!(last(&app).content.contains("keyword search only"));
+        app.handle_slash_command("/nope");
+        assert!(last(&app).content.contains("unknown command"));
+    }
+
+    #[test]
+    fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.state = AppState::Thinking;
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            tool: String::from("run_sql"),
+            detail: (1..=6)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished(ToolStep {
+            tool: String::from("run_sql"),
+            detail: String::new(),
+            summary: String::from("3 rows"),
+            duration_ms: 4,
+        }));
+        app.handle_agent_event(AgentEvent::TextDelta(String::from("**Three** rows")));
+        let spec: ChartSpec = serde_json::from_value(serde_json::json!({
+            "title": "Rows by kind",
+            "kind": "bar",
+            "x": { "label": "kind", "values": ["a", "b"] },
+            "series": [{ "name": "n", "values": [1.0, 2.0] }]
+        }))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        app.handle_agent_event(AgentEvent::TurnComplete(AgentResponse {
+            content: String::from("**Three** rows"),
+            chart: Some(spec),
+            ..AgentResponse::default()
+        }));
+        assert_eq!(app.state, AppState::Idle);
+        let assistant = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .unwrap_or_else(|| fail("no assistant message"));
+        assert!(assistant.chart.is_some(), "the chart belongs to the answer");
+        assert!(app.current_chart.is_some());
+        let step = app
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Step)
+            .unwrap_or_else(|| fail("no step"));
+        assert!(
+            step.detail
+                .as_deref()
+                .is_some_and(|d| d.lines().count() == 6)
+        );
+
+        // Rendering folds the detail to a preview until /steps; the
+        // Markdown bold survives as a span; lines wrap to the width.
+        let lines = ui::format_messages(&app, 20);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("3 more lines")), "{text:?}");
+        assert!(text.iter().all(|l| l.chars().count() <= 20), "{text:?}");
+        app.handle_slash_command("/steps");
+        let expanded = ui::format_messages(&app, 80);
+        assert!(
+            expanded
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains("line 6")))
+        );
+        app.current_chart = None;
+        app.handle_slash_command("/chart 1");
+        assert!(app.current_chart.is_some());
+        app.handle_slash_command("/chart 9");
+        assert_eq!(last(&app).role, MessageRole::Error);
+
+        // Esc while a turn runs cancels it; Ctrl+C when idle quits.
+        let token = CancellationToken::new();
+        app.turn_cancel = Some(token.clone());
+        app.state = AppState::Thinking;
+        app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(token.is_cancelled());
+        assert!(last(&app).content.contains("Cancelling"));
+        app.finish_turn();
+        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn typed_input_is_kept_across_sessions_and_relative_paths_are_files() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        {
+            let mut app = app(dir.path());
+            app.set_textarea_content("/tables");
+            app.submit_message();
+        }
+        let again = app(dir.path());
+        assert_eq!(again.input_history, vec![String::from("/tables")]);
+
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "# hi").unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            detect_file_path(&file.display().to_string()),
+            Some(file.clone())
+        );
+        assert!(detect_file_path("what is in notes.md").is_none());
+        assert!(detect_file_path("/nowhere/notes.md").is_none());
+        assert_eq!(split_args("a \"b c\" 'd e' f"), ["a", "b c", "d e", "f"]);
+    }
 }

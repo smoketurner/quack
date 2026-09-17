@@ -230,18 +230,22 @@ impl Spinner {
 
 fn write_started(err: &mut impl Write, tool: &str, detail: &str, verbose: bool) -> Result<()> {
     writeln!(err, "> {tool}")?;
-    if !detail.is_empty() {
-        let shown: String = if verbose {
-            detail.to_owned()
-        } else {
-            detail.chars().take(400).collect()
-        };
-        for line in shown.lines() {
+    if detail.is_empty() {
+        return Ok(());
+    }
+    if verbose {
+        for line in detail.lines() {
             writeln!(err, "  {line}")?;
         }
-        if shown.chars().count() < detail.chars().count() {
-            writeln!(err, "  ...")?;
-        }
+        return Ok(());
+    }
+    // The same preview the terminal shows collapsed.
+    let (shown, more) = events::preview_detail(detail);
+    for line in shown {
+        writeln!(err, "  {line}")?;
+    }
+    if more > 0 {
+        writeln!(err, "  ({more} more lines; --verbose shows them)")?;
     }
     Ok(())
 }

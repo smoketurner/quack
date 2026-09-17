@@ -535,7 +535,9 @@ pub async fn run_turn(
     cancel: CancellationToken,
 ) -> Result<AgentResponse> {
     let chat = config.chat_model_ref()?;
-    let embedding_model = required_embedding_model(config).await?;
+    // Without an embedding provider the agent still runs: document search
+    // is keyword-only and graph entry is exact (issue #58).
+    let embedding_model = optional_embedding_model(config).await?;
 
     let (prompt, history) = {
         let guard = db
@@ -635,7 +637,7 @@ async fn dispatch(
     config: &Config,
     db: SharedDb,
     chat: ModelRef<'_>,
-    embedding_model: EmbedModel,
+    embedding_model: Option<EmbedModel>,
     policy: WritePolicy,
     prompt: PromptOptions,
     history: Vec<rig::message::Message>,

@@ -1161,10 +1161,22 @@ rendered as footnotes, charts drawn with ratatui, permission prompts answered wi
 `a`, direct SQL when input starts with `SELECT`/`WITH`/`FROM`/`DESCRIBE`/`SHOW`/`PIVOT`/
 `SUMMARIZE`; direct SQL and `/sql` pass the same gate as the agent's statements (internal
 tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown). Slash commands:
-`/help`, `/tables`, `/schema`, `/sql`, `/ingest`, `/attach`,
-`/docs`, `/pin`, `/graph`, `/path`, `/ontology` (`propose`, `review`, `export`, `import`),
-`/mode`, `/chart`, `/export`, `/model`, `/context`, `/clear`, `/quit`. Keys: `Enter` send,
-`Shift+Enter` newline, `Up`/`Down` history, `PageUp`/`PageDown` scroll, `Esc` or `Ctrl+C` cancel
+`/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/attach`), `/import`, `/docs`,
+`/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...` (the `quack ontology` and
+`quack graph` verbs, parsed by the same clap definitions, run in the background with their
+output in the transcript; anything that would ask on stdin is answered yes), `/graph ENTITY`,
+`/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/sessions`, `/resume`, `/new`,
+`/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`, `/chart [N]`, `/steps`,
+`/model`, `/workspace`, `/clear`, `/quit`. Answers render Markdown (headings, bullets,
+fences, inline marks), tool steps show a three-line preview of their detail until `/steps`
+expands them (print mode folds the same way without `--verbose`), and each chart belongs
+to its answer: the pane shows the latest, `/chart N` any earlier one. Lines wrap to the
+terminal width before the scroll range is computed, so the end is always reachable. Typed
+input is kept in `<data_dir>/terminal_history` across sessions; a relative path to an
+existing file ingests it; an embedding provider is optional (keyword search without one).
+Keys: `Enter` send,
+`Shift+Enter` newline, `Up`/`Down` history, `PageUp`/`PageDown` and the mouse wheel scroll,
+`Home`/`End` jump, `Esc` or `Ctrl+C` cancel
 the running turn (recorded with whatever streamed and a cancelled note), `Ctrl+C` when
 idle quits, `Ctrl+L` clear. The web chat has a Stop button and print mode cancels on
 `Ctrl+C`; every interface passes a cancellation token to `run_turn`.

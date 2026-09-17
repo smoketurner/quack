@@ -125,7 +125,7 @@ impl AgentResponse {
 pub async fn run_analysis<M>(
     db: SharedDb,
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: M,
+    embedding_model: Option<M>,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     graph_options: GraphOptions,
@@ -170,7 +170,7 @@ where
 fn search_tool<M>(
     shared_db: SharedDb,
     completion_model: &(impl rig::completion::CompletionModel + Clone + 'static),
-    embedding_model: M,
+    embedding_model: Option<M>,
     retrieval_config: &RetrievalConfig,
     recorder: &TurnRecorder,
 ) -> SearchDocumentsTool<M> {
@@ -194,7 +194,7 @@ fn search_tool<M>(
 async fn run_inner<M>(
     shared_db: SharedDb,
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: M,
+    embedding_model: Option<M>,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     graph_options: GraphOptions,
@@ -429,7 +429,7 @@ struct BuildContext<'a> {
 /// The rig agent with every tool this workspace and mode register.
 fn build_agent<M>(
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: M,
+    embedding_model: Option<M>,
     system_prompt: &str,
     ctx: &BuildContext<'_>,
 ) -> Result<rig::agent::Agent>
@@ -480,7 +480,7 @@ where
         builder = builder
             .tool(SearchGraphTool::new(
                 Arc::clone(&ctx.shared_db),
-                Some(embedding_model.clone()),
+                embedding_model.clone(),
                 ctx.graph_options,
                 ctx.exclude_provisional,
                 Arc::clone(&ctx.graph_results),
@@ -488,7 +488,7 @@ where
             ))
             .tool(FindPathTool::new(
                 Arc::clone(&ctx.shared_db),
-                Some(embedding_model.clone()),
+                embedding_model.clone(),
                 ctx.graph_options,
                 ctx.exclude_provisional,
                 Arc::clone(&ctx.graph_results),
@@ -496,7 +496,9 @@ where
             ));
     }
 
-    if ctx.retrieval_config.always_retrieve {
+    if ctx.retrieval_config.always_retrieve
+        && let Some(embedding_model) = embedding_model
+    {
         let samples = usize::try_from(ctx.retrieval_config.top_k)
             .map_err(|e| Error::Analysis(format!("top_k overflow: {e}")))?;
         let vector_index = DuckDbVectorIndex::new(Arc::clone(&ctx.shared_db), embedding_model);
