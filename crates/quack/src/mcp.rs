@@ -83,8 +83,6 @@ struct Inner {
     /// The server user, for session ownership; `None` over stdio.
     user_id: Option<String>,
     auditor: Auditor,
-    /// The session `query` appends to, created on first use.
-    session: tokio::sync::Mutex<Option<String>>,
 }
 
 /// One MCP server over one workspace. The tool router comes from the
@@ -100,6 +98,13 @@ pub(crate) struct QueryArgs {
     /// The question, in plain language; the agent searches documents, runs
     /// SQL, and answers with citations.
     pub question: String,
+    /// A session to continue, from an earlier answer's `session_id`;
+    /// omit to start a new one.
+    pub session_id: Option<String>,
+    /// `chat` (general knowledge allowed, the default for a new session)
+    /// or `query` (every claim from the workspace). Given with
+    /// `session_id`, it changes that session's mode.
+    pub mode: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -142,6 +147,12 @@ pub(crate) struct DescribeTableArgs {
     pub table: String,
 }
 
+/// The session a turn runs in, and whether this call made it.
+struct ResolvedSession {
+    id: String,
+    created: bool,
+}
+
 fn internal(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
@@ -174,7 +185,6 @@ impl McpServer {
                 policy,
                 user_id,
                 auditor,
-                session: tokio::sync::Mutex::new(None),
             }),
         }
     }
@@ -193,7 +203,7 @@ impl McpServer {
     /// runs SQL as needed; answers with numbered citations.
     #[tool(
         name = "query",
-        description = "Ask the workspace's agent a question in plain language. It searches the documents, runs SQL over the tables, and answers with numbered citations and, when useful, a chart."
+        description = "Ask the workspace's agent a question in plain language. It searches the documents, runs SQL over the tables, and answers with numbered citations and, when useful, a chart. Each call starts a new session unless `session_id` names one from an earlier answer; `mode` is `chat` or `query`."
     )]
     async fn query(
         &self,
@@ -203,7 +213,18 @@ impl McpServer {
         if question.is_empty() {
             return Ok(failure("question must not be empty"));
         }
-        let session_id = self.session_id().await?;
+        let mode = match args.mode.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(text) => match ChatMode::parse(text) {
+                Some(mode) => Some(mode),
+                None => return Ok(failure("mode must be chat or query")),
+            },
+        };
+        let session = match self.resolve_session(args.session_id, mode).await? {
+            Ok(session) => session,
+            Err(message) => return Ok(failure(message)),
+        };
+        let session_id = session.id;
         let (sink, mut events) = events::channel();
         // Nothing renders the stream here; drain it so the turn never
         // blocks on a full channel.
@@ -282,8 +303,12 @@ impl McpServer {
                         Some(detail),
                     )
                     .await;
-                let sid = session_id.clone();
-                drop(self.db(move |db| sessions::delete_if_empty(db, &sid)).await);
+                // A turn that never recorded a message leaves no session
+                // behind; the next call starts afresh.
+                if session.created {
+                    let sid = session_id.clone();
+                    drop(self.db(move |db| sessions::delete_if_empty(db, &sid)).await);
+                }
                 Ok(failure(format!("the agent turn failed: {e}")))
             }
         }
@@ -555,12 +580,46 @@ impl McpServer {
         llm::embed_query(&model, text).await.ok()
     }
 
-    /// The session `query` turns append to, created on the first call and
-    /// owned by the server user when there is one.
-    async fn session_id(&self) -> Result<String, McpError> {
-        let mut slot = self.inner.session.lock().await;
-        if let Some(id) = slot.as_ref() {
-            return Ok(id.clone());
+    /// The session a `query` call appends to: the requested one when it
+    /// exists and the caller may see it (its mode changed when asked),
+    /// else a new one owned by the server user when there is one.
+    async fn resolve_session(
+        &self,
+        requested: Option<String>,
+        mode: Option<ChatMode>,
+    ) -> Result<Result<ResolvedSession, String>, McpError> {
+        let user = self.inner.user_id.clone();
+        let sees_all = match &self.inner.auditor {
+            Auditor::None => true,
+            Auditor::Server(server) => server.access.sees_all_sessions(),
+        };
+        if let Some(id) = requested
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+        {
+            let requested_id = id.clone();
+            let found = self
+                .db(move |db| {
+                    let Some(session) = sessions::get_session(db, &id)? else {
+                        return Ok(false);
+                    };
+                    if !sessions::visible_to(&session, user.as_deref().unwrap_or(""), sees_all) {
+                        return Ok(false);
+                    }
+                    if let Some(mode) = mode {
+                        sessions::set_session_mode(db, &id, mode)?;
+                    }
+                    Ok(true)
+                })
+                .await?;
+            return Ok(if found {
+                Ok(ResolvedSession {
+                    id: requested_id,
+                    created: false,
+                })
+            } else {
+                Err(String::from("that session does not exist"))
+            });
         }
         let model = self
             .inner
@@ -568,14 +627,13 @@ impl McpServer {
             .chat_model_ref()
             .map(|m| m.to_string())
             .map_err(internal)?;
-        let user = self.inner.user_id.clone();
         let id = self
             .db(move |db| {
-                sessions::create_session(db, &model, ChatMode::Chat, user.as_deref()).map(|s| s.id)
+                sessions::create_session(db, &model, mode.unwrap_or_default(), user.as_deref())
+                    .map(|s| s.id)
             })
             .await?;
-        *slot = Some(id.clone());
-        Ok(id)
+        Ok(Ok(ResolvedSession { id, created: true }))
     }
 
     async fn describe(&self, name: &str) -> Result<Option<serde_json::Value>, McpError> {
@@ -876,6 +934,87 @@ mod tests {
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(empty.is_error, Some(true));
+    }
+
+    /// `query` with a model that cannot answer: the failure is reported,
+    /// the session it made is gone, and the next call is not stuck on a
+    /// deleted session id. A session the caller named survives the
+    /// failure, and a session nobody made is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = Config::parse(
+            "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        config.general.data_dir = dir.path().to_path_buf();
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let db = Arc::new(Mutex::new(db));
+        let server = McpServer::new(
+            config,
+            Arc::clone(&db),
+            WorkspaceRow {
+                id: String::from("ws"),
+                name: String::from("stdio"),
+                classification: String::from("internal"),
+                allowed_providers: None,
+            },
+            WritePolicy::Deny,
+            None,
+            Auditor::None,
+        );
+        let ask = |session_id: Option<&str>, mode: Option<&str>| {
+            Parameters(QueryArgs {
+                question: String::from("how many?"),
+                session_id: session_id.map(str::to_owned),
+                mode: mode.map(str::to_owned),
+            })
+        };
+        let session_count = || {
+            let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
+            sessions::list_sessions(&guard, 10)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .len()
+        };
+
+        for _ in 0..2 {
+            let failed = server
+                .query(ask(None, None))
+                .await
+                .unwrap_or_else(|e| fail(&e.message));
+            let text = error_text(&failed);
+            assert!(text.contains("the agent turn failed"), "{text}");
+            assert!(!text.contains("does not exist"), "{text}");
+            assert_eq!(session_count(), 0);
+        }
+
+        let bad_mode = server
+            .query(ask(None, Some("loud")))
+            .await
+            .unwrap_or_else(|e| fail(&e.message));
+        assert!(error_text(&bad_mode).contains("chat or query"));
+
+        let unknown = server
+            .query(ask(Some("nope"), None))
+            .await
+            .unwrap_or_else(|e| fail(&e.message));
+        assert!(error_text(&unknown).contains("does not exist"));
+
+        let existing = {
+            let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
+            sessions::create_session(&guard, "o/m", ChatMode::Chat, None)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .id
+        };
+        let failed = server
+            .query(ask(Some(&existing), Some("query")))
+            .await
+            .unwrap_or_else(|e| fail(&e.message));
+        assert!(error_text(&failed).contains("the agent turn failed"));
+        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
+        let kept =
+            sessions::get_session(&guard, &existing).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(kept.map(|s| s.mode), Some(ChatMode::Query));
     }
 
     #[tokio::test(flavor = "multi_thread")]

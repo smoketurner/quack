@@ -121,8 +121,9 @@ pub fn validate(answer: &str, registered: &[Citation]) -> (String, Vec<Citation>
                 out.push_str(&renumbered.to_string());
                 out.push(']');
             }
-            None if parsed.is_some() => {
-                // A marker the model invented: dropped.
+            None if parsed.is_some() || is_channel_marker(inside) => {
+                // A marker the model invented, or a provider's channel
+                // token that leaked into the text: dropped.
             }
             None => {
                 out.push('[');
@@ -133,6 +134,17 @@ pub fn validate(answer: &str, registered: &[Citation]) -> (String, Vec<Citation>
         out.push_str(after);
     }
     (out, cited)
+}
+
+/// A harmony-style channel token some providers leak into the answer,
+/// such as `[commentary:functions.run_sql]` or `[analysis]`.
+fn is_channel_marker(inside: &str) -> bool {
+    let inside = inside.trim();
+    ["commentary", "analysis", "final"].iter().any(|word| {
+        inside
+            .strip_prefix(word)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', ' ']))
+    })
 }
 
 #[cfg(test)]
@@ -197,6 +209,18 @@ mod tests {
         assert_eq!(registry.register(&[hit("a", "p.pdf", 0)]), 1);
         let (text, cited) = validate("Renews in March【1】 and again[^1].", &registry.all());
         assert_eq!(text, "Renews in March[1] and again[1].");
+        assert_eq!(cited.len(), 1);
+    }
+
+    #[test]
+    fn validate_strips_leaked_channel_markers() {
+        let registry = CitationRegistry::default();
+        assert_eq!(registry.register(&[hit("a", "p.pdf", 0)]), 1);
+        let (text, cited) = validate(
+            "[commentary:functions.run_sql] There were 12 storms [1].[analysis] [final] [finally]",
+            &registry.all(),
+        );
+        assert_eq!(text, " There were 12 storms [1].  [finally]");
         assert_eq!(cited.len(), 1);
     }
 

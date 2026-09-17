@@ -1069,7 +1069,9 @@ streamable HTTP transport (the successor of the HTTP+SSE pair; responses stream 
 authenticated with the same bearer as the REST API. Over HTTP every request passes
 `access()`, each caller gets a transport keyed by workspace, user, and write permission
 (the member role with the write scope), and every tool call is audited with channel
-`mcp`. `query` appends to one session per MCP session, owned by the server user.
+`mcp`. Each `query` call starts a new session (owned by the server user, `mode` `chat` or
+`query`) and returns its `session_id`; passing that id back continues the session, and a
+turn that fails before recording anything leaves no session behind.
 
 Tools: `query`, `search`, `sql`, `list_tables`, `describe_table`, `list_documents`
 (`search_graph` and `find_path` arrive with the graph, #28). Every tool answers with
