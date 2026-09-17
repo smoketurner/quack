@@ -2191,14 +2191,14 @@ async fn graph_page(
     let embedding = if query.entity.is_empty() {
         None
     } else {
-        graph_api::query_embedding_for(&app, &query.entity).await
+        graph_api::query_embedding_for(&app, &query.entity).await?
     };
     let path_embeddings: Option<EndEmbeddings> = if query.from.is_empty() || query.to.is_empty() {
         None
     } else {
         Some((
-            graph_api::query_embedding_for(&app, &query.from).await,
-            graph_api::query_embedding_for(&app, &query.to).await,
+            graph_api::query_embedding_for(&app, &query.from).await?,
+            graph_api::query_embedding_for(&app, &query.to).await?,
         ))
     };
     let wanted = GraphQueryView {

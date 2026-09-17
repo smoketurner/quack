@@ -55,6 +55,17 @@ impl Source {
     }
 }
 
+/// A lookup's row, `None` when there is none, and any other failure as
+/// the error it is (issue #62: `.ok()` turned a broken query into "not
+/// found" and then a UNIQUE violation).
+fn optional<T>(result: duckdb::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Insert or merge a node and return its id. Merging keeps the existing
 /// label, adds properties the existing node lacks, and clears the
 /// provisional flag only when the new evidence is not provisional either.
@@ -68,14 +79,12 @@ pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<String> {
         return Err(Error::Analysis(String::from("a node needs a label")));
     }
     let conn = db.connection();
-    let existing: Option<(String, Option<String>, bool)> = conn
-        .query_row(
-            "SELECT id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes \
-             WHERE normalized_label = ? AND class_id = ?",
-            duckdb::params![normalized, node.class_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
+    let existing: Option<(String, Option<String>, bool)> = optional(conn.query_row(
+        "SELECT id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes \
+         WHERE normalized_label = ? AND class_id = ?",
+        duckdb::params![normalized, node.class_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ))?;
     if let Some((id, properties, provisional)) = existing {
         let mut merged: serde_json::Value = properties
             .and_then(|p| serde_json::from_str(&p).ok())
@@ -127,14 +136,12 @@ pub fn upsert_edge(
     provisional: bool,
 ) -> Result<String> {
     let conn = db.connection();
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM _quack_graph_edges \
-             WHERE source_node_id = ? AND target_node_id = ? AND relation_id = ?",
-            duckdb::params![source, target, relation_id],
-            |r| r.get(0),
-        )
-        .ok();
+    let existing: Option<String> = optional(conn.query_row(
+        "SELECT id FROM _quack_graph_edges \
+         WHERE source_node_id = ? AND target_node_id = ? AND relation_id = ?",
+        duckdb::params![source, target, relation_id],
+        |r| r.get(0),
+    ))?;
     if let Some(id) = existing {
         if !provisional {
             conn.execute(

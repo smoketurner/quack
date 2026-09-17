@@ -109,8 +109,15 @@ async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: Upload
         Ok(model) => model,
         Err(e) => {
             tracing::warn!(error = %e, document = %job.document_id, "upload fails: no embedding model");
-            if let Ok(guard) = db.lock() {
-                drop(guard.mark_document_error(&job.document_id, &e.to_string()));
+            match db.lock() {
+                Ok(guard) => {
+                    if let Err(mark) = guard.mark_document_error(&job.document_id, &e.to_string()) {
+                        tracing::error!(error = %mark, document = %job.document_id, "could not record the upload failure");
+                    }
+                }
+                Err(poisoned) => {
+                    tracing::error!(error = %poisoned, document = %job.document_id, "workspace lock poisoned; upload failure not recorded");
+                }
             }
             return;
         }

@@ -198,7 +198,7 @@ async fn run_search(
     let result = match (entity, class) {
         (None, None) => anyhow::bail!("give an entity, --class CLASS, or both"),
         (Some(entity), class) => {
-            let embedding = query_embedding(config, entity).await;
+            let embedding = query_embedding(config, entity).await?;
             let roots = traverse::resolve_entry(db, entity, class, embedding.as_deref())?;
             if roots.is_empty() {
                 anyhow::bail!("no entity matches '{entity}'");
@@ -229,8 +229,8 @@ async fn run_path(
         return Ok(());
     };
     let options = config.graph.options();
-    let a = query_embedding(config, &from).await;
-    let b = query_embedding(config, &to).await;
+    let a = query_embedding(config, &from).await?;
+    let b = query_embedding(config, &to).await?;
     let from_nodes = traverse::resolve_entry(db, &from, None, a.as_deref())?;
     let to_nodes = traverse::resolve_entry(db, &to, None, b.as_deref())?;
     let (Some(a), Some(b)) = (from_nodes.first(), to_nodes.first()) else {
@@ -340,9 +340,13 @@ fn confirm(out: &mut impl Write) -> Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
-async fn query_embedding(config: &Config, text: &str) -> Option<Vec<f32>> {
-    let model = llm::optional_embedding_model(config).await.ok()??;
-    llm::embed_query(&model, text).await.ok()
+/// `None` without an embedding model; a failing model is an error, not a
+/// silent fall-back to exact matches.
+async fn query_embedding(config: &Config, text: &str) -> Result<Option<Vec<f32>>> {
+    let Some(model) = llm::optional_embedding_model(config).await? else {
+        return Ok(None);
+    };
+    Ok(Some(llm::embed_query(&model, text).await?))
 }
 
 fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Result<()> {

@@ -501,7 +501,7 @@ impl McpServer {
             ));
         }
         let embedding = match &entity {
-            Some(e) => self.embed(e).await,
+            Some(e) => self.embed(e).await?,
             None => None,
         };
         let hops = args.hops.unwrap_or(2).max(1);
@@ -551,8 +551,8 @@ impl McpServer {
         if from.is_empty() || to.is_empty() {
             return Ok(failure("both entities are needed"));
         }
-        let a = self.embed(&from).await;
-        let b = self.embed(&to).await;
+        let a = self.embed(&from).await?;
+        let b = self.embed(&to).await?;
         let max_hops = args.max_hops.unwrap_or(4).max(1);
         let options = self.inner.config.graph.options();
         let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
@@ -603,12 +603,19 @@ impl McpServer {
 }
 
 impl McpServer {
-    /// A label's embedding for fuzzy entity resolution, when a model exists.
-    async fn embed(&self, text: &str) -> Option<Vec<f32>> {
-        let model = llm::optional_embedding_model(&self.inner.config)
+    /// A label's embedding for fuzzy entity resolution: `None` without a
+    /// model, an error when the model fails.
+    async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, McpError> {
+        let Some(model) = llm::optional_embedding_model(&self.inner.config)
             .await
-            .ok()??;
-        llm::embed_query(&model, text).await.ok()
+            .map_err(internal)?
+        else {
+            return Ok(None);
+        };
+        llm::embed_query(&model, text)
+            .await
+            .map(Some)
+            .map_err(internal)
     }
 
     /// The session a `query` call appends to: the requested one when it

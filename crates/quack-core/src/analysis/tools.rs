@@ -1118,14 +1118,25 @@ pub struct SearchGraphArgs {
 }
 
 /// Embed a label for fuzzy entry-point resolution, when a model exists.
-async fn label_embedding<M: EmbeddingModel>(model: Option<&M>, label: &str) -> Option<Vec<f32>> {
-    let model = model?;
-    let embedding = model.embed_text(label).await.ok()?;
+/// The label's embedding for fuzzy entry: `None` without a model, an
+/// error when the model fails (issue #62: a silent `None` degraded the
+/// search to exact matches without saying so).
+async fn label_embedding<M: EmbeddingModel>(
+    model: Option<&M>,
+    label: &str,
+) -> Result<Option<Vec<f32>>, ToolError> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let embedding = model
+        .embed_text(label)
+        .await
+        .map_err(|e| ToolError::Analysis(format!("embedding failed: {e}")))?;
     #[expect(
         clippy::cast_possible_truncation,
         reason = "f64 -> f32 is acceptable for embedding vectors"
     )]
-    Some(embedding.vec.into_iter().map(|v| v as f32).collect())
+    Ok(Some(embedding.vec.into_iter().map(|v| v as f32).collect()))
 }
 
 impl<M> Tool for SearchGraphTool<M>
@@ -1180,7 +1191,7 @@ where
             )));
         }
         let embedding = match entity {
-            Some(e) => label_embedding(self.embedding_model.as_ref(), e).await,
+            Some(e) => label_embedding(self.embedding_model.as_ref(), e).await?,
             None => None,
         };
         let hops = args.hops.unwrap_or(2).max(1);
@@ -1307,8 +1318,8 @@ where
             step.finish("error: both ends are needed");
             return Err(ToolError::Analysis(String::from("give both entities")));
         }
-        let from_embedding = label_embedding(self.embedding_model.as_ref(), from).await;
-        let to_embedding = label_embedding(self.embedding_model.as_ref(), to).await;
+        let from_embedding = label_embedding(self.embedding_model.as_ref(), from).await?;
+        let to_embedding = label_embedding(self.embedding_model.as_ref(), to).await?;
         let max_hops = args.max_hops.unwrap_or(4).max(1);
         let result = {
             let db = lock(&self.db)?;

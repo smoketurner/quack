@@ -1,7 +1,5 @@
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -1145,8 +1143,9 @@ impl WorkspaceDb {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        // Terms are alphanumeric runs, so the list literal needs no quoting.
-        let term_list = format!("[{}]", terms.join(", "));
+        // Quoted, so a token such as `null` stays a word and not a NULL
+        // element (issue #62).
+        let term_list = sql_text_list(&terms);
         let filter = document_filter(document_ids);
         let sql = format!(
             "WITH q AS (SELECT DISTINCT unnest(?::VARCHAR[]) AS term), \
@@ -1420,24 +1419,18 @@ impl WorkspaceDb {
     /// Start a watchdog that interrupts the connection if the statement runs
     /// past the configured timeout. Dropping the guard disarms it.
     fn arm_timeout(&self) -> TimeoutGuard {
-        let done = Arc::new(AtomicBool::new(false));
+        let (disarm, armed) = std::sync::mpsc::channel::<()>();
         let handle = self.conn.interrupt_handle();
         let timeout = self.query_timeout;
-        let done_for_thread = Arc::clone(&done);
+        // The watchdog sleeps on the channel: dropping the guard closes it
+        // and wakes the thread at once, so nothing polls (issue #62).
         std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            while started.elapsed() < timeout {
-                if done_for_thread.load(Ordering::Acquire) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if !done_for_thread.load(Ordering::Acquire) {
+            if armed.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
                 tracing::warn!(?timeout, "statement exceeded timeout; interrupting");
                 handle.interrupt();
             }
         });
-        TimeoutGuard { done }
+        TimeoutGuard { _disarm: disarm }
     }
 
     /// List all user-created tables in the workspace (excludes internal tables).
@@ -1813,14 +1806,9 @@ fn fuse_rankings(
     fused
 }
 
+/// Disarms the watchdog when dropped: the closed channel wakes it.
 struct TimeoutGuard {
-    done: Arc<AtomicBool>,
-}
-
-impl Drop for TimeoutGuard {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
-    }
+    _disarm: std::sync::mpsc::Sender<()>,
 }
 
 /// True when `sql` is one statement that starts with a read-only keyword

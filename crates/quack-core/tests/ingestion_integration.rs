@@ -1601,6 +1601,33 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     assert_eq!((summary.rows, summary.columns.len()), (2, 2));
 }
 
+/// A query token that is also a SQL word stays a word (issue #62).
+#[test]
+fn keyword_search_treats_null_as_a_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-null").unwrap();
+    db.insert_document(&NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"))
+        .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c",
+        document_id: "d",
+        chunk_index: 0,
+        content: "The null hypothesis was rejected.",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
+    assert_eq!(db.search_keyword_chunks("null", 5, &[]).unwrap().len(), 1);
+    assert_eq!(
+        db.search_keyword_chunks("null hypothesis", 5, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// Only ready documents are searchable, and a pass that fails after
 /// writing chunks takes them back out (issue #52).
 #[tokio::test]

@@ -30,13 +30,13 @@ pub(crate) struct SearchQuery {
 }
 
 /// A label's embedding for fuzzy entity resolution, when a model exists.
-pub(crate) async fn query_embedding_for(app: &App, text: &str) -> Option<Vec<f32>> {
-    let model = llm::optional_embedding_model(&app.config).await.ok()??;
-    llm::embed_query(&model, text).await.ok()
-}
-
-async fn query_embedding(app: &App, text: &str) -> Option<Vec<f32>> {
-    query_embedding_for(app, text).await
+/// The text's embedding for fuzzy entry: `None` when no embedding model
+/// is configured, an error when the model fails.
+pub(crate) async fn query_embedding_for(app: &App, text: &str) -> ApiResult<Option<Vec<f32>>> {
+    let Some(model) = llm::optional_embedding_model(&app.config).await? else {
+        return Ok(None);
+    };
+    Ok(Some(llm::embed_query(&model, text).await?))
 }
 
 pub(crate) async fn search(
@@ -62,7 +62,7 @@ pub(crate) async fn search(
         return Err(ApiError::bad_request("give entity, class, or both"));
     }
     let embedding = match &entity {
-        Some(e) => query_embedding(&app, e).await,
+        Some(e) => query_embedding_for(&app, e).await?,
         None => None,
     };
     let hops = q.hops.unwrap_or(2).max(1);
@@ -112,8 +112,8 @@ pub(crate) async fn path(
     if from.is_empty() || to.is_empty() {
         return Err(ApiError::bad_request("from and to are both needed"));
     }
-    let a = query_embedding(&app, &from).await;
-    let b = query_embedding(&app, &to).await;
+    let a = query_embedding_for(&app, &from).await?;
+    let b = query_embedding_for(&app, &to).await?;
     let max_hops = q.max_hops.unwrap_or(4).max(1);
     let options = app.config.graph.options();
     let db = app.workspace_db(&id).await?;

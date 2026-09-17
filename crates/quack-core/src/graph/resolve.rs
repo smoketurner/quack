@@ -211,11 +211,12 @@ pub fn share_token(a: &str, b: &str) -> bool {
 ///
 /// Returns an error when either node is missing or a write fails.
 pub fn merge_nodes(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
-    let conn = db.connection();
-    let tx = conn.unchecked_transaction()?;
-    merge_nodes_in(db, keep, drop)?;
-    tx.commit()?;
-    Ok(())
+    db.under_timeout(|db| {
+        let tx = db.connection().unchecked_transaction()?;
+        merge_nodes_in(db, keep, drop)?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 fn merge_nodes_in(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {

@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use futures::TryStreamExt as _;
 use rig::embeddings::EmbeddingModel;
 use sqlx::{
     AssertSqlSafe, Column, Connection as _, Executor as _, Row, SqlSafeStr as _, Statement as _,
@@ -183,21 +184,19 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         }
         SourceKind::Postgres | SourceKind::Sqlite => {
             let sql = source_query(request)?;
-            let (columns, records) =
-                tokio::time::timeout(timeout, fetch_rows(&request.url, &sql, limit))
-                    .await
-                    .map_err(|_| {
-                        Error::Ingestion(format!(
-                            "the source did not answer within {} s",
-                            timeout.as_secs()
-                        ))
-                    })??;
-            let rows = u64::try_from(records.len()).unwrap_or(u64::MAX);
+            let fetched = tokio::time::timeout(timeout, fetch_rows(&request.url, &sql, limit))
+                .await
+                .map_err(|_| {
+                    Error::Ingestion(format!(
+                        "the source did not answer within {} s",
+                        timeout.as_secs()
+                    ))
+                })??;
             (
                 format!("{table}.csv"),
-                csv_bytes(&columns, &records),
-                columns,
-                Some(rows),
+                fetched.csv.into_bytes(),
+                fetched.columns,
+                Some(fetched.rows),
             )
         }
     };
@@ -286,11 +285,16 @@ fn source_query(request: &ImportRequest) -> Result<String> {
 
 /// Run `inner` on the source with every column cast to text and at most
 /// `limit` rows; returns the column names and the rows as text cells.
-async fn fetch_rows(
-    url: &str,
-    inner: &str,
-    limit: u64,
-) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
+/// What a query source yielded, already as CSV: rows are written as they
+/// arrive, so the memory cost is the file once, not the rows as strings
+/// plus the file (issue #62).
+struct Fetched {
+    columns: Vec<String>,
+    csv: String,
+    rows: u64,
+}
+
+async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
     sqlx::any::install_default_drivers();
     let mut conn = sqlx::AnyConnection::connect(url)
         .await
@@ -319,12 +323,14 @@ async fn fetch_rows(
         write!(select, "CAST({quoted} AS TEXT) AS {quoted}")?;
     }
     write!(select, " FROM ({inner}) AS quack_q LIMIT {limit}")?;
-    let rows = sqlx::query(AssertSqlSafe(select))
-        .fetch_all(&mut conn)
+    let mut csv = Csv::with_header(&columns);
+    let mut rows = 0u64;
+    let mut stream = sqlx::query(AssertSqlSafe(select)).fetch(&mut conn);
+    while let Some(row) = stream
+        .try_next()
         .await
-        .map_err(|e| Error::Ingestion(format!("the source query failed: {e}")))?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+        .map_err(|e| Error::Ingestion(format!("the source query failed: {e}")))?
+    {
         let mut cells = Vec::with_capacity(columns.len());
         for i in 0..columns.len() {
             let cell: Option<String> = row.try_get(i).map_err(|e| {
@@ -335,36 +341,52 @@ async fn fetch_rows(
             })?;
             cells.push(cell);
         }
-        out.push(cells);
+        csv.row(&cells);
+        rows = rows.saturating_add(1);
     }
-    Ok((columns, out))
+    Ok(Fetched {
+        columns,
+        csv: csv.text,
+        rows,
+    })
 }
 
-/// Rows as CSV with a header; `DuckDB` sniffs the types back.
-fn csv_bytes(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<u8> {
-    let field = |value: &str| -> String {
-        if value.contains([',', '"', '\n', '\r']) {
-            format!("\"{}\"", value.replace('"', "\"\""))
-        } else {
-            value.to_owned()
-        }
-    };
-    let mut text = columns
-        .iter()
-        .map(|c| field(c))
-        .collect::<Vec<_>>()
-        .join(",");
-    text.push('\n');
-    for row in rows {
-        let line = row
-            .iter()
-            .map(|cell| cell.as_deref().map_or(String::new(), field))
-            .collect::<Vec<_>>()
-            .join(",");
-        text.push_str(&line);
-        text.push('\n');
+/// CSV text built a row at a time; `DuckDB` sniffs the types back.
+struct Csv {
+    text: String,
+}
+
+impl Csv {
+    fn with_header(columns: &[String]) -> Self {
+        let mut csv = Self {
+            text: String::new(),
+        };
+        csv.line(columns.iter().map(|c| Some(c.as_str())));
+        csv
     }
-    text.into_bytes()
+
+    fn row(&mut self, cells: &[Option<String>]) {
+        self.line(cells.iter().map(Option::as_deref));
+    }
+
+    fn line<'a>(&mut self, cells: impl Iterator<Item = Option<&'a str>>) {
+        for (i, cell) in cells.enumerate() {
+            if i > 0 {
+                self.text.push(',');
+            }
+            let Some(value) = cell else {
+                continue;
+            };
+            if value.contains([',', '"', '\n', '\r']) {
+                self.text.push('"');
+                self.text.push_str(&value.replace('"', "\"\""));
+                self.text.push('"');
+            } else {
+                self.text.push_str(value);
+            }
+        }
+        self.text.push('\n');
+    }
 }
 
 /// How a download is bounded.
@@ -767,10 +789,8 @@ mod tests {
 
     #[test]
     fn csv_quotes_and_leaves_nulls_empty() {
-        let bytes = csv_bytes(
-            &[String::from("a"), String::from("b,c")],
-            &[vec![Some(String::from("x\"y")), None]],
-        );
-        assert_eq!(String::from_utf8_lossy(&bytes), "a,\"b,c\"\n\"x\"\"y\",\n");
+        let mut csv = Csv::with_header(&[String::from("a"), String::from("b,c")]);
+        csv.row(&[Some(String::from("x\"y")), None]);
+        assert_eq!(csv.text, "a,\"b,c\"\n\"x\"\"y\",\n");
     }
 }
