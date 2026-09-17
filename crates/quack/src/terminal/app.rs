@@ -512,7 +512,14 @@ impl App {
             return;
         };
         if allow {
-            request.allow();
+            if for_session {
+                // The rest of this turn through the request, the turns
+                // after through the policy the next turn starts with.
+                request.allow_for_turn();
+                self.allow_write = true;
+            } else {
+                request.allow();
+            }
             self.messages.push(Message::new(
                 MessageRole::System,
                 if for_session {
@@ -521,9 +528,6 @@ impl App {
                     "Allowed."
                 },
             ));
-            if for_session {
-                self.allow_write = true;
-            }
         } else {
             request.deny();
             self.messages

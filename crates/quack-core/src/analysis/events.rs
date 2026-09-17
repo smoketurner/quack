@@ -4,6 +4,7 @@
 //! inline, print mode writes steps to stderr and text to stdout, and later
 //! the server forwards them as SSE and the session store persists them.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -29,20 +30,36 @@ pub struct ToolStep {
 #[derive(Debug)]
 pub struct PermissionRequest {
     pub sql: String,
-    reply: oneshot::Sender<bool>,
+    reply: oneshot::Sender<Decision>,
+}
+
+/// The interface's answer to a permission request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Deny,
+    /// This statement only.
+    Allow,
+    /// This statement and every later write in the same turn (the
+    /// terminal's `a`; issue #56). The interface keeps its own flag for
+    /// the turns after.
+    AllowForTurn,
 }
 
 impl PermissionRequest {
     pub fn allow(self) {
-        self.answer(true);
+        self.answer(Decision::Allow);
+    }
+
+    pub fn allow_for_turn(self) {
+        self.answer(Decision::AllowForTurn);
     }
 
     pub fn deny(self) {
-        self.answer(false);
+        self.answer(Decision::Deny);
     }
 
-    fn answer(self, allowed: bool) {
-        if self.reply.send(allowed).is_err() {
+    fn answer(self, decision: Decision) {
+        if self.reply.send(decision).is_err() {
             tracing::debug!("permission answer arrived after the tool stopped waiting");
         }
     }
@@ -84,6 +101,9 @@ pub struct TurnRecorder {
     sink: EventSink,
     steps: Arc<Mutex<Vec<ToolStep>>>,
     citations: CitationRegistry,
+    /// Set once the interface answered `AllowForTurn`: later writes in
+    /// this turn run without asking.
+    writes_granted: Arc<AtomicBool>,
 }
 
 impl TurnRecorder {
@@ -93,6 +113,7 @@ impl TurnRecorder {
             sink,
             steps: Arc::new(Mutex::new(Vec::new())),
             citations: CitationRegistry::default(),
+            writes_granted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -122,15 +143,26 @@ impl TurnRecorder {
         }
     }
 
-    /// Ask the interface whether a write may run. Resolves to `false` when
-    /// the interface drops the request.
+    /// Ask the interface whether a write may run, unless an earlier
+    /// answer this turn already granted every write. Resolves to `false`
+    /// when the interface drops the request.
     pub async fn ask_permission(&self, sql: &str) -> bool {
+        if self.writes_granted.load(Ordering::Acquire) {
+            return true;
+        }
         let (reply, answer) = oneshot::channel();
         self.emit(AgentEvent::PermissionRequired(PermissionRequest {
             sql: sql.to_owned(),
             reply,
         }));
-        answer.await.unwrap_or(false)
+        match answer.await.unwrap_or(Decision::Deny) {
+            Decision::Deny => false,
+            Decision::Allow => true,
+            Decision::AllowForTurn => {
+                self.writes_granted.store(true, Ordering::Release);
+                true
+            }
+        }
     }
 
     /// The steps recorded so far, in order.
@@ -219,6 +251,22 @@ mod tests {
         let req = permission_request(rx.recv().await).unwrap();
         drop(req);
         assert!(denied.await.is_ok_and(|a| !a));
+
+        // `a` grants the rest of the turn: the next write is not asked.
+        let asker = recorder.clone();
+        let granted = tokio::spawn(async move { asker.ask_permission("UPDATE t SET a = 1").await });
+        let req = permission_request(rx.recv().await).unwrap();
+        req.allow_for_turn();
+        assert!(granted.await.is_ok_and(|a| a));
+        assert!(recorder.ask_permission("DELETE FROM t").await);
+        assert!(rx.try_recv().is_err(), "no request was emitted");
+        // A fresh recorder (the next turn) asks again.
+        let (sink, mut rx) = channel();
+        let next = TurnRecorder::new(sink);
+        let asker = next.clone();
+        let pending = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        assert!(permission_request(rx.recv().await).is_some());
+        pending.abort();
     }
 
     #[test]
