@@ -1056,7 +1056,8 @@ POST   /api/v1/workspaces/{id}/sql                {sql}
 GET    /api/v1/workspaces/{id}/search?q=&k=       hybrid retrieval, no LLM
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
-                                                  (identical bytes: status "duplicate")
+                                                  (identical bytes: status "duplicate";
+                                                  a table another document owns: 409)
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
 PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
 DELETE /api/v1/workspaces/{id}/documents/{doc}

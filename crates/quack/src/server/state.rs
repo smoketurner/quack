@@ -109,9 +109,18 @@ impl AppState {
         }
         let config = self.config.clone();
         let id = workspace_id.to_owned();
-        let db = tokio::task::spawn_blocking(move || WorkspaceDb::open(&config, &id))
-            .await
-            .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
+        let db = tokio::task::spawn_blocking(move || {
+            let db = WorkspaceDb::open(&config, &id)?;
+            // Uploads a previous process took but never finished cannot
+            // be resumed: their bytes are gone with it.
+            let stale = db.fail_stale_uploads()?;
+            if stale > 0 {
+                tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
+            }
+            Ok::<_, quack_core::error::Error>(db)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
         let shared: SharedDb = Arc::new(Mutex::new(db));
         open.insert(workspace_id.to_owned(), Arc::clone(&shared));
         Ok(shared)

@@ -700,6 +700,71 @@ impl WorkspaceDb {
         }
     }
 
+    /// The live (non-error) document that loaded `table`, if any: one
+    /// document owns a table (issue #51).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn table_owner(&self, table: &str) -> Result<Option<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE status <> 'error' AND tables IS NOT NULL \
+             AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY ingested_at, id LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![table])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(document_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether what a ready document loaded is still there: every table
+    /// it recorded exists, and a chunked document still has chunks. A
+    /// document still queued or processing counts as intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query fails.
+    pub fn document_intact(&self, doc: &DocumentInfo) -> Result<bool> {
+        if doc.status != "ready" {
+            return Ok(true);
+        }
+        if let Some(tables) = &doc.tables
+            && !tables.is_empty()
+        {
+            let existing = self.list_tables()?;
+            return Ok(tables.iter().all(|t| existing.contains(t)));
+        }
+        if doc.chunk_count.is_some_and(|n| n > 0) {
+            let chunks: i64 = self.conn.query_row(
+                "SELECT count(*) FROM _quack_chunks WHERE document_id = ?",
+                duckdb::params![doc.id],
+                |r| r.get(0),
+            )?;
+            return Ok(chunks > 0);
+        }
+        Ok(true)
+    }
+
+    /// Fail every document still `queued` or `processing`: called once
+    /// when a server opens the workspace, since upload bytes live only in
+    /// the memory of the process that took them, so nothing can finish a
+    /// row a restart interrupted (issue #51). Returns how many.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn fail_stale_uploads(&self) -> Result<usize> {
+        let changed = self.conn.execute(
+            "UPDATE _quack_documents SET status = 'error', \
+             error_message = 'interrupted by a restart before it was processed; upload it again' \
+             WHERE status IN ('queued', 'processing')",
+            [],
+        )?;
+        Ok(changed)
+    }
+
     /// Set the title parsed from the content, when the caller gave none.
     ///
     /// # Errors

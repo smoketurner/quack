@@ -63,6 +63,7 @@ impl From<CoreError> for ApiError {
                 StatusCode::BAD_REQUEST
             }
             CoreError::Analysis(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            CoreError::TableTaken { .. } => StatusCode::CONFLICT,
             CoreError::Sqlite(_)
             | CoreError::DuckDb(_)
             | CoreError::Embedding(_)

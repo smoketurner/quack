@@ -158,7 +158,8 @@ membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 has
 `Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content
 half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace under the
 same UUID v7. Ingestion is `register_document` (status `queued`, or `Registration::Duplicate` when the
-bytes' SHA-256 already belong to a non-failed document) plus `process_document`
+bytes' SHA-256 already belong to a non-failed document whose table or chunks still exist;
+`Error::TableTaken` when the file's table belongs to another live document) plus `process_document`
 (`processing` to `ready` or `error`, recording `chunk_count` and the parsed title);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
 title and uploader).

@@ -1536,6 +1536,94 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     assert_eq!((summary.rows, summary.columns.len()), (2, 2));
 }
 
+/// One document per table (issue #51): a changed file with the same
+/// name is refused while its predecessor lives; identical bytes after
+/// the table was dropped load again as a new document and the stale row
+/// fails; rows a restart left queued are failed on open.
+#[tokio::test]
+async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-owner").unwrap();
+    let first_bytes = b"region,total\nnorth,1\n";
+    let ingested = |outcome: ingestion::IngestOutcome| match outcome {
+        ingestion::IngestOutcome::Ingested(r) => Some(r),
+        ingestion::IngestOutcome::Duplicate(_) => None,
+    };
+    let first = ingested(
+        ingestion::ingest_file(
+            &config,
+            &db,
+            "ws-owner",
+            &ingestion::NewFile::new("sales.csv", first_bytes),
+            None::<&MockEmbeddingModel>,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first.tables, vec![String::from("sales")]);
+
+    let changed = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-owner",
+        &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,2\n"),
+        None::<&MockEmbeddingModel>,
+    )
+    .await;
+    let err = changed.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("belongs to document"), "{err}");
+    assert!(err.contains(&first.document_id), "{err}");
+    assert_eq!(
+        db.list_documents().unwrap().len(),
+        1,
+        "nothing was registered"
+    );
+    let rows: i64 = db
+        .connection()
+        .query_row("SELECT total FROM sales", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the owner's table is untouched");
+
+    // The table is dropped behind the document's back: the same bytes
+    // are no longer a duplicate.
+    db.execute_statement("DROP TABLE sales").unwrap();
+    let again = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-owner",
+        &ingestion::NewFile::new("sales.csv", first_bytes),
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap();
+    let reloaded = ingested(again).unwrap();
+    assert_ne!(reloaded.document_id, first.document_id);
+    assert!(db.list_tables().unwrap().contains(&String::from("sales")));
+    let stale = db.document(&first.document_id).unwrap().unwrap();
+    assert_eq!(stale.status, "error");
+    assert!(
+        db.table_owner("sales")
+            .unwrap()
+            .is_some_and(|d| d.id == reloaded.document_id)
+    );
+
+    // A queued row from a process that died is failed when the server
+    // opens the workspace.
+    let registration =
+        ingestion::register_document(&db, &ingestion::NewFile::new("later.csv", b"a\n1\n"))
+            .unwrap();
+    let ingestion::Registration::New(queued) = registration else {
+        return assert!(matches!(registration, ingestion::Registration::New(_)));
+    };
+    assert_eq!(db.fail_stale_uploads().unwrap(), 1);
+    let failed = db.document(&queued).unwrap().unwrap();
+    assert_eq!(failed.status, "error");
+    assert!(failed.error_message.is_some_and(|m| m.contains("restart")));
+    assert_eq!(db.fail_stale_uploads().unwrap(), 0);
+}
+
 /// The server's default policy keeps a logged-in user off the server's
 /// disk: a `sqlite:` path is refused before anything is opened.
 #[tokio::test]

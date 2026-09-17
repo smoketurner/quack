@@ -170,7 +170,23 @@ pub fn register_document(db: &WorkspaceDb, file: &NewFile<'_>) -> Result<Registr
     }
     let sha256 = sha256_hex(file.data);
     if let Some(existing) = db.document_by_sha256(&sha256)? {
-        return Ok(Registration::Duplicate(Box::new(existing)));
+        if db.document_intact(&existing)? {
+            return Ok(Registration::Duplicate(Box::new(existing)));
+        }
+        // Its table was dropped (or its chunks are gone): the row no
+        // longer describes anything, so it fails and the bytes load
+        // again as a new document.
+        tracing::warn!(document = %existing.id, file = %existing.filename, "document lost its table or chunks; re-ingesting");
+        db.mark_document_error(
+            &existing.id,
+            "its table or chunks were dropped; the file was ingested again",
+        )?;
+    }
+    if matches!(
+        file_type,
+        parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json
+    ) {
+        check_table_free(db, &sanitize_table_name(file.filename), None)?;
     }
     let doc_id = uuid::Uuid::now_v7().to_string();
     let title = file.title.map(str::trim).filter(|t| !t.is_empty());
@@ -238,7 +254,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
     match file_type {
         parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json => {
             let table_name = db.with(|db| {
-                ingest_structured(config, db, workspace_id, filename, data, &file_type)
+                ingest_structured(config, db, workspace_id, doc_id, filename, data, &file_type)
             })?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
@@ -249,7 +265,8 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
             })
         }
         parser::FileType::Xlsx => {
-            let tables = db.with(|db| ingest_workbook(config, db, workspace_id, filename, data))?;
+            let tables =
+                db.with(|db| ingest_workbook(config, db, workspace_id, doc_id, filename, data))?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
@@ -285,6 +302,19 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
             })
         }
         parser::FileType::Unknown => Err(Error::UnsupportedFileType(filename.to_owned())),
+    }
+}
+
+/// One document per table: refuse when a live document other than
+/// `owner` already loaded `table`.
+fn check_table_free(db: &WorkspaceDb, table: &str, owner: Option<&str>) -> Result<()> {
+    match db.table_owner(table)? {
+        Some(doc) if owner != Some(doc.id.as_str()) => Err(Error::TableTaken {
+            table: table.to_owned(),
+            document: doc.id,
+            filename: doc.filename,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -353,10 +383,13 @@ fn ingest_structured(
     config: &Config,
     db: &WorkspaceDb,
     workspace_id: &str,
+    doc_id: &str,
     filename: &str,
     data: &[u8],
     file_type: &parser::FileType,
 ) -> Result<String> {
+    let table_name = sanitize_table_name(filename);
+    check_table_free(db, &table_name, Some(doc_id))?;
     let files_dir = config.workspace_files_dir(workspace_id);
     std::fs::create_dir_all(&files_dir)?;
     let dest = files_dir.join(
@@ -366,7 +399,6 @@ fn ingest_structured(
     );
     std::fs::write(&dest, data)?;
 
-    let table_name = sanitize_table_name(filename);
     let path = dest.to_string_lossy();
 
     let reader = match file_type {
@@ -403,6 +435,7 @@ fn ingest_workbook(
     config: &Config,
     db: &WorkspaceDb,
     workspace_id: &str,
+    doc_id: &str,
     filename: &str,
     data: &[u8],
 ) -> Result<Vec<String>> {
@@ -411,13 +444,21 @@ fn ingest_workbook(
     std::fs::create_dir_all(&files_dir)?;
     let stem = sanitize_table_name(filename);
     let single = sheets.len() == 1;
+    let names: Vec<String> = sheets
+        .iter()
+        .map(|sheet| {
+            if single {
+                stem.clone()
+            } else {
+                format!("{stem}_{}", sanitize_identifier(&sheet.sheet))
+            }
+        })
+        .collect();
+    for name in &names {
+        check_table_free(db, name, Some(doc_id))?;
+    }
     let mut tables = Vec::with_capacity(sheets.len());
-    for sheet in sheets {
-        let table_name = if single {
-            stem.clone()
-        } else {
-            format!("{stem}_{}", sanitize_identifier(&sheet.sheet))
-        };
+    for (sheet, table_name) in sheets.into_iter().zip(names) {
         let dest = files_dir.join(format!("{table_name}.csv"));
         std::fs::write(&dest, &sheet.csv)?;
         let path = dest.to_string_lossy();

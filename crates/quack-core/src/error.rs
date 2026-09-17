@@ -30,6 +30,17 @@ pub enum Error {
     #[error("ingestion error: {0}")]
     Ingestion(String),
 
+    /// A structured file would load into a table another document owns
+    /// (issue #51): one document per table.
+    #[error(
+        "table '{table}' belongs to document {document} ({filename}); delete that document first, or rename the file"
+    )]
+    TableTaken {
+        table: String,
+        document: String,
+        filename: String,
+    },
+
     #[error("ontology error: {0}")]
     Ontology(String),
 
