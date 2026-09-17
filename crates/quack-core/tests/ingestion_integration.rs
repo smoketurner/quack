@@ -1510,7 +1510,10 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-import").unwrap();
-    let source_path = dir.path().join("source.db");
+    // Beside the data directory, not inside it: quack's own files are
+    // refused as a source (issue #69).
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("source.db");
     {
         use sqlx::Connection as _;
         use sqlx::Executor as _;
@@ -1827,7 +1830,8 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-import-errors").unwrap();
-    let source_path = dir.path().join("source.db");
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("source.db");
     {
         use sqlx::Connection as _;
         use sqlx::Executor as _;

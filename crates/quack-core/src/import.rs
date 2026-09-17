@@ -131,6 +131,30 @@ pub fn redact(url: &str) -> String {
     }
 }
 
+/// The file a `sqlite:` URL names: the scheme and any `//` stripped, the
+/// query string dropped.
+fn sqlite_path(url: &str) -> &str {
+    let rest = url.trim().get("sqlite:".len()..).unwrap_or_default();
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    rest.split_once('?').map_or(rest, |(path, _)| path)
+}
+
+/// Whether a `sqlite:` URL points inside `[general].data_dir`: the control
+/// database and the workspace files are quack's own, and nothing in them
+/// belongs in a workspace table, whoever asks (issue #69).
+fn under_data_dir(config: &Config, url: &str) -> bool {
+    let path = std::path::Path::new(sqlite_path(url));
+    let data_dir = &config.general.data_dir;
+    let inside = |p: &std::path::Path, d: &std::path::Path| p.starts_with(d);
+    if inside(path, data_dir) {
+        return true;
+    }
+    match (std::fs::canonicalize(path), std::fs::canonicalize(data_dir)) {
+        (Ok(p), Ok(d)) => inside(&p, &d),
+        _ => false,
+    }
+}
+
 /// A table name for the workspace: `[A-Za-z0-9_]` runs, else `_`.
 fn table_name(raw: &str) -> Result<String> {
     let name = ingestion::table_name_for(raw);
@@ -180,6 +204,12 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
             return Err(Error::Ingestion(String::from(
                 "files on the server's disk cannot be imported through the server; \
                  run `quack import` on the host, or set [import].allow_local_files",
+            )));
+        }
+        SourceKind::Sqlite if under_data_dir(config, &request.url) => {
+            return Err(Error::Ingestion(String::from(
+                "quack's own data directory (control.db and the workspace files) \
+                 cannot be imported into a workspace",
             )));
         }
         SourceKind::Postgres | SourceKind::Sqlite => {
@@ -777,6 +807,11 @@ mod tests {
         panic!("cannot create a temp dir: {msg}")
     }
 
+    #[expect(clippy::panic, reason = "test helper: the fixture files must exist")]
+    fn no_file(msg: &str) {
+        panic!("cannot write a fixture file: {msg}")
+    }
+
     #[expect(clippy::panic, reason = "test helper: the workspace must open")]
     fn no_workspace(msg: &str) -> WorkspaceDb {
         panic!("cannot open the workspace: {msg}")
@@ -785,6 +820,57 @@ mod tests {
     #[expect(clippy::panic, reason = "test asserts Ok")]
     fn no_import(msg: &str) -> ImportSummary {
         panic!("import failed: {msg}")
+    }
+
+    /// The control database and workspace files stay out of workspaces
+    /// even for the owner (issue #69), through every spelling of the URL;
+    /// a symlink into the data directory does not slip past.
+    #[tokio::test]
+    async fn sqlite_imports_refuse_quacks_own_data_directory() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config.general.data_dir)
+            .unwrap_or_else(|e| no_file(&e.to_string()));
+        let control = config.general.data_dir.join("control.db");
+        std::fs::write(&control, b"").unwrap_or_else(|e| no_file(&e.to_string()));
+        let link = dir.path().join("elsewhere.db");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&control, &link).unwrap_or_else(|e| no_file(&e.to_string()));
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| no_workspace(&e.to_string()));
+        let control = control.display();
+        let mut urls = vec![
+            format!("sqlite:{control}"),
+            format!("sqlite://{control}"),
+            format!("SQLite:{control}?mode=ro"),
+        ];
+        if cfg!(unix) {
+            urls.push(format!("sqlite:{}", link.display()));
+        }
+        for url in urls {
+            let request = ImportRequest {
+                url: url.clone(),
+                table: String::from("x"),
+                query: None,
+                source_table: Some(String::from("users")),
+                limit: None,
+            };
+            let err = import(
+                &config,
+                &db,
+                "ws",
+                &request,
+                ImportPolicy::owner(),
+                None::<&crate::llm::EmbedModel>,
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+            assert!(err.contains("own data directory"), "{url}: {err}");
+        }
+        assert!(!under_data_dir(&config, "sqlite:/tmp/other.db"));
+        assert_eq!(sqlite_path("sqlite://a/b.db?x=1"), "a/b.db");
     }
 
     #[test]

@@ -2815,7 +2815,9 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         )
         .await;
     let ws = body["id"].as_str().unwrap_or_default().to_owned();
-    let source_path = h.app.config.general.data_dir.join("source.db");
+    // Outside the data directory: quack's own files are refused (below).
+    let source_dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let source_path = source_dir.path().join("source.db");
     {
         use sqlx::Connection as _;
         use sqlx::Executor as _;
@@ -2844,6 +2846,30 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
     assert_eq!(body["table"], "vendors");
     let (_, body) = h.get(&format!("/api/v1/workspaces/{ws}/tables"), "").await;
     assert_eq!(body["tables"], serde_json::json!(["vendors"]));
+
+    // The server's own control database stays out, even for the owner
+    // (issue #69).
+    let control = h.app.config.general.data_dir.join("control.db");
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/import"),
+            None,
+            Some(serde_json::json!({
+                "url": format!("sqlite:{}", control.display()),
+                "table": "x",
+                "source_table": "users"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("own data directory"),
+        "{body}"
+    );
 
     let (status, body) = h
         .call(
@@ -2897,10 +2923,10 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         .await;
     assert_eq!(
         imports.len(),
-        3,
-        "two allowed and the failed query; the bad URL never reaches the audit"
+        4,
+        "two allowed, the refused control.db, and the failed query; the bad URL never reaches the audit"
     );
-    assert_eq!(imports.iter().filter(|r| r.outcome == "error").count(), 1);
+    assert_eq!(imports.iter().filter(|r| r.outcome == "error").count(), 2);
 }
 
 fn urlencode(text: &str) -> String {
