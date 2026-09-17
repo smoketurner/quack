@@ -106,28 +106,44 @@ pub(crate) async fn upload(
         .into_response())
 }
 
-/// An OKF bundle: every concept file is queued as a Markdown document, the
-/// front matter and links go to the ontology review queue, and the
-/// `index.md` body is returned as `context` for the caller to apply.
+/// An OKF bundle: every concept file with text is queued as a Markdown
+/// document (quack's own stubs are not), the bundle's ontology snapshot
+/// is restored when the workspace has none, the front matter and links go
+/// to the ontology review queue, and the `index.md` body is returned as
+/// `context` for the caller to apply.
 async fn import_bundle(
     app: &App,
     access: &Access,
     bundle: Bundle,
 ) -> ApiResult<axum::response::Response> {
     let files: Vec<(String, Vec<u8>)> = bundle
-        .concepts()
+        .documents()
         .map(|f| (okf::document_name(&f.path), f.content.as_bytes().to_vec()))
         .collect();
-    let queued = enqueue(app, access, DocumentSource::Upload, files).await?;
+    let queued = if files.is_empty() {
+        Vec::new()
+    } else {
+        enqueue(app, access, DocumentSource::Upload, files).await?
+    };
     let db = app.workspace_db(&access.workspace.id).await?;
     let for_candidates = bundle.clone();
-    let candidates = with_db(db, move |db| {
-        let current = ontology_store::current(db)?;
+    let author = access.identity.username.clone();
+    let (candidates, restored) = with_db(db, move |db| {
+        let mut current = ontology_store::current(db)?;
+        let mut restored = None;
+        if current.is_none()
+            && let Some(snapshot) = for_candidates.ontology()?
+        {
+            let saved =
+                ontology_store::save(db, &snapshot, Some(&author), Some("restored from a bundle"))?;
+            restored = Some(saved.version);
+            current = Some(saved);
+        }
         let candidates = okf::propose(&for_candidates, current.as_ref());
         if !candidates.is_empty() {
             candidates::store_run(db, &candidates)?;
         }
-        Ok(candidates.len())
+        Ok((candidates.len(), restored))
     })
     .await?;
     let context = bundle
@@ -138,6 +154,7 @@ async fn import_bundle(
         Json(serde_json::json!({
             "documents": queued,
             "candidates": candidates,
+            "ontology_version": restored,
             "context": context,
         })),
     )

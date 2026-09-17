@@ -492,8 +492,19 @@ names, the `name` column is the directory name and a display name lives in `_qua
 
 **Sources.** File upload (web, REST, desktop), paste (web: a text box that becomes a
 document), path (TUI, CLI), stdin (print mode), and an OKF bundle as a directory or a tar
-(every concept file a document, section 17 item 13). URL, GitHub, and Confluence
-connectors are deferred (section 18).
+(section 17 item 13). URL, GitHub, and Confluence connectors are deferred (section 18).
+
+**OKF bundles are a one-way knowledge export.** `quack okf export` writes `index.md` from
+the context, a schema-and-samples stub per table, a metadata stub per document, the
+ontology as Markdown files plus an exact JSON snapshot (`ontology/ontology.md`), one entity
+file per graph node (with its id, links that resolve to the target's file, and provenance),
+and `log.md` from the ontology versions only: the audit detail never leaves the workspace,
+and neither table data nor document text is in the bundle. Importing a bundle (`quack
+ingest DIR`, `POST .../documents` with a tar) ingests every concept file that carries text
+as a document (a foreign bundle's files; quack's own stubs are marked `generator: quack`
+and skipped), restores the ontology snapshot when the workspace has none, proposes the
+bundle's types and links as candidates otherwise, and offers `index.md` as the context. The
+graph is rebuilt with `quack graph extract` once the tables and documents are back.
 
 **Parsing.**
 

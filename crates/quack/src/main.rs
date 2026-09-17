@@ -23,8 +23,8 @@ use quack_core::llm;
 use quack_core::llm::oauth::{self, TokenManager};
 use quack_core::llm::oauth::{LoginOptions, LoginPrompt};
 use quack_core::okf::{self, Bundle};
-use quack_core::ontology::candidates;
 use quack_core::ontology::store as ontology_store;
+use quack_core::ontology::{Ontology, candidates};
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
@@ -1346,7 +1346,7 @@ async fn ingest_bundle(
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut stored = 0usize;
     let mut skipped = 0usize;
-    for file in bundle.concepts() {
+    for file in bundle.documents() {
         let (front, _) = okf::parse_front_matter(&file.content);
         let name = okf::document_name(&file.path);
         let outcome = ingestion::ingest_file(
@@ -1372,7 +1372,7 @@ async fn ingest_bundle(
             String::new()
         }
     )?;
-    let current = ontology_store::current(&ws_db)?;
+    let current = restore_bundle_ontology(&ws_db, &bundle, dir, &mut out)?;
     let candidates = okf::propose(&bundle, current.as_ref());
     if !candidates.is_empty() {
         candidates::store_run(&ws_db, &candidates)?;
@@ -1416,6 +1416,37 @@ async fn ingest_bundle(
     }
     out.flush()?;
     Ok(())
+}
+
+/// quack's own export carries the ontology exactly: a workspace without
+/// one takes it back as it was; one that has an ontology reviews the
+/// bundle's types and links as candidates instead. Returns the ontology
+/// in force afterwards.
+fn restore_bundle_ontology(
+    ws_db: &WorkspaceDb,
+    bundle: &Bundle,
+    dir: &str,
+    out: &mut impl Write,
+) -> Result<Option<Ontology>> {
+    let current = ontology_store::current(ws_db)?;
+    if current.is_some() {
+        return Ok(current);
+    }
+    let Some(snapshot) = bundle.ontology()? else {
+        return Ok(None);
+    };
+    let restored = ontology_store::save(
+        ws_db,
+        &snapshot,
+        None,
+        Some(&format!("restored from {dir}")),
+    )?;
+    writeln!(
+        out,
+        "Restored the bundle's ontology (version {} in this workspace).",
+        restored.version
+    )?;
+    Ok(Some(restored))
 }
 
 fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, String)> {

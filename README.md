@@ -98,7 +98,7 @@ Share the workspace:
 ```bash
 quack serve --local                      # web UI, REST API, and MCP on http://127.0.0.1:8080
 quack mcp -w sales                       # MCP over stdio for Claude Code and editors
-quack okf export ./bundle                # export the workspace as Markdown files; `quack ingest DIR` imports it
+quack okf export ./bundle                # one-way Markdown knowledge export (no data, no audit); `quack ingest DIR` restores the ontology and context
 quack user add alice --admin             # users, tokens, members, and the audit log for `quack serve`
 ```
 

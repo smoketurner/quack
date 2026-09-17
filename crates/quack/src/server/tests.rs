@@ -2675,6 +2675,54 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         .await;
     assert_eq!(exports.len(), 1);
 
+    assert!(paths.contains(&"ontology/ontology.md"), "{paths:?}");
+    let log = bundle
+        .files
+        .iter()
+        .find(|f| f.path == "log.md")
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+    assert!(
+        !log.contains("Activity"),
+        "no audit detail in a bundle: {log}"
+    );
+
+    // quack's own bundle back into a fresh workspace: the ontology is
+    // restored exactly, and none of the stubs become documents.
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "okf3" })),
+        )
+        .await;
+    let ws3 = body["id"].as_str().unwrap_or_default().to_owned();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws3}/documents"))
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .body(Body::from(bytes.clone()))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(
+        body["documents"].as_array().map(Vec::len),
+        Some(0),
+        "{body}"
+    );
+    assert_eq!(body["ontology_version"], 1, "{body}");
+    assert_eq!(body["candidates"], 0, "{body}");
+    let (_, restored) = h
+        .get(&format!("/api/v1/workspaces/{ws3}/ontology"), "")
+        .await;
+    assert!(
+        restored["classes"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|x| x["id"] == "organization")),
+        "{restored}"
+    );
+
     // Import into a fresh workspace: concept files become documents, types
     // and links become candidates, index.md comes back as context.
     let (_, body) = h
