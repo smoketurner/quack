@@ -22,6 +22,31 @@ struct MockEmbeddingModel {
     dim: usize,
 }
 
+/// An embedding provider that is down: every call fails.
+struct FailingEmbeddingModel;
+
+impl EmbeddingModel for FailingEmbeddingModel {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = ();
+
+    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+        Self
+    }
+
+    fn ndims(&self) -> usize {
+        TEST_DIM
+    }
+
+    fn embed_texts(
+        &self,
+        _texts: impl IntoIterator<Item = String> + Send,
+    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        std::future::ready(Err(EmbeddingError::ProviderError(String::from(
+            "connection refused",
+        ))))
+    }
+}
+
 impl EmbeddingModel for MockEmbeddingModel {
     const MAX_DOCUMENTS: usize = 1024;
     type Client = ();
@@ -818,16 +843,56 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         })
         .unwrap();
     }
+    {
+        // A node label embedding of the old width: cleared on reopen and
+        // recomputed by the next resolution pass.
+        let db = WorkspaceDb::open(&config, "ws-adopt").unwrap();
+        let node = quack_core::graph::store::upsert_node(
+            &db,
+            &quack_core::graph::store::NewNode {
+                label: String::from("Kenya"),
+                class_id: String::from("country"),
+                properties: serde_json::json!({}),
+                provisional: false,
+            },
+        )
+        .unwrap();
+        quack_core::graph::store::set_node_embedding(&db, &node, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(
+            quack_core::graph::store::nodes_without_embedding(&db, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
     let mut changed = test_config(dir.path());
     if let Some(p) = changed.providers.get_mut("mock") {
         p.embedding_dimension = Some(8);
     }
     let db = WorkspaceDb::open(&changed, "ws-adopt").unwrap();
     assert_eq!(db.embedding_dimension(), 8);
+    let unembedded = quack_core::graph::store::nodes_without_embedding(&db, 10).unwrap();
+    assert_eq!(unembedded.len(), 1);
+    let node_id = unembedded.first().map(|n| n.id.clone()).unwrap();
+    quack_core::graph::store::set_node_embedding(&db, &node_id, &[0.5; 8]).unwrap();
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("8")
     );
+    // The chunk ingested without an embedding survives, term index and
+    // all, and the new width takes embeddings.
+    let kept = db.chunks_by_ids(&[String::from("c")]).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert!(!db.search_keyword_chunks("x", 5, &[]).unwrap().is_empty());
+    db.insert_chunk(&NewChunk {
+        id: "c8",
+        document_id: "d",
+        chunk_index: 1,
+        content: "y",
+        heading: None,
+        page: None,
+        embedding: Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    })
+    .unwrap();
     db.insert_chunk(&NewChunk {
         id: "c2",
         document_id: "d",
@@ -1534,6 +1599,83 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     .await
     .unwrap();
     assert_eq!((summary.rows, summary.columns.len()), (2, 2));
+}
+
+/// Only ready documents are searchable, and a pass that fails after
+/// writing chunks takes them back out (issue #52).
+#[tokio::test]
+async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-failed").unwrap();
+    db.insert_document(&NewDocument::new("d", "a.md", "text/markdown", 1).with_status("error"))
+        .unwrap();
+    db.insert_chunk(&NewChunk {
+        id: "c",
+        document_id: "d",
+        chunk_index: 0,
+        content: "zebra crossing",
+        heading: None,
+        page: None,
+        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+    })
+    .unwrap();
+    assert!(
+        db.search_keyword_chunks("zebra", 5, &[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &[])
+            .unwrap()
+            .is_empty()
+    );
+    db.update_document_status("d", "ready").unwrap();
+    assert_eq!(db.search_keyword_chunks("zebra", 5, &[]).unwrap().len(), 1);
+    assert_eq!(
+        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Embedding fails after the chunks were written: the row is an error
+    // and nothing of it stays searchable or counted.
+    let failed = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-failed",
+        &ingestion::NewFile::new("notes.md", b"# Notes\n\nA giraffe walked by.\n"),
+        Some(&FailingEmbeddingModel),
+    )
+    .await;
+    assert!(failed.is_err());
+    let doc = db
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.filename == "notes.md")
+        .unwrap();
+    assert_eq!(doc.status, "error");
+    assert_eq!(doc.chunk_count, None);
+    let orphans: i64 = db
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM _quack_chunks WHERE document_id = ?",
+            [&doc.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0);
+    let terms: i64 = db
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM _quack_terms WHERE term = 'giraff'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(terms, 0);
 }
 
 /// One document per table (issue #51): a changed file with the same

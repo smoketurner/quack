@@ -236,7 +236,10 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
             db.set_document_tables(doc_id, &result.tables)?;
             db.update_document_status(doc_id, "ready")
         })?,
-        Err(e) => db.with(|db| db.mark_document_error(doc_id, &e.to_string()))?,
+        Err(e) => db.with(|db| {
+            db.discard_chunks(doc_id)?;
+            db.mark_document_error(doc_id, &e.to_string())
+        })?,
     }
     outcome
 }

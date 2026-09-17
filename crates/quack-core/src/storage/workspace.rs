@@ -627,19 +627,23 @@ impl WorkspaceDb {
                 tracing::info!(
                     from = rec,
                     to = conf,
-                    "no embeddings stored; adopting the configured embedding dimension"
+                    "no chunk embeddings stored; adopting the configured embedding dimension"
                 );
+                // Chunks ingested without an embedding provider (and their
+                // term index) stay; only the vector column changes width.
+                // Node label embeddings are recomputed by the next
+                // resolution pass, so they are cleared and resized.
+                // No stored vector survives the change, so the column is
+                // retyped through NULL: DuckDB cannot cast even a NULL
+                // FLOAT[4] to FLOAT[8] on its own.
                 self.conn.execute_batch(&format!(
-                    "DROP TABLE _quack_chunks;
-                     CREATE TABLE _quack_chunks (
-                        id TEXT PRIMARY KEY,
-                        document_id TEXT NOT NULL,
-                        chunk_index INTEGER NOT NULL,
-                        content TEXT NOT NULL,
-                        embedding FLOAT[{conf}],
-                        token_count INTEGER
-                    );"
+                    "ALTER TABLE _quack_chunks ALTER embedding SET DATA TYPE FLOAT[{conf}] USING NULL::FLOAT[{conf}];"
                 ))?;
+                if self.table_exists("_quack_graph_nodes")? {
+                    self.conn.execute_batch(&format!(
+                        "ALTER TABLE _quack_graph_nodes ALTER embedding SET DATA TYPE FLOAT[{conf}] USING NULL::FLOAT[{conf}];"
+                    ))?;
+                }
                 self.embedding_dimension = conf;
             }
             (Some(rec), None) => self.embedding_dimension = rec,
@@ -650,6 +654,29 @@ impl WorkspaceDb {
         if let Some(model) = configured_model {
             self.set_meta("embedding_model", model)?;
         }
+        Ok(())
+    }
+
+    /// Drop a document's chunks and their term index, and clear its chunk
+    /// count: what a failed processing pass leaves behind must not stay
+    /// searchable (issue #52).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a delete fails.
+    pub fn discard_chunks(&self, document_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM _quack_terms WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
+            duckdb::params![document_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM _quack_chunks WHERE document_id = ?",
+            duckdb::params![document_id],
+        )?;
+        self.conn.execute(
+            "UPDATE _quack_documents SET chunk_count = NULL WHERE id = ?",
+            duckdb::params![document_id],
+        )?;
         Ok(())
     }
 
@@ -1131,7 +1158,7 @@ impl WorkspaceDb {
              FROM scored sc \
              JOIN _quack_chunks c ON c.id = sc.chunk_id \
              JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE sc.score > 0{filter} \
+             WHERE sc.score > 0 AND d.status = 'ready'{filter} \
              ORDER BY sc.score DESC, c.chunk_index ASC \
              LIMIT ?"
         );
@@ -1193,7 +1220,7 @@ impl WorkspaceDb {
                     1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE c.embedding IS NOT NULL{filter} \
+             WHERE c.embedding IS NOT NULL AND d.status = 'ready'{filter} \
              ORDER BY score DESC \
              LIMIT ?",
             self.vector_type()
