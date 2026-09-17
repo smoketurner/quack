@@ -1015,6 +1015,7 @@ object print mode emits:
 
 ```
 POST   /api/v1/auth/login                         {username,password} -> token (web session)
+ANY    /mcp/v1/{id}                               MCP over streamable HTTP, same bearer (section 11.3)
 GET    /api/v1/workspaces
 POST   /api/v1/workspaces
 GET    /api/v1/workspaces/{id}
@@ -1058,13 +1059,25 @@ queue (one worker per workspace); clients poll the resource. Rate limiting per t
 
 ### 11.3 MCP server
 
-Same tool set over two transports: `quack mcp [--workspace NAME]` on stdio for Claude Code
-and editors (one line in `.mcp.json`, no server needed), and `/mcp/v1/{workspace}` SSE
-under `quack serve` with the workspace token.
+Same tool set over two transports (`rmcp`, the official Rust SDK): `quack mcp [-w NAME]
+[--allow-write]` on stdio for Claude Code and editors (one line in `.mcp.json`, no server
+needed, unaudited like the CLI), and `/mcp/v1/{workspace}` under `quack serve` over MCP's
+streamable HTTP transport (the successor of the HTTP+SSE pair; responses stream as SSE),
+authenticated with the same bearer as the REST API. Over HTTP every request passes
+`access()`, each caller gets a transport keyed by workspace, user, and write permission
+(the member role with the write scope), and every tool call is audited with channel
+`mcp`. `query` appends to one session per MCP session, owned by the server user.
 
-Tools: `query`, `search`, `sql`, `search_graph`, `find_path`, `list_tables`,
-`describe_table`, `list_documents`. Resources: `quack://workspace/tables`,
-`.../tables/{name}/schema`, `.../documents`, `.../ontology`, `.../context`.
+Tools: `query`, `search`, `sql`, `list_tables`, `describe_table`, `list_documents`
+(`search_graph` and `find_path` arrive with the graph, #28). Every tool answers with
+structured content plus text; refusals (a write without permission, an internal table, a
+missing table) are tool errors the client model can read. Resources:
+`quack://workspace/tables`, `.../tables/{name}/schema`, `.../documents`, `.../ontology`
+(JSON), `.../context` (Markdown).
+
+```json
+{ "mcpServers": { "quack": { "command": "quack", "args": ["mcp", "-w", "logistics"] } } }
+```
 
 ### 11.4 Terminal session (TUI)
 
@@ -1357,7 +1370,8 @@ updated as issues close. Ordered by risk.
    password and token auth, roles, the split audit, the upload queue, and the askama +
    htmx web UI (workspaces, chat with steps, citations, and charts, documents, tables,
    SQL, context editor, settings with members and tokens, admin users and audit). The
-   graph and ontology pages arrive with #27 and #28. **No MCP** (#29); **no desktop
+   graph and ontology pages arrive with #27 and #28. ~~No MCP~~ (#29, closed: `quack mcp`
+   on stdio and `/mcp/v1/{workspace}` over streamable HTTP, section 11.3); **no desktop
    window** (#35). Sections 11, 12.
 4. ~~No ontology or induction~~ (#27, closed): the model, validation, versions with
    diff and restore, the built-in default, JSON import and export, table and document

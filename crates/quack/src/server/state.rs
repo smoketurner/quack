@@ -8,6 +8,8 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::WorkspaceDb;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::queue::UploadQueue;
@@ -22,7 +24,12 @@ pub(crate) struct AppState {
     /// Browser and API-login sessions: token -> user id. Cleared on restart.
     web_sessions: Mutex<HashMap<String, String>>,
     pub queue: UploadQueue,
+    /// One MCP transport per workspace, user, and write permission; each
+    /// carries its own MCP sessions. See `server::mcp_http`.
+    mcp: tokio::sync::Mutex<HashMap<String, McpTransport>>,
 }
+
+pub(crate) type McpTransport = StreamableHttpService<crate::mcp::McpServer, LocalSessionManager>;
 
 pub(crate) type App = Arc<AppState>;
 
@@ -35,7 +42,32 @@ impl AppState {
             local,
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
             web_sessions: Mutex::new(HashMap::new()),
+            mcp: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The MCP transport for `key`, built with `make` on first use.
+    pub(crate) async fn mcp_transport(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> crate::mcp::McpServer,
+    ) -> McpTransport {
+        let mut open = self.mcp.lock().await;
+        if let Some(transport) = open.get(key) {
+            return transport.clone();
+        }
+        let server = make();
+        let transport = StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                // The server may sit behind any host name; bearer auth,
+                // not the Host header, is what guards it.
+                .with_allowed_hosts(Vec::<String>::new())
+                .with_json_response(true),
+        );
+        open.insert(key.to_owned(), transport.clone());
+        transport
     }
 
     /// The shared handle for a workspace, opening the file on first use.

@@ -352,16 +352,9 @@ pub(crate) async fn execute_sql(
 ) -> ApiResult<SqlOutcome> {
     let db = app.workspace_db(&access.workspace.id).await?;
     let sql = statement.to_owned();
-    let kind = with_db(Arc::clone(&db), move |db| {
-        if db.references_internal_table(&sql)? {
-            return Err(quack_core::error::Error::Analysis(String::from(
-                "internal tables are not accessible",
-            )));
-        }
-        db.classify_statement(&sql)
-    })
-    .await
-    .map_err(|e| ApiError::forbidden(e.message))?;
+    let kind = with_db(Arc::clone(&db), move |db| db.classify_user_statement(&sql))
+        .await
+        .map_err(|e| ApiError::forbidden(e.message))?;
     let is_write = match kind {
         StatementKind::Read => false,
         StatementKind::Write => true,

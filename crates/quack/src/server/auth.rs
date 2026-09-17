@@ -42,10 +42,16 @@ pub(crate) struct Identity {
     pub credential: Credential,
     pub client_addr: Option<String>,
     pub request_id: Option<String>,
+    /// Set for requests that arrived over the MCP transport, so audit rows
+    /// name that channel rather than the credential's.
+    pub via_mcp: bool,
 }
 
 impl Identity {
     pub(crate) fn channel(&self) -> Channel {
+        if self.via_mcp {
+            return Channel::Mcp;
+        }
         match self.credential {
             Credential::Token(_) => Channel::Api,
             Credential::Local | Credential::Session(_) => Channel::Web,
@@ -115,6 +121,7 @@ impl FromRequestParts<App> for Identity {
                 credential: Credential::Local,
                 client_addr,
                 request_id,
+                via_mcp: false,
             });
         }
 
@@ -141,6 +148,7 @@ impl FromRequestParts<App> for Identity {
                 credential: Credential::Session(presented),
                 client_addr,
                 request_id,
+                via_mcp: false,
             });
         }
 
@@ -178,6 +186,7 @@ impl FromRequestParts<App> for Identity {
             credential: Credential::Token(token),
             client_addr,
             request_id,
+            via_mcp: false,
         })
     }
 }

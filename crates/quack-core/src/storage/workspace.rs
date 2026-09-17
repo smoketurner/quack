@@ -339,6 +339,22 @@ impl WorkspaceDb {
         Ok(Some(names))
     }
 
+    /// Classify a statement a user or client wrote: `_quack_` tables are
+    /// refused outright, then the statement is read, write, or invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Analysis` when the statement reaches an internal
+    /// table, or a storage error when classification fails.
+    pub fn classify_user_statement(&self, sql: &str) -> crate::error::Result<StatementKind> {
+        if self.references_internal_table(sql)? {
+            return Err(crate::error::Error::Analysis(String::from(
+                "internal tables are not accessible",
+            )));
+        }
+        self.classify_statement(sql)
+    }
+
     /// Whether a statement touches any of quack's internal tables.
     ///
     /// Uses the parsed table references when `DuckDB` can serialize the

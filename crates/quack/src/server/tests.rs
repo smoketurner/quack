@@ -1865,3 +1865,294 @@ fn banner_names_the_address_mode_and_models() {
     let auth = super::banner(&config, addr, false, 3, 0);
     assert!(auth.contains("3 user(s)"));
 }
+
+/// One JSON-RPC request to the MCP endpoint; returns the status, the
+/// parsed body, and the `Mcp-Session-Id` the server assigned.
+async fn mcp_call(
+    h: &Harness,
+    ws: &str,
+    token: Option<&str>,
+    session: Option<&str>,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value, Option<String>) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/mcp/v1/{ws}"))
+        .header(header::HOST, "localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream");
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(session) = session {
+        request = request.header("mcp-session-id", session);
+    }
+    let request = request
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, headers) = h.send(request).await;
+    let session = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    // The transport answers a POST as an SSE stream; the JSON-RPC result
+    // is the last `data:` line that carries a JSON object.
+    let body = match body.as_str() {
+        Some(text) => text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .next_back()
+            .unwrap_or(serde_json::Value::String(text.to_owned())),
+        None => body,
+    };
+    (status, body, session)
+}
+
+fn rpc(id: u32, method: &str, params: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+async fn mcp_session(h: &Harness, ws: &str, token: &str) -> String {
+    let (status, body, session) = mcp_call(
+        h,
+        ws,
+        Some(token),
+        None,
+        rpc(
+            1,
+            "initialize",
+            &serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["serverInfo"]["name"], "quack", "{body}");
+    let session = session.unwrap_or_else(|| fail("no session id"));
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/mcp/v1/{ws}"))
+        .header(header::HOST, "localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("mcp-session-id", &session)
+        .body(Body::from(
+            serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+                .to_string(),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    session
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("mcp", &owner).await;
+    let (read_token, _) = h
+        .app
+        .control
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (write_token, _) = h
+        .app
+        .control
+        .create_token(&ws, &owner, "rw", &[Scope::Read, Scope::Write], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    // No bearer: refused before any MCP handling.
+    let (status, _, _) = mcp_call(
+        &h,
+        &ws,
+        None,
+        None,
+        rpc(1, "initialize", &serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let session = mcp_session(&h, &ws, &read_token).await;
+    let (status, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(2, "tools/list", &serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .map(|tools| tools.iter().filter_map(|t| t["name"].as_str()).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "describe_table",
+            "list_documents",
+            "list_tables",
+            "query",
+            "search",
+            "sql"
+        ]
+    );
+
+    // A read-only token cannot write through `sql`; the refusal is a tool
+    // error the client model can read, and it is audited as denied.
+    let (status, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(3, "tools/call", &serde_json::json!({ "name": "sql", "arguments": { "sql": "CREATE TABLE t (n INTEGER)" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert!(
+        body["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("cannot write")),
+        "{body}"
+    );
+
+    // A write token gets its own transport and may create the table.
+    let rw_session = mcp_session(&h, &ws, &write_token).await;
+    let (status, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&write_token),
+        Some(&rw_session),
+        rpc(4, "tools/call", &serde_json::json!({ "name": "sql", "arguments": { "sql": "CREATE TABLE t AS SELECT 20.5 AS n" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+
+    let (_, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(
+            5,
+            "tools/call",
+            &serde_json::json!({ "name": "list_tables", "arguments": {} }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["tables"],
+        serde_json::json!(["t"]),
+        "{body}"
+    );
+    let (_, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(
+            6,
+            "tools/call",
+            &serde_json::json!({ "name": "sql", "arguments": { "sql": "SELECT n FROM t" } }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["rows"],
+        serde_json::json!([[20.5]]),
+        "{body}"
+    );
+    let (_, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(
+            7,
+            "tools/call",
+            &serde_json::json!({ "name": "describe_table", "arguments": { "table": "nope" } }),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true, "{body}");
+
+    let (_, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(8, "resources/list", &serde_json::json!({})),
+    )
+    .await;
+    let uris: Vec<&str> = body["result"]["resources"]
+        .as_array()
+        .map(|r| r.iter().filter_map(|r| r["uri"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        uris.contains(&"quack://workspace/tables/t/schema"),
+        "{body}"
+    );
+    assert!(uris.contains(&"quack://workspace/context"), "{body}");
+    let (_, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(
+            9,
+            "resources/read",
+            &serde_json::json!({ "uri": "quack://workspace/tables/t/schema" }),
+        ),
+    )
+    .await;
+    let text = body["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("\"row_count\":1"), "{body}");
+    let (_, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(
+            10,
+            "resources/read",
+            &serde_json::json!({ "uri": "quack://workspace/nothing" }),
+        ),
+    )
+    .await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no resource")),
+        "{body}"
+    );
+
+    let sql_rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("sql")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        sql_rows.len(),
+        3,
+        "denied write, allowed write, allowed read"
+    );
+    assert!(sql_rows.iter().all(|r| r.channel == "mcp"), "{sql_rows:?}");
+    assert_eq!(sql_rows.iter().filter(|r| r.outcome == "denied").count(), 1);
+}

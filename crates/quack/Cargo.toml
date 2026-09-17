@@ -29,9 +29,11 @@ mimalloc           = { workspace = true, features = ["secure"] }
 mime_guess         = { workspace = true }
 pulldown-cmark     = { workspace = true, features = ["html"] }
 ratatui            = { workspace = true, features = ["crossterm"] }
+rmcp               = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 ratatui-textarea   = { workspace = true, features = ["crossterm"] }
 rust-embed         = { workspace = true, features = ["deterministic-timestamps"] }
 serde              = { workspace = true, features = ["derive", "std"] }
+schemars           = { workspace = true, features = ["derive"] }
 serde_json         = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time"] }

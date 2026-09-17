@@ -2,10 +2,11 @@
 //! client of `quack-core`. Design doc sections 11.1, 11.2, and 12.
 
 mod api;
-mod auth;
+pub(crate) mod auth;
 mod error;
+mod mcp_http;
 mod queue;
-mod state;
+pub(crate) mod state;
 #[cfg(test)]
 mod tests;
 mod web;
@@ -90,6 +91,7 @@ pub(crate) fn router(app: App) -> Router {
     }
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
         .nest("/api/v1", api)
         .merge(web::router())
         .layer(DefaultBodyLimit::max(upload_limit))

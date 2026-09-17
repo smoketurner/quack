@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
+mod mcp;
 mod ontology_cli;
 mod print;
 mod server;
@@ -179,6 +180,14 @@ enum Commands {
         /// No authentication, one implicit user; loopback only
         #[arg(long)]
         local: bool,
+    },
+
+    /// Serve the workspace as an MCP server over stdio (for Claude Code
+    /// and editors); logs go to stderr
+    Mcp {
+        /// Let the `sql` and `query` tools run statements that modify data
+        #[arg(long)]
+        allow_write: bool,
     },
 
     /// Show, install, import, export, diff, or restore the ontology
@@ -390,6 +399,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_auth(&config, action).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Mcp { allow_write } => run_mcp(cli, allow_write).await,
         Commands::Serve { bind, local } => {
             // The server logs each request at info; other commands stay quiet.
             init_logging_at("info,sqlx=warn,hyper=warn,h2=warn");
@@ -520,8 +530,25 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Ontology { .. }
         | Commands::Auth { .. }
         | Commands::Serve { .. }
+        | Commands::Mcp { .. }
         | Commands::Docs { .. } => Ok(()),
     }
+}
+
+/// `quack mcp`: the workspace as an MCP server on stdin and stdout.
+async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
+    init_logging();
+    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let ws_db =
+        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let policy = if allow_write {
+        WritePolicy::Allow
+    } else {
+        WritePolicy::Deny
+    };
+    mcp::serve_stdio(config, db, workspace, policy).await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Exit 4 when the failure is an OAuth provider without a usable token:

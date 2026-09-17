@@ -87,7 +87,8 @@ cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore 
 cargo run --bin quack -- ontology propose [--extend] [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
-cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI and REST API under /api/v1
+cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}
+cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
 ```
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
@@ -143,6 +144,12 @@ bytes' SHA-256 already belong to a non-failed document) plus `process_document`
 (`processing` to `ready` or `error`, recording `chunk_count` and the parsed title);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
 title and uploader).
+
+The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
+`list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;
+`quack mcp` serves it on stdio (unaudited, like the CLI) and `server/mcp_http.rs` serves it
+at `/mcp/v1/{workspace}` behind `access()`, one transport per workspace, user, and write
+permission, audited with channel `mcp`.
 
 `quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`,

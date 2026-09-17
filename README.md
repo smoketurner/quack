@@ -42,7 +42,8 @@ cargo run --bin quack -- auth login azure                             # OAuth si
 cargo run --bin quack -- user add alice --admin                       # server users, tokens, members, audit
 cargo run --bin quack -- token create -w myworkspace --user alice --name ci --scopes read,write
 cargo run --bin quack -- audit --outcome denied --csv
-cargo run --bin quack -- serve --local                                # web UI and REST API on 127.0.0.1:8080, no login
+cargo run --bin quack -- serve --local                                # web UI, REST API, and MCP (/mcp/v1/{ws}) on 127.0.0.1:8080, no login
+cargo run --bin quack -- mcp -w myworkspace                            # MCP server on stdio: add to .mcp.json for Claude Code
 make demo-data                                                        # load examples/logistics into workspace "logistics"
 ```
 
