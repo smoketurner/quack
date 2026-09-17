@@ -52,7 +52,8 @@
         {% if ws.can_write %}
         <label class="flex items-center gap-1"><input type="checkbox" name="allow_write"> Allow the agent to change tables</label>
         {% endif %}
-        <button type="submit" class="ml-auto rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Send</button>
+        <button type="button" id="stop" class="ml-auto hidden rounded border border-slate-300 px-3 py-2 text-slate-700 hover:bg-slate-100">Stop</button>
+        <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Send</button>
       </div>
       <p id="status" class="mt-2 text-sm text-slate-500"></p>
     </form>

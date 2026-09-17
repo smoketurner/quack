@@ -49,6 +49,7 @@ pub(crate) fn response_json(response: &AgentResponse, session_id: &str) -> serde
         .collect();
     serde_json::json!({
         "answer": response.content,
+        "cancelled": response.cancelled,
         "citations": response.citations,
         "queries": queries,
         "steps": response.steps,
@@ -130,22 +131,35 @@ async fn prepare(
     Ok((access, db, session_id, policy))
 }
 
+/// Cancels the turn when dropped: the SSE stream holds one, so a client
+/// that goes away stops the model instead of leaving the turn to finish
+/// unwatched (issue #45).
+struct CancelOnDrop(llm::CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 fn start_turn(
     app: &App,
     db: SharedDb,
     session_id: &str,
     policy: WritePolicy,
     prompt: &str,
-) -> events::EventStream {
+) -> (events::EventStream, CancelOnDrop) {
     let (sink, stream) = events::channel();
     let config = app.config.clone();
     let session_id = session_id.to_owned();
     let prompt = prompt.to_owned();
+    let cancel = llm::CancellationToken::new();
+    let token = cancel.clone();
     tokio::spawn(async move {
         // run_turn emits TurnComplete or Failed itself.
-        drop(llm::run_turn(&config, db, &session_id, policy, &prompt, sink).await);
+        drop(llm::run_turn(&config, db, &session_id, policy, &prompt, sink, token).await);
     });
-    stream
+    (stream, CancelOnDrop(cancel))
 }
 
 /// Audit the turn. A failed turn that left the session without any message
@@ -192,7 +206,9 @@ pub(crate) async fn query(
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (access, db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
-    let mut stream = start_turn(&app, db, &session_id, policy, &body.prompt);
+    // A client that disconnects drops this future, and the guard with it,
+    // which cancels the turn.
+    let (mut stream, _guard) = start_turn(&app, db, &session_id, policy, &body.prompt);
     let mut failure = None;
     let mut complete = None;
     while let Some(event) = stream.recv().await {
@@ -254,12 +270,12 @@ pub(crate) async fn stream(
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let (access, db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
-    let events = start_turn(&app, db, &session_id, policy, &body.prompt);
+    let (events, guard) = start_turn(&app, db, &session_id, policy, &body.prompt);
     let prompt = body.prompt.clone();
-    let state = (events, app, access, session_id, prompt);
+    let state = (events, app, access, session_id, prompt, guard);
     let stream = futures::stream::unfold(
         state,
-        |(mut events, app, access, session_id, prompt)| async move {
+        |(mut events, app, access, session_id, prompt, guard)| async move {
             let event = events.recv().await?;
             let out = match event {
                 AgentEvent::TextDelta(text) => Event::default().event("text").data(text),
@@ -305,7 +321,7 @@ pub(crate) async fn stream(
                     Event::default().event("error").data(message)
                 }
             };
-            Some((Ok(out), (events, app, access, session_id, prompt)))
+            Some((Ok(out), (events, app, access, session_id, prompt, guard)))
         },
     );
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

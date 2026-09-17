@@ -9,12 +9,12 @@ pub mod oauth;
 use rig::client::EmbeddingsClient;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use secrecy::ExposeSecret;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rig::prelude::*;
 
 use crate::analysis::agent::{self, AgentResponse};
-use crate::analysis::events::EventSink;
+use crate::analysis::events::{self, AgentEvent, EventSink};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::SharedDb;
@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::graph::extract as graph_extract;
 use crate::ontology::{Ontology, documents};
 use crate::storage::{context, sessions};
+pub use tokio_util::sync::CancellationToken;
 
 type OpenAiEmbeddingModel =
     rig::providers::openai::GenericEmbeddingModel<rig::providers::openai::OpenAICompletionsExt>;
@@ -530,6 +531,7 @@ pub async fn run_turn(
     policy: WritePolicy,
     message: &str,
     sink: EventSink,
+    cancel: CancellationToken,
 ) -> Result<AgentResponse> {
     let chat = config.chat_model_ref()?;
     let embedding_model = required_embedding_model(config).await?;
@@ -557,7 +559,27 @@ pub async fn run_turn(
 
     tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
 
-    let response = dispatch(
+    // Events pass through here on their way out so the text streamed so
+    // far is known if the turn is cancelled (issue #45).
+    let (inner_sink, mut inner_events) = events::channel();
+    let streamed: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let forward = tokio::spawn({
+        let streamed = Arc::clone(&streamed);
+        let outer = sink.clone();
+        async move {
+            while let Some(event) = inner_events.recv().await {
+                if let AgentEvent::TextDelta(text) = &event
+                    && let Ok(mut so_far) = streamed.lock()
+                {
+                    so_far.push_str(text);
+                }
+                if outer.send(event).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let turn = dispatch(
         config,
         Arc::clone(&db),
         chat,
@@ -566,9 +588,33 @@ pub async fn run_turn(
         prompt,
         history,
         message,
-        sink,
-    )
-    .await?;
+        inner_sink,
+    );
+    let outcome = tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        outcome = turn => Some(outcome),
+    };
+    // Dropping the turn dropped its sink; the forwarder ends with it.
+    drop(forward.await);
+
+    let response = if let Some(outcome) = outcome {
+        outcome?
+    } else {
+        let mut content = streamed.lock().map(|s| s.clone()).unwrap_or_default();
+        if !content.trim().is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str(CANCELLED_NOTE);
+        let response = AgentResponse {
+            content,
+            cancelled: true,
+            ..AgentResponse::default()
+        };
+        tracing::info!(session = session_id, "agent turn cancelled");
+        drop(sink.send(AgentEvent::TurnComplete(response.clone())));
+        response
+    };
 
     let guard = db
         .lock()
@@ -576,6 +622,9 @@ pub async fn run_turn(
     sessions::record_turn(&guard, session_id, message, &response)?;
     Ok(response)
 }
+
+/// What a cancelled turn's recorded answer ends with.
+pub const CANCELLED_NOTE: &str = "(Cancelled by the user before the answer was complete.)";
 
 #[expect(
     clippy::too_many_arguments,
@@ -725,5 +774,60 @@ mod tests {
             .await
             .err();
         assert!(err.is_some_and(|e| matches!(e, Error::AuthRequired { .. })));
+    }
+
+    /// A cancelled turn is still a turn (issue #45): the session records
+    /// the question and a cancelled answer, `TurnComplete` is emitted, and
+    /// the model is never called (the token is cancelled before the turn
+    /// starts, and the provider address is unreachable anyway).
+    #[tokio::test]
+    async fn cancelled_turns_are_recorded_and_completed() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = parse(
+            "[general]\nchat_model = \"o/m\"\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 4\n",
+        );
+        config.general.data_dir = dir.path().to_path_buf();
+        let db = crate::storage::workspace::WorkspaceDb::open(&config, "ws")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let session = sessions::create_session(&db, "o/m", sessions::ChatMode::Chat, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Mutex::new(db));
+        let (sink, mut events) = events::channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let response = run_turn(
+            &config,
+            Arc::clone(&db),
+            &session.id,
+            WritePolicy::Deny,
+            "how many storms?",
+            sink,
+            cancel,
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(response.cancelled);
+        assert_eq!(response.content, CANCELLED_NOTE);
+        let last = events.recv().await;
+        assert!(
+            matches!(&last, Some(AgentEvent::TurnComplete(r)) if r.cancelled),
+            "{last:?}"
+        );
+        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
+        let messages =
+            sessions::messages(&guard, &session.id).unwrap_or_else(|e| fail(&e.to_string()));
+        let roles: Vec<sessions::MessageRole> = messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                sessions::MessageRole::User,
+                sessions::MessageRole::Assistant
+            ]
+        );
+        assert!(
+            messages
+                .last()
+                .is_some_and(|m| m.content.contains("Cancelled by the user"))
+        );
     }
 }

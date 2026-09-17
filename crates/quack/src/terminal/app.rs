@@ -22,7 +22,7 @@ use quack_core::analysis::citations::Citation;
 use quack_core::error::Error as CoreError;
 use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
-use quack_core::llm;
+use quack_core::llm::{self, CancellationToken};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
 
@@ -60,7 +60,8 @@ Shortcuts:
   PageUp/PageDown   Scroll messages
   Ctrl+U            Clear input line
   Ctrl+L            Clear screen
-  Ctrl+C            Quit
+  Esc or Ctrl+C     Cancel the running turn
+  Ctrl+C            Quit (when nothing is running)
 
 Writes:
   SELECT queries always run. When the agent wants to modify the workspace
@@ -138,6 +139,9 @@ pub(crate) struct App {
     db: SharedDb,
     allow_write: bool,
     agent_events: Option<EventStream>,
+    /// Cancels the running turn; set while `state` is `Thinking` or
+    /// `AwaitingPermission` for an agent request.
+    turn_cancel: Option<CancellationToken>,
     response_rx: mpsc::UnboundedReceiver<BackgroundResult>,
     response_tx: mpsc::UnboundedSender<BackgroundResult>,
 }
@@ -179,6 +183,7 @@ impl App {
             db,
             allow_write,
             agent_events: None,
+            turn_cancel: None,
             response_rx,
             response_tx,
         };
@@ -419,10 +424,32 @@ impl App {
         self.streaming_assistant = false;
         self.open_step = None;
         self.pending_permission = None;
+        self.turn_cancel = None;
         self.scroll_offset = 0;
     }
 
+    /// Cancel the running turn (issue #45): a pending permission request
+    /// is refused first so the tool returns, then the token stops the
+    /// turn, which core records as cancelled and completes.
+    fn cancel_turn(&mut self) {
+        if let Some(request) = self.pending_permission.take() {
+            request.deny();
+        }
+        if let Some(cancel) = self.turn_cancel.take() {
+            cancel.cancel();
+            self.messages
+                .push(Message::new(MessageRole::System, "Cancelling…"));
+            self.state = AppState::Thinking;
+        }
+    }
+
     fn handle_key_event(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if (code, modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            && self.turn_cancel.is_some()
+        {
+            self.cancel_turn();
+            return;
+        }
         if self.state == AppState::AwaitingPermission {
             self.handle_permission_key(code);
             return;
@@ -430,6 +457,9 @@ impl App {
         match (code, modifiers) {
             (KeyCode::Char('c' | 'q'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
+            }
+            (KeyCode::Esc, _) if self.state == AppState::Thinking => {
+                self.cancel_turn();
             }
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 self.messages.clear();
@@ -1216,6 +1246,8 @@ impl App {
         };
         let (sink, rx) = events::channel();
         self.agent_events = Some(rx);
+        let cancel = CancellationToken::new();
+        self.turn_cancel = Some(cancel.clone());
 
         let config = Arc::clone(&self.config);
         let db = Arc::clone(&self.db);
@@ -1223,7 +1255,7 @@ impl App {
         tokio::spawn(async move {
             // run_turn emits TurnComplete or Failed itself; the returned
             // value is the same response, so it is not needed here.
-            drop(llm::run_turn(&config, db, &session_id, policy, &message, sink).await);
+            drop(llm::run_turn(&config, db, &session_id, policy, &message, sink, cancel).await);
         });
     }
 

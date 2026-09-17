@@ -24,7 +24,7 @@ use crate::storage::sessions::ChatMode;
 
 /// Everything a turn produced, delivered with `AgentEvent::TurnComplete` and
 /// returned from `run_analysis`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AgentResponse {
     pub content: String,
     pub steps: Vec<ToolStep>,
@@ -36,6 +36,9 @@ pub struct AgentResponse {
     pub graph: Vec<GraphResult>,
     /// At least one mutating statement was refused during this turn.
     pub write_refused: bool,
+    /// The user cancelled the turn; `content` holds what streamed before.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 /// Run the rig agent with all analysis tools for a single user question,
@@ -466,6 +469,7 @@ fn finish_turn(
         chart,
         graph,
         write_refused: refused.was_refused(),
+        cancelled: false,
     })
 }
 

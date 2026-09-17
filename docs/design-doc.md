@@ -1043,7 +1043,7 @@ POST   /api/v1/workspaces
 GET    /api/v1/workspaces/{id}
 PATCH  /api/v1/workspaces/{id}                    settings
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
-POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events
+POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn
 POST   /api/v1/workspaces/{id}/sql                {sql}
 GET    /api/v1/workspaces/{id}/search?q=&k=       hybrid retrieval, no LLM
 GET    /api/v1/workspaces/{id}/documents
@@ -1113,8 +1113,10 @@ tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown). Slash comm
 `/help`, `/tables`, `/schema`, `/sql`, `/ingest`, `/attach`,
 `/docs`, `/pin`, `/graph`, `/path`, `/ontology` (`propose`, `review`, `export`, `import`),
 `/mode`, `/chart`, `/export`, `/model`, `/context`, `/clear`, `/quit`. Keys: `Enter` send,
-`Shift+Enter` newline, `Up`/`Down` history, `PageUp`/`PageDown` scroll, `Ctrl+C` cancel
-then quit, `Ctrl+L` clear.
+`Shift+Enter` newline, `Up`/`Down` history, `PageUp`/`PageDown` scroll, `Esc` or `Ctrl+C` cancel
+the running turn (recorded with whatever streamed and a cancelled note), `Ctrl+C` when
+idle quits, `Ctrl+L` clear. The web chat has a Stop button and print mode cancels on
+`Ctrl+C`; every interface passes a cancellation token to `run_turn`.
 
 Works on a named workspace (`-w`) or a `.quack/` directory (section 5.1); the latter reads
 local tabular files in place as views.

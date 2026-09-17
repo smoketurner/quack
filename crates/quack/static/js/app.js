@@ -158,7 +158,10 @@
       button.textContent = busy ? "Working…" : "Send";
       button.classList.toggle("opacity-50", busy);
       button.classList.toggle("cursor-not-allowed", busy);
+      button.classList.toggle("ml-auto", !busy);
     }
+    var stop = form.querySelector("#stop");
+    if (stop) stop.classList.toggle("hidden", !busy);
     form.prompt.disabled = busy;
   }
 
@@ -195,11 +198,19 @@
     if (chat.getAttribute("data-session")) body.session_id = chat.getAttribute("data-session");
     if (form.allow_write && form.allow_write.checked) body.allow_write = true;
 
+    // Stop aborts the request; the server sees the stream close and
+    // cancels the turn, recording what streamed so far.
+    var controller = new AbortController();
+    var stop = form.querySelector("#stop");
+    var onStop = function () { controller.abort(); };
+    if (stop) stop.addEventListener("click", onStop);
+
     fetch("/api/v1/workspaces/" + ws + "/query/stream", {
       method: "POST",
       headers: { "content-type": "application/json", "accept": "text/event-stream" },
       body: JSON.stringify(body),
-      credentials: "same-origin"
+      credentials: "same-origin",
+      signal: controller.signal
     }).then(function (res) {
       if (!res.ok) return res.json().then(function (j) { throw new Error(j.error || res.statusText); });
       var reader = res.body.getReader();
@@ -215,9 +226,14 @@
       }
       return pump();
     }).catch(function (err) {
+      if (err.name === "AbortError") {
+        view.body.textContent += (view.body.textContent ? "\n\n" : "") + "(Cancelled.)";
+        return;
+      }
       view.body.textContent = "Error: " + err.message;
       view.article.classList.add("border-red-300");
     }).then(function () {
+      if (stop) stop.removeEventListener("click", onStop);
       finishWorking(view);
       setBusy(form, false);
       form.prompt.focus();

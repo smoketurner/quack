@@ -14,6 +14,22 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::llm;
 
+/// A token that Ctrl+C cancels, and the task watching for it. The turn
+/// is then recorded as cancelled with whatever streamed; a second Ctrl+C
+/// is left to the runtime.
+fn cancel_on_ctrl_c() -> (llm::CancellationToken, tokio::task::JoinHandle<()>) {
+    let cancel = llm::CancellationToken::new();
+    let interrupt = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel.cancel();
+            }
+        }
+    });
+    (cancel, interrupt)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptFormat {
     Text,
@@ -33,11 +49,12 @@ pub(crate) async fn run_prompt(
 ) -> Result<bool> {
     let (sink, mut events) = events::channel();
 
+    let (cancel, interrupt) = cancel_on_ctrl_c();
     let turn = tokio::spawn({
         let config = config.clone();
         let prompt = prompt.to_owned();
         let session_id = session_id.to_owned();
-        async move { llm::run_turn(&config, db, &session_id, policy, &prompt, sink).await }
+        async move { llm::run_turn(&config, db, &session_id, policy, &prompt, sink, cancel).await }
     });
 
     // Never hold the stdout or stderr locks across an await: the tracing
@@ -103,6 +120,7 @@ pub(crate) async fn run_prompt(
         .await
         .context("agent task panicked")?
         .context("agent turn failed")?;
+    interrupt.abort();
 
     match format {
         PromptFormat::Text => {

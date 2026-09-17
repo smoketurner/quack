@@ -236,6 +236,7 @@ impl McpServer {
             self.inner.policy,
             &question,
             sink,
+            llm::CancellationToken::new(),
         )
         .await;
         drop(drain);

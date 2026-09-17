@@ -37,6 +37,7 @@ schemars           = { workspace = true, features = ["derive"] }
 serde_json         = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time"] }
+tokio-util         = { workspace = true }
 tower              = { workspace = true, features = ["util"] }
 tower-http         = { workspace = true, features = ["timeout", "request-id", "limit", "trace"] }
 tower_governor     = { workspace = true, features = ["axum"] }

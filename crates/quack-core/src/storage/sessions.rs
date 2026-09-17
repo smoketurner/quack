@@ -603,6 +603,7 @@ mod tests {
             chart: None,
             graph: Vec::new(),
             write_refused: false,
+            cancelled: false,
         }
     }
 
