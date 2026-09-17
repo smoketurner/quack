@@ -376,6 +376,11 @@ pub struct AnalysisConfig {
     pub max_turns: u32,
     /// Approximate token budget for prior messages replayed to the model.
     pub history_token_budget: u32,
+    /// The largest context window quack asks Ollama for (`num_ctx`). Each
+    /// turn requests what its prompt needs, rounded up, no more than this;
+    /// Ollama's own default is 4,096 and it truncates silently past it.
+    /// Other providers size their own window.
+    pub max_context_tokens: u32,
 }
 
 impl Default for AnalysisConfig {
@@ -387,6 +392,7 @@ impl Default for AnalysisConfig {
             threads: 4,
             max_turns: 10,
             history_token_budget: 32_000,
+            max_context_tokens: 32_768,
         }
     }
 }

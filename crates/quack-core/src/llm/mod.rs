@@ -546,6 +546,8 @@ pub async fn run_turn(
             pinned_token_budget: config.retrieval.pinned_token_budget,
             context: context::combined(&guard)?,
             context_max_tokens: config.context.max_tokens,
+            ollama_context_cap: (chat.provider.provider_type == ProviderType::Ollama)
+                .then_some(config.analysis.max_context_tokens),
         };
         (
             prompt,

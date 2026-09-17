@@ -4,8 +4,8 @@ use crate::error::Result;
 use crate::graph::store as graph_store;
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
-use crate::storage::workspace::CappedResults;
 use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{CappedResults, QueryResults};
 use std::fmt::Write;
 
 /// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to
@@ -55,6 +55,10 @@ pub struct PromptOptions {
     pub context: Option<String>,
     /// Budget for `context` (four characters per token).
     pub context_max_tokens: u32,
+    /// For Ollama, the cap on the context window the turn requests
+    /// (`[analysis].max_context_tokens`); `None` for providers that size
+    /// their own.
+    pub ollama_context_cap: Option<u32>,
 }
 
 /// Build the system prompt in the order the design fixes (section 7.2):
@@ -181,35 +185,106 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 /// The tables block: every user table with its row count, columns, and three
 /// sample rows. Returns the table names so the caller knows whether the
 /// workspace is empty.
+/// Tables past this many are listed by name and row count only.
+const DETAILED_TABLES: usize = 25;
+/// Columns past this many per table are counted, not listed.
+const LISTED_COLUMNS: usize = 40;
+/// Sample rows are shown only for tables up to this wide.
+const SAMPLED_COLUMNS: usize = 20;
+/// A sample cell longer than this is cut, with an ellipsis.
+const SAMPLE_CELL_CHARS: usize = 60;
+
+/// The tables block, bounded so a wide or narrative table cannot crowd
+/// the tool guidance and the question out of a small context window
+/// (issue #40): the model has `describe_table` for the rest.
 fn append_tables(prompt: &mut String, db: &WorkspaceDb) -> Result<Vec<String>> {
     let tables = db.list_tables()?;
     if !tables.is_empty() {
         writeln!(prompt, "Available tables:")?;
-        for table in &tables {
+        for (index, table) in tables.iter().enumerate() {
             let Ok(desc) = db.describe_table(table) else {
                 writeln!(prompt, "- {table}")?;
                 continue;
             };
             writeln!(prompt, "- {table} ({} rows)", desc.row_count)?;
+            if index >= DETAILED_TABLES {
+                continue;
+            }
             writeln!(prompt, "  Columns:")?;
-            for col in &desc.columns {
+            for col in desc.columns.iter().take(LISTED_COLUMNS) {
                 writeln!(prompt, "    - {} ({})", col.name, col.column_type)?;
             }
-            if !desc.sample_rows.rows.is_empty() {
-                writeln!(prompt, "  Sample data:")?;
-                let mut buf = Vec::new();
-                if desc.sample_rows.write_table(&mut buf).is_ok()
-                    && let Ok(text) = String::from_utf8(buf)
-                {
-                    for line in text.lines() {
-                        writeln!(prompt, "    {line}")?;
-                    }
+            if desc.columns.len() > LISTED_COLUMNS {
+                writeln!(
+                    prompt,
+                    "    ... and {} more columns; describe_table lists them all",
+                    desc.columns.len().saturating_sub(LISTED_COLUMNS)
+                )?;
+            }
+            if desc.sample_rows.rows.is_empty() {
+                continue;
+            }
+            if desc.columns.len() > SAMPLED_COLUMNS {
+                writeln!(
+                    prompt,
+                    "  Sample rows omitted ({} columns); describe_table shows them",
+                    desc.columns.len()
+                )?;
+                continue;
+            }
+            writeln!(prompt, "  Sample data:")?;
+            let mut buf = Vec::new();
+            if trimmed_sample(&desc.sample_rows)
+                .write_table(&mut buf)
+                .is_ok()
+                && let Ok(text) = String::from_utf8(buf)
+            {
+                for line in text.lines() {
+                    writeln!(prompt, "    {line}")?;
                 }
             }
+        }
+        if tables.len() > DETAILED_TABLES {
+            writeln!(
+                prompt,
+                "Only the first {DETAILED_TABLES} tables are described here; use describe_table for the others."
+            )?;
         }
         writeln!(prompt)?;
     }
     Ok(tables)
+}
+
+/// The sample rows with every long text cell cut to `SAMPLE_CELL_CHARS`.
+fn trimmed_sample(sample: &QueryResults) -> QueryResults {
+    let mut out = sample.clone();
+    for row in &mut out.rows {
+        for cell in row.iter_mut() {
+            if let serde_json::Value::String(text) = cell
+                && text.chars().count() > SAMPLE_CELL_CHARS
+            {
+                let mut cut: String = text.chars().take(SAMPLE_CELL_CHARS).collect();
+                cut.push('\u{2026}');
+                *cell = serde_json::Value::String(cut);
+            }
+        }
+    }
+    out
+}
+
+/// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
+/// room for tool results and the answer, rounded up to 2,048, between
+/// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
+/// most workspace prompts, which loses the tool guidance and the question.
+#[must_use]
+pub fn ollama_context_size(prompt_chars: usize, cap: u32) -> u32 {
+    const HEADROOM: u32 = 8_192;
+    const FLOOR: u32 = 8_192;
+    const STEP: u32 = 2_048;
+    let prompt_tokens = u32::try_from(prompt_chars.div_ceil(4)).unwrap_or(u32::MAX);
+    let needed = prompt_tokens.saturating_add(HEADROOM);
+    let rounded = needed.div_ceil(STEP).saturating_mul(STEP).max(FLOOR);
+    rounded.min(cap.max(FLOOR))
 }
 
 /// The permissions paragraph for the write policy in force.
@@ -343,6 +418,7 @@ mod tests {
             pinned_token_budget: pinned,
             context: None,
             context_max_tokens: 4000,
+            ollama_context_cap: None,
         }
     }
 
@@ -485,6 +561,65 @@ mod tests {
         let dialect_at = prompt.find("SQL reference").unwrap();
         let perms_at = prompt.find("Permissions:").unwrap();
         assert!(tools_at < dialect_at && dialect_at < perms_at);
+    }
+
+    /// A wide table lists its first columns and counts the rest, shows
+    /// no sample rows, and a long narrative cell is cut; tables past the
+    /// detailed count appear by name only (issue #40).
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn prompt_bounds_wide_tables_long_cells_and_many_tables() {
+        let db = db();
+        let columns: Vec<String> = (0..50).map(|i| format!("c{i} INT")).collect();
+        db.execute_statement(&format!("CREATE TABLE a_wide({})", columns.join(", ")))
+            .unwrap();
+        db.execute_statement(&format!(
+            "INSERT INTO a_wide VALUES ({})",
+            (0..50)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .unwrap();
+        let narrative = "x".repeat(500);
+        db.execute_statement(&format!(
+            "CREATE TABLE notes AS SELECT 1 AS id, '{narrative}' AS body"
+        ))
+        .unwrap();
+        for i in 0..30 {
+            db.execute_statement(&format!("CREATE TABLE t{i:02}(id INT)"))
+                .unwrap();
+        }
+        let prompt = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
+        assert!(prompt.contains("- c39 (INTEGER)"), "{prompt}");
+        assert!(!prompt.contains("- c40 (INTEGER)"), "{prompt}");
+        assert!(prompt.contains("... and 10 more columns"), "{prompt}");
+        assert!(
+            prompt.contains("Sample rows omitted (50 columns)"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(&narrative), "{prompt}");
+        assert!(
+            prompt.contains(&format!("{}\u{2026}", "x".repeat(60))),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Only the first 25 tables are described"),
+            "{prompt}"
+        );
+        // The 32 tables all appear by name; the last ones without columns.
+        assert!(prompt.contains("- t29 (0 rows)"), "{prompt}");
+        assert_eq!(prompt.matches("  Columns:").count(), 25, "{prompt}");
+    }
+
+    #[test]
+    fn ollama_context_size_rounds_up_within_bounds() {
+        assert_eq!(ollama_context_size(0, 32_768), 8_192);
+        assert_eq!(ollama_context_size(4 * 1_000, 32_768), 10_240);
+        // 12,875 prompt tokens plus headroom rounds to 22,528.
+        assert_eq!(ollama_context_size(4 * 12_875, 32_768), 22_528);
+        assert_eq!(ollama_context_size(4 * 100_000, 32_768), 32_768);
+        assert_eq!(ollama_context_size(4 * 100_000, 2_048), 8_192);
     }
 
     #[test]

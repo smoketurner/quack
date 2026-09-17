@@ -156,6 +156,9 @@ where
     // Query mode never answers from an unreviewed graph.
     let exclude_provisional = prompt.mode == ChatMode::Query;
 
+    let context_window = prompt
+        .ollama_context_cap
+        .map(|cap| ollama_window(cap, &system_prompt, &history, user_message));
     let agent = build_agent(
         completion_model,
         embedding_model,
@@ -168,6 +171,7 @@ where
             graph_enabled,
             exclude_provisional,
             write_policy,
+            context_window,
             chart_spec: Arc::clone(&chart_spec),
             graph_results: Arc::clone(&graph_results),
             refused: refused.clone(),
@@ -184,9 +188,29 @@ where
 
     let mut streamed = String::new();
     let mut final_text: Option<String> = None;
+    let mut stopped: Option<String> = None;
 
     while let Some(item) = stream.next().await {
-        match item.map_err(|e| Error::Analysis(e.to_string()))? {
+        let item = match item {
+            Ok(item) => item,
+            Err(e) => {
+                // A turn the model derailed (an unknown tool, the turn
+                // limit) or that failed after text was streamed is still
+                // a turn: keep the text, say what happened, record it. A
+                // model that could not be reached at all stays an error.
+                if streamed.trim().is_empty() && !is_prompt_error(&e) {
+                    return Err(Error::Analysis(e.to_string()));
+                }
+                tracing::warn!(error = %e, "agent turn stopped early");
+                stopped = Some(explain_stream_error(
+                    &e,
+                    analysis_config,
+                    context_window.is_some(),
+                ));
+                break;
+            }
+        };
+        match item {
             rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                 StreamedAssistantContent::Text(text),
             ) => {
@@ -204,12 +228,7 @@ where
         }
     }
 
-    // Prefer what the model streamed for the last turn; fall back to the
-    // aggregated final text when a provider did not stream deltas.
-    let raw = match final_text {
-        Some(text) if streamed.trim().is_empty() => text,
-        Some(_) | None => streamed,
-    };
+    let raw = turn_text(streamed, final_text, stopped, context_window.is_some());
     let (content, cited) = citations::validate(&raw, &recorder.citations().all());
     finish_turn(
         content,
@@ -221,6 +240,109 @@ where
     )
 }
 
+/// The `num_ctx` for this turn (issue #40): Ollama loads a model with a
+/// 4,096-token window unless the request says otherwise and truncates
+/// the front of a longer prompt, which is where the tool guidance is.
+fn ollama_window(
+    cap: u32,
+    system_prompt: &str,
+    history: &[rig::message::Message],
+    user_message: &str,
+) -> u32 {
+    let history_chars = serde_json::to_string(history).map_or(0, |h| h.len());
+    let chars = system_prompt
+        .len()
+        .saturating_add(history_chars)
+        .saturating_add(user_message.len());
+    let prompt_tokens = chars.div_ceil(4);
+    if prompt_tokens > cap as usize {
+        tracing::warn!(
+            prompt_tokens,
+            cap,
+            "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
+        );
+    }
+    text_to_sql::ollama_context_size(chars, cap)
+}
+
+/// The answer text: what the model streamed for the last turn, else the
+/// aggregated final text when a provider did not stream deltas, with a
+/// note when the turn stopped early or produced nothing.
+fn turn_text(
+    streamed: String,
+    final_text: Option<String>,
+    stopped: Option<String>,
+    ollama: bool,
+) -> String {
+    let mut raw = match final_text {
+        Some(text) if streamed.trim().is_empty() => text,
+        Some(_) | None => streamed,
+    };
+    let note = stopped.or_else(|| {
+        raw.trim().is_empty().then(|| {
+            String::from(if ollama {
+                "The model returned no text. With Ollama this usually means the answer or the \
+                 prompt did not fit the context window; raise [analysis].max_context_tokens or \
+                 ask a narrower question."
+            } else {
+                "The model returned no text; ask again or narrow the question."
+            })
+        })
+    });
+    if let Some(reason) = note {
+        if !raw.trim().is_empty() {
+            raw.push_str("\n\n");
+        }
+        raw.push('(');
+        raw.push_str(&reason);
+        raw.push(')');
+    }
+    raw
+}
+
+/// Whether a stream error came from the agent loop itself (rig's
+/// `PromptError`: an unknown tool, the turn limit) rather than from the
+/// provider call.
+fn is_prompt_error(error: &rig::agent::StreamingError) -> bool {
+    matches!(error, rig::agent::StreamingError::Prompt(_))
+}
+
+/// A user-facing sentence for a stream error worth keeping the turn for.
+fn explain_stream_error(
+    error: &rig::agent::StreamingError,
+    analysis_config: &AnalysisConfig,
+    ollama: bool,
+) -> String {
+    use rig::completion::PromptError;
+    match error {
+        rig::agent::StreamingError::Prompt(prompt_error) => match prompt_error.as_ref() {
+            PromptError::UnknownToolCall { tool_name, .. } => format!(
+                "The model called a tool that does not exist ({tool_name}), so the turn \
+                 stopped.{}",
+                if ollama {
+                    " With Ollama this usually means the prompt was cut to the context window; \
+                     check [analysis].max_context_tokens and the model's own limit."
+                } else {
+                    ""
+                }
+            ),
+            PromptError::MaxTurnsError { .. } => format!(
+                "The turn reached the limit of {} tool calls ([analysis].max_turns) before \
+                 the model answered.",
+                analysis_config.max_turns
+            ),
+            PromptError::PromptCancelled { reason, .. } => {
+                format!("The turn was cancelled: {reason}")
+            }
+            PromptError::CompletionError(e) => format!("The model call failed: {e}"),
+            PromptError::MemoryError(e) => format!("The turn failed: {e}"),
+        },
+        rig::agent::StreamingError::Completion(e) => {
+            format!("The model call failed part way through: {e}")
+        }
+    }
+}
+
 /// What `build_agent` needs besides the models and the prompt.
 struct BuildContext<'a> {
     shared_db: SharedDb,
@@ -230,6 +352,8 @@ struct BuildContext<'a> {
     graph_enabled: bool,
     exclude_provisional: bool,
     write_policy: WritePolicy,
+    /// `num_ctx` for Ollama; `None` for other providers.
+    context_window: Option<u32>,
     chart_spec: Arc<Mutex<Option<ChartSpec>>>,
     graph_results: GraphResults,
     refused: RefusalFlag,
@@ -282,6 +406,9 @@ where
             ctx.recorder.clone(),
         ))
         .temperature(0.1);
+    if let Some(num_ctx) = ctx.context_window {
+        builder = builder.additional_params(serde_json::json!({ "num_ctx": num_ctx }));
+    }
 
     if ctx.graph_enabled {
         builder = builder
@@ -340,4 +467,67 @@ fn finish_turn(
         graph,
         write_refused: refused.was_refused(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::completion::PromptError;
+
+    fn prompt_error(e: PromptError) -> rig::agent::StreamingError {
+        rig::agent::StreamingError::Prompt(Box::new(e))
+    }
+
+    #[test]
+    fn stream_errors_are_explained_for_the_user() {
+        let config = AnalysisConfig::default();
+        let unknown = prompt_error(PromptError::UnknownToolCall {
+            tool_name: String::from("container.exec"),
+            available_tools: vec![String::from("run_sql")],
+            allowed_tools: vec![String::from("run_sql")],
+            chat_history: Box::new(Vec::new()),
+        });
+        assert!(is_prompt_error(&unknown));
+        let text = explain_stream_error(&unknown, &config, true);
+        assert!(text.contains("container.exec"), "{text}");
+        assert!(text.contains("max_context_tokens"), "{text}");
+        let text = explain_stream_error(&unknown, &config, false);
+        assert!(!text.contains("Ollama"), "{text}");
+
+        let limit = prompt_error(PromptError::MaxTurnsError {
+            max_turns: 10,
+            chat_history: Box::new(Vec::new()),
+            prompt: Box::new(rig::message::Message::user("q")),
+        });
+        let text = explain_stream_error(&limit, &config, false);
+        assert!(text.contains("10 tool calls"), "{text}");
+
+        let provider = rig::agent::StreamingError::Completion(
+            rig::completion::CompletionError::ProviderError(String::from("connection refused")),
+        );
+        assert!(!is_prompt_error(&provider));
+        let text = explain_stream_error(&provider, &config, false);
+        assert!(text.contains("connection refused"), "{text}");
+    }
+
+    #[test]
+    fn turn_text_keeps_streamed_text_and_notes_early_stops() {
+        assert_eq!(
+            turn_text(
+                String::from("so far"),
+                None,
+                Some(String::from("why")),
+                false
+            ),
+            "so far\n\n(why)"
+        );
+        assert_eq!(
+            turn_text(String::new(), Some(String::from("final")), None, false),
+            "final"
+        );
+        let empty = turn_text(String::new(), Some(String::new()), None, true);
+        assert!(empty.contains("max_context_tokens"), "{empty}");
+        let empty = turn_text(String::new(), None, None, false);
+        assert!(!empty.contains("Ollama"), "{empty}");
+    }
 }

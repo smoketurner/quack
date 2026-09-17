@@ -781,7 +781,10 @@ writes them to stderr. `max_turns` 10, temperature 0.1.
    run: no file reads, extensions, or `SET`, and it says so, since the tables block is
    all the data there is.
 3. Tables block: user-facing tables and views with columns, types, row count, three sample
-   rows.
+   rows. Bounded so one wide or narrative table cannot push the guidance and the question
+   out of a small window: the first 25 tables are described, the first 40 columns listed
+   (the rest counted), sample rows shown only up to 20 columns and cut at 60 characters
+   per cell; `describe_table` has the rest.
 4. Documents block: count, and titles of pinned documents with their full text.
 5. Ontology block: classes with parents, relations with domain and range (compact), node
    and edge counts, and whether the graph is provisional or stale. Only when the graph is
@@ -790,6 +793,14 @@ writes them to stderr. `max_turns` 10, temperature 0.1.
 7. The permission rules.
 
 The prompt names only tools that are registered for this workspace and mode.
+
+For Ollama every request carries `num_ctx`: the prompt's estimated tokens plus room for
+tool results and the answer, rounded up to 2,048, at least 8,192 and at most
+`[analysis].max_context_tokens`, because Ollama otherwise loads the model with a 4,096-token
+window and silently truncates the front of the prompt. A turn the model derails (a call to
+a tool that does not exist, the `max_turns` limit) or that fails after text streamed is
+still a turn: the streamed text is kept, a parenthetical note says what happened, and the
+turn is recorded; only a model that could not be reached at all is an error.
 
 ### 7.3 Tools
 
@@ -1234,6 +1245,7 @@ memory_limit_mb = 256
 threads = 4
 max_turns = 10
 history_token_budget = 32000
+max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
 default_mode = "chat"                   # default for new workspaces
 
 [import]
