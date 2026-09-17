@@ -494,8 +494,8 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     init_logging();
     let format = match cli.format.unwrap_or(OutputFormat::Text) {
         OutputFormat::Json => print::PromptFormat::Json,
-        OutputFormat::Text | OutputFormat::Table => print::PromptFormat::Text,
-        OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::Markdown => {
+        OutputFormat::Text => print::PromptFormat::Text,
+        OutputFormat::Table | OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::Markdown => {
             tracing::error!("-p accepts only --format text or json");
             return Ok(ExitCode::from(EXIT_USAGE));
         }

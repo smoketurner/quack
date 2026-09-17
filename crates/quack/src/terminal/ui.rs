@@ -68,7 +68,10 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" v0.1.0", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            concat!(" v", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw("  "),
         Span::styled(&app.workspace_name, Style::default().fg(Color::Cyan)),
         Span::styled(" \u{00B7} ", Style::default().fg(Color::DarkGray)),

@@ -9,8 +9,9 @@ It also drives the `rust-agents` Claude Code plugin (conventions live in `.claud
 A knowledge engine with many interfaces, built in Rust. A workspace holds documents
 (vectorized), tables (DuckDB), and an ontology-backed knowledge graph; one agent answers
 across all three and shows every action. The core is a library; the web UI, REST API, MCP
-server, terminal session, print mode, and desktop window are thin clients of it, all
-subcommands of one `quack` binary with no Cargo features. The
+server, terminal session, and print mode are thin clients of it, all subcommands of one
+`quack` binary with no Cargo features (`quack desktop`, a Tauri window over the embedded
+server, is planned: #35, not started). The
 design is `docs/design-doc.md`; read it before any non-trivial change, and check its
 section 17 for where the code still lags. The chosen stack:
 
@@ -187,7 +188,7 @@ and `access()` resolves the workspace, checks role and token scope, and writes t
 audit row itself, so a handler holding an `Access` is already authorized. Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
 through `Access::audit`. `query/stream` forwards the agent event stream as SSE (`text`,
-`tool_started`, `tool_finished`, `complete`, `error`); uploads return 202 and are processed
+`tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 and are processed
 by `queue.rs`, one bounded lane per workspace, which locks the workspace only around each
 database step. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `access()` checks and the API's helpers; `WebUser` redirects to `/login` instead

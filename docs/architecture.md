@@ -21,8 +21,8 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 ```
       +------------+  +------------+  +------------+  +------------+  +---------------+
       |  web UI    |  |  REST API  |  |    MCP     |  | TUI/print  |  | quack desktop |
-      |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |  | (Tauri window |
-      |   htmx)    |  |            |  |  HTTP)     |  |  clap)     |  |  over serve)  |
+      |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |  | (planned, #35:|
+      |   htmx)    |  |            |  |  HTTP)     |  |  clap)     |  |  Tauri window)|
       +------------+  +------------+  +------------+  +------------+  +---------------+
                         all subcommands of the single `quack` binary
              \               |               |               |                /

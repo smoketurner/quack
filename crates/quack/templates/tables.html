@@ -4,7 +4,7 @@
 <div class="grid gap-6 md:grid-cols-[14rem_1fr]">
   <aside>
     <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Tables</h2>
-    {% if tables.is_empty() %}<p class="mt-2 text-sm text-slate-600">No tables. Upload a CSV, Parquet, or JSON file.</p>{% endif %}
+    {% if tables.is_empty() %}<p class="mt-2 text-sm text-slate-600">No tables. Upload a CSV, TSV, Parquet, JSON, or Excel file, or import from a database.</p>{% endif %}
     <ul class="mt-2 space-y-1 text-sm">
       {% for t in tables %}<li><a class="block rounded px-2 py-1 font-mono hover:bg-slate-100" href="/w/{{ ws.id }}/tables/{{ t }}">{{ t }}</a></li>{% endfor %}
     </ul>

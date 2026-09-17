@@ -33,7 +33,8 @@ Welcome to quack!
 
 Ask questions about your data, or type SQL (SELECT, WITH, FROM, DESCRIBE, SHOW,
 SUMMARIZE, PIVOT) to run it directly. Drop a file path here to load it
-(CSV, JSON, Parquet, PDF, TXT, MD). Type /help for commands.";
+(CSV, TSV, Parquet, JSON, Excel as tables; PDF, Word, PowerPoint, HTML,
+Markdown, text as documents). Type /help for commands.";
 
 const HELP_TEXT: &str = "\
 Commands:

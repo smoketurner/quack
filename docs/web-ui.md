@@ -34,7 +34,12 @@ the status and message through `HtmlError`.
 Every page struct carries a `page: Page` (title, username, admin flag, local flag, and the
 current workspace with its role and what the caller may do), which `base.html` reads for the
 header and the workspace tabs: chat, documents, tables (with the import form), SQL, context,
-ontology, graph, settings. Fragments that htmx swaps (`documents_rows.html`,
+ontology, graph, settings. The ontology page (`ontology.html`) shows the class tree,
+relations, properties, and mappings, the JSON editor, the version list with the diff to the
+previous version, the propose form, and the paged review queue with bulk accept and reject;
+the graph page (`graph.html`) shows status banners (provisional, stale, missing mapped
+tables, drift), the search and path forms, the ECharts result with a node inspector, the
+merge queue, and the extract, revalidate, and review buttons. Fragments that htmx swaps (`documents_rows.html`,
 `sql_result.html`) are their own structs, rendered to a string and inserted with `|safe`.
 askama escapes everything else. Redirects carry outcomes in the query string: `?error=` renders
 red, `?notice=` green, so a started background pass or a revalidation count is not styled as

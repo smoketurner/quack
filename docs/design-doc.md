@@ -224,8 +224,8 @@ UUID v7 via `uuid::Uuid::now_v7()`.
 ```sql
 -- workspace metadata
 CREATE TABLE _quack_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  -- schema_version, embedding_model, embedding_dimension, ontology_version,
-  -- graph_built_with_ontology_version, default_mode, graph_enabled
+  -- schema_version, embedding_model, embedding_dimension,
+  -- graph_built_with_ontology_version, graph_drift
 
 CREATE TABLE _quack_context (
     version    INTEGER PRIMARY KEY,
@@ -648,8 +648,8 @@ lists it under `missing_tables`.
 
 ### 6.4 Knowledge graph
 
-**Extraction from documents.** Runs after embedding when the workspace has
-`graph_enabled`, or on demand. Each chunk goes to the chat model with the ontology-derived
+**Extraction from documents.** Runs on demand (`quack graph extract`, `POST
+.../graph/extract`, the graph page). Each chunk goes to the chat model with the ontology-derived
 prompt and must return JSON `{nodes: [{label, class, properties}], edges: [{source, target,
 relation, properties}]}`. Responses are parsed strictly; a failed chunk is logged and
 skipped, never retried in a loop. Cost (chunk count, model) is shown before extraction
@@ -847,10 +847,10 @@ turn is recorded; only a model that could not be reached at all is an error.
 | `search_graph(entity?, class?, relation?, hops=2)` | none | Neighborhood or class listing with provenance |
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
-| `export(sql, path, format)` | prompt | `COPY ... TO` into the workspace `files/` |
 
-Graph tools register only when the workspace has `graph_enabled`; SQL tools only when it
-has at least one table; `search_documents` only when it has at least one ready document.
+Graph tools (`search_graph`, `find_path`) register only when the graph has nodes; the
+rest register in every workspace, and the prompt tells the model what the workspace holds.
+An `export` tool (`COPY ... TO` under `files/`) is not built (section 17).
 
 ### 7.4 Permissions and limits
 
@@ -884,7 +884,7 @@ config. Queries execute on a dedicated thread; the caller takes
 **Confinement.** Classification is not enough: `SELECT * FROM read_text('/etc/passwd')`
 is a read. So the workspace connection is confined when it opens, before any user or
 agent statement: `allowed_directories` is the workspace directory alone (ingestion reads
-the originals it copied under `files/`, and a future `export` writes there),
+the originals it copied under `files/`),
 `enable_external_access` is off, so file readers, replacement scans, `COPY`, `ATTACH`,
 `INSTALL`, and `LOAD` fail anywhere else, `allow_persistent_secrets` is off, and
 `lock_configuration` is on, so no later `SET` can widen any of it or lift the limits
@@ -892,7 +892,9 @@ above. The in-memory test database gets the same treatment with an empty allow-l
 
 ### 7.5 Chat modes
 
-Per session, defaulting from the workspace's `_quack_meta.default_mode`:
+Per session, `chat` unless set when the session is created (`--mode`, the REST `mode`
+field, the web selector, the MCP `mode` argument) and changed only explicitly (`/mode`,
+`PATCH .../sessions/{sid}`):
 
 - **chat** - the agent may answer from general knowledge as well as retrieved sources; it
   must still cite when it used a source.
@@ -1042,7 +1044,8 @@ screen people use today and must cover:
 - Workspace list and switcher; workspace settings (context editor with version history,
   mode default, allowed providers, members).
 - Chat: thread list, streaming answer with a collapsible steps block, citations as links
-  that open the document at the page, charts, permission confirm dialog, mode toggle.
+  to the document's row, charts and graph results inline, the allow-writes checkbox, a
+  mode selector for new sessions, Stop, an empty state that lists what the workspace holds.
 - Documents: upload (drag-drop, multi-file), paste text, status with progress, pin,
   delete, re-embed.
 - Tables: list with schema and sample rows; a SQL page with result grid and download.
@@ -1050,7 +1053,8 @@ screen people use today and must cover:
   provenance, merge review queue, provisional and stale banners.
 - Ontology: class, relation, property, and mapping editors with validation inline;
   "Propose" (with cost shown) and "Propose extensions"; the candidate review queue with
-  evidence; version history with diff and restore; import and export as YAML.
+  evidence, paged, with bulk accept and reject and a low-support filter; version history
+  with diff and restore; import and export as JSON.
 - Admin: users, tokens, audit log viewer (the skeletal log; detail opens inside the
   workspace for members).
 
@@ -1077,6 +1081,7 @@ GET    /api/v1/workspaces
 POST   /api/v1/workspaces
 GET    /api/v1/workspaces/{id}
 PATCH  /api/v1/workspaces/{id}                    settings
+POST   /api/v1/auth/login  POST /api/v1/auth/logout  GET /api/v1/auth/me
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
 POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn
 POST   /api/v1/workspaces/{id}/sql                {sql}
@@ -1091,19 +1096,27 @@ DELETE /api/v1/workspaces/{id}/documents/{doc}
 GET    /api/v1/workspaces/{id}/tables[/{name}]
 GET    /api/v1/workspaces/{id}/graph/search?entity=&class=&relation=&hops=
 GET    /api/v1/workspaces/{id}/graph/path?from=&to=
-POST   /api/v1/workspaces/{id}/graph/extract       -> 202, cost in response
+GET    /api/v1/workspaces/{id}/graph/status
+POST   /api/v1/workspaces/{id}/graph/extract       tables now; documents -> 202 with the cost, one run per workspace (409 while one runs)
 POST   /api/v1/workspaces/{id}/graph/revalidate
-GET    /api/v1/workspaces/{id}/ontology            current version; YAML or JSON by Accept
+POST   /api/v1/workspaces/{id}/graph/review        mark a provisional graph reviewed
+GET    /api/v1/workspaces/{id}/graph/merges        PUT .../graph/merges/{mid} {action: accept|reject}
+POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?}
+GET    /api/v1/workspaces/{id}/okf                 the bundle as a tar
+GET    /api/v1/workspaces/{id}/ontology            current version, JSON
 PUT    /api/v1/workspaces/{id}/ontology            import: validate, write a new version
+POST   /api/v1/workspaces/{id}/ontology/init       the built-in default as version 1
 GET    /api/v1/workspaces/{id}/ontology/versions[/{v}]
 POST   /api/v1/workspaces/{id}/ontology/versions/{v}/restore
-POST   /api/v1/workspaces/{id}/ontology/propose    {mode: full|extend, from?, sample?, auto_accept?} -> 202, cost
-GET    /api/v1/workspaces/{id}/ontology/candidates
+POST   /api/v1/workspaces/{id}/ontology/propose    {mode: full|extend, from?, sample?, auto_accept?, documents?} -> 202 with documents
+GET    /api/v1/workspaces/{id}/ontology/candidates[?status=low_support]
+POST   /api/v1/workspaces/{id}/ontology/candidates {accept: [ids], reject: [ids]}
 PUT    /api/v1/workspaces/{id}/ontology/candidates/{cid}   {action: accept|rename|merge_into|reparent|reject, ...}
 GET    /api/v1/workspaces/{id}/context             current; Markdown or JSON by Accept
 PUT    /api/v1/workspaces/{id}/context
 GET    /api/v1/workspaces/{id}/context/versions
 GET    /api/v1/workspaces/{id}/sessions[/{sid}]
+DELETE /api/v1/workspaces/{id}/sessions/{sid}     creator or owner
 PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} | {mode} (creator or owner; audited as share, mode)
                                                   a session's mode is set when it is created;
                                                   `mode` on a later query is ignored
@@ -1162,19 +1175,21 @@ local tabular files in place as views.
 ### 11.5 Print mode and CLI
 
 ```
-quack -p "PROMPT" [-w NAME] [-f table|json|ndjson|csv|markdown] [--mode chat|query]
-      [--allow-write] [--model P/M] [-c | -r SESSION]
-quack -q "SQL" [-w NAME] [-f ...] [--internal]
-quack ingest FILE... [-w NAME] [--as NAME] [--title T] [--pin] [--no-embed] [--extract]
-quack docs | tables | schema TABLE
+quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
+      [--allow-write] [-c | -r SESSION]
+quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown]
+quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
+quack docs [--pin ID | --unpin ID | --delete ID]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--tables-only|--documents-only]
             [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | reject ID..
 quack ontology show | propose [--extend|--from PACK] [--sample N] [--auto-accept]
               | review | accept ID... | reject ID... | export FILE | import FILE
               | versions | restore V
-quack context show | edit | export FILE | import FILE
+quack context show | edit | history | export FILE | import FILE
 quack sessions | export SESSION [--sql|--markdown]
+quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
+quack okf export DIR|-
 quack auth login|status|logout PROVIDER
 quack serve [--bind ADDR] [--local]
 quack mcp [-w NAME]
@@ -1294,7 +1309,6 @@ threads = 4
 max_turns = 10
 history_token_budget = 32000
 max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
-default_mode = "chat"                   # default for new workspaces
 
 [import]
 max_rows = 1000000

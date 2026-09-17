@@ -145,10 +145,11 @@ impl Tool for RunSqlTool {
     type Output = String;
 
     fn description(&self) -> String {
-        String::from(
+        format!(
             "Execute a SQL query against the workspace DuckDB database. SELECT queries always run; \
              statements that modify data need the user's write permission and may be refused. \
-             Returns up to 100 rows as a formatted table.",
+             Returns up to {} rows as a formatted table.",
+            self.max_query_rows
         )
     }
 

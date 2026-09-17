@@ -130,6 +130,18 @@ pub(crate) async fn run_prompt(
             if !response.content.ends_with('\n') {
                 writeln!(out)?;
             }
+            if let Some(chart) = &response.chart {
+                // The spec itself is in `--format json`; text mode says a
+                // chart exists rather than dropping it.
+                writeln!(out)?;
+                writeln!(
+                    out,
+                    "Chart: {} ({} chart, {} points; --format json carries the spec)",
+                    chart.title,
+                    chart.kind.as_str(),
+                    chart.points()
+                )?;
+            }
             if !response.citations.is_empty() {
                 writeln!(out)?;
                 writeln!(out, "Sources:")?;
