@@ -18,10 +18,6 @@ env:
   # invalidating the build cache the way RUSTFLAGS="-D warnings" would.
   CARGO_BUILD_WARNINGS: deny
 
-# NOTE: the workspace ships no crates yet, so fmt/clippy/test/deny report
-# "no members" until you add the first crate under crates/. CI goes green
-# once a crate exists. (See README.md.)
-
 jobs:
   fmt:
     name: Format

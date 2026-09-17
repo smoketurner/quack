@@ -35,7 +35,7 @@ deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.98.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
 crates/               # quack-core (engine), quack (the binary) — see crates/README.md
-docs/                 # design-doc.md (the product) plus the stack patterns, with code
+docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd
 .claude/rules/        # branching, commits, continuous-improvement conventions
 ```
 
@@ -225,5 +225,6 @@ Ollama. Cut a release by pushing an annotated `vX.Y.Z` tag after the branch is p
 
 ## Where to read more
 
-The migration, query, and crypto patterns each have a doc under `docs/` (see the table in
-`README.md`). Read the relevant one before implementing that layer.
+`docs/architecture.md` maps the design to the modules; `docs/migrations.md`,
+`docs/crypto.md`, `docs/web-ui.md`, and `docs/ci-cd.md` cover the schema, TLS, web UI, and
+release layers (the table in `README.md`). Read the relevant one before changing that layer.

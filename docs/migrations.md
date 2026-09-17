@@ -1,44 +1,40 @@
-# Migrations
+# Schema and migrations
 
-Two databases carry schema, and each is versioned on its own side of the classification
-boundary (design doc section 5).
+Two databases carry schema, each versioned on its own side of the classification boundary
+(design doc section 5).
 
 ## `control.db` (SQLite, server mode)
 
 Managed by sea-query DDL builders in `quack-core/src/storage/migrations.rs`. Each schema
-version generates a set of `CREATE TABLE IF NOT EXISTS` statements, applied by
+version is a set of `CREATE TABLE IF NOT EXISTS` statements, applied by
 `ControlPlane::open()` and recorded in `schema_version`.
 
-Authoring rules:
-
-- **UUID v7 primary keys** (client-supplied, `uuid::Uuid::now_v7()`), no `SERIAL`.
-- **One logical change per version** — keep each version's statements focused.
-- Use sea-query's `Table::create()` builder rather than raw SQL strings.
-- Use `if_not_exists()` so migrations are idempotent.
-- **Nothing that reveals workspace content.** `control.db` holds users, workspaces (name and
-  label), membership, tokens, and the access audit log. Content detail belongs in the
-  workspace file.
-- `audit_log` is append-only: no migration or code path may add an `UPDATE` or `DELETE`
-  against it.
+- UUID v7 primary keys, client-generated with `uuid::Uuid::now_v7()`; no `SERIAL`.
+- One logical change per version; `if_not_exists()` so versions are idempotent.
+- Queries are built with sea-query (`Iden` enums per table, `SqliteQueryBuilder`) and run
+  through sqlx wrapped in `AssertSqlSafe`, because sea-query emits dynamic SQL strings.
+  Handlers call typed store methods and never see SQL.
+- Nothing that reveals workspace content: users, workspaces (name and label), membership,
+  tokens, and the access `audit_log`. The audit log is append-only; no code path may
+  `UPDATE` or `DELETE` it.
 
 ## Workspace DuckDB files
 
-Each workspace's `data.duckdb` carries the `_quack_` tables (documents, chunks, ontology,
-graph, provenance, sessions, messages, context, audit detail; design doc section 5.4)
-alongside user tables and views. Their schema is versioned by
-`_quack_meta.schema_version`, applied by `WorkspaceDb::open()`.
+Each workspace's `data.duckdb` carries the `_quack_` tables (documents, chunks, terms,
+ontology, graph, provenance, merges, sessions, messages, context, audit detail; design doc
+section 5.4) beside the user's tables and views. `WorkspaceDb::open()` creates what is
+missing and records `_quack_meta.schema_version`; a bump can trigger a rebuild, as version
+6 rebuilt the term index when stemming arrived.
 
-Authoring rules:
-
-- Statements are parameterized with `duckdb::params!`; the only interpolated values are
-  identifiers through `quote_ident` and the validated `FLOAT[N]` embedding width.
-- Every internal table is prefixed `_quack_` so it can be hidden from the agent's table
-  listing and refused in agent SQL.
-- The embedding dimension is fixed per workspace and recorded in `_quack_meta`; a
-  migration never changes it. Changing the embedding model is a guided re-embed.
-- The ontology and the workspace context are versioned as data (`_quack_ontology_versions`,
-  `_quack_context`), not by schema migrations.
-- Migrations must be safe to run on a workspace that was created by an older binary and
-  copied from another machine: a workspace directory is portable.
-
-User tables and views are never touched by migrations.
+- Internal statements are constant strings with `duckdb::params!` bindings. The only
+  interpolated values are identifiers through `quote_ident` and the validated `FLOAT[N]`
+  embedding width. sea-query is not used here: its SQLite backend cannot express DuckDB's
+  arrays or recursive CTEs.
+- Every internal table is prefixed `_quack_` so it is hidden from the agent's table listing
+  and refused in user and agent SQL.
+- The embedding dimension is fixed per workspace and recorded in `_quack_meta`; a schema
+  version never changes it. Changing the embedding model is a re-embed.
+- The ontology and the workspace context are versioned as data
+  (`_quack_ontology_versions`, `_quack_context`), not by schema versions.
+- A workspace directory is portable: every version must open a file created by an older
+  binary on another machine. User tables and views are never touched.

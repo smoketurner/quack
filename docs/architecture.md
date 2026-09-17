@@ -1,33 +1,28 @@
 # Architecture
 
-How the pieces of this project fit together. The product design is in
-[design-doc.md](design-doc.md); this file covers the Cargo workspace, the crate layering,
-and the lint baseline.
+How the code is laid out. The product design is [design-doc.md](design-doc.md); this file
+maps its sections to the crates and modules that exist.
 
 ## Workspace
 
-A virtual Cargo workspace (`Cargo.toml` has no `[package]`). All crates live under
-`crates/` and are discovered by `members = ["crates/*"]`. Shared settings come from the
-root:
-
-- `[workspace.package]` — `version`, `edition = "2024"`, `rust-version` (MSRV), `license`.
-  Inherit per crate with `edition.workspace = true`, etc.
-- `[workspace.dependencies]` — the pinned dependency menu. Crates use
-  `dep = { workspace = true, features = ["..."] }`.
-- `[workspace.lints]` — the strict lint baseline. Crates use `[lints] workspace = true`.
-
-`resolver = "3"` (the edition-2024 default) gives MSRV-aware dependency resolution.
+A virtual Cargo workspace (`Cargo.toml` has no `[package]`) with two members under
+`crates/`: `quack-core`, the library, and `quack`, the one binary. Shared settings come
+from the root: `[workspace.package]` (edition 2024, the MSRV), `[workspace.dependencies]`
+(every dependency pinned to an exact version with default features off; members opt in),
+and `[workspace.lints]` (panic, cast, and arithmetic denies plus clippy `pedantic`). Every
+member declares `[lints] workspace = true`. There are no Cargo features: every build
+contains every surface.
 
 ## Layering
 
-Every interface is a thin adapter over the core library. Nothing above the core line owns
+Every interface is a thin adapter over the core. Nothing above the core line owns
 behavior; nothing below it knows about HTTP, terminals, or windows.
 
 ```
       +------------+  +------------+  +------------+  +------------+  +---------------+
       |  web UI    |  |  REST API  |  |    MCP     |  | TUI/print  |  | quack desktop |
       |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |  | (Tauri window |
-      |   htmx)    |  |            |  |  SSE)      |  |  clap)     |  |  over serve)  |
+      |   htmx)    |  |            |  |  HTTP)     |  |  clap)     |  |  over serve)  |
       +------------+  +------------+  +------------+  +------------+  +---------------+
                         all subcommands of the single `quack` binary
              \               |               |               |                /
@@ -38,60 +33,46 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
                               +-----------------------------+
 ```
 
-**Current crates** (what builds today):
+## `quack-core`
 
-| Crate | Binary | Owns |
+| Module | Owns | Design doc |
 |---|---|---|
-| `quack-core` | — | config, errors, crypto provider install, `control.db` (sqlx + sea-query), workspace DuckDB engine with statement classification and limits, ingestion, chunking, vector search, rig-based agent, tools, write policy, `llm` provider construction and `run_turn` dispatch, chart spec |
-| `quack` | `quack` | interactive terminal session when run with no arguments; `-p` print mode; `-q` SQL with output formats; `ingest`; `--allow-write` |
+| `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[import]`), unknown keys rejected, `QUACK_*` overrides | 13 |
+| `crypto` | installs the aws-lc-rs provider once | 14 |
+| `error` | the `thiserror` enum every layer returns | |
+| `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |
+| `storage::migrations` | `control.db` schema versions | [migrations.md](migrations.md) |
+| `storage::workspace` | the workspace DuckDB file: open with confinement and limits, the `_quack_` tables, statement classification, hybrid retrieval (cosine scan plus BM25 over `_quack_terms`), the document registry, query execution with faithful JSON values | 5.4, 6.1, 7.4 |
+| `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit | 5.3, 8 |
+| `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
+| `import` | rows from Postgres, SQLite, or an HTTP data file as a workspace table | 6.2 |
+| `analysis` | the agent loop as an event stream (`agent`, `events`), the tools (`tools`), the system prompt (`text_to_sql`), write policy, citations, the chart spec, the reranking hook (`rerank`) | 7, 9 |
+| `ontology` | the model, validation, versions (`store`), induction from tables and documents (`induction`, `documents`), the review queue (`candidates`) | 6.3, 6.5 |
+| `graph` | the knowledge graph: `store`, `tables` (mapping extraction), `extract` (constrained model extraction with drift), `resolve` (merges), `traverse` | 6.4 |
+| `okf` | Open Knowledge Format bundles in and out | 17 |
+| `llm` | rig provider construction, `run_turn`, extractors and the reranker over the chat model, OAuth token management (`oauth`) | 10 |
 
-`serve`, `mcp`, print mode (`-p`), admin, and later `desktop` are added to `quack` as
-subcommands (design doc section 4). There are no Cargo features; every build contains
-every surface.
+## `quack`
 
-## Core modules
-
-`quack-core` is organized by substrate and by responsibility:
-
-| Module | Responsibility |
+| Module | Owns |
 |---|---|
-| `workspace/` | open and create a workspace directory; `.quack/` discovery for the TUI |
-| `storage/` | the workspace DuckDB file (everything classified, including `sessions.rs` for conversations) and `control.db` (access control and access audit) |
-| `ingestion/` | parsers, chunking with heading and page metadata, embedding, index maintenance |
-| `retrieval/` | vector + full-text fusion, citation metadata, pinned documents |
-| `analytics/` | SQL execution, read/write classification, resource limits, schema introspection |
-| `ontology/` | ontology tables, validation, versions, induction (propose and review) |
-| `graph/` | ontology-guided extraction, entity resolution, provenance, traversal |
-| `agent/` | the tool-calling loop as an event stream (`events.rs`), tools, permissions, prompt, chat modes |
-| `llm/` | rig provider construction; auth none / API key / OAuth PKCE with a token manager |
-| `context/` | the stored workspace context; Markdown import and export |
-
-Today's code has `storage/`, `ingestion/`, `analysis/` (agent, tools, policy, text-to-SQL,
-vector index, chart), `llm/`, and `crypto`. The split above is the target; new work should
-land in the target module rather than growing `analysis/`.
+| `main` | the clap command tree, print mode entry, the workspace-local subcommands (`ingest`, `docs`, `sessions`, `export`, `context`, `import`, `okf`, `auth`) |
+| `print` | `-p`: one turn, answer to stdout, steps to stderr, text or JSON |
+| `terminal` | the interactive session (ratatui): streaming, inline steps, the permission prompt, slash commands, charts |
+| `ontology_cli`, `graph_cli`, `admin` | `quack ontology`, `quack graph`, and the server administration commands |
+| `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
+| `server` | `quack serve`: `auth` (identity and `access()`), `api` (REST handlers), `web` (askama pages over the same helpers, [web-ui.md](web-ui.md)), `queue` (uploads), `state`, `mcp_http` |
 
 ## The storage boundary
 
-A workspace is one directory: `data.duckdb` plus `files/`. Everything classified about
-the workspace is inside it, including the sessions, the ontology, the context, and the
-detail of what was done. `control.db` holds only who may open which workspace and the
-access audit (who, what resource by opaque id, outcome, channel, when). See design doc
-sections 5 and 12. When adding a table, ask which side of the boundary it belongs on; if
-it can reveal workspace content, it goes in the DuckDB file with a `_quack_` prefix.
+A workspace is one directory: `data.duckdb` plus `files/`. Everything classified about the
+workspace is inside it: the sessions, the ontology, the graph, the context, and the detail
+of what was done. `control.db` holds only who may open which workspace and the access audit
+(who, what resource by opaque id, outcome, channel, when). When adding a table, ask which
+side of the boundary it belongs on; if it can reveal workspace content, it goes in the
+DuckDB file with a `_quack_` prefix (design doc sections 5 and 12).
 
-## Lint inheritance
-
-Every crate must declare:
-
-```toml
-[lints]
-workspace = true
-```
-
-This applies the panic-prevention, cast, and arithmetic denies plus clippy `pedantic`
-(as warnings) from the root. Without it, a crate silently escapes the baseline.
-
-## Build & test flow
+## Build and test
 
 ```bash
 make check   # cargo check --workspace --all-targets --all-features
@@ -100,9 +81,5 @@ make test    # cargo test --workspace --all-features
 make deny    # cargo deny check (advisories, licenses, bans)
 ```
 
-## Adding a layer
-
-1. `cargo new --lib crates/<name>` (see `crates/README.md`).
-2. Add `[lints] workspace = true` and inherit package fields.
-3. Pull deps from the workspace menu; add new ones (pinned) to `[workspace.dependencies]`.
-4. Read the matching `docs/` file for that layer's patterns before writing code.
+New dependencies go in the root `[workspace.dependencies]` menu, pinned to the current
+version, never inline in a member crate.

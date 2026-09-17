@@ -1,56 +1,28 @@
-# Crypto & TLS: aws-lc-rs only
+# Crypto and TLS: aws-lc-rs only
 
-This project uses **aws-lc-rs** as the single crypto provider for all TLS connections and
-signing. OpenSSL and `ring` are deliberately kept out: they're banned in `deny.toml` and
-excluded by feature selection.
+quack uses aws-lc-rs as the single crypto provider for every TLS connection and for
+hashing. OpenSSL and `ring` are kept out: `deny.toml` bans `openssl`, `openssl-sys`,
+`native-tls`, and `ring`, and every TLS-capable dependency is enabled with its aws-lc-rs
+feature. One audited, FIPS-capable provider, nothing to cross-compile for the static musl
+build, and no ambiguity about which backend rustls picks at runtime.
 
-Why: one audited, FIPS-capable provider; no system OpenSSL to cross-compile or patch; a
-smaller attack surface; and no ambiguity about which backend rustls picks at runtime.
+## Where it is wired
 
-## Install the default provider once, at startup
+- `quack_core::crypto::install_default_provider()` installs the rustls default provider
+  and is the first call in `main`, before any TLS use. A second call in one process is an
+  error, which the strict lints surface instead of an `unwrap`.
+- Features: `rustls` with `aws_lc_rs`, `reqwest` and `rig` with `rustls`, `sqlx` with
+  `tls-rustls-aws-lc-rs` (the Postgres import). SHA-256 for tokens and document dedup
+  comes from `aws_lc_rs::digest`, AES-256-GCM for the OAuth token cache from
+  `aws_lc_rs::aead`.
 
-rustls requires a process-wide default `CryptoProvider`. Install aws-lc-rs as the very first
-thing in `main`, before any TLS connection is created:
-
-```rust
-fn main() -> anyhow::Result<()> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("default crypto provider already installed"))?;
-
-    // ... build runtime, pools, server ...
-    Ok(())
-}
-```
-
-`install_default` returns `Err` if a provider is already set, so the `map_err` keeps the
-strict `unwrap_used`/`expect_used` lints satisfied.
-
-## Feature selection
-
-Enable the aws-lc-rs path on every TLS-using crate, with default features off so no other
-backend sneaks in:
-
-```toml
-rustls       = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
-tokio-rustls = { workspace = true, features = ["aws-lc-rs"] }
-webpki-roots = { workspace = true }
-```
-
-If you add an HTTP client (`reqwest`) or JWTs (`jsonwebtoken`), pick their `rustls` +
-`aws-lc-rs` features too — never `native-tls`, `default-tls`, or a `ring` feature.
-
-## Enforce it
-
-`deny.toml` already denies `openssl`, `openssl-sys`, `native-tls`, and `ring`, so a stray
-feature fails `cargo deny check`. Double-check the resolved graph after wiring up TLS:
+## The gate
 
 ```bash
-cargo tree -i ring          # expect: "package ID specification ... did not match any packages"
-cargo tree -i openssl-sys   # expect: no match
-cargo tree -i aws-lc-rs     # expect: aws-lc-rs present, pulled by rustls
+make release-gates
 ```
 
-An empty result for `ring`/`openssl-sys` and a present `aws-lc-rs` confirms the single-
-provider setup. Make `cargo deny check` part of CI (it already is) so regressions are caught
-on every PR.
+runs `cargo tree -i ring -e normal` and `cargo tree -i openssl-sys -e normal`, which must
+print nothing, then `cargo deny check`. The `-e normal` matters: `libduckdb-sys` pulls
+`ureq`, and with it `ring`, as a build-time dependency only; nothing links it into the
+binary. The release workflow runs the same target before building anything.

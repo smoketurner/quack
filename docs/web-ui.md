@@ -3,7 +3,8 @@
 How `quack serve` renders its web UI (design doc sections 11.1, 11.2, and 12): axum serves
 the routes, rust-embed bakes the assets into the executable, askama renders the templates,
 htmx refreshes the document list and the SQL grid, and a small script streams the chat
-over the SSE endpoint. Tailwind builds the CSS with the standalone binary. The code lives in
+over the SSE endpoint and draws the charts and the graph. Tailwind builds the CSS with the
+standalone binary. The code lives in
 `crates/quack/src/server/web/`, the templates in `crates/quack/templates/`, and the assets
 in `crates/quack/static/`. Localization via fluent is deferred (design doc section 18).
 
@@ -32,7 +33,8 @@ the status and message through `HtmlError`.
 
 Every page struct carries a `page: Page` (title, username, admin flag, local flag, and the
 current workspace with its role and what the caller may do), which `base.html` reads for the
-header and the workspace tabs. Fragments that htmx swaps (`documents_rows.html`,
+header and the workspace tabs: chat, documents, tables (with the import form), SQL, context,
+ontology, graph, settings. Fragments that htmx swaps (`documents_rows.html`,
 `sql_result.html`) are their own structs, rendered to a string and inserted with `|safe`.
 askama escapes everything else.
 
@@ -46,7 +48,8 @@ askama escapes everything else.
   vendored so the binary works air-gapped. `static/js/app.js` is quack's own: it posts to
   `/api/v1/workspaces/{id}/query/stream`, parses the SSE events, renders the steps block,
   the answer, citations as links to the document list, and the chart spec as an ECharts
-  option, and renders stored charts on page load.
+  option; on page load it renders stored charts and the graph page's result as an ECharts
+  force graph (nodes coloured by class, click scrolls to the inspector entry).
 
 ## Static handler
 
