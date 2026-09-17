@@ -1492,15 +1492,60 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
     let (status, html, _) = h.page(&format!("/w/{ws}/ontology"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("Review queue (1 pending)") && html.contains("orders.mode"),
+        html.contains("1 pending")
+            && html.contains("orders.mode")
+            && html.contains("Accept selected"),
         "{html}"
     );
-    // The page's form with auto-accept takes the remaining proposal straight in.
+    // Bulk decisions (issue #55): the API rejects the candidate by id in
+    // one call, the page's bulk form accepts the re-proposed one.
+    let (_, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    let pending_id = body["candidates"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/candidates"),
+            None,
+            Some(serde_json::json!({ "reject": [pending_id] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rejected"], 1);
+    let (status, _) = h
+        .call(
+            Method::POST,
+            &format!("{base}/candidates"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "mode": "extend" })),
+        )
+        .await;
+    assert_eq!(body["candidates"], 1, "{body}");
+    let (_, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    let pending_id = body["candidates"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     let (status, _, headers) = h
         .form(
-            &format!("/w/{ws}/ontology/propose"),
+            &format!("/w/{ws}/ontology/candidates"),
             None,
-            "extend=true&auto_accept=true",
+            &format!("bulk=accept&status=pending&ids={pending_id}"),
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);

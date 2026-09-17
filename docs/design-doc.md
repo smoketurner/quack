@@ -738,7 +738,12 @@ permission-gated and audited.
 show the proposal grouped by kind with evidence inline. Actions per candidate: accept,
 rename, merge into an existing class or relation, reparent, reject. Accepting writes a new
 ontology version. `PUT .../ontology/candidates/{id}` and `quack ontology accept ID...`
-apply the same actions from scripts.
+apply the same actions from scripts; `POST .../ontology/candidates` with `{accept: [ids],
+reject: [ids]}` decides many at once, as the page's tick boxes do. The page shows fifty
+candidates at a time, pending or low-support (a filter link, never hidden). Extend mode
+treats a mapped table as covered: its rows belong to the class the mapping names, so no
+class or mapping is proposed for it, and a column its mapping already relates proposes no
+relation; new columns still propose properties.
 
 **Modes.**
 

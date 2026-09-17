@@ -14,14 +14,29 @@
   <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Propose</button>
 </form>
 {% endif %}
-{% if !queue.is_empty() %}
+{% if pending_total > 0 || low_support_total > 0 %}
 <section class="mt-4">
-  <h2 class="text-sm font-semibold uppercase text-slate-500">Review queue ({{ queue.len() }} pending)</h2>
+  <h2 class="text-sm font-semibold uppercase text-slate-500">Review queue</h2>
+  <p class="mt-1 flex flex-wrap items-center gap-3 text-sm">
+    {% if queue_status == "pending" %}<span class="font-medium">{{ pending_total }} pending</span>{% else %}<a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology">{{ pending_total }} pending</a>{% endif %}
+    {% if queue_status == "low_support" %}<span class="font-medium">{{ low_support_total }} low support</span>{% else %}<a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology?status=low_support">{{ low_support_total }} low support</a>{% endif %}
+    {% if queue_status == "low_support" %}<span class="text-slate-500">seen in fewer documents than <code>[ontology].min_support_documents</code>; accept what you know to be right</span>{% endif %}
+    {% if queue_pages > 1 %}<span class="text-slate-500">page {{ queue_page }} of {{ queue_pages }}{% if queue_page > 1 %} · <a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology?status={{ queue_status }}&page={{ queue_page - 1 }}">previous</a>{% endif %}{% if queue_page < queue_pages %} · <a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology?status={{ queue_status }}&page={{ queue_page + 1 }}">next</a>{% endif %}</span>{% endif %}
+  </p>
+  {% if ws.can_write && !queue.is_empty() %}
+  <form method="post" action="/w/{{ ws.id }}/ontology/candidates" id="bulk-review" class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+    <input type="hidden" name="status" value="{{ queue_status }}">
+    <span class="text-slate-500">Ticked candidates:</span>
+    <button type="submit" name="bulk" value="accept" class="rounded bg-slate-900 px-2 py-1 text-xs text-white hover:bg-slate-700">Accept selected</button>
+    <button type="submit" name="bulk" value="reject" class="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100">Reject selected</button>
+  </form>
+  {% endif %}
   <table class="mt-2 w-full text-sm">
-    <thead><tr class="border-b border-slate-300 text-left text-xs uppercase text-slate-500"><th class="py-1">Kind</th><th>Proposal</th><th>Evidence</th><th>Conf.</th><th></th></tr></thead>
+    <thead><tr class="border-b border-slate-300 text-left text-xs uppercase text-slate-500">{% if ws.can_write %}<th class="py-1"><input type="checkbox" onclick="document.querySelectorAll('input[name=ids]').forEach(function (b) { b.checked = event.target.checked; })" title="Tick all on this page"></th>{% endif %}<th class="py-1">Kind</th><th>Proposal</th><th>Evidence</th><th>Conf.</th><th></th></tr></thead>
     <tbody>
     {% for c in queue %}
     <tr class="border-b border-slate-200 align-top">
+      {% if ws.can_write %}<td class="py-2"><input type="checkbox" name="ids" value="{{ c.id }}" form="bulk-review"></td>{% endif %}
       <td class="py-2">{{ c.kind }}</td>
       <td class="font-mono">{{ c.proposal_id }}{% if !c.detail.is_empty() %}<div class="text-xs text-slate-500">{{ c.detail }}</div>{% endif %}</td>
       <td class="text-slate-600">{{ c.evidence }}</td>

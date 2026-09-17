@@ -64,7 +64,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/ontology/propose", post(ontology::propose))
         .route(
             "/workspaces/{id}/ontology/candidates",
-            get(ontology::list_candidates),
+            get(ontology::list_candidates).post(ontology::decide_many),
         )
         .route(
             "/workspaces/{id}/ontology/candidates/{cid}",

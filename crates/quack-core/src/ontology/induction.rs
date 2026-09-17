@@ -320,6 +320,34 @@ impl Known<'_> {
         self.0
             .is_some_and(|o| o.mappings.iter().any(|m| m.table == table))
     }
+    /// The class a mapped table already feeds, whatever it is called
+    /// (issue #55: `notable_events` maps to `storm_event`, not to a new
+    /// `notable_event`).
+    fn mapped_class(&self, table: &str) -> Option<String> {
+        self.0.and_then(|o| {
+            o.mappings
+                .iter()
+                .find(|m| m.table == table)
+                .map(|m| m.class.clone())
+        })
+    }
+    /// Whether the table's mapping already turns this column into a
+    /// relation.
+    fn mapped_relation(&self, table: &str, column: &str) -> bool {
+        self.0.is_some_and(|o| {
+            o.mappings
+                .iter()
+                .any(|m| m.table == table && m.relations.iter().any(|r| r.column == column))
+        })
+    }
+}
+
+/// The class a table's rows belong to: the one its mapping names, else
+/// one derived from the table name.
+fn class_for_table(known: &Known<'_>, table: &str) -> String {
+    known
+        .mapped_class(table)
+        .unwrap_or_else(|| class_id_for_table(table))
 }
 
 fn propose_table(
@@ -331,7 +359,7 @@ fn propose_table(
     candidates: &mut Vec<Candidate>,
 ) -> Result<()> {
     let known = Known(current);
-    let class_id = class_id_for_table(&profile.name);
+    let class_id = class_for_table(&known, &profile.name);
     let key_property = profile.key.as_deref().map(snake_id);
     let mut property_ids = Vec::new();
     let mut property_map = BTreeMap::new();
@@ -379,7 +407,7 @@ fn propose_table(
                 low_support: false,
             });
         }
-        if !is_key {
+        if !is_key && !known.mapped_relation(&profile.name, &column.name) {
             propose_relations(
                 db,
                 profile,
@@ -447,7 +475,7 @@ fn propose_relations(
     relations: &mut Vec<MappingRelation>,
     candidates: &mut Vec<Candidate>,
 ) -> Result<()> {
-    let class_id = class_id_for_table(&profile.name);
+    let class_id = class_for_table(known, &profile.name);
     for other in profiles.iter().filter(|p| p.name != profile.name) {
         let Some(other_key) = other.key.as_deref() else {
             continue;
@@ -456,7 +484,7 @@ fn propose_relations(
         if share < options.key_overlap_threshold || column.distinct == 0 {
             continue;
         }
-        let target_class = class_id_for_table(&other.name);
+        let target_class = class_for_table(known, &other.name);
         let (relation_id, defined) =
             relation_id_for(&column.name, &class_id, &target_class, known, candidates);
         relations.push(MappingRelation {
@@ -860,6 +888,30 @@ mod tests {
         let again = propose_from_tables(&db, Some(&ontology), &TableEvidenceOptions::default())
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(again.is_empty(), "{}", again.len());
+        // A table mapped to a class named differently from the table is
+        // covered too: nothing is proposed for it (issue #55).
+        let mut renamed = ontology.clone();
+        for class in &mut renamed.classes {
+            if class.id == "claim" {
+                class.id = String::from("insurance_claim");
+            }
+        }
+        for mapping in &mut renamed.mappings {
+            if mapping.class == "claim" {
+                mapping.class = String::from("insurance_claim");
+            }
+        }
+        for relation in &mut renamed.relations {
+            if relation.domain == "claim" {
+                relation.domain = String::from("insurance_claim");
+            }
+            if relation.range == "claim" {
+                relation.range = String::from("insurance_claim");
+            }
+        }
+        let again = propose_from_tables(&db, Some(&renamed), &TableEvidenceOptions::default())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(again.is_empty(), "{again:?}");
     }
 
     #[test]

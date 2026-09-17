@@ -286,9 +286,37 @@ struct OntologyPage {
     json: String,
     versions: Vec<ontology_store::VersionRow>,
     diff: Option<OntologyDiff>,
+    /// The page of the queue being shown.
     queue: Vec<CandidateView>,
+    /// `pending` or `low_support`: which queue `queue` shows.
+    queue_status: String,
+    queue_page: usize,
+    queue_pages: usize,
+    pending_total: usize,
+    low_support_total: usize,
     has_tables: bool,
     error: Option<String>,
+}
+
+/// Candidates shown per review page.
+const CANDIDATES_PER_PAGE: usize = 50;
+
+#[derive(Deserialize, Default)]
+struct OntologyQuery {
+    error: Option<String>,
+    /// `pending` (default) or `low_support`.
+    status: Option<String>,
+    page: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct BulkDecideForm {
+    /// `accept` or `reject`.
+    bulk: String,
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    status: String,
 }
 
 /// One node as the graph page's inspector shows it.
@@ -398,6 +426,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
         .route("/w/{id}/ontology/propose", post(ontology_propose))
+        .route("/w/{id}/ontology/candidates", post(ontology_decide_many))
         .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
         .route("/w/{id}/ontology/{v}/restore", post(ontology_restore))
         .route("/w/{id}/graph", get(graph_page))
@@ -1187,12 +1216,16 @@ async fn ontology_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Query(q): Query<FlashQuery>,
+    Query(q): Query<OntologyQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "ontology").await?;
     let db = app.workspace_db(&id).await?;
-    let (ontology, versions, diff, queue, has_tables) = with_db(db, |db| {
+    let queue_status = match q.status.as_deref() {
+        Some("low_support") => "low_support",
+        _ => "pending",
+    };
+    let (ontology, versions, diff, pending, low_support, has_tables) = with_db(db, |db| {
         let current = ontology_store::current(db)?;
         let versions = ontology_store::versions(db, 20)?;
         let diff = match &current {
@@ -1200,12 +1233,32 @@ async fn ontology_page(
                 .map(|older| c.diff(&older)),
             _ => None,
         };
-        let queue = candidates::pending(db)?;
+        let pending = candidates::pending(db)?;
+        let low_support = candidates::low_support(db)?;
         let has_tables = !db.list_tables()?.is_empty();
-        Ok((current, versions, diff, queue, has_tables))
+        Ok((current, versions, diff, pending, low_support, has_tables))
     })
     .await?;
-    let queue = queue.into_iter().map(candidate_view).collect();
+    let (pending_total, low_support_total) = (pending.len(), low_support.len());
+    let rows = if queue_status == "low_support" {
+        low_support
+    } else {
+        pending
+    };
+    // The queue is paged (issue #55): 221 candidates from one document
+    // pass are not one wall of rows.
+    let queue_pages = rows.len().div_ceil(CANDIDATES_PER_PAGE).max(1);
+    let queue_page = q.page.unwrap_or(1).clamp(1, queue_pages);
+    let queue = rows
+        .into_iter()
+        .skip(
+            queue_page
+                .saturating_sub(1)
+                .saturating_mul(CANDIDATES_PER_PAGE),
+        )
+        .take(CANDIDATES_PER_PAGE)
+        .map(candidate_view)
+        .collect();
     let json = match &ontology {
         Some(o) => o.to_json()?,
         None => String::new(),
@@ -1218,9 +1271,87 @@ async fn ontology_page(
         versions,
         diff,
         queue,
+        queue_status: queue_status.to_owned(),
+        queue_page,
+        queue_pages,
+        pending_total,
+        low_support_total,
         has_tables,
         error: q.error,
     })
+}
+
+/// Accept or reject every ticked candidate at once (issue #55).
+async fn ontology_decide_many(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+    MultiForm(form): MultiForm<BulkDecideForm>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let back = if form.status == "low_support" {
+        format!("/w/{id}/ontology?status=low_support")
+    } else {
+        format!("/w/{id}/ontology")
+    };
+    if form.ids.is_empty() {
+        return Ok(Redirect::to(&format!(
+            "{back}{}error=tick+at+least+one+candidate",
+            if back.contains('?') { "&" } else { "?" }
+        ))
+        .into_response());
+    }
+    let accept = match form.bulk.as_str() {
+        "accept" => true,
+        "reject" => false,
+        _ => {
+            return Ok(Redirect::to(&format!(
+                "{back}{}error=unknown+bulk+action",
+                if back.contains('?') { "&" } else { "?" }
+            ))
+            .into_response());
+        }
+    };
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let ids = form.ids.clone();
+    let outcome = with_db(db, move |db| {
+        if accept {
+            let decisions: Vec<(String, Decision)> =
+                ids.into_iter().map(|id| (id, Decision::Accept)).collect();
+            Ok(Some(
+                candidates::accept(db, &decisions, Some(&author))?.version,
+            ))
+        } else {
+            candidates::reject(db, &ids, Some(&author))?;
+            Ok(None)
+        }
+    })
+    .await;
+    let target = match outcome {
+        Ok(version) => {
+            access
+                .audit(
+                    &app,
+                    "ontology",
+                    None,
+                    Outcome::Allowed,
+                    Some(serde_json::json!({
+                        "bulk": form.bulk,
+                        "ids": form.ids,
+                        "version": version,
+                    })),
+                )
+                .await?;
+            back
+        }
+        Err(e) => format!(
+            "{back}{}error={}",
+            if back.contains('?') { "&" } else { "?" },
+            urlencoded(&e.message)
+        ),
+    };
+    Ok(Redirect::to(&target).into_response())
 }
 
 /// The one-line detail of a model- or bundle-sourced proposal.

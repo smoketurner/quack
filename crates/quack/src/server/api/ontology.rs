@@ -276,6 +276,72 @@ pub(crate) async fn list_candidates(
     Ok(Json(serde_json::json!({ "candidates": rows })))
 }
 
+#[derive(Deserialize, Default)]
+pub(crate) struct DecideManyRequest {
+    /// Candidate ids to accept as proposed.
+    #[serde(default)]
+    pub accept: Vec<String>,
+    /// Candidate ids to reject.
+    #[serde(default)]
+    pub reject: Vec<String>,
+}
+
+/// Accept and reject candidates in bulk: one new version for every
+/// acceptance together (issue #55).
+pub(crate) async fn decide_many(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<String>,
+    Json(body): Json<DecideManyRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    if body.accept.is_empty() && body.reject.is_empty() {
+        return Err(ApiError::bad_request(
+            "give candidate ids to accept or reject",
+        ));
+    }
+    let db = app.workspace_db(&id).await?;
+    let author = access.identity.username.clone();
+    let (accept, reject) = (body.accept.clone(), body.reject.clone());
+    let (version, rejected) = with_db(db, move |db| {
+        let rejected = if reject.is_empty() {
+            0
+        } else {
+            candidates::reject(db, &reject, Some(&author))?
+        };
+        let version = if accept.is_empty() {
+            None
+        } else {
+            let decisions: Vec<(String, Decision)> = accept
+                .into_iter()
+                .map(|id| (id, Decision::Accept))
+                .collect();
+            Some(candidates::accept(db, &decisions, Some(&author))?.version)
+        };
+        Ok((version, rejected))
+    })
+    .await
+    .map_err(|e| ApiError::bad_request(e.message))?;
+    access
+        .audit(
+            &app,
+            "ontology",
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({
+                "accepted": body.accept,
+                "rejected": body.reject,
+                "version": version,
+            })),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({
+        "accepted": body.accept.len(),
+        "rejected": rejected,
+        "version": version,
+    })))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct DecideRequest {
     /// `accept`, `rename`, `merge_into`, `reparent`, or `reject`.
