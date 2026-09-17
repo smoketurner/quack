@@ -69,14 +69,14 @@ pub(crate) enum OntologyAction {
     Accept {
         ids: Vec<String>,
         /// Accept under this id (one candidate only)
-        #[arg(long, conflicts_with_all = ["merge_into", "parent"])]
+        #[arg(long, conflicts_with_all = ["merge_into", "reparent"])]
         rename: Option<String>,
         /// Treat the candidate as this existing class, relation, or property
         #[arg(long)]
         merge_into: Option<String>,
         /// Accept a class under this parent
         #[arg(long)]
-        parent: Option<String>,
+        reparent: Option<String>,
     },
     /// Reject candidates by id (prefixes accepted)
     Reject { ids: Vec<String> },
@@ -268,21 +268,21 @@ fn run_review(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
             ids,
             rename,
             merge_into,
-            parent,
+            reparent,
         } => {
             if ids.is_empty() {
                 anyhow::bail!("give at least one candidate id");
             }
-            if ids.len() > 1 && (rename.is_some() || merge_into.is_some() || parent.is_some()) {
+            if ids.len() > 1 && (rename.is_some() || merge_into.is_some() || reparent.is_some()) {
                 anyhow::bail!(
-                    "--rename, --merge-into, and --parent apply to one candidate at a time"
+                    "--rename, --merge-into, and --reparent apply to one candidate at a time"
                 );
             }
             let decision = if let Some(new_id) = rename {
                 Decision::Rename(new_id)
             } else if let Some(target) = merge_into {
                 Decision::MergeInto(target)
-            } else if let Some(parent) = parent {
+            } else if let Some(parent) = reparent {
                 Decision::Reparent(parent)
             } else {
                 Decision::Accept

@@ -683,7 +683,10 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
     assert_eq!(body["pinned"], true);
 
     let (status, body) = h
-        .get(&format!("/api/v1/workspaces/{ws}/search?q=flood"), &token)
+        .get(
+            &format!("/api/v1/workspaces/{ws}/search?query=flood"),
+            &token,
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["chunks"][0]["filename"], "policy.md");
@@ -910,7 +913,10 @@ async fn query_endpoints_fail_cleanly_without_a_chat_model() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = h
-        .get(&format!("/api/v1/workspaces/{ws}/search?q="), &owner_token)
+        .get(
+            &format!("/api/v1/workspaces/{ws}/search?query="),
+            &owner_token,
+        )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

@@ -139,15 +139,7 @@ pub(crate) async fn run_prompt(
             }
         }
         PromptFormat::Json => {
-            let object = serde_json::json!({
-                "answer": response.content,
-                "steps": response.steps,
-                "citations": response.citations,
-                "chart": response.chart,
-                "graph": response.graph,
-                "write_refused": response.write_refused,
-                "session_id": session_id,
-            });
+            let object = response.to_json(session_id);
             serde_json::to_writer_pretty(&mut out, &object)?;
             writeln!(out)?;
         }

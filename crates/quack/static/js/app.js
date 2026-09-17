@@ -320,7 +320,7 @@
       view.body.textContent = "Error: " + data;
       view.article.classList.add("border-red-300");
       finishWorking(view);
-    } else if (event === "permission_denied") {
+    } else if (event === "write_refused") {
       status.textContent = data;
     }
   }

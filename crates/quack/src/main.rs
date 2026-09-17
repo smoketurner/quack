@@ -429,8 +429,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Ontology { action } => {
             let ws_db = open_workspace(cli).await?;
             let config = Config::load().context("failed to load configuration")?;
-            ontology_cli::run(&config, &ws_db, action).await?;
-            Ok(ExitCode::SUCCESS)
+            exit_after(ontology_cli::run(&config, &ws_db, action).await)
         }
         Commands::Graph { action } => run_graph(cli, action).await,
         Commands::Okf {
@@ -611,7 +610,19 @@ async fn run_export(cli: &Cli, session_id: &str, sql: bool) -> Result<ExitCode> 
 async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
     let config = Config::load().context("failed to load configuration")?;
-    graph_cli::run(&config, &ws_db, action).await?;
+    exit_after(graph_cli::run(&config, &ws_db, action).await)
+}
+
+/// The exit code for a command that may have needed a provider login:
+/// 4 for `AuthRequired` (as `-p` and `ingest`), else the error or success.
+fn exit_after(outcome: Result<()>) -> Result<ExitCode> {
+    if let Err(e) = &outcome
+        && let Some(code) = auth_exit_code(e)
+    {
+        tracing::error!("{e:#}");
+        return Ok(code);
+    }
+    outcome?;
     Ok(ExitCode::SUCCESS)
 }
 

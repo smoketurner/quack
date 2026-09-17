@@ -76,7 +76,7 @@ pub(crate) enum GraphAction {
     /// Apply merge proposals by id (prefixes accepted)
     Merge { ids: Vec<String> },
     /// Decline merge proposals by id (prefixes accepted)
-    Unmerge { ids: Vec<String> },
+    Reject { ids: Vec<String> },
 }
 
 pub(crate) async fn run(config: &Config, db: &WorkspaceDb, action: GraphAction) -> Result<()> {
@@ -151,7 +151,7 @@ pub(crate) async fn run(config: &Config, db: &WorkspaceDb, action: GraphAction) 
                 writeln!(out, "Merged {} into {}.", m.drop.label, m.keep.label)?;
             }
         }
-        GraphAction::Unmerge { ids } => {
+        GraphAction::Reject { ids } => {
             for id in &ids {
                 let m = resolve::reject(db, id, None)?;
                 writeln!(out, "Kept {} and {} apart.", m.keep.label, m.drop.label)?;

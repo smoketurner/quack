@@ -41,6 +41,69 @@ pub struct AgentResponse {
     pub cancelled: bool,
 }
 
+/// One SQL statement the turn ran, as the response object lists it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct QueryRun {
+    pub sql: String,
+    /// Rows the statement produced, when the step reported a count.
+    pub rows: Option<u64>,
+    pub duration_ms: u64,
+}
+
+impl AgentResponse {
+    /// The `run_sql` steps as statements with their row counts.
+    #[must_use]
+    pub fn queries(&self) -> Vec<QueryRun> {
+        self.steps
+            .iter()
+            .filter(|s| s.tool == "run_sql")
+            .map(|s| QueryRun {
+                sql: s.detail.clone(),
+                rows: s
+                    .summary
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok()),
+                duration_ms: s.duration_ms,
+            })
+            .collect()
+    }
+
+    /// The one response object every interface returns (design doc 11.2,
+    /// issue #50): print mode's `--format json`, the REST body and SSE
+    /// `complete` event, and the MCP structured content all carry this.
+    #[must_use]
+    pub fn to_json(&self, session_id: &str) -> serde_json::Value {
+        let citations: Vec<serde_json::Value> = self
+            .citations
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "n": c.n,
+                    "chunk_id": c.chunk_id,
+                    "document_id": c.document_id,
+                    "filename": c.filename,
+                    "chunk_index": c.chunk_index,
+                    "page": c.page,
+                    "heading": c.heading,
+                    "label": c.label(),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "answer": self.content,
+            "citations": citations,
+            "queries": self.queries(),
+            "steps": self.steps,
+            "graph": self.graph,
+            "chart": self.chart,
+            "write_refused": self.write_refused,
+            "cancelled": self.cancelled,
+            "session_id": session_id,
+        })
+    }
+}
+
 /// Run the rig agent with all analysis tools for a single user question,
 /// emitting `AgentEvent`s on `sink` as the turn progresses. `history` is
 /// the prior conversation to replay to the model (see
@@ -512,6 +575,49 @@ mod tests {
         assert!(!is_prompt_error(&provider));
         let text = explain_stream_error(&provider, &config, false);
         assert!(text.contains("connection refused"), "{text}");
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test asserts fixed keys")]
+    fn to_json_carries_every_field_and_derives_queries() {
+        let response = AgentResponse {
+            content: String::from("12 storms [1]"),
+            steps: vec![
+                ToolStep {
+                    tool: String::from("run_sql"),
+                    detail: String::from("SELECT count(*) FROM events"),
+                    summary: String::from("1 rows"),
+                    duration_ms: 7,
+                },
+                ToolStep {
+                    tool: String::from("search_documents"),
+                    detail: String::from("storms"),
+                    summary: String::from("3 chunks"),
+                    duration_ms: 4,
+                },
+            ],
+            citations: vec![Citation {
+                n: 1,
+                chunk_id: String::from("c"),
+                document_id: String::from("d"),
+                filename: String::from("noaa.pdf"),
+                chunk_index: 2,
+                page: Some(4),
+                heading: None,
+            }],
+            ..AgentResponse::default()
+        };
+        let json = response.to_json("s1");
+        assert_eq!(json["answer"], "12 storms [1]");
+        assert_eq!(json["queries"][0]["sql"], "SELECT count(*) FROM events");
+        assert_eq!(json["queries"][0]["rows"], 1);
+        assert_eq!(json["queries"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["citations"][0]["label"], "noaa.pdf, page 4");
+        assert_eq!(json["citations"][0]["chunk_id"], "c");
+        assert_eq!(json["session_id"], "s1");
+        assert_eq!(json["write_refused"], false);
+        assert_eq!(json["cancelled"], false);
+        assert!(json["graph"].is_array() && json["chart"].is_null());
     }
 
     #[test]

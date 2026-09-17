@@ -116,7 +116,11 @@ prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quac
 clients themselves. OAuth providers (`quack_core::llm::oauth`) hand out a bearer through
 one shared `TokenManager` per provider: PKCE or device-code login via `quack auth`, an
 AES-256-GCM cache under `<data_dir>/tokens/` keyed from the OS keychain or a 0600 key file,
-silent refresh, and `Error::AuthRequired` (exit 4 in `-p` and `ingest`) when no flow can run.
+silent refresh, and `Error::AuthRequired` (exit 4 from every command that reaches a provider) when no flow can run.
+Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
+labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `session_id`); a write refused
+inside a turn is `write_refused: true` (REST 200 plus a `write_refused` SSE event, MCP structured
+content, print exit 3).
 The ontology (`quack_core::ontology`, design doc 6.3) is classes with single inheritance
 from `entity`, relations with a domain and a range, typed properties, and table mappings.
 It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, checks

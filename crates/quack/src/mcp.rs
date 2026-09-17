@@ -281,20 +281,6 @@ impl McpServer {
                         Some(detail),
                     )
                     .await?;
-                let citations: Vec<serde_json::Value> = response
-                    .citations
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "n": c.n,
-                            "label": c.label(),
-                            "document_id": c.document_id,
-                            "filename": c.filename,
-                            "page": c.page,
-                            "heading": c.heading,
-                        })
-                    })
-                    .collect();
                 let mut text = response.content.clone();
                 if !response.citations.is_empty() {
                     text.push_str("\n\nSources:\n");
@@ -312,15 +298,7 @@ impl McpServer {
                     );
                 }
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-                result.structured_content = Some(serde_json::json!({
-                    "answer": response.content,
-                    "citations": citations,
-                    "chart": response.chart,
-                    "graph": response.graph,
-                    "steps": response.steps,
-                    "session_id": session_id,
-                    "write_refused": response.write_refused,
-                }));
+                result.structured_content = Some(response.to_json(&session_id));
                 Ok(result)
             }
             Err(e) => {

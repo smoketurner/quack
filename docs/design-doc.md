@@ -148,7 +148,7 @@ Every interface calls the same core entry points:
 | Graph | `graph::neighborhood`, `graph::path` | graph page | `GET .../graph/*` | `search_graph` | `/graph`, `quack graph` |
 | Ontology | `ontology::{get,propose,accept,validate}` | ontology page | `.../ontology/*` | resource | `quack ontology` |
 | Context | `context::{get,put}` | settings page | `.../context` | resource | `/context` |
-| Permission | `agent::Permission` | confirm dialog | 403 + reason | tool error | y/n prompt / exit 3 |
+| Permission | `agent::Permission` | prompt; `write_refused` on the answer | 200, `write_refused: true`, SSE `write_refused` | `write_refused: true` plus a sentence | y/n/a prompt / exit 3 |
 
 The LLM layer is `rig`. `quack-core::llm` builds rig clients from config and exposes
 `ChatModel` and `EmbedModel` enums so the rest of the core is provider-agnostic.
@@ -847,12 +847,17 @@ reference `_quack_` tables are refused for the agent regardless.
 
 | Interface | Read | Write |
 |-----------|------|-------|
-| TUI | run | prompt `Run this statement? [y/N/always]` showing the SQL |
-| Print mode | run | refuse, exit 3, unless `--allow-write` |
-| Web / REST, `viewer` | run | 403 |
-| Web / REST, `member`+ | run | 403 unless `allow_write: true`; the web UI shows a confirm dialog and re-sends |
-| MCP | run | tool error unless the token has the `write` scope |
+| TUI | run | prompt `y`/`n`/`a` showing the SQL; `a` covers the rest of the turn and the session |
+| Print mode | run | refuse unless `--allow-write`; the answer completes and the exit code is 3 |
+| Web / REST | run | refuse unless `allow_write: true` from a member with the write scope (a request that asks for `allow_write` without it is 403); a refusal inside the turn is not a failed request: 200 with `write_refused: true` on the response object and a `write_refused` SSE event; the web page shows a banner offering the checkbox |
+| MCP | run | refuse unless the token has the `write` scope; `write_refused: true` in the structured content and a sentence in the text |
 | Desktop | run | native confirm dialog |
+
+Every interface returns the same response object (11.2): `answer`, `citations` (each with
+`n`, `chunk_id`, `document_id`, `filename`, `chunk_index`, `page`, `heading`, `label`),
+`queries`, `steps`, `graph`, `chart`, `write_refused`, `cancelled`, `session_id`, built by
+`AgentResponse::to_json`. `AuthRequired` is exit code 4 from every command that reaches a
+provider.
 
 **Limits.** The agent's connection runs with `SET memory_limit` and `SET threads` from
 config. Queries execute on a dedicated thread; the caller takes
@@ -1058,7 +1063,7 @@ PATCH  /api/v1/workspaces/{id}                    settings
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
 POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn
 POST   /api/v1/workspaces/{id}/sql                {sql}
-GET    /api/v1/workspaces/{id}/search?q=&k=       hybrid retrieval, no LLM
+GET    /api/v1/workspaces/{id}/search?query=&top_k=   hybrid retrieval, no LLM (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
                                                   (identical bytes: status "duplicate";
@@ -1147,7 +1152,7 @@ quack ingest FILE... [-w NAME] [--as NAME] [--title T] [--pin] [--no-embed] [--e
 quack docs | tables | schema TABLE
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--tables-only|--documents-only]
-            [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | unmerge ID..
+            [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | reject ID..
 quack ontology show | propose [--extend|--from PACK] [--sample N] [--auto-accept]
               | review | accept ID... | reject ID... | export FILE | import FILE
               | versions | restore V

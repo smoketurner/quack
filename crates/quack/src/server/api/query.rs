@@ -34,30 +34,7 @@ pub(crate) struct QueryRequest {
 
 /// The response object shared with print mode (design doc 11.2).
 pub(crate) fn response_json(response: &AgentResponse, session_id: &str) -> serde_json::Value {
-    let queries: Vec<serde_json::Value> = response
-        .steps
-        .iter()
-        .filter(|s| s.tool == "run_sql")
-        .map(|s| {
-            let rows = s
-                .summary
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse::<u64>().ok());
-            serde_json::json!({ "sql": s.detail, "rows": rows, "duration_ms": s.duration_ms })
-        })
-        .collect();
-    serde_json::json!({
-        "answer": response.content,
-        "cancelled": response.cancelled,
-        "citations": response.citations,
-        "queries": queries,
-        "steps": response.steps,
-        "chart": response.chart,
-        "graph": response.graph,
-        "write_refused": response.write_refused,
-        "session_id": session_id,
-    })
+    response.to_json(session_id)
 }
 
 /// Everything a turn needs before the model is called: the authorization,
@@ -289,7 +266,7 @@ pub(crate) async fn stream(
                 AgentEvent::PermissionRequired(request) => {
                     request.deny();
                     Event::default()
-                        .event("permission_denied")
+                        .event("write_refused")
                         .data("writes are off for this request")
                 }
                 AgentEvent::TurnComplete(response) => {
@@ -407,8 +384,8 @@ pub(crate) async fn execute_sql(
 
 #[derive(Deserialize)]
 pub(crate) struct SearchQuery {
-    pub q: String,
-    pub k: Option<u32>,
+    pub query: String,
+    pub top_k: Option<u32>,
 }
 
 /// Hybrid retrieval with no model call: the embedding provider when one is
@@ -420,11 +397,11 @@ pub(crate) async fn search(
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let query = q.q.trim().to_owned();
+    let query = q.query.trim().to_owned();
     if query.is_empty() {
-        return Err(ApiError::bad_request("q must not be empty"));
+        return Err(ApiError::bad_request("query must not be empty"));
     }
-    let top_k = q.k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
+    let top_k = q.top_k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
     let rrf_k = app.config.retrieval.rrf_k;
     let embedding: Option<Vec<f32>> = match llm::optional_embedding_model(&app.config).await? {
         Some(model) => Some(llm::embed_query(&model, &query).await?),
