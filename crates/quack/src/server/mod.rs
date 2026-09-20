@@ -41,6 +41,39 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const RATE_PER_SECOND: u64 = 1;
 const RATE_BURST: u32 = 120;
 
+/// The same, for the two endpoints that check a password. The general limit
+/// is sized for a browsing session and is far too loose to make password
+/// guessing expensive, so the login routes carry their own (issue #73).
+const LOGIN_RATE_PER_SECOND: u64 = 2;
+const LOGIN_RATE_BURST: u32 = 10;
+
+/// How often a limiter drops the per-key state that has fallen back to a
+/// fresh bucket. governor holds one entry per caller until something sweeps
+/// it, so without this the maps grow for the life of the process — one entry
+/// per address that ever connected.
+const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Run `sweep` every `interval` for as long as the runtime lives.
+///
+/// Taking a closure rather than the limiter keeps governor's deeply generic
+/// types out of a signature: the caller clones the `Arc` it already has and
+/// the compiler infers the rest.
+fn spawn_cleanup(interval: Duration, sweep: impl Fn() + Send + 'static) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("no runtime to sweep rate-limiter state on; it will not be reclaimed");
+        return;
+    };
+    handle.spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // The first tick fires immediately, when there is nothing to sweep.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            sweep();
+        }
+    });
+}
+
 #[derive(Clone)]
 struct RequestIdV7;
 
@@ -75,6 +108,29 @@ impl KeyExtractor for CallerKey {
     }
 }
 
+/// Put the login limiter in front of one route. Each call builds its own
+/// bucket, so a browser hammering the form cannot spend the budget the API
+/// login would have had, or the other way round.
+pub(crate) fn throttled_login(
+    route: axum::routing::MethodRouter<App>,
+) -> axum::routing::MethodRouter<App> {
+    let config = GovernorConfigBuilder::default()
+        .per_second(LOGIN_RATE_PER_SECOND)
+        .burst_size(LOGIN_RATE_BURST)
+        .key_extractor(CallerKey)
+        .finish()
+        .map(Arc::new);
+    let Some(config) = config else {
+        // Unreachable with constants this builder accepts; an unthrottled
+        // login is still better than a server that will not start.
+        tracing::error!("login rate limiter could not be built; logins are not throttled");
+        return route;
+    };
+    let limiter = Arc::clone(config.limiter());
+    spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
+    route.layer(GovernorLayer::new(config))
+}
+
 pub(crate) fn router(app: App) -> Router {
     let upload_limit = usize::try_from(app.config.ingestion.upload_max_mb)
         .unwrap_or(usize::MAX)
@@ -85,15 +141,22 @@ pub(crate) fn router(app: App) -> Router {
         .key_extractor(CallerKey)
         .finish()
         .map(Arc::new);
-    let mut api = api::router();
+    // Everything a caller can reach is rate limited, not just the API: the
+    // web UI drives the same handlers, and MCP drives the agent. `/healthz`
+    // stays outside, because a throttled health check reads as a dead
+    // server to whatever is watching it.
+    let mut limited = Router::new()
+        .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
+        .nest("/api/v1", api::router())
+        .merge(web::router());
     if let Some(config) = governor {
-        api = api.layer(GovernorLayer::new(config));
+        let limiter = Arc::clone(config.limiter());
+        spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
+        limited = limited.layer(GovernorLayer::new(config));
     }
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
-        .nest("/api/v1", api)
-        .merge(web::router())
+        .merge(limited)
         .layer(DefaultBodyLimit::max(upload_limit))
         // One span per request, carrying the id the request-id layer set
         // (it is the outer layer, so the header exists here); the response

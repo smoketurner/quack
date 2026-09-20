@@ -1342,6 +1342,25 @@ roadmap and may never be built.
   scoped to a workspace with `read` / `write` / `admin` scopes. OIDC login for users (the
   PKCE machinery from 10.2 pointed at the org IdP, `sub` as `oidc_subject`) is the intended
   production path and is scheduled after the token path ships.
+- **A browser session is bounded at both ends** (issue #73). It dies
+  `[server].session_max_age_hours` after login however much it is used, and
+  `[server].session_idle_minutes` after its last request, whichever comes first; the
+  expired entry is dropped on the request that finds it, which is answered 401 `session
+  expired` and audited as a denied `session` action. Expiry is measured with a monotonic
+  clock, so moving the system clock cannot extend a session. The cookie is `HttpOnly`,
+  `SameSite=Lax`, carries a `Max-Age` matching the absolute lifetime, and carries `Secure`
+  whenever the request did not arrive on loopback — so a cookie minted behind a
+  TLS-terminating proxy is never sent back over a plaintext downgrade, while plain HTTP on
+  a laptop keeps working.
+- **Rate limiting covers everything a caller can reach**, not just the API: one
+  `tower_governor` limiter over the web UI, the REST API, and MCP, keyed by bearer token
+  when there is one and peer address otherwise. The two endpoints that check a password
+  (`POST /login` and `POST /api/v1/auth/login`) carry a second, tighter limiter, because
+  the general budget is sized for a browsing session and is far too loose to make guessing
+  expensive. `/healthz` sits outside every limiter, since a throttled health check reads as
+  a dead server to whatever is watching it. Each limiter's per-key state is swept once a
+  minute: governor holds one entry per caller until something drops it, so an unswept
+  limiter grows by one entry for every address that ever connected.
 - Roles: `viewer` asks questions and searches; `member` also uploads, pins, deletes own
   uploads, grants write, edits the context and ontology, runs proposals and extraction;
   `owner` manages members and tokens and sees all sessions. `is_admin` manages users and
@@ -1456,6 +1475,8 @@ enum_max_values = 12                    # distinct values under which a column b
 bind = "127.0.0.1:8080"                 # QUACK_BIND
 local = false
 workers_per_workspace = 1
+session_max_age_hours = 12              # a browser session dies this long after login
+session_idle_minutes = 120              # ... or this long after its last request
 ```
 
 Every section sets `deny_unknown_fields`, so a key that is not in this list is a startup

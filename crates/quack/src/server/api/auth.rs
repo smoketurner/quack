@@ -6,11 +6,13 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum_extra::extract::CookieJar;
-use axum_extra::extract::cookie::{Cookie, SameSite};
-use quack_core::storage::control::{AuditEntry, Channel, Outcome};
+use axum_extra::extract::cookie::Cookie;
+use quack_core::storage::control::Outcome;
 use serde::Deserialize;
 
-use crate::server::auth::{Credential, Identity, SESSION_COOKIE};
+use crate::server::auth::{
+    Credential, Identity, Peer, SESSION_COOKIE, password_login, request_id, session_cookie,
+};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
@@ -22,37 +24,24 @@ pub(crate) struct LoginRequest {
 
 pub(crate) async fn login(
     State(app): State<App>,
+    peer: Peer,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
     if app.local {
         return Err(ApiError::bad_request("local mode has no login"));
     }
-    let user = app
-        .control
-        .verify_password(&body.username, &body.password)
-        .await?;
-    let Some(user) = user else {
-        let mut entry = AuditEntry::new("login", Outcome::Denied, Channel::Web);
-        entry.user_id = app
-            .control
-            .find_user_by_username(&body.username)
-            .await?
-            .map(|u| u.id);
-        app.control.record_audit(&entry).await?;
-        return Err(ApiError::unauthorized("wrong username or password"));
-    };
-    let token = app.open_web_session(&user.id)?;
-    let mut entry = AuditEntry::new("login", Outcome::Allowed, Channel::Web);
-    entry.user_id = Some(user.id.clone());
-    app.control.record_audit(&entry).await?;
-    let cookie = Cookie::build((SESSION_COOKIE, token.clone()))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .build();
+    let (user, token) = password_login(
+        &app,
+        peer,
+        request_id(&headers),
+        &body.username,
+        &body.password,
+    )
+    .await?;
     Ok((
-        jar.add(cookie),
+        jar.add(session_cookie(&app, peer, token.clone())),
         Json(serde_json::json!({ "token": token, "user": user })),
     ))
 }

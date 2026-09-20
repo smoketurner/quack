@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
@@ -21,8 +22,9 @@ pub(crate) struct AppState {
     pub local: bool,
     /// A workspace file is opened once per process; every request shares it.
     workspaces: tokio::sync::Mutex<HashMap<String, SharedDb>>,
-    /// Browser and API-login sessions: token -> user id. Cleared on restart.
-    web_sessions: Mutex<HashMap<String, String>>,
+    /// Browser and API-login sessions, by token. Cleared on restart, and
+    /// individually once either `[server]` lifetime runs out.
+    web_sessions: Mutex<HashMap<String, WebSession>>,
     pub queue: UploadQueue,
     /// One MCP transport per workspace, user, and write permission; each
     /// carries its own MCP sessions. See `server::mcp_http`.
@@ -30,6 +32,27 @@ pub(crate) struct AppState {
     /// Workspaces with a graph extraction in flight: one at a time each,
     /// so a reset cannot clear a run part way (issue #48).
     extractions: Mutex<HashSet<String>>,
+}
+
+/// A live browser session. Both bounds are measured with [`Instant`], so a
+/// clock the operator moves cannot extend or shorten one.
+struct WebSession {
+    user_id: String,
+    /// When the session was opened, against `session_max_age`.
+    started: Instant,
+    /// The last request that presented it, against `session_idle`.
+    last_seen: Instant,
+}
+
+/// What a presented session token resolved to.
+pub(crate) enum SessionLookup {
+    /// A live session, belonging to this user id.
+    Active(String),
+    /// The token named a session that had outlived one of its bounds. It is
+    /// gone now; the caller must log in again.
+    Expired,
+    /// No session by that name — it may still be an API token.
+    Unknown,
 }
 
 /// Holds a workspace's extraction slot; dropping it frees the slot.
@@ -135,15 +158,55 @@ impl AppState {
             "qs_{}",
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
         );
-        self.web_sessions
+        let now = Instant::now();
+        let mut sessions = self
+            .web_sessions
             .lock()
-            .map_err(|e| ApiError::internal(format!("session store poisoned: {e}")))?
-            .insert(token.clone(), user_id.to_owned());
+            .map_err(|e| ApiError::internal(format!("session store poisoned: {e}")))?;
+        // A login is the natural moment to drop whatever died since the last
+        // one: nothing else walks the map, and a session nobody presents
+        // again would otherwise sit here until the process ends.
+        sessions.retain(|_, session| !self.session_expired(session, now));
+        sessions.insert(
+            token.clone(),
+            WebSession {
+                user_id: user_id.to_owned(),
+                started: now,
+                last_seen: now,
+            },
+        );
         Ok(token)
     }
 
-    pub(crate) fn web_session_user(&self, token: &str) -> Option<String> {
-        self.web_sessions.lock().ok()?.get(token).cloned()
+    /// Whether `session` has outlived either bound as of `now`.
+    fn session_expired(&self, session: &WebSession, now: Instant) -> bool {
+        let server = &self.config.server;
+        now.duration_since(session.started) >= server.session_max_age()
+            || now.duration_since(session.last_seen) >= server.session_idle()
+    }
+
+    /// Resolve a session token, dropping it if it has expired and marking it
+    /// used if it has not.
+    pub(crate) fn web_session_user(&self, token: &str) -> SessionLookup {
+        let Ok(mut sessions) = self.web_sessions.lock() else {
+            return SessionLookup::Unknown;
+        };
+        let now = Instant::now();
+        // Read the bounds first and let that borrow end, so the expired
+        // branch is free to take the mutable one `remove` needs.
+        let expired = match sessions.get(token) {
+            Some(session) => self.session_expired(session, now),
+            None => return SessionLookup::Unknown,
+        };
+        if expired {
+            sessions.remove(token);
+            return SessionLookup::Expired;
+        }
+        let Some(session) = sessions.get_mut(token) else {
+            return SessionLookup::Unknown;
+        };
+        session.last_seen = now;
+        SessionLookup::Active(session.user_id.clone())
     }
 
     pub(crate) fn close_web_session(&self, token: &str) {
