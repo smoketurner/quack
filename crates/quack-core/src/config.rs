@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::graph::GraphOptions;
@@ -296,6 +297,11 @@ pub struct ServerConfig {
     pub local: bool,
     /// Concurrent ingest workers per workspace.
     pub workers_per_workspace: u32,
+    /// How long a browser session lives after login, however much it is
+    /// used. Also the session cookie's `Max-Age`.
+    pub session_max_age_hours: u32,
+    /// How long a browser session survives with no request on it.
+    pub session_idle_minutes: u32,
 }
 
 impl Default for ServerConfig {
@@ -304,7 +310,23 @@ impl Default for ServerConfig {
             bind: String::from("127.0.0.1:8080"),
             local: false,
             workers_per_workspace: 1,
+            session_max_age_hours: 12,
+            session_idle_minutes: 120,
         }
+    }
+}
+
+impl ServerConfig {
+    /// A session's absolute lifetime.
+    #[must_use]
+    pub fn session_max_age(&self) -> Duration {
+        Duration::from_secs(u64::from(self.session_max_age_hours).saturating_mul(3600))
+    }
+
+    /// How long a session may sit unused before it is dropped.
+    #[must_use]
+    pub fn session_idle(&self) -> Duration {
+        Duration::from_secs(u64::from(self.session_idle_minutes).saturating_mul(60))
     }
 }
 

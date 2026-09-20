@@ -17,14 +17,14 @@ use axum_extra::extract::CookieJar;
 // Multi-valued fields (checkboxes) need serde_html_form, which axum's own
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
-use axum_extra::extract::cookie::{Cookie, SameSite};
+use axum_extra::extract::cookie::Cookie;
 use quack_core::ontology::induction::{Decision, Proposal, propose_from_tables};
 use quack_core::ontology::store as ontology_store;
 use quack_core::ontology::{Ontology, OntologyDiff, candidates};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditEntry, AuditFilter, AuditRow, Channel, MemberRow, Outcome, ProviderAllowList, Role, Scope,
-    TokenRow, UserRow, WorkspaceChanges,
+    AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, Role, Scope, TokenRow, UserRow,
+    WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
@@ -34,7 +34,10 @@ use serde::Deserialize;
 use super::api::documents as docs_api;
 use super::api::graph as graph_api;
 use super::api::query as query_api;
-use super::auth::{Access, Credential, Identity, Need, SESSION_COOKIE, access, require_admin};
+use super::auth::{
+    Access, Credential, Identity, Need, Peer, SESSION_COOKIE, access, password_login, request_id,
+    require_admin, session_cookie,
+};
 use super::error::ApiError;
 use super::state::{App, with_db};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
@@ -413,7 +416,10 @@ pub(crate) fn router() -> Router<App> {
     Router::new()
         .route("/", get(index))
         .route("/static/{*path}", get(static_asset))
-        .route("/login", get(login_page).post(login_submit))
+        .route(
+            "/login",
+            get(login_page).merge(super::throttled_login(post(login_submit))),
+        )
         .route("/logout", post(logout))
         .route("/workspaces", get(workspaces).post(create_workspace))
         .route("/w/{id}", get(workspace_index))
@@ -515,36 +521,36 @@ struct LoginForm {
 
 async fn login_submit(
     State(app): State<App>,
+    peer: Peer,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> WebResult<Response> {
     if app.local {
         return Ok(Redirect::to("/workspaces").into_response());
     }
-    let user = app
-        .control
-        .verify_password(&form.username, &form.password)
-        .await?;
-    let Some(user) = user else {
-        let mut entry = AuditEntry::new("login", Outcome::Denied, Channel::Web);
-        entry.user_id = app
-            .control
-            .find_user_by_username(&form.username)
-            .await?
-            .map(|u| u.id);
-        app.control.record_audit(&entry).await?;
-        return Ok(Redirect::to("/login?error=wrong+username+or+password").into_response());
+    // A wrong password is the form again with a message, not a 401; any
+    // other failure is still an error page.
+    let token = match password_login(
+        &app,
+        peer,
+        request_id(&headers),
+        &form.username,
+        &form.password,
+    )
+    .await
+    {
+        Ok((_, token)) => token,
+        Err(e) if e.status == StatusCode::UNAUTHORIZED => {
+            return Ok(Redirect::to("/login?error=wrong+username+or+password").into_response());
+        }
+        Err(e) => return Err(e.into()),
     };
-    let token = app.open_web_session(&user.id)?;
-    let mut entry = AuditEntry::new("login", Outcome::Allowed, Channel::Web);
-    entry.user_id = Some(user.id);
-    app.control.record_audit(&entry).await?;
-    let cookie = Cookie::build((SESSION_COOKIE, token))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .build();
-    Ok((jar.add(cookie), Redirect::to("/workspaces")).into_response())
+    Ok((
+        jar.add(session_cookie(&app, peer, token)),
+        Redirect::to("/workspaces"),
+    )
+        .into_response())
 }
 
 async fn logout(

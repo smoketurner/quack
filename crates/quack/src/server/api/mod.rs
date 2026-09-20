@@ -23,7 +23,7 @@ use super::state::App;
 
 pub(crate) fn router() -> Router<App> {
     Router::new()
-        .route("/auth/login", post(auth::login))
+        .route("/auth/login", super::throttled_login(post(auth::login)))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route(
