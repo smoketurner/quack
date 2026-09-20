@@ -6,11 +6,20 @@ name: Lockdown untrusted workflows
 
 on:
   push:
+    # Scoped to main, matching ci.yml. Without it every push to a branch with an
+    # open pull request ran this twice, once per event, on the same commit.
+    branches: [main]
     paths:
       - ".github/workflows/**"
   pull_request:
     paths:
       - ".github/workflows/**"
+
+# Supersede the previous run on the same ref: only the newest workflow files
+# matter, and nothing here writes a cache that a cancellation would strand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

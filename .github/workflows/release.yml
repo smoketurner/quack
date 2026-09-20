@@ -18,6 +18,19 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# One release at a time, queued rather than cancelled. The group name is a
+# constant, not derived from the ref, so a second tag serialises behind the
+# first instead of running beside it: two releases in flight would race on the
+# push-by-digest uploads to GHCR and on the `imagetools create --tag latest` in
+# image-index. `cancel-in-progress` stays false because interrupting a release
+# is worse than delaying one — a cancelled run can leave digests pushed with no
+# index pointing at them. Note GitHub holds only one run pending per group, so a
+# third release queued behind a running one and a waiting one displaces the
+# waiting one; releases are hand-cut, so that is not a path we take.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions: {}
 
 env:

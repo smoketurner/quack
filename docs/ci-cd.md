@@ -15,6 +15,29 @@
 Work lands as commits on the main branch; CI runs on push. Releases are the only other
 workflow, and it runs on tags alone so it never spends minutes on ordinary pushes.
 
+### Concurrency
+
+Every workflow declares a `concurrency` group, and the choice of whether to cancel or to
+queue follows from what the run would leave behind:
+
+- **`ci.yml` and `secure_workflows.yml` cancel.** A new commit supersedes the run before
+  it, so the group is `<workflow>-<ref>` with `cancel-in-progress`. `ci.yml` makes one
+  exception: on `refs/heads/main` it does not cancel, because cancelling a job skips its
+  `Post Setup Rust cache` step, and `main` is the only ref that saves a cache — auto
+  cancelling there would starve every other run's restore.
+- **`release.yml` queues.** Its group is the constant `release` rather than a per-ref
+  name, so a second tag waits for the first instead of running beside it, and
+  `cancel-in-progress` is `false`. Two releases in flight would race on the
+  `push-by-digest` uploads to GHCR and on `imagetools create --tag latest`, and a
+  cancelled one can leave digests pushed with no index pointing at them. GitHub holds
+  only one run pending per group, so a third release displaces a waiting second; tags are
+  cut by hand, so that does not come up. `reusable-build.yml` needs no group of its own —
+  a called workflow's jobs belong to the caller's run and inherit its group.
+
+Both `ci.yml` and `secure_workflows.yml` scope their `push:` trigger to `main`, so a
+branch with an open pull request runs each one once, on the `pull_request` event, rather
+than twice.
+
 ### Build caching
 
 Compiling DuckDB's C++ amalgamation (`libduckdb-sys`) takes around nine minutes and is
