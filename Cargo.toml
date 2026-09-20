@@ -19,9 +19,9 @@ resolver = "3"
 members  = ["crates/*"]
 
 [workspace.package]
-version      = "0.1.0"
+version      = "0.1.1"
 edition      = "2024"
-rust-version = "1.98.0"
+rust-version = "1.98.1"
 license      = "Apache-2.0 OR MIT"
 repository   = "https://github.com/smoketurner/quack"
 publish      = false
@@ -48,7 +48,7 @@ axum-extra           = { version = "=0.12.6", default-features = false }
 axum-server          = { version = "=0.8.0", default-features = false }
 base64               = { version = "=0.23.1", default-features = false }
 calamine             = { version = "=0.36.1", default-features = false }
-clap                 = { version = "=4.6.6", default-features = false }
+clap                 = { version = "=4.6.7", default-features = false }
 crossterm            = { version = "=0.29.0", default-features = false }
 dirs                 = { version = "=7.0.0", default-features = false }
 duckdb               = { version = "=1.10505.0", default-features = false }
@@ -64,7 +64,7 @@ linux-keyutils-keyring-store = { version = "=1.0.0", default-features = false }
 mimalloc             = { version = "=0.1.52", default-features = false }
 mime_guess           = { version = "=2.0.5", default-features = false }
 oauth2               = { version = "=5.0.0", default-features = false }
-pdf-extract          = { version = "=0.12.0", default-features = false }
+pdf-extract          = { version = "=0.12.1", default-features = false }
 proptest             = { version = "=1.11.0", default-features = false }
 pulldown-cmark       = { version = "=0.13.4", default-features = false }
 quick-xml            = { version = "=0.42.0", default-features = false } # calamine's version, to keep one copy
