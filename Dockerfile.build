@@ -26,6 +26,13 @@ ENV AWS_LC_FIPS_SYS_CXX=clang++
 
 RUN cargo install cargo-chef --locked
 
+# cargo-cyclonedx writes the release SBOM. It is installed here, in the base
+# layer, rather than beside the `cargo cyclonedx` call: that call sits after
+# `COPY . .`, so installing it there recompiled the tool from source on every
+# source change. Installing it unconditionally also keeps this layer identical
+# for SBOM and non-SBOM builds, so both share the cache.
+RUN cargo install cargo-cyclonedx --version 0.5.6 --locked
+
 # --- Planner: the dependency recipe ---
 FROM base AS planner
 WORKDIR /app
@@ -54,8 +61,7 @@ RUN touch -d "@${SOURCE_DATE_EPOCH}" crates/quack-core/src/lib.rs crates/quack/s
 RUN cargo build --release --locked --target "${TARGET}" --package quack
 
 RUN if [ "${GENERATE_SBOM}" = "true" ]; then \
-      cargo install cargo-cyclonedx --version 0.5.6 --locked \
-      && cargo cyclonedx --target "${TARGET}" --format json; \
+      cargo cyclonedx --target "${TARGET}" --format json; \
     fi
 
 # Only the binary and any SBOM go to /out.
