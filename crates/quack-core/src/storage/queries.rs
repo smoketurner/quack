@@ -3,13 +3,6 @@ use sea_query::Iden;
 // --- Control plane tables (SQLite) ---
 
 #[derive(Iden)]
-pub enum SchemaVersion {
-    Table,
-    Version,
-    AppliedAt,
-}
-
-#[derive(Iden)]
 pub enum Users {
     Table,
     Id,

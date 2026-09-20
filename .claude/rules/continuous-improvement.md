@@ -24,7 +24,7 @@ Workspace members are auto-detected from `Cargo.toml`. Track these logical subsy
 `coverage-status.md` as crates are added:
 
 - **access control** — `control.db`: users, workspaces, membership, tokens, access audit
-  (sea-query migrations)
+  (SQL-file migrations, sea-query for queries)
 - **workspace storage** — DuckDB per-workspace files: user tables, `_quack_` tables, query
   execution, read/write classification, limits
 - **ingestion and retrieval** — parsers, chunking, embedding, hybrid vector + FTS search,

@@ -26,6 +26,11 @@ and code — this file is the gate, the doc is the detail.
 - [ ] **UUID v7 primary keys**, client-generated via `uuid::Uuid::now_v7()` — not v4
       (`gen_random_uuid()`), not `SERIAL`/sequential PKs.
 - [ ] `control.db` queries built with sea-query — **no raw SQL in handlers**.
+- [ ] **A shipped `control.db` migration is never edited.** Schema changes add a new
+      `crates/quack-core/migrations/NNNN_*.sql`; sqlx checksums each file and refuses a
+      database whose recorded checksum no longer matches. Migration SQL is literal and
+      never generated from the `Iden` enums in `storage::queries`, which track the
+      current schema rather than history (`docs/migrations.md`).
 - [ ] **The workspace DuckDB file is the classification boundary.** Anything that can
       reveal workspace content (documents, chunks, graph, ontology, context, sessions,
       messages, audit detail) lives in that file with a `_quack_` prefix, never in

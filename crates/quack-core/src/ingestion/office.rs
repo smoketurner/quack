@@ -145,7 +145,7 @@ fn entity_text(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
     if let Ok(Some(c)) = reference.resolve_char_ref() {
         return Some(c.to_string());
     }
-    let name = reference.decode().ok()?;
+    let name = reference.xml10_content();
     quick_xml::escape::resolve_predefined_entity(&name).map(str::to_owned)
 }
 
@@ -162,12 +162,10 @@ fn core_title(xml: &str) -> Option<String> {
     let mut title = String::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) if e.local_name().as_ref() == b"title" => in_title = true,
-            Ok(Event::End(e)) if e.local_name().as_ref() == b"title" => break,
+            Ok(Event::Start(e)) if e.local_name().as_ref() == "title" => in_title = true,
+            Ok(Event::End(e)) if e.local_name().as_ref() == "title" => break,
             Ok(Event::Text(t)) if in_title => {
-                if let Ok(text) = t.decode() {
-                    title.push_str(&text);
-                }
+                title.push_str(&t.xml10_content());
             }
             Ok(Event::GeneralRef(r)) if in_title => {
                 if let Some(text) = entity_text(&r) {
@@ -208,13 +206,13 @@ fn word_paragraphs(xml: &str) -> Result<Vec<Paragraph>> {
             .map_err(|e| Error::Ingestion(format!("DOCX XML error: {e}")))?;
         match event {
             Event::Start(e) => match e.local_name().as_ref() {
-                b"p" => {
+                "p" => {
                     current = Some(Paragraph {
                         kind: ParagraphKind::Body,
                         text: String::new(),
                     });
                 }
-                b"pStyle" => {
+                "pStyle" => {
                     if let Some(p) = current.as_mut() {
                         p.kind = style_kind(&e);
                     }
@@ -222,17 +220,17 @@ fn word_paragraphs(xml: &str) -> Result<Vec<Paragraph>> {
                 _ => {}
             },
             Event::Empty(e) => match e.local_name().as_ref() {
-                b"pStyle" => {
+                "pStyle" => {
                     if let Some(p) = current.as_mut() {
                         p.kind = style_kind(&e);
                     }
                 }
-                b"tab" => {
+                "tab" => {
                     if let Some(p) = current.as_mut() {
                         p.text.push(' ');
                     }
                 }
-                b"br" | b"cr" => {
+                "br" | "cr" => {
                     if let Some(p) = current.as_mut() {
                         p.text.push('\n');
                     }
@@ -240,10 +238,8 @@ fn word_paragraphs(xml: &str) -> Result<Vec<Paragraph>> {
                 _ => {}
             },
             Event::Text(t) => {
-                if let Some(p) = current.as_mut()
-                    && let Ok(text) = t.decode()
-                {
-                    p.text.push_str(&text);
+                if let Some(p) = current.as_mut() {
+                    p.text.push_str(&t.xml10_content());
                 }
             }
             Event::GeneralRef(r) => {
@@ -254,7 +250,7 @@ fn word_paragraphs(xml: &str) -> Result<Vec<Paragraph>> {
                 }
             }
             Event::End(e) => {
-                if e.local_name().as_ref() == b"p"
+                if e.local_name().as_ref() == "p"
                     && let Some(p) = current.take()
                     && !p.text.trim().is_empty()
                 {
@@ -281,7 +277,7 @@ fn style_kind(e: &BytesStart<'_>) -> ParagraphKind {
         .try_get_attribute("w:val")
         .ok()
         .flatten()
-        .map(|a| String::from_utf8_lossy(&a.value).to_string())
+        .map(|a| a.value.into_owned())
         .unwrap_or_default();
     let lower = value.to_ascii_lowercase();
     if lower == "title" {
@@ -314,23 +310,23 @@ fn slide_text(xml: &str) -> Result<SlideText> {
             .map_err(|e| Error::Ingestion(format!("PPTX XML error: {e}")))?;
         match event {
             Event::Start(e) => match e.local_name().as_ref() {
-                b"sp" => {
+                "sp" => {
                     shape_depth = shape_depth.saturating_add(1);
                     in_title_shape = false;
                 }
-                b"p" => {
+                "p" => {
                     in_paragraph = true;
                     paragraph.clear();
                 }
                 _ => {}
             },
             Event::Empty(e) => {
-                if e.local_name().as_ref() == b"ph" && shape_depth > 0 {
+                if e.local_name().as_ref() == "ph" && shape_depth > 0 {
                     let kind = e
                         .try_get_attribute("type")
                         .ok()
                         .flatten()
-                        .map(|a| String::from_utf8_lossy(&a.value).to_string())
+                        .map(|a| a.value.into_owned())
                         .unwrap_or_default();
                     if kind == "title" || kind == "ctrTitle" {
                         in_title_shape = true;
@@ -338,8 +334,8 @@ fn slide_text(xml: &str) -> Result<SlideText> {
                 }
             }
             Event::Text(t) => {
-                if in_paragraph && let Ok(text) = t.decode() {
-                    paragraph.push_str(&text);
+                if in_paragraph {
+                    paragraph.push_str(&t.xml10_content());
                 }
             }
             Event::GeneralRef(r) => {
@@ -348,7 +344,7 @@ fn slide_text(xml: &str) -> Result<SlideText> {
                 }
             }
             Event::End(e) => match e.local_name().as_ref() {
-                b"p" => {
+                "p" => {
                     in_paragraph = false;
                     let line = paragraph.trim().to_owned();
                     if !line.is_empty() {
@@ -365,7 +361,7 @@ fn slide_text(xml: &str) -> Result<SlideText> {
                         }
                     }
                 }
-                b"sp" => {
+                "sp" => {
                     shape_depth = shape_depth.saturating_sub(1);
                     in_title_shape = false;
                 }
