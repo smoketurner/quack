@@ -222,12 +222,19 @@ cargo test --workspace <test_name>   # name filter across the workspace
 
 ## Releases
 
-`.github/workflows/release.yml` runs on a `v*` tag only: gates, reproducible static musl
-binaries (`Dockerfile.build`, `docker-bake.hcl`), native macOS and Windows binaries, the
-multi-arch `quack serve` image on GHCR from the prebuilt binaries (`Dockerfile.release`)
-plus image tarballs for air-gapped hosts, `SHA256SUMS`, and a Homebrew formula
-(`scripts/release/`). `docker-compose.yml` with `deploy/config.toml` runs the image beside
-Ollama. Cut a release by pushing an annotated `vX.Y.Z` tag after the branch is pushed.
+`.github/workflows/release.yml` runs on a `v*` tag only: gates, then everything that
+compiles, signs, or attests happens inside `.github/workflows/reusable-build.yml`, which
+never holds `contents: write` — that split is what makes the provenance SLSA Build Level 3,
+since the Sigstore certificate names the build workflow as the builder. It produces
+reproducible static musl binaries for Linux x86_64 and aarch64 (`Dockerfile.build`,
+`docker-bake.hcl`) with CycloneDX SBOMs, native macOS arm64 and Windows x86_64 and aarch64
+binaries (code-signed and, on macOS, notarized when the signing secrets exist; unsigned
+with a warning when they do not), and the multi-arch `quack serve` image on GHCR from the
+prebuilt binaries (`Dockerfile.release`) plus image tarballs for air-gapped hosts. The
+`publish` job only downloads those artifacts, writes `SHA256SUMS`, and creates the release.
+`docker-compose.yml` with `deploy/config.toml` runs the image beside Ollama. Cut a release
+by pushing an annotated `vX.Y.Z` tag after the branch is pushed; `workflow_dispatch` builds
+everything and publishes nothing.
 
 ## Where to read more
 

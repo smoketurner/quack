@@ -1,10 +1,17 @@
 name: Release
 
 # Tag-triggered only (`v*`), or by hand, so it never spends minutes on
-# ordinary pushes. Produces: static musl binaries for Linux x86_64 and
-# aarch64 (reproducible, with SBOMs), native macOS and Windows binaries, the
-# `quack serve` image for amd64 and arm64 on GHCR plus its tarballs for
-# air-gapped hosts, SHA256SUMS, a Homebrew formula, and a GitHub release.
+# ordinary pushes. Building and publishing are separate jobs on purpose: every
+# artifact is built, signed, and attested inside reusable-build.yml, which never
+# holds `contents: write`, and this workflow's publish job only uploads what
+# came out of it. That split is what makes the provenance SLSA Build Level 3 —
+# the Sigstore certificate names reusable-build.yml as the builder.
+#
+# Produces: static musl binaries for Linux x86_64 and aarch64 (reproducible,
+# with SBOMs), native macOS arm64 and Windows x86_64/aarch64 binaries (signed
+# when the signing secrets are set), the `quack serve` image for amd64 and arm64
+# on GHCR plus its tarballs for air-gapped hosts, SHA256SUMS, a Homebrew
+# formula, and a GitHub release.
 
 on:
   push:
@@ -46,182 +53,84 @@ jobs:
         with:
           command: check
 
-  musl:
-    name: Static musl (${{ matrix.name }})
-    needs: gates
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux-amd64, runner: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build the reproducible static binary
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
-        with:
-          source: .
-          targets: ci
-        env:
-          TARGET: ${{ matrix.target }}
-          GENERATE_SBOM: "true"
-      - name: Smoke test
-        run: |
-          "./target/${TARGET}/release/quack" --help
-        env:
-          TARGET: ${{ matrix.target }}
-      - name: Collect
-        run: |
-          mkdir -p "binaries/${TARGET}"
-          cp "target/${TARGET}/release/quack" "binaries/${TARGET}/quack"
-          sbom="$(find crates -name '*cdx.json' | head -1)"
-          if [ -n "$sbom" ]; then cp "$sbom" "binaries/${TARGET}/quack.cdx.json"; fi
-        env:
-          TARGET: ${{ matrix.target }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-${{ matrix.target }}
-          path: binaries/
-          if-no-files-found: error
-
-  native:
-    name: Native (${{ matrix.name }})
-    needs: gates
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: macos-arm64, runner: macos-latest, target: aarch64-apple-darwin, binary: quack }
-          - { name: macos-x86_64, runner: macos-15-intel, target: x86_64-apple-darwin, binary: quack }
-          - { name: windows-x86_64, runner: windows-latest, target: x86_64-pc-windows-msvc, binary: quack.exe }
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Setup Rust toolchain
-        shell: bash
-        run: rustup show && rustup target add "${TARGET}"
-        env:
-          TARGET: ${{ matrix.target }}
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v1"
-          shared-key: "release-${{ matrix.target }}"
-          lookup-only: true
-      - name: Build
-        shell: bash
-        run: cargo build --release --locked --package quack --target "${TARGET}"
-        env:
-          TARGET: ${{ matrix.target }}
-      - name: Smoke test and collect
-        shell: bash
-        run: |
-          "./target/${TARGET}/release/${BINARY}" --help
-          mkdir -p "binaries/${TARGET}"
-          cp "target/${TARGET}/release/${BINARY}" "binaries/${TARGET}/${BINARY}"
-        env:
-          TARGET: ${{ matrix.target }}
-          BINARY: ${{ matrix.binary }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-${{ matrix.target }}
-          path: binaries/
-          if-no-files-found: error
-
-  image:
-    name: Container image
-    needs: musl
+  version:
+    name: Release version
     runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Derive the version from the ref
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${REF_TYPE}" = "tag" ]; then
+            echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Everything that touches a compiler lives in the reusable workflow so the
+  # attestations it writes name that workflow as the builder. The permissions
+  # here are the ceiling for its jobs; each one declares its own subset.
+  build:
+    name: Build
+    needs: [gates, version]
     permissions:
       contents: read
       packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: binaries-*-linux-musl
-          path: binaries
-          merge-multiple: true
-      - name: Lay out the binaries per architecture
-        run: |
-          mkdir -p dist/linux-amd64 dist/linux-arm64
-          cp binaries/x86_64-unknown-linux-musl/quack dist/linux-amd64/quack
-          cp binaries/aarch64-unknown-linux-musl/quack dist/linux-arm64/quack
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Image tag
-        id: tag
-        run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        if: github.ref_type == 'tag'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push the multi-arch image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: Dockerfile.release
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.ref_type == 'tag' }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
-      - name: Image tarballs for air-gapped hosts
-        run: |
-          mkdir -p images
-          for arch in amd64 arm64; do
-            docker buildx build --file Dockerfile.release --platform "linux/${arch}" \
-              --tag "quack:${VERSION}" \
-              --output "type=docker,dest=images/quack-image-${VERSION}-linux-${arch}.tar" .
-          done
-        env:
-          VERSION: ${{ steps.tag.outputs.version }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: images
-          path: images/
-          if-no-files-found: error
+      id-token: write
+      attestations: write
+    uses: $/.github/workflows/reusable-build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      push-image: ${{ github.ref_type == 'tag' }}
+    secrets:
+      APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_CERTIFICATE_NAME: ${{ secrets.APPLE_CERTIFICATE_NAME }}
+      MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+      CERTIFICATE_PROFILE: ${{ secrets.CERTIFICATE_PROFILE }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
 
   publish:
     name: Publish the release
     if: github.ref_type == 'tag'
-    needs: [musl, native, image]
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # No checkout: this job only moves artifacts the build workflow produced.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binaries-*
-          path: binaries
+          path: dist
           merge-multiple: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: images
+          pattern: images-*
           path: dist
-      - name: Package
-        run: scripts/release/package.sh "${GITHUB_REF_NAME#v}" binaries dist
+          merge-multiple: true
+      - name: Collect SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          # The per-archive .sha256 files came from the machines that built
+          # them; verify against those, then publish one consolidated file.
+          sha256sum -c -- *.sha256
+          rm ./*.sha256
+          sha256sum -- *.tar.gz *.zip *.tar > SHA256SUMS
       - name: Publish
         run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag ./dist/*
         env:

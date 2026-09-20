@@ -1,0 +1,579 @@
+# Builds, signs, and attests every release artifact: the five `quack` binaries,
+# their archives, the CycloneDX SBOMs, and the `quack serve` image. Build and
+# attest run inside this reusable workflow so the Sigstore certificate records
+# it — not the caller — as the signer identity, which is what makes the
+# provenance SLSA Build Level 3. Nothing here may hold `contents: write`; the
+# caller publishes the release from the artifacts this workflow uploads.
+#
+# Verify a published asset:
+#   gh attestation verify quack-<version>-<target>.tar.gz --owner smoketurner \
+#     --signer-workflow smoketurner/quack/.github/workflows/reusable-build.yml
+name: Reusable Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version without the v prefix (e.g. 0.2.0)"
+        required: true
+        type: string
+      push-image:
+        description: "Push the container image to GHCR and attest its digest"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      # All optional: a missing credential downgrades that platform to an
+      # unsigned binary with a warning, it does not fail the release.
+      APPLE_CERTIFICATE_P12_BASE64:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_CERTIFICATE_NAME:
+        required: false
+      MACOS_KEYCHAIN_PASSWORD:
+        required: false
+      APPLE_ID:
+        required: false
+      APPLE_ID_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      TRUSTED_SIGNING_ENDPOINT:
+        required: false
+      TRUSTED_SIGNING_ACCOUNT:
+        required: false
+      CERTIFICATE_PROFILE:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_WARNINGS: deny
+
+jobs:
+  binaries:
+    name: Binary (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: reproducible static musl builds in Docker (Dockerfile.build).
+          - name: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux
+            binary: quack
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux
+            binary: quack
+          # macOS and Windows: native cargo builds on native runners. Nothing
+          # is cross-compiled: DuckDB and aws-lc-rs both build C/C++ from
+          # source, and a native host keeps that out of the release path.
+          - name: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos
+            binary: quack
+          - name: windows-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            binary: quack.exe
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            platform: windows
+            binary: quack.exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set SOURCE_DATE_EPOCH for reproducible builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          echo "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" >> "$GITHUB_ENV"
+
+      - name: Check code-signing credentials
+        id: signing
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE_NAME: ${{ secrets.APPLE_CERTIFICATE_NAME }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          CERTIFICATE_PROFILE: ${{ secrets.CERTIFICATE_PROFILE }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          set -euo pipefail
+
+          macos_sign=false
+          if [ -n "${APPLE_CERTIFICATE_P12_BASE64}" ] \
+            && [ -n "${APPLE_CERTIFICATE_PASSWORD}" ] \
+            && [ -n "${APPLE_CERTIFICATE_NAME}" ] \
+            && [ -n "${MACOS_KEYCHAIN_PASSWORD}" ]; then
+            macos_sign=true
+          fi
+
+          macos_notarize=false
+          if [ "${macos_sign}" = true ] \
+            && [ -n "${APPLE_ID}" ] \
+            && [ -n "${APPLE_ID_PASSWORD}" ] \
+            && [ -n "${APPLE_TEAM_ID}" ]; then
+            macos_notarize=true
+          fi
+
+          windows_sign=false
+          if [ -n "${TRUSTED_SIGNING_ENDPOINT}" ] \
+            && [ -n "${TRUSTED_SIGNING_ACCOUNT}" ] \
+            && [ -n "${CERTIFICATE_PROFILE}" ] \
+            && [ -n "${AZURE_CLIENT_ID}" ] \
+            && [ -n "${AZURE_TENANT_ID}" ]; then
+            windows_sign=true
+          fi
+
+          {
+            echo "macos_sign=${macos_sign}"
+            echo "macos_notarize=${macos_notarize}"
+            echo "windows_sign=${windows_sign}"
+          } >> "$GITHUB_OUTPUT"
+
+          warn() {
+            echo "::warning title=Unsigned release binary::$1"
+            echo "> [!WARNING]" >> "$GITHUB_STEP_SUMMARY"
+            echo "> $1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          case "${PLATFORM}" in
+            macos)
+              if [ "${macos_sign}" != true ]; then
+                warn "The macOS binary is neither signed nor notarized: set APPLE_CERTIFICATE_P12_BASE64, APPLE_CERTIFICATE_PASSWORD, APPLE_CERTIFICATE_NAME and MACOS_KEYCHAIN_PASSWORD."
+              elif [ "${macos_notarize}" != true ]; then
+                warn "The macOS binary is signed but not notarized: set APPLE_ID, APPLE_ID_PASSWORD and APPLE_TEAM_ID."
+              fi
+              ;;
+            windows)
+              if [ "${windows_sign}" != true ]; then
+                warn "The Windows binary is not signed: set TRUSTED_SIGNING_ENDPOINT, TRUSTED_SIGNING_ACCOUNT, CERTIFICATE_PROFILE, AZURE_CLIENT_ID and AZURE_TENANT_ID."
+              fi
+              ;;
+          esac
+
+      # --- Linux: reproducible static musl binary with an SBOM ---
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: matrix.platform == 'linux'
+
+      - name: Build the reproducible static binary
+        if: matrix.platform == 'linux'
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        with:
+          source: .
+          targets: ci
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
+          GENERATE_SBOM: "true"
+
+      # --- macOS and Windows: native cargo build ---
+
+      - name: Install GNU tar (macOS)
+        if: matrix.platform == 'macos'
+        run: brew list gnu-tar >/dev/null 2>&1 || brew install gnu-tar
+
+      - name: Install NASM (Windows x86_64)
+        # aws-lc-sys assembles its x86_64 Windows assembly with NASM, which the
+        # runner image does not carry. Installing it keeps the build on real
+        # assembly sources instead of the crate's prebuilt objects. NASM 3.x is
+        # too new for aws-lc's assembly, so this tracks the 2.16 series.
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        env:
+          NASM_VERSION: "2.16.03"
+          NASM_SHA256: "3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6"
+        run: |
+          set -euo pipefail
+          archive="nasm-${NASM_VERSION}-win64.zip"
+          curl -fsSL --retry 3 --retry-all-errors -o "${archive}" \
+            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/${archive}"
+          echo "${NASM_SHA256}  ${archive}" | sha256sum -c -
+          7z x -bso0 "${archive}" -o"${RUNNER_TEMP}/nasm"
+          rm "${archive}"
+          # GITHUB_PATH must carry a Windows path: the cargo build scripts that
+          # call nasm are native processes, not bash ones.
+          cygpath -w "${RUNNER_TEMP}/nasm/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/nasm/nasm-${NASM_VERSION}/nasm.exe" -v
+
+      - name: Setup Rust toolchain
+        if: matrix.platform != 'linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup show
+          rustup target add "${TARGET}"
+
+      - name: Setup Rust cache
+        if: matrix.platform != 'linux'
+        # Restore-only: a release build must never write a cache entry, and it
+        # reads only tag-scoped ones, so there is no poisoning path.
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+        with:
+          prefix-key: "v1"
+          shared-key: "release-${{ matrix.target }}"
+          save-if: "false"
+
+      - name: Build
+        if: matrix.platform != 'linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --package quack --target "${TARGET}"
+
+      - name: Smoke test
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          "./target/${TARGET}/release/${BINARY}" --help
+
+      # --- Signing ---
+
+      - name: Import the Apple Developer ID certificate
+        if: matrix.platform == 'macos' && steps.signing.outputs.macos_sign == 'true'
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          rm certificate.p12
+
+      - name: Code sign the macOS binary
+        if: matrix.platform == 'macos' && steps.signing.outputs.macos_sign == 'true'
+        env:
+          APPLE_CERTIFICATE_NAME: ${{ secrets.APPLE_CERTIFICATE_NAME }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          /usr/bin/codesign --force --sign "$APPLE_CERTIFICATE_NAME" \
+            --options runtime --timestamp "target/${TARGET}/release/quack"
+          /usr/bin/codesign --verify --strict --verbose=2 "target/${TARGET}/release/quack"
+
+      - name: Notarize the macOS binary
+        if: matrix.platform == 'macos' && steps.signing.outputs.macos_notarize == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          xcrun notarytool store-credentials "notarytool-profile" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_ID_PASSWORD"
+          # A bare binary cannot be stapled, so the ticket lives with Apple and
+          # Gatekeeper checks it online; the submission still has to be made.
+          mkdir -p notarize-staging
+          cp "target/${TARGET}/release/quack" notarize-staging/
+          ditto -c -k --keepParent notarize-staging "quack-notarize-${VERSION}.zip"
+          xcrun notarytool submit "quack-notarize-${VERSION}.zip" \
+            --keychain-profile "notarytool-profile" --wait
+          rm -rf notarize-staging "quack-notarize-${VERSION}.zip"
+
+      - name: Code sign the Windows binary
+        # Azure Trusted Signing over GitHub OIDC; the signing tool is an x86_64
+        # executable, which the arm64 runner runs under emulation.
+        if: matrix.platform == 'windows' && steps.signing.outputs.windows_sign == 'true'
+        uses: skeeto/aas-sign@0008af00d4dd2ff2e482ba5ede70831d78f9da59 # v1.1.0
+        with:
+          version: v1.1.0
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          account: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          profile: ${{ secrets.CERTIFICATE_PROFILE }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          files: |
+            target/${{ matrix.target }}/release/quack.exe
+
+      # --- Package, attest, upload ---
+
+      - name: Create archive (tar.gz)
+        if: matrix.platform != 'windows'
+        id: archive-tar
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="quack-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p dist
+
+          # GNU tar (gtar on macOS, tar on Linux) for a deterministic archive.
+          if command -v gtar &> /dev/null; then
+            TAR_CMD="gtar"
+          else
+            TAR_CMD="tar"
+          fi
+
+          "$TAR_CMD" --sort=name \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              --owner=0 --group=0 --numeric-owner \
+              -C "target/${TARGET}/release" \
+              -czf "dist/${ARCHIVE}" quack
+          (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          echo "asset=dist/${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Create archive (zip)
+        if: matrix.platform == 'windows'
+        id: archive-zip
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="quack-${VERSION}-${TARGET}.zip"
+          mkdir -p dist
+
+          # 7-Zip ships with the Windows runner images; git-bash has no zip(1).
+          # Stage the signed binary in the working directory so it lands at the
+          # zip root: extracting gives quack.exe directly, with no versioned
+          # subdirectory, because 7z stores the path it is given.
+          cp "target/${TARGET}/release/quack.exe" quack.exe
+          7z a "dist/${ARCHIVE}" quack.exe
+          rm quack.exe
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          echo "asset=dist/${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect the SBOM
+        id: sbom
+        if: matrix.platform == 'linux'
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          sbom="$(find crates/quack -name 'quack*cdx.json' | head -1)"
+          if [ -z "$sbom" ]; then
+            echo "::error title=Missing SBOM::cargo-cyclonedx produced no SBOM for ${TARGET}"
+            exit 1
+          fi
+          name="quack-${VERSION}-${TARGET}.cdx.json"
+          cp "$sbom" "dist/${name}"
+          echo "path=dist/${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.archive-tar.outputs.asset || steps.archive-zip.outputs.asset }}
+
+      - name: Attest the SBOM
+        if: steps.sbom.outputs.path != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.archive-tar.outputs.asset }}
+          sbom-path: ${{ steps.sbom.outputs.path }}
+
+      - name: Clean up the macOS keychain
+        if: always() && matrix.platform == 'macos'
+        run: security delete-keychain build.keychain || true
+
+  image:
+    name: Container image (${{ matrix.arch }})
+    needs: binaries
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One native runner per architecture: no emulation anywhere, and
+          # Dockerfile.release's staging layer runs on its own architecture.
+          - arch: amd64
+            runner: ubuntu-latest
+            artifact: binaries-linux-amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            artifact: binaries-linux-arm64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: binaries
+
+      - name: Lay out the binary
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/linux-${ARCH}"
+          tar -xzf "binaries/quack-${VERSION}-${TARGET}.tar.gz" -C "dist/linux-${ARCH}"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: inputs.push-image
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        if: inputs.push-image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/${{ matrix.arch }}
+          provenance: true
+          sbom: true
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export the digest
+        if: inputs.push-image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.push-image
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Image tarball for air-gapped hosts
+        # The same layers the push built, exported as a `docker load` tarball.
+        env:
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p images
+          docker buildx build --file Dockerfile.release --platform "linux/${ARCH}" \
+            --tag "quack:${VERSION}" \
+            --output "type=docker,dest=images/quack-image-${VERSION}-linux-${ARCH}.tar" .
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: images-${{ matrix.arch }}
+          path: images/
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Attest the image tarball
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: images/*.tar
+
+  image-index:
+    name: Container image index
+    needs: image
+    if: inputs.push-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digests-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the manifest list and push it
+        working-directory: digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046  # intentional splitting: one arg per digest
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" --tag "${IMAGE}:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Read the index digest
+        id: index
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the pushed image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true

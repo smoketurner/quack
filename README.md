@@ -13,9 +13,14 @@ The design is in [docs/design-doc.md](docs/design-doc.md).
 
 Pick one:
 
-- Download a static binary for Linux, macOS, or Windows from the GitHub releases page.
-  Each release includes `SHA256SUMS`.
-- Install with Homebrew. Each release ships a `quack.rb` formula.
+- Download a static binary for Linux (x86_64, aarch64), macOS (Apple silicon), or Windows
+  (x86_64, arm64) from the GitHub releases page. Each release includes `SHA256SUMS` and a
+  build provenance attestation:
+
+  ```bash
+  gh attestation verify quack-<version>-<target>.tar.gz --owner smoketurner \
+    --signer-workflow smoketurner/quack/.github/workflows/reusable-build.yml
+  ```
 - Run the container. `ghcr.io/smoketurner/quack` starts `quack serve`. Each release also
   attaches an image tarball for hosts that cannot reach a registry. `docker-compose.yml`
   runs the image next to Ollama. See [docs/ci-cd.md](docs/ci-cd.md).

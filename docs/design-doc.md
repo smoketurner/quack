@@ -1548,16 +1548,20 @@ updated as issues close. Ordered by risk.
    Sections 5.3, 5.4, 12.
 10. ~~No release pipeline~~ (#30, closed): `.github/workflows/release.yml` runs only on a
     `v*` tag (or by hand): the gates (fmt, clippy, tests, `make release-gates` for the
-    ring and OpenSSL runtime-tree checks, cargo deny), reproducible static musl binaries
-    for x86_64 and aarch64 with CycloneDX SBOMs through `Dockerfile.build` and
-    `docker-bake.hcl` on native runners, native macOS (arm64, x86_64) and Windows
-    binaries, the `quack serve` image for amd64 and arm64 on GHCR built from the
-    prebuilt binaries (`Dockerfile.release`) plus per-architecture image tarballs for
-    `docker load` on air-gapped hosts, `SHA256SUMS`, a Homebrew formula
-    (`scripts/release/homebrew-formula.sh`, for a tap), and the GitHub release.
-    `Dockerfile` builds the same image from source for `make image` and
-    `docker-compose.yml`, which runs it beside Ollama with `deploy/config.toml`.
-    Section 14.
+    ring and OpenSSL runtime-tree checks, cargo deny), then
+    `.github/workflows/reusable-build.yml` for everything that compiles, signs, or
+    attests — reproducible static musl binaries for x86_64 and aarch64 with CycloneDX
+    SBOMs through `Dockerfile.build` and `docker-bake.hcl`, native macOS arm64 and
+    Windows x86_64 and aarch64 binaries, each on its own native runner and code-signed
+    (Apple Developer ID with notarization, Azure Trusted Signing) when the secrets exist,
+    and the `quack serve` image for amd64 and arm64 on GHCR built per architecture from
+    the prebuilt binaries (`Dockerfile.release`) plus per-architecture image tarballs for
+    `docker load` on air-gapped hosts. Every artifact carries a build provenance
+    attestation signed under the build workflow's identity, which is SLSA Build Level 3;
+    no job that builds holds `contents: write`, and a separate `publish` job writes
+    `SHA256SUMS` and creates the GitHub release. `Dockerfile` builds the same image from
+    source for `make image` and `docker-compose.yml`, which runs it beside Ollama with
+    `deploy/config.toml`. Section 14.
 11. ~~No stemming in keyword search~~ (#31, closed: Snowball English over the same
     tokenizer, schema version 6 rebuilds older term indexes on open); ~~no reranking
     hook~~ (#34, closed: `Reranker` trait, `none` or `model`); ~~large-workspace vector

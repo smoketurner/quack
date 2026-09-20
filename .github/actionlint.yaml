@@ -1,0 +1,11 @@
+# actionlint configuration.
+#
+# The release workflow calls its build workflow through GitHub's
+# self-repository syntax (`uses: $/.github/workflows/reusable-build.yml`), which
+# pins the called workflow to the caller's own commit. zizmor's self-repository
+# audit asks for that form; actionlint 1.7 does not know it yet, so the format
+# check is ignored for that one file.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      - 'reusable workflow call "\$/\.github/workflows/reusable-build\.yml" at "uses" is not following the format'
