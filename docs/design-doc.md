@@ -1376,7 +1376,13 @@ tick_rate_ms = 50
 
 - **One binary, `quack`, no Cargo features.** Every surface is a subcommand and every
   build contains all of them. Static musl on Linux (`x86_64`, `aarch64`), native on macOS
-  and Windows. DuckDB and SQLite are bundled and statically linked.
+  (`aarch64`) and Windows (`x86_64`, `aarch64`). DuckDB and SQLite are bundled and
+  statically linked.
+- **Released artifacts are signed and attested.** The macOS binary carries a Developer ID
+  signature and a notarization ticket, the Windows ones an Azure Artifact Signing
+  signature, and every archive, image tarball, and pushed image has a build provenance
+  attestation naming `.github/workflows/reusable-build.yml` as its builder, which is what
+  makes the provenance SLSA Build Level 3 (`docs/ci-cd.md`).
 - **No DuckDB extension is ever installed or loaded at runtime.** A static musl binary
   cannot `dlopen`, and `libduckdb-sys` can only compile in `json`, `parquet`, `icu`, and
   `autocomplete`. Anything that would need another extension (`vss`, `fts`, `excel`,
@@ -1392,7 +1398,8 @@ tick_rate_ms = 50
   are release gates.
 - **Container image** for `quack serve`: `Dockerfile` builds from source (CSS stage with
   the standalone Tailwind binary, checksum verified; `rust:<MSRV>-alpine` with cargo-chef
-  for the musl build, `cmake`, `clang`, `g++`, `perl` for DuckDB and aws-lc;
+  for the musl build, `cmake`, `clang`, `g++`, `perl` for DuckDB and aws-lc, and `go`
+  for the FIPS module's delocate pass, which needs `AWS_LC_FIPS_SYS_CC=clang`;
   `distroless/static` `nonroot` runtime with `/quack` and `/data`, `QUACK_DATA_DIR=/data`,
   `QUACK_CONFIG_DIR=/config`, port 8080); `Dockerfile.release` builds the same runtime
   from the prebuilt musl binaries so the release job never compiles under emulation.

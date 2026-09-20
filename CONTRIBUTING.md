@@ -6,6 +6,9 @@ Prerequisites:
 
 - **Rust** — pinned in `rust-toolchain.toml`; install via [rustup](https://rustup.rs/)
 - **cmake** + **clang** — build dependency of `aws-lc-rs`
+- **go** (Linux only) — `aws-lc-fips-sys` runs AWS-LC's delocate pass over the generated
+  assembly; Linux builds link the FIPS module (`docs/crypto.md`). Set
+  `AWS_LC_FIPS_SYS_CC=clang`: delocate cannot parse gcc's output
 
 Common commands (`make help` lists all):
 
