@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{ReaderDb, SharedDb, open_reader};
 use quack_core::config::Config;
 use quack_core::storage::workspace::WorkspaceDb;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -15,13 +15,26 @@ use super::error::{ApiError, ApiResult};
 use super::queue::UploadQueue;
 use quack_core::storage::control::{ControlPlane, random_bytes};
 
+/// A workspace's writer connection plus its reader, opened together so a
+/// reader is built once per workspace handle rather than once per turn (a
+/// turn acquiring one must never wait on the writer mutex a slow write
+/// elsewhere is holding).
+#[derive(Clone)]
+struct WorkspaceHandle {
+    writer: SharedDb,
+    reader: ReaderDb,
+}
+
 pub(crate) struct AppState {
     pub config: Config,
     pub control: ControlPlane,
     /// `--local`: no authentication, one implicit owner of everything.
     pub local: bool,
     /// A workspace file is opened once per process; every request shares it.
-    workspaces: tokio::sync::Mutex<HashMap<String, SharedDb>>,
+    /// The cell is what enforces "once": `DuckDB`'s file lock is advisory
+    /// and per-process, so two concurrent opens of one file both succeed
+    /// and yield independent databases whose writes overwrite each other.
+    workspaces: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<WorkspaceHandle>>>>,
     /// Browser and API-login sessions, by token. Cleared on restart, and
     /// individually once either `[server]` lifetime runs out.
     web_sessions: Mutex<HashMap<String, WebSession>>,
@@ -125,29 +138,62 @@ impl AppState {
         (transport, server)
     }
 
-    /// The shared handle for a workspace, opening the file on first use.
-    pub(crate) async fn workspace_db(&self, workspace_id: &str) -> ApiResult<SharedDb> {
-        let mut open = self.workspaces.lock().await;
-        if let Some(db) = open.get(workspace_id) {
-            return Ok(Arc::clone(db));
-        }
+    /// The writer and reader for a workspace, opening the file and building
+    /// the reader once on first use.
+    ///
+    /// The map lock is held only long enough to hand out the workspace's
+    /// cell; opening the file and cloning the reader pool happen outside
+    /// it, so one workspace's first access never blocks another's. The cell
+    /// is what makes the open happen exactly once — concurrent first-time
+    /// callers await the same initialization instead of each opening the
+    /// file. De-duplicating afterwards would not do: two opens would both
+    /// have already run, and both would have written.
+    ///
+    /// A failed open is never remembered. `get_or_try_init` leaves the cell
+    /// empty on error, so the next request retries rather than inheriting a
+    /// permanent failure; nothing here may cache the error alongside it.
+    async fn workspace_handle(&self, workspace_id: &str) -> ApiResult<WorkspaceHandle> {
+        let cell = {
+            let mut open = self.workspaces.lock().await;
+            Arc::clone(
+                open.entry(workspace_id.to_owned())
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
         let config = self.config.clone();
         let id = workspace_id.to_owned();
-        let db = tokio::task::spawn_blocking(move || {
-            let db = WorkspaceDb::open(&config, &id)?;
-            // Uploads a previous process took but never finished cannot
-            // be resumed: their bytes are gone with it.
-            let stale = db.fail_stale_uploads()?;
-            if stale > 0 {
-                tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
-            }
-            Ok::<_, quack_core::error::Error>(db)
+        let pool_size = self.config.analysis.reader_pool_size;
+        cell.get_or_try_init(|| async move {
+            let db = tokio::task::spawn_blocking(move || {
+                let db = WorkspaceDb::open(&config, &id)?;
+                // Uploads a previous process took but never finished cannot
+                // be resumed: their bytes are gone with it.
+                let stale = db.fail_stale_uploads()?;
+                if stale > 0 {
+                    tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
+                }
+                Ok::<_, quack_core::error::Error>(db)
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
+            let writer: SharedDb = Arc::new(Mutex::new(db));
+            let reader = open_reader(&writer, pool_size).await;
+            Ok(WorkspaceHandle { writer, reader })
         })
         .await
-        .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
-        let shared: SharedDb = Arc::new(Mutex::new(db));
-        open.insert(workspace_id.to_owned(), Arc::clone(&shared));
-        Ok(shared)
+        .cloned()
+    }
+
+    /// The writer handle for a workspace, opening the file on first use.
+    pub(crate) async fn workspace_db(&self, workspace_id: &str) -> ApiResult<SharedDb> {
+        Ok(self.workspace_handle(workspace_id).await?.writer)
+    }
+
+    /// The reader handle for a workspace (built once, alongside the
+    /// writer, on first use): every read-only handler should prefer this
+    /// over [`Self::workspace_db`] so it never queues behind a write.
+    pub(crate) async fn reader_db(&self, workspace_id: &str) -> ApiResult<ReaderDb> {
+        Ok(self.workspace_handle(workspace_id).await?.reader)
     }
 
     /// Start a browser session for the user and return its token.

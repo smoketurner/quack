@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use quack_core::analysis::events::{self, AgentEvent, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::llm;
 
@@ -38,9 +38,14 @@ pub(crate) enum PromptFormat {
 
 /// Run one turn in `session_id` and print it. Returns whether a write was
 /// refused.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors llm::run_turn plus print mode's own formatting options"
+)]
 pub(crate) async fn run_prompt(
     config: &Config,
     db: SharedDb,
+    reader_db: ReaderDb,
     session_id: &str,
     policy: WritePolicy,
     prompt: &str,
@@ -54,7 +59,19 @@ pub(crate) async fn run_prompt(
         let config = config.clone();
         let prompt = prompt.to_owned();
         let session_id = session_id.to_owned();
-        async move { llm::run_turn(&config, db, &session_id, policy, &prompt, sink, cancel).await }
+        async move {
+            llm::run_turn(
+                &config,
+                db,
+                reader_db,
+                &session_id,
+                policy,
+                &prompt,
+                sink,
+                cancel,
+            )
+            .await
+        }
     });
 
     // Never hold the stdout or stderr locks across an await: the tracing

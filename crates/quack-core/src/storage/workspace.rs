@@ -248,6 +248,54 @@ impl WorkspaceDb {
         Ok(db)
     }
 
+    /// Open a second, reader connection to the same database:
+    /// `duckdb::Connection::try_clone` opens a new connection against the
+    /// already-open `DatabaseInstance`, so it succeeds even though
+    /// `lock_configuration` is set — that lock freezes the *configuration*
+    /// (`allowed_directories`, resource limits, ...), which is shared by
+    /// every connection to the instance, not the ability to open more of
+    /// them. `Connection::open` is not an option here: it would create a
+    /// second `DatabaseInstance` and take the file's exclusive lock.
+    ///
+    /// The clone inherits the confinement and resource limits already
+    /// locked in on `self`, so it must never call [`Self::confine_to`] or
+    /// [`Self::apply_resource_limits`] again — both `SET`s would fail once
+    /// the configuration is locked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `DuckDB` cannot open the new connection.
+    pub fn try_clone_reader(&self) -> Result<Self> {
+        Ok(Self {
+            conn: self.conn.try_clone()?,
+            embedding_dimension: self.embedding_dimension,
+            query_timeout: self.query_timeout,
+            files_dir: self.files_dir.clone(),
+        })
+    }
+
+    /// Whether this connection has any temp tables: only ever the CLI's
+    /// piped-stdin table, `ingestion::STDIN_TABLE`, loaded before a
+    /// workspace handle's first turn — the agent itself is refused any
+    /// statement that would create one (`analysis::tools::gate_statement`),
+    /// so none can appear later. `DuckDB` temp tables are connection-local,
+    /// so a [`Self::try_clone_reader`] clone would not see one: a caller
+    /// building a reader for a workspace handle's lifetime
+    /// (`analysis::tools::open_reader`) checks this once, at open, and
+    /// reuses the writer instead when it's true.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog query fails.
+    pub fn has_temp_tables(&self) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM duckdb_tables() WHERE temporary",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Cap memory and parallelism for every statement on this connection.
     fn apply_resource_limits(&self, config: &Config) -> Result<()> {
         let memory_limit = format!("{}MB", config.analysis.memory_limit_mb);
@@ -1416,6 +1464,31 @@ impl WorkspaceDb {
         f(self)
     }
 
+    /// Run `f`'s reads inside `BEGIN TRANSACTION READ ONLY`, scoped to `f`
+    /// alone: reader connections use this for every query so no transaction
+    /// outlives one piece of work, pinning an old snapshot and blocking
+    /// checkpointing. `DuckDB`'s `unchecked_transaction` cannot pass the
+    /// `READ ONLY` modifier, so the statements are issued directly; a write
+    /// `f` attempts fails with `DuckDB`'s own error, before it reaches the
+    /// write-gating the agent and API already apply. Safe on the writer
+    /// connection too for a statement already known to be a read (`run_sql`
+    /// does this); only a statement that might write must stay outside it.
+    /// Not re-entrant: `f` must not call this again on the same connection
+    /// (`DuckDB` rejects a nested `BEGIN`), and it never will through
+    /// today's callers, all of which run one statement or a bounded set of
+    /// them without transaction control of their own.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error (the transaction is rolled back), or the error
+    /// from beginning or committing the transaction itself.
+    pub fn read_only<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        let mut guard = ReadOnlyGuard::begin(&self.conn)?;
+        let value = f(self)?;
+        guard.commit()?;
+        Ok(value)
+    }
+
     /// Start a watchdog that interrupts the connection if the statement runs
     /// past the configured timeout. Dropping the guard disarms it.
     fn arm_timeout(&self) -> TimeoutGuard {
@@ -1811,17 +1884,62 @@ struct TimeoutGuard {
     _disarm: std::sync::mpsc::Sender<()>,
 }
 
+/// Guards one `BEGIN TRANSACTION READ ONLY` on a reader connection.
+/// Dropping without committing rolls back, so an early `?` return inside
+/// [`WorkspaceDb::read_only`] never leaves the transaction open.
+struct ReadOnlyGuard<'a> {
+    conn: &'a duckdb::Connection,
+    committed: bool,
+}
+
+impl<'a> ReadOnlyGuard<'a> {
+    fn begin(conn: &'a duckdb::Connection) -> Result<Self> {
+        conn.execute_batch("BEGIN TRANSACTION READ ONLY")?;
+        Ok(Self {
+            conn,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ReadOnlyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Err(e) = self.conn.execute_batch("ROLLBACK")
+        {
+            tracing::warn!(error = %e, "failed to roll back a read-only transaction");
+        }
+    }
+}
+
 /// True when `sql` is one statement that starts with a read-only keyword
 /// `DuckDB` cannot serialize. A semicolon anywhere but the very end disqualifies
-/// it, so `DESCRIBE t; DROP TABLE t` is not read-only.
+/// it, so `DESCRIBE t; DROP TABLE t` is not read-only. `EXPLAIN` alone only
+/// prints a plan, but `EXPLAIN ANALYZE` executes it — `EXPLAIN ANALYZE
+/// INSERT INTO t VALUES (1)` really inserts — so that combination is never
+/// read-only regardless of what it explains.
 fn is_single_read_only_statement(sql: &str) -> bool {
     let trimmed = sql.trim().trim_end_matches(';').trim_end();
     if trimmed.contains(';') {
         return false;
     }
-    let Some(first) = trimmed.split_whitespace().next() else {
+    let mut words = trimmed.split_whitespace();
+    let Some(first) = words.next() else {
         return false;
     };
+    if first.eq_ignore_ascii_case("EXPLAIN")
+        && words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("ANALYZE"))
+    {
+        return false;
+    }
     READ_ONLY_KEYWORDS
         .iter()
         .any(|k| k.eq_ignore_ascii_case(first))
@@ -2288,6 +2406,176 @@ mod tests {
         // Ordinary statements are untouched.
         assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
         assert!(db.execute_query("SELECT * FROM t").is_ok());
+    }
+
+    /// Proof-of-concept for the reader connection: `try_clone`
+    /// succeeds once `lock_configuration = true` (set by `confine_to` on
+    /// open), because `DuckDB` locks the connection's *configuration*, not
+    /// its ability to open more connections to the same database; and a
+    /// write inside `BEGIN TRANSACTION READ ONLY` is rejected by `DuckDB`
+    /// itself, before it ever reaches the workspace's write-gating.
+    #[test]
+    fn reader_connection_clones_after_lock_configuration_and_cannot_write() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let reader = db.conn.try_clone().unwrap_or_else(|e| fail(&e.to_string()));
+
+        reader
+            .execute_batch("BEGIN TRANSACTION READ ONLY")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let err = reader
+            .execute_batch("CREATE TABLE t(a INT)")
+            .err()
+            .unwrap_or_else(|| fail("write inside a read-only transaction should have failed"));
+        // The connection and its in-memory database are dropped at the end
+        // of the test; no need to end the transaction explicitly.
+        assert!(
+            err.to_string().to_lowercase().contains("read"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The actual guarded path (`try_clone_reader` plus `read_only`), not
+    /// just the raw statements the proof above assumes: a write attempted
+    /// inside `read_only` on a reader clone is rejected, and the connection
+    /// is still usable for a genuine read right after.
+    #[test]
+    fn read_only_on_a_reader_clone_rejects_a_write() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let reader = db
+            .try_clone_reader()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let err = reader
+            .read_only(|db| db.execute_statement("CREATE TABLE t(a INT)"))
+            .err()
+            .unwrap_or_else(|| fail("a write inside read_only on a reader should have failed"));
+        assert!(
+            err.to_string().to_lowercase().contains("read"),
+            "unexpected error: {err}"
+        );
+        assert!(reader.read_only(|db| db.execute_query("SELECT 1")).is_ok());
+    }
+
+    /// A write on the writer, made before a reader is cloned from it, is
+    /// still visible to the reader afterward, and so is a write made even
+    /// later: `DuckDB` snapshots a transaction at `BEGIN`, not at
+    /// `try_clone`, and the writer's statements autocommit.
+    #[test]
+    fn reader_clone_sees_the_writers_prior_and_later_writes() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement("CREATE TABLE t(a INT)")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement("INSERT INTO t VALUES (1)")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let reader = db
+            .try_clone_reader()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let count = |reader: &WorkspaceDb| -> i64 {
+            reader
+                .read_only(|db| db.execute_query("SELECT count(*) FROM t"))
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_else(|| fail("no count returned"))
+        };
+        assert_eq!(count(&reader), 1);
+
+        db.execute_statement("INSERT INTO t VALUES (2)")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(count(&reader), 2);
+    }
+
+    /// A closure that errors inside `read_only` rolls the transaction
+    /// back, and the connection is immediately reusable for another
+    /// `read_only` call: `ReadOnlyGuard::drop` did not leave one open.
+    #[test]
+    fn read_only_rolls_back_on_error_and_the_connection_stays_usable() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            db.read_only(|db| db.execute_query("SELECT * FROM no_such_table"))
+                .is_err()
+        );
+        assert!(db.read_only(|db| db.execute_query("SELECT 1")).is_ok());
+    }
+
+    /// The reader clone inherits confinement: it cannot read outside the
+    /// workspace directory either, exactly like the writer (mirrors
+    /// `workspace_connection_is_confined_to_its_directory_and_locked`).
+    #[test]
+    fn reader_clone_is_confined_like_the_writer() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let reader = db
+            .try_clone_reader()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let outside = dir.path().join("outside.csv");
+        std::fs::write(&outside, "a\n1\n").unwrap_or_else(|e| fail(&e.to_string()));
+        let err = reader
+            .execute_query(&format!(
+                "SELECT * FROM read_csv_auto('{}')",
+                outside.display()
+            ))
+            .err();
+        assert!(err.is_some(), "the reader escaped the sandbox");
+        let text = err.map(|e| e.to_string()).unwrap_or_default();
+        // `read_csv_auto` on a real, existing file outside the workspace
+        // has only one legitimate way to fail: the confinement check.
+        // Unlike the writer's confinement test, nothing here can produce a
+        // Catalog Error, so that arm would only ever hide an unrelated
+        // regression (`read_csv_auto` itself going missing, say).
+        assert!(text.contains("Permission Error"), "{text}");
+
+        let inside = config.workspace_files_dir("ws").join("inside.csv");
+        std::fs::write(&inside, "a\n1\n2\n").unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            reader
+                .execute_query(&format!(
+                    "SELECT * FROM read_csv_auto('{}')",
+                    inside.display()
+                ))
+                .is_ok()
+        );
+    }
+
+    /// `DuckDB` temp tables (the CLI's `stdin` table, `ingestion::STDIN_TABLE`)
+    /// are connection-local: a reader clone opened after the writer created
+    /// one does not see it. Tools reading through the reader must never be
+    /// pointed at it; only the writer connection (`run_sql`) can.
+    #[test]
+    fn reader_connection_cannot_see_the_writers_temp_tables() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement("CREATE TEMP TABLE stdin AS SELECT 1 AS a")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(db.execute_query("SELECT * FROM stdin").is_ok());
+
+        let reader = db
+            .try_clone_reader()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let err = reader
+            .execute_query("SELECT * FROM stdin")
+            .err()
+            .unwrap_or_else(|| fail("the reader should not see the writer's temp table"));
+        assert!(err.to_string().contains("stdin"), "{err}");
+    }
+
+    #[test]
+    fn has_temp_tables_reports_a_piped_stdin_table() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            !db.has_temp_tables()
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        );
+        db.execute_statement("CREATE TEMP TABLE stdin AS SELECT 1 AS a")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            db.has_temp_tables()
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        );
     }
 
     #[test]

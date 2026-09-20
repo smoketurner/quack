@@ -7,7 +7,7 @@ mod ui;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 
 /// Run the terminal session against a resolved workspace until the user quits.
@@ -22,6 +22,7 @@ pub(crate) fn run(
     workspace_name: String,
     workspace_id: String,
     db: SharedDb,
+    reader_db: ReaderDb,
     session_id: String,
     allow_write: bool,
 ) -> Result<()> {
@@ -38,6 +39,7 @@ pub(crate) fn run(
         provider_display,
         config,
         db,
+        reader_db,
         session_id,
         allow_write,
     )?;

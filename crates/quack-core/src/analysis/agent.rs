@@ -15,7 +15,7 @@ use super::rerank::ModelReranker;
 use super::text_to_sql::{self, PromptOptions};
 use super::tools::{
     CreateChartTool, DescribeTableTool, FindPathTool, GraphResults, ListDocumentsTool,
-    ListTablesTool, RunSqlTool, SearchDocumentsTool, SearchGraphTool, SharedDb,
+    ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool, SharedDb,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::store as graph_store;
@@ -107,7 +107,11 @@ impl AgentResponse {
 /// Run the rig agent with all analysis tools for a single user question,
 /// emitting `AgentEvent`s on `sink` as the turn progresses. `history` is
 /// the prior conversation to replay to the model (see
-/// `storage::sessions::history_for_model`).
+/// `storage::sessions::history_for_model`). `reader_db` is the workspace
+/// handle's reader, built once for its whole lifetime by
+/// [`super::tools::open_reader`] — acquiring one here would mean every turn
+/// waits on the writer mutex before it can even start, exactly when a slow
+/// write is most likely to be holding it.
 ///
 /// Text streams as `TextDelta`; every tool call is bracketed by
 /// `ToolStarted`/`ToolFinished`; a write under `WritePolicy::Ask` pauses on
@@ -124,6 +128,7 @@ impl AgentResponse {
 )]
 pub async fn run_analysis<M>(
     db: SharedDb,
+    reader_db: ReaderDb,
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
     embedding_model: Option<M>,
     analysis_config: &AnalysisConfig,
@@ -141,6 +146,7 @@ where
     let recorder = TurnRecorder::new(sink);
     match run_inner(
         db,
+        reader_db,
         completion_model,
         embedding_model,
         analysis_config,
@@ -168,14 +174,14 @@ where
 /// The `search_documents` tool, with the chat model as reranker when
 /// `[retrieval].rerank = "model"`.
 fn search_tool<M>(
-    shared_db: SharedDb,
+    reader_db: ReaderDb,
     completion_model: &(impl rig::completion::CompletionModel + Clone + 'static),
     embedding_model: Option<M>,
     retrieval_config: &RetrievalConfig,
     recorder: &TurnRecorder,
 ) -> SearchDocumentsTool<M> {
     let search = SearchDocumentsTool::new(
-        shared_db,
+        reader_db,
         embedding_model,
         retrieval_config.top_k,
         retrieval_config.rrf_k,
@@ -190,9 +196,27 @@ fn search_tool<M>(
     }
 }
 
+/// The system prompt and whether the graph is enabled, read through the
+/// turn's reader connection.
+async fn system_prompt_and_graph(
+    reader_db: &ReaderDb,
+    prompt: &PromptOptions,
+) -> Result<(String, bool)> {
+    let prompt_for_db = prompt.clone();
+    reader_db
+        .with_db(move |db| {
+            Ok((
+                text_to_sql::build_system_prompt(db, &prompt_for_db)?,
+                graph_store::status(db)?.enabled(),
+            ))
+        })
+        .await
+}
+
 #[expect(clippy::too_many_arguments, reason = "mirrors run_analysis")]
 async fn run_inner<M>(
     shared_db: SharedDb,
+    reader_db: ReaderDb,
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
     embedding_model: Option<M>,
     analysis_config: &AnalysisConfig,
@@ -207,15 +231,7 @@ async fn run_inner<M>(
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    let (system_prompt, graph_enabled) = {
-        let db = shared_db
-            .lock()
-            .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
-        (
-            text_to_sql::build_system_prompt(&db, &prompt)?,
-            graph_store::status(&db)?.enabled(),
-        )
-    };
+    let (system_prompt, graph_enabled) = system_prompt_and_graph(&reader_db, &prompt).await?;
     let chart_spec: Arc<Mutex<Option<ChartSpec>>> = Arc::new(Mutex::new(None));
     let graph_results: GraphResults = Arc::new(Mutex::new(Vec::new()));
     let refused = RefusalFlag::default();
@@ -231,6 +247,7 @@ where
         &system_prompt,
         &BuildContext {
             shared_db: Arc::clone(&shared_db),
+            reader_db,
             analysis_config,
             retrieval_config,
             graph_options,
@@ -411,7 +428,10 @@ fn explain_stream_error(
 
 /// What `build_agent` needs besides the models and the prompt.
 struct BuildContext<'a> {
+    /// The writer connection: only `run_sql` gets it, since it may write.
     shared_db: SharedDb,
+    /// A reader connection for every tool that only reads.
+    reader_db: ReaderDb,
     analysis_config: &'a AnalysisConfig,
     retrieval_config: &'a RetrievalConfig,
     graph_options: GraphOptions,
@@ -437,7 +457,7 @@ where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
     let search = search_tool(
-        Arc::clone(&ctx.shared_db),
+        ctx.reader_db.clone(),
         &completion_model,
         embedding_model.clone(),
         ctx.retrieval_config,
@@ -449,25 +469,26 @@ where
         .tool(search)
         .tool(RunSqlTool::new(
             Arc::clone(&ctx.shared_db),
+            ctx.reader_db.clone(),
             ctx.analysis_config.max_query_rows,
             ctx.write_policy,
             ctx.refused.clone(),
             ctx.recorder.clone(),
         ))
         .tool(DescribeTableTool::new(
-            Arc::clone(&ctx.shared_db),
+            ctx.reader_db.clone(),
             ctx.recorder.clone(),
         ))
         .tool(ListTablesTool::new(
-            Arc::clone(&ctx.shared_db),
+            ctx.reader_db.clone(),
             ctx.recorder.clone(),
         ))
         .tool(ListDocumentsTool::new(
-            Arc::clone(&ctx.shared_db),
+            ctx.reader_db.clone(),
             ctx.recorder.clone(),
         ))
         .tool(CreateChartTool::new(
-            Arc::clone(&ctx.shared_db),
+            ctx.reader_db.clone(),
             Arc::clone(&ctx.chart_spec),
             ctx.recorder.clone(),
         ))
@@ -479,7 +500,7 @@ where
     if ctx.graph_enabled {
         builder = builder
             .tool(SearchGraphTool::new(
-                Arc::clone(&ctx.shared_db),
+                ctx.reader_db.clone(),
                 embedding_model.clone(),
                 ctx.graph_options,
                 ctx.exclude_provisional,
@@ -487,7 +508,7 @@ where
                 ctx.recorder.clone(),
             ))
             .tool(FindPathTool::new(
-                Arc::clone(&ctx.shared_db),
+                ctx.reader_db.clone(),
                 embedding_model.clone(),
                 ctx.graph_options,
                 ctx.exclude_provisional,
@@ -501,7 +522,7 @@ where
     {
         let samples = usize::try_from(ctx.retrieval_config.top_k)
             .map_err(|e| Error::Analysis(format!("top_k overflow: {e}")))?;
-        let vector_index = DuckDbVectorIndex::new(Arc::clone(&ctx.shared_db), embedding_model);
+        let vector_index = DuckDbVectorIndex::new(ctx.reader_db.clone(), embedding_model);
         builder = builder.dynamic_context(samples, vector_index);
     }
 

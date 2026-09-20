@@ -17,7 +17,7 @@ use crate::analysis::agent::{self, AgentResponse};
 use crate::analysis::events::{self, AgentEvent, EventSink};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
-use crate::analysis::tools::SharedDb;
+use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::config_file_path;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
@@ -532,15 +532,23 @@ pub fn chat_model_display(config: &Config) -> String {
 /// recording the turn when it completes.
 ///
 /// This is the single dispatch point over provider types; interfaces call it
-/// rather than matching on `provider_type` themselves.
+/// rather than matching on `provider_type` themselves. `reader_db` is the
+/// workspace handle's reader (`analysis::tools::open_reader`), built once
+/// for the handle's whole lifetime by whoever opened it — not here, so
+/// starting a turn never waits on `db`'s mutex to acquire one.
 ///
 /// # Errors
 ///
 /// Returns an error if no chat model is configured, a provider cannot be
 /// built, the session does not exist, or the agent turn fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one entry point per turn; interfaces call this directly"
+)]
 pub async fn run_turn(
     config: &Config,
     db: SharedDb,
+    reader_db: ReaderDb,
     session_id: &str,
     policy: WritePolicy,
     message: &str,
@@ -598,6 +606,7 @@ pub async fn run_turn(
     let turn = dispatch(
         config,
         Arc::clone(&db),
+        reader_db,
         chat,
         embedding_model,
         policy,
@@ -649,6 +658,7 @@ pub const CANCELLED_NOTE: &str = "(Cancelled by the user before the answer was c
 async fn dispatch(
     config: &Config,
     db: SharedDb,
+    reader_db: ReaderDb,
     chat: ModelRef<'_>,
     embedding_model: Option<EmbedModel>,
     policy: WritePolicy,
@@ -662,6 +672,7 @@ async fn dispatch(
             let client = build_ollama_client(config, chat.provider_name, chat.provider).await?;
             agent::run_analysis(
                 db,
+                reader_db,
                 client.completion_model(chat.model),
                 embedding_model,
                 &config.analysis,
@@ -679,6 +690,7 @@ async fn dispatch(
             let client = build_openai_client(config, chat.provider_name, chat.provider).await?;
             agent::run_analysis(
                 db,
+                reader_db,
                 client.completion_model(chat.model),
                 embedding_model,
                 &config.analysis,
@@ -696,6 +708,7 @@ async fn dispatch(
             let client = build_anthropic_client(config, chat.provider_name, chat.provider).await?;
             agent::run_analysis(
                 db,
+                reader_db,
                 client.completion_model(chat.model),
                 embedding_model,
                 &config.analysis,
@@ -808,12 +821,15 @@ mod tests {
         let session = sessions::create_session(&db, "o/m", sessions::ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
         let db: SharedDb = Arc::new(Mutex::new(db));
+        let reader_db =
+            crate::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let (sink, mut events) = events::channel();
         let cancel = CancellationToken::new();
         cancel.cancel();
         let response = run_turn(
             &config,
             Arc::clone(&db),
+            reader_db,
             &session.id,
             WritePolicy::Deny,
             "how many storms?",

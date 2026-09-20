@@ -11,7 +11,7 @@ use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::llm;
 use quack_core::storage::control::Outcome;
 use quack_core::storage::sessions::{self, ChatMode};
@@ -44,7 +44,7 @@ async fn prepare(
     identity: Identity,
     workspace_id: &str,
     body: &QueryRequest,
-) -> ApiResult<(Access, SharedDb, String, WritePolicy)> {
+) -> ApiResult<(Access, SharedDb, ReaderDb, String, WritePolicy)> {
     let access = access(app, identity, workspace_id, Need::READ).await?;
     if body.allow_write && !access.permits(Need::WRITE) {
         access
@@ -75,6 +75,7 @@ async fn prepare(
         ),
     };
     let db = app.workspace_db(workspace_id).await?;
+    let reader_db = app.reader_db(workspace_id).await?;
     let requested = body.session_id.clone();
     let model = chat.to_string();
     let user = access.identity.user_id.clone();
@@ -104,7 +105,7 @@ async fn prepare(
     } else {
         WritePolicy::Deny
     };
-    Ok((access, db, session_id, policy))
+    Ok((access, db, reader_db, session_id, policy))
 }
 
 /// Cancels the turn when dropped: the SSE stream holds one, so a client
@@ -121,6 +122,7 @@ impl Drop for CancelOnDrop {
 fn start_turn(
     app: &App,
     db: SharedDb,
+    reader_db: ReaderDb,
     session_id: &str,
     policy: WritePolicy,
     prompt: &str,
@@ -133,7 +135,19 @@ fn start_turn(
     let token = cancel.clone();
     tokio::spawn(async move {
         // run_turn emits TurnComplete or Failed itself.
-        drop(llm::run_turn(&config, db, &session_id, policy, &prompt, sink, token).await);
+        drop(
+            llm::run_turn(
+                &config,
+                db,
+                reader_db,
+                &session_id,
+                policy,
+                &prompt,
+                sink,
+                token,
+            )
+            .await,
+        );
     });
     (stream, CancelOnDrop(cancel))
 }
@@ -181,10 +195,10 @@ pub(crate) async fn query(
     Path(id): Path<String>,
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (access, db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
+    let (access, db, reader_db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
     // A client that disconnects drops this future, and the guard with it,
     // which cancels the turn.
-    let (mut stream, _guard) = start_turn(&app, db, &session_id, policy, &body.prompt);
+    let (mut stream, _guard) = start_turn(&app, db, reader_db, &session_id, policy, &body.prompt);
     let mut failure = None;
     let mut complete = None;
     while let Some(event) = stream.recv().await {
@@ -245,8 +259,8 @@ pub(crate) async fn stream(
     Path(id): Path<String>,
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
-    let (access, db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
-    let (events, guard) = start_turn(&app, db, &session_id, policy, &body.prompt);
+    let (access, db, reader_db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
+    let (events, guard) = start_turn(&app, db, reader_db, &session_id, policy, &body.prompt);
     let prompt = body.prompt.clone();
     let state = (events, app, access, session_id, prompt, guard);
     let stream = futures::stream::unfold(
@@ -353,6 +367,14 @@ pub(crate) async fn execute_sql(
         StatementKind::Invalid(message) => return Err(ApiError::bad_request(message)),
     };
     let detail = serde_json::json!({ "sql": statement });
+    if is_write && quack_core::analysis::tools::creates_temp_object(statement) {
+        access
+            .audit(app, "sql", None, Outcome::Denied, Some(detail))
+            .await?;
+        return Err(ApiError::bad_request(
+            quack_core::analysis::tools::TEMP_OBJECT_REFUSED,
+        ));
+    }
     if is_write && !access.permits(Need::WRITE) {
         access
             .audit(app, "sql", None, Outcome::Denied, Some(detail))
@@ -361,9 +383,26 @@ pub(crate) async fn execute_sql(
             "writes need the member role and the write scope",
         ));
     }
+    let reader_db = app.reader_db(&access.workspace.id).await?;
     let sql = statement.to_owned();
     let max_rows = app.config.analysis.max_query_rows;
-    let result = with_db(db, move |db| db.execute_query_capped(&sql, max_rows)).await;
+    let result = if is_write {
+        let result = with_db(db, move |db| db.execute_query_capped(&sql, max_rows)).await;
+        // Whatever ran might have created a temp object the check above
+        // did not catch (a leading comment, a multi-statement batch);
+        // check the writer's catalog regardless of whether the statement
+        // itself errored, since an earlier statement in a batch can have
+        // already run.
+        reader_db.observe_write().await;
+        result
+    } else {
+        // A read never queues behind a write: run it on the workspace's
+        // reader connection instead of the writer.
+        reader_db
+            .with_db(move |db| db.execute_query_capped(&sql, max_rows))
+            .await
+            .map_err(ApiError::from)
+    };
     let outcome = if result.is_ok() {
         Outcome::Allowed
     } else {
@@ -407,16 +446,18 @@ pub(crate) async fn search(
         Some(model) => Some(llm::embed_query(&model, &query).await?),
         None => None,
     };
-    let db = app.workspace_db(&id).await?;
+    let reader_db = app.reader_db(&id).await?;
     let text = query.clone();
-    let hits = with_db(db, move |db| {
-        let none: [String; 0] = [];
-        match embedding.as_deref() {
-            Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &none),
-            None => db.search_keyword_chunks(&text, top_k, &none),
-        }
-    })
-    .await?;
+    let hits = reader_db
+        .with_db(move |db| {
+            let none: [String; 0] = [];
+            match embedding.as_deref() {
+                Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &none),
+                None => db.search_keyword_chunks(&text, top_k, &none),
+            }
+        })
+        .await
+        .map_err(ApiError::from)?;
     access
         .audit(
             &app,

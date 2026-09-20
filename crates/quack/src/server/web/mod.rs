@@ -796,8 +796,9 @@ async fn chat(
     }
     // The empty state says what there is to ask about.
     let (tables, documents) = if messages.is_empty() {
-        let db = app.workspace_db(&id).await?;
-        with_db(db, |db| Ok((db.list_tables()?, db.list_documents()?))).await?
+        let db = app.reader_db(&id).await?;
+        db.with_db(|db| Ok((db.list_tables()?, db.list_documents()?)))
+            .await?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -842,8 +843,8 @@ async fn unshare_session(
 }
 
 async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
-    let db = app.workspace_db(&access.workspace.id).await?;
-    let documents = with_db(db, WorkspaceDb::list_documents).await?;
+    let db = app.reader_db(&access.workspace.id).await?;
+    let documents = db.with_db(WorkspaceDb::list_documents).await?;
     let pending = documents
         .iter()
         .any(|d| d.status == "queued" || d.status == "processing");
@@ -1016,8 +1017,8 @@ async fn tables(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "tables").await?;
-    let db = app.workspace_db(&id).await?;
-    let list = with_db(db, WorkspaceDb::list_tables).await?;
+    let db = app.reader_db(&id).await?;
+    let list = db.with_db(WorkspaceDb::list_tables).await?;
     html(&TablesPage {
         page: page(&app, &access.identity, "Tables", Some(&access)),
         tables: list,
@@ -1071,18 +1072,19 @@ async fn table(
     Path((id, name)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let db = app.workspace_db(&id).await?;
+    let db = app.reader_db(&id).await?;
     let wanted = name.clone();
-    let (list, described) = with_db(db, move |db| {
-        let list = db.list_tables()?;
-        let described = if list.contains(&wanted) && !wanted.starts_with("_quack_") {
-            Some(db.describe_table(&wanted)?)
-        } else {
-            None
-        };
-        Ok((list, described))
-    })
-    .await?;
+    let (list, described) = db
+        .with_db(move |db| {
+            let list = db.list_tables()?;
+            let described = if list.contains(&wanted) && !wanted.starts_with("_quack_") {
+                Some(db.describe_table(&wanted)?)
+            } else {
+                None
+            };
+            Ok((list, described))
+        })
+        .await?;
     let described = described.ok_or_else(|| ApiError::not_found("no such table"))?;
     access
         .audit(
@@ -1253,25 +1255,28 @@ async fn ontology_page(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "ontology").await?;
-    let db = app.workspace_db(&id).await?;
+    let db = app.reader_db(&id).await?;
     let queue_status = match q.status.as_deref() {
         Some("low_support") => "low_support",
         _ => "pending",
     };
-    let (ontology, versions, diff, pending, low_support, has_tables) = with_db(db, |db| {
-        let current = ontology_store::current(db)?;
-        let versions = ontology_store::versions(db, 20)?;
-        let diff = match &current {
-            Some(c) if c.version > 1 => ontology_store::version(db, c.version.saturating_sub(1))?
-                .map(|older| c.diff(&older)),
-            _ => None,
-        };
-        let pending = candidates::pending(db)?;
-        let low_support = candidates::low_support(db)?;
-        let has_tables = !db.list_tables()?.is_empty();
-        Ok((current, versions, diff, pending, low_support, has_tables))
-    })
-    .await?;
+    let (ontology, versions, diff, pending, low_support, has_tables) = db
+        .with_db(|db| {
+            let current = ontology_store::current(db)?;
+            let versions = ontology_store::versions(db, 20)?;
+            let diff = match &current {
+                Some(c) if c.version > 1 => {
+                    ontology_store::version(db, c.version.saturating_sub(1))?
+                        .map(|older| c.diff(&older))
+                }
+                _ => None,
+            };
+            let pending = candidates::pending(db)?;
+            let low_support = candidates::low_support(db)?;
+            let has_tables = !db.list_tables()?.is_empty();
+            Ok((current, versions, diff, pending, low_support, has_tables))
+        })
+        .await?;
     let (pending_total, low_support_total) = (pending.len(), low_support.len());
     let rows = if queue_status == "low_support" {
         low_support
@@ -2183,7 +2188,7 @@ async fn graph_page(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "graph").await?;
-    let db = app.workspace_db(&id).await?;
+    let db = app.reader_db(&id).await?;
     let options = app.config.graph.options();
     let query = GraphQueryView {
         entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
@@ -2216,16 +2221,17 @@ async fn graph_page(
         to: query.to.clone(),
         max_hops: query.max_hops,
     };
-    let (status, has_ontology, chunk_count, merges, result) = with_db(db, move |db| {
-        graph_page_data(
-            db,
-            &wanted,
-            embedding.as_deref(),
-            path_embeddings.as_ref(),
-            options,
-        )
-    })
-    .await?;
+    let (status, has_ontology, chunk_count, merges, result) = db
+        .with_db(move |db| {
+            graph_page_data(
+                db,
+                &wanted,
+                embedding.as_deref(),
+                path_embeddings.as_ref(),
+                options,
+            )
+        })
+        .await?;
     let result = match result {
         Some((title, found)) => Some(graph_result_view(title, &found)?),
         None => None,
@@ -2280,7 +2286,7 @@ fn graph_page_data(
 ) -> CoreResult<PageData> {
     let status = graph_store::status(db)?;
     let ontology = ontology_store::current(db)?;
-    let chunk_count = extract::chunks(db, None)?.len();
+    let chunk_count = usize::try_from(extract::pending_chunk_count(db)?).unwrap_or(0);
     let merges = resolve::pending(db)?;
     let result = if let Some((a, b)) = path_embeddings {
         let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;

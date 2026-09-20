@@ -409,6 +409,10 @@ pub struct AnalysisConfig {
     /// Chunks extracted at once. Ollama serves one request at a time
     /// unless `OLLAMA_NUM_PARALLEL` is raised, so more only queues there.
     pub extraction_concurrency: u32,
+    /// Reader connections held open per workspace handle, round-robined so
+    /// concurrent reads run in parallel instead of queuing behind each
+    /// other on one shared connection.
+    pub reader_pool_size: u32,
 }
 
 impl Default for AnalysisConfig {
@@ -423,6 +427,7 @@ impl Default for AnalysisConfig {
             max_context_tokens: 32_768,
             extraction_timeout_seconds: 120,
             extraction_concurrency: 1,
+            reader_pool_size: 4,
         }
     }
 }
@@ -564,6 +569,16 @@ impl Config {
                     embed.provider_name
                 )));
             }
+        }
+        // Unlike the other [analysis] numbers, this one allocates OS-level
+        // DuckDB connections at workspace open, one spawn_blocking round
+        // trip and one writer-mutex acquisition each — an unreasonable
+        // value blocks every request to that workspace until it finishes.
+        if !(1..=32).contains(&self.analysis.reader_pool_size) {
+            return Err(Error::Config(format!(
+                "[analysis].reader_pool_size must be between 1 and 32, got {}",
+                self.analysis.reader_pool_size
+            )));
         }
         Ok(())
     }

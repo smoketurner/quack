@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rig::embeddings::EmbeddingModel;
@@ -19,6 +20,176 @@ use crate::ontology::store as ontology_store;
 
 pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
 
+/// Shared state behind every clone of one workspace handle's `ReaderDb`.
+struct ReaderPool {
+    /// A small fixed pool of reader clones, round-robined so concurrent
+    /// reads run in parallel instead of queuing behind each other on one
+    /// shared connection.
+    readers: Vec<SharedDb>,
+    next: AtomicUsize,
+    writer: SharedDb,
+    /// Set once a write is observed to have created a temp object on the
+    /// writer (see [`ReaderDb::observe_write`]): from then on every pick
+    /// routes to the writer instead. A `DuckDB` temp object never appears
+    /// on a reader clone and never goes away for the process's life, so
+    /// this is sticky rather than rechecked per call.
+    degraded: AtomicBool,
+}
+
+/// A workspace handle for a tool that only ever reads. The pool behind it
+/// is private: the only way to query through a `ReaderDb` is
+/// [`ReaderDb::with_db`], which always scopes the work inside
+/// [`WorkspaceDb::read_only`], so a write attempted through one fails at
+/// the database rather than merely by the caller remembering to wrap it.
+#[derive(Clone)]
+pub struct ReaderDb(Arc<ReaderPool>);
+
+impl ReaderDb {
+    /// Wrap `db` as its own single-entry pool: every query still goes
+    /// through [`WorkspaceDb::read_only`], so a write is refused, but
+    /// there is no separate connection. For tests that want the
+    /// read-only net without a real clone, and as the degraded fallback
+    /// [`open_reader`] returns when a clone would not serve.
+    #[must_use]
+    pub fn new(db: SharedDb) -> Self {
+        Self::from_pool(vec![Arc::clone(&db)], db)
+    }
+
+    fn from_pool(readers: Vec<SharedDb>, writer: SharedDb) -> Self {
+        Self(Arc::new(ReaderPool {
+            readers,
+            next: AtomicUsize::new(0),
+            writer,
+            degraded: AtomicBool::new(false),
+        }))
+    }
+
+    /// The connection this call should use: the writer once degraded,
+    /// otherwise the first pool entry, starting from the round-robin
+    /// cursor, that is not currently locked by another call — so a slot
+    /// mid-scan does not stall every Nth read behind it. If every slot is
+    /// busy, this falls back to the cursor's slot like plain round-robin
+    /// and blocks there, same as before this preference existed. The
+    /// probe is best-effort: another task can take the chosen slot before
+    /// the caller actually locks it, which only costs that caller the
+    /// same wait a busy slot would have anyway.
+    fn pick(&self) -> &SharedDb {
+        if self.0.degraded.load(Ordering::Relaxed) {
+            return &self.0.writer;
+        }
+        let len = self.0.readers.len();
+        let start = self.0.next.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..len {
+            let i = start.wrapping_add(offset).checked_rem(len).unwrap_or(0);
+            let Some(candidate) = self.0.readers.get(i) else {
+                continue;
+            };
+            if let Ok(guard) = candidate.try_lock() {
+                drop(guard);
+                return candidate;
+            }
+        }
+        let i = start.checked_rem(len).unwrap_or(0);
+        self.0.readers.get(i).unwrap_or(&self.0.writer)
+    }
+
+    /// A handle to classify a statement against (`gate_statement`) rather
+    /// than execute it: classification is a pure parse, so any connection
+    /// works, and picking a pool slot instead of the writer avoids taking
+    /// the writer's mutex for a read-only tool's classification.
+    pub(crate) fn classify_on(&self) -> &SharedDb {
+        self.pick()
+    }
+
+    /// Run `f` against the locked workspace handle on the blocking pool,
+    /// inside a read-only transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error, or an error from locking, the blocking task,
+    /// or the transaction itself.
+    pub async fn with_db<T>(
+        &self,
+        f: impl FnOnce(&WorkspaceDb) -> crate::error::Result<T> + Send + 'static,
+    ) -> crate::error::Result<T>
+    where
+        T: Send + 'static,
+    {
+        with_db(self.pick(), move |db| db.read_only(f)).await
+    }
+
+    /// Check the writer for a temp object created since this handle was
+    /// opened and, if one exists, degrade every clone of this `ReaderDb`
+    /// to the writer for good. Call this after any statement that ran on
+    /// the writer and was classified a write: `creates_temp_object`'s
+    /// text match on the SQL catches the obvious `CREATE TEMP TABLE`
+    /// case with a friendly refusal before it runs, but cannot be
+    /// complete (a leading comment, a semicolon before the real
+    /// statement, a multi-statement batch all defeat it), so this is the
+    /// actual correctness backstop — observed from `DuckDB`'s own
+    /// catalog after the fact, not predicted from the statement text.
+    pub async fn observe_write(&self) {
+        if self.0.degraded.load(Ordering::Relaxed) {
+            return;
+        }
+        let has_temp = with_db(&self.0.writer, WorkspaceDb::has_temp_tables)
+            .await
+            .unwrap_or(false);
+        if has_temp {
+            self.0.degraded.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Build a reader pool for a workspace handle's whole lifetime — once, not
+/// once per turn, so acquiring one never waits on the writer mutex a slow
+/// write elsewhere is holding. `pool_size` genuine
+/// [`WorkspaceDb::try_clone_reader`] clones, unless the writer already has
+/// a temp table (the CLI's piped `stdin`) a clone could not see, in which
+/// case every reader-routed tool shares the writer from the start. A clone
+/// that fails (allocation, a `DuckDB` internal error) degrades that one
+/// pool slot to the writer, with a warning, rather than the caller
+/// aborting.
+pub async fn open_reader(shared_db: &SharedDb, pool_size: u32) -> ReaderDb {
+    let pool_size = pool_size.max(1);
+    // One lock acquisition and one blocking-pool round trip for the temp
+    // check and every clone, instead of `pool_size + 1` separate ones:
+    // shortens how long a concurrent first-time open of this workspace
+    // can overlap another one, and is simply less work.
+    let outcome = with_db(shared_db, move |db| {
+        if db.has_temp_tables()? {
+            return Ok((true, Vec::new()));
+        }
+        let clones = (0..pool_size).map(|_| db.try_clone_reader()).collect();
+        Ok((false, clones))
+    })
+    .await;
+    let (has_temp_tables, clones) = outcome.unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "failed to open the reader pool; every read will share the writer"
+        );
+        (true, Vec::new())
+    });
+    if has_temp_tables {
+        return ReaderDb::new(Arc::clone(shared_db));
+    }
+    let readers = clones
+        .into_iter()
+        .map(|clone| match clone {
+            Ok(db) => Arc::new(Mutex::new(db)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to clone a reader connection; this slot will share the writer"
+                );
+                Arc::clone(shared_db)
+            }
+        })
+        .collect();
+    ReaderDb::from_pool(readers, Arc::clone(shared_db))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("query error: {0}")]
@@ -37,9 +208,43 @@ impl From<std::fmt::Error> for ToolError {
     }
 }
 
-fn lock(db: &SharedDb) -> Result<std::sync::MutexGuard<'_, WorkspaceDb>, ToolError> {
-    db.lock()
-        .map_err(|e| ToolError::Query(format!("mutex poisoned: {e}")))
+/// Map a core DB error onto the `ToolError` shown to the model, keeping
+/// its own category instead of always wrapping it as a query error — an
+/// `Error::Analysis` already reads as `"analysis error: ..."`, so wrapping
+/// it again in `ToolError::Query` would show the model
+/// `"query error: analysis error: ..."`.
+fn tool_error(e: crate::error::Error) -> ToolError {
+    match e {
+        Error::Analysis(msg) => ToolError::Analysis(msg),
+        other => ToolError::Query(other.to_string()),
+    }
+}
+
+/// Run `f` against the locked workspace handle on the blocking pool, so a
+/// `DuckDB` call never blocks an async worker. Every tool that queries the
+/// writer directly (`run_sql`, and `gate_statement`'s classification) calls
+/// this; every tool that only reads goes through [`ReaderDb::with_db`]
+/// instead, which wraps this same helper in [`WorkspaceDb::read_only`].
+///
+/// # Errors
+///
+/// Returns `f`'s error, or an error if the blocking task itself panics.
+pub(crate) async fn with_db<T>(
+    db: &SharedDb,
+    f: impl FnOnce(&WorkspaceDb) -> crate::error::Result<T> + Send + 'static,
+) -> crate::error::Result<T>
+where
+    T: Send + 'static,
+{
+    let db = Arc::clone(db);
+    tokio::task::spawn_blocking(move || {
+        let guard = db
+            .lock()
+            .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
+        f(&guard)
+    })
+    .await
+    .map_err(|e| Error::Analysis(format!("database task failed: {e}")))?
 }
 
 /// Prefix of a `run_sql` or `describe_table` result that carries a `DuckDB`
@@ -56,9 +261,44 @@ pub const INTERNAL_TABLE_REFUSED: &str =
 
 /// What the gate decided about a statement.
 enum Gate {
-    Run,
+    /// Run it; the classification the gate already computed, so the
+    /// caller can run a `Read` inside [`WorkspaceDb::read_only`] and a
+    /// `Write` bare instead of re-deciding.
+    Run(StatementKind),
     /// Do not run; hand this text back to the model.
     Reject(String),
+}
+
+/// Message returned to the caller when a statement would create a temp
+/// table or view.
+pub const TEMP_OBJECT_REFUSED: &str = "Temporary tables and views are not visible to every reader \
+     for the rest of this workspace's session; create a regular table instead \
+     (CREATE TABLE, without TEMP or TEMPORARY).";
+
+/// Whether `sql` is a `CREATE [OR REPLACE] {TEMP | TEMPORARY} ...`
+/// statement. `DuckDB` temp objects are connection-local, so one created
+/// on the writer would be invisible to every reader-routed tool for the
+/// rest of the workspace handle's life (they run on other connections);
+/// every path that can run a write (`gate_statement`, the REST and MCP
+/// `sql` handlers) refuses these outright with this as the friendly,
+/// fail-fast message. It cannot be a complete check — a leading comment,
+/// a semicolon before the real statement, or a multi-statement batch all
+/// defeat a text match — so [`ReaderDb::observe_write`] is the actual
+/// correctness backstop; this is the fast path for the obvious case.
+#[must_use]
+pub fn creates_temp_object(sql: &str) -> bool {
+    let mut words = sql.split_whitespace().map(str::to_uppercase);
+    if words.next().as_deref() != Some("CREATE") {
+        return false;
+    }
+    let mut word = words.next();
+    if word.as_deref() == Some("OR") {
+        if words.next().as_deref() != Some("REPLACE") {
+            return false;
+        }
+        word = words.next();
+    }
+    matches!(word.as_deref(), Some("TEMP" | "TEMPORARY"))
 }
 
 /// Classify a statement and apply the write policy. Takes and releases the
@@ -70,29 +310,37 @@ async fn gate_statement(
     refused: &RefusalFlag,
     recorder: &TurnRecorder,
 ) -> Result<Gate, ToolError> {
-    let kind = {
-        let guard = lock(db)?;
-        if guard
-            .references_internal_table(sql)
-            .map_err(|e| ToolError::Query(e.to_string()))?
-        {
-            return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
+    let sql_owned = sql.to_owned();
+    let kind = with_db(db, move |db| {
+        if db.references_internal_table(&sql_owned)? {
+            return Ok(None);
         }
-        guard
-            .classify_statement(sql)
-            .map_err(|e| ToolError::Query(e.to_string()))?
+        db.classify_statement(&sql_owned).map(Some)
+    })
+    .await
+    .map_err(tool_error)?;
+    let Some(kind) = kind else {
+        return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
     };
     match kind {
-        StatementKind::Read => Ok(Gate::Run),
+        StatementKind::Read => Ok(Gate::Run(kind)),
         StatementKind::Invalid(msg) => Ok(Gate::Reject(format!("SQL syntax error: {msg}"))),
         StatementKind::Write => {
+            if creates_temp_object(sql) {
+                // A mutating statement the caller wanted to run did not
+                // run, same as WRITE_REFUSED: AgentResponse::write_refused
+                // should say so.
+                refused.set();
+                tracing::info!(sql, "refused a statement that would create a temp object");
+                return Ok(Gate::Reject(String::from(TEMP_OBJECT_REFUSED)));
+            }
             let allowed = match policy {
                 WritePolicy::Allow => true,
                 WritePolicy::Deny => false,
                 WritePolicy::Ask => recorder.ask_permission(sql).await,
             };
             if allowed {
-                Ok(Gate::Run)
+                Ok(Gate::Run(kind))
             } else {
                 refused.set();
                 tracing::info!(sql, "refused write statement from agent");
@@ -108,6 +356,9 @@ async fn gate_statement(
 
 pub struct RunSqlTool {
     db: SharedDb,
+    /// The workspace's reader, purely to call [`ReaderDb::observe_write`]
+    /// after a write runs here: `run_sql` never reads through it.
+    reader_db: ReaderDb,
     max_query_rows: u32,
     policy: WritePolicy,
     refused: RefusalFlag,
@@ -117,6 +368,7 @@ pub struct RunSqlTool {
 impl RunSqlTool {
     pub fn new(
         db: SharedDb,
+        reader_db: ReaderDb,
         max_query_rows: u32,
         policy: WritePolicy,
         refused: RefusalFlag,
@@ -124,6 +376,7 @@ impl RunSqlTool {
     ) -> Self {
         Self {
             db,
+            reader_db,
             max_query_rows,
             policy,
             refused,
@@ -177,24 +430,38 @@ impl Tool for RunSqlTool {
                 step.finish("refused");
                 Ok(message)
             }
-            Gate::Run => {
+            Gate::Run(kind) => {
                 // DuckDB blocks for up to the query timeout: keep that off
                 // the async workers, and keep the lock inside the blocking
-                // thread with it.
-                let db = Arc::clone(&self.db);
+                // thread with it. A statement the gate classified `Read`
+                // still runs inside a read-only transaction, the same net
+                // every other tool has, in case a future parser
+                // divergence ever let a mutation through as `Read`.
                 let sql = args.query.clone();
                 let max_rows = self.max_query_rows;
-                let results = tokio::task::spawn_blocking(move || -> Result<_, ToolError> {
-                    let db = lock(&db)?;
-                    Ok(db.execute_query_capped(&sql, max_rows))
+                let read_only = matches!(kind, StatementKind::Read);
+                let results = with_db(&self.db, move |db| {
+                    if read_only {
+                        db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))
+                    } else {
+                        Ok(db.execute_query_capped(&sql, max_rows))
+                    }
                 })
                 .await
-                .map_err(|e| ToolError::Query(format!("query task failed: {e}")))??;
+                .map_err(tool_error)?;
+                if !read_only {
+                    // Whatever ran might have created a temp object
+                    // `creates_temp_object` did not catch (a leading
+                    // comment, a multi-statement batch); check the
+                    // writer's catalog regardless of whether the
+                    // statement itself errored, since an earlier
+                    // statement in a batch can have already run.
+                    self.reader_db.observe_write().await;
+                }
                 match results {
                     Ok(results) => {
                         step.finish(format!("{} rows", results.total_rows));
-                        text_to_sql::format_query_result(&results)
-                            .map_err(|e| ToolError::Query(e.to_string()))
+                        text_to_sql::format_query_result(&results).map_err(tool_error)
                     }
                     // A failed statement is a result, not a tool failure: rig
                     // hides a tool error's message from the model, but DuckDB's
@@ -215,7 +482,7 @@ impl Tool for RunSqlTool {
 // ---------------------------------------------------------------------------
 
 pub struct SearchDocumentsTool<M> {
-    db: SharedDb,
+    db: ReaderDb,
     /// `None` runs keyword search alone: a workspace without an embedding
     /// provider still answers from its documents.
     embedding_model: Option<M>,
@@ -228,7 +495,7 @@ pub struct SearchDocumentsTool<M> {
 
 impl<M> SearchDocumentsTool<M> {
     pub fn new(
-        db: SharedDb,
+        db: ReaderDb,
         embedding_model: Option<M>,
         default_top_k: u32,
         rrf_k: u32,
@@ -271,13 +538,11 @@ pub struct SearchDocumentsArgs {
 /// document ids. Anything that matches nothing is an error naming the
 /// documents that exist, so the model retries instead of getting an empty
 /// result it reads as "the workspace has nothing on this".
-fn resolve_document_ids(db: &WorkspaceDb, wanted: &[String]) -> Result<Vec<String>, ToolError> {
+fn resolve_document_ids(db: &WorkspaceDb, wanted: &[String]) -> crate::error::Result<Vec<String>> {
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
-    let documents = db
-        .list_documents()
-        .map_err(|e| ToolError::Query(e.to_string()))?;
+    let documents = db.list_documents()?;
     let mut resolved = Vec::with_capacity(wanted.len());
     for want in wanted {
         let want = want.trim();
@@ -294,7 +559,7 @@ fn resolve_document_ids(db: &WorkspaceDb, wanted: &[String]) -> Result<Vec<Strin
                 .iter()
                 .map(|d| format!("{} ({})", d.id, d.filename))
                 .collect();
-            return Err(ToolError::Query(format!(
+            return Err(Error::Analysis(format!(
                 "no document matches '{want}'; pass an id from list_documents or omit \
                  document_ids to search everything. Documents: {}",
                 known.join(", ")
@@ -363,21 +628,23 @@ where
             top_k
         };
 
-        let results = {
-            let db = lock(&self.db)?;
-            resolve_document_ids(&db, &args.document_ids).and_then(|ids| {
+        let query = args.query.clone();
+        let document_ids = args.document_ids.clone();
+        let rrf_k = self.rrf_k;
+        let results = self
+            .db
+            .with_db(move |db| {
+                let ids = resolve_document_ids(db, &document_ids)?;
                 match &query_vec {
-                    Some(vector) => {
-                        db.search_hybrid_chunks(&args.query, vector, fetch, self.rrf_k, &ids)
-                    }
-                    None => db.search_keyword_chunks(&args.query, fetch, &ids),
+                    Some(vector) => db.search_hybrid_chunks(&query, vector, fetch, rrf_k, &ids),
+                    None => db.search_keyword_chunks(&query, fetch, &ids),
                 }
-                .map_err(|e| ToolError::Query(e.to_string()))
             })
-        };
+            .await;
         let results = match results {
             Ok(results) => results,
             Err(e) => {
+                let e = tool_error(e);
                 step.finish(format!("error: {e}"));
                 return Err(e);
             }
@@ -442,12 +709,13 @@ pub fn format_search_results(
 // ---------------------------------------------------------------------------
 
 pub struct DescribeTableTool {
-    db: SharedDb,
+    db: ReaderDb,
     recorder: TurnRecorder,
 }
 
 impl DescribeTableTool {
-    pub fn new(db: SharedDb, recorder: TurnRecorder) -> Self {
+    #[must_use]
+    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
         Self { db, recorder }
     }
 }
@@ -473,32 +741,38 @@ impl Tool for DescribeTableTool {
             .unwrap_or_else(|_| json!({"type": "object"}))
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "Tool trait requires async fn"
-    )]
     async fn call(
         &self,
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let step = self.recorder.start(Self::NAME, &args.table_name);
-        let desc = {
-            let db = lock(&self.db)?;
-            match db.describe_table(&args.table_name) {
-                Ok(d) => d,
-                Err(e) => {
-                    step.finish(format!("error: {e}"));
-                    let tables = db.list_tables().unwrap_or_default();
-                    return Ok(format!(
-                        "{SQL_ERROR_PREFIX}{e}\nTables in this workspace: {}",
-                        if tables.is_empty() {
-                            String::from("none")
-                        } else {
-                            tables.join(", ")
-                        }
-                    ));
-                }
+        let table_name = args.table_name.clone();
+        let outcome = self
+            .db
+            .with_db(move |db| {
+                Ok(match db.describe_table(&table_name) {
+                    Ok(d) => Ok(d),
+                    Err(e) => {
+                        let tables = db.list_tables().unwrap_or_default();
+                        Err((e.to_string(), tables))
+                    }
+                })
+            })
+            .await
+            .map_err(tool_error)?;
+        let desc = match outcome {
+            Ok(d) => d,
+            Err((message, tables)) => {
+                step.finish(format!("error: {message}"));
+                return Ok(format!(
+                    "{SQL_ERROR_PREFIX}{message}\nTables in this workspace: {}",
+                    if tables.is_empty() {
+                        String::from("none")
+                    } else {
+                        tables.join(", ")
+                    }
+                ));
             }
         };
 
@@ -530,12 +804,13 @@ impl Tool for DescribeTableTool {
 // ---------------------------------------------------------------------------
 
 pub struct ListTablesTool {
-    db: SharedDb,
+    db: ReaderDb,
     recorder: TurnRecorder,
 }
 
 impl ListTablesTool {
-    pub fn new(db: SharedDb, recorder: TurnRecorder) -> Self {
+    #[must_use]
+    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
         Self { db, recorder }
     }
 }
@@ -557,31 +832,36 @@ impl Tool for ListTablesTool {
         })
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "Tool trait requires async fn"
-    )]
     async fn call(
         &self,
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let step = self.recorder.start(Self::NAME, "");
-        let tables = {
-            let db = lock(&self.db)?;
-            db.list_tables()
-                .map_err(|e| ToolError::Query(e.to_string()))?
-        };
+        // One reader round trip for the listing and every table's row
+        // count, rather than one per table; each count is its own
+        // timeout-guarded statement, so one huge table cannot pin the
+        // transaction indefinitely.
+        let tables: Vec<(String, Option<i64>)> = self
+            .db
+            .with_db(|db| {
+                let tables = db.list_tables()?;
+                Ok(tables
+                    .into_iter()
+                    .map(|t| {
+                        let count = db.under_timeout(|db| db.count_rows(&t)).ok();
+                        (t, count)
+                    })
+                    .collect())
+            })
+            .await
+            .map_err(tool_error)?;
         step.finish(format!("{} tables", tables.len()));
         if tables.is_empty() {
             return Ok(String::from("No tables found in this workspace."));
         }
         let mut output = String::from("Tables:\n");
-        for table in &tables {
-            let count = {
-                let db = lock(&self.db)?;
-                db.count_rows(table).ok()
-            };
+        for (table, count) in &tables {
             match count {
                 Some(n) => writeln!(output, "- {table} ({n} rows)")?,
                 None => writeln!(output, "- {table}")?,
@@ -596,12 +876,13 @@ impl Tool for ListTablesTool {
 // ---------------------------------------------------------------------------
 
 pub struct ListDocumentsTool {
-    db: SharedDb,
+    db: ReaderDb,
     recorder: TurnRecorder,
 }
 
 impl ListDocumentsTool {
-    pub fn new(db: SharedDb, recorder: TurnRecorder) -> Self {
+    #[must_use]
+    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
         Self { db, recorder }
     }
 }
@@ -623,21 +904,17 @@ impl Tool for ListDocumentsTool {
         })
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "Tool trait requires async fn"
-    )]
     async fn call(
         &self,
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let step = self.recorder.start(Self::NAME, "");
-        let docs = {
-            let db = lock(&self.db)?;
-            db.list_documents()
-                .map_err(|e| ToolError::Query(e.to_string()))?
-        };
+        let docs = self
+            .db
+            .with_db(WorkspaceDb::list_documents)
+            .await
+            .map_err(tool_error)?;
         step.finish(format!("{} documents", docs.len()));
         if docs.is_empty() {
             return Ok(String::from("No documents found in this workspace."));
@@ -667,14 +944,14 @@ impl Tool for ListDocumentsTool {
 // ---------------------------------------------------------------------------
 
 pub struct CreateChartTool {
-    db: SharedDb,
+    db: ReaderDb,
     chart_spec: Arc<Mutex<Option<ChartSpec>>>,
     recorder: TurnRecorder,
 }
 
 impl CreateChartTool {
     pub fn new(
-        db: SharedDb,
+        db: ReaderDb,
         chart_spec: Arc<Mutex<Option<ChartSpec>>>,
         recorder: TurnRecorder,
     ) -> Self {
@@ -726,7 +1003,7 @@ impl Tool for CreateChartTool {
         let step = self.recorder.start(Self::NAME, args.sql.trim());
         // Charts are read-only: never prompt, never write.
         if let Gate::Reject(message) = gate_statement(
-            &self.db,
+            self.db.classify_on(),
             &args.sql,
             WritePolicy::Deny,
             &RefusalFlag::default(),
@@ -738,14 +1015,12 @@ impl Tool for CreateChartTool {
             return Ok(format!("Chart query rejected. {message}"));
         }
 
-        let results = {
-            let db = lock(&self.db)?;
-            db.execute_query(&args.sql)
-                .map_err(|e| ToolError::Query(e.to_string()))
-        };
+        let sql = args.sql.clone();
+        let results = self.db.with_db(move |db| db.execute_query(&sql)).await;
         let results = match results {
             Ok(r) => r,
             Err(e) => {
+                let e = tool_error(e);
                 step.finish(format!("error: {e}"));
                 return Err(e);
             }
@@ -901,7 +1176,7 @@ mod tests {
         let refused = RefusalFlag::default();
         assert!(matches!(
             gate_statement(&db, "SELECT 1", WritePolicy::Deny, &refused, &recorder).await,
-            Ok(Gate::Run)
+            Ok(Gate::Run(StatementKind::Read))
         ));
         assert!(matches!(
             gate_statement(&db, "SELECT * FROM _quack_chunks", WritePolicy::Allow, &refused, &recorder).await,
@@ -912,6 +1187,154 @@ mod tests {
             Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
         ));
         assert!(!refused.was_refused());
+    }
+
+    #[test]
+    fn creates_temp_object_detects_temp_and_temporary_create_statements() {
+        assert!(creates_temp_object("CREATE TEMP TABLE t AS SELECT 1"));
+        assert!(creates_temp_object("create temporary table t(a int)"));
+        assert!(creates_temp_object(
+            "CREATE OR REPLACE TEMP TABLE t AS SELECT 1"
+        ));
+        assert!(!creates_temp_object("CREATE TABLE t(a INT)"));
+        assert!(!creates_temp_object("CREATE OR REPLACE TABLE t(a INT)"));
+        assert!(!creates_temp_object("SELECT 1"));
+    }
+
+    /// The text matcher is a fast path for the obvious case, not a
+    /// complete check — these four all reach the writer undetected. Pinned
+    /// here so the limitation is explicit; `observe_write` (tested below)
+    /// is what actually closes the gap they leave.
+    #[test]
+    fn creates_temp_object_misses_known_bypasses() {
+        assert!(!creates_temp_object(
+            "-- scratch\nCREATE TEMP TABLE c1(a INT)"
+        ));
+        assert!(!creates_temp_object(
+            "/* scratch */ CREATE TEMP TABLE c2(a INT)"
+        ));
+        assert!(!creates_temp_object(
+            "SELECT 1; CREATE TEMP TABLE c3(a INT)"
+        ));
+        assert!(!creates_temp_object("; CREATE TEMP TABLE c4(a INT)"));
+    }
+
+    /// The actual correctness backstop for the bypasses above: once a temp
+    /// object appears on the writer by any means, `observe_write` degrades
+    /// every clone of that `ReaderDb` to the writer, so a table a bypass
+    /// created is still visible to reads.
+    #[tokio::test]
+    async fn observe_write_degrades_every_clone_once_a_temp_table_appears() {
+        let db = shared_db();
+        let reader_db = open_reader(&db, 2).await;
+        let reader_clone = reader_db.clone();
+
+        // Before the write: the reader pool is real clones, so a temp
+        // table on the writer is not yet visible to them.
+        with_db(&db, |db| {
+            db.execute_statement("CREATE TEMP TABLE scratch AS SELECT 1 AS a")
+        })
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(
+            reader_db
+                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
+                .await
+                .is_err()
+        );
+
+        reader_db.observe_write().await;
+
+        // Now every clone of the ReaderDb sees it, because the degrade is
+        // sticky state shared behind the `Arc`, not per-clone.
+        assert!(
+            reader_db
+                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            reader_clone
+                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The four `creates_temp_object` bypasses: a leading line comment, a
+    /// leading block comment, a leading semicolon, and a harmless first
+    /// statement ahead of the real one. Each reaches `run_sql`'s writer
+    /// undetected (`creates_temp_object_misses_known_bypasses` pins that),
+    /// but correctness does not rest on the detector — this runs each one
+    /// through the real tool and then reads the table back through the
+    /// reader, proving `observe_write`'s post-write degrade catches what
+    /// the pre-check misses. Asserting only that the detector misses them
+    /// would just re-encode the brittleness the sticky degrade replaces.
+    #[tokio::test]
+    async fn run_sql_bypasses_are_still_visible_to_reads_after_they_run() {
+        for bypass in [
+            "-- scratch\nCREATE TEMP TABLE scratch(a INT)",
+            "/* scratch */ CREATE TEMP TABLE scratch(a INT)",
+            "; CREATE TEMP TABLE scratch(a INT)",
+            "SELECT 1; CREATE TEMP TABLE scratch(a INT)",
+        ] {
+            let db = shared_db();
+            let reader_db = open_reader(&db, 2).await;
+            let (sink, _rx) = super::super::events::channel();
+            let recorder = TurnRecorder::new(sink);
+            let tool = RunSqlTool::new(
+                Arc::clone(&db),
+                reader_db.clone(),
+                100,
+                WritePolicy::Allow,
+                RefusalFlag::default(),
+                recorder,
+            );
+            let out = tool
+                .call(
+                    &mut ToolContext::new(),
+                    RunSqlArgs {
+                        query: String::from(bypass),
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| fail_test(&format!("{bypass}: tool call failed: {e}")));
+            assert!(
+                !out.starts_with(SQL_ERROR_PREFIX),
+                "{bypass}: statement did not run: {out}"
+            );
+
+            let visible = reader_db
+                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
+                .await;
+            assert!(
+                visible.is_ok(),
+                "{bypass}: reader still cannot see the bypass table: {visible:?}"
+            );
+        }
+    }
+
+    /// A temp table created mid-turn would be invisible to every
+    /// reader-routed tool for the rest of the turn, so `run_sql` refuses to
+    /// create one outright rather than let that happen.
+    #[tokio::test]
+    async fn gate_refuses_statements_that_create_temp_tables() {
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let db = shared_db();
+        let refused = RefusalFlag::default();
+        assert!(matches!(
+            gate_statement(
+                &db,
+                "CREATE TEMP TABLE t AS SELECT 1",
+                WritePolicy::Allow,
+                &refused,
+                &recorder
+            )
+            .await,
+            Ok(Gate::Reject(m)) if m == TEMP_OBJECT_REFUSED
+        ));
+        assert!(refused.was_refused());
     }
 
     /// Without an embedding model the search tool answers from the term
@@ -935,7 +1358,7 @@ mod tests {
         }
         let db = shared_db();
         {
-            let guard = lock(&db).unwrap_or_else(|e| fail_test(&e.to_string()));
+            let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
             guard
                 .insert_document(
                     &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
@@ -964,7 +1387,7 @@ mod tests {
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
-            Arc::clone(&db),
+            ReaderDb::new(Arc::clone(&db)),
             None,
             5,
             60,
@@ -990,7 +1413,7 @@ mod tests {
         );
 
         let reranked = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
-            Arc::clone(&db),
+            ReaderDb::new(Arc::clone(&db)),
             None,
             5,
             60,
@@ -1025,8 +1448,10 @@ mod tests {
     async fn run_sql_caps_rows_and_reports_the_rest() {
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
+        let db = shared_db();
         let tool = RunSqlTool::new(
-            shared_db(),
+            Arc::clone(&db),
+            ReaderDb::new(db),
             2,
             WritePolicy::Deny,
             RefusalFlag::default(),
@@ -1063,7 +1488,7 @@ mod tests {
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         {
-            let guard = lock(&db).unwrap_or_else(|e| fail_test(&e.to_string()));
+            let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
             assert!(
                 guard
                     .execute_statement("CREATE TABLE trips(trip_distance DOUBLE)")
@@ -1072,6 +1497,7 @@ mod tests {
         }
         let tool = RunSqlTool::new(
             Arc::clone(&db),
+            ReaderDb::new(Arc::clone(&db)),
             100,
             WritePolicy::Deny,
             RefusalFlag::default(),
@@ -1099,7 +1525,7 @@ mod tests {
         );
 
         // A missing table names the tables that do exist.
-        let describe = DescribeTableTool::new(Arc::clone(&db), recorder.clone());
+        let describe = DescribeTableTool::new(ReaderDb::new(Arc::clone(&db)), recorder.clone());
         let out = describe
             .call(
                 &mut ToolContext::new(),
@@ -1142,7 +1568,7 @@ mod tests {
                 &recorder
             )
             .await,
-            Ok(Gate::Run)
+            Ok(Gate::Run(StatementKind::Write))
         ));
         assert!(!refused.was_refused());
         assert!(matches!(
@@ -1169,7 +1595,7 @@ mod tests {
                 matches!(
                     gate_statement(&db, "DELETE FROM t", WritePolicy::Ask, &refused, &recorder)
                         .await,
-                    Ok(Gate::Run)
+                    Ok(Gate::Run(StatementKind::Write))
                 )
             }
         });
@@ -1195,7 +1621,7 @@ use crate::graph::{self, GraphResult};
 pub type GraphResults = Arc<Mutex<Vec<GraphResult>>>;
 
 pub struct SearchGraphTool<M> {
-    db: SharedDb,
+    db: ReaderDb,
     embedding_model: Option<M>,
     options: graph::GraphOptions,
     exclude_provisional: bool,
@@ -1205,7 +1631,7 @@ pub struct SearchGraphTool<M> {
 
 impl<M> SearchGraphTool<M> {
     pub fn new(
-        db: SharedDb,
+        db: ReaderDb,
         embedding_model: Option<M>,
         options: graph::GraphOptions,
         exclude_provisional: bool,
@@ -1319,30 +1745,41 @@ where
             .as_deref()
             .map(str::trim)
             .filter(|r| !r.is_empty());
-        let result = {
-            let db = lock(&self.db)?;
-            let outcome = if let Some(e) = entity {
-                graph::traverse::resolve_entry(&db, e, class, embedding.as_deref()).and_then(
-                    |roots| {
-                        graph::traverse::neighborhood(&db, &roots, hops, relation, &self.options)
-                    },
-                )
-            } else {
-                ontology_store::current(&db).and_then(|o| {
-                    graph::traverse::by_class(
-                        &db,
-                        o.as_ref(),
-                        class.unwrap_or_default(),
-                        self.options.max_nodes,
-                        &self.options,
-                    )
-                })
-            };
-            outcome.map_err(|e| ToolError::Query(e.to_string()))
-        };
+        let entity = entity.map(str::to_owned);
+        let class = class.map(str::to_owned);
+        let relation = relation.map(str::to_owned);
+        let options = self.options;
+        let result = self
+            .db
+            .with_db(move |db| {
+                if let Some(e) = entity.as_deref() {
+                    graph::traverse::resolve_entry(db, e, class.as_deref(), embedding.as_deref())
+                        .and_then(|roots| {
+                            graph::traverse::neighborhood(
+                                db,
+                                &roots,
+                                hops,
+                                relation.as_deref(),
+                                &options,
+                            )
+                        })
+                } else {
+                    ontology_store::current(db).and_then(|o| {
+                        graph::traverse::by_class(
+                            db,
+                            o.as_ref(),
+                            class.as_deref().unwrap_or_default(),
+                            options.max_nodes,
+                            &options,
+                        )
+                    })
+                }
+            })
+            .await;
         let result = match result {
             Ok(result) => result,
             Err(e) => {
+                let e = tool_error(e);
                 step.finish(format!("error: {e}"));
                 return Err(e);
             }
@@ -1357,7 +1794,7 @@ where
             result.nodes.len(),
             result.edges.len()
         ));
-        let text = format_graph_result(&result, &self.recorder, &self.db)?;
+        let text = format_graph_result(&result, &self.recorder, &self.db).await?;
         if let Ok(mut results) = self.results.lock() {
             results.push(result);
         }
@@ -1366,7 +1803,7 @@ where
 }
 
 pub struct FindPathTool<M> {
-    db: SharedDb,
+    db: ReaderDb,
     embedding_model: Option<M>,
     options: graph::GraphOptions,
     exclude_provisional: bool,
@@ -1376,7 +1813,7 @@ pub struct FindPathTool<M> {
 
 impl<M> FindPathTool<M> {
     pub fn new(
-        db: SharedDb,
+        db: ReaderDb,
         embedding_model: Option<M>,
         options: graph::GraphOptions,
         exclude_provisional: bool,
@@ -1440,27 +1877,37 @@ where
         let from_embedding = label_embedding(self.embedding_model.as_ref(), from).await?;
         let to_embedding = label_embedding(self.embedding_model.as_ref(), to).await?;
         let max_hops = args.max_hops.unwrap_or(4).max(1);
-        let result = {
-            let db = lock(&self.db)?;
-            let outcome =
-                graph::traverse::resolve_entry(&db, from, None, from_embedding.as_deref())
+        let from_owned = from.to_owned();
+        let to_owned = to.to_owned();
+        let options = self.options;
+        let result = self
+            .db
+            .with_db(move |db| {
+                graph::traverse::resolve_entry(db, &from_owned, None, from_embedding.as_deref())
                     .and_then(|a| {
-                        let b =
-                            graph::traverse::resolve_entry(&db, to, None, to_embedding.as_deref())?;
+                        let b = graph::traverse::resolve_entry(
+                            db,
+                            &to_owned,
+                            None,
+                            to_embedding.as_deref(),
+                        )?;
                         Ok((a, b))
                     })
                     .and_then(|(a, b)| match (a.first(), b.first()) {
-                        (Some(a), Some(b)) => {
-                            graph::traverse::path(&db, a, b, max_hops, &self.options)
+                        (Some(a), Some(b)) => graph::traverse::path(db, a, b, max_hops, &options),
+                        (None, _) => {
+                            Err(Error::Analysis(format!("no entity matches '{from_owned}'")))
                         }
-                        (None, _) => Err(Error::Analysis(format!("no entity matches '{from}'"))),
-                        (_, None) => Err(Error::Analysis(format!("no entity matches '{to}'"))),
-                    });
-            outcome.map_err(|e| ToolError::Query(e.to_string()))
-        };
+                        (_, None) => {
+                            Err(Error::Analysis(format!("no entity matches '{to_owned}'")))
+                        }
+                    })
+            })
+            .await;
         let result = match result {
             Ok(result) => result,
             Err(e) => {
+                let e = tool_error(e);
                 step.finish(format!("error: {e}"));
                 return Err(e);
             }
@@ -1477,7 +1924,7 @@ where
             ));
         }
         step.finish(format!("{} hops", result.edges.len()));
-        let text = format_graph_result(&result, &self.recorder, &self.db)?;
+        let text = format_graph_result(&result, &self.recorder, &self.db).await?;
         if let Ok(mut results) = self.results.lock() {
             results.push(result);
         }
@@ -1488,10 +1935,10 @@ where
 /// Render a graph result for the model: the tree, then the sources each
 /// node and edge came from, registered as citable `[n]` markers (chunks)
 /// or named as table rows.
-fn format_graph_result(
+async fn format_graph_result(
     result: &GraphResult,
     recorder: &TurnRecorder,
-    db: &SharedDb,
+    db: &ReaderDb,
 ) -> Result<String, ToolError> {
     if result.nodes.is_empty() {
         return Ok(String::from(
@@ -1506,11 +1953,10 @@ fn format_graph_result(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let chunks = {
-        let db = lock(db)?;
-        db.chunks_by_ids(&chunk_ids)
-            .map_err(|e| ToolError::Query(e.to_string()))?
-    };
+    let chunks = db
+        .with_db(move |db| db.chunks_by_ids(&chunk_ids))
+        .await
+        .map_err(tool_error)?;
     if !chunks.is_empty() {
         let first = recorder.citations().register(&chunks);
         writeln!(out, "\nSources (cite with the [n] marker):")?;

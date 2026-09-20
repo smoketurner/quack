@@ -31,11 +31,13 @@ pub(crate) async fn handle(
         if can_write { "rw" } else { "ro" }
     );
     let db = app.workspace_db(&access.workspace.id).await?;
+    let reader = app.reader_db(&access.workspace.id).await?;
     let (transport, server) = app
         .mcp_transport(&key, || {
             McpServer::new(
                 app.config.clone(),
                 db,
+                reader,
                 access.workspace.clone(),
                 if can_write {
                     WritePolicy::Allow
