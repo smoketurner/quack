@@ -368,10 +368,7 @@ impl ControlPlane {
 
         self.adopt_legacy_versions().await?;
 
-        MIGRATOR
-            .run(&self.pool)
-            .await
-            .map_err(sqlx::Error::from)?;
+        MIGRATOR.run(&self.pool).await.map_err(sqlx::Error::from)?;
 
         Ok(())
     }
@@ -384,13 +381,16 @@ impl ControlPlane {
     /// access record. `schema_version` is left in place, inert, so an older
     /// binary opening the same file still sees its own versions as applied.
     async fn adopt_legacy_versions(&self) -> Result<()> {
-        if self.table_exists("_sqlx_migrations").await? || !self.table_exists("schema_version").await? {
+        if self.table_exists("_sqlx_migrations").await?
+            || !self.table_exists("schema_version").await?
+        {
             return Ok(());
         }
 
-        let legacy: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
-            .fetch_one(&self.pool)
-            .await?;
+        let legacy: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+                .fetch_one(&self.pool)
+                .await?;
         if legacy <= 0 {
             return Ok(());
         }
@@ -1188,13 +1188,19 @@ mod tests {
                  version INTEGER PRIMARY KEY, \
                  applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
         );
-        for file in ["0001_access_control", "0002_audit_log_access_record", "0003_users_and_token_scopes"] {
-            sql.push_str(&std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("migrations")
-                    .join(format!("{file}.sql")),
-            )
-            .unwrap_or_else(|e| fail(&e.to_string())));
+        for file in [
+            "0001_access_control",
+            "0002_audit_log_access_record",
+            "0003_users_and_token_scopes",
+        ] {
+            sql.push_str(
+                &std::fs::read_to_string(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("migrations")
+                        .join(format!("{file}.sql")),
+                )
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            );
         }
         sql.push_str("INSERT INTO schema_version (version) VALUES (1), (2), (3);");
         sql.push_str(
@@ -1213,7 +1219,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = Config::default();
         config.general.data_dir = dir.path().to_path_buf();
-        config.ensure_dirs().unwrap_or_else(|e| fail(&e.to_string()));
+        config
+            .ensure_dirs()
+            .unwrap_or_else(|e| fail(&e.to_string()));
         legacy_control_db(&config.control_db_path()).await;
 
         let cp = ControlPlane::open(&config)
