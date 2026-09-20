@@ -51,6 +51,20 @@ pub fn install_default_provider() -> Result<()> {
 /// [`install_default_provider`]: that runs at the top of `main`, before any
 /// subscriber exists, so a log there goes nowhere. A build that should be FIPS
 /// but reports no FIPS module still works, so this warns rather than failing.
+/// One line naming the crypto module this binary links, for `--version`:
+/// `AWS-LC FIPS 4.2.0 (FIPS module 40200)` for a FIPS build, `AWS-LC 5.7.0`
+/// otherwise. The AWS-LC library version is the one that matters for a CVE or a
+/// certificate; aws-lc-rs has no runtime API for its own crate version, which
+/// stays in `Cargo.lock`.
+#[must_use]
+pub fn provider_description() -> String {
+    let awslc = aws_lc_rs::awslc_version();
+    match aws_lc_rs::fips_version() {
+        Some(module) => format!("AWS-LC FIPS {awslc} (FIPS module {module})"),
+        None => format!("AWS-LC {awslc}"),
+    }
+}
+
 pub fn log_provider() {
     let awslc = aws_lc_rs::awslc_version();
     let fips =
