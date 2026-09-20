@@ -41,7 +41,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `crypto` | installs the aws-lc-rs provider once | 14 |
 | `error` | the `thiserror` enum every layer returns | |
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |
-| `storage::migrations` | `control.db` schema versions | [migrations.md](migrations.md) |
+| `migrations/*.sql` | `control.db` schema versions | [migrations.md](migrations.md) |
 | `storage::workspace` | the workspace DuckDB file: open with confinement and limits, the `_quack_` tables, statement classification, hybrid retrieval (cosine scan plus BM25 over `_quack_terms`), the document registry, query execution with faithful JSON values | 5.4, 6.1, 7.4 |
 | `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit | 5.3, 8 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |

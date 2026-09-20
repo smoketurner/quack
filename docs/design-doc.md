@@ -392,14 +392,22 @@ provider's is an error with a clear message, never a silent mismatch. Session an
 writes are small and frequent; DuckDB's MVCC handles them alongside ingestion writes in
 one process without a separate database.
 
-### 5.5 `control.db` (server only, SQLite, sea-query)
+### 5.5 `control.db` (server only, SQLite, sea-query queries, SQL-file migrations)
 
 At `<data_dir>/control.db`, opened by `quack serve`, the desktop app, and the admin
 subcommands. It answers one question, who may open which workspace, and holds nothing that
 reveals what a workspace contains.
 
 ```sql
-CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+-- applied schema versions, written by sqlx::migrate! (docs/migrations.md)
+CREATE TABLE _sqlx_migrations (
+    version        BIGINT PRIMARY KEY,
+    description    TEXT NOT NULL,
+    installed_on   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    success        BOOLEAN NOT NULL,
+    checksum       BLOB NOT NULL,        -- SHA-384 of the migration file
+    execution_time BIGINT NOT NULL
+);
 
 CREATE TABLE users (
     id            TEXT PRIMARY KEY,          -- UUID v7

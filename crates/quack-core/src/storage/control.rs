@@ -17,6 +17,16 @@ use super::queries::{ApiTokens, AuditLog, Members, Users, Workspaces};
 use crate::config::Config;
 use crate::error::{Error, Result};
 
+/// The `control.db` schema, as plain SQL files embedded at compile time.
+///
+/// One file per version under `crates/quack-core/migrations/`. A file that has
+/// shipped is frozen: sqlx records a SHA-384 checksum per version in
+/// `_sqlx_migrations` and refuses a database whose recorded checksum no longer
+/// matches. Migrations are never regenerated from the `Iden` enums in
+/// `storage::queries`, because those track the current schema, not history
+/// (`docs/migrations.md`).
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// A workspace row from the control plane.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkspaceRow {
@@ -356,33 +366,53 @@ impl ControlPlane {
             .execute(&self.pool)
             .await?;
 
-        // schema_version itself is created by v1, so bootstrap it first.
-        let bootstrap = super::migrations::v1_statements();
-        if let Some(create_schema_version) = bootstrap.first() {
-            sqlx::query(AssertSqlSafe(create_schema_version.as_str()))
-                .execute(&self.pool)
-                .await?;
-        }
+        self.adopt_legacy_versions().await?;
 
-        let current = self.schema_version().await?;
-
-        for (version, statements) in super::migrations::versions() {
-            if version <= current {
-                continue;
-            }
-            for sql in &statements {
-                sqlx::query(AssertSqlSafe(sql.as_str()))
-                    .execute(&self.pool)
-                    .await?;
-            }
-            sqlx::query("INSERT INTO schema_version (version) VALUES (?)")
-                .bind(version)
-                .execute(&self.pool)
-                .await?;
-            tracing::info!(version, "applied control.db migration");
-        }
+        MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)?;
 
         Ok(())
+    }
+
+    /// Record, without running, the versions a pre-sqlx binary already applied.
+    ///
+    /// Versions 1 to 3 were applied by sea-query DDL builders that tracked
+    /// progress in a `schema_version` table. Replaying them is not idempotent:
+    /// version 2 drops and recreates `audit_log`, which would destroy the
+    /// access record. `schema_version` is left in place, inert, so an older
+    /// binary opening the same file still sees its own versions as applied.
+    async fn adopt_legacy_versions(&self) -> Result<()> {
+        if self.table_exists("_sqlx_migrations").await? || !self.table_exists("schema_version").await? {
+            return Ok(());
+        }
+
+        let legacy: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            .fetch_one(&self.pool)
+            .await?;
+        if legacy <= 0 {
+            return Ok(());
+        }
+
+        tracing::info!(
+            version = legacy,
+            "adopting control.db created before sqlx migrations"
+        );
+        MIGRATOR
+            .skip(&self.pool, Some(legacy))
+            .await
+            .map_err(sqlx::Error::from)?;
+        Ok(())
+    }
+
+    async fn table_exists(&self, name: &str) -> Result<bool> {
+        let found: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
     }
 
     /// Highest applied schema version.
@@ -391,11 +421,11 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn schema_version(&self) -> Result<i64> {
-        Ok(
-            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
-                .fetch_one(&self.pool)
-                .await?,
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success",
         )
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     // --- workspaces -------------------------------------------------------
@@ -1139,6 +1169,95 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// A database from before sqlx migrations: the three sea-query versions
+    /// applied, progress recorded in `schema_version`, and rows in the tables
+    /// that replaying those versions would destroy.
+    async fn legacy_control_db(path: &std::path::Path) {
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let options = SqliteConnectOptions::from_str(&url).unwrap_or_else(|e| fail(&e.to_string()));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let mut sql = String::from(
+            "CREATE TABLE IF NOT EXISTS schema_version (\
+                 version INTEGER PRIMARY KEY, \
+                 applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+        );
+        for file in ["0001_access_control", "0002_audit_log_access_record", "0003_users_and_token_scopes"] {
+            sql.push_str(&std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(format!("{file}.sql")),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string())));
+        }
+        sql.push_str("INSERT INTO schema_version (version) VALUES (1), (2), (3);");
+        sql.push_str(
+            "INSERT INTO audit_log (id, action, outcome, channel) \
+             VALUES ('01890000-0000-7000-8000-000000000001', 'login', 'allowed', 'cli');",
+        );
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_schema_version_is_adopted_without_replaying_migrations() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().to_path_buf();
+        config.ensure_dirs().unwrap_or_else(|e| fail(&e.to_string()));
+        legacy_control_db(&config.control_db_path()).await;
+
+        let cp = ControlPlane::open(&config)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        assert!(cp.schema_version().await.is_ok_and(|v| v == 3));
+        // Replaying v2 would have dropped and recreated audit_log.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&cp.pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(rows, 1, "the access record must survive adoption");
+    }
+
+    #[tokio::test]
+    async fn a_shipped_migration_may_not_change_under_an_existing_database() {
+        let (dir, cp) = open().await;
+        drop(cp);
+
+        // Simulate an edit to a migration that has already been applied.
+        sqlx::raw_sql("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 1")
+            .execute(
+                &SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(
+                        SqliteConnectOptions::from_str(&format!(
+                            "sqlite:{}",
+                            dir.path().join("control.db").display()
+                        ))
+                        .unwrap_or_else(|e| fail(&e.to_string())),
+                    )
+                    .await
+                    .unwrap_or_else(|e| fail(&e.to_string())),
+            )
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().to_path_buf();
+        assert!(
+            ControlPlane::open(&config).await.is_err(),
+            "a changed checksum must refuse the database, not migrate it"
+        );
     }
 
     #[tokio::test]

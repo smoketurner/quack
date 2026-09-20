@@ -34,7 +34,7 @@ sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
-sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "any", "tls-rustls-aws-lc-rs"] }
+sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "any", "migrate", "macros", "tls-rustls-aws-lc-rs"] }
 tar           = { workspace = true }
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
