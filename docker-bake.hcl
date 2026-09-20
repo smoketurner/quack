@@ -26,6 +26,16 @@ target "_common" {
 }
 
 # The release build: reproducible, with a CycloneDX SBOM beside the binary.
+#
+# No `type=gha` cache. This target runs only from the release workflow, and an
+# Actions cache written on a tag ref can only be read back by that same tag, so
+# the entry every release uploaded was never readable by the next one. Writing
+# it was worse than useless: `mode=max` pushes the whole cooked musl dependency
+# tree, several GB per architecture, into the repository's 10 GB cache budget,
+# where it evicts the CI entries that keep ordinary pushes fast (a
+# `workflow_dispatch` run on main shares main's cache scope, so it could evict
+# them directly). Releases are rare and reproducibility matters more there than
+# minutes; local `docker buildx bake ci` still uses the daemon's own cache.
 target "ci" {
   inherits = ["_common"]
   args = {
@@ -33,6 +43,4 @@ target "ci" {
     SOURCE_DATE_EPOCH = SOURCE_DATE_EPOCH
     GENERATE_SBOM     = GENERATE_SBOM
   }
-  cache-from = ["type=gha,scope=bake-ci-${TARGET}"]
-  cache-to   = ["type=gha,mode=max,ignore-error=true,scope=bake-ci-${TARGET}"]
 }

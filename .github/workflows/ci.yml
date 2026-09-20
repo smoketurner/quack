@@ -22,6 +22,16 @@ env:
   # Deny rustc warnings on plain `cargo build`/`cargo test` (cargo >=1.97) without
   # invalidating the build cache the way RUSTFLAGS="-D warnings" would.
   CARGO_BUILD_WARNINGS: deny
+  # Line-tables-only debuginfo (`debug = 1`): test backtraces keep file and line
+  # numbers, but the cached `target/` is roughly half the size. This is what
+  # keeps the caches below inside the repository's 10 GB Actions budget. At full
+  # debuginfo the three entries came to 10.4 GB on their own, so GitHub evicted
+  # them between runs — and only an exact key hit preserves libduckdb-sys's
+  # build-script output, so every eviction cost another ~9 minutes recompiling
+  # DuckDB's C++ amalgamation. rust-cache hashes every CARGO_* variable into its
+  # cache key, so release.yml's gates job has to set this identically or it
+  # cannot restore what CI saved.
+  CARGO_PROFILE_DEV_DEBUG: "1"
 
 jobs:
   fmt:
@@ -35,15 +45,18 @@ jobs:
           persist-credentials: false
       - name: Setup Rust toolchain
         run: rustup show
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v1"
-          shared-key: "fmt"
-          cache-targets: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No rust-cache step: `cargo fmt` shells out to `cargo metadata --no-deps`,
+      # so it never resolves the dependency graph, downloads from the registry,
+      # or writes to `target/`. The entry it used to save held nothing this job
+      # reads and only competed for the repository's cache budget.
       - run: cargo fmt --all --check
 
+  # clippy and test stay separate, parallel jobs with a cache entry each. Folding
+  # them into one job would halve the number of entries, but they only run in
+  # sequence there: measured cold on run 35522371594, clippy 11m36s then tests
+  # 13m08s, 25m08s for the job, against ~13m when the two run side by side.
+  # Keeping both entries is affordable now that the debuginfo setting above has
+  # roughly halved each one.
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -64,7 +77,7 @@ jobs:
           shared-key: "clippy-${{ runner.os }}"
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Unit Tests (${{ matrix.name }})
