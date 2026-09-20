@@ -2,11 +2,11 @@
 
 ## Continuous integration
 
-- **`.github/workflows/ci.yml`** — `fmt`, `check` (clippy then `cargo test --locked`, one
-  job per OS: Linux lints and tests, macOS tests), `dependency-review` (PRs), and
-  `license-check` (`cargo-deny check`). Toolchain from `rust-toolchain.toml` via
-  `rustup show`; caching via `Swatinem/rust-cache`; actions SHA-pinned; `permissions: {}`
-  top-level with per-job `contents: read`.
+- **`.github/workflows/ci.yml`** — `fmt`, `clippy` (`--locked -D warnings`), `test`
+  (`cargo test --locked`, Linux + macOS), `dependency-review` (PRs), and `license-check`
+  (`cargo-deny check`). Toolchain from `rust-toolchain.toml` via `rustup show`; caching via
+  `Swatinem/rust-cache` (see [Build caching](#build-caching)); actions SHA-pinned;
+  `permissions: {}` top-level with per-job `contents: read`.
 - **`.github/workflows/secure_workflows.yml`** — fails CI if any third-party action is used
   without a full commit-SHA pin (`zgosalvez/github-actions-ensure-sha-pinned-actions`).
 - **`.github/dependabot.yml`** — `cargo`, `github-actions`, and `docker` (the base-image
@@ -27,19 +27,20 @@ build script's output. Two constraints shape it:
   generation of entries, so the steady state has to leave room for two.
 - **Only an exact key hit preserves the build-script output.** `rust-cache`'s restore-key
   fallback recovers the registry and some artifacts, but `libduckdb-sys` re-runs, so a
-  near-miss costs the full nine minutes. Cache keys must be stable and shared, not
-  per-job.
+  near-miss costs the full nine minutes. An entry that survives to be hit exactly is worth
+  more than a marginally better-shaped one that gets evicted.
 
 What follows from that:
 
-- **One entry per runner OS**, `v1-check-<os>`, holding the clippy and the test artifacts
-  together — hence the single `check` job rather than separate `clippy` and `test` jobs.
-  The workspace declares no Cargo features, so `--all-features` resolves the same
-  dependency graph `cargo test` does and the two share fingerprints.
-- **`CARGO_PROFILE_DEV_DEBUG: "1"`** (line tables only) roughly halves the cached
-  `target/`. Test backtraces keep file and line numbers. `rust-cache` hashes every
-  `CARGO_*` variable into the key, so `release.yml` sets it identically or its gates job
-  cannot restore what CI saved.
+- **`CARGO_PROFILE_DEV_DEBUG: "1"`** (line tables only) roughly halves each cached
+  `target/`, which is what brings the total inside the budget; test backtraces keep file
+  and line numbers. `rust-cache` hashes every `CARGO_*` variable into the key, so
+  `release.yml` sets it identically or its gates job cannot restore what CI saved.
+- **One entry per job that compiles**: `v1-clippy-<os>` and `v1-debug-<os>`. Folding
+  clippy into the test job would halve the number of entries, but the two then run in
+  sequence rather than side by side — measured cold, 11m36s of clippy plus 13m08s of
+  tests against about 13 minutes for the same work in parallel. Separate entries are
+  affordable at line-tables-only debuginfo, so the jobs stay parallel.
 - **Only pushes to `main` save** (`save-if`); pull requests restore. Tag refs can read
   caches from `main` but write their own scope, which nothing reads back — so no release
   job writes a cache, and none should.
