@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use quack_core::analysis::events::{self, AgentEvent, EventStream, PermissionRequest};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::storage::sessions::{self, ChatMode, MessageRole as StoredRole};
@@ -161,6 +161,7 @@ pub(crate) struct App {
     config: Arc<Config>,
     workspace_id: String,
     db: SharedDb,
+    reader_db: ReaderDb,
     allow_write: bool,
     agent_events: Option<EventStream>,
     /// Cancels the running turn; set while `state` is `Thinking` or
@@ -175,12 +176,17 @@ pub(crate) struct App {
 }
 
 impl App {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one constructor for the terminal session's whole state"
+    )]
     pub(crate) fn new(
         workspace_name: String,
         workspace_id: String,
         provider_display: String,
         config: Arc<Config>,
         db: SharedDb,
+        reader_db: ReaderDb,
         session_id: String,
         allow_write: bool,
     ) -> Result<Self> {
@@ -210,6 +216,7 @@ impl App {
             config,
             workspace_id,
             db,
+            reader_db,
             allow_write,
             agent_events: None,
             turn_cancel: None,
@@ -1627,11 +1634,24 @@ impl App {
 
         let config = Arc::clone(&self.config);
         let db = Arc::clone(&self.db);
+        let reader_db = self.reader_db.clone();
         let session_id = self.session_id.clone();
         tokio::spawn(async move {
             // run_turn emits TurnComplete or Failed itself; the returned
             // value is the same response, so it is not needed here.
-            drop(llm::run_turn(&config, db, &session_id, policy, &message, sink, cancel).await);
+            drop(
+                llm::run_turn(
+                    &config,
+                    db,
+                    reader_db,
+                    &session_id,
+                    policy,
+                    &message,
+                    sink,
+                    cancel,
+                )
+                .await,
+            );
         });
     }
 
@@ -2018,12 +2038,15 @@ mod tests {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Mutex::new(db));
+        let reader_db = ReaderDb::new(Arc::clone(&db));
         App::new(
             String::from("ws"),
             String::from("ws"),
             String::from("o/m"),
             Arc::new(config),
-            Arc::new(Mutex::new(db)),
+            db,
+            reader_db,
             session.id,
             false,
         )

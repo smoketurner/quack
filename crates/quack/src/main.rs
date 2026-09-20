@@ -12,7 +12,7 @@ mod terminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{SharedDb, open_reader};
 use quack_core::config::AuthMode;
 use quack_core::config::Config;
 use quack_core::crypto;
@@ -567,9 +567,11 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         cli.mode.map(ChatMode::from),
     )?;
     let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     let outcome = print::run_prompt(
         &config,
         Arc::clone(&db),
+        reader_db,
         &session_id,
         policy,
         prompt,
@@ -813,12 +815,13 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     let policy = if allow_write {
         WritePolicy::Allow
     } else {
         WritePolicy::Deny
     };
-    mcp::serve_stdio(config, db, workspace, policy).await?;
+    mcp::serve_stdio(config, db, reader_db, workspace, policy).await?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1009,11 +1012,14 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         cli.resume.as_deref(),
         cli.mode.map(ChatMode::from),
     )?;
+    let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     terminal::run(
         config,
         ws_name,
         workspace.id,
-        Arc::new(Mutex::new(ws_db)),
+        db,
+        reader_db,
         session_id,
         cli.allow_write,
     )?;

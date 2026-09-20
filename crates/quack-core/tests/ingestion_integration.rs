@@ -658,9 +658,39 @@ fn classify_mutations_and_escapes_as_write() {
         "SELECT 1; DROP TABLE t",
         "DESCRIBE t; DROP TABLE t",
         "CREATE TABLE u AS SELECT 1",
+        "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
     ] {
         assert_eq!(kind(&db, sql), StatementKind::Write, "{sql}");
     }
+}
+
+/// `EXPLAIN ANALYZE` executes the statement it explains, unlike a plain
+/// `EXPLAIN`, which only prints a plan; before this fix it classified as
+/// `Read` and ran unguarded, letting `EXPLAIN ANALYZE INSERT ...` mutate
+/// under `WritePolicy::Deny`, and, on `POST /sql`, under a viewer role that
+/// never checks `Need::WRITE` for a `Read`-classified statement.
+#[test]
+fn explain_analyze_is_write_and_does_not_mutate_through_read_only() {
+    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    db.execute_statement("CREATE TABLE t(a INT)").unwrap();
+    db.execute_statement("INSERT INTO t VALUES (1)").unwrap();
+
+    assert_eq!(
+        kind(&db, "EXPLAIN ANALYZE INSERT INTO t VALUES (2)"),
+        StatementKind::Write
+    );
+
+    // The same statement, run the way a `Read`-classified one would run
+    // inside `read_only`: it must fail, not mutate.
+    let err = db
+        .read_only(|db| db.execute_statement("EXPLAIN ANALYZE INSERT INTO t VALUES (2)"))
+        .err();
+    assert!(err.is_some(), "EXPLAIN ANALYZE mutated inside read_only");
+    let rows = db.execute_query("SELECT count(*) FROM t").unwrap();
+    assert_eq!(
+        rows.rows.first().and_then(|r| r.first()),
+        Some(&serde_json::Value::Number(1.into()))
+    );
 }
 
 #[test]

@@ -58,9 +58,21 @@ and code — this file is the gate, the doc is the detail.
 - [ ] **The workspace connection is confined at open** (`WorkspaceDb::confine_to`, design
       doc section 7.4): `allowed_directories` is the workspace directory only,
       `enable_external_access` and `allow_persistent_secrets` are off, and
-      `lock_configuration` is on before any user or agent statement runs. Nothing may open
-      a second, unconfined connection to a workspace file, and every `SET` the code needs
-      goes before the lock.
+      `lock_configuration` is on before any user or agent statement runs, and every `SET`
+      the code needs goes before the lock. Every other connection to that workspace file is
+      a `WorkspaceDb::try_clone_reader` clone of that confined one (`duckdb::Connection::
+      try_clone`, a new connection to the same already-open `DatabaseInstance`, which
+      inherits the locked configuration) — never `Connection::open` on a workspace path a
+      second time. **Nothing stops you from doing that, which is why this is a rule.**
+      `DuckDB`'s file lock is advisory and per-process: it refuses a second `quack`
+      process, but two opens inside one process both succeed, both complete the whole
+      confinement sequence, and produce two independent `DatabaseInstance`s that cannot
+      see each other's commits and silently overwrite each other's writes. In-process
+      single-open is therefore ours to enforce — in the server, the per-workspace
+      `OnceCell` in `AppState::workspace_handle`. A reader clone never calls `confine_to`
+      or `apply_resource_limits`
+      again (both `SET`s fail once configuration is locked), and every statement it runs
+      goes through `WorkspaceDb::read_only`, scoped to that one piece of work.
 
 ## Workspace hygiene → [docs/architecture.md](../../docs/architecture.md)
 

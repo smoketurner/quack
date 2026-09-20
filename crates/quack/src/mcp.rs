@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
@@ -98,6 +98,7 @@ impl Auditor {
 struct Inner {
     config: Config,
     db: SharedDb,
+    reader: ReaderDb,
     workspace: WorkspaceRow,
     policy: WritePolicy,
     /// The server user, for session ownership; `None` over stdio.
@@ -192,6 +193,7 @@ impl McpServer {
     pub(crate) fn new(
         config: Config,
         db: SharedDb,
+        reader: ReaderDb,
         workspace: WorkspaceRow,
         policy: WritePolicy,
         user_id: Option<String>,
@@ -201,6 +203,7 @@ impl McpServer {
             inner: Arc::new(Inner {
                 config,
                 db,
+                reader,
                 workspace,
                 policy,
                 user_id,
@@ -226,6 +229,17 @@ impl McpServer {
         with_db(Arc::clone(&self.inner.db), f)
             .await
             .map_err(|e| internal(e.message))
+    }
+
+    /// Like [`Self::db`], but for a tool that only reads: routes through
+    /// the workspace's reader connection instead of the writer, so it
+    /// never queues behind an ingest.
+    async fn reader_db<T, F>(&self, f: F) -> Result<T, McpError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
+    {
+        self.inner.reader.with_db(f).await.map_err(internal)
     }
 
     /// Ask the workspace agent one question. Searches the documents and
@@ -261,6 +275,7 @@ impl McpServer {
         let outcome = llm::run_turn(
             &self.inner.config,
             Arc::clone(&self.inner.db),
+            self.inner.reader.clone(),
             &session_id,
             self.inner.policy,
             &question,
@@ -350,7 +365,7 @@ impl McpServer {
         };
         let text = query.clone();
         let hits = self
-            .db(move |db| {
+            .reader_db(move |db| {
                 let none: [String; 0] = [];
                 match embedding.as_deref() {
                     Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &none),
@@ -394,6 +409,13 @@ impl McpServer {
             StatementKind::Write => true,
             StatementKind::Invalid(message) => return Ok(failure(message)),
         };
+        if is_write && quack_core::analysis::tools::creates_temp_object(&statement) {
+            self.inner
+                .auditor
+                .record("sql", None, Outcome::Denied, Some(detail))
+                .await?;
+            return Ok(failure(quack_core::analysis::tools::TEMP_OBJECT_REFUSED));
+        }
         if is_write && self.inner.policy != WritePolicy::Allow {
             self.inner
                 .auditor
@@ -405,9 +427,23 @@ impl McpServer {
         }
         let sql = statement.clone();
         let max_rows = self.inner.config.analysis.max_query_rows;
-        let result = self
-            .db(move |db| db.execute_query_capped(&sql, max_rows))
-            .await;
+        let result = if is_write {
+            let result = self
+                .db(move |db| db.execute_query_capped(&sql, max_rows))
+                .await;
+            // Whatever ran might have created a temp object the check
+            // above did not catch (a leading comment, a multi-statement
+            // batch); check the writer's catalog regardless of whether
+            // the statement itself errored, since an earlier statement in
+            // a batch can have already run.
+            self.inner.reader.observe_write().await;
+            result
+        } else {
+            // A read never queues behind a write: run it on the reader
+            // connection instead of the writer.
+            self.reader_db(move |db| db.execute_query_capped(&sql, max_rows))
+                .await
+        };
         let outcome = if result.is_ok() {
             Outcome::Allowed
         } else {
@@ -443,7 +479,7 @@ impl McpServer {
                 Some(serde_json::json!({ "what": "tables" })),
             )
             .await?;
-        let tables = self.db(WorkspaceDb::list_tables).await?;
+        let tables = self.reader_db(WorkspaceDb::list_tables).await?;
         Ok(CallToolResult::structured(
             serde_json::json!({ "tables": tables }),
         ))
@@ -509,7 +545,7 @@ impl McpServer {
         let options = self.inner.config.graph.options();
         let detail = serde_json::json!({ "entity": entity, "class": class, "relation": relation, "hops": hops });
         let result = self
-            .db(move |db| {
+            .reader_db(move |db| {
                 if let Some(entity) = entity {
                     let roots = traverse::resolve_entry(
                         db,
@@ -558,7 +594,7 @@ impl McpServer {
         let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
         let (from_label, to_label) = (from.clone(), to.clone());
         let result = self
-            .db(move |db| {
+            .reader_db(move |db| {
                 let from_nodes = traverse::resolve_entry(db, &from_label, None, a.as_deref())?;
                 let to_nodes = traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
                 match (from_nodes.first(), to_nodes.first()) {
@@ -595,7 +631,7 @@ impl McpServer {
                 Some(serde_json::json!({ "what": "documents" })),
             )
             .await?;
-        let documents = self.db(WorkspaceDb::list_documents).await?;
+        let documents = self.reader_db(WorkspaceDb::list_documents).await?;
         Ok(CallToolResult::structured(
             serde_json::json!({ "documents": documents }),
         ))
@@ -671,7 +707,7 @@ impl McpServer {
     async fn describe(&self, name: &str) -> Result<Option<serde_json::Value>, McpError> {
         let table = name.to_owned();
         let described = self
-            .db(move |db| {
+            .reader_db(move |db| {
                 if !db.list_tables()?.contains(&table) {
                     return Ok(None);
                 }
@@ -695,24 +731,24 @@ impl McpServer {
 
     async fn resource_text(&self, uri: &str) -> Result<Option<String>, McpError> {
         if uri == RESOURCE_TABLES {
-            let tables = self.db(WorkspaceDb::list_tables).await?;
+            let tables = self.reader_db(WorkspaceDb::list_tables).await?;
             return Ok(Some(serde_json::json!({ "tables": tables }).to_string()));
         }
         if uri == RESOURCE_DOCUMENTS {
-            let documents = self.db(WorkspaceDb::list_documents).await?;
+            let documents = self.reader_db(WorkspaceDb::list_documents).await?;
             return Ok(Some(
                 serde_json::json!({ "documents": documents }).to_string(),
             ));
         }
         if uri == RESOURCE_ONTOLOGY {
-            let ontology = self.db(ontology_store::current).await?;
+            let ontology = self.reader_db(ontology_store::current).await?;
             return Ok(Some(match ontology {
                 Some(ontology) => ontology.to_json().map_err(internal)?,
                 None => String::from("{}"),
             }));
         }
         if uri == RESOURCE_CONTEXT {
-            let current = self.db(context::current).await?;
+            let current = self.reader_db(context::current).await?;
             return Ok(Some(current.map(|c| c.content).unwrap_or_default()));
         }
         if let Some(rest) = uri.strip_prefix("quack://workspace/tables/")
@@ -772,7 +808,7 @@ impl ServerHandler for McpServer {
                 )
                 .with_mime_type("text/markdown"),
         ];
-        for table in self.db(WorkspaceDb::list_tables).await? {
+        for table in self.reader_db(WorkspaceDb::list_tables).await? {
             resources.push(
                 Resource::new(
                     format!("quack://workspace/tables/{table}/schema"),
@@ -839,10 +875,11 @@ impl ServerHandler for McpServer {
 pub(crate) async fn serve_stdio(
     config: Config,
     db: SharedDb,
+    reader: ReaderDb,
     workspace: WorkspaceRow,
     policy: WritePolicy,
 ) -> anyhow::Result<()> {
-    let server = McpServer::new(config, db, workspace, policy, None, Auditor::None);
+    let server = McpServer::new(config, db, reader, workspace, policy, None, Auditor::None);
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
@@ -870,9 +907,12 @@ mod tests {
         let mut config = Config::default();
         config.general.data_dir = dir.to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Mutex::new(db));
+        let reader = ReaderDb::new(Arc::clone(&db));
         McpServer::new(
             config,
-            Arc::new(Mutex::new(db)),
+            db,
+            reader,
             WorkspaceRow {
                 id: String::from("ws"),
                 name: String::from("stdio"),
@@ -990,10 +1030,13 @@ mod tests {
         .unwrap_or_else(|e| fail(&e.to_string()));
         config.general.data_dir = dir.path().to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let db = Arc::new(Mutex::new(db));
+        let db: SharedDb = Arc::new(Mutex::new(db));
+        let reader =
+            quack_core::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let server = McpServer::new(
             config,
             Arc::clone(&db),
+            reader,
             WorkspaceRow {
                 id: String::from("ws"),
                 name: String::from("stdio"),

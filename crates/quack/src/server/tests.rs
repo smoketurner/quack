@@ -586,6 +586,58 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert!(access_rows.iter().all(|r| r.request_id.is_some()));
 }
 
+/// The obvious `CREATE TEMP TABLE` case never reaches the writer: `POST
+/// /sql` refuses it up front, the same as `run_sql`.
+#[tokio::test]
+async fn sql_refuses_to_create_a_temp_table() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("data", &owner).await;
+    let owner_token = h.login("owner").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &owner_token,
+            serde_json::json!({ "sql": "CREATE TEMP TABLE scratch AS SELECT 1 AS a" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// A leading comment defeats the text-based guard, so the statement runs
+/// and creates a temp table on the writer — the sticky degrade
+/// (`ReaderDb::observe_write`) is what keeps a later read from 422ing with
+/// a Catalog Error, proven end to end through the real HTTP routes.
+#[tokio::test]
+async fn sql_bypass_temp_tables_are_still_visible_after_the_reader_degrades() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("data", &owner).await;
+    let owner_token = h.login("owner").await;
+    let sql = |s: &str| serde_json::json!({ "sql": s });
+
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &owner_token,
+            sql("-- scratch\nCREATE TEMP TABLE scratch AS SELECT 1 AS a"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Reads route through the reader; without the sticky degrade this
+    // would 422 with a Catalog Error instead of seeing the row.
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &owner_token,
+            sql("SELECT * FROM scratch"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0][0], 1);
+}
+
 fn multipart(filename: &str, content_type: &str, data: &str) -> (String, Vec<u8>) {
     let boundary = "quackboundary";
     let body = format!(

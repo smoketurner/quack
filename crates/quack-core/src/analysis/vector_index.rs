@@ -3,15 +3,15 @@ use rig::vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndex}
 use serde::Deserialize;
 use serde_json::json;
 
-use super::tools::SharedDb;
+use super::tools::ReaderDb;
 
 pub struct DuckDbVectorIndex<M> {
-    db: SharedDb,
+    db: ReaderDb,
     embedding_model: M,
 }
 
 impl<M> DuckDbVectorIndex<M> {
-    pub fn new(db: SharedDb, embedding_model: M) -> Self {
+    pub fn new(db: ReaderDb, embedding_model: M) -> Self {
         Self {
             db,
             embedding_model,
@@ -39,13 +39,11 @@ where
 
         let samples = u32::try_from(req.samples()).unwrap_or(5);
 
-        let results = {
-            let db = self.db.lock().map_err(|_| {
-                VectorStoreError::datastore(std::io::Error::other("mutex poisoned"))
-            })?;
-            db.search_similar_chunks(&query_vec, samples, &[])
-                .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?
-        };
+        let results = self
+            .db
+            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &[]))
+            .await
+            .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?;
 
         results
             .into_iter()
@@ -76,13 +74,11 @@ where
 
         let samples = u32::try_from(req.samples()).unwrap_or(5);
 
-        let results = {
-            let db = self.db.lock().map_err(|_| {
-                VectorStoreError::datastore(std::io::Error::other("mutex poisoned"))
-            })?;
-            db.search_similar_chunks(&query_vec, samples, &[])
-                .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?
-        };
+        let results = self
+            .db
+            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &[]))
+            .await
+            .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?;
 
         Ok(results
             .into_iter()

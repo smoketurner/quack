@@ -1451,6 +1451,7 @@ history_token_budget = 32000
 max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
 extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
 extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
+reader_pool_size = 4                    # reader connections per workspace handle, round-robined
 
 [import]
 max_rows = 1000000

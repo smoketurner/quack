@@ -172,6 +172,27 @@ pub struct ChunkText {
     pub text: String,
 }
 
+/// How many chunks [`chunks`] would return, without loading their content:
+/// the graph page shows this as a count, and loading every chunk's full
+/// text just to call `.len()` on the result is wasted work (and, once that
+/// query runs through a reader connection shared by every other read, no
+/// longer confined to the one requester who pays for it).
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn pending_chunk_count(db: &WorkspaceDb) -> Result<i64> {
+    let n = db.connection().query_row(
+        "SELECT count(*) FROM _quack_chunks c \
+         JOIN _quack_documents d ON d.id = c.document_id \
+         WHERE d.status = 'ready' \
+           AND NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(n)
+}
+
 /// Chunks of ready documents not yet extracted under any ontology
 /// version, sampled evenly across documents when `limit` is given
 /// (issue #60: the first N chunks by ingest order were one document's
