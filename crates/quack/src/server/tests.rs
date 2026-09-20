@@ -3107,17 +3107,26 @@ async fn the_login_form_is_rate_limited_and_healthz_is_not() {
     h.user("root", true).await;
     // An unknown username, so each rejection costs only a password hash.
     let form = "username=nobody&password=wrong";
-    let mut limited_after = None;
-    for attempt in 0..(super::LOGIN_RATE_BURST + 4) {
-        let (status, _, _) = h.form("/login", None, form).await;
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            limited_after = Some(attempt);
-            break;
-        }
-    }
+    // The attempts go out together. A sequential loop races the bucket
+    // draining against it refilling a cell every `LOGIN_RATE_PER_SECOND`
+    // seconds, and an argon2 verify in an unoptimized test build can outlast
+    // the refill on a loaded machine, so the budget is never spent and no
+    // attempt is refused (this test failed that way in CI). Concurrent
+    // attempts put every limiter check within microseconds of the others,
+    // whatever the hash behind it costs: the check runs when the request
+    // future is first polled, before the handler awaits anything.
+    let attempts = (0..(super::LOGIN_RATE_BURST + 4)).map(|_| h.form("/login", None, form));
+    let refused = futures::future::join_all(attempts)
+        .await
+        .into_iter()
+        .filter(|(status, _, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    // Everything past the burst is refused; one cell of slack in case the
+    // bucket happens to replenish one mid-pass.
     assert!(
-        limited_after.is_some(),
-        "the form accepted every attempt; it is not throttled"
+        refused >= 3,
+        "{refused} of {} attempts were refused; the form is not throttled",
+        super::LOGIN_RATE_BURST + 4
     );
 
     for _ in 0..(super::LOGIN_RATE_BURST + 4) {
