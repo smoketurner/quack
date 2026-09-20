@@ -16,6 +16,13 @@ and code — this file is the gate, the doc is the detail.
       or `ring` features on any dependency (`deny.toml` bans them).
 - [ ] TLS crates use their rustls **+ aws-lc-rs** features (`rustls` → `aws_lc_rs`,
       `sqlx` → `tls-rustls-aws-lc-rs`, etc.).
+- [ ] **FIPS is Linux-only, by linkage.** `aws-lc-rs` and `rustls` carry their shared
+      features in `[dependencies]` (`crates/quack-core/Cargo.toml`), and the
+      `cfg(target_os = "linux")` section adds `fips` to both. aws-lc-fips-sys
+      links statically only on Linux and BSD; elsewhere a FIPS build needs a shared library
+      beside the binary. The Linux build needs `cmake`, `go`, and
+      `AWS_LC_FIPS_SYS_CC=clang`/`CXX=clang++`; `crypto::install_default_provider` logs the
+      module it installed and a test asserts the gating (`docs/crypto.md`).
 - [ ] Binaries install the default provider **once** at the top of `main`
       (`aws_lc_rs::default_provider().install_default()`), before any TLS use.
 - [ ] After touching TLS deps: `cargo tree -i ring` and `cargo tree -i openssl-sys` return no

@@ -212,29 +212,6 @@ jobs:
         if: matrix.platform == 'macos'
         run: brew list gnu-tar >/dev/null 2>&1 || brew install gnu-tar
 
-      - name: Install NASM (Windows x86_64)
-        # aws-lc-sys assembles its x86_64 Windows assembly with NASM, which the
-        # runner image does not carry. Installing it keeps the build on real
-        # assembly sources instead of the crate's prebuilt objects. NASM 3.x is
-        # too new for aws-lc's assembly, so this tracks the 2.16 series.
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
-        env:
-          NASM_VERSION: "2.16.03"
-          NASM_SHA256: "3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6"
-        run: |
-          set -euo pipefail
-          archive="nasm-${NASM_VERSION}-win64.zip"
-          curl -fsSL --retry 3 --retry-all-errors -o "${archive}" \
-            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/${archive}"
-          echo "${NASM_SHA256}  ${archive}" | sha256sum -c -
-          7z x -bso0 "${archive}" -o"${RUNNER_TEMP}/nasm"
-          rm "${archive}"
-          # GITHUB_PATH must carry a Windows path: the cargo build scripts that
-          # call nasm are native processes, not bash ones.
-          cygpath -w "${RUNNER_TEMP}/nasm/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
-          "${RUNNER_TEMP}/nasm/nasm-${NASM_VERSION}/nasm.exe" -v
-
       - name: Setup Rust toolchain
         if: matrix.platform != 'linux'
         shell: bash

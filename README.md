@@ -24,7 +24,9 @@ Pick one:
 - Run the container. `ghcr.io/smoketurner/quack` starts `quack serve`. Each release also
   attaches an image tarball for hosts that cannot reach a registry. `docker-compose.yml`
   runs the image next to Ollama. See [docs/ci-cd.md](docs/ci-cd.md).
-- Build from source with `cargo build --release`. Linux needs `cmake` and `clang`.
+- Build from source with `cargo build --release`. Linux needs `cmake`, `clang`, and `go`
+  (the FIPS module builds there, see [docs/crypto.md](docs/crypto.md)); macOS and Windows
+  need `cmake` and a C++ compiler.
 
 ## Configure
 

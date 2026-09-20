@@ -24,7 +24,10 @@ section 17 for where the code still lags. The chosen stack:
 - **sea-query** for type-safe SQL generation against `control.db`; bound parameters for
   DuckDB internals
 - **rig** for LLM providers (Ollama, OpenAI-compatible, Anthropic) and the agent loop
-- **aws-lc-rs** as the single crypto/TLS provider (never OpenSSL or `ring`)
+- **aws-lc-rs** as the single crypto/TLS provider (never OpenSSL or `ring`), with its and
+  rustls's `fips` features on Linux, so the distributed musl binaries and the image run on
+  the FIPS-validated AWS-LC module; it is the only family where the FIPS build links
+  statically (`docs/crypto.md`)
 
 ## Repository layout
 
@@ -205,7 +208,8 @@ make fmt       # cargo fmt --all
 make lint      # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test      # cargo test --workspace --all-features
 make deny      # cargo deny check
-make release-gates   # no ring or OpenSSL in the runtime tree, then cargo deny (the release job runs it)
+make release-gates   # no ring or OpenSSL in the runtime tree, then cargo deny
+make crypto-gates    # the tree check alone (what the release job runs; it checks deny separately)
 make image     # the quack serve container image from source (docker buildx)
 make help      # list targets
 ```

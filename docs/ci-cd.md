@@ -30,9 +30,11 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
 
 `release.yml`:
 
-1. **gates** — `cargo fmt --check`, clippy, the test suite, `make release-gates`
+1. **gates** — `cargo fmt --check`, clippy, the test suite, `make crypto-gates`
    (`cargo tree -i ring -e normal` and `-i openssl-sys -e normal` must be empty: aws-lc-rs
-   is the only crypto provider, design doc section 14), and `cargo deny check`.
+   is the only crypto provider, design doc section 14), and `cargo deny check` through the
+   pinned action. The job runs `crypto-gates` rather than `release-gates` because the latter
+   also shells out to `cargo deny`, which is not installed on the runner.
 2. **version** — the tag without its `v`, or `0.0.0-<short sha>` for a manual run.
 3. **build** — calls `reusable-build.yml`. Its `permissions:` block is the ceiling for the
    called jobs (`contents: read`, `packages: write`, `id-token: write`,
@@ -60,10 +62,11 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
    The Linux builds are reproducible static musl binaries through `Dockerfile.build` and
    `docker-bake.hcl` (`rust:<MSRV>-alpine`, cargo-chef, `SOURCE_DATE_EPOCH` from the
    commit) with a CycloneDX SBOM (`cargo-cyclonedx`) beside the binary; the GitHub Actions
-   cache keeps the cooked dependency layer, which is most of the time. The Windows x86_64
-   job installs NASM (checksum-verified, 2.16 series) because aws-lc-sys assembles its
-   x86_64 Windows assembly with it and the runner image has none; the arm64 Windows job
-   needs no NASM and uses the image's clang-cl. Each job then signs (see below), archives
+   cache keeps the cooked dependency layer, which is most of the time. The Linux builds
+   link the FIPS module, so their builders carry `go` next to `cmake` and set
+   `AWS_LC_FIPS_SYS_CC=clang` — see [crypto.md](crypto.md). No runner installs an assembler:
+   on Windows x86_64, rustls's `aws_lc_rs` feature turns on `aws-lc-rs/prebuilt-nasm`, so
+   aws-lc-sys links its shipped objects instead. Each job then signs (see below), archives
    (`.tar.gz`, or `.zip` built with 7-Zip on Windows), writes a `.sha256`, attests build
    provenance for the archive, and attests the SBOM where there is one.
 2. **image** — one job per architecture on its own native runner (`ubuntu-latest`,

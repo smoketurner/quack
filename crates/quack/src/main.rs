@@ -42,10 +42,22 @@ const EXIT_WRITE_REFUSED: u8 = 3;
 /// Exit status when an OAuth provider needs `quack auth login` first.
 const EXIT_AUTH_REQUIRED: u8 = 4;
 
+/// `--version` names the crypto module as well, so an operator can tell a FIPS
+/// binary from a non-FIPS one without turning on `RUST_LOG=info`. `-V` stays
+/// the bare version. A static because clap takes a `&'static str`.
+static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\n{}",
+        env!("CARGO_PKG_VERSION"),
+        quack_core::crypto::provider_description()
+    )
+});
+
 #[derive(Parser)]
 #[command(
     name = "quack",
     version,
+    long_version = LONG_VERSION.as_str(),
     about = "Knowledge engine: documents, tables, and a knowledge graph in one workspace",
     long_about = "With no arguments, starts the interactive terminal session in a workspace.\n\
                   `-p PROMPT` asks the agent one question and prints the answer; \
@@ -1292,6 +1304,9 @@ fn init_logging_at(default: &str) {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
         )
         .init();
+    // The provider is installed at the top of `main`, before any subscriber
+    // exists; this is the first point where saying so reaches a log.
+    crypto::log_provider();
 }
 
 async fn resolve_workspace(workspace_name: Option<&str>) -> Result<(Config, WorkspaceRow, String)> {

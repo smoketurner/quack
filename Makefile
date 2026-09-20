@@ -17,7 +17,7 @@ WORKSPACE ?= storms
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack
 
-.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny release-gates image hooks css-dev css-build run run-server demo-data help
+.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build run run-server demo-data help
 
 all: build
 
@@ -53,10 +53,12 @@ test-coverage: ## Generate an HTML coverage report (requires cargo-llvm-cov)
 test-mutants: ## Run mutation testing (requires cargo-mutants)
 	$(CARGO) mutants
 
-release-gates: ## The crypto gates a release must pass: no ring or OpenSSL at runtime, cargo deny clean
+crypto-gates: ## No ring or OpenSSL in the runtime dependency tree (needs no extra tools)
 	@if $(CARGO) tree -i ring -e normal 2>/dev/null | grep -q ring; then echo "ring is in the runtime dependency tree"; exit 1; fi
 	@if $(CARGO) tree -i openssl-sys -e normal 2>/dev/null | grep -q openssl; then echo "openssl-sys is in the runtime dependency tree"; exit 1; fi
 	@echo "runtime tree is clean of ring and OpenSSL"
+
+release-gates: crypto-gates ## The crypto gates a release must pass: crypto-gates plus cargo deny clean
 	$(CARGO) deny check
 
 image: ## Build the quack serve container image from source: make image [TAG=quack:dev]

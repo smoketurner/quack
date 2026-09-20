@@ -12,8 +12,17 @@
 # Keep this Rust version in sync with rust-toolchain.toml.
 FROM rust:1.98.0-alpine AS base
 # DuckDB (C++) and aws-lc-rs build from source on musl. No openssl: aws-lc-rs
-# is the only crypto provider (deny.toml bans openssl and ring).
-RUN apk add --no-cache musl-dev pkgconfig cmake make perl clang linux-headers g++
+# is the only crypto provider (deny.toml bans openssl and ring). Linux builds
+# use the FIPS module (quack-core's target-gated aws-lc-rs "fips" feature),
+# whose build needs cmake and go: go runs AWS-LC's delocate pass over the
+# generated assembly.
+RUN apk add --no-cache musl-dev pkgconfig cmake make perl clang linux-headers g++ go
+
+# delocate parses what the compiler emits and cannot read gcc's output ("parse
+# error near WS"), so the FIPS module builds with clang while everything else
+# keeps the default toolchain.
+ENV AWS_LC_FIPS_SYS_CC=clang
+ENV AWS_LC_FIPS_SYS_CXX=clang++
 
 RUN cargo install cargo-chef --locked
 

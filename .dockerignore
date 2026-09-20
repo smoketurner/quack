@@ -13,6 +13,8 @@
 
 # Source and compile-time assets
 !crates/quack-core/src/
+# sqlx::migrate!("./migrations") reads these at compile time (docs/migrations.md)
+!crates/quack-core/migrations/
 !crates/quack/src/
 !crates/quack/templates/
 !crates/quack/static/
