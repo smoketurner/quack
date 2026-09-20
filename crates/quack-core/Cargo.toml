@@ -43,12 +43,7 @@ tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
-# The crypto module is chosen per target. FIPS is Linux-only, and not for want
-# of tooling: aws-lc-fips-sys emits a *static* library only for Linux and BSD on
-# x86_64 and aarch64 (builder/main.rs, `impl Default for OutputLibType`). A macOS
-# FIPS build links libcrypto.dylib, which a single-file release archive cannot
-# carry, and Windows has no pre-generated FIPS bindings at all. The Linux FIPS
-# build needs cmake and go on the builder. See docs/crypto.md.
+# FIPS on Linux only: aws-lc-fips-sys links statically nowhere else (docs/crypto.md).
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, features = ["keychain"] }
 
