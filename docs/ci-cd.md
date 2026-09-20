@@ -21,10 +21,11 @@ Every workflow declares a `concurrency` group, and the choice of whether to canc
 queue follows from what the run would leave behind:
 
 - **`ci.yml` and `secure_workflows.yml` cancel.** A new commit supersedes the run before
-  it, so the group is `<workflow>-<ref>` with `cancel-in-progress`. `ci.yml` makes one
-  exception: on `refs/heads/main` it does not cancel, because cancelling a job skips its
+  it, so the group is `<workflow>-<ref>` with `cancel-in-progress`. `ci.yml` makes two
+  exceptions: on `refs/heads/main` it does not cancel, because cancelling a job skips its
   `Post Setup Rust cache` step, and `main` is the only ref that saves a cache — auto
-  cancelling there would starve every other run's restore.
+  cancelling there would starve every other run's restore; and it does not cancel a
+  `merge_group` run, because a cancelled required check drops the entry from the queue.
 - **`release.yml` queues.** Its group is the constant `release` rather than a per-ref
   name, so a second tag waits for the first instead of running beside it, and
   `cancel-in-progress` is `false`. Two releases in flight would race on the
@@ -37,6 +38,38 @@ queue follows from what the run would leave behind:
 Both `ci.yml` and `secure_workflows.yml` scope their `push:` trigger to `main`, so a
 branch with an open pull request runs each one once, on the `pull_request` event, rather
 than twice.
+
+### Merge queue
+
+`main` is behind a merge queue (the `main` ruleset, squash merges, `ALLGREEN` grouping).
+Two pieces have to line up or the queue stops gating anything:
+
+1. **`ci.yml` triggers on `merge_group`.** The queue builds each entry on its own
+   `refs/heads/gh-readonly-queue/main/...` ref and dispatches `merge_group`, which is
+   neither `push` nor `pull_request`. Without the trigger no workflow runs against that
+   ref.
+2. **The ruleset lists the checks.** The queue waits only on checks the branch ruleset
+   marks required; with an empty list it merges an entry the moment it is enqueued. The
+   required set is `Format`, `Clippy`, `Unit Tests (linux)`, `Unit Tests (macos)`, and
+   `License, Advisory & Ban Check`:
+
+   ```bash
+   gh api repos/smoketurner/quack/rulesets/23731779 --jq '.rules'   # inspect
+   ```
+
+Two jobs are deliberately **not** required, because a required check that never reports
+deadlocks the entry for the full `check_response_timeout_minutes`:
+
+- **`Dependency Review`** is `if: github.event_name == 'pull_request'` and
+  `dependency-review-action` only works in a pull request context, so it skips on a
+  merge group.
+- **`Harden Security`** (`secure_workflows.yml`) filters on `paths: .github/workflows/**`,
+  so it never starts for a merge group whose entries touch no workflow file. It also has
+  no `merge_group` trigger for the same reason. Nothing is lost: combining pull requests
+  cannot introduce an unpinned action that the per-pull-request run did not already see.
+
+Adding the required checks before `ci.yml`'s `merge_group` trigger is on `main` would
+deadlock the queue, so that order matters when reconstructing this setup.
 
 ### Build caching
 
