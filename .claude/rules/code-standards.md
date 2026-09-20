@@ -16,9 +16,9 @@ and code — this file is the gate, the doc is the detail.
       or `ring` features on any dependency (`deny.toml` bans them).
 - [ ] TLS crates use their rustls **+ aws-lc-rs** features (`rustls` → `aws_lc_rs`,
       `sqlx` → `tls-rustls-aws-lc-rs`, etc.).
-- [ ] **FIPS is Linux-only, by linkage.** `aws-lc-rs` and `rustls` are declared per target
-      in `crates/quack-core/Cargo.toml`: `fips` under `cfg(target_os = "linux")`,
-      `aws-lc-sys` and `aws_lc_rs` under `cfg(not(target_os = "linux"))`. aws-lc-fips-sys
+- [ ] **FIPS is Linux-only, by linkage.** `aws-lc-rs` and `rustls` carry their shared
+      features in `[dependencies]` (`crates/quack-core/Cargo.toml`), and the
+      `cfg(target_os = "linux")` section adds `fips` to both. aws-lc-fips-sys
       links statically only on Linux and BSD; elsewhere a FIPS build needs a shared library
       beside the binary. The Linux build needs `cmake`, `go`, and
       `AWS_LC_FIPS_SYS_CC=clang`/`CXX=clang++`; `crypto::install_default_provider` logs the

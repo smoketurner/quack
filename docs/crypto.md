@@ -21,15 +21,15 @@ build, and no ambiguity about which backend rustls picks at runtime.
 - Features: `reqwest` and `rig` with `rustls`, `sqlx` with `tls-rustls-aws-lc-rs` (the
   Postgres import). SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
   AES-256-GCM for the OAuth token cache from `aws_lc_rs::aead`.
-- `aws-lc-rs` and `rustls` are declared per target, not once (`crates/quack-core/Cargo.toml`):
-  `fips` on Linux, `aws-lc-sys` and `aws_lc_rs` everywhere else. Nothing names the
-  `aws-lc-sys` feature for its own sake — rustls's `aws_lc_rs` feature already enables it,
-  along with `aws-lc-rs/prebuilt-nasm`. `crates/quack` declares neither: it installs the
-  provider through `quack_core::crypto` and uses no rustls API of its own.
-- Both rustls declarations carry `prefer-post-quantum`, so `X25519MLKEM768` leads the key
-  exchange list instead of trailing it. It survives the FIPS build too: that hybrid sends
-  the ML-KEM share first (`post_quantum_first: true`), and rustls's `fips()` for a hybrid
-  defers to whichever half comes first, which is approved when the library is in FIPS mode.
+- `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
+  (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`
+  to both — Cargo unions the feature sets, so Linux gets FIPS and nothing else changes.
+  `crates/quack` declares neither: it installs the provider through `quack_core::crypto`
+  and uses no rustls API of its own.
+- `rustls` carries `prefer-post-quantum`, so `X25519MLKEM768` leads the key exchange list
+  instead of trailing it. It survives the FIPS build too: that hybrid sends the ML-KEM
+  share first (`post_quantum_first: true`), and rustls's `fips()` for a hybrid defers to
+  whichever half comes first, which is approved when the library is in FIPS mode.
 
 ## FIPS on Linux
 
