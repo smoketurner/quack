@@ -24,6 +24,12 @@ build, and no ambiguity about which backend rustls picks at runtime.
   logging; `-V` stays the bare version. The AWS-LC library version is the one that matters
   for a CVE or a certificate — aws-lc-rs exposes no runtime API for its own crate version,
   which stays in `Cargo.lock`.
+- Both numbers come from `aws_lc_rs::awslc_version()` and `aws_lc_rs::fips_version()`,
+  added in [aws/aws-lc-rs#1167](https://github.com/aws/aws-lc-rs/pull/1167) and present in
+  the pinned 1.18.1, so the pin cannot move backwards past that release.
+  `fips_version()` is `None` for every `aws-lc-sys` build, which is what the `AWS-LC FIPS`
+  label keys on; it is resolved from the headers at build time, so the log line asks
+  `CryptoProvider::fips()` instead for what rustls actually installed.
 - Features: `reqwest` and `rig` with `rustls`, `sqlx` with `tls-rustls-aws-lc-rs` (the
   Postgres import). SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
   AES-256-GCM for the OAuth token cache from `aws_lc_rs::aead`.
