@@ -1676,6 +1676,32 @@ impl Harness {
         )
     }
 
+    /// A form POST that arrives from `peer`, so the handler sees the same
+    /// `ConnectInfo` the real server sets.
+    async fn form_from(
+        &self,
+        path: &str,
+        peer: &str,
+        form: &str,
+    ) -> (StatusCode, String, axum::http::HeaderMap) {
+        let addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|e| fail(&format!("{e}")));
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form.to_owned()))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        let (status, body, headers) = self.send(request).await;
+        (
+            status,
+            body.as_str().unwrap_or_default().to_owned(),
+            headers,
+        )
+    }
+
     async fn form(
         &self,
         path: &str,
@@ -1699,6 +1725,17 @@ impl Harness {
             headers,
         )
     }
+}
+
+/// Every `Set-Cookie` on a response, joined, so one assertion can look for
+/// an attribute or its absence.
+fn set_cookie(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn location(headers: &axum::http::HeaderMap) -> String {
@@ -2938,4 +2975,132 @@ fn urlencode(text: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
+}
+
+/// Issue #73: a session dies once it has sat unused for
+/// `[server].session_idle_minutes`, and the token is then refused and
+/// forgotten rather than quietly treated as an unknown API token.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_session_expires_and_is_audited() {
+    let mut config = Config::default();
+    // Zero is "already idle", so the very next request is past the bound.
+    config.server.session_idle_minutes = 0;
+    let h = harness_with(false, config).await;
+    h.user("root", true).await;
+    let token = h.login("root").await;
+
+    let (status, body) = h.get("/api/v1/workspaces", &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("session expired"),
+        "{body}"
+    );
+    let denied = h
+        .audit(AuditFilter {
+            action: Some(String::from("session")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied.first().map(|r| r.outcome.as_str()), Some("denied"));
+    // The second attempt finds nothing left to expire, so it falls through
+    // to the token path: the entry really was dropped.
+    let (status, body) = h.get("/api/v1/workspaces", &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown token"),
+        "{body}"
+    );
+}
+
+/// The absolute bound is separate from the idle one: a session in constant
+/// use still dies at `[server].session_max_age_hours`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_expires_at_its_absolute_age_however_busy() {
+    let mut config = Config::default();
+    config.server.session_max_age_hours = 0;
+    // Generous idle bound, so only the absolute one can fire.
+    config.server.session_idle_minutes = 600;
+    let h = harness_with(false, config).await;
+    h.user("root", true).await;
+    let token = h.login("root").await;
+
+    let (status, body) = h.get("/api/v1/workspaces", &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("session expired"),
+        "{body}"
+    );
+}
+
+/// The cookie carries `Secure` for anything that did not arrive on
+/// loopback, and a `Max-Age` matching the session's absolute lifetime, so a
+/// browser drops it when the server would.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_cookie_is_secure_off_loopback_and_carries_max_age() {
+    let h = harness(false).await;
+    h.user("root", true).await;
+
+    let (status, _, headers) = h
+        .form_from("/login", "127.0.0.1:51000", "username=root&password=pw")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let local = set_cookie(&headers);
+    assert!(local.contains("quack_session="), "{local}");
+    assert!(local.contains("HttpOnly"), "{local}");
+    assert!(local.contains("SameSite=Lax"), "{local}");
+    // 12 hours, the default absolute lifetime.
+    assert!(local.contains("Max-Age=43200"), "{local}");
+    assert!(
+        !local.contains("Secure"),
+        "plain HTTP on loopback is the normal local case: {local}"
+    );
+
+    let (status, _, headers) = h
+        .form_from("/login", "203.0.113.7:51000", "username=root&password=pw")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let remote = set_cookie(&headers);
+    assert!(
+        remote.contains("Secure"),
+        "a cookie minted off-loopback must never go back in the clear: {remote}"
+    );
+    assert!(remote.contains("Max-Age=43200"), "{remote}");
+}
+
+/// Issue #73: the browser login form is throttled the way the API login
+/// already was, and `/healthz` stays outside every limiter so a health probe
+/// can never be made to look like a dead server.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_login_form_is_rate_limited_and_healthz_is_not() {
+    let h = harness(false).await;
+    h.user("root", true).await;
+    // An unknown username, so each rejection costs only a password hash.
+    let form = "username=nobody&password=wrong";
+    let mut limited_after = None;
+    for attempt in 0..(super::LOGIN_RATE_BURST + 4) {
+        let (status, _, _) = h.form("/login", None, form).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited_after = Some(attempt);
+            break;
+        }
+    }
+    assert!(
+        limited_after.is_some(),
+        "the form accepted every attempt; it is not throttled"
+    );
+
+    for _ in 0..(super::LOGIN_RATE_BURST + 4) {
+        let (status, body) = h.call(Method::GET, "/healthz", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
 }

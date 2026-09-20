@@ -5,18 +5,23 @@
 //! yields a user. [`Access`] then checks membership, role, and token scope
 //! for one workspace and writes the denied audit row itself, so a handler
 //! that gets an `Access` back has already been authorized.
+//!
+//! [`password_login`] is the one place a password is checked, for both the
+//! JSON API and the browser form (issue #73).
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum_extra::extract::CookieJar;
+use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::storage::control::{
-    AuditEntry, Channel, Outcome, Role, Scope, TokenRow, WorkspaceRow, sha256_hex,
+    AuditEntry, Channel, Outcome, Role, Scope, TokenRow, UserRow, WorkspaceRow, sha256_hex,
 };
+use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
-use super::state::App;
+use super::state::{App, SessionLookup};
 use quack_core::storage::audit;
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
@@ -24,6 +29,9 @@ pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// The implicit user in `--local` mode.
 pub(crate) const LOCAL_USER_ID: &str = "local";
+
+/// The audit action both login paths record, under either outcome.
+const LOGIN_ACTION: &str = "login";
 
 /// How the caller authenticated.
 #[derive(Debug, Clone)]
@@ -86,6 +94,102 @@ impl Identity {
     }
 }
 
+/// The address the request came from, when the server recorded one. In
+/// production `into_make_service_with_connect_info` always does; the
+/// `oneshot` tests never do.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Peer(pub Option<SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Peer {
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> {
+        std::future::ready(Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0),
+        )))
+    }
+}
+
+impl Peer {
+    /// Whether a cookie set on this response must carry `Secure`. Anything
+    /// that did not come from loopback may have crossed a network, including
+    /// the hop in front of a TLS-terminating proxy, so the cookie must never
+    /// go back in the clear. Loopback is the plain-HTTP local case, and an
+    /// unknown peer is treated the same way.
+    fn needs_secure(self) -> bool {
+        self.0.is_some_and(|addr| !addr.ip().is_loopback())
+    }
+
+    fn ip(self) -> Option<String> {
+        self.0.map(|addr| addr.ip().to_string())
+    }
+}
+
+/// The session cookie for a freshly opened session. `Max-Age` matches the
+/// session's absolute lifetime, so the browser drops it when the server
+/// would rather than holding a token that can only be refused.
+pub(crate) fn session_cookie(app: &App, peer: Peer, token: String) -> Cookie<'static> {
+    let cookie = Cookie::build((SESSION_COOKIE, token))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(peer.needs_secure());
+    match app.config.server.session_max_age().try_into() {
+        Ok(max_age) => cookie.max_age(max_age).build(),
+        // Out of range only for a lifetime no operator can configure. A
+        // cookie without `Max-Age` still dies with the browser session, and
+        // the server expires the session itself regardless.
+        Err(_) => cookie.build(),
+    }
+}
+
+/// Check a password and open a session, for both login paths. Either
+/// outcome is audited with the address and request id the caller came in
+/// with; the rate limiter on the two login routes is what makes guessing
+/// expensive.
+pub(crate) async fn password_login(
+    app: &App,
+    peer: Peer,
+    request_id: Option<String>,
+    username: &str,
+    password: &str,
+) -> ApiResult<(UserRow, String)> {
+    let verified = app.control.verify_password(username, password).await?;
+    let mut entry = AuditEntry::new(
+        LOGIN_ACTION,
+        if verified.is_some() {
+            Outcome::Allowed
+        } else {
+            Outcome::Denied
+        },
+        Channel::Web,
+    );
+    entry.user_id = match &verified {
+        Some(user) => Some(user.id.clone()),
+        // Name the account a wrong password was aimed at, when there is one.
+        None => app
+            .control
+            .find_user_by_username(username)
+            .await?
+            .map(|u| u.id),
+    };
+    entry.client_addr = peer.ip();
+    entry.request_id = request_id;
+    app.control.record_audit(&entry).await?;
+
+    let Some(user) = verified else {
+        return Err(ApiError::unauthorized("wrong username or password"));
+    };
+    let token = app.open_web_session(&user.id)?;
+    Ok((user, token))
+}
+
 fn bearer(parts: &Parts) -> Option<String> {
     parts
         .headers
@@ -96,17 +200,21 @@ fn bearer(parts: &Parts) -> Option<String> {
         .map(|t| t.trim().to_owned())
 }
 
+/// The id the request-id layer set, for an audit row written where there is
+/// no [`Identity`] to carry it — the login paths have no caller yet.
+pub(crate) fn request_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
 fn request_meta(parts: &Parts) -> (Option<String>, Option<String>) {
     let addr = parts
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().to_string());
-    let request_id = parts
-        .headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    (addr, request_id)
+    (addr, request_id(&parts.headers))
 }
 
 impl FromRequestParts<App> for Identity {
@@ -136,21 +244,33 @@ impl FromRequestParts<App> for Identity {
             return Err(ApiError::unauthorized("log in or send a bearer token"));
         };
 
-        if let Some(user_id) = app.web_session_user(&presented) {
-            let user = app
-                .control
-                .get_user(&user_id)
-                .await?
-                .ok_or_else(|| ApiError::unauthorized("session user no longer exists"))?;
-            return Ok(Self {
-                user_id: user.id,
-                username: user.username,
-                is_admin: user.is_admin,
-                credential: Credential::Session(presented),
-                client_addr,
-                request_id,
-                via_mcp: false,
-            });
+        match app.web_session_user(&presented) {
+            SessionLookup::Active(user_id) => {
+                let user = app
+                    .control
+                    .get_user(&user_id)
+                    .await?
+                    .ok_or_else(|| ApiError::unauthorized("session user no longer exists"))?;
+                return Ok(Self {
+                    user_id: user.id,
+                    username: user.username,
+                    is_admin: user.is_admin,
+                    credential: Credential::Session(presented),
+                    client_addr,
+                    request_id,
+                    via_mcp: false,
+                });
+            }
+            // Saying so, rather than falling through to "unknown token",
+            // is what lets a browser tell an expired login from a bad one.
+            SessionLookup::Expired => {
+                let mut entry = AuditEntry::new("session", Outcome::Denied, Channel::Web);
+                entry.client_addr = client_addr;
+                entry.request_id = request_id;
+                app.control.record_audit(&entry).await?;
+                return Err(ApiError::unauthorized("session expired; log in again"));
+            }
+            SessionLookup::Unknown => {}
         }
 
         let hash = sha256_hex(presented.as_bytes());

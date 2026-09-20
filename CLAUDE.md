@@ -188,7 +188,13 @@ ingestion path as a document with source `import` and the redacted URL as title.
 `quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`,
 and `access()` resolves the workspace, checks role and token scope, and writes the denied
-audit row itself, so a handler holding an `Access` is already authorized. Every
+audit row itself, so a handler holding an `Access` is already authorized. Both login paths
+go through one `auth::password_login`, and a browser session expires at
+`[server].session_max_age_hours` or after `session_idle_minutes` unused, whichever is first
+(`state::SessionLookup`); its cookie is `HttpOnly`, `SameSite=Lax`, `Max-Age`d to the
+absolute lifetime, and `Secure` unless the request came from loopback. One `tower_governor`
+limiter covers the web UI, the API, and MCP, with a tighter one on the two login routes and
+none on `/healthz` (design doc 12). Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
 through `Access::audit`. `query/stream` forwards the agent event stream as SSE (`text`,
 `tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 and are processed

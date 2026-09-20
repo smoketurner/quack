@@ -41,6 +41,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const RATE_PER_SECOND: u64 = 1;
 const RATE_BURST: u32 = 120;
 
+/// The same, for the two endpoints that check a password. The general limit
+/// is sized for a browsing session and is far too loose to make password
+/// guessing expensive, so the login routes carry their own (issue #73).
+const LOGIN_RATE_PER_SECOND: u64 = 2;
+const LOGIN_RATE_BURST: u32 = 10;
+
 #[derive(Clone)]
 struct RequestIdV7;
 
@@ -75,6 +81,27 @@ impl KeyExtractor for CallerKey {
     }
 }
 
+/// Put the login limiter in front of one route. Each call builds its own
+/// bucket, so a browser hammering the form cannot spend the budget the API
+/// login would have had, or the other way round.
+pub(crate) fn throttled_login(
+    route: axum::routing::MethodRouter<App>,
+) -> axum::routing::MethodRouter<App> {
+    let config = GovernorConfigBuilder::default()
+        .per_second(LOGIN_RATE_PER_SECOND)
+        .burst_size(LOGIN_RATE_BURST)
+        .key_extractor(CallerKey)
+        .finish()
+        .map(Arc::new);
+    let Some(config) = config else {
+        // Unreachable with constants this builder accepts; an unthrottled
+        // login is still better than a server that will not start.
+        tracing::error!("login rate limiter could not be built; logins are not throttled");
+        return route;
+    };
+    route.layer(GovernorLayer::new(config))
+}
+
 pub(crate) fn router(app: App) -> Router {
     let upload_limit = usize::try_from(app.config.ingestion.upload_max_mb)
         .unwrap_or(usize::MAX)
@@ -85,15 +112,20 @@ pub(crate) fn router(app: App) -> Router {
         .key_extractor(CallerKey)
         .finish()
         .map(Arc::new);
-    let mut api = api::router();
+    // Everything a caller can reach is rate limited, not just the API: the
+    // web UI drives the same handlers, and MCP drives the agent. `/healthz`
+    // stays outside, because a throttled health check reads as a dead
+    // server to whatever is watching it.
+    let mut limited = Router::new()
+        .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
+        .nest("/api/v1", api::router())
+        .merge(web::router());
     if let Some(config) = governor {
-        api = api.layer(GovernorLayer::new(config));
+        limited = limited.layer(GovernorLayer::new(config));
     }
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
-        .nest("/api/v1", api)
-        .merge(web::router())
+        .merge(limited)
         .layer(DefaultBodyLimit::max(upload_limit))
         // One span per request, carrying the id the request-id layer set
         // (it is the outer layer, so the header exists here); the response
