@@ -22,6 +22,14 @@ env:
   # Deny rustc warnings on plain `cargo build`/`cargo test` (cargo >=1.97) without
   # invalidating the build cache the way RUSTFLAGS="-D warnings" would.
   CARGO_BUILD_WARNINGS: deny
+  # Line-tables-only debuginfo (`debug = 1`): test backtraces keep file and line
+  # numbers, but the cached `target/` is roughly half the size. The repository
+  # gets 10 GB of Actions cache in total, and full-debuginfo entries overran it,
+  # so GitHub evicted them between runs and every job recompiled DuckDB's C++
+  # amalgamation from scratch (~9 minutes). rust-cache hashes every CARGO_*
+  # variable into its cache key, so release.yml's gates job has to set this
+  # identically or it cannot restore what CI saved.
+  CARGO_PROFILE_DEV_DEBUG: "1"
 
 jobs:
   fmt:
@@ -35,39 +43,14 @@ jobs:
           persist-credentials: false
       - name: Setup Rust toolchain
         run: rustup show
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v1"
-          shared-key: "fmt"
-          cache-targets: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No rust-cache step: `cargo fmt` shells out to `cargo metadata --no-deps`,
+      # so it never resolves the dependency graph, downloads from the registry,
+      # or writes to `target/`. The entry it used to save held nothing this job
+      # reads and only competed for the repository's cache budget.
       - run: cargo fmt --all --check
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
-      - name: Setup Rust toolchain
-        run: rustup show
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v1"
-          shared-key: "clippy-${{ runner.os }}"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-  test:
-    name: Unit Tests (${{ matrix.name }})
+  check:
+    name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -75,11 +58,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux
+          - label: Lint & Test (linux)
             runner: ubuntu-latest
+            lint: true
             install-deps: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
-          - name: macos
+          - label: Test (macos)
             runner: macos-latest
+            lint: false
             install-deps: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,13 +75,22 @@ jobs:
         run: ${{ matrix.install-deps }} # zizmor: ignore[template-injection] — static matrix value
       - name: Setup Rust toolchain
         run: rustup show
+      # One cache entry per runner OS, holding the clippy and the test artifacts
+      # together. Clippy used to be a separate job with its own entry; two
+      # multi-GB entries per OS did not fit the 10 GB budget alongside macOS, so
+      # they evicted each other and both jobs rebuilt DuckDB every run. The
+      # workspace declares no Cargo features, so `--all-features` resolves to the
+      # same dependency graph `cargo test` uses and the two share fingerprints.
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: "v1"
-          shared-key: "debug-${{ runner.os }}"
+          shared-key: "check-${{ runner.os }}"
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+      - name: Clippy
+        if: matrix.lint
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --locked --workspace
 

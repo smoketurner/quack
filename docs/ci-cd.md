@@ -2,11 +2,11 @@
 
 ## Continuous integration
 
-- **`.github/workflows/ci.yml`** — `fmt`, `clippy` (`--locked -D warnings`), `test`
-  (`cargo test --locked`, Linux + macOS), `dependency-review` (PRs), and `license-check`
-  (`cargo-deny check`). Toolchain from `rust-toolchain.toml` via `rustup show`; caching via
-  `Swatinem/rust-cache`; actions SHA-pinned; `permissions: {}` top-level with per-job
-  `contents: read`.
+- **`.github/workflows/ci.yml`** — `fmt`, `check` (clippy then `cargo test --locked`, one
+  job per OS: Linux lints and tests, macOS tests), `dependency-review` (PRs), and
+  `license-check` (`cargo-deny check`). Toolchain from `rust-toolchain.toml` via
+  `rustup show`; caching via `Swatinem/rust-cache`; actions SHA-pinned; `permissions: {}`
+  top-level with per-job `contents: read`.
 - **`.github/workflows/secure_workflows.yml`** — fails CI if any third-party action is used
   without a full commit-SHA pin (`zgosalvez/github-actions-ensure-sha-pinned-actions`).
 - **`.github/dependabot.yml`** — `cargo`, `github-actions`, and `docker` (the base-image
@@ -14,6 +14,43 @@
 
 Work lands as commits on the main branch; CI runs on push. Releases are the only other
 workflow, and it runs on tags alone so it never spends minutes on ordinary pushes.
+
+### Build caching
+
+Compiling DuckDB's C++ amalgamation (`libduckdb-sys`) takes around nine minutes and is
+most of what any cold job here does, so the whole caching layout exists to keep that one
+build script's output. Two constraints shape it:
+
+- **The repository gets 10 GB of Actions cache in total.** Past that GitHub evicts
+  least-recently-used entries, and it does so mid-run: a job that saves a fresh entry can
+  evict the one a parallel job is about to restore. Every `Cargo.lock` change starts a new
+  generation of entries, so the steady state has to leave room for two.
+- **Only an exact key hit preserves the build-script output.** `rust-cache`'s restore-key
+  fallback recovers the registry and some artifacts, but `libduckdb-sys` re-runs, so a
+  near-miss costs the full nine minutes. Cache keys must be stable and shared, not
+  per-job.
+
+What follows from that:
+
+- **One entry per runner OS**, `v1-check-<os>`, holding the clippy and the test artifacts
+  together — hence the single `check` job rather than separate `clippy` and `test` jobs.
+  The workspace declares no Cargo features, so `--all-features` resolves the same
+  dependency graph `cargo test` does and the two share fingerprints.
+- **`CARGO_PROFILE_DEV_DEBUG: "1"`** (line tables only) roughly halves the cached
+  `target/`. Test backtraces keep file and line numbers. `rust-cache` hashes every
+  `CARGO_*` variable into the key, so `release.yml` sets it identically or its gates job
+  cannot restore what CI saved.
+- **Only pushes to `main` save** (`save-if`); pull requests restore. Tag refs can read
+  caches from `main` but write their own scope, which nothing reads back — so no release
+  job writes a cache, and none should.
+- **`fmt` is not cached.** `cargo fmt` runs `cargo metadata --no-deps`, so it touches
+  neither the registry nor `target/`.
+- **Nothing caches a `--release` build.** CI builds only the dev profile, so a
+  `release-<target>` key would have no writer, and funding one would evict the entries
+  that keep every push fast. The macOS and Windows release builds are cold by design.
+
+If cache pressure returns, `gh api repos/smoketurner/quack/actions/cache/usage` reports the
+total and `gh cache list` the entries; stale generations can go with `gh cache delete`.
 
 ## Releases (`release.yml` + `reusable-build.yml`)
 
@@ -30,7 +67,9 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
 
 `release.yml`:
 
-1. **gates** — `cargo fmt --check`, clippy, the test suite, `make crypto-gates`
+1. **gates** — `cargo fmt --check`, clippy, the test suite (restoring CI's `v1-check-Linux`
+   cache read-only, which is why its `CARGO_*` environment has to match `ci.yml`),
+   `make crypto-gates`
    (`cargo tree -i ring -e normal` and `-i openssl-sys -e normal` must be empty: aws-lc-rs
    is the only crypto provider, design doc section 14), and `cargo deny check` through the
    pinned action. The job runs `crypto-gates` rather than `release-gates` because the latter
@@ -61,8 +100,10 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
 
    The Linux builds are reproducible static musl binaries through `Dockerfile.build` and
    `docker-bake.hcl` (`rust:<MSRV>-alpine`, cargo-chef, `SOURCE_DATE_EPOCH` from the
-   commit) with a CycloneDX SBOM (`cargo-cyclonedx`) beside the binary; the GitHub Actions
-   cache keeps the cooked dependency layer, which is most of the time. The Linux builds
+   commit) with a CycloneDX SBOM (`cargo-cyclonedx`, installed in the base layer so a
+   source change does not rebuild it) beside the binary. Within one run, cargo-chef keeps
+   the cooked dependency layer off the critical path; across runs there is no layer cache,
+   for the reason given under [Build caching](#build-caching). The Linux builds
    link the FIPS module, so their builders carry `go` next to `cmake` and set
    `AWS_LC_FIPS_SYS_CC=clang` — see [crypto.md](crypto.md). No runner installs an assembler:
    on Windows x86_64, rustls's `aws_lc_rs` feature turns on `aws-lc-rs/prebuilt-nasm`, so
@@ -108,8 +149,9 @@ gh attestation verify oci://ghcr.io/smoketurner/quack:<version> --owner smoketur
   --signer-workflow smoketurner/quack/.github/workflows/reusable-build.yml
 ```
 
-Every action is SHA-pinned; `rust-cache` runs restore-only (`save-if: false`) in the build
-workflow so release artifacts never write to a cache that a pull request could poison.
+Every action is SHA-pinned. No job in `reusable-build.yml` reads or writes an Actions
+cache, and `release.yml`'s gates job runs `rust-cache` restore-only (`save-if: false`), so
+a release never writes a cache a later run could be poisoned by.
 
 ## Container images
 

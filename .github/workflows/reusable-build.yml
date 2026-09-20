@@ -221,16 +221,13 @@ jobs:
           rustup show
           rustup target add "${TARGET}"
 
-      - name: Setup Rust cache
-        if: matrix.platform != 'linux'
-        # Restore-only: a release build must never write a cache entry, and it
-        # reads only tag-scoped ones, so there is no poisoning path.
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
-        with:
-          prefix-key: "v1"
-          shared-key: "release-${{ matrix.target }}"
-          save-if: "false"
-
+      # No rust-cache step here, deliberately. These are `--release` builds of
+      # targets CI never builds, so nothing ever writes a `release-<target>` key
+      # — the restore-only step this replaces always missed. Populating one is
+      # not affordable either: the repository's Actions cache budget is 10 GB
+      # total, CI's two entries already use most of it, and three more
+      # release-profile entries would evict the caches that keep every push
+      # fast. Release runs are rare; pushes are not. See docs/ci-cd.md.
       - name: Build
         if: matrix.platform != 'linux'
         shell: bash
@@ -487,6 +484,15 @@ jobs:
 
       - name: Image tarball for air-gapped hosts
         # The same layers the push built, exported as a `docker load` tarball.
+        # This stays a second invocation rather than a second `--output` on the
+        # one above because the docker exporter cannot carry the provenance and
+        # SBOM attestations the pushed image needs. It is not a second build:
+        # the buildx builder created by setup-buildx-action holds its layer
+        # cache for the whole job, and Dockerfile.release only copies a prebuilt
+        # binary onto distroless, so this re-exports rather than recompiles.
+        # No `type=gha` cache for the same reason — the one layer that could be
+        # cached wraps a binary that changes every release, so it would spend
+        # the repository's 10 GB cache budget to save nothing.
         env:
           VERSION: ${{ inputs.version }}
           ARCH: ${{ matrix.arch }}
