@@ -40,6 +40,12 @@ allow = [
 exceptions = [
     # webpki-roots ships Mozilla CA certs; pulled by ureq (build dep of libduckdb-sys).
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    # The FIPS-validated AWS-LC module, used on Linux only (quack-core's
+    # target-gated aws-lc-rs "fips" feature). Its sources carry the OpenSSL
+    # license because AWS-LC descends from OpenSSL via BoringSSL. That is the
+    # license, not the banned `openssl` crate: nothing links OpenSSL itself,
+    # which `make release-gates` re-checks with `cargo tree -i openssl-sys`.
+    { allow = ["OpenSSL"], crate = "aws-lc-fips-sys" },
 ]
 
 [bans]

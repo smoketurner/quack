@@ -22,6 +22,11 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # AWS-LC's delocate pass cannot parse gcc's assembly output, so the FIPS
+  # module (Linux only) builds with clang. Ignored on macOS and Windows, which
+  # build against aws-lc-sys instead.
+  AWS_LC_FIPS_SYS_CC: clang
+  AWS_LC_FIPS_SYS_CXX: clang++
   CARGO_BUILD_WARNINGS: deny
 
 jobs:
@@ -35,7 +40,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang
+        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
       - name: Setup Rust toolchain
         run: rustup show
       - name: Setup Rust cache
@@ -48,7 +53,10 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
       - name: Crypto gates (aws-lc-rs only, no ring or OpenSSL at runtime)
-        run: make release-gates
+        # Not `make release-gates`: that target also runs `cargo deny check`,
+        # which needs a cargo-deny install this runner does not have. The
+        # pinned cargo-deny action below is how this workflow checks deny.
+        run: make crypto-gates
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check

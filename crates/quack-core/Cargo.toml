@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 argon2        = { workspace = true, features = ["alloc", "password-hash", "getrandom"] }
-aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
 base64        = { workspace = true, features = ["std"] }
 calamine      = { workspace = true }
 dirs          = { workspace = true }
@@ -27,7 +26,6 @@ quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
 rust-stemmers = { workspace = true }
-rustls        = { workspace = true, features = ["aws_lc_rs", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
 scraper       = { workspace = true }
 sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
@@ -45,14 +43,26 @@ tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
+# The crypto module is chosen per target. FIPS is Linux-only, and not for want
+# of tooling: aws-lc-fips-sys emits a *static* library only for Linux and BSD on
+# x86_64 and aarch64 (builder/main.rs, `impl Default for OutputLibType`). A macOS
+# FIPS build links libcrypto.dylib, which a single-file release archive cannot
+# carry, and Windows has no pre-generated FIPS bindings at all. The Linux FIPS
+# build needs cmake and go on the builder. See docs/crypto.md.
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+aws-lc-rs                    = { workspace = true, features = ["fips"] }
 linux-keyutils-keyring-store = { workspace = true }
+rustls                       = { workspace = true, features = ["fips", "prefer-post-quantum", "std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { workspace = true }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+rustls    = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 
 [dev-dependencies]
 sqlx     = { workspace = true, features = ["runtime-tokio", "sqlite"] }

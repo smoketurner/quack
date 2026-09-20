@@ -1386,8 +1386,10 @@ tick_rate_ms = 50
 - **Desktop bundles:** when `quack desktop` exists, `tauri build` wraps the same binary
   into `.dmg`, `.msi`, and `.AppImage` installers. Not a separate binary.
 - **mimalloc** (`secure`) as the global allocator.
-- **Crypto:** rustls + aws-lc-rs; `fips` as a build-time option; `cargo tree -i ring` and
-  `-i openssl-sys` are release gates.
+- **Crypto:** rustls + aws-lc-rs, with the `fips` feature of both on Linux, where
+  aws-lc-fips-sys links statically, so every distributed Linux binary and the image run on
+  the FIPS-validated module (`docs/crypto.md`); `cargo tree -i ring` and `-i openssl-sys`
+  are release gates.
 - **Container image** for `quack serve`: `Dockerfile` builds from source (CSS stage with
   the standalone Tailwind binary, checksum verified; `rust:<MSRV>-alpine` with cargo-chef
   for the musl build, `cmake`, `clang`, `g++`, `perl` for DuckDB and aws-lc;
@@ -1547,7 +1549,7 @@ updated as issues close. Ordered by risk.
    server records the editing user and writes the detail row under the access row's id.
    Sections 5.3, 5.4, 12.
 10. ~~No release pipeline~~ (#30, closed): `.github/workflows/release.yml` runs only on a
-    `v*` tag (or by hand): the gates (fmt, clippy, tests, `make release-gates` for the
+    `v*` tag (or by hand): the gates (fmt, clippy, tests, `make crypto-gates` for the
     ring and OpenSSL runtime-tree checks, cargo deny), then
     `.github/workflows/reusable-build.yml` for everything that compiles, signs, or
     attests — reproducible static musl binaries for x86_64 and aarch64 with CycloneDX

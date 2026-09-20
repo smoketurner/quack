@@ -1292,6 +1292,9 @@ fn init_logging_at(default: &str) {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
         )
         .init();
+    // The provider is installed at the top of `main`, before any subscriber
+    // exists; this is the first point where saying so reaches a log.
+    crypto::log_provider();
 }
 
 async fn resolve_workspace(workspace_name: Option<&str>) -> Result<(Config, WorkspaceRow, String)> {

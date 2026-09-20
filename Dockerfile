@@ -75,8 +75,15 @@ ARG SOURCE_DATE_EPOCH=0
 #   cmake/make/clang/g++: build system, C and C++ compilers, libclang for bindgen
 #   linux-headers/musl-dev: musl target headers
 #   perl: aws-lc's assembly generation
+#   go: AWS-LC's delocate pass over the FIPS module's generated assembly
+#       (Linux uses the FIPS module: quack-core's target-gated "fips" feature)
 # No openssl: aws-lc-rs is the only crypto provider (deny.toml bans openssl and ring).
-RUN apk add --no-cache musl-dev pkgconfig cmake make perl clang linux-headers g++
+RUN apk add --no-cache musl-dev pkgconfig cmake make perl clang linux-headers g++ go
+
+# delocate cannot parse gcc's assembly output, so the FIPS module builds with
+# clang while everything else keeps the default toolchain.
+ENV AWS_LC_FIPS_SYS_CC=clang
+ENV AWS_LC_FIPS_SYS_CXX=clang++
 
 # Cook the dependencies (cached until Cargo.toml or Cargo.lock change).
 COPY --from=planner /app/recipe.json recipe.json

@@ -14,6 +14,11 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # AWS-LC's delocate pass cannot parse gcc's assembly output, so the FIPS
+  # module (Linux only) builds with clang. Ignored on macOS and Windows, which
+  # build against aws-lc-sys instead.
+  AWS_LC_FIPS_SYS_CC: clang
+  AWS_LC_FIPS_SYS_CXX: clang++
   # Deny rustc warnings on plain `cargo build`/`cargo test` (cargo >=1.97) without
   # invalidating the build cache the way RUSTFLAGS="-D warnings" would.
   CARGO_BUILD_WARNINGS: deny
@@ -49,7 +54,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang
+        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
       - name: Setup Rust toolchain
         run: rustup show
       - name: Setup Rust cache
@@ -72,7 +77,7 @@ jobs:
         include:
           - name: linux
             runner: ubuntu-latest
-            install-deps: sudo apt-get update && sudo apt-get install -y cmake clang
+            install-deps: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
           - name: macos
             runner: macos-latest
             install-deps: ""
