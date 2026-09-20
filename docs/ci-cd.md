@@ -84,9 +84,17 @@ summary when a credential is missing:
   and `notarytool submit --wait` notarizes it (`APPLE_ID`, `APPLE_ID_PASSWORD`,
   `APPLE_TEAM_ID`). A bare binary cannot be stapled, so the ticket stays with Apple and
   Gatekeeper checks it online.
-- **Windows** — Azure Trusted Signing over GitHub OIDC (`TRUSTED_SIGNING_ENDPOINT`,
-  `TRUSTED_SIGNING_ACCOUNT`, `CERTIFICATE_PROFILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`).
-  The signing tool is an x86_64 executable, which the arm64 runner runs under emulation.
+- **Windows** — Azure Artifact Signing (formerly Trusted Signing) over GitHub OIDC
+  (`TRUSTED_SIGNING_ENDPOINT`, `TRUSTED_SIGNING_ACCOUNT`, `CERTIFICATE_PROFILE`,
+  `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), signing as Smoke Turner, LLC with the certificate
+  profile every smoketurner project shares. The signing tool is an x86_64 executable,
+  which the arm64 runner runs under emulation. It runs on tag builds only: the federated
+  identity credential (`smoketurner-infra`, `environments/azure/code_signing.tf`) trusts
+  the exact subject
+  `repo:smoketurner@8753311/quack@1366961169:workflow:Release:ref_type:tag`, so this
+  repository's OIDC subject customization has to include the `repo`, `workflow`, and
+  `ref_type` claims, and a `workflow_dispatch` run is deliberately left unsigned rather
+  than failing the token exchange.
 
 Verify a published asset or the image:
 

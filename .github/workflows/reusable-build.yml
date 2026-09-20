@@ -114,6 +114,7 @@ jobs:
         shell: bash
         env:
           PLATFORM: ${{ matrix.platform }}
+          REF_TYPE: ${{ github.ref_type }}
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_CERTIFICATE_NAME: ${{ secrets.APPLE_CERTIFICATE_NAME }}
@@ -145,8 +146,14 @@ jobs:
             macos_notarize=true
           fi
 
+          # Azure Artifact Signing trusts this repository's OIDC token only for
+          # tag-triggered runs of this workflow (the federated credential's
+          # subject ends in `ref_type:tag`, smoketurner-infra
+          # environments/azure/code_signing.tf). On any other ref the token
+          # exchange would fail outright, so a dry run stays unsigned instead.
           windows_sign=false
-          if [ -n "${TRUSTED_SIGNING_ENDPOINT}" ] \
+          if [ "${REF_TYPE}" = "tag" ] \
+            && [ -n "${TRUSTED_SIGNING_ENDPOINT}" ] \
             && [ -n "${TRUSTED_SIGNING_ACCOUNT}" ] \
             && [ -n "${CERTIFICATE_PROFILE}" ] \
             && [ -n "${AZURE_CLIENT_ID}" ] \
@@ -175,7 +182,9 @@ jobs:
               fi
               ;;
             windows)
-              if [ "${windows_sign}" != true ]; then
+              if [ "${windows_sign}" != true ] && [ "${REF_TYPE}" != "tag" ]; then
+                warn "The Windows binary is not signed: Azure Artifact Signing trusts this repository only on a tag."
+              elif [ "${windows_sign}" != true ]; then
                 warn "The Windows binary is not signed: set TRUSTED_SIGNING_ENDPOINT, TRUSTED_SIGNING_ACCOUNT, CERTIFICATE_PROFILE, AZURE_CLIENT_ID and AZURE_TENANT_ID."
               fi
               ;;
