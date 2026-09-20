@@ -10,7 +10,7 @@
 # (`make css-build`), so there is no Tailwind stage here.
 
 # Keep this Rust version in sync with rust-toolchain.toml.
-FROM rust:1.98.0-alpine AS base
+FROM rust:1.98.1-alpine AS base
 # DuckDB (C++) and aws-lc-rs build from source on musl. No openssl: aws-lc-rs
 # is the only crypto provider (deny.toml bans openssl and ring). Linux builds
 # use the FIPS module (quack-core's target-gated aws-lc-rs "fips" feature),

@@ -15,7 +15,7 @@ server, is planned: #35, not started). The
 design is `docs/design-doc.md`; read it before any non-trivial change, and check its
 section 17 for where the code still lags. The chosen stack:
 
-- **Workspace** of crates under `crates/` (edition 2024, resolver 3, MSRV 1.98.0)
+- **Workspace** of crates under `crates/` (edition 2024, resolver 3, MSRV 1.98.1)
 - **DuckDB** (via `duckdb-rs`), one file per workspace, holding everything classified
   about that workspace: user tables, chunks, graph, ontology, context, sessions, audit
   detail (all internal tables prefixed `_quack_`)
@@ -36,7 +36,7 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 .clippy.toml          # clippy tuning (levels live in Cargo.toml)
 .rustfmt.toml         # stable-only formatting
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
-rust-toolchain.toml   # pinned 1.98.0 + rustfmt + clippy
+rust-toolchain.toml   # pinned 1.98.1 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
 crates/               # quack-core (engine), quack (the binary) — see crates/README.md
 docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd

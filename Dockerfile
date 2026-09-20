@@ -53,7 +53,7 @@ RUN cd crates/quack \
 
 # cargo-chef base stage, shared by the planner and the builder.
 # Keep this Rust version in sync with rust-toolchain.toml.
-FROM rust:1.98.0-alpine AS chef
+FROM rust:1.98.1-alpine AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
