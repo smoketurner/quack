@@ -47,6 +47,33 @@ const RATE_BURST: u32 = 120;
 const LOGIN_RATE_PER_SECOND: u64 = 2;
 const LOGIN_RATE_BURST: u32 = 10;
 
+/// How often a limiter drops the per-key state that has fallen back to a
+/// fresh bucket. governor holds one entry per caller until something sweeps
+/// it, so without this the maps grow for the life of the process — one entry
+/// per address that ever connected.
+const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Run `sweep` every `interval` for as long as the runtime lives.
+///
+/// Taking a closure rather than the limiter keeps governor's deeply generic
+/// types out of a signature: the caller clones the `Arc` it already has and
+/// the compiler infers the rest.
+fn spawn_cleanup(interval: Duration, sweep: impl Fn() + Send + 'static) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("no runtime to sweep rate-limiter state on; it will not be reclaimed");
+        return;
+    };
+    handle.spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // The first tick fires immediately, when there is nothing to sweep.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            sweep();
+        }
+    });
+}
+
 #[derive(Clone)]
 struct RequestIdV7;
 
@@ -99,6 +126,8 @@ pub(crate) fn throttled_login(
         tracing::error!("login rate limiter could not be built; logins are not throttled");
         return route;
     };
+    let limiter = Arc::clone(config.limiter());
+    spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
     route.layer(GovernorLayer::new(config))
 }
 
@@ -121,6 +150,8 @@ pub(crate) fn router(app: App) -> Router {
         .nest("/api/v1", api::router())
         .merge(web::router());
     if let Some(config) = governor {
+        let limiter = Arc::clone(config.limiter());
+        spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
         limited = limited.layer(GovernorLayer::new(config));
     }
     Router::new()

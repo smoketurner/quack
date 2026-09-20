@@ -1358,7 +1358,9 @@ roadmap and may never be built.
   (`POST /login` and `POST /api/v1/auth/login`) carry a second, tighter limiter, because
   the general budget is sized for a browsing session and is far too loose to make guessing
   expensive. `/healthz` sits outside every limiter, since a throttled health check reads as
-  a dead server to whatever is watching it.
+  a dead server to whatever is watching it. Each limiter's per-key state is swept once a
+  minute: governor holds one entry per caller until something drops it, so an unswept
+  limiter grows by one entry for every address that ever connected.
 - Roles: `viewer` asks questions and searches; `member` also uploads, pins, deletes own
   uploads, grants write, edits the context and ontology, runs proposals and extraction;
   `owner` manages members and tokens and sees all sessions. `is_admin` manages users and

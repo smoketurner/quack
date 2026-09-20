@@ -3077,6 +3077,27 @@ async fn the_session_cookie_is_secure_off_loopback_and_carries_max_age() {
     assert!(remote.contains("Max-Age=43200"), "{remote}");
 }
 
+/// The limiters' per-key state is swept on a loop rather than once: without
+/// it governor keeps one entry per caller for the life of the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limiter_state_is_swept_repeatedly() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let sweeps = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&sweeps);
+    super::spawn_cleanup(std::time::Duration::from_millis(5), move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    // Loosely bounded so a loaded machine cannot make this flaky; the point
+    // is that it ticks more than once, not how fast.
+    assert!(
+        sweeps.load(Ordering::Relaxed) >= 2,
+        "the cleanup loop ran {} times; it is not repeating",
+        sweeps.load(Ordering::Relaxed)
+    );
+}
+
 /// Issue #73: the browser login form is throttled the way the API login
 /// already was, and `/healthz` stays outside every limiter so a health probe
 /// can never be made to look like a dead server.
