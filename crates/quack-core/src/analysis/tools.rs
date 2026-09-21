@@ -484,6 +484,16 @@ impl Tool for RunSqlTool {
 // search_documents
 // ---------------------------------------------------------------------------
 
+/// `search_documents`'s `top_k` argument is model-supplied and had no
+/// ceiling: `args.top_k.unwrap_or(default).max(1)` only floors it, so a
+/// call with an implausibly large `top_k` ran the vector and keyword
+/// scans with that `LIMIT` and returned every one of those chunks' full
+/// text as the tool result, unbounded by anything else in the turn. This
+/// caps it at a size still far more than any question needs (the default
+/// is 8), while leaving room for a model that deliberately wants a wider
+/// sweep.
+const MAX_SEARCH_TOP_K: u32 = 50;
+
 pub struct SearchDocumentsTool<M> {
     db: ReaderDb,
     /// `None` runs keyword search alone: a workspace without an embedding
@@ -631,7 +641,10 @@ where
             },
         };
 
-        let top_k = args.top_k.unwrap_or(self.default_top_k).max(1);
+        let top_k = args
+            .top_k
+            .unwrap_or(self.default_top_k)
+            .clamp(1, MAX_SEARCH_TOP_K);
         let fetch = if self.reranker.is_some() {
             top_k.max(self.rerank_candidates)
         } else {
@@ -1868,6 +1881,62 @@ mod tests {
             last.as_deref()
                 .is_some_and(|s| s.contains("reranked by reverse")),
             "{last:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_documents_top_k_is_capped_regardless_of_what_the_model_asks_for() {
+        let db = shared_db();
+        {
+            let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
+            guard
+                .insert_document(
+                    &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
+                )
+                .unwrap_or_else(|e| fail_test(&e.to_string()));
+            for i in 0..(MAX_SEARCH_TOP_K * 2) {
+                guard
+                    .insert_chunk(&crate::storage::workspace::NewChunk {
+                        id: &format!("c{i}"),
+                        document_id: "d",
+                        chunk_index: i,
+                        content: &format!("Hail fell in county {i}."),
+                        heading: None,
+                        page: None,
+                        embedding: None,
+                    })
+                    .unwrap_or_else(|e| fail_test(&e.to_string()));
+            }
+        }
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink);
+        let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+            ReaderDb::new(Arc::clone(&db)),
+            None,
+            5,
+            60,
+            recorder,
+        );
+        let text = tool
+            .call(
+                &mut ToolContext::new(),
+                SearchDocumentsArgs {
+                    query: String::from("hail"),
+                    // Twice the cap and then some: a model is free to ask
+                    // for this, and used to get every chunk it named back
+                    // in full.
+                    top_k: Some(1_000_000),
+                    document_ids: Vec::new(),
+                    entity: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        let returned = text.matches("(document_id: d, chunk ").count();
+        assert_eq!(
+            u32::try_from(returned).unwrap_or(u32::MAX),
+            MAX_SEARCH_TOP_K,
+            "{text}"
         );
     }
 
