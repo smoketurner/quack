@@ -43,7 +43,10 @@ Each workspace's `data.duckdb` carries the `_quack_` tables (documents, chunks, 
 ontology, graph, provenance, merges, sessions, messages, context, audit detail; design doc
 section 5.4) beside the user's tables and views. `WorkspaceDb::open()` creates what is
 missing and records `_quack_meta.schema_version`; a bump can trigger a rebuild, as version
-6 rebuilt the term index when stemming arrived.
+6 rebuilt the term index when stemming arrived and version 7 rebuilt it again to add the
+joined identifier term (`pol8841` alongside `pol` and `8841` for `POL-8841`; issue #77).
+Phrase search (`"..."` in a keyword query) needed no version bump: it post-filters
+candidates by substring rather than adding term positions to `_quack_terms`.
 
 This side is deliberately *not* a numbered migration list, and stays in Rust: the DDL is
 parameterized by the workspace's embedding width (`FLOAT[{dim}]`, `graph::ddl(dim)`), and

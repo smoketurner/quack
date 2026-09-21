@@ -21,11 +21,17 @@ pub const INTERNAL_TABLES: &[&str] = &[
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
+/// How far a quoted-phrase query over-fetches BM25 candidates before the
+/// substring post-filter, since `_quack_terms` carries no positions.
+const PHRASE_OVER_FETCH: u32 = 4;
+/// Absolute cap on phrase-search candidates, regardless of `top_k`.
+const PHRASE_CANDIDATE_CAP: u32 = 500;
+
 /// Every internal table carries this prefix; anything starting with it is hidden.
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "6";
+const WORKSPACE_SCHEMA_VERSION: &str = "7";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -537,9 +543,10 @@ impl WorkspaceDb {
             .meta("schema_version")?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
-        // Version 4 introduced the term index; version 6 changed its
-        // tokens (stemming), so older workspaces rebuild it on open.
-        if recorded < 6 && self.chunk_count()? > 0 {
+        // Version 4 introduced the term index; version 6 changed its tokens
+        // (stemming) and version 7 added joined identifier terms, so older
+        // workspaces rebuild it on open.
+        if recorded < 7 && self.chunk_count()? > 0 {
             tracing::info!("indexing existing chunks for keyword search");
             self.reindex_terms()?;
         }
@@ -1175,6 +1182,14 @@ impl WorkspaceDb {
     /// SQL from `_quack_terms` and each chunk's term count. Needs no
     /// extension and no rebuild step.
     ///
+    /// A `"..."` quoted phrase in `query` is an adjacency requirement: `_quack_terms`
+    /// carries no positions (`docs/migrations.md`), so BM25 still ranks by the
+    /// phrase's own tokens, but the candidates are over-fetched and then
+    /// post-filtered to those whose content or heading contains the phrase as a
+    /// case-insensitive, whitespace-normalized substring. A phrase that matches no
+    /// candidate returns an empty result rather than falling back to the
+    /// unfiltered ranking. Unbalanced quotes are treated as ordinary text.
+    ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
@@ -1194,6 +1209,15 @@ impl WorkspaceDb {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
+        let phrases = extract_phrases(query);
+        let fetch_k = if phrases.is_empty() {
+            top_k
+        } else {
+            top_k
+                .saturating_mul(PHRASE_OVER_FETCH)
+                .min(PHRASE_CANDIDATE_CAP)
+                .max(top_k)
+        };
         // Quoted, so a token such as `null` stays a word and not a NULL
         // element (issue #62).
         let term_list = sql_text_list(&terms);
@@ -1220,7 +1244,7 @@ impl WorkspaceDb {
              ORDER BY sc.score DESC, c.chunk_index ASC \
              LIMIT ?"
         );
-        let limit = i64::from(top_k);
+        let limit = i64::from(fetch_k);
         let mut stmt = self.conn.prepare(&sql)?;
         let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(2));
         params.push(&term_list);
@@ -1231,11 +1255,21 @@ impl WorkspaceDb {
         while let Some(row) = rows.next()? {
             results.push(chunk_from_row(row, 7)?);
         }
+        if phrases.is_empty() {
+            return Ok(results);
+        }
+        filter_by_phrases(&mut results, &phrases);
+        results.truncate(usize::try_from(top_k).unwrap_or(usize::MAX));
         Ok(results)
     }
 
     /// Hybrid retrieval: vector and keyword rankings fused with reciprocal
     /// rank fusion (`score = sum over rankings of 1 / (rrf_k + rank)`).
+    ///
+    /// A quoted phrase in `query_text` filters the fused result the same way
+    /// [`Self::search_keyword_chunks`] filters its own: the vector leg knows
+    /// nothing about phrases, so both legs are over-fetched and the phrase
+    /// substring filter runs once on the fused ranking.
     ///
     /// # Errors
     ///
@@ -1248,10 +1282,25 @@ impl WorkspaceDb {
         rrf_k: u32,
         scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
+        let phrases = extract_phrases(query_text);
         let candidates = top_k.saturating_mul(2).max(1);
-        let vector = self.search_similar_chunks(query_embedding, candidates, scope)?;
-        let keyword = self.search_keyword_chunks(query_text, candidates, scope)?;
-        Ok(fuse_rankings(vector, keyword, top_k, rrf_k))
+        let fuse_k = if phrases.is_empty() {
+            top_k
+        } else {
+            candidates
+                .saturating_mul(PHRASE_OVER_FETCH)
+                .min(PHRASE_CANDIDATE_CAP)
+                .max(top_k)
+        };
+        let vector = self.search_similar_chunks(query_embedding, fuse_k, scope)?;
+        let keyword = self.search_keyword_chunks(query_text, fuse_k, scope)?;
+        let mut fused = fuse_rankings(vector, keyword, fuse_k, rrf_k);
+        if phrases.is_empty() {
+            return Ok(fused);
+        }
+        filter_by_phrases(&mut fused, &phrases);
+        fused.truncate(usize::try_from(top_k).unwrap_or(usize::MAX));
+        Ok(fused)
     }
 
     /// Search for the most similar chunks to a query embedding. `score` is
@@ -1807,17 +1856,93 @@ fn chunk_from_row(row: &duckdb::Row<'_>, score_idx: usize) -> duckdb::Result<Chu
     })
 }
 
-/// Lowercased alphanumeric runs; the same rule indexes chunks and parses
-/// queries, so `POL-8841` becomes `pol` and `8841` on both sides.
+/// Punctuation that joins alphanumeric runs into one identifier (`POL-8841`,
+/// `v1.2.3`, `ns/part:7`) without introducing whitespace.
+fn is_identifier_joiner(c: char) -> bool {
+    matches!(c, '-' | '.' | '_' | '/' | ':')
+}
+
+/// Lowercased alphanumeric runs, stemmed; the same rule indexes chunks and
+/// parses queries. A run joined by identifier punctuation with no
+/// whitespace (`POL-8841`, `v1.2.3`, `ABC_123`, `ns/part:7`) additionally
+/// indexes its punctuation-stripped, lowercased, unstemmed form (`pol8841`)
+/// alongside the split, stemmed pieces (`pol`, `8841`), so the query
+/// `POL-8841` matches a document containing that exact identifier ahead of
+/// one that merely contains `pol` and `8841` apart. Because the joined form
+/// is derived the same way on both sides, a bare run like `pol8841` in text
+/// is also found by the query `POL-8841` — desirable, since both spell the
+/// same identifier. Ordinary prose has no joiner in a run, so it tokenizes
+/// exactly as before.
 #[must_use]
 pub fn tokenize(text: &str) -> Vec<String> {
     static STEMMER: std::sync::LazyLock<rust_stemmers::Stemmer> = std::sync::LazyLock::new(|| {
         rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
     });
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| STEMMER.stem(&t.to_lowercase()).into_owned())
+    let mut terms = Vec::new();
+    for run in text.split(|c: char| !(c.is_alphanumeric() || is_identifier_joiner(c))) {
+        let run = run.trim_matches(|c: char| !c.is_alphanumeric());
+        if run.is_empty() {
+            continue;
+        }
+        for token in run.split(|c: char| !c.is_alphanumeric()) {
+            if !token.is_empty() {
+                terms.push(STEMMER.stem(&token.to_lowercase()).into_owned());
+            }
+        }
+        if run.contains(is_identifier_joiner) {
+            let alnum: String = run.chars().filter(|c| c.is_alphanumeric()).collect();
+            terms.push(alnum.to_lowercase());
+        }
+    }
+    terms
+}
+
+/// Quoted phrases from a keyword query: each `"..."` pair is taken as an
+/// exact adjacency requirement. An odd number of `"` characters is an
+/// unbalanced quote, so the whole query is left as ordinary text instead of
+/// guessing which quote was meant to close.
+fn extract_phrases(query: &str) -> Vec<String> {
+    if !query.matches('"').count().is_multiple_of(2) {
+        return Vec::new();
+    }
+    query
+        .split('"')
+        .enumerate()
+        .filter_map(|(i, s)| (i % 2 == 1).then_some(s.trim()))
+        .filter(|s| !s.is_empty())
+        .map(String::from)
         .collect()
+}
+
+/// Collapse runs of whitespace to a single space and trim the ends, so
+/// phrase matching does not care whether a chunk wrapped the phrase across a
+/// line break.
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `phrase` occurs in `text` as a case-insensitive,
+/// whitespace-normalized substring.
+fn contains_phrase(text: &str, phrase: &str) -> bool {
+    normalize_whitespace(text)
+        .to_lowercase()
+        .contains(&normalize_whitespace(phrase).to_lowercase())
+}
+
+/// Keep only the results whose content or heading contains every phrase,
+/// preserving the existing (ranked) order. Shared by
+/// [`WorkspaceDb::search_keyword_chunks`] and
+/// [`WorkspaceDb::search_hybrid_chunks`], since the latter's vector leg
+/// carries no phrase information of its own.
+fn filter_by_phrases(results: &mut Vec<ChunkSearchResult>, phrases: &[String]) {
+    results.retain(|r| {
+        phrases.iter().all(|phrase| {
+            contains_phrase(&r.content, phrase)
+                || r.heading
+                    .as_deref()
+                    .is_some_and(|h| contains_phrase(h, phrase))
+        })
+    });
 }
 
 /// Term frequencies for a chunk's content plus its heading.
@@ -2866,7 +2991,7 @@ mod tests {
         assert_eq!(
             tokenize("Policy POL-8841 renews; see \"Exclusions\" (page 12)."),
             vec![
-                "polici", "pol", "8841", "renew", "see", "exclus", "page", "12"
+                "polici", "pol", "8841", "pol8841", "renew", "see", "exclus", "page", "12"
             ]
         );
         // Inflections meet at one stem; codes and numbers are untouched.
@@ -2874,8 +2999,32 @@ mod tests {
             tokenize("renewal renewals renewing"),
             vec!["renew", "renew", "renew"]
         );
-        assert_eq!(tokenize("AB-12X9"), vec!["ab", "12x9"]);
+        assert_eq!(tokenize("AB-12X9"), vec!["ab", "12x9", "ab12x9"]);
         assert!(tokenize("  --- ").is_empty());
+    }
+
+    #[test]
+    fn tokenize_indexes_the_joined_form_of_an_identifier() {
+        // Hyphen, dot, underscore, slash, and colon all join.
+        assert_eq!(tokenize("v1.2.3"), vec!["v1", "2", "3", "v123"]);
+        assert_eq!(tokenize("ABC_123"), vec!["abc", "123", "abc123"]);
+        assert_eq!(tokenize("ns/part:7"), vec!["ns", "part", "7", "nspart7"]);
+        // A joiner touching whitespace does not merge across words: prose
+        // punctuation still tokenizes exactly as before.
+        assert_eq!(
+            tokenize("end of sentence - new sentence."),
+            vec!["end", "of", "sentenc", "new", "sentenc"]
+        );
+        // The query side uses the same function, so a bare joined form
+        // already in text (`pol8841`) is found by the query `POL-8841`.
+        assert!(tokenize("POL-8841").contains(&String::from("pol8841")));
+        assert_eq!(tokenize("pol8841"), vec!["pol8841"]);
+        // The joined form uses full Unicode case folding, not ASCII-only
+        // lowercasing, so a non-ASCII identifier's casing does not change
+        // which term it indexes: `Ünit-9` in text and `ünit-9` in a query
+        // must both produce the joined term `ünit9`.
+        assert_eq!(tokenize("Ünit-9").last(), tokenize("ünit-9").last(),);
+        assert_eq!(tokenize("Ünit-9").last(), Some(&String::from("ünit9")));
     }
 
     #[test]
@@ -2890,6 +3039,36 @@ mod tests {
             ]
         );
         assert_eq!(term_count(&tf), 5);
+    }
+
+    #[test]
+    fn extract_phrases_reads_balanced_quotes() {
+        assert_eq!(
+            extract_phrases("\"flood exclusion\""),
+            vec![String::from("flood exclusion")]
+        );
+        assert_eq!(
+            extract_phrases("find \"flood exclusion\" near \"water damage\""),
+            vec![
+                String::from("flood exclusion"),
+                String::from("water damage")
+            ]
+        );
+        assert!(extract_phrases("no quotes here").is_empty());
+        assert!(extract_phrases("\"\"").is_empty());
+        // Unbalanced quotes: an odd count is ordinary text, not a phrase.
+        assert!(extract_phrases("say \"hello").is_empty());
+        assert!(extract_phrases("a \"b\" c\" d").is_empty());
+    }
+
+    #[test]
+    fn contains_phrase_normalizes_case_and_whitespace() {
+        assert!(contains_phrase(
+            "the FLOOD   Exclusion\napplies here",
+            "flood exclusion"
+        ));
+        assert!(!contains_phrase("flood and exclusion", "flood exclusion"));
+        assert!(contains_phrase("Flood Exclusion", "  flood   exclusion  "));
     }
 
     #[test]
@@ -3019,5 +3198,252 @@ mod tests {
         let output = String::from_utf8_lossy(&buf);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    fn insert_ready_document(db: &WorkspaceDb, id: &str) {
+        db.insert_document(&NewDocument::new(id, "doc.txt", "text/plain", 10).with_status("ready"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+
+    fn insert_text_chunk(
+        db: &WorkspaceDb,
+        id: &str,
+        document_id: &str,
+        chunk_index: u32,
+        content: &str,
+    ) {
+        db.insert_chunk(&NewChunk {
+            id,
+            document_id,
+            chunk_index,
+            content,
+            heading: None,
+            page: None,
+            embedding: None,
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+
+    /// The joined identifier term must rank a chunk containing the exact
+    /// identifier above one that only contains its split pieces apart.
+    #[test]
+    fn search_keyword_chunks_ranks_the_exact_identifier_above_split_terms() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        insert_text_chunk(&db, "c1", "doc1", 0, "Policy POL-8841 covers water damage.");
+        insert_text_chunk(
+            &db,
+            "c2",
+            "doc1",
+            1,
+            "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.",
+        );
+
+        let results = db
+            .search_keyword_chunks("POL-8841", 10, &ChunkScope::all())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            results.first().map(|r| r.id.as_str()),
+            Some("c1"),
+            "the exact identifier should outrank its split pieces: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_keyword_chunks_filters_candidates_by_quoted_phrase() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        insert_text_chunk(
+            &db,
+            "c1",
+            "doc1",
+            0,
+            "The flood exclusion applies to basements.",
+        );
+        // Same two words, not adjacent: matches the bag-of-words ranking but
+        // not the phrase.
+        insert_text_chunk(
+            &db,
+            "c2",
+            "doc1",
+            1,
+            "Exclusion of flood risk is handled in a separate clause.",
+        );
+
+        let results = db
+            .search_keyword_chunks("\"flood exclusion\"", 10, &ChunkScope::all())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
+    }
+
+    #[test]
+    fn search_keyword_chunks_phrase_match_in_heading() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        db.insert_chunk(&NewChunk {
+            id: "c1",
+            document_id: "doc1",
+            chunk_index: 0,
+            content: "See below for what is not covered.",
+            heading: Some("Flood Exclusion"),
+            page: None,
+            embedding: None,
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let results = db
+            .search_keyword_chunks("\"flood exclusion\"", 10, &ChunkScope::all())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
+    }
+
+    #[test]
+    fn search_keyword_chunks_phrase_with_no_match_returns_empty() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        insert_text_chunk(
+            &db,
+            "c1",
+            "doc1",
+            0,
+            "Exclusion of flood risk is handled in a separate clause.",
+        );
+
+        let results = db
+            .search_keyword_chunks("\"flood exclusion\"", 10, &ChunkScope::all())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            results.is_empty(),
+            "a phrase with no exact match must not fall back to unfiltered candidates: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_keyword_chunks_unbalanced_quote_is_ordinary_text() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        insert_text_chunk(
+            &db,
+            "c1",
+            "doc1",
+            0,
+            "Exclusion of flood risk is handled in a separate clause.",
+        );
+
+        let results = db
+            .search_keyword_chunks("\"flood exclusion", 10, &ChunkScope::all())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        // No phrase requirement kicks in: ordinary bag-of-words matching
+        // still finds the chunk even though the words are not adjacent.
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_hybrid_chunks_ranks_identifier_and_filters_phrase() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        let embedding = [0.1_f32, 0.2, 0.3, 0.4];
+        db.insert_chunk(&NewChunk {
+            id: "c1",
+            document_id: "doc1",
+            chunk_index: 0,
+            content: "Policy POL-8841 covers water damage.",
+            heading: None,
+            page: None,
+            embedding: Some(&embedding),
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        db.insert_chunk(&NewChunk {
+            id: "c2",
+            document_id: "doc1",
+            chunk_index: 1,
+            content: "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.",
+            heading: None,
+            page: None,
+            embedding: Some(&embedding),
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let results = db
+            .search_hybrid_chunks("POL-8841", &embedding, 10, 60, &ChunkScope::all())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
+    }
+
+    #[test]
+    fn search_hybrid_chunks_phrase_filters_to_matching_chunks() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        let embedding = [0.1_f32, 0.2, 0.3, 0.4];
+        db.insert_chunk(&NewChunk {
+            id: "c1",
+            document_id: "doc1",
+            chunk_index: 0,
+            content: "The flood exclusion applies to basements.",
+            heading: None,
+            page: None,
+            embedding: Some(&embedding),
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        db.insert_chunk(&NewChunk {
+            id: "c2",
+            document_id: "doc1",
+            chunk_index: 1,
+            content: "Exclusion of flood risk is handled in a separate clause.",
+            heading: None,
+            page: None,
+            embedding: Some(&embedding),
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let results = db
+            .search_hybrid_chunks(
+                "\"flood exclusion\"",
+                &embedding,
+                10,
+                60,
+                &ChunkScope::all(),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
+    }
+
+    /// Version 7 added joined identifier terms, so a workspace still
+    /// recorded at an older version must reindex `_quack_terms` on open
+    /// (`WorkspaceDb::create_internal_tables`).
+    #[test]
+    fn opening_an_older_workspace_reindexes_terms_for_identifier_search() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            insert_ready_document(&db, "doc1");
+            insert_text_chunk(&db, "c1", "doc1", 0, "Policy POL-8841 applies.");
+            // Simulate a workspace indexed before version 7: the joined
+            // identifier term is missing and the recorded version rolls back.
+            db.execute_statement("DELETE FROM _quack_terms WHERE term = 'pol8841'")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta_public("schema_version", "6")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+
+        let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            reopened
+                .meta("schema_version")
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            Some(String::from(WORKSPACE_SCHEMA_VERSION))
+        );
+        let rows = reopened
+            .execute_query("SELECT count(*) FROM _quack_terms WHERE term = 'pol8841'")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            rows.rows.first().and_then(|r| r.first()),
+            Some(&serde_json::Value::Number(1.into())),
+            "reopening should have rebuilt the term index with the joined form"
+        );
     }
 }

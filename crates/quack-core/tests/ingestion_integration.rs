@@ -875,7 +875,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("6"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("7"));
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("4")
@@ -1320,7 +1320,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
         );
     }
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("6"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("7"));
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())
         .unwrap();

@@ -582,18 +582,26 @@ message.
 `array_cosine_distance`) and a BM25 search over the terms quack tokenized at ingest
 (`_quack_terms`, scored in SQL; no DuckDB extension). Tokens are lowercased alphanumeric
 runs passed through the Snowball English stemmer (`rust-stemmers`), so `renewals` meets
-`renewal` on the keyword side. Splitting on every non-alphanumeric character means a code
-like `POL-8841` indexes as `pol` and `8841`; what matters is that the query side splits
-identically. The term index is rebuilt on open when a workspace predates the stemmer. Each
-ranking is over-fetched to twice `top_k`, fused with reciprocal rank fusion (`k = 60`), and
-the top `k` chunks (default 8) are returned. A reranking hook
-(`analysis::rerank::Reranker`) sits between fusion and the answer: off by default
-(`[retrieval].rerank = "none"`), or `"model"`, which over-fetches `rerank_candidates`
-(24) and has the chat model order them listwise in one tool-less call, so an air-gapped
-deployment gets reranking from the model it already runs. A failed ranking call keeps the
-fused order and the tool step says so. A cross-encoder provider fits the same trait. This is the main retrieval
-quality improvement over the pgvector setup, where keyword-exact questions (part numbers,
-policy IDs) go unanswered.
+`renewal` on the keyword side; the query side tokenizes identically. A run joined by
+`-`, `.`, `_`, `/`, or `:` with no whitespace, such as `POL-8841`, additionally indexes its
+punctuation-stripped, unstemmed form (`pol8841`) alongside the split pieces (`pol`, `8841`),
+so a query for that identifier ranks a chunk containing it ahead of one that merely contains
+`pol` and `8841` apart (`storage::workspace::tokenize`, issue #77). A `"..."` quoted phrase
+in a query is an exact adjacency requirement: since `_quack_terms` carries no term
+positions, BM25 still ranks candidates by the phrase's own tokens, over-fetched, and a
+post-filter keeps only the chunks whose content or heading contains the phrase as a
+case-insensitive, whitespace-normalized substring; a phrase matching nothing returns no
+keyword results rather than falling back to the unfiltered ranking. The term index is
+rebuilt on open when a workspace predates the stemmer or the joined identifier form. Each
+ranking is over-fetched to twice `top_k` (more when a phrase is present), fused with
+reciprocal rank fusion (`k = 60`), and the top `k` chunks (default 8) are returned. A
+reranking hook (`analysis::rerank::Reranker`) sits between fusion and the answer: off by
+default (`[retrieval].rerank = "none"`), or `"model"`, which over-fetches
+`rerank_candidates` (24) and has the chat model order them listwise in one tool-less call,
+so an air-gapped deployment gets reranking from the model it already runs. A failed ranking
+call keeps the fused order and the tool step says so. A cross-encoder provider fits the
+same trait. This is the main retrieval quality improvement over the pgvector setup, where
+keyword-exact questions (part numbers, policy IDs) go unanswered.
 
 **Citations.** Every retrieved chunk carries `document_id`, `filename`, `title`, `page`,
 `heading`, and its fused score. The agent cites by `[n]` markers that map to these chunks;
