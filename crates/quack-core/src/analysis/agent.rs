@@ -24,6 +24,14 @@ use crate::graph::{GraphOptions, GraphResult};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
+/// How long Ollama keeps the chat model loaded after a request, sent on
+/// every agent request so a gap between tool calls or turns does not pay
+/// a multi-second reload (see [`build_agent`]'s use of it). Ollama accepts
+/// a Go duration string; long enough to cover a slow multi-tool-call turn
+/// or a user's think time between messages, short enough not to pin an
+/// idle workspace's model in memory indefinitely.
+const OLLAMA_KEEP_ALIVE: &str = "30m";
+
 /// What the provider charged for a turn. Every budget quack computes
 /// itself — the history trim, Ollama's `num_ctx` — is a four-characters-
 /// per-token estimate; this is the measured count the provider reported,
@@ -572,7 +580,21 @@ where
         ))
         .temperature(0.1);
     if let Some(num_ctx) = ctx.context_window {
-        builder = builder.additional_params(serde_json::json!({ "num_ctx": num_ctx }));
+        // `keep_alive` is Ollama-only too (rig lifts it out of
+        // `additional_params` into the request's top-level field, never
+        // into `options`). Nothing was setting it, so every request fell
+        // back to Ollama's own default (`OLLAMA_KEEP_ALIVE`, 5 minutes
+        // unless the operator changed it) each time it decided whether to
+        // keep the model loaded. A turn with several tool calls, or an
+        // idle stretch between turns in a TUI or web session, can leave a
+        // gap longer than that, which pays a multi-second reload the same
+        // way a changed `num_ctx` does (measured live, both in the perf
+        // handoff). Sending it explicitly on every request keeps the
+        // model warm through longer gaps regardless of the server's
+        // default.
+        builder = builder.additional_params(
+            serde_json::json!({ "num_ctx": num_ctx, "keep_alive": OLLAMA_KEEP_ALIVE }),
+        );
     }
 
     // The ontology is describable as soon as it exists: the prompt block

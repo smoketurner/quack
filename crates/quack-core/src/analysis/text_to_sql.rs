@@ -336,14 +336,25 @@ fn trimmed_sample(sample: &QueryResults) -> QueryResults {
 }
 
 /// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
-/// room for tool results and the answer, rounded up to 2,048, between
+/// room for tool results and the answer, rounded up to 8,192, between
 /// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
 /// most workspace prompts, which loses the tool guidance and the question.
+///
+/// `num_ctx` is a load option: asking Ollama for a different value than
+/// the one the model is already loaded with forces a full model reload,
+/// which measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama
+/// serve`, repeated `/api/generate` calls that only changed `num_ctx`) —
+/// against single-digit milliseconds for a request that keeps the same
+/// value. A session's history only grows turn over turn until the
+/// history trim caps it, so the requested size is non-decreasing within
+/// a session; the step below is deliberately coarse (four tiers instead
+/// of one every 2,048 tokens) so a growing conversation crosses it, and
+/// pays that reload, at most three times instead of up to twelve.
 #[must_use]
 pub fn ollama_context_size(prompt_chars: usize, cap: u32) -> u32 {
     const HEADROOM: u32 = 8_192;
     const FLOOR: u32 = 8_192;
-    const STEP: u32 = 2_048;
+    const STEP: u32 = 8_192;
     let prompt_tokens = u32::try_from(prompt_chars.div_ceil(4)).unwrap_or(u32::MAX);
     let needed = prompt_tokens.saturating_add(HEADROOM);
     let rounded = needed.div_ceil(STEP).saturating_mul(STEP).max(FLOOR);
@@ -720,9 +731,9 @@ mod tests {
     #[test]
     fn ollama_context_size_rounds_up_within_bounds() {
         assert_eq!(ollama_context_size(0, 32_768), 8_192);
-        assert_eq!(ollama_context_size(4 * 1_000, 32_768), 10_240);
-        // 12,875 prompt tokens plus headroom rounds to 22,528.
-        assert_eq!(ollama_context_size(4 * 12_875, 32_768), 22_528);
+        assert_eq!(ollama_context_size(4 * 1_000, 32_768), 16_384);
+        // 12,875 prompt tokens plus headroom rounds to 24,576.
+        assert_eq!(ollama_context_size(4 * 12_875, 32_768), 24_576);
         assert_eq!(ollama_context_size(4 * 100_000, 32_768), 32_768);
         assert_eq!(ollama_context_size(4 * 100_000, 2_048), 8_192);
     }

@@ -893,9 +893,15 @@ graph tools are conditional, and mode changes no registration — query mode onl
 provisional graph results.
 
 For Ollama every request carries `num_ctx`: the prompt's estimated tokens plus room for
-tool results and the answer (a fixed 8,192-token headroom), rounded up to 2,048, capped by
+tool results and the answer (a fixed 8,192-token headroom), rounded up to 8,192, capped by
 `[analysis].max_context_tokens` but never below 8,192, because Ollama otherwise loads the
-model with a 4,096-token window and silently truncates the front of the prompt. A turn the model derails (a call to
+model with a 4,096-token window and silently truncates the front of the prompt. `num_ctx`
+is a load option: a value that differs from what the model is already loaded with forces a
+full reload (measured at several seconds for a 20B model), so the step is deliberately
+coarse — a growing session's history crosses it at most a few times rather than at every
+2,048 tokens — and every request also carries `keep_alive` (30 minutes), since nothing did
+before and a gap between tool calls or turns otherwise pays the same reload once Ollama's
+own default (5 minutes) lapses. A turn the model derails (a call to
 a tool that does not exist, the `max_turns` limit) or that fails after text streamed is
 still a turn: the streamed text is kept, a parenthetical note says what happened, and the
 turn is recorded; only a model that could not be reached at all is an error.
