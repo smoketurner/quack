@@ -24,14 +24,6 @@ use crate::graph::{GraphOptions, GraphResult};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
-/// How long Ollama keeps the chat model loaded after a request, sent on
-/// every agent request so a gap between tool calls or turns does not pay
-/// a multi-second reload (see [`build_agent`]'s use of it). Ollama accepts
-/// a Go duration string; long enough to cover a slow multi-tool-call turn
-/// or a user's think time between messages, short enough not to pin an
-/// idle workspace's model in memory indefinitely.
-const OLLAMA_KEEP_ALIVE: &str = "30m";
-
 /// What the provider charged for a turn. Every budget quack computes
 /// itself — the history trim, Ollama's `num_ctx` — is a four-characters-
 /// per-token estimate; this is the measured count the provider reported,
@@ -593,7 +585,7 @@ where
         // model warm through longer gaps regardless of the server's
         // default.
         builder = builder.additional_params(
-            serde_json::json!({ "num_ctx": num_ctx, "keep_alive": OLLAMA_KEEP_ALIVE }),
+            serde_json::json!({ "num_ctx": num_ctx, "keep_alive": crate::llm::OLLAMA_KEEP_ALIVE }),
         );
     }
 

@@ -29,10 +29,120 @@ pub use tokio_util::sync::CancellationToken;
 type OpenAiEmbeddingModel =
     rig::providers::openai::GenericEmbeddingModel<rig::providers::openai::OpenAICompletionsExt>;
 
+/// How long every Ollama request asks the server to keep the model loaded.
+/// Ollama's own default is 5 minutes (`OLLAMA_KEEP_ALIVE`), which a gap
+/// between tool calls or turns can exceed, and a reload of a 20B model
+/// costs several seconds (measured live in the perf handoff).
+pub const OLLAMA_KEEP_ALIVE: &str = "30m";
+
+/// The smallest context window the embedding model is loaded with. Ollama
+/// otherwise loads it at the model's full length (32k for qwen3-embedding,
+/// 5.8 GB of KV cache against 2.1 GB at 2,048, measured live) even though
+/// no input is longer than a chunk.
+const OLLAMA_EMBED_MIN_CTX: u32 = 2048;
+
+/// Ollama's `/api/embed`, with the two load options rig's own embedding
+/// client never sends: `num_ctx`, sized to the longest input quack embeds
+/// (a chunk) instead of the model's maximum, and `keep_alive`, so the
+/// embedding model stays resident between the query embedding and the
+/// chat call of one turn instead of lapsing on Ollama's 5-minute default.
+#[derive(Clone)]
+pub struct OllamaEmbedder {
+    client: rig::providers::ollama::Client,
+    model: String,
+    ndims: usize,
+    num_ctx: u32,
+}
+
+impl OllamaEmbedder {
+    /// The `num_ctx` for `chunk_size_tokens`-token inputs: twice the chunk
+    /// size, since the chunker counts cl100k tokens and the embedding
+    /// model's tokenizer may count more, rounded up to a power of two and
+    /// never below [`OLLAMA_EMBED_MIN_CTX`].
+    #[must_use]
+    pub fn context_window(chunk_size_tokens: u32) -> u32 {
+        chunk_size_tokens
+            .saturating_mul(2)
+            .checked_next_power_of_two()
+            .unwrap_or(u32::MAX)
+            .max(OLLAMA_EMBED_MIN_CTX)
+    }
+
+    /// The request body Ollama receives for `texts`.
+    #[must_use]
+    pub fn request_body(&self, texts: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "input": texts,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": { "num_ctx": self.num_ctx },
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OllamaEmbedResponse {
+    embeddings: Vec<Vec<f64>>,
+}
+
+impl EmbeddingModel for OllamaEmbedder {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = rig::providers::ollama::Client;
+
+    fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
+        Self {
+            client: client.clone(),
+            model: model.into(),
+            ndims: dims.unwrap_or_default(),
+            num_ctx: OLLAMA_EMBED_MIN_CTX,
+        }
+    }
+
+    fn ndims(&self) -> usize {
+        self.ndims
+    }
+
+    async fn embed_texts(
+        &self,
+        texts: impl IntoIterator<Item = String> + Send,
+    ) -> std::result::Result<Vec<Embedding>, EmbeddingError> {
+        use rig::http_client::{self, HttpClientExt};
+
+        let texts: Vec<String> = texts.into_iter().collect();
+        let body = serde_json::to_vec(&self.request_body(&texts))?;
+        let request = self
+            .client
+            .post("api/embed")?
+            .body(body)
+            .map_err(|e| EmbeddingError::HttpError(e.into()))?;
+        let response = self.client.send::<_, Vec<u8>>(request).await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = http_client::text(response).await?;
+            return Err(EmbeddingError::from_http_response(status, text));
+        }
+        let bytes: Vec<u8> = response.into_body().await?;
+        let parsed: OllamaEmbedResponse = serde_json::from_slice(&bytes)?;
+        if parsed.embeddings.len() != texts.len() {
+            return Err(EmbeddingError::ResponseError(format!(
+                "ollama returned {} embeddings for {} inputs",
+                parsed.embeddings.len(),
+                texts.len()
+            )));
+        }
+        Ok(parsed
+            .embeddings
+            .into_iter()
+            .zip(texts)
+            .map(|(vec, document)| Embedding { document, vec })
+            .collect())
+    }
+}
+
 /// Embedding model over every provider that supports embeddings.
 #[derive(Clone)]
 pub enum EmbedModel {
-    Ollama(rig::providers::ollama::EmbeddingModel),
+    Ollama(OllamaEmbedder),
     OpenAi(OpenAiEmbeddingModel),
     /// An OpenAI-compatible endpoint behind OAuth: the bearer can change
     /// between batches of a long ingest, so the client is rebuilt per call
@@ -67,9 +177,7 @@ impl EmbeddingModel for EmbedModel {
     type Client = rig::providers::ollama::Client;
 
     fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
-        Self::Ollama(rig::providers::ollama::EmbeddingModel::make(
-            client, model, dims,
-        ))
+        Self::Ollama(OllamaEmbedder::make(client, model, dims))
     }
 
     fn ndims(&self) -> usize {
@@ -467,9 +575,12 @@ async fn build_embed_model(config: &Config, model: ModelRef<'_>) -> Result<Embed
     match model.provider.provider_type {
         ProviderType::Ollama => {
             let client = build_ollama_client(config, model.provider_name, model.provider).await?;
-            Ok(EmbedModel::Ollama(
-                client.embedding_model_with_ndims(model.model, ndims),
-            ))
+            Ok(EmbedModel::Ollama(OllamaEmbedder {
+                client,
+                model: model.model.to_owned(),
+                ndims,
+                num_ctx: OllamaEmbedder::context_window(config.ingestion.chunk_size_tokens),
+            }))
         }
         ProviderType::Openai if model.provider.auth == AuthMode::Oauth => {
             let manager =
@@ -792,6 +903,37 @@ mod tests {
         );
         let model = required_embedding_model(&config).await;
         assert!(model.is_ok_and(|m| m.ndims() == 4));
+    }
+
+    #[tokio::test]
+    async fn ollama_embed_requests_carry_a_bounded_window_and_keep_alive() {
+        let config = parse(
+            "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n[ingestion]\nchunk_size_tokens = 3000\n",
+        );
+        let model = required_embedding_model(&config).await;
+        let Ok(EmbedModel::Ollama(embedder)) = model else {
+            fail("expected the Ollama embedder")
+        };
+        let body = embedder.request_body(&[String::from("a chunk")]);
+        assert_eq!(body.get("model"), Some(&serde_json::json!("nomic")));
+        assert_eq!(body.get("input"), Some(&serde_json::json!(["a chunk"])));
+        assert_eq!(
+            body.get("keep_alive"),
+            Some(&serde_json::json!(OLLAMA_KEEP_ALIVE))
+        );
+        // 3,000 tokens doubled and rounded up to a power of two.
+        assert_eq!(
+            body.pointer("/options/num_ctx"),
+            Some(&serde_json::json!(8192))
+        );
+    }
+
+    #[test]
+    fn ollama_embed_window_never_drops_below_the_floor() {
+        assert_eq!(OllamaEmbedder::context_window(512), OLLAMA_EMBED_MIN_CTX);
+        assert_eq!(OllamaEmbedder::context_window(1024), OLLAMA_EMBED_MIN_CTX);
+        assert_eq!(OllamaEmbedder::context_window(1025), 4096);
+        assert_eq!(OllamaEmbedder::context_window(u32::MAX), u32::MAX);
     }
 
     #[tokio::test]

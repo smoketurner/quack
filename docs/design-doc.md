@@ -901,7 +901,14 @@ full reload (measured at several seconds for a 20B model), so the step is delibe
 coarse — a growing session's history crosses it at most a few times rather than at every
 2,048 tokens — and every request also carries `keep_alive` (30 minutes), since nothing did
 before and a gap between tool calls or turns otherwise pays the same reload once Ollama's
-own default (5 minutes) lapses. A turn the model derails (a call to
+own default (5 minutes) lapses. Embedding requests go through quack's own `/api/embed`
+client (`llm::OllamaEmbedder`) rather than rig's, which sends neither: they carry the same
+`keep_alive`, so the embedding model does not lapse between the query embedding and the chat
+call of one turn, and a `num_ctx` sized to a chunk (twice `[ingestion].chunk_size_tokens`,
+rounded up to a power of two, never below 2,048) instead of the model's full length, which
+Ollama otherwise loads it with (32k for qwen3-embedding: 5.8 GB of cache against 2.1 GB,
+measured, at the same throughput). On a host where the two models at full size would not
+both fit, that difference is what stops them evicting each other every turn. A turn the model derails (a call to
 a tool that does not exist, the `max_turns` limit) or that fails after text streamed is
 still a turn: the streamed text is kept, a parenthetical note says what happened, and the
 turn is recorded; only a model that could not be reached at all is an error.
