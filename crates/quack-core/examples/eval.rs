@@ -350,6 +350,20 @@ struct GoldQuestion {
     #[serde(default)]
     kind: String,
     expected: Vec<GoldExpected>,
+    /// This question's correct answer is that nothing should come back: the
+    /// individual words appear in the corpus (so a bag-of-words ranking
+    /// returns something), but the exact phrase does not, so a phrase-aware
+    /// search should filter every candidate out.
+    #[serde(default)]
+    expect_empty: bool,
+}
+
+/// What a gold question expects back: specific chunk ids, or nothing at
+/// all (an `expect_empty` question).
+#[derive(Debug, Clone)]
+enum Expectation {
+    Chunks(BTreeSet<String>),
+    Empty,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -361,15 +375,22 @@ struct RetrievalMetrics {
     n: usize,
 }
 
+/// One kind's (`identifier`, `phrase`, `semantic`) metrics for every
+/// backend, so a tokenization or phrase-filtering change shows up on its
+/// own row instead of averaged away across question kinds.
+#[derive(Debug, Serialize)]
+struct BackendMetrics {
+    keyword: RetrievalMetrics,
+    similar: RetrievalMetrics,
+    hybrid: RetrievalMetrics,
+}
+
 #[derive(Debug, Serialize)]
 struct RetrievalReport {
     keyword: RetrievalMetrics,
     similar: RetrievalMetrics,
     hybrid: RetrievalMetrics,
-    /// Hybrid recall@8, grouped by gold-question kind (`identifier`,
-    /// `phrase`, `semantic`), so a change to identifier or phrase
-    /// tokenization shows up on its own line instead of averaged away.
-    by_kind: BTreeMap<String, RetrievalMetrics>,
+    by_kind: BTreeMap<String, BackendMetrics>,
     n: usize,
 }
 
@@ -377,30 +398,42 @@ fn ids_of(results: Vec<ChunkSearchResult>) -> Vec<String> {
     results.into_iter().map(|r| r.id).collect()
 }
 
-fn recall_at(expected: &BTreeSet<String>, ranked: &[String], k: usize) -> f64 {
-    if expected.is_empty() {
-        return 0.0;
-    }
-    let hit = ranked
-        .iter()
-        .take(k)
-        .filter(|id| expected.contains(*id))
-        .count();
-    hit as f64 / expected.len() as f64
-}
-
-fn reciprocal_rank(expected: &BTreeSet<String>, ranked: &[String]) -> f64 {
-    for (i, id) in ranked.iter().enumerate() {
-        if expected.contains(id) {
-            return 1.0 / (i as f64 + 1.0);
+fn recall_at(expectation: &Expectation, ranked: &[String], k: usize) -> f64 {
+    match expectation {
+        Expectation::Chunks(expected) => {
+            if expected.is_empty() {
+                return 0.0;
+            }
+            let hit = ranked
+                .iter()
+                .take(k)
+                .filter(|id| expected.contains(*id))
+                .count();
+            hit as f64 / expected.len() as f64
         }
+        // Nothing should have been returned at all; a k-cutoff is
+        // meaningless when the correct answer is an empty list.
+        Expectation::Empty => f64::from(u8::from(ranked.is_empty())),
     }
-    0.0
 }
 
-/// A gold question's expected chunk ids paired with what a search backend
+fn reciprocal_rank(expectation: &Expectation, ranked: &[String]) -> f64 {
+    match expectation {
+        Expectation::Chunks(expected) => {
+            for (i, id) in ranked.iter().enumerate() {
+                if expected.contains(id) {
+                    return 1.0 / (i as f64 + 1.0);
+                }
+            }
+            0.0
+        }
+        Expectation::Empty => f64::from(u8::from(ranked.is_empty())),
+    }
+}
+
+/// A gold question's expectation paired with what a search backend
 /// actually ranked, for one question.
-type QuestionPairs = Vec<(BTreeSet<String>, Vec<String>)>;
+type QuestionPairs = Vec<(Expectation, Vec<String>)>;
 
 fn aggregate(per_question: &QuestionPairs) -> RetrievalMetrics {
     let n = per_question.len();
@@ -417,11 +450,11 @@ fn aggregate(per_question: &QuestionPairs) -> RetrievalMetrics {
     let mut sum5 = 0.0;
     let mut sum8 = 0.0;
     let mut summrr = 0.0;
-    for (expected, ranked) in per_question {
-        sum1 += recall_at(expected, ranked, 1);
-        sum5 += recall_at(expected, ranked, 5);
-        sum8 += recall_at(expected, ranked, 8);
-        summrr += reciprocal_rank(expected, ranked);
+    for (expectation, ranked) in per_question {
+        sum1 += recall_at(expectation, ranked, 1);
+        sum5 += recall_at(expectation, ranked, 5);
+        sum8 += recall_at(expectation, ranked, 8);
+        summrr += reciprocal_rank(expectation, ranked);
     }
     let n_f = n as f64;
     RetrievalMetrics {
@@ -445,24 +478,30 @@ async fn evaluate_retrieval(
     let mut keyword_pairs = Vec::with_capacity(gold.len());
     let mut similar_pairs = Vec::with_capacity(gold.len());
     let mut hybrid_pairs = Vec::with_capacity(gold.len());
-    let mut hybrid_by_kind: BTreeMap<String, QuestionPairs> = BTreeMap::new();
+    let mut by_kind: BTreeMap<String, (QuestionPairs, QuestionPairs, QuestionPairs)> =
+        BTreeMap::new();
 
     for q in &gold {
-        let expected: BTreeSet<String> = chunks
-            .iter()
-            .filter(|c| {
-                q.expected
-                    .iter()
-                    .any(|e| e.filename == c.filename && c.content.contains(e.contains.as_str()))
-            })
-            .map(|c| c.id.clone())
-            .collect();
-        if expected.is_empty() {
-            return Err(Error::Ingestion(format!(
-                "gold question '{}' matched no ingested chunk; fix the fixture",
-                q.question
-            )));
-        }
+        let expectation = if q.expect_empty {
+            Expectation::Empty
+        } else {
+            let expected: BTreeSet<String> = chunks
+                .iter()
+                .filter(|c| {
+                    q.expected.iter().any(|e| {
+                        e.filename == c.filename && c.content.contains(e.contains.as_str())
+                    })
+                })
+                .map(|c| c.id.clone())
+                .collect();
+            if expected.is_empty() {
+                return Err(Error::Ingestion(format!(
+                    "gold question '{}' matched no ingested chunk; fix the fixture",
+                    q.question
+                )));
+            }
+            Expectation::Chunks(expected)
+        };
 
         let keyword_ids =
             ids_of(db.search_keyword_chunks(&q.question, top_k, &ChunkScope::all())?);
@@ -481,22 +520,36 @@ async fn evaluate_retrieval(
             &ChunkScope::all(),
         )?);
 
-        keyword_pairs.push((expected.clone(), keyword_ids));
-        similar_pairs.push((expected.clone(), similar_ids));
-        hybrid_by_kind
-            .entry(q.kind.clone())
-            .or_default()
-            .push((expected.clone(), hybrid_ids.clone()));
-        hybrid_pairs.push((expected, hybrid_ids));
+        let kind_entry = by_kind.entry(q.kind.clone()).or_default();
+        kind_entry
+            .0
+            .push((expectation.clone(), keyword_ids.clone()));
+        kind_entry
+            .1
+            .push((expectation.clone(), similar_ids.clone()));
+        kind_entry.2.push((expectation.clone(), hybrid_ids.clone()));
+
+        keyword_pairs.push((expectation.clone(), keyword_ids));
+        similar_pairs.push((expectation.clone(), similar_ids));
+        hybrid_pairs.push((expectation, hybrid_ids));
     }
 
     Ok(RetrievalReport {
         keyword: aggregate(&keyword_pairs),
         similar: aggregate(&similar_pairs),
         hybrid: aggregate(&hybrid_pairs),
-        by_kind: hybrid_by_kind
+        by_kind: by_kind
             .into_iter()
-            .map(|(kind, pairs)| (kind, aggregate(&pairs)))
+            .map(|(kind, (kw, sim, hy))| {
+                (
+                    kind,
+                    BackendMetrics {
+                        keyword: aggregate(&kw),
+                        similar: aggregate(&sim),
+                        hybrid: aggregate(&hy),
+                    },
+                )
+            })
             .collect(),
         n: gold.len(),
     })
@@ -848,13 +901,27 @@ impl Report {
                 m.recall_at_1, m.recall_at_5, m.recall_at_8, m.mrr
             )?;
         }
-        writeln!(out, "\nHybrid recall@8 by question kind:")?;
-        for (kind, m) in &self.retrieval.by_kind {
-            writeln!(
-                out,
-                "{kind:<10} {:>10.3} ({} questions)",
-                m.recall_at_8, m.n
-            )?;
+        writeln!(
+            out,
+            "\nRetrieval by question kind (identifier/phrase questions carry the decoys that make #77's fix visible):"
+        )?;
+        writeln!(
+            out,
+            "{:<10} {:<10} {:>10} {:>10} {:>10} {:>8} {:>6}",
+            "kind", "method", "recall@1", "recall@5", "recall@8", "mrr", "n"
+        )?;
+        for (kind, backends) in &self.retrieval.by_kind {
+            for (name, m) in [
+                ("keyword", &backends.keyword),
+                ("similar", &backends.similar),
+                ("hybrid", &backends.hybrid),
+            ] {
+                writeln!(
+                    out,
+                    "{kind:<10} {name:<10} {:>10.3} {:>10.3} {:>10.3} {:>8.3} {:>6}",
+                    m.recall_at_1, m.recall_at_5, m.recall_at_8, m.mrr, m.n
+                )?;
+            }
         }
 
         writeln!(

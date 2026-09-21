@@ -101,5 +101,11 @@
       { "filename": "episode-01.md", "contains": "golf ball sized hail" },
       { "filename": "episode-02.md", "contains": "golf ball sized hail" }
     ]
+  },
+  {
+    "question": "\"catastrophic flood damage\"",
+    "kind": "phrase",
+    "expected": [],
+    "expect_empty": true
   }
 ]
