@@ -383,6 +383,9 @@ pub fn record_turn(
             serde_json::to_value(&response.graph)?,
         );
     }
+    if let Some(usage) = response.usage {
+        metadata.insert(String::from("usage"), serde_json::to_value(usage)?);
+    }
     let metadata = if metadata.is_empty() {
         None
     } else {
@@ -590,6 +593,7 @@ pub fn delete_if_empty(db: &WorkspaceDb, session_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::agent::TokenUsage;
     use crate::analysis::events::ToolStep;
 
     fn db() -> WorkspaceDb {
@@ -610,6 +614,7 @@ mod tests {
             graph: Vec::new(),
             write_refused: false,
             cancelled: false,
+            usage: None,
         }
     }
 
@@ -726,6 +731,52 @@ mod tests {
         let session = get_session(&db, &session.id).unwrap().unwrap();
         assert_eq!(session.title.as_deref(), Some("how many claims are open?"));
         assert_eq!(session.message_count, 3);
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn token_usage_round_trips_through_the_assistant_metadata() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        let mut answer = response("There are 4 open claims.", vec![]);
+        answer.usage = Some(TokenUsage {
+            input_tokens: 1_204,
+            output_tokens: 57,
+            total_tokens: 1_261,
+        });
+        record_turn(&db, &session.id, "how many?", &answer).unwrap();
+
+        let rows = messages(&db, &session.id).unwrap();
+        let assistant = rows
+            .iter()
+            .find(|r| r.role == MessageRole::Assistant)
+            .unwrap();
+        let usage = assistant
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("usage"))
+            .unwrap();
+        let count = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+        assert_eq!(count("input_tokens"), Some(1_204));
+        assert_eq!(count("output_tokens"), Some(57));
+        assert_eq!(count("total_tokens"), Some(1_261));
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn a_turn_without_reported_usage_records_no_usage_key() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        record_turn(&db, &session.id, "q", &response("a", vec![])).unwrap();
+
+        let rows = messages(&db, &session.id).unwrap();
+        let assistant = rows
+            .iter()
+            .find(|r| r.role == MessageRole::Assistant)
+            .unwrap();
+        // No chart, citations, graph or usage: the whole metadata column
+        // stays NULL rather than holding an empty object.
+        assert!(assistant.metadata.is_none());
     }
 
     #[test]

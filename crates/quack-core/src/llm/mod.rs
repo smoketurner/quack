@@ -155,6 +155,14 @@ pub async fn stream_answer(
                     StreamedAssistantContent::Text(t),
                 ) => answer.push_str(&t.text),
                 rig::agent::MultiTurnStreamItem::FinalResponse(r) => {
+                    if r.usage.has_values() {
+                        tracing::debug!(
+                            call = what,
+                            input_tokens = r.usage.input_tokens,
+                            output_tokens = r.usage.output_tokens,
+                            "provider token usage"
+                        );
+                    }
                     final_text = Some(r.output);
                 }
                 _ => {}

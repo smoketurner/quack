@@ -22,6 +22,51 @@ use crate::graph::store as graph_store;
 use crate::graph::{GraphOptions, GraphResult};
 use crate::storage::sessions::ChatMode;
 
+/// What the provider charged for a turn. Every budget quack computes
+/// itself — the history trim, Ollama's `num_ctx` — is a four-characters-
+/// per-token estimate; this is the measured count the provider reported,
+/// for the response object and the transcript.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "these are the field names of rig's Usage and of every provider's API, and they are the response object's JSON keys"
+)]
+pub struct TokenUsage {
+    /// Prompt tokens: the system prompt, the replayed history, the tool
+    /// results, and the question, summed over every completion request
+    /// the turn made.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Kept separate because some providers report only this one.
+    pub total_tokens: u64,
+}
+
+impl From<rig::completion::Usage> for TokenUsage {
+    fn from(usage: rig::completion::Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+        }
+    }
+}
+
+impl TokenUsage {
+    /// Add one completion request's counts, for the turns that never reach
+    /// a final response.
+    fn add(&mut self, usage: rig::completion::Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+    }
+
+    /// The counts, unless every one is zero — rig's sentinel for a provider
+    /// that reported no usage at all.
+    fn reported(self) -> Option<Self> {
+        (self != Self::default()).then_some(self)
+    }
+}
+
 /// Everything a turn produced, delivered with `AgentEvent::TurnComplete` and
 /// returned from `run_analysis`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -39,6 +84,11 @@ pub struct AgentResponse {
     /// The user cancelled the turn; `content` holds what streamed before.
     #[serde(default)]
     pub cancelled: bool,
+    /// Tokens the provider reported for the turn. `None` when it reported
+    /// none — a local model often does, and zeroes there would read as a
+    /// turn that cost nothing.
+    #[serde(default)]
+    pub usage: Option<TokenUsage>,
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
@@ -99,6 +149,7 @@ impl AgentResponse {
             "chart": self.chart,
             "write_refused": self.write_refused,
             "cancelled": self.cancelled,
+            "usage": self.usage,
             "session_id": session_id,
         })
     }
@@ -272,6 +323,11 @@ where
     let mut streamed = String::new();
     let mut final_text: Option<String> = None;
     let mut stopped: Option<String> = None;
+    // The final response carries rig's aggregate for the whole run; the
+    // per-call counts are the fallback for a turn that derails before it,
+    // which is exactly the turn whose cost is worth knowing.
+    let mut aggregate: Option<TokenUsage> = None;
+    let mut per_call = TokenUsage::default();
 
     while let Some(item) = stream.next().await {
         let item = match item {
@@ -301,12 +357,15 @@ where
                 recorder.emit(AgentEvent::TextDelta(text.text));
             }
             rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
+                if response.usage.has_values() {
+                    aggregate = Some(response.usage.into());
+                }
                 final_text = Some(response.output);
             }
+            rig::agent::MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
             rig::agent::MultiTurnStreamItem::StreamAssistantItem(_)
             | rig::agent::MultiTurnStreamItem::StreamUserItem(_)
             | rig::agent::MultiTurnStreamItem::ToolExecutionCommitted { .. }
-            | rig::agent::MultiTurnStreamItem::CompletionCall(_)
             | rig::agent::MultiTurnStreamItem::ModelTurnRetried { .. } => {}
         }
     }
@@ -320,6 +379,7 @@ where
         &graph_results,
         recorder,
         &refused,
+        aggregate.or_else(|| per_call.reported()),
     )
 }
 
@@ -538,6 +598,7 @@ fn finish_turn(
     graph_results: &GraphResults,
     recorder: &TurnRecorder,
     refused: &RefusalFlag,
+    usage: Option<TokenUsage>,
 ) -> Result<AgentResponse> {
     let chart = chart_spec
         .lock()
@@ -556,6 +617,7 @@ fn finish_turn(
         graph,
         write_refused: refused.was_refused(),
         cancelled: false,
+        usage,
     })
 }
 
@@ -641,6 +703,53 @@ mod tests {
         assert_eq!(json["write_refused"], false);
         assert_eq!(json["cancelled"], false);
         assert!(json["graph"].is_array() && json["chart"].is_null());
+        // A provider that reported nothing leaves `usage` null rather than
+        // claiming the turn was free.
+        assert!(json["usage"].is_null());
+
+        let counted = AgentResponse {
+            usage: Some(TokenUsage {
+                input_tokens: 980,
+                output_tokens: 43,
+                total_tokens: 1_023,
+            }),
+            ..AgentResponse::default()
+        };
+        let json = counted.to_json("s1");
+        assert_eq!(json["usage"]["input_tokens"], 980);
+        assert_eq!(json["usage"]["output_tokens"], 43);
+        assert_eq!(json["usage"]["total_tokens"], 1_023);
+    }
+
+    #[test]
+    fn per_call_usage_accumulates_across_a_turns_completion_requests() {
+        let call = |input: u64, output: u64| rig::completion::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input.saturating_add(output),
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            tool_use_prompt_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let mut usage = TokenUsage::default();
+        usage.add(call(400, 20));
+        usage.add(call(650, 35));
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 1_050,
+                output_tokens: 55,
+                total_tokens: 1_105,
+            }
+        );
+        assert_eq!(usage.reported(), Some(usage));
+        // A provider that reports nothing leaves the accumulator at its
+        // default, which `run_inner` reads as "no counts", not zero cost.
+        let mut none = TokenUsage::default();
+        none.add(call(0, 0));
+        assert_eq!(none, TokenUsage::default());
+        assert_eq!(none.reported(), None);
     }
 
     #[test]
