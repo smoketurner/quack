@@ -295,7 +295,14 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 config.ingestion.chunk_overlap_tokens,
                 &config.ingestion.tokenizer_encoding,
             )?;
-            let chunk_count = embed_and_store(db, doc_id, &chunks, embedding_model).await?;
+            let chunk_count = embed_and_store(
+                db,
+                doc_id,
+                &chunks,
+                embedding_model,
+                config.ingestion.embedding_batch_size,
+            )
+            .await?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
@@ -476,11 +483,14 @@ fn ingest_workbook(
     Ok(tables)
 }
 
+/// Store `chunks`, then embed them `batch_size` at a time
+/// (`[ingestion].embedding_batch_size`, at least one per request).
 async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
     db: &D,
     document_id: &str,
     chunks: &[chunker::Chunk],
     embedding_model: Option<&M>,
+    batch_size: u32,
 ) -> Result<u32> {
     let stored = db.with(|db| {
         let mut stored: u32 = 0;
@@ -505,7 +515,8 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
     })?;
 
     if let Some(model) = embedding_model {
-        let batch_size = 64usize;
+        let batch_size = usize::try_from(batch_size.max(1))
+            .map_err(|_| Error::Ingestion("embedding_batch_size overflow".into()))?;
         let mut offset = 0usize;
 
         while offset < chunks.len() {

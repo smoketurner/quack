@@ -22,6 +22,43 @@ struct MockEmbeddingModel {
     dim: usize,
 }
 
+/// Records the size of every batch it is asked to embed.
+struct BatchRecordingModel {
+    batches: std::sync::Mutex<Vec<usize>>,
+}
+
+impl EmbeddingModel for BatchRecordingModel {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = ();
+
+    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+        Self {
+            batches: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn ndims(&self) -> usize {
+        TEST_DIM
+    }
+
+    fn embed_texts(
+        &self,
+        texts: impl IntoIterator<Item = String> + Send,
+    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        let texts: Vec<String> = texts.into_iter().collect();
+        if let Ok(mut batches) = self.batches.lock() {
+            batches.push(texts.len());
+        }
+        std::future::ready(Ok(texts
+            .into_iter()
+            .map(|document| Embedding {
+                document,
+                vec: vec![0.1_f64; TEST_DIM],
+            })
+            .collect()))
+    }
+}
+
 /// An embedding provider that is down: every call fails.
 struct FailingEmbeddingModel;
 
@@ -200,6 +237,46 @@ async fn ingest_text_with_mock_embeddings() {
         .unwrap();
     let count = qr.rows.first().unwrap().first().unwrap();
     assert_ne!(count, &serde_json::Value::Number(0.into()));
+}
+
+#[tokio::test]
+async fn embedding_batch_size_bounds_every_embed_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.ingestion.embedding_batch_size = 2;
+    let workspace_id = "ws-batch";
+
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let model = BatchRecordingModel::make(&(), "mock", None);
+
+    // Five headed sections, each its own chunk at 50 tokens.
+    let sections: Vec<String> = (1..=5)
+        .map(|i| format!("# Section {i}\n\nA short paragraph about topic number {i}.\n"))
+        .collect();
+    let data = sections.join("\n");
+    let result = ingestion::ingest_file(
+        &config,
+        &db,
+        workspace_id,
+        &ingestion::NewFile::new("batches.md", data.as_bytes()),
+        Some(&model),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+
+    let batches = model.batches.lock().unwrap().clone();
+    let total: usize = batches.iter().sum();
+    assert_eq!(total, result.chunks_stored as usize);
+    assert!(
+        batches.len() >= 2,
+        "expected several batches, got {batches:?}"
+    );
+    assert!(
+        batches.iter().all(|&n| (1..=2).contains(&n)),
+        "every batch within the configured size: {batches:?}"
+    );
 }
 
 #[tokio::test]

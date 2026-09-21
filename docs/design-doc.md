@@ -571,8 +571,8 @@ sentence boundaries. The nearest preceding heading is stored on the chunk and pr
 its embedding input; page numbers are recorded where the source has them. Token counts via
 `tiktoken` (`cl100k_base`).
 
-**Embedding.** Batches of 64 through the configured embedding provider (the batch size is
-a constant; `[ingestion].embedding_batch_size` is not read). There is no index to build on
+**Embedding.** Batches of `[ingestion].embedding_batch_size` (64 by default, at least one)
+through the configured embedding provider. There is no index to build on
 either side: vector search is an exact scan, and the term rows for a chunk are appended as
 it is inserted. A full term rebuild happens only when an older workspace is opened
 (schema version below 6). Re-uploading a file with the same SHA-256 is a no-op with a
