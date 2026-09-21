@@ -187,7 +187,10 @@ resolves the name (the same entry-point resolution `search_graph` uses), narrows
 to the chunks that entity was extracted from (`graph::store::chunks_of_nodes` into
 `storage::workspace::ChunkScope`, which bounds both the vector and the BM25 leg), and every
 hit names the entities the graph took from it (`graph::store::entities_of_chunks`). An
-entity that exists only in mapped table rows says so instead of returning nothing.
+entity that exists only in mapped table rows says so instead of returning nothing. The
+`entity` argument is offered only while the graph has nodes (`SearchDocumentsTool::with_graph`),
+like the graph tools themselves. Ollama embedding requests go through `llm::OllamaEmbedder`,
+not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with

@@ -901,7 +901,14 @@ full reload (measured at several seconds for a 20B model), so the step is delibe
 coarse — a growing session's history crosses it at most a few times rather than at every
 2,048 tokens — and every request also carries `keep_alive` (30 minutes), since nothing did
 before and a gap between tool calls or turns otherwise pays the same reload once Ollama's
-own default (5 minutes) lapses. A turn the model derails (a call to
+own default (5 minutes) lapses. Embedding requests go through quack's own `/api/embed`
+client (`llm::OllamaEmbedder`) rather than rig's, which sends neither: they carry the same
+`keep_alive`, so the embedding model does not lapse between the query embedding and the chat
+call of one turn, and a `num_ctx` sized to a chunk (twice `[ingestion].chunk_size_tokens`,
+rounded up to a power of two, never below 2,048) instead of the model's full length, which
+Ollama otherwise loads it with (32k for qwen3-embedding: 5.8 GB of cache against 2.1 GB,
+measured, at the same throughput). On a host where the two models at full size would not
+both fit, that difference is what stops them evicting each other every turn. A turn the model derails (a call to
 a tool that does not exist, the `max_turns` limit) or that fails after text streamed is
 still a turn: the streamed text is kept, a parenthetical note says what happened, and the
 turn is recorded; only a model that could not be reached at all is an error.
@@ -928,7 +935,10 @@ built (section 17).
 **The substrates cross in the tools, not only in the store.** `search_documents(entity)`
 resolves the name against the graph and restricts retrieval to the chunks that entity was
 extracted from, and every hit names the entities the graph already took from it, so the
-model can follow one into `search_graph`. Graph provenance to a mapped table renders as a
+model can follow one into `search_graph`. The `entity` argument is in the tool's schema
+only while the graph has nodes, the same condition that registers the graph tools: a model
+shown it on a workspace without a graph tries it, is refused, and spends a second round
+trip and twice the tokens reaching the same answer (measured live). Graph provenance to a mapped table renders as a
 predicate (`"orders" WHERE "order_id" = 'A-42'`) that `run_sql` can run, since the mapping
 records the key column. An entity in the graph only from table rows says so rather than
 returning nothing.

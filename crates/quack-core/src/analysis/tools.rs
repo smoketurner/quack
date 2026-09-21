@@ -504,6 +504,11 @@ pub struct SearchDocumentsTool<M> {
     reranker: Option<Arc<dyn Reranker>>,
     rerank_candidates: u32,
     recorder: TurnRecorder,
+    /// The graph has nodes, so the `entity` argument can resolve. Without
+    /// one the argument is left out of the tool's schema and description:
+    /// a model shown it tries it, is refused, and spends a second round
+    /// trip (and twice the tokens, measured live) reaching the same answer.
+    graph_enabled: bool,
 }
 
 impl<M> SearchDocumentsTool<M> {
@@ -522,7 +527,15 @@ impl<M> SearchDocumentsTool<M> {
             reranker: None,
             rerank_candidates: 0,
             recorder,
+            graph_enabled: false,
         }
+    }
+
+    /// Offer the `entity` argument: only when the graph has nodes.
+    #[must_use]
+    pub fn with_graph(mut self, graph_enabled: bool) -> Self {
+        self.graph_enabled = graph_enabled;
+        self
     }
 
     /// Over-fetch `candidates` and let `reranker` order them before the
@@ -596,17 +609,32 @@ where
     type Output = String;
 
     fn description(&self) -> String {
-        String::from(
+        let mut text = String::from(
             "Search the ingested documents by meaning and by keyword. Returns the most relevant \
              text chunks, each numbered [n] with its source file, page, and heading, for citing \
-             in the answer, and names the graph entities each chunk was the source of. Pass \
-             entity to search only the passages one entity was extracted from.",
-        )
+             in the answer",
+        );
+        if self.graph_enabled {
+            text.push_str(
+                ", and names the graph entities each chunk was the source of. Pass entity to \
+                 search only the passages one entity was extracted from",
+            );
+        }
+        text.push('.');
+        text
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(SearchDocumentsArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}))
+        let mut schema = serde_json::to_value(schemars::schema_for!(SearchDocumentsArgs))
+            .unwrap_or_else(|_| json!({"type": "object"}));
+        if !self.graph_enabled
+            && let Some(properties) = schema
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            properties.remove("entity");
+        }
+        schema
     }
 
     async fn call(
@@ -1882,6 +1910,29 @@ mod tests {
                 .is_some_and(|s| s.contains("reranked by reverse")),
             "{last:?}"
         );
+    }
+
+    #[test]
+    fn search_documents_offers_the_entity_argument_only_with_a_graph() {
+        let (sink, _rx) = super::super::events::channel();
+        let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+            ReaderDb::new(shared_db()),
+            None,
+            5,
+            60,
+            TurnRecorder::new(sink),
+        );
+        let has_entity = |tool: &SearchDocumentsTool<crate::llm::EmbedModel>| {
+            tool.parameters().pointer("/properties/entity").is_some()
+        };
+
+        assert!(!has_entity(&tool));
+        assert!(tool.parameters().pointer("/properties/query").is_some());
+        assert!(!tool.description().contains("entity"));
+
+        let tool = tool.with_graph(true);
+        assert!(has_entity(&tool));
+        assert!(tool.description().contains("Pass entity"));
     }
 
     #[tokio::test]
