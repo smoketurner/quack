@@ -785,6 +785,17 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
         ["Kenya (country)"]
     );
 
+    // A typo the overlap test cannot catch: one dropped or changed letter
+    // still suggests the real label (issue #92, seen live on OKLAHOMS).
+    assert_eq!(
+        traverse::suggest_entities(&db, "Ugandq", None, None).unwrap(),
+        ["Uganda (country)"]
+    );
+    assert_eq!(
+        traverse::suggest_entities(&db, "Kenyaa", None, None).unwrap(),
+        ["Kenya (country)"]
+    );
+
     // Held to the class when one was given, and empty when nothing is close.
     assert!(
         traverse::suggest_entities(&db, "Orgenics", Some("country"), None)

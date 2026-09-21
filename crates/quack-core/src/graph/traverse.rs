@@ -25,6 +25,19 @@ const PROPERTY_VALUE_CHARS: usize = 60;
 /// How many labels a lookup that matched nothing offers as alternatives.
 const SUGGESTION_LIMIT: u32 = 5;
 
+/// How alike two labels must read for one to be offered as the other's
+/// correction: Jaro-Winkler, which `DuckDB` has built in, so no extension
+/// is loaded. A single transposed or dropped letter scores well above
+/// this; two unrelated names of the same length do not.
+const SUGGESTION_SIMILARITY: f64 = 0.88;
+
+/// How far a label embedding may be from the query and still be offered
+/// as a suggestion. Looser than [`ENTRY_MAX_DISTANCE`], which decides
+/// what *is* the entity, but not unbounded: in a small graph the nearest
+/// node is whatever exists, and suggesting an unrelated label invites the
+/// model to search again and answer about the wrong thing.
+const SUGGESTION_MAX_DISTANCE: f64 = 0.5;
+
 /// Nodes matching `entity`: exact normalized label (any class, or one
 /// class), else the nearest label embeddings within a distance, else
 /// nothing.
@@ -77,10 +90,15 @@ pub fn resolve_entry(
 }
 
 /// Labels worth retrying when a lookup matched nothing: nodes whose
-/// normalized label overlaps the text either way, then the nearest label
-/// embeddings whatever their distance (`resolve_entry` has already
-/// rejected them as matches, which does not make them useless as
-/// suggestions). Rendered as `label (class)`.
+/// normalized label overlaps the text either way or is a near-miss of it
+/// (Jaro-Winkler, so a one-letter typo still suggests the real label),
+/// closest first, then label embeddings within a looser distance than an
+/// entry point takes — `resolve_entry` has already rejected those as
+/// matches, which does not make them useless as suggestions, though a
+/// suggestion no closer than any other label would be. The embedding pass finds
+/// nothing until `graph::resolve` has run with an embedding model, since
+/// only that writes node embeddings; the similarity pass always works.
+/// Rendered as `label (class)`.
 ///
 /// # Errors
 ///
@@ -98,14 +116,19 @@ pub fn suggest_entities(
     let mut out: Vec<String> = Vec::new();
     let mut stmt = db.connection().prepare(
         "SELECT label, class_id FROM _quack_graph_nodes \
-         WHERE (contains(normalized_label, ?) OR contains(?, normalized_label)) \
-         AND (? IS NULL OR class_id = ?) ORDER BY length(label), label LIMIT ?",
+         WHERE (contains(normalized_label, ?) OR contains(?, normalized_label) \
+                OR jaro_winkler_similarity(normalized_label, ?) >= ?) \
+         AND (? IS NULL OR class_id = ?) \
+         ORDER BY jaro_winkler_similarity(normalized_label, ?) DESC, length(label), label LIMIT ?",
     )?;
     let mut rows = stmt.query(duckdb::params![
         normalized,
         normalized,
+        normalized,
+        SUGGESTION_SIMILARITY,
         class_id,
         class_id,
+        normalized,
         i64::from(SUGGESTION_LIMIT)
     ])?;
     while let Some(row) = rows.next()? {
@@ -118,7 +141,10 @@ pub fn suggest_entities(
     drop(rows);
     drop(stmt);
     if let Some(query) = query_embedding {
-        for (node, _) in store::nearest_nodes(db, query, class_id, SUGGESTION_LIMIT)? {
+        for (node, distance) in store::nearest_nodes(db, query, class_id, SUGGESTION_LIMIT)? {
+            if distance > SUGGESTION_MAX_DISTANCE {
+                continue;
+            }
             let label = format!("{} ({})", node.label, node.class_id);
             if !out.contains(&label) {
                 out.push(label);

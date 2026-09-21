@@ -1379,6 +1379,37 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_rendering_is_cut_but_keeps_its_totals() {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..400 {
+            lines.push(format!(
+                "Node {i:03} (storm_event) {{event_type: Tornado, state: OKLAHOMA}}"
+            ));
+        }
+        let body = format!("{}\n", lines.join("\n"));
+        let text = format!("{body}200 of 1529 matching nodes, 0 edges, 200 sources — cut off\n");
+        let trimmed = trim_graph_text(&text, MAX_GRAPH_TEXT_CHARS);
+        assert!(
+            trimmed.chars().count() < text.chars().count(),
+            "it should be shorter"
+        );
+        assert!(trimmed.contains("Node 000"), "{trimmed}");
+        assert!(!trimmed.contains("Node 399"), "the tail is cut");
+        // The summary line survives, so the totals are never what gets lost.
+        assert!(trimmed.contains("200 of 1529 matching nodes"), "{trimmed}");
+        assert!(
+            trimmed.contains("more lines not shown") && trimmed.contains("describe_class"),
+            "{trimmed}"
+        );
+        // Comfortably inside a turn's budget once cut.
+        assert!(
+            trimmed.chars().count() < MAX_GRAPH_TEXT_CHARS + 400,
+            "{}",
+            trimmed.chars().count()
+        );
+    }
+
+    #[test]
     fn an_empty_result_says_which_kind_of_empty_it_is() {
         let nothing = empty_graph_text(false, &[]).unwrap_or_default();
         assert!(
@@ -2196,7 +2227,15 @@ where
         step.finish(if stripped {
             String::from("matches are provisional")
         } else {
-            format!("{} nodes, {} edges", result.nodes.len(), result.edges.len())
+            let of = match result.total_nodes.filter(|_| result.truncated) {
+                Some(total) => format!(" of {total}"),
+                None => String::new(),
+            };
+            format!(
+                "{}{of} nodes, {} edges",
+                result.nodes.len(),
+                result.edges.len()
+            )
         });
         let text = format_graph_result(
             &result,
@@ -2395,9 +2434,43 @@ fn empty_graph_text(
     Ok(out)
 }
 
+/// The most characters one graph result may put into a turn. A listing of
+/// `max_nodes` entities, each with its properties, is otherwise large
+/// enough to push a fixed Ollama `num_ctx` over: the front of the prompt
+/// is cut, the tool list goes with it, and the model invents a tool name
+/// (seen live on gpt-oss:20b, the failure #40 describes).
+const MAX_GRAPH_TEXT_CHARS: usize = 6_000;
+
+/// Chunk sources cited from one graph result before the rest are counted.
+const MAX_GRAPH_SOURCES: usize = 10;
+
+/// Table rows named in one graph result before the rest are counted.
+const MAX_GRAPH_ROWS: usize = 20;
+
+/// An oversized rendering cut at a line boundary, keeping the summary line
+/// (which carries the totals) and saying what to do instead.
+fn trim_graph_text(text: &str, budget: usize) -> String {
+    let summary = text.trim_end().lines().next_back().unwrap_or_default();
+    let mut kept = String::new();
+    let mut shown: usize = 0;
+    for line in text.lines() {
+        if kept.chars().count().saturating_add(line.chars().count()) > budget {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        shown = shown.saturating_add(1);
+    }
+    format!(
+        "{kept}... {} more lines not shown: narrow the search with a class, a relation, or fewer \
+         hops, and use describe_class to count a class.\n{summary}\n",
+        text.lines().count().saturating_sub(shown)
+    )
+}
+
 /// Render a graph result for the model: the tree, then the sources each
 /// node and edge came from, registered as citable `[n]` markers (chunks)
-/// or named as table rows.
+/// or named as table rows. Bounded as a whole, not just per node.
 async fn format_graph_result(
     result: &GraphResult,
     recorder: &TurnRecorder,
@@ -2408,14 +2481,21 @@ async fn format_graph_result(
     if result.nodes.is_empty() {
         return empty_graph_text(stripped_provisional, suggestions);
     }
-    let mut out = graph::traverse::render_tree(result);
-    let chunk_ids: Vec<String> = result
+    let tree = graph::traverse::render_tree(result);
+    let mut out = if tree.chars().count() > MAX_GRAPH_TEXT_CHARS {
+        trim_graph_text(&tree, MAX_GRAPH_TEXT_CHARS)
+    } else {
+        tree
+    };
+    // Bounded like the tree: a 200-node listing can carry a source per
+    // node, and every one of them would be quoted in full.
+    let all_chunk_ids: std::collections::BTreeSet<String> = result
         .provenance
         .iter()
         .filter_map(|p| p.chunk_id.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
         .collect();
+    let hidden_chunks = all_chunk_ids.len().saturating_sub(MAX_GRAPH_SOURCES);
+    let chunk_ids: Vec<String> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
     let (chunks, ontology) = db
         .with_db(move |db| {
             let chunks = db.chunks_by_ids(&chunk_ids)?;
@@ -2432,6 +2512,9 @@ async fn format_graph_result(
             let excerpt: String = chunk.content.trim().chars().take(200).collect();
             writeln!(out, "[{n}] {}{page}: {excerpt}", chunk.filename)?;
         }
+        if hidden_chunks > 0 {
+            writeln!(out, "... and {hidden_chunks} more sources")?;
+        }
     }
     let rows: std::collections::BTreeSet<String> = result
         .provenance
@@ -2446,10 +2529,17 @@ async fn format_graph_result(
         })
         .collect();
     if !rows.is_empty() {
+        let hidden_rows = rows.len().saturating_sub(MAX_GRAPH_ROWS);
+        let shown: Vec<String> = rows.into_iter().take(MAX_GRAPH_ROWS).collect();
+        let more = if hidden_rows > 0 {
+            format!("; ... and {hidden_rows} more rows")
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "\nFrom table rows (run_sql can read them): {}",
-            rows.into_iter().collect::<Vec<_>>().join("; ")
+            "\nFrom table rows (run_sql can read them): {}{more}",
+            shown.join("; ")
         )?;
     }
     Ok(out)
