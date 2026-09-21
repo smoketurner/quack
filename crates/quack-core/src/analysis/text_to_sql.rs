@@ -253,14 +253,26 @@ fn append_tables(prompt: &mut String, db: &WorkspaceDb) -> Result<Vec<String>> {
     if !tables.is_empty() {
         writeln!(prompt, "Available tables:")?;
         for (index, table) in tables.iter().enumerate() {
+            // Tables past the detail cap only ever print their row count,
+            // so only ask for that: `describe_table` also runs `DESCRIBE`
+            // and a sample-row `SELECT`, whose output would be thrown
+            // away below. A workspace with far more tables than the cap
+            // (a per-table induced ontology, say) otherwise pays for a
+            // full describe and sample of every excess table on every
+            // turn for nothing.
+            if index >= DETAILED_TABLES {
+                let Ok(row_count) = db.count_rows(table) else {
+                    writeln!(prompt, "- {table}")?;
+                    continue;
+                };
+                writeln!(prompt, "- {table} ({row_count} rows)")?;
+                continue;
+            }
             let Ok(desc) = db.describe_table(table) else {
                 writeln!(prompt, "- {table}")?;
                 continue;
             };
             writeln!(prompt, "- {table} ({} rows)", desc.row_count)?;
-            if index >= DETAILED_TABLES {
-                continue;
-            }
             writeln!(prompt, "  Columns:")?;
             for col in desc.columns.iter().take(LISTED_COLUMNS) {
                 writeln!(prompt, "    - {} ({})", col.name, col.column_type)?;
