@@ -91,6 +91,67 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
         ),
     }
 
+    let ontology = ontology_store::current(db)?;
+    let graph = graph_store::status(db)?;
+    append_tool_guidance(&mut prompt, graph.enabled());
+
+    let version = db.duckdb_version()?;
+    writeln!(
+        prompt,
+        "DuckDB {version} SQL reference. This is DuckDB's dialect, not Postgres, MySQL, or \
+         SQLite; prefer these idioms:"
+    )?;
+    prompt.push_str(DIALECT_REFERENCE);
+    prompt.push('\n');
+
+    let tables = append_tables(&mut prompt, db)?;
+    let documents = append_documents(&mut prompt, db)?;
+    append_pinned_documents(&mut prompt, db, options.pinned_token_budget)?;
+
+    if let Some(ontology) = ontology {
+        prompt.push_str(&ontology.render_for_prompt());
+        if graph.enabled() {
+            writeln!(
+                prompt,
+                "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}. search_graph and \
+                 find_path read it; both return provenance to cite.",
+                graph.nodes,
+                graph.edges,
+                if graph.provisional() {
+                    " (provisional: built from an unreviewed ontology; say so when you use it)"
+                } else {
+                    ""
+                },
+                if graph.stale {
+                    " (stale: the ontology changed since it was built)"
+                } else {
+                    ""
+                }
+            )?;
+        }
+        writeln!(prompt)?;
+    }
+
+    if tables.is_empty() && documents == 0 {
+        writeln!(
+            prompt,
+            "No tables or documents have been ingested yet. Let the user know they can ingest files first."
+        )?;
+        writeln!(prompt)?;
+    }
+
+    append_context(&mut prompt, options)?;
+
+    prompt.push_str(permissions_text(options.write_policy));
+
+    Ok(prompt)
+}
+
+/// The numbered procedures, one per substrate. The table, SQL, chart and
+/// document tools are always registered; the graph block appears only when
+/// the graph tools do (design doc 7.2), since guidance for a tool the
+/// model cannot call is worse than none.
+fn append_tool_guidance(prompt: &mut String, graph_enabled: bool) {
     prompt.push_str(
         "When answering analytical questions about structured data:\n\
          1. First use list_tables or describe_table to understand the available data; run \
@@ -109,77 +170,45 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
          4. Do not write a Sources or References section; one is appended for you from the markers\n\n",
     );
 
-    let version = db.duckdb_version()?;
-    writeln!(
-        prompt,
-        "DuckDB {version} SQL reference. This is DuckDB's dialect, not Postgres, MySQL, or \
-         SQLite; prefer these idioms:"
-    )?;
-    prompt.push_str(DIALECT_REFERENCE);
-    prompt.push('\n');
+    if graph_enabled {
+        prompt.push_str(
+            "When answering questions about how entities relate:\n\
+             1. Call search_graph with an entity's name for what it connects to, or with an \
+             ontology class id to list the entities of that class\n\
+             2. Call find_path when the question is how two named entities connect\n\
+             3. Use the class and relation ids from the ontology below; a wrong id comes back as \
+             an error naming the real ones, and a name that matches no entity comes back with \
+             the closest labels, so call again rather than giving up\n\
+             4. Cite the [n] markers the results register, the same way you cite search_documents\n\
+             5. If the graph has nothing, search the documents before telling the user the \
+             workspace does not cover the question\n\n",
+        );
+    }
+}
 
-    let tables = append_tables(&mut prompt, db)?;
-
+/// The document inventory block; returns how many documents it listed so
+/// the caller can tell an empty workspace from a full one.
+fn append_documents(prompt: &mut String, db: &WorkspaceDb) -> Result<usize> {
     let docs = db.list_documents()?;
-    if !docs.is_empty() {
-        writeln!(prompt, "Ingested documents:")?;
-        for doc in &docs {
-            let title = doc
-                .title
-                .as_deref()
-                .map_or(String::new(), |t| format!(" \"{t}\""));
-            writeln!(
-                prompt,
-                "- {}{title} (status: {}, type: {})",
-                doc.filename,
-                doc.status,
-                doc.mime_type.as_deref().unwrap_or("unknown"),
-            )?;
-        }
-        writeln!(prompt)?;
+    if docs.is_empty() {
+        return Ok(0);
     }
-
-    append_pinned_documents(&mut prompt, db, options.pinned_token_budget)?;
-
-    if let Some(ontology) = ontology_store::current(db)? {
-        prompt.push_str(&ontology.render_for_prompt());
-        let graph = graph_store::status(db)?;
-        if graph.enabled() {
-            writeln!(
-                prompt,
-                "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}. Use search_graph \
-                 for an entity's neighbourhood or every entity of a class, and find_path for how \
-                 two entities connect; both return provenance to cite.",
-                graph.nodes,
-                graph.edges,
-                if graph.provisional() {
-                    " (provisional: built from an unreviewed ontology; say so when you use it)"
-                } else {
-                    ""
-                },
-                if graph.stale {
-                    " (stale: the ontology changed since it was built)"
-                } else {
-                    ""
-                }
-            )?;
-        }
-        writeln!(prompt)?;
-    }
-
-    if tables.is_empty() && docs.is_empty() {
+    writeln!(prompt, "Ingested documents:")?;
+    for doc in &docs {
+        let title = doc
+            .title
+            .as_deref()
+            .map_or(String::new(), |t| format!(" \"{t}\""));
         writeln!(
             prompt,
-            "No tables or documents have been ingested yet. Let the user know they can ingest files first."
+            "- {}{title} (status: {}, type: {})",
+            doc.filename,
+            doc.status,
+            doc.mime_type.as_deref().unwrap_or("unknown"),
         )?;
-        writeln!(prompt)?;
     }
-
-    append_context(&mut prompt, options)?;
-
-    prompt.push_str(permissions_text(options.write_policy));
-
-    Ok(prompt)
+    writeln!(prompt)?;
+    Ok(docs.len())
 }
 
 /// The tables block: every user table with its row count, columns, and three
@@ -420,6 +449,48 @@ mod tests {
             context_max_tokens: 4000,
             ollama_context_cap: None,
         }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn the_graph_procedure_appears_only_once_the_graph_has_nodes() {
+        const PROCEDURE: &str = "When answering questions about how entities relate";
+        let db = db();
+        ontology_store::save(
+            &db,
+            &crate::ontology::Ontology::builtin_default(),
+            Some("tester"),
+            None,
+        )
+        .unwrap();
+
+        // An ontology alone registers no graph tools, so it gets no procedure.
+        let without = build_system_prompt(&db, &options(ChatMode::Chat, 0)).unwrap();
+        assert!(!without.contains(PROCEDURE), "{without}");
+        assert!(without.contains("Ontology (version"), "{without}");
+
+        graph_store::upsert_node(
+            &db,
+            &crate::graph::store::NewNode {
+                label: String::from("Acme"),
+                class_id: String::from("organization"),
+                properties: serde_json::json!({}),
+                provisional: false,
+            },
+        )
+        .unwrap();
+        let with = build_system_prompt(&db, &options(ChatMode::Chat, 0)).unwrap();
+        assert!(with.contains(PROCEDURE), "{with}");
+        assert!(
+            with.contains("search_graph") && with.contains("find_path"),
+            "{with}"
+        );
+        // The guidance comes before the ontology it refers to (design doc 7.2).
+        assert!(
+            with.find(PROCEDURE) < with.find("Ontology (version"),
+            "{with}"
+        );
+        assert!(with.contains("Knowledge graph: 1 nodes, 0 edges"), "{with}");
     }
 
     #[test]

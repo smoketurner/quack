@@ -170,7 +170,8 @@ carries each node's and edge's typed properties, bounded; a class or relation id
 ontology does not define is refused with the ids that do exist, a name that matches no
 entity comes back with the closest labels (`traverse::suggest_entities`), and a result
 query mode emptied by dropping provisional nodes says so rather than claiming the graph
-is empty.
+is empty. The tool guidance in the system prompt gains a numbered graph procedure whenever
+those tools are registered.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with

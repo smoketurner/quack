@@ -870,7 +870,9 @@ writes them to stderr. `max_turns` 10, temperature 0.1.
    again), and a Friendly SQL reference pinned to the bundled DuckDB version, which the
    prompt states. The reference carries only what the confined connection (7.4) can
    run: no file reads, extensions, or `SET`, and it says so, since the tables block is
-   all the data there is.
+   all the data there is. The guidance is one numbered procedure per substrate:
+   structured data, document content, and — only when the graph tools are registered —
+   how entities relate.
 3. Tables block: user-facing tables and views with columns, types, row count, three sample
    rows. Bounded so one wide or narrative table cannot push the guidance and the question
    out of a small window: the first 25 tables are described, the first 40 columns listed
