@@ -1684,24 +1684,36 @@ workspace) are local-only and not wired into a release. There is no fuzzing.
 
 **Evaluation.** `make eval` (`crates/quack-core/examples/eval.rs`, issue #74) is the
 answer-quality counterpart to the correctness suites above: it ingests a small in-tree
-storms-like fixture (`crates/quack-core/eval/`, 20 documents and three CSV tables written
-for the harness, not the NOAA download) into a temporary workspace and prints recall@k and
-MRR for `search_keyword_chunks`, `search_similar_chunks`, and `search_hybrid_chunks` over a
-gold question set (tagged `identifier`, `phrase`, or `semantic` so a tokenization change is
-visible on its own row); precision and recall of `ontology::induction::propose_from_tables`
-against a hand-written expected ontology; node and edge precision and recall of
-`graph::extract::run` over ten hand-labelled chunks through a canned `GraphExtractor`, so
-the numbers measure validation, resolution, and storage rather than a model; and how many
-of a fixed set of recorded answers keep every `[n]` marker through
-`analysis::citations::validate`. Vector search uses a deterministic hashing embedder (a
-bag-of-words projection, not a semantic one) so the run needs no Ollama and finishes in
-seconds. It writes the same numbers as JSON to `QUACK_EVAL_OUT` when set, for a before/after
-diff. Baseline on this fixture: keyword recall@8 1.000 (MRR 0.975), hybrid recall@8 0.850
-(MRR 0.627, identifier and phrase questions both 1.000, semantic 0.625 because the hashing
-embedder is not semantic), similarity-only recall@8 0.650; ontology induction and graph
-extraction both precision 1.000 / recall 1.000 against their fixtures; citation validity
-8/8 recorded answers validated as expected. A prompt, chunker, stemmer, or fusion-constant
-change is no longer a coin flip: this is the number that moves.
+storms-like fixture (`crates/quack-core/eval/`, 27 documents and three CSV tables written
+for the harness, not the NOAA download) into a temporary workspace and prints recall@1/5/8
+and MRR, per question kind (`identifier`, `phrase`, `semantic`) and per backend
+(`search_keyword_chunks`, `search_similar_chunks`, `search_hybrid_chunks`), over a 21-question
+gold set; precision and recall of `ontology::induction::propose_from_tables` against a
+hand-written expected ontology; node and edge precision and recall of `graph::extract::run`
+over ten hand-labelled chunks through a canned `GraphExtractor`, so the numbers measure
+validation, resolution, and storage rather than a model; and how many of a fixed set of
+recorded answers keep every `[n]` marker through `analysis::citations::validate`. Vector
+search uses a deterministic hashing embedder (a bag-of-words projection, not a semantic one)
+so the run needs no Ollama and finishes in seconds. It writes the same numbers as JSON to
+`QUACK_EVAL_OUT` when set, for a before/after diff.
+
+Five identifier questions (`SR-8841`, `SR-4437`, `SR-7765`, `SR-2214`, the `AKQ` office code)
+and two phrase questions (`"flash flood emergency"`, `"wall of water"`) carry decoy documents
+whose split identifier pieces or non-adjacent phrase words outscore the true chunk under
+plain BM25, so the fixture actually discriminates issue #77's identifier-joining and
+phrase-filter fix instead of trivially scoring 1.000 either way; one phrase question
+(`"catastrophic flood damage"`) expects an empty result, since every word in it appears
+somewhere but the exact phrase appears nowhere. Baseline on this fixture (before #77):
+keyword recall@1 0.571 (MRR 0.762), hybrid recall@1 0.452 (MRR 0.605); by kind, keyword
+recall@1/MRR is 0.444/0.722 for identifier and 0.000/0.375 for phrase, both dragged down by
+the decoys; ontology induction and graph extraction both precision 1.000 / recall 1.000
+against their fixtures; citation validity 8/8 recorded answers validated as expected. With
+`fix/77-identifier-and-phrase-search` (#104) merged on top, the same fixture measures
+keyword identifier recall@1/MRR at 0.889/0.944 and keyword phrase recall@1/MRR at 0.875/
+1.000 — the identifier-joined term and the phrase substring filter recover every decoyed
+question except the bare `AKQ` code, which has no hyphen for the joined-identifier term to
+attach to. Those are the expected numbers once #104 merges; a prompt, chunker, stemmer, or
+fusion-constant change is no longer a coin flip either way: this is the number that moves.
 
 ---
 
