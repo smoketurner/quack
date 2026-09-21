@@ -934,9 +934,18 @@ and anything else means write. `DESCRIBE`, `SHOW`, `SUMMARIZE`, `PIVOT`, `UNPIVO
 
 Every interface returns the same response object (11.2): `answer`, `citations` (each with
 `n`, `chunk_id`, `document_id`, `filename`, `chunk_index`, `page`, `heading`, `label`),
-`queries`, `steps`, `graph`, `chart`, `write_refused`, `cancelled`, `session_id`, built by
-`AgentResponse::to_json`. `AuthRequired` is exit code 4 from every command that reaches a
-provider.
+`queries`, `steps`, `graph`, `chart`, `write_refused`, `cancelled`, `usage`, `session_id`,
+built by `AgentResponse::to_json`. `AuthRequired` is exit code 4 from every command that
+reaches a provider.
+
+`usage` is what the provider reported for the turn — `input_tokens`, `output_tokens`,
+`total_tokens`, rig's aggregate over every completion request the turn made, falling back
+to the sum of the per-request counts when the turn derailed before a final response. It is
+`null` when the provider reported nothing, which a local model often does; zeroes there
+would read as a turn that cost nothing. The same counts go on the assistant message's
+metadata in `_quack_messages`, so a session export carries them. They are a record, not an
+input: the history trim and Ollama's `num_ctx` still run on their own estimate, because
+both are computed before the call.
 
 **Limits.** The agent's connection runs with `SET memory_limit` and `SET threads` from
 config. A statement runs on the calling thread — for the agent, a `spawn_blocking` one —
@@ -1159,6 +1168,7 @@ mode emits:
   "chart": {...},
   "write_refused": false,
   "cancelled": false,
+  "usage": {"input_tokens": 1204, "output_tokens": 57, "total_tokens": 1261},
   "session_id": "..."
 }
 ```
