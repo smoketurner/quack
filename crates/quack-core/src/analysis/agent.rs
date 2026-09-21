@@ -540,7 +540,8 @@ where
         embedding_model.clone(),
         ctx.retrieval_config,
         &ctx.recorder,
-    );
+    )
+    .with_graph(ctx.graph_enabled);
     let mut builder = completion_model
         .into_agent_builder()
         .preamble(system_prompt)

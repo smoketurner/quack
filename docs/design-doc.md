@@ -935,7 +935,10 @@ built (section 17).
 **The substrates cross in the tools, not only in the store.** `search_documents(entity)`
 resolves the name against the graph and restricts retrieval to the chunks that entity was
 extracted from, and every hit names the entities the graph already took from it, so the
-model can follow one into `search_graph`. Graph provenance to a mapped table renders as a
+model can follow one into `search_graph`. The `entity` argument is in the tool's schema
+only while the graph has nodes, the same condition that registers the graph tools: a model
+shown it on a workspace without a graph tries it, is refused, and spends a second round
+trip and twice the tokens reaching the same answer (measured live). Graph provenance to a mapped table renders as a
 predicate (`"orders" WHERE "order_id" = 'A-42'`) that `run_sql` can run, since the mapping
 records the key column. An entity in the graph only from table rows says so rather than
 returning nothing.
