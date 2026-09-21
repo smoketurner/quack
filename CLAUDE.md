@@ -136,7 +136,13 @@ It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, c
 mapped tables and columns against the workspace, and writes a new version with a JSON
 snapshot, `since_version` carried over for items that already existed. JSON is the only
 interchange form (export, import, `PUT /ontology`); a file is never the source of truth.
-The system prompt carries a compact rendering when an ontology exists. Induction from
+The system prompt carries a compact rendering when an ontology exists
+(`Ontology::render_capped`, 30 items per section with the rest counted; extraction still
+gets `render_for_prompt` in full, since the model may only answer with ids it was shown),
+and the `describe_class` tool registers alongside it: one class with its ancestry,
+subclasses, typed properties, the relations it takes part in, its mapped table, and the
+graph's exact count of it (`graph::store::class_census`) — the count traversal cannot give,
+since a class listing stops at `max_nodes` and user SQL may not read `_quack_` tables. Induction from
 tables (`ontology::induction::propose_from_tables`, no model calls) proposes a class per
 table, typed properties per column (enum, date, number, boolean, string), the unique
 non-null column as key, a relation where a column's values overlap another table's key,
@@ -170,8 +176,18 @@ carries each node's and edge's typed properties, bounded; a class or relation id
 ontology does not define is refused with the ids that do exist, a name that matches no
 entity comes back with the closest labels (`traverse::suggest_entities`), and a result
 query mode emptied by dropping provisional nodes says so rather than claiming the graph
-is empty. The tool guidance in the system prompt gains a numbered graph procedure whenever
-those tools are registered.
+is empty. A result cut short by `max_nodes` says so too, and a class listing carries the
+total it was capped from (`GraphResult::total_nodes`, `truncated`). Provenance to a mapped
+table renders as a predicate `run_sql` can run, since the mapping knows the key column. The
+tool guidance in the system prompt gains a numbered graph procedure whenever those tools
+are registered.
+
+Retrieval and the graph meet through `_quack_provenance`: `search_documents(entity)`
+resolves the name (the same entry-point resolution `search_graph` uses), narrows the search
+to the chunks that entity was extracted from (`graph::store::chunks_of_nodes` into
+`storage::workspace::ChunkScope`, which bounds both the vector and the BM25 leg), and every
+hit names the entities the graph took from it (`graph::store::entities_of_chunks`). An
+entity that exists only in mapped table rows says so instead of returning nothing.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with

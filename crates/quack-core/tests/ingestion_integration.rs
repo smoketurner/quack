@@ -11,7 +11,7 @@ use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
-    DocumentSource, NewChunk, NewDocument, StatementKind, WorkspaceDb,
+    ChunkScope, DocumentSource, NewChunk, NewDocument, StatementKind, WorkspaceDb,
 };
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
@@ -540,20 +540,22 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
 
     let query = [1.0_f32, 0.0, 0.0, 0.0];
 
-    let all = db.search_similar_chunks(&query, 5, &[]).unwrap();
+    let all = db
+        .search_similar_chunks(&query, 5, &ChunkScope::all())
+        .unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all.first().unwrap().filename, "policy.pdf");
     assert_eq!(all.last().unwrap().filename, "faq.md");
 
     let only_b = db
-        .search_similar_chunks(&query, 5, &[String::from("doc-b")])
+        .search_similar_chunks(&query, 5, &ChunkScope::documents([String::from("doc-b")]))
         .unwrap();
     assert_eq!(only_b.len(), 1);
     assert_eq!(only_b.first().unwrap().document_id, "doc-b");
     assert_eq!(only_b.first().unwrap().filename, "faq.md");
 
     let none = db
-        .search_similar_chunks(&query, 5, &[String::from("missing")])
+        .search_similar_chunks(&query, 5, &ChunkScope::documents([String::from("missing")]))
         .unwrap();
     assert!(none.is_empty());
 }
@@ -602,7 +604,9 @@ fn workspace_db_search_similar_chunks() {
     .unwrap();
 
     let query = [1.0_f32, 0.0, 0.0, 0.0];
-    let results = db.search_similar_chunks(&query, 3, &[]).unwrap();
+    let results = db
+        .search_similar_chunks(&query, 3, &ChunkScope::all())
+        .unwrap();
     assert_eq!(results.len(), 3);
     assert_eq!(results.first().unwrap().content, "first chunk");
     assert_eq!(results.last().unwrap().content, "second chunk");
@@ -912,7 +916,11 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     // all, and the new width takes embeddings.
     let kept = db.chunks_by_ids(&[String::from("c")]).unwrap();
     assert_eq!(kept.len(), 1);
-    assert!(!db.search_keyword_chunks("x", 5, &[]).unwrap().is_empty());
+    assert!(
+        !db.search_keyword_chunks("x", 5, &ChunkScope::all())
+            .unwrap()
+            .is_empty()
+    );
     db.insert_chunk(&NewChunk {
         id: "c8",
         document_id: "d",
@@ -1075,7 +1083,7 @@ fn chunk_metadata_round_trips_through_search() {
     let config = test_config(dir.path());
     let db = seeded_for_search(&config, "ws-meta-search");
     let hits = db
-        .search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 1, &[])
+        .search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 1, &ChunkScope::all())
         .unwrap();
     let top = hits.first().unwrap();
     assert_eq!(top.id, "a0");
@@ -1084,24 +1092,81 @@ fn chunk_metadata_round_trips_through_search() {
     assert!(top.score > 0.99, "{}", top.score);
 }
 
+/// A chunk scope narrows both legs of retrieval, and a scope that names
+/// no chunks returns nothing rather than widening to the workspace.
+#[test]
+fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let db = seeded_for_search(&config, "ws-chunk-scope");
+
+    let only_a0 = ChunkScope::all().and_chunks([String::from("a0")]);
+    let keyword = db.search_keyword_chunks("flood", 5, &only_a0).unwrap();
+    assert_eq!(
+        keyword.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a0"]
+    );
+    let vector = db
+        .search_similar_chunks(&[0.0, 0.0, 1.0, 0.0], 5, &only_a0)
+        .unwrap();
+    assert_eq!(
+        vector.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a0"],
+        "the closer chunk b1 is outside the scope"
+    );
+    let hybrid = db
+        .search_hybrid_chunks("claims", &[0.0, 0.0, 1.0, 0.0], 5, 60, &only_a0)
+        .unwrap();
+    assert!(hybrid.iter().all(|h| h.id == "a0"), "{hybrid:?}");
+
+    // Both filters at once, contradicting each other.
+    let crossed = ChunkScope::documents([String::from("doc-b")]).and_chunks([String::from("a0")]);
+    assert!(
+        db.search_keyword_chunks("flood", 5, &crossed)
+            .unwrap()
+            .is_empty()
+    );
+
+    // An entity whose chunk set came back empty must find nothing.
+    let nothing = ChunkScope::all().and_chunks(Vec::new());
+    assert!(nothing.is_empty());
+    assert!(
+        db.search_keyword_chunks("flood", 5, &nothing)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &nothing)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!ChunkScope::all().is_empty());
+}
+
 #[test]
 fn keyword_search_finds_exact_tokens_the_vector_misses() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = seeded_for_search(&config, "ws-keyword");
-    let hits = db.search_keyword_chunks("POL-8841", 5, &[]).unwrap();
+    let hits = db
+        .search_keyword_chunks("POL-8841", 5, &ChunkScope::all())
+        .unwrap();
     assert_eq!(
         hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
         vec!["b0"]
     );
-    let none = db.search_keyword_chunks("zebra", 5, &[]).unwrap();
+    let none = db
+        .search_keyword_chunks("zebra", 5, &ChunkScope::all())
+        .unwrap();
     assert!(none.is_empty());
     let filtered = db
-        .search_keyword_chunks("flood", 5, &[String::from("doc-b")])
+        .search_keyword_chunks("flood", 5, &ChunkScope::documents([String::from("doc-b")]))
         .unwrap();
     assert!(filtered.is_empty());
     // Stemming: an inflected query finds the base form in the chunk.
-    let stemmed = db.search_keyword_chunks("exclusions", 5, &[]).unwrap();
+    let stemmed = db
+        .search_keyword_chunks("exclusions", 5, &ChunkScope::all())
+        .unwrap();
     assert!(!stemmed.is_empty());
     assert!(
         stemmed
@@ -1117,11 +1182,15 @@ fn keyword_search_on_empty_workspace_is_empty() {
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-noindex").unwrap();
     assert!(
-        db.search_keyword_chunks("anything", 3, &[])
+        db.search_keyword_chunks("anything", 3, &ChunkScope::all())
             .unwrap()
             .is_empty()
     );
-    assert!(db.search_keyword_chunks("   ", 3, &[]).unwrap().is_empty());
+    assert!(
+        db.search_keyword_chunks("   ", 3, &ChunkScope::all())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1131,12 +1200,14 @@ fn keyword_search_ranks_by_bm25_and_uses_headings() {
     let db = seeded_for_search(&config, "ws-bm25");
     // "flood" appears in a0's content; "exclusions" only in its heading.
     let hits = db
-        .search_keyword_chunks("flood exclusions", 5, &[])
+        .search_keyword_chunks("flood exclusions", 5, &ChunkScope::all())
         .unwrap();
     assert_eq!(hits.first().map(|h| h.id.as_str()), Some("a0"));
     assert_eq!(hits.len(), 1);
     // "thirty" only in b1; "claims" also only in b1's content here.
-    let hits = db.search_keyword_chunks("claims thirty", 5, &[]).unwrap();
+    let hits = db
+        .search_keyword_chunks("claims thirty", 5, &ChunkScope::all())
+        .unwrap();
     assert_eq!(hits.first().map(|h| h.id.as_str()), Some("b1"));
     assert!(hits.iter().all(|h| h.score > 0.0));
 }
@@ -1165,14 +1236,22 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
             .unwrap();
         db.execute_statement("UPDATE _quack_meta SET value = '5' WHERE key = 'schema_version'")
             .unwrap();
-        assert!(db.search_keyword_chunks("8841", 3, &[]).unwrap().is_empty());
+        assert!(
+            db.search_keyword_chunks("8841", 3, &ChunkScope::all())
+                .unwrap()
+                .is_empty()
+        );
     }
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
     assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("6"));
-    let hits = db.search_keyword_chunks("8841", 3, &[]).unwrap();
+    let hits = db
+        .search_keyword_chunks("8841", 3, &ChunkScope::all())
+        .unwrap();
     assert_eq!(hits.first().map(|h| h.id.as_str()), Some("c0"));
     // Rebuilt with stems: the inflected query matches now.
-    let renewals = db.search_keyword_chunks("renewals", 3, &[]).unwrap();
+    let renewals = db
+        .search_keyword_chunks("renewals", 3, &ChunkScope::all())
+        .unwrap();
     assert_eq!(renewals.first().map(|h| h.id.as_str()), Some("c0"));
     assert!(
         !db.list_tables()
@@ -1189,7 +1268,7 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     let db = seeded_for_search(&config, "ws-hybrid");
     // Vector nearest is a0 (flood); the keyword "POL-8841" only matches b0.
     let hits = db
-        .search_hybrid_chunks("POL-8841", &[1.0, 0.0, 0.0, 0.0], 3, 60, &[])
+        .search_hybrid_chunks("POL-8841", &[1.0, 0.0, 0.0, 0.0], 3, 60, &ChunkScope::all())
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids.len(), 3);
@@ -1200,7 +1279,7 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     assert!(hits.iter().all(|h| h.score <= top_score));
 
     let limited = db
-        .search_hybrid_chunks("flood", &[1.0, 0.0, 0.0, 0.0], 1, 60, &[])
+        .search_hybrid_chunks("flood", &[1.0, 0.0, 0.0, 0.0], 1, 60, &ChunkScope::all())
         .unwrap();
     assert_eq!(limited.len(), 1);
     assert_eq!(limited.first().unwrap().id, "a0");
@@ -1233,7 +1312,9 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
         Some("Exclusions")
     );
     assert!(rows.rows.first().unwrap().last().unwrap().is_null());
-    let hits = db.search_keyword_chunks("thirty", 5, &[]).unwrap();
+    let hits = db
+        .search_keyword_chunks("thirty", 5, &ChunkScope::all())
+        .unwrap();
     assert_eq!(
         hits.first().map(|h| h.heading.as_deref()),
         Some(Some("Claims"))
@@ -1652,9 +1733,14 @@ fn keyword_search_treats_null_as_a_word() {
         embedding: None,
     })
     .unwrap();
-    assert_eq!(db.search_keyword_chunks("null", 5, &[]).unwrap().len(), 1);
     assert_eq!(
-        db.search_keyword_chunks("null hypothesis", 5, &[])
+        db.search_keyword_chunks("null", 5, &ChunkScope::all())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.search_keyword_chunks("null hypothesis", 5, &ChunkScope::all())
             .unwrap()
             .len(),
         1
@@ -1681,19 +1767,24 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
     })
     .unwrap();
     assert!(
-        db.search_keyword_chunks("zebra", 5, &[])
+        db.search_keyword_chunks("zebra", 5, &ChunkScope::all())
             .unwrap()
             .is_empty()
     );
     assert!(
-        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &[])
+        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &ChunkScope::all())
             .unwrap()
             .is_empty()
     );
     db.update_document_status("d", "ready").unwrap();
-    assert_eq!(db.search_keyword_chunks("zebra", 5, &[]).unwrap().len(), 1);
     assert_eq!(
-        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &[])
+        db.search_keyword_chunks("zebra", 5, &ChunkScope::all())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &ChunkScope::all())
             .unwrap()
             .len(),
         1

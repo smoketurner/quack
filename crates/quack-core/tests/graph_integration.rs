@@ -655,6 +655,103 @@ fn auto_accepted_ontologies_are_provisional_until_reviewed() {
     assert!(!store::current_is_auto_accepted(&db).unwrap());
 }
 
+/// A class listing says how many nodes it left behind, and the census
+/// counts them without a traversal — the count user SQL cannot get, since
+/// `_quack_` tables are closed to it.
+#[test]
+fn class_listings_report_the_total_they_were_capped_from() {
+    let db = workspace();
+    for i in 0..12 {
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: format!("Country {i:02}"),
+                class_id: String::from("country"),
+                properties: serde_json::json!({}),
+                provisional: false,
+            },
+        )
+        .unwrap();
+    }
+    let current = ontology();
+    let options = GraphOptions {
+        max_nodes: 5,
+        ..GraphOptions::default()
+    };
+
+    let capped = traverse::by_class(&db, Some(&current), "country", 5, &options).unwrap();
+    assert_eq!(capped.nodes.len(), 5);
+    assert_eq!(capped.total_nodes, Some(12));
+    assert!(capped.truncated);
+    let tree = traverse::render_tree(&capped);
+    assert!(tree.contains("5 of 12 matching nodes"), "{tree}");
+    assert!(tree.contains("cut off at the node limit"), "{tree}");
+
+    let whole =
+        traverse::by_class(&db, Some(&current), "country", 50, &GraphOptions::default()).unwrap();
+    assert_eq!(whole.nodes.len(), 12);
+    assert!(!whole.truncated);
+    assert!(!traverse::render_tree(&whole).contains("cut off"), "{tree}");
+
+    // The census counts the class and its subclasses without listing them.
+    let (total, samples) = graph_store::class_census(&db, &[String::from("country")], 3).unwrap();
+    assert_eq!(total, 12);
+    assert_eq!(samples, ["Country 00", "Country 01", "Country 02"]);
+    let (none, _) = graph_store::class_census(&db, &[String::from("vendor")], 3).unwrap();
+    assert_eq!(none, 0);
+}
+
+/// Provenance joins the two substrates both ways: an entity names the
+/// chunks it was extracted from, and a chunk names the entities in it.
+#[tokio::test]
+async fn provenance_maps_between_entities_and_chunks() {
+    let db = workspace();
+    let current = ontology();
+    tables::extract(&db, &current, false).unwrap();
+    let chunks = extract::chunks(&db, None).unwrap();
+    extract::run(&db, chunks, &Canned, &current, false, 2, &|_| {})
+        .await
+        .unwrap();
+
+    let orgenics = traverse::resolve_entry(&db, "Orgenics Ltd", None, None).unwrap();
+    let ids: Vec<String> = orgenics.iter().map(|n| n.id.clone()).collect();
+    assert!(
+        !ids.is_empty(),
+        "the canned extractor produces Orgenics Ltd"
+    );
+    let chunks = graph_store::chunks_of_nodes(&db, &ids).unwrap();
+    assert_eq!(chunks, ["c1"], "extracted from the one chunk that parsed");
+
+    // A node built from a table row has no chunk provenance at all.
+    let po = traverse::resolve_entry(&db, "PO-1", None, None).unwrap();
+    let po_ids: Vec<String> = po.iter().map(|n| n.id.clone()).collect();
+    assert!(
+        graph_store::chunks_of_nodes(&db, &po_ids)
+            .unwrap()
+            .is_empty(),
+        "table rows leave table provenance, not chunks"
+    );
+
+    let entities = graph_store::entities_of_chunks(&db, &[String::from("c1")], 8).unwrap();
+    let in_c1 = entities.get("c1").cloned().unwrap_or_default();
+    assert!(
+        in_c1.contains(&String::from("Orgenics Ltd (vendor)")),
+        "{in_c1:?}"
+    );
+    assert!(
+        in_c1.contains(&String::from("Kenya (country)")),
+        "{in_c1:?}"
+    );
+    // Bounded per chunk, and a chunk nothing was extracted from is absent.
+    let capped = graph_store::entities_of_chunks(&db, &[String::from("c1")], 1).unwrap();
+    assert_eq!(capped.get("c1").map(Vec::len), Some(1));
+    assert!(
+        !graph_store::entities_of_chunks(&db, &[String::from("c2")], 8)
+            .unwrap()
+            .contains_key("c2")
+    );
+}
+
 /// A lookup that matched nothing offers the labels it came closest to —
 /// by overlap either way, then by embedding — so the model can call again
 /// instead of being told the graph is empty.

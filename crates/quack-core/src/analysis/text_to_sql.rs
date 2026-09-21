@@ -93,7 +93,7 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 
     let ontology = ontology_store::current(db)?;
     let graph = graph_store::status(db)?;
-    append_tool_guidance(&mut prompt, graph.enabled());
+    append_tool_guidance(&mut prompt, graph.enabled(), ontology.is_some());
 
     let version = db.duckdb_version()?;
     writeln!(
@@ -109,7 +109,7 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
     append_pinned_documents(&mut prompt, db, options.pinned_token_budget)?;
 
     if let Some(ontology) = ontology {
-        prompt.push_str(&ontology.render_for_prompt());
+        prompt.push_str(&ontology.render_capped(PROMPT_ONTOLOGY_ITEMS));
         if graph.enabled() {
             writeln!(
                 prompt,
@@ -149,9 +149,10 @@ pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<
 
 /// The numbered procedures, one per substrate. The table, SQL, chart and
 /// document tools are always registered; the graph block appears only when
-/// the graph tools do (design doc 7.2), since guidance for a tool the
-/// model cannot call is worse than none.
-fn append_tool_guidance(prompt: &mut String, graph_enabled: bool) {
+/// the graph tools do and the `describe_class` line only when an ontology
+/// exists (design doc 7.2), since guidance for a tool the model cannot
+/// call is worse than none.
+fn append_tool_guidance(prompt: &mut String, graph_enabled: bool, ontology_present: bool) {
     prompt.push_str(
         "When answering analytical questions about structured data:\n\
          1. First use list_tables or describe_table to understand the available data; run \
@@ -170,17 +171,31 @@ fn append_tool_guidance(prompt: &mut String, graph_enabled: bool) {
          4. Do not write a Sources or References section; one is appended for you from the markers\n\n",
     );
 
+    if ontology_present {
+        prompt.push_str(
+            "The ontology block below is capped. describe_class gives one class in full: what it \
+             inherits, its subclasses, its typed properties with their enum values, the relations \
+             it takes part in, the table it is mapped to, and how many entities of it the graph \
+             holds. Use it to get an exact id before searching, and for the count of a class — a \
+             class listing stops at the node limit, describe_class does not.\n\n",
+        );
+    }
+
     if graph_enabled {
         prompt.push_str(
             "When answering questions about how entities relate:\n\
              1. Call search_graph with an entity's name for what it connects to, or with an \
              ontology class id to list the entities of that class\n\
              2. Call find_path when the question is how two named entities connect\n\
-             3. Use the class and relation ids from the ontology below; a wrong id comes back as \
-             an error naming the real ones, and a name that matches no entity comes back with \
-             the closest labels, so call again rather than giving up\n\
-             4. Cite the [n] markers the results register, the same way you cite search_documents\n\
-             5. If the graph has nothing, search the documents before telling the user the \
+             3. Use the class and relation ids from the ontology below, or describe_class to \
+             check one; a wrong id comes back as an error naming the real ones, and a name that \
+             matches no entity comes back with the closest labels, so call again rather than \
+             giving up\n\
+             4. Cite the [n] markers the results register, the same way you cite search_documents. \
+             A result that names table rows can be read with run_sql: it gives the predicate\n\
+             5. A result that says it was cut off at the node limit is not the whole answer; \
+             narrow the class or count with describe_class instead of counting the lines\n\
+             6. If the graph has nothing, search the documents before telling the user the \
              workspace does not cover the question\n\n",
         );
     }
@@ -210,6 +225,13 @@ fn append_documents(prompt: &mut String, db: &WorkspaceDb) -> Result<usize> {
     writeln!(prompt)?;
     Ok(docs.len())
 }
+
+/// Classes, relations and mappings past this many are counted rather than
+/// listed in the ontology block; `describe_class` has the rest. An
+/// ontology induced from a wide workspace carries a class per table, which
+/// would crowd out the guidance and the question (the bound the tables
+/// block has had since issue #40).
+const PROMPT_ONTOLOGY_ITEMS: usize = 30;
 
 /// The tables block: every user table with its row count, columns, and three
 /// sample rows. Returns the table names so the caller knows whether the

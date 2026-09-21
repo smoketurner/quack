@@ -67,6 +67,15 @@ pub struct GraphResult {
     /// Ids of the nodes the query resolved its entry point to.
     #[serde(default)]
     pub roots: Vec<String>,
+    /// How many nodes matched before `max_nodes` applied, when the query
+    /// could count them (a class listing). `None` for a walk, which stops
+    /// at the cap without knowing what it did not visit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_nodes: Option<u64>,
+    /// Whether `max_nodes` cut this result short. A reader that does not
+    /// check it reads a capped listing as the whole population.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl GraphResult {
@@ -320,6 +329,7 @@ mod tests {
                 },
             ],
             roots: vec![String::from("a"), String::from("b")],
+            ..GraphResult::default()
         };
         let kept = result.without_provisional();
         assert_eq!(kept.nodes.len(), 2);

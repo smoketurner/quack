@@ -23,7 +23,7 @@ use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
 use quack_core::storage::control::{Outcome, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
-use quack_core::storage::workspace::{StatementKind, WorkspaceDb};
+use quack_core::storage::workspace::{ChunkScope, StatementKind, WorkspaceDb};
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -366,10 +366,10 @@ impl McpServer {
         let text = query.clone();
         let hits = self
             .reader_db(move |db| {
-                let none: [String; 0] = [];
+                let scope = ChunkScope::all();
                 match embedding.as_deref() {
-                    Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &none),
-                    None => db.search_keyword_chunks(&text, top_k, &none),
+                    Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &scope),
+                    None => db.search_keyword_chunks(&text, top_k, &scope),
                 }
             })
             .await?;

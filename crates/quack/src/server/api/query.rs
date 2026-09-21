@@ -15,7 +15,7 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::llm;
 use quack_core::storage::control::Outcome;
 use quack_core::storage::sessions::{self, ChatMode};
-use quack_core::storage::workspace::StatementKind;
+use quack_core::storage::workspace::{ChunkScope, StatementKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
@@ -450,10 +450,10 @@ pub(crate) async fn search(
     let text = query.clone();
     let hits = reader_db
         .with_db(move |db| {
-            let none: [String; 0] = [];
+            let scope = ChunkScope::all();
             match embedding.as_deref() {
-                Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &none),
-                None => db.search_keyword_chunks(&text, top_k, &none),
+                Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &scope),
+                None => db.search_keyword_chunks(&text, top_k, &scope),
             }
         })
         .await

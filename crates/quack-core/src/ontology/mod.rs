@@ -44,6 +44,11 @@ fn root_class() -> String {
     String::from(ROOT_CLASS)
 }
 
+/// How many items a `take(limit)` left out, or `None` when it left none.
+fn hidden(total: usize, limit: usize) -> Option<usize> {
+    total.checked_sub(limit).filter(|rest| *rest > 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relation {
@@ -223,6 +228,37 @@ impl Ontology {
     #[must_use]
     pub fn is_subclass_of(&self, class_id: &str, ancestor: &str) -> bool {
         ancestor == ROOT_CLASS || self.ancestry(class_id).iter().any(|c| c == ancestor)
+    }
+
+    /// The classes whose parent is this one, nearest first.
+    #[must_use]
+    pub fn subclasses(&self, class_id: &str) -> Vec<&Class> {
+        self.classes
+            .iter()
+            .filter(|c| c.parent == class_id)
+            .collect()
+    }
+
+    /// The relations a class can take part in, inherited ones included:
+    /// those it is the domain of, and those it is the range of.
+    #[must_use]
+    pub fn relations_of(&self, class_id: &str) -> (Vec<&Relation>, Vec<&Relation>) {
+        let mut out = (Vec::new(), Vec::new());
+        for relation in &self.relations {
+            if self.is_subclass_of(class_id, &relation.domain) {
+                out.0.push(relation);
+            }
+            if self.is_subclass_of(class_id, &relation.range) {
+                out.1.push(relation);
+            }
+        }
+        out
+    }
+
+    /// The mapped table a class's nodes are built from, if any.
+    #[must_use]
+    pub fn mapping_for(&self, class_id: &str) -> Option<&Mapping> {
+        self.mappings.iter().find(|m| m.class == class_id)
     }
 
     /// The property ids a class carries, its own and inherited.
@@ -427,14 +463,26 @@ impl Ontology {
         Ok(())
     }
 
-    /// The compact block the system prompt carries (design doc 7.2).
+    /// The whole ontology, every class, relation and mapping. The
+    /// extraction prompt (6.5) needs all of it: the model may only answer
+    /// with ids it has been shown.
     #[must_use]
     pub fn render_for_prompt(&self) -> String {
+        self.render_capped(usize::MAX)
+    }
+
+    /// The block the system prompt carries (design doc 7.2), capped at
+    /// `limit` items per section. An ontology induced from a wide
+    /// workspace has a class per table and a property per column, which
+    /// would crowd the guidance and the question out of a small window —
+    /// the same bound the tables block has; `describe_class` has the rest.
+    #[must_use]
+    pub fn render_capped(&self, limit: usize) -> String {
         let mut lines = vec![
             format!("Ontology (version {}):", self.version),
             String::from("- classes (child: parent [key] {properties}):"),
         ];
-        for class in &self.classes {
+        for class in self.classes.iter().take(limit) {
             let props = self.class_properties(&class.id);
             let key = class
                 .key
@@ -450,11 +498,21 @@ impl Ontology {
             };
             lines.push(format!("  - {}: {}{key}{props}", class.id, class.parent));
         }
+        if let Some(rest) = hidden(self.classes.len(), limit) {
+            lines.push(format!(
+                "  - ... and {rest} more classes; describe_class shows any class by id"
+            ));
+        }
         lines.push(String::from("- relations (id: domain -> range):"));
-        for relation in &self.relations {
+        for relation in self.relations.iter().take(limit) {
             lines.push(format!(
                 "  - {}: {} -> {}",
                 relation.id, relation.domain, relation.range
+            ));
+        }
+        if let Some(rest) = hidden(self.relations.len(), limit) {
+            lines.push(format!(
+                "  - ... and {rest} more relations; describe_class lists the ones a class takes part in"
             ));
         }
         lines.push(format!(
@@ -462,11 +520,14 @@ impl Ontology {
         ));
         if !self.mappings.is_empty() {
             lines.push(String::from("- mapped tables:"));
-            for mapping in &self.mappings {
+            for mapping in self.mappings.iter().take(limit) {
                 lines.push(format!(
                     "  - {} -> {} (key column {})",
                     mapping.table, mapping.class, mapping.key
                 ));
+            }
+            if let Some(rest) = hidden(self.mappings.len(), limit) {
+                lines.push(format!("  - ... and {rest} more mapped tables"));
             }
         }
         let mut out = lines.join("\n");
@@ -774,6 +835,43 @@ mod tests {
         assert!(text.contains("works_at: person -> organization"));
         assert!(text.contains("mentions: entity -> entity"));
         assert!(!text.contains("mapped tables"));
+    }
+
+    #[test]
+    fn the_capped_rendering_counts_what_it_leaves_out() {
+        let default = Ontology::builtin_default();
+        let capped = default.render_capped(2);
+        assert!(capped.contains("person: entity"), "{capped}");
+        assert!(!capped.contains("concept: entity"), "{capped}");
+        assert!(
+            capped.contains("and 5 more classes; describe_class shows any class by id"),
+            "{capped}"
+        );
+        assert!(capped.contains("and 3 more relations"), "{capped}");
+        // `mentions` is implicit and always named, cap or no cap.
+        assert!(capped.contains("mentions: entity -> entity"), "{capped}");
+        // Uncapped, nothing is counted away.
+        let full = default.render_capped(usize::MAX);
+        assert_eq!(full, default.render_for_prompt());
+        assert!(!full.contains("more classes"), "{full}");
+    }
+
+    #[test]
+    fn relations_and_subclasses_follow_inheritance() {
+        let ontology = Ontology::builtin_default();
+        let (from, to) = ontology.relations_of("person");
+        let from: Vec<&str> = from.iter().map(|r| r.id.as_str()).collect();
+        let to: Vec<&str> = to.iter().map(|r| r.id.as_str()).collect();
+        // `works_at` is the class's own; the `entity`-domain ones are inherited.
+        assert!(
+            from.contains(&"works_at") && from.contains(&"located_in"),
+            "{from:?}"
+        );
+        assert!(!from.contains(&"produced_by"), "{from:?}");
+        assert!(to.contains(&"part_of"), "{to:?}");
+        assert_eq!(ontology.subclasses("entity").len(), ontology.classes.len());
+        assert!(ontology.subclasses("person").is_empty());
+        assert!(ontology.mapping_for("person").is_none());
     }
 
     #[test]

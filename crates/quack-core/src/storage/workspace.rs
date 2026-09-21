@@ -1182,8 +1182,11 @@ impl WorkspaceDb {
         &self,
         query: &str,
         top_k: u32,
-        document_ids: &[String],
+        scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
         let terms: Vec<String> = term_frequencies(query, None)
             .into_iter()
             .map(|(t, _)| t)
@@ -1194,7 +1197,7 @@ impl WorkspaceDb {
         // Quoted, so a token such as `null` stays a word and not a NULL
         // element (issue #62).
         let term_list = sql_text_list(&terms);
-        let filter = document_filter(document_ids);
+        let filter = scope.sql();
         let sql = format!(
             "WITH q AS (SELECT DISTINCT unnest(?::VARCHAR[]) AS term), \
                   stats AS (SELECT count(*) AS n, avg(token_count) AS avgdl \
@@ -1219,12 +1222,9 @@ impl WorkspaceDb {
         );
         let limit = i64::from(top_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> =
-            Vec::with_capacity(document_ids.len().saturating_add(2));
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(2));
         params.push(&term_list);
-        for id in document_ids {
-            params.push(id);
-        }
+        scope.bind(&mut params);
         params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
         let mut results = Vec::new();
@@ -1246,11 +1246,11 @@ impl WorkspaceDb {
         query_embedding: &[f32],
         top_k: u32,
         rrf_k: u32,
-        document_ids: &[String],
+        scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
         let candidates = top_k.saturating_mul(2).max(1);
-        let vector = self.search_similar_chunks(query_embedding, candidates, document_ids)?;
-        let keyword = self.search_keyword_chunks(query_text, candidates, document_ids)?;
+        let vector = self.search_similar_chunks(query_embedding, candidates, scope)?;
+        let keyword = self.search_keyword_chunks(query_text, candidates, scope)?;
         Ok(fuse_rankings(vector, keyword, top_k, rrf_k))
     }
 
@@ -1267,9 +1267,12 @@ impl WorkspaceDb {
         &self,
         query_embedding: &[f32],
         top_k: u32,
-        document_ids: &[String],
+        scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
-        let filter = document_filter(document_ids);
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = scope.sql();
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
                     1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score \
@@ -1284,12 +1287,9 @@ impl WorkspaceDb {
         let query_literal = format_embedding(query_embedding);
         let limit = i64::from(top_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> =
-            Vec::with_capacity(document_ids.len().saturating_add(2));
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(2));
         params.push(&query_literal);
-        for id in document_ids {
-            params.push(id);
-        }
+        scope.bind(&mut params);
         params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
         let mut results = Vec::new();
@@ -1840,12 +1840,80 @@ fn term_count(terms: &[(String, u32)]) -> i64 {
         .fold(0i64, |acc, (_, tf)| acc.saturating_add(i64::from(*tf)))
 }
 
-fn document_filter(document_ids: &[String]) -> String {
-    if document_ids.is_empty() {
-        String::new()
-    } else {
-        let placeholders = vec!["?"; document_ids.len()].join(", ");
-        format!(" AND c.document_id IN ({placeholders})")
+/// Which chunks a search may return. Empty means the whole workspace; a
+/// scope narrows it to certain documents, to an explicit set of chunks
+/// (the chunks a graph entity was extracted from), or to both at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkScope {
+    /// Empty means every document: `resolve_document_ids` refuses an id
+    /// that matches nothing, so an empty list never means "none".
+    documents: Vec<String>,
+    /// `None` means no chunk restriction at all; `Some(ids)` means exactly
+    /// those chunks, and `Some(empty)` means none — an entity whose chunks
+    /// came back empty must return no rows, not the whole workspace.
+    chunks: Option<Vec<String>>,
+}
+
+impl ChunkScope {
+    /// Every ready chunk in the workspace.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Only chunks belonging to these documents.
+    #[must_use]
+    pub fn documents<I: IntoIterator<Item = String>>(ids: I) -> Self {
+        Self {
+            documents: ids.into_iter().collect(),
+            chunks: None,
+        }
+    }
+
+    /// Narrow further to these chunk ids, however few.
+    #[must_use]
+    pub fn and_chunks<I: IntoIterator<Item = String>>(mut self, ids: I) -> Self {
+        self.chunks = Some(ids.into_iter().collect());
+        self
+    }
+
+    /// Whether the scope names nothing at all, so a search must return no
+    /// rows instead of widening to the whole workspace.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.as_ref().is_some_and(Vec::is_empty)
+    }
+
+    /// The `AND ...` fragment for a query that has `_quack_chunks` as `c`.
+    fn sql(&self) -> String {
+        let mut clauses = Vec::new();
+        if !self.documents.is_empty() {
+            let placeholders = vec!["?"; self.documents.len()].join(", ");
+            clauses.push(format!(" AND c.document_id IN ({placeholders})"));
+        }
+        if let Some(chunks) = self.chunks.as_ref().filter(|ids| !ids.is_empty()) {
+            let placeholders = vec!["?"; chunks.len()].join(", ");
+            clauses.push(format!(" AND c.id IN ({placeholders})"));
+        }
+        clauses.concat()
+    }
+
+    /// How many parameters [`ChunkScope::bind`] will push.
+    fn len(&self) -> usize {
+        self.documents
+            .len()
+            .saturating_add(self.chunks.as_ref().map_or(0, Vec::len))
+    }
+
+    /// Push the scope's parameters, in the order [`ChunkScope::sql`] names
+    /// them.
+    fn bind<'a>(&'a self, params: &mut Vec<&'a dyn duckdb::ToSql>) {
+        for id in &self.documents {
+            params.push(id);
+        }
+        for id in self.chunks.iter().flatten() {
+            params.push(id);
+        }
     }
 }
 

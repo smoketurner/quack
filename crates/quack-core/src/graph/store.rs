@@ -1,7 +1,7 @@
 //! Persistence for nodes, edges, provenance, and the graph's bookkeeping in
 //! `_quack_meta`: the ontology version it was built with, and drift.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Drift, Edge, GraphStatus, Node, Provenance, normalize_label};
 use crate::error::{Error, Result};
@@ -237,6 +237,91 @@ pub fn all_node_ids(db: &WorkspaceDb) -> Result<Vec<String>> {
         out.push(row.get(0)?);
     }
     Ok(out)
+}
+
+/// The chunks any of these nodes were extracted from. This is the edge
+/// between the graph and retrieval: it turns an entity into the passages
+/// that mention it (design doc 6.4, provenance).
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn chunks_of_nodes(db: &WorkspaceDb, node_ids: &[String]) -> Result<Vec<String>> {
+    let mut stmt = db.connection().prepare(
+        "SELECT DISTINCT chunk_id FROM _quack_provenance \
+         WHERE list_contains(?::VARCHAR[], subject_id) AND chunk_id <> '' ORDER BY chunk_id",
+    )?;
+    let mut rows = stmt.query(duckdb::params![id_list(node_ids)])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get::<_, String>(0)?);
+    }
+    Ok(out)
+}
+
+/// The entities each of these chunks was the source of, as
+/// `label (class)`, at most `per_chunk` each. The reverse of
+/// [`chunks_of_nodes`]: it tells a retrieved passage what the graph
+/// already knows is in it.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn entities_of_chunks(
+    db: &WorkspaceDb,
+    chunk_ids: &[String],
+    per_chunk: usize,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut stmt = db.connection().prepare(
+        "SELECT p.chunk_id, n.label, n.class_id FROM _quack_provenance p \
+         JOIN _quack_graph_nodes n ON n.id = p.subject_id \
+         WHERE list_contains(?::VARCHAR[], p.chunk_id) ORDER BY p.chunk_id, n.label",
+    )?;
+    let mut rows = stmt.query(duckdb::params![id_list(chunk_ids)])?;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let chunk_id: String = row.get(0)?;
+        let entity = format!(
+            "{} ({})",
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?
+        );
+        let entities = out.entry(chunk_id).or_default();
+        if entities.len() < per_chunk && !entities.contains(&entity) {
+            entities.push(entity);
+        }
+    }
+    Ok(out)
+}
+
+/// How many nodes carry any of `class_ids`, and the first few labels.
+/// Counting is the one graph question traversal cannot answer: user SQL
+/// may not read `_quack_` tables, and a class listing stops at
+/// `max_nodes`.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub fn class_census(
+    db: &WorkspaceDb,
+    class_ids: &[String],
+    samples: u32,
+) -> Result<(u64, Vec<String>)> {
+    let total: u64 = db.connection().query_row(
+        "SELECT count(*) FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id)",
+        duckdb::params![id_list(class_ids)],
+        |row| row.get(0),
+    )?;
+    let mut stmt = db.connection().prepare(
+        "SELECT label FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id) \
+         ORDER BY label LIMIT ?",
+    )?;
+    let mut rows = stmt.query(duckdb::params![id_list(class_ids), i64::from(samples)])?;
+    let mut labels = Vec::new();
+    while let Some(row) = rows.next()? {
+        labels.push(row.get::<_, String>(0)?);
+    }
+    Ok((total, labels))
 }
 
 /// One node by id.

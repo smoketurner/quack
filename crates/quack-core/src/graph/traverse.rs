@@ -189,6 +189,9 @@ pub fn neighborhood(
     if let Some(relation) = relation {
         result.edges.retain(|e| e.relation_id == relation);
     }
+    // A walk that filled its budget stopped early; unlike a class listing
+    // it cannot say how much it did not visit.
+    result.truncated = ids.len() >= max_visited;
     result.roots = root_ids;
     Ok(result)
 }
@@ -275,6 +278,7 @@ pub fn path(
         edges,
         provenance,
         roots: vec![from.id.clone(), to.id.clone()],
+        ..GraphResult::default()
     })
 }
 
@@ -298,6 +302,13 @@ pub fn by_class(
             }
         }
     }
+    // Counted before the cap applies: a listing that silently stopped at
+    // `max_nodes` reads as the whole population of the class.
+    let total: u64 = db.connection().query_row(
+        "SELECT count(*) FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id)",
+        duckdb::params![id_list(&classes)],
+        |row| row.get(0),
+    )?;
     let mut stmt = db.connection().prepare(
         "SELECT id FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id) ORDER BY label LIMIT ?",
     )?;
@@ -309,7 +320,10 @@ pub fn by_class(
     }
     drop(rows);
     drop(stmt);
-    collect(db, &ids)
+    let mut result = collect(db, &ids)?;
+    result.truncated = total > u64::try_from(result.nodes.len()).unwrap_or(u64::MAX);
+    result.total_nodes = Some(total);
+    Ok(result)
 }
 
 /// Nodes by id with the edges among them and everything's provenance.
@@ -327,6 +341,7 @@ fn collect(db: &WorkspaceDb, ids: &[String]) -> Result<GraphResult> {
         edges,
         provenance,
         roots: Vec::new(),
+        ..GraphResult::default()
     })
 }
 
@@ -360,6 +375,11 @@ pub fn render_tree(result: &GraphResult) -> String {
         }
     }
     out.push_str(&result.nodes.len().to_string());
+    if let Some(total) = result.total_nodes.filter(|_| result.truncated) {
+        out.push_str(" of ");
+        out.push_str(&total.to_string());
+        out.push_str(" matching");
+    }
     out.push_str(" nodes, ");
     out.push_str(&result.edges.len().to_string());
     out.push_str(" edges, ");
@@ -367,6 +387,17 @@ pub fn render_tree(result: &GraphResult) -> String {
     out.push_str(" sources");
     if result.nodes.iter().any(|n| n.provisional) {
         out.push_str(" (provisional: built from an unreviewed ontology)");
+    }
+    if result.truncated {
+        // Without this the reader takes the cap for the population and
+        // answers "how many are there" with `max_nodes`.
+        out.push_str(match result.total_nodes {
+            Some(_) => {
+                " — cut off at the node limit, so this is not the whole class; count with \
+                 describe_class rather than by counting these lines"
+            }
+            None => " — cut off at the node limit, so entities further out are missing",
+        });
     }
     out.push('\n');
     out
@@ -559,6 +590,7 @@ mod tests {
             }],
             provenance: Vec::new(),
             roots: vec![String::from("a")],
+            ..GraphResult::default()
         };
         let tree = render_tree(&result);
         assert!(
