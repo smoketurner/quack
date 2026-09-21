@@ -253,14 +253,26 @@ fn append_tables(prompt: &mut String, db: &WorkspaceDb) -> Result<Vec<String>> {
     if !tables.is_empty() {
         writeln!(prompt, "Available tables:")?;
         for (index, table) in tables.iter().enumerate() {
+            // Tables past the detail cap only ever print their row count,
+            // so only ask for that: `describe_table` also runs `DESCRIBE`
+            // and a sample-row `SELECT`, whose output would be thrown
+            // away below. A workspace with far more tables than the cap
+            // (a per-table induced ontology, say) otherwise pays for a
+            // full describe and sample of every excess table on every
+            // turn for nothing.
+            if index >= DETAILED_TABLES {
+                let Ok(row_count) = db.count_rows(table) else {
+                    writeln!(prompt, "- {table}")?;
+                    continue;
+                };
+                writeln!(prompt, "- {table} ({row_count} rows)")?;
+                continue;
+            }
             let Ok(desc) = db.describe_table(table) else {
                 writeln!(prompt, "- {table}")?;
                 continue;
             };
             writeln!(prompt, "- {table} ({} rows)", desc.row_count)?;
-            if index >= DETAILED_TABLES {
-                continue;
-            }
             writeln!(prompt, "  Columns:")?;
             for col in desc.columns.iter().take(LISTED_COLUMNS) {
                 writeln!(prompt, "    - {} ({})", col.name, col.column_type)?;
@@ -324,14 +336,25 @@ fn trimmed_sample(sample: &QueryResults) -> QueryResults {
 }
 
 /// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
-/// room for tool results and the answer, rounded up to 2,048, between
+/// room for tool results and the answer, rounded up to 8,192, between
 /// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
 /// most workspace prompts, which loses the tool guidance and the question.
+///
+/// `num_ctx` is a load option: asking Ollama for a different value than
+/// the one the model is already loaded with forces a full model reload,
+/// which measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama
+/// serve`, repeated `/api/generate` calls that only changed `num_ctx`) —
+/// against single-digit milliseconds for a request that keeps the same
+/// value. A session's history only grows turn over turn until the
+/// history trim caps it, so the requested size is non-decreasing within
+/// a session; the step below is deliberately coarse (four tiers instead
+/// of one every 2,048 tokens) so a growing conversation crosses it, and
+/// pays that reload, at most three times instead of up to twelve.
 #[must_use]
 pub fn ollama_context_size(prompt_chars: usize, cap: u32) -> u32 {
     const HEADROOM: u32 = 8_192;
     const FLOOR: u32 = 8_192;
-    const STEP: u32 = 2_048;
+    const STEP: u32 = 8_192;
     let prompt_tokens = u32::try_from(prompt_chars.div_ceil(4)).unwrap_or(u32::MAX);
     let needed = prompt_tokens.saturating_add(HEADROOM);
     let rounded = needed.div_ceil(STEP).saturating_mul(STEP).max(FLOOR);
@@ -513,6 +536,67 @@ mod tests {
             "{with}"
         );
         assert!(with.contains("Knowledge graph: 1 nodes, 0 edges"), "{with}");
+    }
+
+    /// The stable part of the prompt (role, tool guidance, dialect, table
+    /// and document schema, ontology) must come out byte-identical across
+    /// two calls with nothing in the workspace changed, and the whole
+    /// prompt otherwise (the workspace context, which can differ by
+    /// caller) must too. Ollama keeps a KV cache for the common prefix of
+    /// consecutive requests to the same loaded model; a stable part that
+    /// changed for no reason (nondeterministic ordering, a timestamp, a
+    /// session id) would silently defeat that cache on every turn.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn the_prompt_is_byte_identical_across_repeated_calls_with_no_workspace_change() {
+        let db = db();
+        db.execute_statement("CREATE TABLE claims(id INT, amount INT, status VARCHAR)")
+            .unwrap();
+        db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")
+            .unwrap();
+        db.insert_document(
+            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+        )
+        .unwrap();
+        ontology_store::save(
+            &db,
+            &crate::ontology::Ontology::builtin_default(),
+            Some("tester"),
+            None,
+        )
+        .unwrap();
+        graph_store::upsert_node(
+            &db,
+            &crate::graph::store::NewNode {
+                label: String::from("Acme"),
+                class_id: String::from("organization"),
+                properties: serde_json::json!({}),
+                provisional: false,
+            },
+        )
+        .unwrap();
+        let mut opts = options(ChatMode::Chat, 1000);
+        opts.context = Some(String::from("Amounts are in cents."));
+
+        let first = build_system_prompt(&db, &opts).unwrap();
+        let second = build_system_prompt(&db, &opts).unwrap();
+        assert_eq!(first, second);
+
+        // The volatile, caller-supplied part (the workspace context) comes
+        // after every part the workspace itself determines.
+        let role_at = first.find("You are a data analysis assistant").unwrap();
+        let guidance_at = first.find("When answering analytical questions").unwrap();
+        let dialect_at = first.find("SQL reference").unwrap();
+        let tables_at = first.find("Available tables:").unwrap();
+        let documents_at = first.find("Ingested documents:").unwrap();
+        let ontology_at = first.find("Ontology (version").unwrap();
+        let context_at = first.find("Workspace context").unwrap();
+        assert!(role_at < guidance_at);
+        assert!(guidance_at < dialect_at);
+        assert!(dialect_at < tables_at);
+        assert!(tables_at < documents_at);
+        assert!(documents_at < ontology_at);
+        assert!(ontology_at < context_at, "{first}");
     }
 
     #[test]
@@ -708,9 +792,9 @@ mod tests {
     #[test]
     fn ollama_context_size_rounds_up_within_bounds() {
         assert_eq!(ollama_context_size(0, 32_768), 8_192);
-        assert_eq!(ollama_context_size(4 * 1_000, 32_768), 10_240);
-        // 12,875 prompt tokens plus headroom rounds to 22,528.
-        assert_eq!(ollama_context_size(4 * 12_875, 32_768), 22_528);
+        assert_eq!(ollama_context_size(4 * 1_000, 32_768), 16_384);
+        // 12,875 prompt tokens plus headroom rounds to 24,576.
+        assert_eq!(ollama_context_size(4 * 12_875, 32_768), 24_576);
         assert_eq!(ollama_context_size(4 * 100_000, 32_768), 32_768);
         assert_eq!(ollama_context_size(4 * 100_000, 2_048), 8_192);
     }

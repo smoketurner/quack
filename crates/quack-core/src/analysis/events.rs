@@ -4,6 +4,7 @@
 //! inline, print mode writes steps to stderr and text to stdout, and later
 //! the server forwards them as SSE and the session store persists them.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -118,6 +119,12 @@ pub struct TurnRecorder {
     /// Set once the interface answered `AllowForTurn`: later writes in
     /// this turn run without asking.
     writes_granted: Arc<AtomicBool>,
+    /// Embeddings computed so far this turn, by exact input text: more
+    /// than one tool can resolve the same entity label (`search_documents`
+    /// and `search_graph` on the same name, `find_path` reusing an entity
+    /// a prior call already resolved), and this keeps a turn from paying
+    /// for the same embedding call twice.
+    embedding_cache: Arc<Mutex<HashMap<String, Vec<f32>>>>,
 }
 
 impl TurnRecorder {
@@ -128,6 +135,21 @@ impl TurnRecorder {
             steps: Arc::new(Mutex::new(Vec::new())),
             citations: CitationRegistry::default(),
             writes_granted: Arc::new(AtomicBool::new(false)),
+            embedding_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// This turn's cached embedding for `text`, if some earlier call this
+    /// turn already computed it.
+    #[must_use]
+    pub fn cached_embedding(&self, text: &str) -> Option<Vec<f32>> {
+        self.embedding_cache.lock().ok()?.get(text).cloned()
+    }
+
+    /// Remember `text`'s embedding for the rest of this turn.
+    pub fn cache_embedding(&self, text: &str, embedding: Vec<f32>) {
+        if let Ok(mut cache) = self.embedding_cache.lock() {
+            cache.insert(text.to_owned(), embedding);
         }
     }
 
@@ -238,6 +260,20 @@ mod tests {
             Some(AgentEvent::ToolStarted { .. })
         ));
         assert!(matches!(rx.recv().await, Some(AgentEvent::ToolFinished(_))));
+    }
+
+    #[test]
+    fn embedding_cache_returns_what_it_was_given_and_nothing_else() {
+        let (sink, _rx) = channel();
+        let recorder = TurnRecorder::new(sink);
+        assert_eq!(recorder.cached_embedding("Acme"), None);
+
+        recorder.cache_embedding("Acme", vec![1.0, 2.0, 3.0]);
+        assert_eq!(recorder.cached_embedding("Acme"), Some(vec![1.0, 2.0, 3.0]));
+        // A different tool resolving the same label this turn gets the
+        // same vector back rather than embedding it again.
+        assert_eq!(recorder.cached_embedding("Acme"), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(recorder.cached_embedding("Beta"), None);
     }
 
     fn permission_request(event: Option<AgentEvent>) -> Option<PermissionRequest> {

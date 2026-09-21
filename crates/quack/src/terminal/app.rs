@@ -316,29 +316,47 @@ impl App {
 
     pub(crate) fn run(mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         let tick_rate = Duration::from_millis(TICK_RATE_MS);
+        // Redrawing unconditionally at the tick rate re-renders the whole
+        // transcript (markdown parsing and word-wrap over every message)
+        // every 50 ms forever, including while the session sits idle with
+        // nothing on screen changing. `dirty` gates the draw on there
+        // being something new to show; the only thing that still needs a
+        // steady redraw with nothing else happening is the spinner, which
+        // animates only while a background task is in flight.
+        let mut dirty = true;
 
         loop {
-            terminal.draw(|frame| ui::draw(frame, &self))?;
+            if dirty || Self::spinner_active(&self.state) {
+                terminal.draw(|frame| ui::draw(frame, &self))?;
+                dirty = false;
+            }
 
             while let Ok(result) = self.response_rx.try_recv() {
                 self.handle_background_result(result);
+                dirty = true;
             }
-            self.drain_agent_events();
+            if self.drain_agent_events() {
+                dirty = true;
+            }
 
             if event::poll(tick_rate)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key_event(key.code, key.modifiers);
+                        dirty = true;
                     }
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollUp => {
                             self.scroll_offset = self.scroll_offset.saturating_add(3);
+                            dirty = true;
                         }
                         MouseEventKind::ScrollDown => {
                             self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                            dirty = true;
                         }
                         _ => {}
                     },
+                    Event::Resize(..) => dirty = true,
                     _ => {}
                 }
             }
@@ -354,7 +372,19 @@ impl App {
         Ok(())
     }
 
-    fn drain_agent_events(&mut self) {
+    /// Whether the state shows an animated spinner, which needs a redraw
+    /// every tick even with no new input or event to react to.
+    fn spinner_active(state: &AppState) -> bool {
+        matches!(
+            state,
+            AppState::Thinking | AppState::Ingesting | AppState::RunningSql
+        )
+    }
+
+    /// Drains every pending agent event and reports whether it handled
+    /// one (or the stream closed), so the caller knows whether the
+    /// screen has something new to show.
+    fn drain_agent_events(&mut self) -> bool {
         let mut pending = Vec::new();
         let mut closed = false;
         if let Some(rx) = self.agent_events.as_mut() {
@@ -369,6 +399,7 @@ impl App {
                 }
             }
         }
+        let changed = !pending.is_empty() || closed;
         for event in pending {
             self.handle_agent_event(event);
         }
@@ -379,6 +410,7 @@ impl App {
                 self.finish_turn();
             }
         }
+        changed
     }
 
     fn handle_agent_event(&mut self, event: AgentEvent) {
