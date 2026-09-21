@@ -622,15 +622,8 @@ where
         let step = self.recorder.start(Self::NAME, &detail);
         let query_vec: Option<Vec<f32>> = match &self.embedding_model {
             None => None,
-            Some(model) => match model.embed_text(&args.query).await {
-                Ok(embedding) => {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
-                    )]
-                    let vector: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
-                    Some(vector)
-                }
+            Some(model) => match cached_embed(model, &self.recorder, &args.query).await {
+                Ok(vector) => Some(vector),
                 Err(e) => {
                     step.finish(format!("error: {e}"));
                     return Err(ToolError::Embedding(e.to_string()));
@@ -646,9 +639,13 @@ where
         };
 
         // The entity's own embedding, not the query's: it resolves a label,
-        // so `search_documents(query, entity)` is one embed call each.
+        // so `search_documents(query, entity)` is one embed call each,
+        // cached against a later call (search_graph, find_path) that
+        // resolves the same label again this turn.
         let entity_vec = match entity {
-            Some(entity) => label_embedding(self.embedding_model.as_ref(), entity).await?,
+            Some(entity) => {
+                label_embedding(self.embedding_model.as_ref(), &self.recorder, entity).await?
+            }
             None => None,
         };
 
@@ -1159,6 +1156,68 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail_test(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// Counts calls to `embed_texts` so a test can assert a cache actually
+    /// prevented one, rather than merely returning a plausible-looking
+    /// vector either way.
+    struct CountingEmbeddingModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl rig::embeddings::EmbeddingModel for CountingEmbeddingModel {
+        const MAX_DOCUMENTS: usize = 1024;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn ndims(&self) -> usize {
+            4
+        }
+
+        fn embed_texts(
+            &self,
+            texts: impl IntoIterator<Item = String> + Send,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<rig::embeddings::Embedding>, rig::embeddings::EmbeddingError>,
+        > + Send {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = texts
+                .into_iter()
+                .map(|text| rig::embeddings::Embedding {
+                    document: text,
+                    vec: vec![0.1_f64; 4],
+                })
+                .collect();
+            std::future::ready(Ok(result))
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_embed_asks_the_model_only_once_per_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = CountingEmbeddingModel {
+            calls: Arc::clone(&calls),
+        };
+        let (sink, _rx) = crate::analysis::events::channel();
+        let recorder = TurnRecorder::new(sink);
+
+        let first = cached_embed(&model, &recorder, "Acme").await;
+        let second = cached_embed(&model, &recorder, "Acme").await;
+        let other = cached_embed(&model, &recorder, "Beta").await;
+
+        assert!(first.is_ok());
+        assert_eq!(first.as_ref().ok(), second.as_ref().ok());
+        assert!(other.is_ok());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one call for \"Acme\", one for the different text \"Beta\", none for the repeat"
+        );
     }
 
     #[test]
@@ -2148,26 +2207,50 @@ fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> crate::erro
     )))
 }
 
+/// Embed `text` once per turn: cached on the turn recorder by exact input
+/// text, so a turn that asks to embed the same query or entity label more
+/// than once (retrieval and a rerank check, or the same entity resolved
+/// by `search_documents`, `search_graph`, and `find_path` in one turn)
+/// pays for the model call only the first time.
+///
+/// # Errors
+///
+/// Returns the model's error, unwrapped so a caller keeps its usual
+/// message formatting.
+async fn cached_embed<M: EmbeddingModel>(
+    model: &M,
+    recorder: &TurnRecorder,
+    text: &str,
+) -> std::result::Result<Vec<f32>, rig::embeddings::EmbeddingError> {
+    if let Some(cached) = recorder.cached_embedding(text) {
+        return Ok(cached);
+    }
+    let embedding = model.embed_text(text).await?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
+    )]
+    let vector: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
+    recorder.cache_embedding(text, vector.clone());
+    Ok(vector)
+}
+
 /// Embed a label for fuzzy entry-point resolution, when a model exists.
 /// The label's embedding for fuzzy entry: `None` without a model, an
 /// error when the model fails (issue #62: a silent `None` degraded the
 /// search to exact matches without saying so).
 async fn label_embedding<M: EmbeddingModel>(
     model: Option<&M>,
+    recorder: &TurnRecorder,
     label: &str,
 ) -> Result<Option<Vec<f32>>, ToolError> {
     let Some(model) = model else {
         return Ok(None);
     };
-    let embedding = model
-        .embed_text(label)
+    let vector = cached_embed(model, recorder, label)
         .await
         .map_err(|e| ToolError::Analysis(format!("embedding failed: {e}")))?;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "f64 -> f32 is acceptable for embedding vectors"
-    )]
-    Ok(Some(embedding.vec.into_iter().map(|v| v as f32).collect()))
+    Ok(Some(vector))
 }
 
 impl<M> Tool for SearchGraphTool<M>
@@ -2222,7 +2305,7 @@ where
             )));
         }
         let embedding = match entity {
-            Some(e) => label_embedding(self.embedding_model.as_ref(), e).await?,
+            Some(e) => label_embedding(self.embedding_model.as_ref(), &self.recorder, e).await?,
             None => None,
         };
         let query = GraphQuery {
@@ -2357,8 +2440,10 @@ where
             step.finish("error: both ends are needed");
             return Err(ToolError::Analysis(String::from("give both entities")));
         }
-        let from_embedding = label_embedding(self.embedding_model.as_ref(), from).await?;
-        let to_embedding = label_embedding(self.embedding_model.as_ref(), to).await?;
+        let from_embedding =
+            label_embedding(self.embedding_model.as_ref(), &self.recorder, from).await?;
+        let to_embedding =
+            label_embedding(self.embedding_model.as_ref(), &self.recorder, to).await?;
         let max_hops = args.max_hops.unwrap_or(4).max(1);
         let from_owned = from.to_owned();
         let to_owned = to.to_owned();
