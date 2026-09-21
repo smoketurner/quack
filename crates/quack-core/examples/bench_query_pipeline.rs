@@ -138,22 +138,37 @@ fn main() {
     report("search_hybrid_chunks", &durations);
 
     // --- system prompt assembly ---
+    quack_core::ontology::store::save(
+        &db,
+        &quack_core::ontology::Ontology::builtin_default(),
+        Some("bench"),
+        None,
+    )
+    .unwrap();
     let options = PromptOptions {
         mode: ChatMode::Chat,
         write_policy: quack_core::analysis::policy::WritePolicy::Deny,
         pinned_token_budget: 4_000,
-        context: None,
+        context: Some(String::from(
+            "This workspace tracks insurance claims and their supporting policy documents.",
+        )),
         context_max_tokens: 2_000,
         ollama_context_cap: None,
     };
     let mut durations = Vec::new();
+    let mut prompt = String::new();
     for _ in 0..10 {
         let t0 = Instant::now();
-        let prompt = text_to_sql::build_system_prompt(&db, &options).unwrap();
+        prompt = text_to_sql::build_system_prompt(&db, &options).unwrap();
         durations.push(t0.elapsed());
         assert!(!prompt.is_empty());
     }
     report("build_system_prompt", &durations);
+    println!(
+        "system prompt size: {} chars, ~{} tokens (4 chars/token estimate)",
+        prompt.chars().count(),
+        prompt.chars().count().div_ceil(4)
+    );
 }
 
 fn report(label: &str, durations: &[std::time::Duration]) {

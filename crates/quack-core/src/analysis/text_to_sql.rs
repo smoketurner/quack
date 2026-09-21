@@ -538,6 +538,67 @@ mod tests {
         assert!(with.contains("Knowledge graph: 1 nodes, 0 edges"), "{with}");
     }
 
+    /// The stable part of the prompt (role, tool guidance, dialect, table
+    /// and document schema, ontology) must come out byte-identical across
+    /// two calls with nothing in the workspace changed, and the whole
+    /// prompt otherwise (the workspace context, which can differ by
+    /// caller) must too. Ollama keeps a KV cache for the common prefix of
+    /// consecutive requests to the same loaded model; a stable part that
+    /// changed for no reason (nondeterministic ordering, a timestamp, a
+    /// session id) would silently defeat that cache on every turn.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn the_prompt_is_byte_identical_across_repeated_calls_with_no_workspace_change() {
+        let db = db();
+        db.execute_statement("CREATE TABLE claims(id INT, amount INT, status VARCHAR)")
+            .unwrap();
+        db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")
+            .unwrap();
+        db.insert_document(
+            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+        )
+        .unwrap();
+        ontology_store::save(
+            &db,
+            &crate::ontology::Ontology::builtin_default(),
+            Some("tester"),
+            None,
+        )
+        .unwrap();
+        graph_store::upsert_node(
+            &db,
+            &crate::graph::store::NewNode {
+                label: String::from("Acme"),
+                class_id: String::from("organization"),
+                properties: serde_json::json!({}),
+                provisional: false,
+            },
+        )
+        .unwrap();
+        let mut opts = options(ChatMode::Chat, 1000);
+        opts.context = Some(String::from("Amounts are in cents."));
+
+        let first = build_system_prompt(&db, &opts).unwrap();
+        let second = build_system_prompt(&db, &opts).unwrap();
+        assert_eq!(first, second);
+
+        // The volatile, caller-supplied part (the workspace context) comes
+        // after every part the workspace itself determines.
+        let role_at = first.find("You are a data analysis assistant").unwrap();
+        let guidance_at = first.find("When answering analytical questions").unwrap();
+        let dialect_at = first.find("SQL reference").unwrap();
+        let tables_at = first.find("Available tables:").unwrap();
+        let documents_at = first.find("Ingested documents:").unwrap();
+        let ontology_at = first.find("Ontology (version").unwrap();
+        let context_at = first.find("Workspace context").unwrap();
+        assert!(role_at < guidance_at);
+        assert!(guidance_at < dialect_at);
+        assert!(dialect_at < tables_at);
+        assert!(tables_at < documents_at);
+        assert!(documents_at < ontology_at);
+        assert!(ontology_at < context_at, "{first}");
+    }
+
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn context_is_placed_after_documents_and_truncated_to_budget() {
