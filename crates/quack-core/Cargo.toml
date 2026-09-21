@@ -59,6 +59,15 @@ rustls                       = { workspace = true, features = ["fips"] }
 windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
-sqlx     = { workspace = true, features = ["runtime-tokio", "sqlite"] }
-tempfile = { workspace = true }
-zip      = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
+criterion = { workspace = true, features = ["cargo_bench_support"] }
+sqlx      = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+tempfile  = { workspace = true }
+zip       = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
+
+[[bench]]
+name    = "retrieval"
+harness = false
+
+[[bench]]
+name    = "prompt"
+harness = false

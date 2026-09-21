@@ -10,6 +10,9 @@ BIN ?= quack
 # Address for `make run-server`.
 BIND ?= 127.0.0.1:8080
 
+# Largest retrieval benchmark size; the 1M-chunk point takes a quarter of an hour to fill.
+BENCH_CHUNKS ?= 100000
+
 # Example under examples/ that `make demo-data` loads, and the workspace it fills.
 EXAMPLE ?= storms
 WORKSPACE ?= storms
@@ -45,6 +48,9 @@ lint: ## Run clippy with warnings denied
 
 test: ## Run unit tests
 	$(CARGO) test --workspace --all-features
+
+bench: ## Run the criterion benchmarks (BENCH_CHUNKS=1000000 for the 1M-chunk retrieval point)
+	QUACK_BENCH_CHUNKS=$(BENCH_CHUNKS) $(CARGO) bench --workspace
 
 test-coverage: ## Generate an HTML coverage report (requires cargo-llvm-cov)
 	$(CARGO) llvm-cov --workspace --html

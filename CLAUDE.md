@@ -245,6 +245,7 @@ make fmt       # cargo fmt --all
 make lint      # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test      # cargo test --workspace --all-features
 make deny      # cargo deny check
+make bench     # criterion benchmarks: retrieval latency by workspace size, prompt assembly (BENCH_CHUNKS=1000000 for the 1M point)
 make release-gates   # no ring or OpenSSL in the runtime tree, then cargo deny
 make crypto-gates    # the tree check alone (what the release job runs; it checks deny separately)
 make image     # the quack serve container image from source (docker buildx)
