@@ -164,7 +164,13 @@ and walks neighborhoods, shortest paths, and classes with subclass expansion, bo
 was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,
 and drift; `revalidate` drops what the current ontology no longer allows. The agent
 registers `search_graph` and `find_path` only when the graph has nodes, query mode drops
-provisional results, and every response shape carries the turn's `graph` results.
+provisional results, and every response shape carries the turn's `graph` results. Their
+rendering (`graph::traverse::render_tree`, shared with `quack graph` and the terminal)
+carries each node's and edge's typed properties, bounded; a class or relation id the
+ontology does not define is refused with the ids that do exist, a name that matches no
+entity comes back with the closest labels (`traverse::suggest_entities`), and a result
+query mode emptied by dropping provisional nodes says so rather than claiming the graph
+is empty.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with

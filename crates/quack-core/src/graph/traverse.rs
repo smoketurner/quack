@@ -14,6 +14,17 @@ use crate::storage::workspace::WorkspaceDb;
 /// How far an embedding match may be from the query to count as the entity.
 const ENTRY_MAX_DISTANCE: f64 = 0.25;
 
+/// Properties past this many are counted rather than rendered: a node
+/// built from a wide mapped table carries one per column, and the tree has
+/// to stay readable inside a system prompt.
+const RENDERED_PROPERTIES: usize = 8;
+
+/// A rendered property value longer than this is cut, with an ellipsis.
+const PROPERTY_VALUE_CHARS: usize = 60;
+
+/// How many labels a lookup that matched nothing offers as alternatives.
+const SUGGESTION_LIMIT: u32 = 5;
+
 /// Nodes matching `entity`: exact normalized label (any class, or one
 /// class), else the nearest label embeddings within a distance, else
 /// nothing.
@@ -63,6 +74,59 @@ pub fn resolve_entry(
         }
     }
     Ok(Vec::new())
+}
+
+/// Labels worth retrying when a lookup matched nothing: nodes whose
+/// normalized label overlaps the text either way, then the nearest label
+/// embeddings whatever their distance (`resolve_entry` has already
+/// rejected them as matches, which does not make them useless as
+/// suggestions). Rendered as `label (class)`.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub fn suggest_entities(
+    db: &WorkspaceDb,
+    entity: &str,
+    class_id: Option<&str>,
+    query_embedding: Option<&[f32]>,
+) -> Result<Vec<String>> {
+    let normalized = super::normalize_label(entity);
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut stmt = db.connection().prepare(
+        "SELECT label, class_id FROM _quack_graph_nodes \
+         WHERE (contains(normalized_label, ?) OR contains(?, normalized_label)) \
+         AND (? IS NULL OR class_id = ?) ORDER BY length(label), label LIMIT ?",
+    )?;
+    let mut rows = stmt.query(duckdb::params![
+        normalized,
+        normalized,
+        class_id,
+        class_id,
+        i64::from(SUGGESTION_LIMIT)
+    ])?;
+    while let Some(row) = rows.next()? {
+        out.push(format!(
+            "{} ({})",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?
+        ));
+    }
+    drop(rows);
+    drop(stmt);
+    if let Some(query) = query_embedding {
+        for (node, _) in store::nearest_nodes(db, query, class_id, SUGGESTION_LIMIT)? {
+            let label = format!("{} ({})", node.label, node.class_id);
+            if !out.contains(&label) {
+                out.push(label);
+            }
+        }
+    }
+    out.truncate(usize::try_from(SUGGESTION_LIMIT).unwrap_or(5));
+    Ok(out)
 }
 
 /// The nodes within `hops` of `roots` (optionally along one relation),
@@ -308,6 +372,60 @@ pub fn render_tree(result: &GraphResult) -> String {
     out
 }
 
+/// The properties of a node or edge as ` {key: value, key: value}`, empty
+/// when there are none. The ontology types them (6.3) and the extractors
+/// fill them in; without this the model only ever sees labels and classes.
+fn format_properties(properties: &serde_json::Value) -> String {
+    let Some(map) = properties.as_object() else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut dropped: usize = 0;
+    for (key, value) in map {
+        let value = property_value(value);
+        if value.is_empty() {
+            continue;
+        }
+        if parts.len() >= RENDERED_PROPERTIES {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
+        parts.push(format!("{key}: {value}"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    if dropped > 0 {
+        parts.push(format!("... {dropped} more"));
+    }
+    format!(" {{{}}}", parts.join(", "))
+}
+
+/// One property value, flattened and cut: arrays join their elements,
+/// strings lose their quotes, null and empty strings render as nothing so
+/// an unset property is left out rather than shown as noise.
+fn property_value(value: &serde_json::Value) -> String {
+    let text = match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.trim().to_owned(),
+        serde_json::Value::Array(items) => {
+            let rendered: Vec<String> = items
+                .iter()
+                .map(property_value)
+                .filter(|item| !item.is_empty())
+                .collect();
+            rendered.join(", ")
+        }
+        other => other.to_string(),
+    };
+    if text.chars().count() > PROPERTY_VALUE_CHARS {
+        let mut cut: String = text.chars().take(PROPERTY_VALUE_CHARS).collect();
+        cut.push('\u{2026}');
+        return cut;
+    }
+    text
+}
+
 fn walk<'a>(
     result: &'a GraphResult,
     by_id: &BTreeMap<&'a str, &'a Node>,
@@ -322,7 +440,9 @@ fn walk<'a>(
     out.push_str(&node.label);
     out.push_str(" (");
     out.push_str(&node.class_id);
-    out.push_str(")\n");
+    out.push(')');
+    out.push_str(&format_properties(&node.properties));
+    out.push('\n');
     for edge in &result.edges {
         let (other, arrow) = if edge.source_node_id == node.id {
             (edge.target_node_id.as_str(), "->")
@@ -340,6 +460,7 @@ fn walk<'a>(
             out.push_str(arrow);
             out.push(' ');
             out.push_str(&edge.relation_id);
+            out.push_str(&format_properties(&edge.properties));
             out.push(' ');
             out.push_str(&next.label);
             out.push('\n');
@@ -350,7 +471,102 @@ fn walk<'a>(
         out.push_str(arrow);
         out.push(' ');
         out.push_str(&edge.relation_id);
+        out.push_str(&format_properties(&edge.properties));
         out.push('\n');
         walk(result, by_id, next, depth.saturating_add(2), visited, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::graph::Edge;
+
+    fn node(id: &str, label: &str, properties: serde_json::Value) -> Node {
+        Node {
+            id: String::from(id),
+            label: String::from(label),
+            class_id: String::from("organization"),
+            properties,
+            provisional: false,
+        }
+    }
+
+    #[test]
+    fn properties_render_sorted_and_flattened() {
+        let text = format_properties(&json!({
+            "status": "open",
+            "amount": 1200.5,
+            "aliases": ["Acme Ltd", "Acme"],
+            "closed": null,
+            "note": "  padded  ",
+        }));
+        assert_eq!(
+            text,
+            " {aliases: Acme Ltd, Acme, amount: 1200.5, note: padded, status: open}"
+        );
+    }
+
+    #[test]
+    fn properties_without_values_render_as_nothing() {
+        assert_eq!(format_properties(&json!({})), "");
+        assert_eq!(format_properties(&json!(null)), "");
+        assert_eq!(format_properties(&json!("not an object")), "");
+        assert_eq!(
+            format_properties(&json!({ "empty": "", "unset": null })),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_long_value_is_cut_and_extra_properties_are_counted() {
+        let long = "x".repeat(PROPERTY_VALUE_CHARS + 10);
+        let text = format_properties(&json!({ "note": long }));
+        assert!(text.ends_with("\u{2026}}"), "{text}");
+        assert_eq!(
+            text.chars().count(),
+            // " {note: " + the cut value + the ellipsis + "}"
+            PROPERTY_VALUE_CHARS + 10
+        );
+
+        let mut wide = serde_json::Map::new();
+        for i in 0..(RENDERED_PROPERTIES + 3) {
+            wide.insert(format!("p{i:02}"), json!("v"));
+        }
+        let text = format_properties(&serde_json::Value::Object(wide));
+        assert!(text.contains("p00: v") && text.contains("p07: v"), "{text}");
+        assert!(!text.contains("p08"), "{text}");
+        assert!(text.ends_with("... 3 more}"), "{text}");
+    }
+
+    #[test]
+    fn the_tree_carries_node_and_edge_properties() {
+        let result = GraphResult {
+            nodes: vec![
+                node("a", "Acme", json!({ "founded": 1999 })),
+                node("b", "Orgenics", json!({})),
+            ],
+            edges: vec![Edge {
+                id: String::from("e"),
+                source_node_id: String::from("a"),
+                target_node_id: String::from("b"),
+                relation_id: String::from("supplies"),
+                weight: 1.0,
+                properties: json!({ "since": "2020" }),
+                provisional: false,
+            }],
+            provenance: Vec::new(),
+            roots: vec![String::from("a")],
+        };
+        let tree = render_tree(&result);
+        assert!(
+            tree.contains("Acme (organization) {founded: 1999}"),
+            "{tree}"
+        );
+        assert!(tree.contains("-> supplies {since: 2020}"), "{tree}");
+        // A node with no properties keeps the bare label and class.
+        assert!(tree.contains("Orgenics (organization)\n"), "{tree}");
     }
 }

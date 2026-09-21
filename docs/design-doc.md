@@ -912,6 +912,14 @@ Graph tools (`search_graph`, `find_path`) register only when the graph has nodes
 rest register in every workspace, and the prompt tells the model what the workspace holds.
 An `export` tool (`COPY ... TO` under `files/`) is not built (section 17).
 
+Both graph tools render each node and edge with the properties the ontology types, bounded
+at eight per subject and sixty characters per value. A lookup that finds nothing says which
+kind of nothing it found, so the model retries instead of reporting an empty workspace: a
+class or relation id the ontology does not define is an error naming the ids that exist
+(the contract `search_documents` already has for `document_ids`), a name that matches no
+entity comes back with the closest labels in the graph, and a result that query mode
+emptied by dropping provisional nodes says the matches exist but are unreviewed.
+
 ### 7.4 Permissions and limits
 
 **Classification.** Before executing `run_sql`, the statement is passed to DuckDB's own

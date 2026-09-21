@@ -654,3 +654,85 @@ fn auto_accepted_ontologies_are_provisional_until_reviewed() {
     store::save(&db, &Ontology::builtin_default(), None, Some("reviewed")).unwrap();
     assert!(!store::current_is_auto_accepted(&db).unwrap());
 }
+
+/// A lookup that matched nothing offers the labels it came closest to —
+/// by overlap either way, then by embedding — so the model can call again
+/// instead of being told the graph is empty.
+#[tokio::test]
+async fn a_missed_lookup_suggests_the_labels_that_exist() {
+    let db = workspace();
+    for (label, class_id) in [
+        ("Orgenics Ltd", "vendor"),
+        ("Kenya", "country"),
+        ("Uganda", "country"),
+    ] {
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from(label),
+                class_id: String::from(class_id),
+                properties: serde_json::json!({}),
+                provisional: false,
+            },
+        )
+        .unwrap();
+    }
+
+    // The query inside a label, and a label inside the query.
+    assert_eq!(
+        traverse::suggest_entities(&db, "Orgenics", None, None).unwrap(),
+        ["Orgenics Ltd (vendor)"]
+    );
+    assert_eq!(
+        traverse::suggest_entities(&db, "Kenya Ports Authority", None, None).unwrap(),
+        ["Kenya (country)"]
+    );
+
+    // Held to the class when one was given, and empty when nothing is close.
+    assert!(
+        traverse::suggest_entities(&db, "Orgenics", Some("country"), None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        traverse::suggest_entities(&db, "Helsinki", None, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        traverse::suggest_entities(&db, "   ", None, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    // With an embedding, a label sharing no text still comes back: these
+    // are the matches `resolve_entry` rejected as too far to be the entity.
+    for node in graph_store::nodes_without_embedding(&db, 10).unwrap() {
+        let label = LetterEmbedding.embed_text(&node.label).await.unwrap();
+        graph_store::set_node_embedding(&db, &node.id, &letter_vector(&label.vec)).unwrap();
+    }
+    let query = LetterEmbedding.embed_text("Kampala").await.unwrap();
+    let suggestions =
+        traverse::suggest_entities(&db, "Kampala", None, Some(&letter_vector(&query.vec))).unwrap();
+    assert!(
+        suggestions.contains(&String::from("Kenya (country)")),
+        "{suggestions:?}"
+    );
+}
+
+/// A `LetterEmbedding` vector as `f32`: the fixture embeds 0, 1, or a
+/// hundredth, all exact in `f32`.
+fn letter_vector(embedding: &[f64]) -> Vec<f32> {
+    embedding
+        .iter()
+        .map(|v| {
+            if *v >= 1.0 {
+                1.0
+            } else if *v > 0.0 {
+                0.01
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}

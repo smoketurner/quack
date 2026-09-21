@@ -17,6 +17,7 @@ use super::rerank::{self, Reranker};
 use super::text_to_sql;
 use crate::error::Error;
 use crate::ontology::store as ontology_store;
+use crate::ontology::{self, Ontology};
 
 pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
 
@@ -1076,6 +1077,71 @@ mod tests {
     }
 
     #[test]
+    fn unknown_class_and_relation_ids_are_refused_with_the_real_ones() {
+        let ontology = Ontology::builtin_default();
+        assert!(check_class(Some(&ontology), "organization").is_ok());
+        // The root class and `mentions` are implicit: never declared, always valid.
+        assert!(check_class(Some(&ontology), ontology::ROOT_CLASS).is_ok());
+        assert!(check_relation(Some(&ontology), ontology::MENTIONS_RELATION).is_ok());
+        assert!(check_relation(Some(&ontology), "works_at").is_ok());
+
+        let err = check_class(Some(&ontology), "organisation")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("no class 'organisation'") && err.contains("organization"),
+            "{err}"
+        );
+        let err = check_relation(Some(&ontology), "employed_by")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("no relation 'employed_by'") && err.contains("works_at"),
+            "{err}"
+        );
+        assert!(check_class(None, "organization").is_err());
+        assert!(check_relation(None, "works_at").is_err());
+    }
+
+    #[test]
+    fn long_id_lists_are_counted_rather_than_pasted() {
+        let ids: Vec<String> = (0..(LISTED_IDS + 5)).map(|i| format!("c{i:03}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let text = listed(&refs);
+        assert!(text.starts_with("c000, c001"), "{text}");
+        assert!(text.ends_with("... and 5 more"), "{text}");
+        assert!(!text.contains("c040"), "{text}");
+        assert_eq!(listed(&["a", "b"]), "a, b");
+    }
+
+    #[test]
+    fn an_empty_result_says_which_kind_of_empty_it_is() {
+        let nothing = empty_graph_text(false, &[]).unwrap_or_default();
+        assert!(
+            nothing.contains("the graph has nothing on this"),
+            "{nothing}"
+        );
+
+        let suggested =
+            empty_graph_text(false, &[String::from("Acme (organization)")]).unwrap_or_default();
+        assert!(
+            suggested.contains("Acme (organization)") && suggested.contains("Search again"),
+            "{suggested}"
+        );
+
+        // Provisional matches were found and then stripped: the workspace
+        // has the entity, query mode just will not answer from it.
+        let stripped = empty_graph_text(true, &[]).unwrap_or_default();
+        assert!(
+            stripped.contains("provisional") && stripped.contains("quack graph review"),
+            "{stripped}"
+        );
+        assert!(!stripped.contains("No matching entities"), "{stripped}");
+    }
+
+    #[test]
     fn document_ids_resolve_by_id_prefix_or_filename() {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
@@ -1662,6 +1728,124 @@ pub struct SearchGraphArgs {
     pub hops: Option<u32>,
 }
 
+/// What a graph lookup produced: the result, and the labels to offer when
+/// it found nothing.
+struct GraphLookup {
+    result: GraphResult,
+    suggestions: Vec<String>,
+}
+
+/// One `search_graph` call's arguments, trimmed and defaulted, with the
+/// entity's embedding already taken (embedding is async, the lookup is
+/// not).
+struct GraphQuery {
+    entity: Option<String>,
+    class: Option<String>,
+    relation: Option<String>,
+    hops: u32,
+    embedding: Option<Vec<f32>>,
+}
+
+/// A `search_graph` lookup on the database thread: refuse ids the ontology
+/// does not define, traverse from the entity or list the class, and gather
+/// the labels to suggest when nothing matched.
+fn lookup_graph(
+    db: &WorkspaceDb,
+    query: &GraphQuery,
+    options: &graph::GraphOptions,
+) -> crate::error::Result<GraphLookup> {
+    let ontology = ontology_store::current(db)?;
+    let class = query.class.as_deref();
+    let relation = query.relation.as_deref();
+    let embedding = query.embedding.as_deref();
+    if let Some(class) = class {
+        check_class(ontology.as_ref(), class)?;
+    }
+    if let Some(relation) = relation {
+        check_relation(ontology.as_ref(), relation)?;
+    }
+    let result = if let Some(entity) = query.entity.as_deref() {
+        let roots = graph::traverse::resolve_entry(db, entity, class, embedding)?;
+        graph::traverse::neighborhood(db, &roots, query.hops, relation, options)?
+    } else {
+        graph::traverse::by_class(
+            db,
+            ontology.as_ref(),
+            class.unwrap_or_default(),
+            options.max_nodes,
+            options,
+        )?
+    };
+    let suggestions = match query.entity.as_deref() {
+        Some(entity) if result.nodes.is_empty() => {
+            graph::traverse::suggest_entities(db, entity, class, embedding)?
+        }
+        Some(_) | None => Vec::new(),
+    };
+    Ok(GraphLookup {
+        result,
+        suggestions,
+    })
+}
+
+/// Ids past this many are counted rather than listed when an unknown id is
+/// refused: an induced ontology can carry a class per table.
+const LISTED_IDS: usize = 40;
+
+/// `a, b, c ... and N more`, so a refusal names what exists without
+/// pasting a whole ontology into the model's context.
+fn listed(ids: &[&str]) -> String {
+    let mut shown: Vec<String> = ids
+        .iter()
+        .take(LISTED_IDS)
+        .map(|id| (*id).to_owned())
+        .collect();
+    let hidden = ids.len().saturating_sub(shown.len());
+    if hidden > 0 {
+        shown.push(format!("... and {hidden} more"));
+    }
+    shown.join(", ")
+}
+
+/// Refuse a class the ontology does not define, naming the ones it does.
+/// `resolve_document_ids` sets the contract for `search_documents`: an id
+/// that matches nothing is an error the model can correct, never an empty
+/// result it reads as "the workspace has nothing on this".
+fn check_class(ontology: Option<&Ontology>, class_id: &str) -> crate::error::Result<()> {
+    let Some(ontology) = ontology else {
+        return Err(Error::Analysis(String::from(
+            "this workspace has no ontology, so it has no classes to search by",
+        )));
+    };
+    if class_id == ontology::ROOT_CLASS || ontology.class(class_id).is_some() {
+        return Ok(());
+    }
+    let mut ids: Vec<&str> = vec![ontology::ROOT_CLASS];
+    ids.extend(ontology.classes.iter().map(|c| c.id.as_str()));
+    Err(Error::Analysis(format!(
+        "no class '{class_id}' in the ontology; the classes are: {}",
+        listed(&ids)
+    )))
+}
+
+/// Refuse a relation the ontology does not define, naming the ones it does.
+fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> crate::error::Result<()> {
+    let Some(ontology) = ontology else {
+        return Err(Error::Analysis(String::from(
+            "this workspace has no ontology, so it has no relations to follow",
+        )));
+    };
+    if relation_id == ontology::MENTIONS_RELATION || ontology.relation(relation_id).is_some() {
+        return Ok(());
+    }
+    let mut ids: Vec<&str> = vec![ontology::MENTIONS_RELATION];
+    ids.extend(ontology.relations.iter().map(|r| r.id.as_str()));
+    Err(Error::Analysis(format!(
+        "no relation '{relation_id}' in the ontology; the relations are: {}",
+        listed(&ids)
+    )))
+}
+
 /// Embed a label for fuzzy entry-point resolution, when a model exists.
 /// The label's embedding for fuzzy entry: `None` without a model, an
 /// error when the model fails (issue #62: a silent `None` degraded the
@@ -1739,62 +1923,51 @@ where
             Some(e) => label_embedding(self.embedding_model.as_ref(), e).await?,
             None => None,
         };
-        let hops = args.hops.unwrap_or(2).max(1);
-        let relation = args
-            .relation
-            .as_deref()
-            .map(str::trim)
-            .filter(|r| !r.is_empty());
-        let entity = entity.map(str::to_owned);
-        let class = class.map(str::to_owned);
-        let relation = relation.map(str::to_owned);
+        let query = GraphQuery {
+            entity: entity.map(str::to_owned),
+            class: class.map(str::to_owned),
+            relation: args
+                .relation
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(str::to_owned),
+            hops: args.hops.unwrap_or(2).max(1),
+            embedding,
+        };
         let options = self.options;
-        let result = self
+        let lookup = self
             .db
-            .with_db(move |db| {
-                if let Some(e) = entity.as_deref() {
-                    graph::traverse::resolve_entry(db, e, class.as_deref(), embedding.as_deref())
-                        .and_then(|roots| {
-                            graph::traverse::neighborhood(
-                                db,
-                                &roots,
-                                hops,
-                                relation.as_deref(),
-                                &options,
-                            )
-                        })
-                } else {
-                    ontology_store::current(db).and_then(|o| {
-                        graph::traverse::by_class(
-                            db,
-                            o.as_ref(),
-                            class.as_deref().unwrap_or_default(),
-                            options.max_nodes,
-                            &options,
-                        )
-                    })
-                }
-            })
+            .with_db(move |db| lookup_graph(db, &query, &options))
             .await;
-        let result = match result {
-            Ok(result) => result,
+        let lookup = match lookup {
+            Ok(lookup) => lookup,
             Err(e) => {
                 let e = tool_error(e);
                 step.finish(format!("error: {e}"));
                 return Err(e);
             }
         };
+        let had_matches = !lookup.result.nodes.is_empty();
         let result = if self.exclude_provisional {
-            result.without_provisional()
+            lookup.result.without_provisional()
         } else {
-            result
+            lookup.result
         };
-        step.finish(format!(
-            "{} nodes, {} edges",
-            result.nodes.len(),
-            result.edges.len()
-        ));
-        let text = format_graph_result(&result, &self.recorder, &self.db).await?;
+        let stripped = had_matches && result.nodes.is_empty();
+        step.finish(if stripped {
+            String::from("matches are provisional")
+        } else {
+            format!("{} nodes, {} edges", result.nodes.len(), result.edges.len())
+        });
+        let text = format_graph_result(
+            &result,
+            &self.recorder,
+            &self.db,
+            stripped,
+            &lookup.suggestions,
+        )
+        .await?;
         if let Ok(mut results) = self.results.lock() {
             results.push(result);
         }
@@ -1883,25 +2056,23 @@ where
         let result = self
             .db
             .with_db(move |db| {
-                graph::traverse::resolve_entry(db, &from_owned, None, from_embedding.as_deref())
-                    .and_then(|a| {
-                        let b = graph::traverse::resolve_entry(
-                            db,
-                            &to_owned,
-                            None,
-                            to_embedding.as_deref(),
-                        )?;
-                        Ok((a, b))
-                    })
-                    .and_then(|(a, b)| match (a.first(), b.first()) {
-                        (Some(a), Some(b)) => graph::traverse::path(db, a, b, max_hops, &options),
-                        (None, _) => {
-                            Err(Error::Analysis(format!("no entity matches '{from_owned}'")))
-                        }
-                        (_, None) => {
-                            Err(Error::Analysis(format!("no entity matches '{to_owned}'")))
-                        }
-                    })
+                let a = graph::traverse::resolve_entry(
+                    db,
+                    &from_owned,
+                    None,
+                    from_embedding.as_deref(),
+                )?;
+                let b =
+                    graph::traverse::resolve_entry(db, &to_owned, None, to_embedding.as_deref())?;
+                match (a.first(), b.first()) {
+                    (Some(a), Some(b)) => graph::traverse::path(db, a, b, max_hops, &options),
+                    (None, _) => Err(unresolved_entity(
+                        db,
+                        &from_owned,
+                        from_embedding.as_deref(),
+                    )),
+                    (_, None) => Err(unresolved_entity(db, &to_owned, to_embedding.as_deref())),
+                }
             })
             .await;
         let result = match result {
@@ -1912,24 +2083,78 @@ where
                 return Err(e);
             }
         };
+        let had_matches = !result.nodes.is_empty();
         let result = if self.exclude_provisional {
             result.without_provisional()
         } else {
             result
         };
+        let stripped = had_matches && result.nodes.is_empty();
         if result.nodes.is_empty() {
+            if stripped {
+                step.finish("path is provisional");
+                return Ok(format!(
+                    "A path connects {from} and {to}, but it runs through provisional entities: \
+                     they were built from an ontology version nobody has reviewed, and query mode \
+                     does not answer from those. Tell the user the path is unreviewed and that \
+                     `quack graph review` accepts it."
+                ));
+            }
             step.finish("no path");
             return Ok(format!(
                 "No path connects {from} and {to} within {max_hops} hops."
             ));
         }
         step.finish(format!("{} hops", result.edges.len()));
-        let text = format_graph_result(&result, &self.recorder, &self.db).await?;
+        let text = format_graph_result(&result, &self.recorder, &self.db, false, &[]).await?;
         if let Ok(mut results) = self.results.lock() {
             results.push(result);
         }
         Ok(text)
     }
+}
+
+/// The error for a path endpoint that resolved to nothing, carrying the
+/// nearest labels so the model can call again with a real one.
+fn unresolved_entity(db: &WorkspaceDb, entity: &str, embedding: Option<&[f32]>) -> Error {
+    let suggestions =
+        graph::traverse::suggest_entities(db, entity, None, embedding).unwrap_or_default();
+    if suggestions.is_empty() {
+        return Error::Analysis(format!("no entity matches '{entity}'"));
+    }
+    Error::Analysis(format!(
+        "no entity matches '{entity}'; the closest labels in the graph are: {}",
+        suggestions.join(", ")
+    ))
+}
+
+/// What the model is told when a lookup came back empty: that the graph
+/// has nothing, that it has only unreviewed matches, or which labels to
+/// try instead.
+fn empty_graph_text(
+    stripped_provisional: bool,
+    suggestions: &[String],
+) -> Result<String, ToolError> {
+    if stripped_provisional {
+        return Ok(String::from(
+            "The graph has matches, but all of them are provisional: they were built from an \
+             ontology version nobody has reviewed, and query mode does not answer from those. \
+             Tell the user the graph has unreviewed matches and that `quack graph review` \
+             accepts them.",
+        ));
+    }
+    let mut out = String::from("No matching entities in the graph.");
+    if suggestions.is_empty() {
+        out.push_str(" Tell the user the graph has nothing on this.");
+        return Ok(out);
+    }
+    write!(
+        out,
+        " The closest labels in the graph are: {}. Search again with one of them if that is what \
+         the user meant; otherwise tell the user the graph has nothing on this.",
+        suggestions.join(", ")
+    )?;
+    Ok(out)
 }
 
 /// Render a graph result for the model: the tree, then the sources each
@@ -1939,11 +2164,11 @@ async fn format_graph_result(
     result: &GraphResult,
     recorder: &TurnRecorder,
     db: &ReaderDb,
+    stripped_provisional: bool,
+    suggestions: &[String],
 ) -> Result<String, ToolError> {
     if result.nodes.is_empty() {
-        return Ok(String::from(
-            "No matching entities in the graph. Tell the user the graph has nothing on this.",
-        ));
+        return empty_graph_text(stripped_provisional, suggestions);
     }
     let mut out = graph::traverse::render_tree(result);
     let chunk_ids: Vec<String> = result
