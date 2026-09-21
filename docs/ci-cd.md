@@ -134,13 +134,16 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
 2. **version** — the tag without its `v`, or `0.0.0-<short sha>` for a manual run.
 3. **build** — calls `reusable-build.yml`. Its `permissions:` block is the ceiling for the
    called jobs (`contents: read`, `packages: write`, `id-token: write`,
-   `attestations: write`), and the signing secrets are forwarded there explicitly; each is
+   `attestations: write`, `artifact-metadata: write`), and the signing secrets are
+   forwarded there explicitly; each is
    declared optional, so a missing credential downgrades that platform to an unsigned
    binary with a warning instead of failing the release.
 4. **publish** (tag only, `contents: write`, no checkout) — downloads the build artifacts,
    verifies each archive against the `.sha256` file written on the machine that built it,
    consolidates them into `SHA256SUMS`, and runs `gh release create --generate-notes
-   --verify-tag` over the archives, SBOMs, image tarballs, and `SHA256SUMS`.
+   --verify-tag` over the archives, SBOMs, image tarballs, and `SHA256SUMS`. Because there
+   is no checkout, that step sets `GH_REPO`: with no git remote to infer the repository
+   from, `gh` fails with "not a git repository" before it reaches the API.
 
 `reusable-build.yml`:
 
@@ -174,7 +177,8 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
    attested like the binaries.
 3. **image-index** (tag only) — `docker buildx imagetools create` joins the per-architecture
    digests into `ghcr.io/smoketurner/quack:<version>` and `:latest`, then attests the index
-   digest to the registry.
+   digest to the registry. Pushing the attestation also writes an artifact metadata storage
+   record, which is why this job alone carries `artifact-metadata: write`.
 
 Code signing, all optional and all checked in one step per job that warns into the job
 summary when a credential is missing:
