@@ -768,16 +768,20 @@ pub fn format_search_results(
             .heading
             .as_deref()
             .map_or(String::new(), |h| format!(", under \"{h}\""));
+        // Graph entities stay on the metadata line: on its own line under
+        // the header a model quotes the list back as if it were part of
+        // the passage (seen live).
+        let graph = entities
+            .get(&chunk.id)
+            .filter(|e| !e.is_empty())
+            .map_or(String::new(), |e| {
+                format!(", graph entities: {}", e.join(", "))
+            });
         writeln!(
             out,
-            "[{n}] {}{page}{heading} (document_id: {}, chunk {}, score {:.4})",
+            "[{n}] {}{page}{heading} (document_id: {}, chunk {}, score {:.4}{graph})",
             chunk.filename, chunk.document_id, chunk.chunk_index, chunk.score
         )?;
-        if let Some(entities) = entities.get(&chunk.id).filter(|e| !e.is_empty()) {
-            // What the graph already extracted from this passage, so the
-            // model can follow one into search_graph or find_path.
-            writeln!(out, "Entities here: {}", entities.join(", "))?;
-        }
         writeln!(out, "{}", chunk.content.trim())?;
         writeln!(out)?;
     }
@@ -1501,6 +1505,35 @@ mod tests {
         assert!(out.contains("\nFlood is excluded.\n"));
         assert!(out.contains("[2] faq.md (document_id: doc-1, chunk 1, score 0.1250)\n"));
         assert!(out.contains("Claims close in 30 days."));
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn search_results_name_the_entities_a_chunk_was_the_source_of() {
+        let entities = BTreeMap::from([(
+            String::from("c0"),
+            vec![
+                String::from("OKLAHOMA (state)"),
+                String::from("EF4 (scale)"),
+            ],
+        )]);
+        let out = format_search_results(
+            &[hit(0, "efscale.html", "Damage indicators.")],
+            1,
+            &entities,
+        )
+        .unwrap();
+        // On the metadata line, not above the passage: a line of its own
+        // gets quoted back as though it were the document's text.
+        assert!(
+            out.contains("graph entities: OKLAHOMA (state), EF4 (scale))"),
+            "{out}"
+        );
+        assert!(out.contains("\nDamage indicators.\n"), "{out}");
+        // A chunk with no entities keeps the plain metadata line.
+        let none =
+            format_search_results(&[hit(0, "efscale.html", "x")], 1, &BTreeMap::new()).unwrap();
+        assert!(!none.contains("graph entities"), "{none}");
     }
 
     #[test]
