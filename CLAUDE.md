@@ -244,6 +244,7 @@ make build     # cargo build --release
 make fmt       # cargo fmt --all
 make lint      # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test      # cargo test --workspace --all-features
+make eval      # retrieval, ontology induction, graph extraction, and citation numbers; no model needed
 make deny      # cargo deny check
 make release-gates   # no ring or OpenSSL in the runtime tree, then cargo deny
 make crypto-gates    # the tree check alone (what the release job runs; it checks deny separately)

@@ -53,6 +53,9 @@ test-coverage: ## Generate an HTML coverage report (requires cargo-llvm-cov)
 test-mutants: ## Run mutation testing (requires cargo-mutants)
 	$(CARGO) mutants
 
+eval: ## Run the evaluation harness: retrieval, induction, extraction, citations
+	$(CARGO) run -p quack-core --example eval
+
 crypto-gates: ## No ring or OpenSSL in the runtime dependency tree (needs no extra tools)
 	@if $(CARGO) tree -i ring -e normal 2>/dev/null | grep -q ring; then echo "ring is in the runtime dependency tree"; exit 1; fi
 	@if $(CARGO) tree -i openssl-sys -e normal 2>/dev/null | grep -q openssl; then echo "openssl-sys is in the runtime dependency tree"; exit 1; fi

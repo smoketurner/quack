@@ -1,0 +1,105 @@
+[
+  {
+    "question": "What are the estimated wind speeds for an EF2 tornado?",
+    "kind": "semantic",
+    "expected": [{ "filename": "ef-scale.md", "contains": "111 to 135" }]
+  },
+  {
+    "question": "What is the wind speed range of an EF5 tornado?",
+    "kind": "semantic",
+    "expected": [{ "filename": "ef-scale.md", "contains": "over 200 miles per hour" }]
+  },
+  {
+    "question": "What is a Category 4 hurricane's sustained wind speed range?",
+    "kind": "semantic",
+    "expected": [{ "filename": "saffir-simpson.md", "contains": "130 to 156" }]
+  },
+  {
+    "question": "What does a fatality code of I mean?",
+    "kind": "semantic",
+    "expected": [{ "filename": "glossary.md", "contains": "indirect, meaning the death" }]
+  },
+  {
+    "question": "What does the property damage suffix M mean?",
+    "kind": "semantic",
+    "expected": [{ "filename": "glossary.md", "contains": "M` for millions" }]
+  },
+  {
+    "question": "What should you do when a tornado warning is issued?",
+    "kind": "semantic",
+    "expected": [{ "filename": "tornado-safety.md", "contains": "lowest floor of a sturdy" }]
+  },
+  {
+    "question": "What is required for an entry to be recorded in the storm events database?",
+    "kind": "semantic",
+    "expected": [{ "filename": "data-preparation.md", "contains": "recognized event type" }]
+  },
+  {
+    "question": "What distinguishes a direct death from an indirect death?",
+    "kind": "semantic",
+    "expected": [{ "filename": "data-preparation.md", "contains": "physical force caused it" }]
+  },
+  {
+    "question": "What happened in storm report SR-8841?",
+    "kind": "identifier",
+    "expected": [{ "filename": "episode-01.md", "contains": "Rutherford County" }]
+  },
+  {
+    "question": "What happened in storm report SR-4437?",
+    "kind": "identifier",
+    "expected": [{ "filename": "episode-08.md", "contains": "Grady County" }]
+  },
+  {
+    "question": "What happened in storm report SR-7765?",
+    "kind": "identifier",
+    "expected": [{ "filename": "episode-09.md", "contains": "hurricane landfall" }]
+  },
+  {
+    "question": "What happened in storm report SR-2214?",
+    "kind": "identifier",
+    "expected": [{ "filename": "episode-06.md", "contains": "Cedar River" }]
+  },
+  {
+    "question": "How much snow fell during storm report SR-6688?",
+    "kind": "identifier",
+    "expected": [{ "filename": "episode-05.md", "contains": "fourteen inches" }]
+  },
+  {
+    "question": "What ignited the wildfire in storm report SR-9901?",
+    "kind": "identifier",
+    "expected": [{ "filename": "episode-07.md", "contains": "ignited by lightning" }]
+  },
+  {
+    "question": "Which forecast office covers Wakefield, Virginia?",
+    "kind": "identifier",
+    "expected": [{ "filename": "office-akq.md", "contains": "AKQ" }]
+  },
+  {
+    "question": "Which forecast office covers Oxnard, California?",
+    "kind": "identifier",
+    "expected": [{ "filename": "office-lox.md", "contains": "LOX" }]
+  },
+  {
+    "question": "Which forecast office covers Glasgow, Montana?",
+    "kind": "identifier",
+    "expected": [{ "filename": "office-ggw.md", "contains": "GGW" }]
+  },
+  {
+    "question": "\"flash flood emergency\"",
+    "kind": "phrase",
+    "expected": [{ "filename": "episode-04.md", "contains": "flash flood emergency" }]
+  },
+  {
+    "question": "\"wall of water\"",
+    "kind": "phrase",
+    "expected": [{ "filename": "episode-06.md", "contains": "wall of water" }]
+  },
+  {
+    "question": "\"golf ball sized hail\"",
+    "kind": "phrase",
+    "expected": [
+      { "filename": "episode-01.md", "contains": "golf ball sized hail" },
+      { "filename": "episode-02.md", "contains": "golf ball sized hail" }
+    ]
+  }
+]

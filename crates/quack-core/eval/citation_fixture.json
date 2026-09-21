@@ -1,0 +1,42 @@
+[
+  {
+    "registered_chunks": 3,
+    "answer": "Storm SR-8841 produced EF2 damage [1] near Rutherford County [2].",
+    "expected_surviving_markers": 2
+  },
+  {
+    "registered_chunks": 2,
+    "answer": "Category 4 winds reach 156 mph [1].",
+    "expected_surviving_markers": 1
+  },
+  {
+    "registered_chunks": 2,
+    "answer": "This is unsupported [5].",
+    "expected_surviving_markers": 0
+  },
+  {
+    "registered_chunks": 1,
+    "answer": "Snow totaled fourteen inches [1] and also see [2].",
+    "expected_surviving_markers": 1
+  },
+  {
+    "registered_chunks": 4,
+    "answer": "[1][2][3][4] all agree.",
+    "expected_surviving_markers": 4
+  },
+  {
+    "registered_chunks": 2,
+    "answer": "No citations here at all.",
+    "expected_surviving_markers": 0
+  },
+  {
+    "registered_chunks": 3,
+    "answer": "The model said [commentary: something] before answering [1].",
+    "expected_surviving_markers": 1
+  },
+  {
+    "registered_chunks": 0,
+    "answer": "Nothing was retrieved [1].",
+    "expected_surviving_markers": 0
+  }
+]

@@ -1682,6 +1682,27 @@ and macOS, plus dependency review and cargo-deny, on every push and pull request
 (`make test-coverage`, `cargo llvm-cov`) and mutation testing (`make test-mutants`, the whole
 workspace) are local-only and not wired into a release. There is no fuzzing.
 
+**Evaluation.** `make eval` (`crates/quack-core/examples/eval.rs`, issue #74) is the
+answer-quality counterpart to the correctness suites above: it ingests a small in-tree
+storms-like fixture (`crates/quack-core/eval/`, 20 documents and three CSV tables written
+for the harness, not the NOAA download) into a temporary workspace and prints recall@k and
+MRR for `search_keyword_chunks`, `search_similar_chunks`, and `search_hybrid_chunks` over a
+gold question set (tagged `identifier`, `phrase`, or `semantic` so a tokenization change is
+visible on its own row); precision and recall of `ontology::induction::propose_from_tables`
+against a hand-written expected ontology; node and edge precision and recall of
+`graph::extract::run` over ten hand-labelled chunks through a canned `GraphExtractor`, so
+the numbers measure validation, resolution, and storage rather than a model; and how many
+of a fixed set of recorded answers keep every `[n]` marker through
+`analysis::citations::validate`. Vector search uses a deterministic hashing embedder (a
+bag-of-words projection, not a semantic one) so the run needs no Ollama and finishes in
+seconds. It writes the same numbers as JSON to `QUACK_EVAL_OUT` when set, for a before/after
+diff. Baseline on this fixture: keyword recall@8 1.000 (MRR 0.975), hybrid recall@8 0.850
+(MRR 0.627, identifier and phrase questions both 1.000, semantic 0.625 because the hashing
+embedder is not semantic), similarity-only recall@8 0.650; ontology induction and graph
+extraction both precision 1.000 / recall 1.000 against their fixtures; citation validity
+8/8 recorded answers validated as expected. A prompt, chunker, stemmer, or fusion-constant
+change is no longer a coin flip: this is the number that moves.
+
 ---
 
 ## 17. Gaps Between This Document and the Code
