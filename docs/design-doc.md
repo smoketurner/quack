@@ -1597,18 +1597,32 @@ because the system being replaced runs on Postgres.
    Horizontal scaling or an HA pair is not possible without moving storage to a server
    database. For a single-instance deployment this is a simplification, not a limitation.
 2. **Vector search is an exact scan, not an index.** Every query computes the cosine
-   distance against every stored embedding inside DuckDB. That is tens of milliseconds
-   for a hundred thousand 768-dimensional chunks and grows linearly; the working set is
-   `chunks × dimension × 4` bytes (about 3 GB per million chunks). Past a few hundred
-   thousand chunks per workspace, add an approximate index that ships inside the binary
-   rather than a DuckDB extension. The decision, recorded so it is not rediscovered
-   (#32): a pure-Rust HNSW crate over the same stored vectors, persisted beside
-   `data.duckdb` and rebuilt from `_quack_chunks` when missing or stale, is the accepted
-   path; the alternative of a custom DuckDB build with `vss` and `fts` statically linked
-   (DuckDB's extension config, `DUCKDB_LIB_DIR` and `DUCKDB_STATIC`) is a C++ build
-   pipeline per release target and is not pursued. Neither is built until a workspace
-   reaches that size. BM25 is an indexed join on `_quack_terms` and stays fast far
-   beyond that.
+   distance against every stored embedding inside DuckDB; the working set is
+   `chunks × dimension × 4` bytes (about 4 GB per million 1,024-wide chunks). Measured
+   with `cargo bench -p quack-core --bench retrieval` (`make bench`; synthetic chunks of
+   sixty words from a 2,000-word vocabulary, 1,024-dimension vectors, top 8, an in-memory
+   workspace on a 10-core Apple Silicon laptop, p50 / p99 per query):
+
+   | chunks | vector scan | BM25 leg | fused hybrid |
+   |---|---|---|---|
+   | 10,000 | 10 / 11 ms | 8 / 8 ms | 18 / 19 ms |
+   | 100,000 | 95 / 95 ms | 36 / 37 ms | 134 / 138 ms |
+   | 1,000,000 | 165 / 168 ms | 285 / 287 ms | 450 / 456 ms |
+
+   The scan is linear to 100,000 chunks (about 1 µs per chunk) and sublinear past it
+   once DuckDB spreads it across cores. Retrieval stays well under the model's own time
+   at every size a workspace is likely to reach, so no index is built. The decision,
+   recorded so it is not rediscovered (#32): if a workspace passes a million chunks, a
+   pure-Rust HNSW crate over the same stored vectors, persisted beside `data.duckdb` and
+   rebuilt from `_quack_chunks` when missing or stale, is the accepted path; the
+   alternative of a custom DuckDB build with `vss` and `fts` statically linked (DuckDB's
+   extension config, `DUCKDB_LIB_DIR` and `DUCKDB_STATIC`) is a C++ build pipeline per
+   release target and is not pursued. BM25 is an indexed join on `_quack_terms`, but its
+   cost grows with the posting lists, not the chunk count alone: at a million chunks
+   (sixty million term rows) it is the larger half of a hybrid query, so a workspace that
+   size wants the term index looked at before the vector scan. Because every request on
+   a workspace waits behind the same connection, these are also the latencies other
+   requests queue behind while a search runs.
 3. **One file is the boundary, so one file is the backup unit.** Back up a workspace by
    copying its directory while the server holds no write transaction. A
    `quack workspace snapshot NAME` that does this through DuckDB's `CHECKPOINT` is still

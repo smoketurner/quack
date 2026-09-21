@@ -44,6 +44,7 @@ argon2               = { version = "=0.6.0", default-features = false }
 askama               = { version = "=0.16.1", default-features = false }
 aws-lc-rs            = { version = "=1.18.1", default-features = false }
 axum                 = { version = "=0.8.9", default-features = false }
+criterion            = { version = "=0.8.2", default-features = false }
 axum-extra           = { version = "=0.12.6", default-features = false }
 axum-server          = { version = "=0.8.0", default-features = false }
 base64               = { version = "=0.23.1", default-features = false }
