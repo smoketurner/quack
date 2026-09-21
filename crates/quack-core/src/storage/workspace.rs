@@ -1890,12 +1890,8 @@ pub fn tokenize(text: &str) -> Vec<String> {
             }
         }
         if run.contains(is_identifier_joiner) {
-            let joined: String = run
-                .chars()
-                .filter(|c| c.is_alphanumeric())
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-            terms.push(joined);
+            let alnum: String = run.chars().filter(|c| c.is_alphanumeric()).collect();
+            terms.push(alnum.to_lowercase());
         }
     }
     terms
@@ -3023,6 +3019,12 @@ mod tests {
         // already in text (`pol8841`) is found by the query `POL-8841`.
         assert!(tokenize("POL-8841").contains(&String::from("pol8841")));
         assert_eq!(tokenize("pol8841"), vec!["pol8841"]);
+        // The joined form uses full Unicode case folding, not ASCII-only
+        // lowercasing, so a non-ASCII identifier's casing does not change
+        // which term it indexes: `Ünit-9` in text and `ünit-9` in a query
+        // must both produce the joined term `ünit9`.
+        assert_eq!(tokenize("Ünit-9").last(), tokenize("ünit-9").last(),);
+        assert_eq!(tokenize("Ünit-9").last(), Some(&String::from("ünit9")));
     }
 
     #[test]
