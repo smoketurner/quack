@@ -8,7 +8,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::storage::workspace::{ChunkSearchResult, StatementKind, WorkspaceDb};
+use crate::storage::workspace::{
+    ChunkScope, ChunkSearchResult, StatementKind, WorkspaceDb, quote_ident,
+};
 
 use super::chart::{self, ChartSpec};
 use super::events::TurnRecorder;
@@ -17,6 +19,7 @@ use super::rerank::{self, Reranker};
 use super::text_to_sql;
 use crate::error::Error;
 use crate::ontology::store as ontology_store;
+use crate::ontology::{self, Ontology};
 
 pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
 
@@ -532,6 +535,9 @@ pub struct SearchDocumentsArgs {
     /// (prefixes accepted) or exact file names
     #[serde(default)]
     pub document_ids: Vec<String>,
+    /// Restrict the search to passages this entity was extracted from,
+    /// named as it appears in the knowledge graph
+    pub entity: Option<String>,
 }
 
 /// Map what the model passed (an id, an id prefix, or a file name) to
@@ -583,7 +589,8 @@ where
         String::from(
             "Search the ingested documents by meaning and by keyword. Returns the most relevant \
              text chunks, each numbered [n] with its source file, page, and heading, for citing \
-             in the answer.",
+             in the answer, and names the graph entities each chunk was the source of. Pass \
+             entity to search only the passages one entity was extracted from.",
         )
     }
 
@@ -597,10 +604,20 @@ where
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let detail = if args.document_ids.is_empty() {
-            args.query.clone()
-        } else {
-            format!("{} (in {})", args.query, args.document_ids.join(", "))
+        let entity = args
+            .entity
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty());
+        let detail = match (args.document_ids.is_empty(), entity) {
+            (true, None) => args.query.clone(),
+            (true, Some(entity)) => format!("{} (about {entity})", args.query),
+            (false, None) => format!("{} (in {})", args.query, args.document_ids.join(", ")),
+            (false, Some(entity)) => format!(
+                "{} (about {entity}, in {})",
+                args.query,
+                args.document_ids.join(", ")
+            ),
         };
         let step = self.recorder.start(Self::NAME, &detail);
         let query_vec: Option<Vec<f32>> = match &self.embedding_model {
@@ -628,16 +645,27 @@ where
             top_k
         };
 
+        // The entity's own embedding, not the query's: it resolves a label,
+        // so `search_documents(query, entity)` is one embed call each.
+        let entity_vec = match entity {
+            Some(entity) => label_embedding(self.embedding_model.as_ref(), entity).await?,
+            None => None,
+        };
+
         let query = args.query.clone();
         let document_ids = args.document_ids.clone();
+        let entity = entity.map(str::to_owned);
         let rrf_k = self.rrf_k;
         let results = self
             .db
             .with_db(move |db| {
-                let ids = resolve_document_ids(db, &document_ids)?;
+                let mut scope = ChunkScope::documents(resolve_document_ids(db, &document_ids)?);
+                if let Some(entity) = entity.as_deref() {
+                    scope = scope.and_chunks(entity_chunks(db, entity, entity_vec.as_deref())?);
+                }
                 match &query_vec {
-                    Some(vector) => db.search_hybrid_chunks(&query, vector, fetch, rrf_k, &ids),
-                    None => db.search_keyword_chunks(&query, fetch, &ids),
+                    Some(vector) => db.search_hybrid_chunks(&query, vector, fetch, rrf_k, &scope),
+                    None => db.search_keyword_chunks(&query, fetch, &scope),
                 }
             })
             .await;
@@ -664,9 +692,55 @@ where
             None => (results, String::new()),
         };
         step.finish(format!("{} chunks{note}", results.len()));
+        let chunk_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+        // Best effort: the annotation is extra context, so a graph that
+        // cannot be read must not fail a search that already succeeded.
+        let entities = self
+            .db
+            .with_db(move |db| graph::store::entities_of_chunks(db, &chunk_ids, CHUNK_ENTITIES))
+            .await
+            .unwrap_or_default();
         let first = self.recorder.citations().register(&results);
-        format_search_results(&results, first).map_err(Into::into)
+        format_search_results(&results, first, &entities).map_err(Into::into)
     }
+}
+
+/// Entities named per retrieved chunk before the rest are counted.
+const CHUNK_ENTITIES: usize = 8;
+
+/// The chunks an entity was extracted from, for `search_documents(entity)`.
+/// A name that resolves to nothing is an error naming the closest labels,
+/// and an entity that exists only in mapped tables says so: both beat an
+/// empty result the model reads as "the documents do not cover this".
+fn entity_chunks(
+    db: &WorkspaceDb,
+    entity: &str,
+    embedding: Option<&[f32]>,
+) -> crate::error::Result<Vec<String>> {
+    let nodes = graph::traverse::resolve_entry(db, entity, None, embedding)?;
+    if nodes.is_empty() {
+        let suggestions = graph::traverse::suggest_entities(db, entity, None, embedding)?;
+        if suggestions.is_empty() {
+            return Err(Error::Analysis(format!(
+                "no entity '{entity}' in the knowledge graph; drop the entity argument to search \
+                 every document"
+            )));
+        }
+        return Err(Error::Analysis(format!(
+            "no entity '{entity}' in the knowledge graph; the closest labels are: {}",
+            suggestions.join(", ")
+        )));
+    }
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let chunks = graph::store::chunks_of_nodes(db, &ids)?;
+    if chunks.is_empty() {
+        return Err(Error::Analysis(format!(
+            "'{entity}' is in the graph, but only from table rows, so no document passage is \
+             tied to it; search_graph has its connections, or drop the entity argument to search \
+             every document"
+        )));
+    }
+    Ok(chunks)
 }
 
 /// Render search hits as numbered, citable chunks.
@@ -677,6 +751,7 @@ where
 pub fn format_search_results(
     results: &[ChunkSearchResult],
     first_marker: u32,
+    entities: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> Result<String, std::fmt::Error> {
     if results.is_empty() {
         return Ok(String::from(
@@ -693,9 +768,18 @@ pub fn format_search_results(
             .heading
             .as_deref()
             .map_or(String::new(), |h| format!(", under \"{h}\""));
+        // Graph entities stay on the metadata line: on its own line under
+        // the header a model quotes the list back as if it were part of
+        // the passage (seen live).
+        let graph = entities
+            .get(&chunk.id)
+            .filter(|e| !e.is_empty())
+            .map_or(String::new(), |e| {
+                format!(", graph entities: {}", e.join(", "))
+            });
         writeln!(
             out,
-            "[{n}] {}{page}{heading} (document_id: {}, chunk {}, score {:.4})",
+            "[{n}] {}{page}{heading} (document_id: {}, chunk {}, score {:.4}{graph})",
             chunk.filename, chunk.document_id, chunk.chunk_index, chunk.score
         )?;
         writeln!(out, "{}", chunk.content.trim())?;
@@ -1067,12 +1151,291 @@ impl Tool for CreateChartTool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::storage::workspace::NewDocument;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail_test(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    #[test]
+    fn unknown_class_and_relation_ids_are_refused_with_the_real_ones() {
+        let ontology = Ontology::builtin_default();
+        assert!(check_class(Some(&ontology), "organization").is_ok());
+        // The root class and `mentions` are implicit: never declared, always valid.
+        assert!(check_class(Some(&ontology), ontology::ROOT_CLASS).is_ok());
+        assert!(check_relation(Some(&ontology), ontology::MENTIONS_RELATION).is_ok());
+        assert!(check_relation(Some(&ontology), "works_at").is_ok());
+
+        let err = check_class(Some(&ontology), "organisation")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("no class 'organisation'") && err.contains("organization"),
+            "{err}"
+        );
+        let err = check_relation(Some(&ontology), "employed_by")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("no relation 'employed_by'") && err.contains("works_at"),
+            "{err}"
+        );
+        assert!(check_class(None, "organization").is_err());
+        assert!(check_relation(None, "works_at").is_err());
+    }
+
+    /// Two chunks about hail, the denser one second, for the search tests.
+    fn seed_hail_chunks(db: &SharedDb) {
+        use crate::storage::workspace::{NewChunk, NewDocument};
+        let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
+        guard
+            .insert_document(
+                &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
+            )
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        for (i, text) in [
+            "Hail fell on Denver.",
+            "Hail and hail again in Denver county.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            guard
+                .insert_chunk(&NewChunk {
+                    id: &format!("c{i}"),
+                    document_id: "d",
+                    chunk_index: u32::try_from(i).unwrap_or(0),
+                    content: text,
+                    heading: None,
+                    page: None,
+                    embedding: None,
+                })
+                .unwrap_or_else(|e| fail_test(&e.to_string()));
+        }
+    }
+
+    #[test]
+    fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(
+            db.insert_document(
+                &NewDocument::new("doc-1", "notes.md", "text/markdown", 1).with_status("ready")
+            )
+            .is_ok()
+        );
+        assert!(
+            db.insert_chunk(&crate::storage::workspace::NewChunk {
+                id: "c1",
+                document_id: "doc-1",
+                chunk_index: 0,
+                content: "Acme ships to Kenya.",
+                heading: None,
+                page: None,
+                embedding: None,
+            })
+            .is_ok()
+        );
+        let node = |label: &str| crate::graph::store::NewNode {
+            label: String::from(label),
+            class_id: String::from("organization"),
+            properties: json!({}),
+            provisional: false,
+        };
+        let acme = graph::store::upsert_node(&db, &node("Acme"))
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(
+            graph::store::add_provenance(
+                &db,
+                &acme,
+                &graph::store::Source::chunk("doc-1", "c1", 1.0)
+            )
+            .is_ok()
+        );
+        let from_table = graph::store::upsert_node(&db, &node("Orgenics"))
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(
+            graph::store::add_provenance(
+                &db,
+                &from_table,
+                &graph::store::Source::row("vendors", "V-1")
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            entity_chunks(&db, "acme", None).unwrap_or_default(),
+            [String::from("c1")],
+            "the entry point normalizes the label"
+        );
+
+        // In the graph, but only from a table: the model is told to use
+        // search_graph rather than reading an empty document search.
+        let tables_only = entity_chunks(&db, "Orgenics", None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            tables_only.contains("only from table rows") && tables_only.contains("search_graph"),
+            "{tables_only}"
+        );
+
+        // Not in the graph at all, with and without a near label.
+        let near = entity_chunks(&db, "Acme Corporation", None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            near.contains("the closest labels are: Acme (organization)"),
+            "{near}"
+        );
+        let nothing = entity_chunks(&db, "Helsinki", None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            nothing.contains("drop the entity argument") && !nothing.contains("closest"),
+            "{nothing}"
+        );
+    }
+
+    #[test]
+    fn row_provenance_becomes_a_predicate_when_the_class_is_mapped() {
+        let mut ontology = Ontology::builtin_default();
+        ontology.mappings.push(crate::ontology::Mapping {
+            table: String::from("orders"),
+            class: String::from("organization"),
+            key: String::from("order id"),
+            properties: BTreeMap::new(),
+            relations: Vec::new(),
+        });
+        assert_eq!(
+            row_reference(Some(&ontology), "orders", Some("A-42")),
+            "\"orders\" WHERE \"order id\" = 'A-42'"
+        );
+        // A quote in the key is escaped, not left to break the statement.
+        assert_eq!(
+            row_reference(Some(&ontology), "orders", Some("O'Hara")),
+            "\"orders\" WHERE \"order id\" = 'O''Hara'"
+        );
+        // Without a mapping the column is unknown: say the row, do not guess.
+        assert_eq!(
+            row_reference(Some(&ontology), "audit", Some("7")),
+            "audit row 7"
+        );
+        assert_eq!(row_reference(None, "orders", Some("7")), "orders row 7");
+        assert_eq!(
+            row_reference(Some(&ontology), "orders", None),
+            "orders (row key unknown)"
+        );
+    }
+
+    #[test]
+    fn describe_class_covers_the_ontology_and_the_graph() {
+        let ontology = Ontology::builtin_default();
+        let census = (3, vec![String::from("Ada"), String::from("Alan")]);
+        let text = describe_class(&ontology, "person", &census);
+        assert!(
+            text.contains("Class person (inherits: person -> entity)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Properties: email (string), title (string)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Relations from it: works_at -> organization"),
+            "{text}"
+        );
+        // Inherited from `entity`, which every class is a subclass of.
+        assert!(text.contains("part_of"), "{text}");
+        assert!(text.contains("Subclasses: none"), "{text}");
+        assert!(
+            text.contains("In the graph: 3 entities, for example Ada, Alan"),
+            "{text}"
+        );
+
+        let empty = describe_class(&ontology, "product", &(0, Vec::new()));
+        assert!(empty.contains("In the graph: no entities"), "{empty}");
+        assert!(empty.contains("Properties: none"), "{empty}");
+        assert!(empty.contains("produced_by -> organization"), "{empty}");
+        // `part_of` ranges over `entity`, so every class is a target of it.
+        assert!(
+            empty.contains("Relations to it: part_of from entity"),
+            "{empty}"
+        );
+    }
+
+    #[test]
+    fn long_id_lists_are_counted_rather_than_pasted() {
+        let ids: Vec<String> = (0..(LISTED_IDS + 5)).map(|i| format!("c{i:03}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let text = listed(&refs);
+        assert!(text.starts_with("c000, c001"), "{text}");
+        assert!(text.ends_with("... and 5 more"), "{text}");
+        assert!(!text.contains("c040"), "{text}");
+        assert_eq!(listed(&["a", "b"]), "a, b");
+    }
+
+    #[test]
+    fn an_oversized_rendering_is_cut_but_keeps_its_totals() {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..400 {
+            lines.push(format!(
+                "Node {i:03} (storm_event) {{event_type: Tornado, state: OKLAHOMA}}"
+            ));
+        }
+        let body = format!("{}\n", lines.join("\n"));
+        let text = format!("{body}200 of 1529 matching nodes, 0 edges, 200 sources — cut off\n");
+        let trimmed = trim_graph_text(&text, MAX_GRAPH_TEXT_CHARS);
+        assert!(
+            trimmed.chars().count() < text.chars().count(),
+            "it should be shorter"
+        );
+        assert!(trimmed.contains("Node 000"), "{trimmed}");
+        assert!(!trimmed.contains("Node 399"), "the tail is cut");
+        // The summary line survives, so the totals are never what gets lost.
+        assert!(trimmed.contains("200 of 1529 matching nodes"), "{trimmed}");
+        assert!(
+            trimmed.contains("more lines not shown") && trimmed.contains("describe_class"),
+            "{trimmed}"
+        );
+        // Comfortably inside a turn's budget once cut.
+        assert!(
+            trimmed.chars().count() < MAX_GRAPH_TEXT_CHARS + 400,
+            "{}",
+            trimmed.chars().count()
+        );
+    }
+
+    #[test]
+    fn an_empty_result_says_which_kind_of_empty_it_is() {
+        let nothing = empty_graph_text(false, &[]).unwrap_or_default();
+        assert!(
+            nothing.contains("the graph has nothing on this"),
+            "{nothing}"
+        );
+
+        let suggested =
+            empty_graph_text(false, &[String::from("Acme (organization)")]).unwrap_or_default();
+        assert!(
+            suggested.contains("Acme (organization)") && suggested.contains("Search again"),
+            "{suggested}"
+        );
+
+        // Provisional matches were found and then stripped: the workspace
+        // has the entity, query mode just will not answer from it.
+        let stripped = empty_graph_text(true, &[]).unwrap_or_default();
+        assert!(
+            stripped.contains("provisional") && stripped.contains("quack graph review"),
+            "{stripped}"
+        );
+        assert!(!stripped.contains("No matching entities"), "{stripped}");
     }
 
     #[test]
@@ -1129,6 +1492,7 @@ mod tests {
                 hit(1, "faq.md", "Claims close in 30 days."),
             ],
             1,
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(
@@ -1145,15 +1509,44 @@ mod tests {
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn search_results_name_the_entities_a_chunk_was_the_source_of() {
+        let entities = BTreeMap::from([(
+            String::from("c0"),
+            vec![
+                String::from("OKLAHOMA (state)"),
+                String::from("EF4 (scale)"),
+            ],
+        )]);
+        let out = format_search_results(
+            &[hit(0, "efscale.html", "Damage indicators.")],
+            1,
+            &entities,
+        )
+        .unwrap();
+        // On the metadata line, not above the passage: a line of its own
+        // gets quoted back as though it were the document's text.
+        assert!(
+            out.contains("graph entities: OKLAHOMA (state), EF4 (scale))"),
+            "{out}"
+        );
+        assert!(out.contains("\nDamage indicators.\n"), "{out}");
+        // A chunk with no entities keeps the plain metadata line.
+        let none =
+            format_search_results(&[hit(0, "efscale.html", "x")], 1, &BTreeMap::new()).unwrap();
+        assert!(!none.contains("graph entities"), "{none}");
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn format_search_results_continues_numbering() {
-        let out = format_search_results(&[hit(0, "a.md", "x")], 5).unwrap();
+        let out = format_search_results(&[hit(0, "a.md", "x")], 5, &BTreeMap::new()).unwrap();
         assert!(out.contains("\n[5] a.md"), "{out}");
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn format_search_results_empty_tells_model_to_say_so() {
-        let out = format_search_results(&[], 4).unwrap();
+        let out = format_search_results(&[], 4, &BTreeMap::new()).unwrap();
         assert!(out.contains("No relevant chunks found"));
     }
 
@@ -1342,7 +1735,6 @@ mod tests {
     /// to it and the step says so (issue #63).
     #[tokio::test]
     async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker() {
-        use crate::storage::workspace::{NewChunk, NewDocument};
         struct Reverse;
         impl Reranker for Reverse {
             fn rank<'a>(
@@ -1357,33 +1749,7 @@ mod tests {
             }
         }
         let db = shared_db();
-        {
-            let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
-            guard
-                .insert_document(
-                    &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
-                )
-                .unwrap_or_else(|e| fail_test(&e.to_string()));
-            for (i, text) in [
-                "Hail fell on Denver.",
-                "Hail and hail again in Denver county.",
-            ]
-            .iter()
-            .enumerate()
-            {
-                guard
-                    .insert_chunk(&NewChunk {
-                        id: &format!("c{i}"),
-                        document_id: "d",
-                        chunk_index: u32::try_from(i).unwrap_or(0),
-                        content: text,
-                        heading: None,
-                        page: None,
-                        embedding: None,
-                    })
-                    .unwrap_or_else(|e| fail_test(&e.to_string()));
-            }
-        }
+        seed_hail_chunks(&db);
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
@@ -1400,6 +1766,7 @@ mod tests {
                     query: String::from("hail"),
                     top_k: None,
                     document_ids: Vec::new(),
+                    entity: None,
                 },
             )
             .await
@@ -1427,6 +1794,7 @@ mod tests {
                     query: String::from("hail"),
                     top_k: None,
                     document_ids: Vec::new(),
+                    entity: None,
                 },
             )
             .await
@@ -1662,6 +2030,124 @@ pub struct SearchGraphArgs {
     pub hops: Option<u32>,
 }
 
+/// What a graph lookup produced: the result, and the labels to offer when
+/// it found nothing.
+struct GraphLookup {
+    result: GraphResult,
+    suggestions: Vec<String>,
+}
+
+/// One `search_graph` call's arguments, trimmed and defaulted, with the
+/// entity's embedding already taken (embedding is async, the lookup is
+/// not).
+struct GraphQuery {
+    entity: Option<String>,
+    class: Option<String>,
+    relation: Option<String>,
+    hops: u32,
+    embedding: Option<Vec<f32>>,
+}
+
+/// A `search_graph` lookup on the database thread: refuse ids the ontology
+/// does not define, traverse from the entity or list the class, and gather
+/// the labels to suggest when nothing matched.
+fn lookup_graph(
+    db: &WorkspaceDb,
+    query: &GraphQuery,
+    options: &graph::GraphOptions,
+) -> crate::error::Result<GraphLookup> {
+    let ontology = ontology_store::current(db)?;
+    let class = query.class.as_deref();
+    let relation = query.relation.as_deref();
+    let embedding = query.embedding.as_deref();
+    if let Some(class) = class {
+        check_class(ontology.as_ref(), class)?;
+    }
+    if let Some(relation) = relation {
+        check_relation(ontology.as_ref(), relation)?;
+    }
+    let result = if let Some(entity) = query.entity.as_deref() {
+        let roots = graph::traverse::resolve_entry(db, entity, class, embedding)?;
+        graph::traverse::neighborhood(db, &roots, query.hops, relation, options)?
+    } else {
+        graph::traverse::by_class(
+            db,
+            ontology.as_ref(),
+            class.unwrap_or_default(),
+            options.max_nodes,
+            options,
+        )?
+    };
+    let suggestions = match query.entity.as_deref() {
+        Some(entity) if result.nodes.is_empty() => {
+            graph::traverse::suggest_entities(db, entity, class, embedding)?
+        }
+        Some(_) | None => Vec::new(),
+    };
+    Ok(GraphLookup {
+        result,
+        suggestions,
+    })
+}
+
+/// Ids past this many are counted rather than listed when an unknown id is
+/// refused: an induced ontology can carry a class per table.
+const LISTED_IDS: usize = 40;
+
+/// `a, b, c ... and N more`, so a refusal names what exists without
+/// pasting a whole ontology into the model's context.
+fn listed(ids: &[&str]) -> String {
+    let mut shown: Vec<String> = ids
+        .iter()
+        .take(LISTED_IDS)
+        .map(|id| (*id).to_owned())
+        .collect();
+    let hidden = ids.len().saturating_sub(shown.len());
+    if hidden > 0 {
+        shown.push(format!("... and {hidden} more"));
+    }
+    shown.join(", ")
+}
+
+/// Refuse a class the ontology does not define, naming the ones it does.
+/// `resolve_document_ids` sets the contract for `search_documents`: an id
+/// that matches nothing is an error the model can correct, never an empty
+/// result it reads as "the workspace has nothing on this".
+fn check_class(ontology: Option<&Ontology>, class_id: &str) -> crate::error::Result<()> {
+    let Some(ontology) = ontology else {
+        return Err(Error::Analysis(String::from(
+            "this workspace has no ontology, so it has no classes to search by",
+        )));
+    };
+    if class_id == ontology::ROOT_CLASS || ontology.class(class_id).is_some() {
+        return Ok(());
+    }
+    let mut ids: Vec<&str> = vec![ontology::ROOT_CLASS];
+    ids.extend(ontology.classes.iter().map(|c| c.id.as_str()));
+    Err(Error::Analysis(format!(
+        "no class '{class_id}' in the ontology; the classes are: {}",
+        listed(&ids)
+    )))
+}
+
+/// Refuse a relation the ontology does not define, naming the ones it does.
+fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> crate::error::Result<()> {
+    let Some(ontology) = ontology else {
+        return Err(Error::Analysis(String::from(
+            "this workspace has no ontology, so it has no relations to follow",
+        )));
+    };
+    if relation_id == ontology::MENTIONS_RELATION || ontology.relation(relation_id).is_some() {
+        return Ok(());
+    }
+    let mut ids: Vec<&str> = vec![ontology::MENTIONS_RELATION];
+    ids.extend(ontology.relations.iter().map(|r| r.id.as_str()));
+    Err(Error::Analysis(format!(
+        "no relation '{relation_id}' in the ontology; the relations are: {}",
+        listed(&ids)
+    )))
+}
+
 /// Embed a label for fuzzy entry-point resolution, when a model exists.
 /// The label's embedding for fuzzy entry: `None` without a model, an
 /// error when the model fails (issue #62: a silent `None` degraded the
@@ -1739,62 +2225,59 @@ where
             Some(e) => label_embedding(self.embedding_model.as_ref(), e).await?,
             None => None,
         };
-        let hops = args.hops.unwrap_or(2).max(1);
-        let relation = args
-            .relation
-            .as_deref()
-            .map(str::trim)
-            .filter(|r| !r.is_empty());
-        let entity = entity.map(str::to_owned);
-        let class = class.map(str::to_owned);
-        let relation = relation.map(str::to_owned);
+        let query = GraphQuery {
+            entity: entity.map(str::to_owned),
+            class: class.map(str::to_owned),
+            relation: args
+                .relation
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(str::to_owned),
+            hops: args.hops.unwrap_or(2).max(1),
+            embedding,
+        };
         let options = self.options;
-        let result = self
+        let lookup = self
             .db
-            .with_db(move |db| {
-                if let Some(e) = entity.as_deref() {
-                    graph::traverse::resolve_entry(db, e, class.as_deref(), embedding.as_deref())
-                        .and_then(|roots| {
-                            graph::traverse::neighborhood(
-                                db,
-                                &roots,
-                                hops,
-                                relation.as_deref(),
-                                &options,
-                            )
-                        })
-                } else {
-                    ontology_store::current(db).and_then(|o| {
-                        graph::traverse::by_class(
-                            db,
-                            o.as_ref(),
-                            class.as_deref().unwrap_or_default(),
-                            options.max_nodes,
-                            &options,
-                        )
-                    })
-                }
-            })
+            .with_db(move |db| lookup_graph(db, &query, &options))
             .await;
-        let result = match result {
-            Ok(result) => result,
+        let lookup = match lookup {
+            Ok(lookup) => lookup,
             Err(e) => {
                 let e = tool_error(e);
                 step.finish(format!("error: {e}"));
                 return Err(e);
             }
         };
+        let had_matches = !lookup.result.nodes.is_empty();
         let result = if self.exclude_provisional {
-            result.without_provisional()
+            lookup.result.without_provisional()
         } else {
-            result
+            lookup.result
         };
-        step.finish(format!(
-            "{} nodes, {} edges",
-            result.nodes.len(),
-            result.edges.len()
-        ));
-        let text = format_graph_result(&result, &self.recorder, &self.db).await?;
+        let stripped = had_matches && result.nodes.is_empty();
+        step.finish(if stripped {
+            String::from("matches are provisional")
+        } else {
+            let of = match result.total_nodes.filter(|_| result.truncated) {
+                Some(total) => format!(" of {total}"),
+                None => String::new(),
+            };
+            format!(
+                "{}{of} nodes, {} edges",
+                result.nodes.len(),
+                result.edges.len()
+            )
+        });
+        let text = format_graph_result(
+            &result,
+            &self.recorder,
+            &self.db,
+            stripped,
+            &lookup.suggestions,
+        )
+        .await?;
         if let Ok(mut results) = self.results.lock() {
             results.push(result);
         }
@@ -1883,25 +2366,23 @@ where
         let result = self
             .db
             .with_db(move |db| {
-                graph::traverse::resolve_entry(db, &from_owned, None, from_embedding.as_deref())
-                    .and_then(|a| {
-                        let b = graph::traverse::resolve_entry(
-                            db,
-                            &to_owned,
-                            None,
-                            to_embedding.as_deref(),
-                        )?;
-                        Ok((a, b))
-                    })
-                    .and_then(|(a, b)| match (a.first(), b.first()) {
-                        (Some(a), Some(b)) => graph::traverse::path(db, a, b, max_hops, &options),
-                        (None, _) => {
-                            Err(Error::Analysis(format!("no entity matches '{from_owned}'")))
-                        }
-                        (_, None) => {
-                            Err(Error::Analysis(format!("no entity matches '{to_owned}'")))
-                        }
-                    })
+                let a = graph::traverse::resolve_entry(
+                    db,
+                    &from_owned,
+                    None,
+                    from_embedding.as_deref(),
+                )?;
+                let b =
+                    graph::traverse::resolve_entry(db, &to_owned, None, to_embedding.as_deref())?;
+                match (a.first(), b.first()) {
+                    (Some(a), Some(b)) => graph::traverse::path(db, a, b, max_hops, &options),
+                    (None, _) => Err(unresolved_entity(
+                        db,
+                        &from_owned,
+                        from_embedding.as_deref(),
+                    )),
+                    (_, None) => Err(unresolved_entity(db, &to_owned, to_embedding.as_deref())),
+                }
             })
             .await;
         let result = match result {
@@ -1912,19 +2393,30 @@ where
                 return Err(e);
             }
         };
+        let had_matches = !result.nodes.is_empty();
         let result = if self.exclude_provisional {
             result.without_provisional()
         } else {
             result
         };
+        let stripped = had_matches && result.nodes.is_empty();
         if result.nodes.is_empty() {
+            if stripped {
+                step.finish("path is provisional");
+                return Ok(format!(
+                    "A path connects {from} and {to}, but it runs through provisional entities: \
+                     they were built from an ontology version nobody has reviewed, and query mode \
+                     does not answer from those. Tell the user the path is unreviewed and that \
+                     `quack graph review` accepts it."
+                ));
+            }
             step.finish("no path");
             return Ok(format!(
                 "No path connects {from} and {to} within {max_hops} hops."
             ));
         }
         step.finish(format!("{} hops", result.edges.len()));
-        let text = format_graph_result(&result, &self.recorder, &self.db).await?;
+        let text = format_graph_result(&result, &self.recorder, &self.db, false, &[]).await?;
         if let Ok(mut results) = self.results.lock() {
             results.push(result);
         }
@@ -1932,29 +2424,116 @@ where
     }
 }
 
+/// The error for a path endpoint that resolved to nothing, carrying the
+/// nearest labels so the model can call again with a real one.
+fn unresolved_entity(db: &WorkspaceDb, entity: &str, embedding: Option<&[f32]>) -> Error {
+    let suggestions =
+        graph::traverse::suggest_entities(db, entity, None, embedding).unwrap_or_default();
+    if suggestions.is_empty() {
+        return Error::Analysis(format!("no entity matches '{entity}'"));
+    }
+    Error::Analysis(format!(
+        "no entity matches '{entity}'; the closest labels in the graph are: {}",
+        suggestions.join(", ")
+    ))
+}
+
+/// What the model is told when a lookup came back empty: that the graph
+/// has nothing, that it has only unreviewed matches, or which labels to
+/// try instead.
+fn empty_graph_text(
+    stripped_provisional: bool,
+    suggestions: &[String],
+) -> Result<String, ToolError> {
+    if stripped_provisional {
+        return Ok(String::from(
+            "The graph has matches, but all of them are provisional: they were built from an \
+             ontology version nobody has reviewed, and query mode does not answer from those. \
+             Tell the user the graph has unreviewed matches and that `quack graph review` \
+             accepts them.",
+        ));
+    }
+    let mut out = String::from("No matching entities in the graph.");
+    if suggestions.is_empty() {
+        out.push_str(" Tell the user the graph has nothing on this.");
+        return Ok(out);
+    }
+    write!(
+        out,
+        " The closest labels in the graph are: {}. Search again with one of them if that is what \
+         the user meant; otherwise tell the user the graph has nothing on this.",
+        suggestions.join(", ")
+    )?;
+    Ok(out)
+}
+
+/// The most characters one graph result may put into a turn. A listing of
+/// `max_nodes` entities, each with its properties, is otherwise large
+/// enough to push a fixed Ollama `num_ctx` over: the front of the prompt
+/// is cut, the tool list goes with it, and the model invents a tool name
+/// (seen live on gpt-oss:20b, the failure #40 describes).
+const MAX_GRAPH_TEXT_CHARS: usize = 6_000;
+
+/// Chunk sources cited from one graph result before the rest are counted.
+const MAX_GRAPH_SOURCES: usize = 10;
+
+/// Table rows named in one graph result before the rest are counted.
+const MAX_GRAPH_ROWS: usize = 20;
+
+/// An oversized rendering cut at a line boundary, keeping the summary line
+/// (which carries the totals) and saying what to do instead.
+fn trim_graph_text(text: &str, budget: usize) -> String {
+    let summary = text.trim_end().lines().next_back().unwrap_or_default();
+    let mut kept = String::new();
+    let mut shown: usize = 0;
+    for line in text.lines() {
+        if kept.chars().count().saturating_add(line.chars().count()) > budget {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        shown = shown.saturating_add(1);
+    }
+    format!(
+        "{kept}... {} more lines not shown: narrow the search with a class, a relation, or fewer \
+         hops, and use describe_class to count a class.\n{summary}\n",
+        text.lines().count().saturating_sub(shown)
+    )
+}
+
 /// Render a graph result for the model: the tree, then the sources each
 /// node and edge came from, registered as citable `[n]` markers (chunks)
-/// or named as table rows.
+/// or named as table rows. Bounded as a whole, not just per node.
 async fn format_graph_result(
     result: &GraphResult,
     recorder: &TurnRecorder,
     db: &ReaderDb,
+    stripped_provisional: bool,
+    suggestions: &[String],
 ) -> Result<String, ToolError> {
     if result.nodes.is_empty() {
-        return Ok(String::from(
-            "No matching entities in the graph. Tell the user the graph has nothing on this.",
-        ));
+        return empty_graph_text(stripped_provisional, suggestions);
     }
-    let mut out = graph::traverse::render_tree(result);
-    let chunk_ids: Vec<String> = result
+    let tree = graph::traverse::render_tree(result);
+    let mut out = if tree.chars().count() > MAX_GRAPH_TEXT_CHARS {
+        trim_graph_text(&tree, MAX_GRAPH_TEXT_CHARS)
+    } else {
+        tree
+    };
+    // Bounded like the tree: a 200-node listing can carry a source per
+    // node, and every one of them would be quoted in full.
+    let all_chunk_ids: std::collections::BTreeSet<String> = result
         .provenance
         .iter()
         .filter_map(|p| p.chunk_id.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
         .collect();
-    let chunks = db
-        .with_db(move |db| db.chunks_by_ids(&chunk_ids))
+    let hidden_chunks = all_chunk_ids.len().saturating_sub(MAX_GRAPH_SOURCES);
+    let chunk_ids: Vec<String> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
+    let (chunks, ontology) = db
+        .with_db(move |db| {
+            let chunks = db.chunks_by_ids(&chunk_ids)?;
+            Ok((chunks, ontology_store::current(db)?))
+        })
         .await
         .map_err(tool_error)?;
     if !chunks.is_empty() {
@@ -1966,22 +2545,248 @@ async fn format_graph_result(
             let excerpt: String = chunk.content.trim().chars().take(200).collect();
             writeln!(out, "[{n}] {}{page}: {excerpt}", chunk.filename)?;
         }
+        if hidden_chunks > 0 {
+            writeln!(out, "... and {hidden_chunks} more sources")?;
+        }
     }
     let rows: std::collections::BTreeSet<String> = result
         .provenance
         .iter()
         .filter_map(|p| {
-            p.table_name
-                .as_deref()
-                .map(|t| format!("{t} row {}", p.row_key.as_deref().unwrap_or("?")))
+            let table = p.table_name.as_deref()?;
+            Some(row_reference(
+                ontology.as_ref(),
+                table,
+                p.row_key.as_deref(),
+            ))
         })
         .collect();
     if !rows.is_empty() {
+        let hidden_rows = rows.len().saturating_sub(MAX_GRAPH_ROWS);
+        let shown: Vec<String> = rows.into_iter().take(MAX_GRAPH_ROWS).collect();
+        let more = if hidden_rows > 0 {
+            format!("; ... and {hidden_rows} more rows")
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "\nFrom table rows: {}",
-            rows.into_iter().collect::<Vec<_>>().join("; ")
+            "\nFrom table rows (run_sql can read them): {}{more}",
+            shown.join("; ")
         )?;
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// describe_class
+// ---------------------------------------------------------------------------
+
+/// Sample entity labels `describe_class` shows for a class.
+const CLASS_SAMPLES: u32 = 10;
+
+pub struct DescribeClassTool {
+    db: ReaderDb,
+    recorder: TurnRecorder,
+}
+
+impl DescribeClassTool {
+    #[must_use]
+    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
+        Self { db, recorder }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DescribeClassArgs {
+    /// The ontology class id to describe
+    pub class_id: String,
+}
+
+impl Tool for DescribeClassTool {
+    const NAME: &'static str = "describe_class";
+    type Error = ToolError;
+    type Args = DescribeClassArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Describe one ontology class: what it inherits from, its subclasses, its typed \
+             properties, the relations it can take part in, the table it is mapped to, and how \
+             many entities of it the knowledge graph holds, with a few example names. Use it to \
+             get exact class and relation ids before calling search_graph, and to count the \
+             entities of a class — a class listing stops at the node limit, this does not.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(DescribeClassArgs))
+            .unwrap_or_else(|_| json!({"type": "object"}))
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let class_id = args.class_id.trim().to_owned();
+        let step = self.recorder.start(Self::NAME, &class_id);
+        let text = self
+            .db
+            .with_db(move |db| {
+                let ontology = ontology_store::current(db)?;
+                check_class(ontology.as_ref(), &class_id)?;
+                let Some(ontology) = ontology else {
+                    return Err(Error::Analysis(String::from(
+                        "this workspace has no ontology",
+                    )));
+                };
+                let classes = class_and_subclasses(&ontology, &class_id);
+                let census = graph::store::class_census(db, &classes, CLASS_SAMPLES)?;
+                Ok(describe_class(&ontology, &class_id, &census))
+            })
+            .await;
+        match text {
+            Ok(text) => {
+                step.finish(format!("{} lines", text.lines().count()));
+                Ok(text)
+            }
+            Err(e) => {
+                let e = tool_error(e);
+                step.finish(format!("error: {e}"));
+                Err(e)
+            }
+        }
+    }
+}
+
+/// A class and every class under it, the set `search_graph(class)` lists
+/// and `class_census` counts.
+fn class_and_subclasses(ontology: &Ontology, class_id: &str) -> Vec<String> {
+    let mut out = vec![class_id.to_owned()];
+    for class in &ontology.classes {
+        if class.id != class_id && ontology.is_subclass_of(&class.id, class_id) {
+            out.push(class.id.clone());
+        }
+    }
+    out
+}
+
+/// One class as the model sees it: the ontology's view of it plus what
+/// the graph actually holds.
+fn describe_class(ontology: &Ontology, class_id: &str, census: &(u64, Vec<String>)) -> String {
+    let mut lines = vec![format!(
+        "Class {class_id} (inherits: {})",
+        ontology.ancestry(class_id).join(" -> ")
+    )];
+    if let Some(class) = ontology.class(class_id) {
+        if let Some(description) = class.description.as_deref() {
+            lines.push(format!("  {description}"));
+        }
+        if let Some(key) = class.key.as_deref() {
+            lines.push(format!("Key property: {key}"));
+        }
+    }
+
+    let subclasses: Vec<&str> = ontology
+        .subclasses(class_id)
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    lines.push(if subclasses.is_empty() {
+        String::from("Subclasses: none")
+    } else {
+        format!(
+            "Subclasses: {} (search_graph on this class covers them too)",
+            listed(&subclasses)
+        )
+    });
+
+    let properties: Vec<String> = ontology
+        .class_properties(class_id)
+        .iter()
+        .map(|id| match ontology.property(id) {
+            Some(property) if property.values.is_empty() => {
+                format!("{id} ({})", property.kind.as_str())
+            }
+            Some(property) => format!("{id} (enum: {})", property.values.join(", ")),
+            None => id.clone(),
+        })
+        .collect();
+    lines.push(if properties.is_empty() {
+        String::from("Properties: none")
+    } else {
+        format!("Properties: {}", properties.join(", "))
+    });
+
+    let (from, to) = ontology.relations_of(class_id);
+    lines.push(relation_line("Relations from it", &from, |relation| {
+        format!("{} -> {}", relation.id, relation.range)
+    }));
+    lines.push(relation_line("Relations to it", &to, |relation| {
+        format!("{} from {}", relation.id, relation.domain)
+    }));
+
+    if let Some(mapping) = ontology.mapping_for(class_id) {
+        lines.push(format!(
+            "Mapped table: {} (key column {}); run_sql can query it directly",
+            mapping.table, mapping.key
+        ));
+    }
+
+    let (total, samples) = census;
+    lines.push(if *total == 0 {
+        String::from("In the graph: no entities of this class")
+    } else if samples.len() < usize::try_from(*total).unwrap_or(usize::MAX) {
+        format!(
+            "In the graph: {total} entities, for example {}",
+            samples.join(", ")
+        )
+    } else {
+        format!(
+            "In the graph: {total} entities \u{2014} {}",
+            samples.join(", ")
+        )
+    });
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// One `Relations ...` line, or `none` when the class takes part in no
+/// relation in that direction.
+fn relation_line(
+    label: &str,
+    relations: &[&crate::ontology::Relation],
+    render: impl Fn(&crate::ontology::Relation) -> String,
+) -> String {
+    if relations.is_empty() {
+        return format!("{label}: none");
+    }
+    let rendered: Vec<String> = relations.iter().map(|r| render(r)).collect();
+    format!("{label}: {}", rendered.join("; "))
+}
+
+/// A row's provenance as something the model can act on: the mapping
+/// knows which column holds the key, so the row reads as a predicate
+/// (`orders WHERE order_id = 'A-42'`) rather than as prose the model has
+/// to guess a column name from. The mapping is what built the node in the
+/// first place (design doc 6.3, table mapping).
+fn row_reference(ontology: Option<&Ontology>, table: &str, row_key: Option<&str>) -> String {
+    let Some(key) = row_key else {
+        return format!("{table} (row key unknown)");
+    };
+    let column = ontology
+        .and_then(|o| o.mappings.iter().find(|m| m.table == table))
+        .map(|m| m.key.as_str());
+    match column {
+        Some(column) => format!(
+            "{} WHERE {} = '{}'",
+            quote_ident(table),
+            quote_ident(column),
+            key.replace('\'', "''")
+        ),
+        None => format!("{table} row {key}"),
+    }
 }

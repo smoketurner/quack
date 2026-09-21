@@ -14,12 +14,14 @@ use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::ModelReranker;
 use super::text_to_sql::{self, PromptOptions};
 use super::tools::{
-    CreateChartTool, DescribeTableTool, FindPathTool, GraphResults, ListDocumentsTool,
-    ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool, SharedDb,
+    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphResults,
+    ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
+    SharedDb,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::store as graph_store;
 use crate::graph::{GraphOptions, GraphResult};
+use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
 /// What the provider charged for a turn. Every budget quack computes
@@ -247,19 +249,29 @@ fn search_tool<M>(
     }
 }
 
-/// The system prompt and whether the graph is enabled, read through the
-/// turn's reader connection.
-async fn system_prompt_and_graph(
+/// The system prompt and what the workspace models, read through the
+/// turn's reader connection: the two decide which tools register.
+struct PromptAndModel {
+    system_prompt: String,
+    /// The graph has nodes, so `search_graph` and `find_path` can answer.
+    graph_enabled: bool,
+    /// An ontology exists, so `describe_class` has something to describe —
+    /// true even before anything has been extracted into the graph.
+    ontology_present: bool,
+}
+
+async fn system_prompt_and_model(
     reader_db: &ReaderDb,
     prompt: &PromptOptions,
-) -> Result<(String, bool)> {
+) -> Result<PromptAndModel> {
     let prompt_for_db = prompt.clone();
     reader_db
         .with_db(move |db| {
-            Ok((
-                text_to_sql::build_system_prompt(db, &prompt_for_db)?,
-                graph_store::status(db)?.enabled(),
-            ))
+            Ok(PromptAndModel {
+                system_prompt: text_to_sql::build_system_prompt(db, &prompt_for_db)?,
+                graph_enabled: graph_store::status(db)?.enabled(),
+                ontology_present: ontology_store::current(db)?.is_some(),
+            })
         })
         .await
 }
@@ -282,7 +294,11 @@ async fn run_inner<M>(
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    let (system_prompt, graph_enabled) = system_prompt_and_graph(&reader_db, &prompt).await?;
+    let PromptAndModel {
+        system_prompt,
+        graph_enabled,
+        ontology_present,
+    } = system_prompt_and_model(&reader_db, &prompt).await?;
     let chart_spec: Arc<Mutex<Option<ChartSpec>>> = Arc::new(Mutex::new(None));
     let graph_results: GraphResults = Arc::new(Mutex::new(Vec::new()));
     let refused = RefusalFlag::default();
@@ -303,6 +319,7 @@ where
             retrieval_config,
             graph_options,
             graph_enabled,
+            ontology_present,
             exclude_provisional,
             write_policy,
             context_window,
@@ -496,6 +513,7 @@ struct BuildContext<'a> {
     retrieval_config: &'a RetrievalConfig,
     graph_options: GraphOptions,
     graph_enabled: bool,
+    ontology_present: bool,
     exclude_provisional: bool,
     write_policy: WritePolicy,
     /// `num_ctx` for Ollama; `None` for other providers.
@@ -555,6 +573,16 @@ where
         .temperature(0.1);
     if let Some(num_ctx) = ctx.context_window {
         builder = builder.additional_params(serde_json::json!({ "num_ctx": num_ctx }));
+    }
+
+    // The ontology is describable as soon as it exists: the prompt block
+    // is capped, so a class the model wants the detail of may not be in it
+    // even when nothing has been extracted into the graph yet.
+    if ctx.ontology_present {
+        builder = builder.tool(DescribeClassTool::new(
+            ctx.reader_db.clone(),
+            ctx.recorder.clone(),
+        ));
     }
 
     if ctx.graph_enabled {

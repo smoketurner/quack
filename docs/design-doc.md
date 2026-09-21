@@ -870,7 +870,9 @@ writes them to stderr. `max_turns` 10, temperature 0.1.
    again), and a Friendly SQL reference pinned to the bundled DuckDB version, which the
    prompt states. The reference carries only what the confined connection (7.4) can
    run: no file reads, extensions, or `SET`, and it says so, since the tables block is
-   all the data there is.
+   all the data there is. The guidance is one numbered procedure per substrate:
+   structured data, document content, and — only when the graph tools are registered —
+   how entities relate.
 3. Tables block: user-facing tables and views with columns, types, row count, three sample
    rows. Bounded so one wide or narrative table cannot push the guidance and the question
    out of a small window: the first 25 tables are described, the first 40 columns listed
@@ -879,8 +881,10 @@ writes them to stderr. `max_turns` 10, temperature 0.1.
 4. Documents block: every document by filename, title, status and mime type, then the
    pinned documents with their full text (6.1).
 5. Ontology block, whenever an ontology exists: classes with parents, relations with domain
-   and range (compact). The node and edge counts, and whether the graph is provisional or
-   stale, follow only when the graph has content.
+   and range (compact), capped at 30 items per section with the rest counted — an induced
+   ontology has a class per table, and `describe_class` has what the cap left out. The node
+   and edge counts, and whether the graph is provisional or stale, follow only when the
+   graph has content.
 6. Global context prefix, then the workspace context.
 7. The permission rules.
 
@@ -900,17 +904,42 @@ turn is recorded; only a model that could not be reached at all is an error.
 
 | Tool | Permission | Description |
 |------|------------|-------------|
-| `search_documents(query, top_k=8, document_ids?)` | none | Hybrid retrieval; returns chunks with citation metadata |
+| `search_documents(query, top_k=8, document_ids?, entity?)` | none | Hybrid retrieval; returns chunks with citation metadata and the entities each was the source of |
 | `list_documents()` | none | Registry with status and pinned flag |
 | `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer |
 | `describe_table(table_name)` / `list_tables()` | none | Schema and inventory |
+| `describe_class(class_id)` | none | One ontology class in full, with how many entities of it the graph holds |
 | `search_graph(entity?, class?, relation?, hops=2)` | none | Neighborhood or class listing with provenance |
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
 
-Graph tools (`search_graph`, `find_path`) register only when the graph has nodes; the
-rest register in every workspace, and the prompt tells the model what the workspace holds.
-An `export` tool (`COPY ... TO` under `files/`) is not built (section 17).
+Graph tools (`search_graph`, `find_path`) register only when the graph has nodes and
+`describe_class` whenever an ontology exists, since the prompt's ontology block is capped
+and a class may not be in it; the rest register in every workspace, and the prompt tells
+the model what the workspace holds. An `export` tool (`COPY ... TO` under `files/`) is not
+built (section 17).
+
+**The substrates cross in the tools, not only in the store.** `search_documents(entity)`
+resolves the name against the graph and restricts retrieval to the chunks that entity was
+extracted from, and every hit names the entities the graph already took from it, so the
+model can follow one into `search_graph`. Graph provenance to a mapped table renders as a
+predicate (`"orders" WHERE "order_id" = 'A-42'`) that `run_sql` can run, since the mapping
+records the key column. An entity in the graph only from table rows says so rather than
+returning nothing.
+
+Both graph tools render each node and edge with the properties the ontology types, bounded
+at eight per subject and sixty characters per value. A lookup that finds nothing says which
+kind of nothing it found, so the model retries instead of reporting an empty workspace: a
+class or relation id the ontology does not define is an error naming the ids that exist
+(the contract `search_documents` already has for `document_ids`), a name that matches no
+entity comes back with the closest labels in the graph, and a result that query mode
+emptied by dropping provisional nodes says the matches exist but are unreviewed.
+
+A result cut short by `max_nodes` says so, and a class listing carries the total it was
+capped from (`GraphResult::total_nodes`, `truncated`), because the reader otherwise takes
+the cap for the population of the class. Counting is the one graph question traversal
+cannot answer — user SQL may not read `_quack_` tables — so `describe_class` reports the
+exact count of a class and its subclasses.
 
 ### 7.4 Permissions and limits
 

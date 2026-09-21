@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::tools::ReaderDb;
+use crate::storage::workspace::ChunkScope;
 
 pub struct DuckDbVectorIndex<M> {
     db: ReaderDb,
@@ -41,7 +42,7 @@ where
 
         let results = self
             .db
-            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &[]))
+            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &ChunkScope::all()))
             .await
             .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?;
 
@@ -76,7 +77,7 @@ where
 
         let results = self
             .db
-            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &[]))
+            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &ChunkScope::all()))
             .await
             .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?;
 
