@@ -428,7 +428,7 @@ impl std::fmt::Display for RerankMode {
 pub struct AnalysisConfig {
     pub max_query_rows: u32,
     pub query_timeout_seconds: u32,
-    /// DuckDB memory for the workspace connection. The knowledge graph's
+    /// `DuckDB` memory for the workspace connection. The knowledge graph's
     /// indexes live inside it as long as the file is open, so it bounds
     /// how large a graph the workspace can hold, not only what one
     /// statement may use.
