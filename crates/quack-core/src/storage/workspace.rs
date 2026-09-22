@@ -1539,6 +1539,30 @@ impl WorkspaceDb {
         f(self)
     }
 
+    /// Run `f` so that `canceller` can interrupt its statements while it
+    /// runs; one cancelled before `f` starts fails without running it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error (an interrupted statement's included), or
+    /// [`Error::Analysis`] when the work was cancelled before it started.
+    pub fn cancellable<R>(
+        &self,
+        canceller: &QueryCanceller,
+        f: impl FnOnce(&Self) -> Result<R>,
+    ) -> Result<R> {
+        {
+            let mut slot = canceller.slot();
+            if slot.cancelled {
+                return Err(Error::Analysis(String::from("cancelled")));
+            }
+            slot.running = Some(self.conn.interrupt_handle());
+        }
+        let result = f(self);
+        canceller.slot().running = None;
+        result
+    }
+
     /// Run `f`'s reads inside `BEGIN TRANSACTION READ ONLY`, scoped to `f`
     /// alone: reader connections use this for every query so no transaction
     /// outlives one piece of work, pinning an old snapshot and blocking
@@ -2114,6 +2138,44 @@ fn fuse_rankings(
     fused
 }
 
+/// Lets another thread stop the statements one piece of work runs, and
+/// only while that work runs: [`WorkspaceDb::cancellable`] registers the
+/// connection's interrupt handle for the length of the work and removes it
+/// before the connection is released, so a late cancel never interrupts
+/// whatever the connection runs next. A cancel before the work starts makes
+/// it fail at once. How the work queue stops a running SQL job.
+#[derive(Clone, Default)]
+pub struct QueryCanceller(std::sync::Arc<std::sync::Mutex<CancelSlot>>);
+
+#[derive(Default)]
+struct CancelSlot {
+    running: Option<std::sync::Arc<duckdb::InterruptHandle>>,
+    cancelled: bool,
+}
+
+impl QueryCanceller {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, CancelSlot> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Interrupt the statement running under this canceller, if any, and
+    /// refuse any work that has not started yet.
+    pub fn cancel(&self) {
+        let mut slot = self.slot();
+        slot.cancelled = true;
+        if let Some(handle) = &slot.running {
+            handle.interrupt();
+        }
+    }
+}
+
 /// Disarms the watchdog when dropped: the closed channel wakes it.
 struct TimeoutGuard {
     _disarm: std::sync::mpsc::Sender<()>,
@@ -2611,6 +2673,45 @@ mod tests {
     /// Two statements that differ only in their literals, spacing, and
     /// case share a shape; a different column, a different statement kind,
     /// and anything `DuckDB` cannot serialize do not.
+    #[test]
+    fn a_canceller_interrupts_only_the_work_it_guards() {
+        let db = WorkspaceDb::open_in_memory(4)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .with_query_timeout(Duration::from_secs(60));
+        // Cancelled before the work starts: it never runs.
+        let early = QueryCanceller::new();
+        early.cancel();
+        assert!(db.cancellable(&early, |_| Ok(())).is_err());
+
+        // Cancelled while a long statement runs: the statement stops.
+        let canceller = QueryCanceller::new();
+        let remote = canceller.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            remote.cancel();
+        });
+        let started = std::time::Instant::now();
+        let outcome = db.cancellable(&canceller, |db| {
+            db.execute_query_capped(
+                "SELECT count(*) FROM range(100000000000) t(i) WHERE i % 7 = 0",
+                10,
+            )
+        });
+        assert!(outcome.is_err(), "the statement was interrupted");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(stopper.join().is_ok());
+
+        // The connection is free again, and a canceller no longer guarding
+        // anything interrupts nothing.
+        let after = QueryCanceller::new();
+        assert!(
+            db.cancellable(&after, |db| db.execute_query_capped("SELECT 1", 10))
+                .is_ok()
+        );
+        after.cancel();
+        assert!(db.execute_query_capped("SELECT 2", 10).is_ok());
+    }
+
     #[test]
     fn statement_shape_ignores_literals_and_source_positions() {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));

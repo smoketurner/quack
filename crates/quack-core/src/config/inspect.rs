@@ -331,6 +331,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "allow_private_hosts",
         ],
     ),
+    ("jobs", &["history"]),
 ];
 
 /// The table of providers, whose sub-tables are named by the operator.
@@ -343,6 +344,7 @@ const PROVIDER_KEYS: &[&str] = &[
     "base_url",
     "api_key_env",
     "embedding_dimension",
+    "max_concurrent_requests",
     "oauth",
 ];
 
@@ -376,6 +378,7 @@ fn collect(config: &Config, file: Option<&Table>, in_force: bool) -> Vec<Setting
     ontology(&mut inventory, config, &defaults);
     graph(&mut inventory, config, &defaults);
     import(&mut inventory, config, &defaults);
+    jobs(&mut inventory, config, &defaults);
     inventory.settings
 }
 
@@ -417,6 +420,11 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 "embedding_dimension",
                 provider.embedding_dimension.map(|d| d.to_string()),
                 None,
+            );
+            s.optional(
+                "max_concurrent_requests",
+                provider.max_concurrent_requests.map(|n| n.to_string()),
+                Some(provider.default_request_limit().to_string()),
             );
         }
         let Some(oauth) = &provider.oauth else {
@@ -578,6 +586,12 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         server.session_idle_minutes,
         default.session_idle_minutes,
     );
+}
+
+fn jobs(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
+    let (jobs, default) = (&config.jobs, &defaults.jobs);
+    let mut s = inventory.section("jobs");
+    s.number("history", jobs.history, default.history);
 }
 
 fn ontology(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
@@ -1171,7 +1185,7 @@ top_k = 3
             .collect();
         assert_eq!(sections.first(), Some(&"general"));
         assert!(sections.contains(&"providers.ollama"));
-        assert_eq!(sections.last(), Some(&"import"));
+        assert_eq!(sections.last(), Some(&"jobs"));
     }
 
     #[test]

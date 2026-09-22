@@ -19,7 +19,7 @@ use quack_core::config::Config;
 /// and every slash command, and a question says how to configure one;
 /// without an embedding model document search is keyword-only, as in print
 /// mode and the web.
-pub(crate) fn run(
+pub(crate) async fn run(
     config: Config,
     workspace_name: String,
     workspace_id: String,
@@ -47,7 +47,7 @@ pub(crate) fn run(
     // it, so it is released by hand either way.
     let mouse =
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
-    let result = tui_app.run(&mut terminal);
+    let result = tui_app.run(&mut terminal).await;
     if mouse {
         drop(crossterm::execute!(
             std::io::stdout(),

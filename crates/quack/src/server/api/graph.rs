@@ -17,8 +17,10 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
+use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::{App, with_db};
 use quack_core::analysis::tools::SharedDb;
+use quack_core::jobs::{JobKind, JobSpec, Lane};
 use quack_core::ontology::Ontology;
 
 #[derive(Deserialize, Default)]
@@ -274,7 +276,7 @@ pub(crate) async fn start_extraction(
             Some(serde_json::json!({ "tables": table_summaries, "cost": cost })),
         )
         .await?;
-    spawn_document_extraction(
+    let job = spawn_document_extraction(
         Arc::clone(app),
         access.clone(),
         run.clone(),
@@ -290,7 +292,7 @@ pub(crate) async fn start_extraction(
         },
     );
     Ok(
-        serde_json::json!({ "tables": table_summaries, "cost": cost, "run": run, "status": "running" }),
+        serde_json::json!({ "tables": table_summaries, "cost": cost, "run": run, "job": job, "status": "running" }),
     )
 }
 
@@ -339,9 +341,22 @@ struct DocumentJob {
 }
 
 /// Run the model over the chunks, resolve, record the version, and audit
-/// the run's end under `run_id`.
-fn spawn_document_extraction(app: App, access: Access, run_id: String, job: DocumentJob) {
-    tokio::spawn(async move {
+/// the run's end under `run_id`, as a job in the workspace's graph lane
+/// with a chunk count for its progress.
+fn spawn_document_extraction(
+    app: App,
+    access: Access,
+    run_id: String,
+    job: DocumentJob,
+) -> quack_core::jobs::JobId {
+    let spec = JobSpec::new(JobKind::Graph, "graph extraction")
+        .workspace(access.workspace.id.clone())
+        .owner(Some(access.identity.user_id.clone()))
+        .lane(Lane::serial(format!("graph:{}", access.workspace.id)));
+    let jobs = app.jobs.clone();
+    let (cancel_app, cancel_access, cancel_run) =
+        (Arc::clone(&app), access.clone(), run_id.clone());
+    let id = jobs.submit(spec, move |ctx| async move {
         let DocumentJob {
             db,
             chunks,
@@ -353,6 +368,7 @@ fn spawn_document_extraction(app: App, access: Access, run_id: String, job: Docu
             slot,
         } = job;
         let progress = |done: quack_core::progress::ChunkDone| {
+            ctx.progress(done.done, done.total);
             tracing::info!(
                 run = %run_id,
                 done = done.done,
@@ -409,11 +425,51 @@ fn spawn_document_extraction(app: App, access: Access, run_id: String, job: Docu
         {
             tracing::error!(error = %e.message, "audit write failed after graph extraction");
         }
-        if let Err(e) = result {
-            tracing::warn!(run = %run_id, error = %e, "graph extraction failed");
-        }
         drop(slot);
+        match result {
+            Ok((summary, _)) => Ok(format!(
+                "{} nodes, {} edges from {} chunks",
+                summary.nodes, summary.edges, summary.chunks
+            )),
+            Err(e) => {
+                tracing::warn!(run = %run_id, error = %e, "graph extraction failed");
+                Err(e)
+            }
+        }
     });
+    when_cancelled_unstarted(&jobs, id, move || async move {
+        audit_cancelled(
+            &cancel_app,
+            &cancel_access,
+            "graph_extract",
+            "graph_run",
+            &cancel_run,
+        )
+        .await;
+    });
+    id
+}
+
+/// The closing audit row of a background run cancelled before it started.
+pub(crate) async fn audit_cancelled(
+    app: &App,
+    access: &Access,
+    action: &str,
+    resource: &str,
+    run_id: &str,
+) {
+    if let Err(e) = access
+        .audit(
+            app,
+            action,
+            Some((resource, run_id)),
+            Outcome::Error,
+            Some(serde_json::json!({ "finished": true, "error": "cancelled before it started" })),
+        )
+        .await
+    {
+        tracing::error!(error = %e.message, "audit write failed after a cancelled run");
+    }
 }
 
 pub(crate) async fn revalidate(

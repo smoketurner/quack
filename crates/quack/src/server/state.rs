@@ -1,5 +1,5 @@
 //! What every handler shares: the config, the control plane, one open
-//! `DuckDB` handle per workspace, the browser sessions, and the upload queue.
+//! `DuckDB` handle per workspace, the browser sessions, and the work queue.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -7,12 +7,12 @@ use std::time::Instant;
 
 use quack_core::analysis::tools::{ReaderDb, SharedDb, open_reader};
 use quack_core::config::Config;
+use quack_core::jobs::JobQueue;
 use quack_core::storage::workspace::WorkspaceDb;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
-use super::queue::UploadQueue;
 use quack_core::storage::control::{ControlPlane, random_bytes};
 
 /// A workspace's writer connection plus its reader, opened together so a
@@ -38,7 +38,10 @@ pub(crate) struct AppState {
     /// Browser and API-login sessions, by token. Cleared on restart, and
     /// individually once either `[server]` lifetime runs out.
     web_sessions: Mutex<HashMap<String, WebSession>>,
-    pub queue: UploadQueue,
+    /// Every background job: uploads, extraction and proposal runs, agent
+    /// turns. Its registry is in memory, so workspace content in a job's
+    /// label never reaches `control.db`.
+    pub jobs: JobQueue,
     /// One MCP transport per workspace, user, and write permission; each
     /// carries its own MCP sessions. See `server::mcp_http`.
     mcp: tokio::sync::Mutex<HashMap<String, (McpTransport, crate::mcp::McpServer)>>,
@@ -89,7 +92,7 @@ pub(crate) type App = Arc<AppState>;
 impl AppState {
     pub(crate) fn new(config: Config, control: ControlPlane, local: bool) -> Self {
         Self {
-            queue: UploadQueue::new(config.server.workers_per_workspace),
+            jobs: JobQueue::from_config(&config.jobs),
             config,
             control,
             local,

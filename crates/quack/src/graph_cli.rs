@@ -9,8 +9,10 @@ use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::graph::{GraphResult, GraphStatus};
 use quack_core::graph::{extract, resolve, store as graph_store, tables, traverse};
+use quack_core::ingestion::DbHandle;
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
+use quack_core::progress::Progress;
 use quack_core::storage::workspace::WorkspaceDb;
 
 #[derive(Subcommand)]
@@ -81,23 +83,20 @@ pub(crate) enum GraphAction {
 
 /// Run one graph action, writing what the user should see to `out`
 /// (stdout for the CLI, the transcript for the terminal session).
+///
+/// The workspace is locked only around each database step, never across a
+/// model call, so the terminal's other work keeps going during an
+/// extraction; `progress` hears about every extracted chunk.
 pub(crate) async fn run(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     action: GraphAction,
     out: &mut impl Write,
+    progress: Progress<'_>,
 ) -> Result<()> {
     match action {
         search @ GraphAction::Search { .. } => run_search(config, db, out, search).await?,
         path @ GraphAction::Path { .. } => run_path(config, db, out, path).await?,
-        GraphAction::Status { json } => {
-            let status = graph_store::status(db)?;
-            if json {
-                writeln!(out, "{}", serde_json::to_string_pretty(&status)?)?;
-            } else {
-                write!(out, "{}", status_text(&status))?;
-            }
-        }
         GraphAction::Extract {
             tables_only,
             documents_only,
@@ -122,8 +121,27 @@ pub(crate) async fn run(
                     reset,
                     yes,
                 },
+                progress,
             )
             .await?;
+        }
+        quick => db.with(|db| Ok(run_quick(db, quick, out)))??,
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// The actions that are one short run of database work.
+fn run_quick(db: &WorkspaceDb, action: GraphAction, out: &mut impl Write) -> Result<()> {
+    match action {
+        GraphAction::Search { .. } | GraphAction::Path { .. } | GraphAction::Extract { .. } => {}
+        GraphAction::Status { json } => {
+            let status = graph_store::status(db)?;
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&status)?)?;
+            } else {
+                write!(out, "{}", status_text(&status))?;
+            }
         }
         GraphAction::Revalidate => {
             let outcome = graph_store::revalidate(db)?;
@@ -163,7 +181,6 @@ pub(crate) async fn run(
             }
         }
     }
-    out.flush()?;
     Ok(())
 }
 
@@ -183,7 +200,7 @@ struct ExtractArgs {
 
 async fn run_search(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     out: &mut impl Write,
     action: GraphAction,
 ) -> Result<()> {
@@ -204,23 +221,24 @@ async fn run_search(
         (None, None) => anyhow::bail!("give an entity, --class CLASS, or both"),
         (Some(entity), class) => {
             let embedding = query_embedding(config, entity).await?;
-            let roots = traverse::resolve_entry(db, entity, class, embedding.as_deref())?;
+            let roots =
+                db.with(|db| traverse::resolve_entry(db, entity, class, embedding.as_deref()))?;
             if roots.is_empty() {
                 anyhow::bail!("no entity matches '{entity}'");
             }
-            traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options)?
+            db.with(|db| traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options))?
         }
-        (None, Some(class)) => {
+        (None, Some(class)) => db.with(|db| {
             let ontology = ontology_store::current(db)?;
-            traverse::by_class(db, ontology.as_ref(), class, options.max_nodes, &options)?
-        }
+            traverse::by_class(db, ontology.as_ref(), class, options.max_nodes, &options)
+        })?,
     };
     print_result(out, &result, json)
 }
 
 async fn run_path(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     out: &mut impl Write,
     action: GraphAction,
 ) -> Result<()> {
@@ -236,15 +254,15 @@ async fn run_path(
     let options = config.graph.options();
     let a = query_embedding(config, &from).await?;
     let b = query_embedding(config, &to).await?;
-    let from_nodes = traverse::resolve_entry(db, &from, None, a.as_deref())?;
-    let to_nodes = traverse::resolve_entry(db, &to, None, b.as_deref())?;
+    let from_nodes = db.with(|db| traverse::resolve_entry(db, &from, None, a.as_deref()))?;
+    let to_nodes = db.with(|db| traverse::resolve_entry(db, &to, None, b.as_deref()))?;
     let (Some(a), Some(b)) = (from_nodes.first(), to_nodes.first()) else {
         anyhow::bail!(
             "no entity matches '{}'",
             if from_nodes.is_empty() { &from } else { &to }
         );
     };
-    let result = traverse::path(db, a, b, max_hops, &options)?;
+    let result = db.with(|db| traverse::path(db, a, b, max_hops, &options))?;
     if result.is_empty() && !json {
         writeln!(out, "No path within {max_hops} hops.")?;
         return Ok(());
@@ -254,15 +272,17 @@ async fn run_path(
 
 async fn run_extract(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     out: &mut impl Write,
     args: ExtractArgs,
+    progress: Progress<'_>,
 ) -> Result<()> {
-    let ontology = ontology_store::current(db)?
+    let ontology = db
+        .with(ontology_store::current)?
         .context("no ontology yet: run `quack ontology init` or `quack ontology propose` first")?;
-    let provisional = ontology_store::current_is_auto_accepted(db)?;
+    let provisional = db.with(ontology_store::current_is_auto_accepted)?;
     if args.reset {
-        graph_store::clear(db)?;
+        db.with(graph_store::clear)?;
         writeln!(out, "Cleared the graph.")?;
     }
     if args.sources != Sources::Documents {
@@ -272,7 +292,7 @@ async fn run_extract(
                 "No mapped tables in the ontology; skipping table extraction."
             )?;
         } else {
-            for summary in tables::extract(db, &ontology, provisional)? {
+            for summary in db.with(|db| tables::extract(db, &ontology, provisional))? {
                 match &summary.skipped {
                     Some(reason) => writeln!(out, "Table {}: skipped, {reason}", summary.table)?,
                     None => writeln!(
@@ -285,7 +305,7 @@ async fn run_extract(
         }
     }
     if args.sources != Sources::Tables {
-        let chunks = extract::chunks(db, args.sample)?;
+        let chunks = db.with(|db| extract::chunks(db, args.sample))?;
         if chunks.is_empty() {
             writeln!(
                 out,
@@ -308,7 +328,7 @@ async fn run_extract(
                     &ontology,
                     provisional,
                     config.analysis.extraction_concurrency,
-                    &crate::ontology_cli::chunk_progress,
+                    progress,
                 )
                 .await?;
                 writeln!(
@@ -341,8 +361,8 @@ async fn run_extract(
             resolved.auto_merged, resolved.proposed
         )?;
     }
-    graph_store::set_built_with(db, ontology.version)?;
-    write!(out, "{}", status_text(&graph_store::status(db)?))?;
+    db.with(|db| graph_store::set_built_with(db, ontology.version))?;
+    write!(out, "{}", status_text(&db.with(graph_store::status)?))?;
     Ok(())
 }
 

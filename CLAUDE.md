@@ -115,6 +115,23 @@ into the system prompt after the schema and documents, capped at `[context].max_
 the agent never writes it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
 pie; 200 points max), not ECharts.
 
+Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::JobQueue`
+runs submitted jobs with optional lanes that keep submission order (a chat session is a
+serial lane, so a follow-up waits for the answer before it; a workspace's uploads, graph
+extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
+broadcast of `JobInfo` snapshots every interface reports from. There is no job pool:
+resources are limited where they are used. Every rig client is built over
+`llm::LimitedHttp`, which holds one permit of the provider's process-wide
+`[providers.NAME].max_concurrent_requests` (1 for Ollama, 8 otherwise) per request until
+its body or stream ends. The registry is in memory only (labels can be workspace content).
+The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
+`AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
+statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
+a strip above the prompt shows active jobs, `/jobs` lists them, `/cancel N` stops one, and
+write prompts from concurrent work queue up. Terminal jobs share the session's one
+`SharedDb`; `graph_cli::run` and `ontology_cli::run` take any `DbHandle` and lock only
+around each database step.
+
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes
 it. `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
@@ -230,9 +247,11 @@ limiter covers the web UI, the API, and MCP, with a tighter one on the two login
 none on `/healthz` (design doc 12). Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
 through `Access::audit`. `query/stream` forwards the agent event stream as SSE (`text`,
-`status`, `tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 and are processed
-by `queue.rs`, one bounded lane per workspace, which locks the workspace only around each
-database step. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
+`status`, `tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 with a `job` id
+and run on the work queue in a lane of `[server].workers_per_workspace` per workspace
+(`queue.rs`), which locks the workspace only around each database step; `api/jobs.rs`
+serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
+and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `access()` checks and the API's helpers; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits) and
 htmx and ECharts are vendored (`docs/web-ui.md`). Tests drive the router with

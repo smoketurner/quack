@@ -26,8 +26,19 @@ use crate::ontology::{Ontology, documents};
 use crate::storage::{context, sessions};
 pub use tokio_util::sync::CancellationToken;
 
-type OpenAiEmbeddingModel =
-    rig::providers::openai::GenericEmbeddingModel<rig::providers::openai::OpenAICompletionsExt>;
+pub mod limit;
+
+pub use limit::LimitedHttp;
+
+/// Every rig client quack builds sends through [`LimitedHttp`], so each
+/// provider's `max_concurrent_requests` bounds the model requests in flight.
+type OllamaClient = rig::providers::ollama::Client<LimitedHttp>;
+type OpenAiClient = rig::providers::openai::CompletionsClient<LimitedHttp>;
+type AnthropicClient = rig::providers::anthropic::Client<LimitedHttp>;
+type OpenAiEmbeddingModel = rig::providers::openai::GenericEmbeddingModel<
+    rig::providers::openai::OpenAICompletionsExt,
+    LimitedHttp,
+>;
 
 /// How long every Ollama request asks the server to keep the model loaded.
 /// Ollama's own default is 5 minutes (`OLLAMA_KEEP_ALIVE`), which a gap
@@ -48,7 +59,7 @@ const OLLAMA_EMBED_MIN_CTX: u32 = 2048;
 /// chat call of one turn instead of lapsing on Ollama's 5-minute default.
 #[derive(Clone)]
 pub struct OllamaEmbedder {
-    client: rig::providers::ollama::Client,
+    client: OllamaClient,
     model: String,
     ndims: usize,
     num_ctx: u32,
@@ -87,7 +98,7 @@ struct OllamaEmbedResponse {
 
 impl EmbeddingModel for OllamaEmbedder {
     const MAX_DOCUMENTS: usize = 1024;
-    type Client = rig::providers::ollama::Client;
+    type Client = OllamaClient;
 
     fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
         Self {
@@ -152,6 +163,8 @@ pub enum EmbedModel {
         base_url: Option<String>,
         model: String,
         ndims: usize,
+        /// The provider's limited client, reused by every rebuild.
+        http: LimitedHttp,
     },
 }
 
@@ -161,20 +174,26 @@ impl EmbedModel {
         base_url: Option<&str>,
         model: &str,
         ndims: usize,
+        http: &LimitedHttp,
     ) -> std::result::Result<OpenAiEmbeddingModel, EmbeddingError> {
         let token = manager
             .access_token()
             .await
             .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
-        let client = openai_client_with_key(manager.provider(), base_url, token.expose_secret())
-            .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
+        let client = openai_client_with_key(
+            manager.provider(),
+            base_url,
+            token.expose_secret(),
+            http.clone(),
+        )
+        .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
         Ok(client.embedding_model_with_ndims(model, ndims))
     }
 }
 
 impl EmbeddingModel for EmbedModel {
     const MAX_DOCUMENTS: usize = 1024;
-    type Client = rig::providers::ollama::Client;
+    type Client = OllamaClient;
 
     fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
         Self::Ollama(OllamaEmbedder::make(client, model, dims))
@@ -200,8 +219,9 @@ impl EmbeddingModel for EmbedModel {
                 base_url,
                 model,
                 ndims,
+                http,
             } => {
-                Self::oauth_model(manager, base_url.as_deref(), model, *ndims)
+                Self::oauth_model(manager, base_url.as_deref(), model, *ndims, http)
                     .await?
                     .embed_texts(texts)
                     .await
@@ -523,7 +543,7 @@ impl OllamaRunningModels {
 /// model measured live and shows the user nothing meanwhile, so the turn
 /// says so first. Any failure to ask counts as loaded: the chat call that
 /// follows reports the real error.
-async fn ollama_model_resident(client: &rig::providers::ollama::Client, model: &str) -> bool {
+async fn ollama_model_resident(client: &OllamaClient, model: &str) -> bool {
     use rig::http_client::HttpClientExt;
 
     let listed = async {
@@ -547,13 +567,15 @@ async fn build_ollama_client(
     config: &Config,
     name: &str,
     provider: &ProviderConfig,
-) -> Result<rig::providers::ollama::Client> {
+) -> Result<OllamaClient> {
     let key = credential(config, name, provider)
         .await?
         .map(rig::providers::ollama::OllamaApiKey::from)
         .unwrap_or_default();
 
-    let mut builder = rig::providers::ollama::Client::builder().api_key(key);
+    let mut builder = rig::providers::ollama::Client::builder()
+        .api_key(key)
+        .http_client(LimitedHttp::for_provider(name, provider));
 
     if let Some(base_url) = &provider.base_url {
         let url = base_url.trim_end_matches("/v1");
@@ -569,21 +591,29 @@ async fn build_openai_client(
     config: &Config,
     name: &str,
     provider: &ProviderConfig,
-) -> Result<rig::providers::openai::CompletionsClient> {
+) -> Result<OpenAiClient> {
     let key = credential(config, name, provider).await?.ok_or_else(|| {
         Error::Config(format!(
             "provider '{name}' (openai) requires auth = \"api-key\" or \"oauth\""
         ))
     })?;
-    openai_client_with_key(name, provider.base_url.as_deref(), &key)
+    openai_client_with_key(
+        name,
+        provider.base_url.as_deref(),
+        &key,
+        LimitedHttp::for_provider(name, provider),
+    )
 }
 
 fn openai_client_with_key(
     name: &str,
     base_url: Option<&str>,
     key: &str,
-) -> Result<rig::providers::openai::CompletionsClient> {
-    let mut builder = rig::providers::openai::CompletionsClient::builder().api_key(key);
+    http: LimitedHttp,
+) -> Result<OpenAiClient> {
+    let mut builder = rig::providers::openai::CompletionsClient::builder()
+        .api_key(key)
+        .http_client(http);
 
     if let Some(base_url) = base_url {
         builder = builder.base_url(base_url);
@@ -598,14 +628,16 @@ async fn build_anthropic_client(
     config: &Config,
     name: &str,
     provider: &ProviderConfig,
-) -> Result<rig::providers::anthropic::Client> {
+) -> Result<AnthropicClient> {
     let key = credential(config, name, provider).await?.ok_or_else(|| {
         Error::Config(format!(
             "provider '{name}' (anthropic) requires auth = \"api-key\" or \"oauth\""
         ))
     })?;
 
-    let mut builder = rig::providers::anthropic::Client::builder().api_key(&key);
+    let mut builder = rig::providers::anthropic::Client::builder()
+        .api_key(&key)
+        .http_client(LimitedHttp::for_provider(name, provider));
 
     if let Some(base_url) = &provider.base_url {
         builder = builder.base_url(base_url);
@@ -649,6 +681,7 @@ async fn build_embed_model(config: &Config, model: ModelRef<'_>) -> Result<Embed
                 base_url: model.provider.base_url.clone(),
                 model: model.model.to_owned(),
                 ndims,
+                http: LimitedHttp::for_provider(model.provider_name, model.provider),
             })
         }
         ProviderType::Openai => {

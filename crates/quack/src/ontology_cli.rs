@@ -7,9 +7,11 @@ use std::io::{Read, Write};
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::ingestion::DbHandle;
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{Candidate, Decision, propose_from_tables};
 use quack_core::ontology::{candidates, documents, store};
+use quack_core::progress::Progress;
 use quack_core::storage::workspace::WorkspaceDb;
 
 #[derive(Subcommand)]
@@ -84,20 +86,24 @@ pub(crate) enum OntologyAction {
 
 /// Run one ontology action, writing what the user should see to `out`
 /// (stdout for the CLI, the transcript for the terminal session).
+///
+/// The workspace is locked only around each database step, never across a
+/// model call; `progress` hears about every chunk of a document pass.
 pub(crate) async fn run(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     action: OntologyAction,
     out: &mut impl Write,
+    progress: Progress<'_>,
 ) -> Result<()> {
     match action {
         propose_action @ OntologyAction::Propose { .. } => {
-            run_propose(config, db, propose_action, out).await?;
+            run_propose(config, db, propose_action, out, progress).await?;
         }
         review @ (OntologyAction::Review { .. }
         | OntologyAction::Accept { .. }
-        | OntologyAction::Reject { .. }) => run_review(db, review, out)?,
-        manage => run_manage(db, manage, out)?,
+        | OntologyAction::Reject { .. }) => db.with(|db| Ok(run_review(db, review, out)))??,
+        manage => db.with(|db| Ok(run_manage(db, manage, out)))??,
     }
     out.flush()?;
     Ok(())
@@ -200,9 +206,10 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
 /// `propose`, with optional seeding from a file.
 async fn run_propose(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     action: OntologyAction,
     out: &mut impl Write,
+    progress: Progress<'_>,
 ) -> Result<()> {
     let OntologyAction::Propose {
         extend,
@@ -215,7 +222,7 @@ async fn run_propose(
     else {
         return Ok(());
     };
-    let seeded = seed(db, from.as_deref(), out)?;
+    let seeded = db.with(|db| Ok(seed(db, from.as_deref(), out)))??;
     let pass = documents.then_some(DocumentPass {
         sample,
         assume_yes: yes,
@@ -229,6 +236,7 @@ async fn run_propose(
             documents: pass,
         },
         out,
+        progress,
     )
     .await
 }
@@ -347,23 +355,26 @@ fn seed(db: &WorkspaceDb, from: Option<&str>, out: &mut impl Write) -> Result<bo
 /// asked, into the queue, or straight into a version with `--auto-accept`.
 async fn propose(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     args: ProposeArgs,
     out: &mut impl Write,
+    progress: Progress<'_>,
 ) -> Result<()> {
-    let current = store::current(db)?;
+    let current = db.with(store::current)?;
     let base = if args.extend { current.as_ref() } else { None };
-    let mut proposals = propose_from_tables(
-        db,
-        base.or(current.as_ref()),
-        &config.ontology.table_evidence(),
-    )?;
+    let mut proposals = db.with(|db| {
+        propose_from_tables(
+            db,
+            base.or(current.as_ref()),
+            &config.ontology.table_evidence(),
+        )
+    })?;
     if let Some(pass) = &args.documents {
         let mut options = config.ontology.document_evidence();
         if let Some(n) = pass.sample {
             options.sample_chunks = n;
         }
-        let cost = documents::estimate(db, &options)?;
+        let cost = db.with(|db| documents::estimate(db, &options))?;
         writeln!(
             out,
             "Document evidence: {} chunks sampled across {} documents, {} model calls to {}.",
@@ -380,15 +391,18 @@ async fn propose(
         } else if !pass.assume_yes && !confirm(out)? {
             writeln!(out, "Skipped the document pass.")?;
         } else {
-            let from_documents = run_documents(config, db, current.as_ref(), &options, out).await?;
+            let from_documents =
+                run_documents(config, db, current.as_ref(), &options, out, progress).await?;
             proposals.extend(from_documents);
         }
     }
     if proposals.is_empty() {
         writeln!(out, "Nothing to propose: the tables are already covered.")?;
     } else if args.auto_accept {
-        candidates::store_run(db, &proposals)?;
-        let stored = candidates::accept_all(db, None)?;
+        let stored = db.with(|db| {
+            candidates::store_run(db, &proposals)?;
+            candidates::accept_all(db, None)
+        })?;
         writeln!(
             out,
             "accepted {} proposals; ontology is now version {}",
@@ -396,7 +410,7 @@ async fn propose(
             stored.version
         )?;
     } else {
-        candidates::store_run(db, &proposals)?;
+        db.with(|db| candidates::store_run(db, &proposals))?;
         let by_kind = |kind: &str| {
             proposals
                 .iter()
@@ -438,12 +452,13 @@ pub(crate) fn chunk_progress(done: quack_core::progress::ChunkDone) {
 /// Sample, extract with the chat model, and propose.
 async fn run_documents(
     config: &Config,
-    db: &WorkspaceDb,
+    db: &impl DbHandle,
     current: Option<&Ontology>,
     options: &documents::DocumentEvidenceOptions,
     out: &mut impl Write,
+    progress: Progress<'_>,
 ) -> Result<Vec<Candidate>> {
-    let sample = documents::sample_chunks(db, options.sample_chunks)?;
+    let sample = db.with(|db| documents::sample_chunks(db, options.sample_chunks))?;
     let extractor = quack_core::llm::chat_extractor(config).await?;
     let embeddings = quack_core::llm::optional_embedding_model(config).await?;
     let (candidates, summary) = documents::run(
@@ -453,7 +468,7 @@ async fn run_documents(
         options,
         embeddings.as_ref(),
         config.analysis.extraction_concurrency,
-        &chunk_progress,
+        progress,
     )
     .await?;
     writeln!(

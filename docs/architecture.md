@@ -37,7 +37,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 
 | Module | Owns | Design doc |
 |---|---|---|
-| `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[import]`), unknown keys rejected, `QUACK_*` overrides | 13 |
+| `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[import]`, `[jobs]`), unknown keys rejected, `QUACK_*` overrides | 13 |
 | `config::inspect` | the same file read outside `Config::load`: every recognized setting with the value in force and its origin, the file's unrecognized keys, the environment variables read (`quack config`) | 13 |
 | `crypto` | installs the aws-lc-rs provider once | 14 |
 | `doctor` | `quack doctor`'s checks over a `config::inspect` result: config file, crypto module, data directory mode, `control.db`, the workspace, each model's credential and a model-list probe of its provider, the server bind; creates nothing | 11.5 |
@@ -53,7 +53,8 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `graph` | the knowledge graph: `store`, `tables` (mapping extraction), `extract` (constrained model extraction with drift), `resolve` (merges), `traverse` | 6.4 |
 | `okf` | Open Knowledge Format bundles in and out | 17 |
 | `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
-| `llm` | rig provider construction, `run_turn`, extractors and the reranker over the chat model, OAuth token management (`oauth`) | 10 |
+| `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots | 4.1 |
+| `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `run_turn`, extractors and the reranker over the chat model, OAuth token management (`oauth`) | 4.1, 10 |
 
 ## `quack`
 
@@ -61,10 +62,10 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 |---|---|
 | `main` | the clap command tree, print mode entry, the workspace-local subcommands (`ingest`, `docs`, `sessions`, `export`, `context`, `import`, `okf`, `auth`) |
 | `print` | `-p`: one turn, answer to stdout, steps to stderr, text or JSON |
-| `terminal` | the interactive session (ratatui): streaming, inline steps, the permission prompt, slash commands, charts |
+| `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts |
 | `ontology_cli`, `graph_cli`, `admin` | `quack ontology`, `quack graph`, and the server administration commands |
 | `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
-| `server` | `quack serve`: `auth` (identity and `access()`), `api` (REST handlers), `web` (askama pages over the same helpers, [web-ui.md](web-ui.md)), `queue` (uploads), `state`, `mcp_http` |
+| `server` | `quack serve`: `auth` (identity and `access()`), `api` (REST handlers), `web` (askama pages over the same helpers, [web-ui.md](web-ui.md)), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
 
 ## The storage boundary
 

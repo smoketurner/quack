@@ -35,6 +35,7 @@ pub struct Config {
     pub ontology: OntologyConfig,
     pub graph: GraphConfig,
     pub import: ImportConfig,
+    pub jobs: JobsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,8 +146,32 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     /// Width of the vectors this provider's embedding models produce.
     pub embedding_dimension: Option<u32>,
+    /// Model requests in flight to this provider at once, across the whole
+    /// process; the rest wait their turn (design doc 4.1). Unset: 1 for
+    /// Ollama, which serves one request per model unless
+    /// `OLLAMA_NUM_PARALLEL` says otherwise, 8 for hosted APIs.
+    pub max_concurrent_requests: Option<u32>,
     /// Required when `auth = "oauth"`, forbidden otherwise.
     pub oauth: Option<OAuthConfig>,
+}
+
+impl ProviderConfig {
+    /// The request limit when `max_concurrent_requests` is unset.
+    #[must_use]
+    pub const fn default_request_limit(&self) -> u32 {
+        match self.provider_type {
+            ProviderType::Ollama => 1,
+            ProviderType::Openai | ProviderType::Anthropic => 8,
+        }
+    }
+
+    /// Model requests this provider may have in flight at once (at least 1).
+    #[must_use]
+    pub fn request_limit(&self) -> u32 {
+        self.max_concurrent_requests
+            .unwrap_or_else(|| self.default_request_limit())
+            .max(1)
+    }
 }
 
 /// A resolved `PROVIDER/MODEL` reference.
@@ -311,6 +336,24 @@ impl GraphConfig {
             merge_threshold: self.merge_threshold,
             auto_merge_threshold: self.auto_merge_threshold,
         }
+    }
+}
+
+/// The work queue every interface submits background work to (design doc
+/// 4.1): agent turns, SQL, ingests, imports, ontology and graph runs. Jobs
+/// are not counted against a pool; what they wait on is the resource they
+/// use (a provider's `max_concurrent_requests`, the workspace writer) and
+/// their lane.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JobsConfig {
+    /// Finished jobs kept for the job list, newest first.
+    pub history: u32,
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self { history: 100 }
     }
 }
 

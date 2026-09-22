@@ -128,6 +128,7 @@ fn eval_config(data_dir: &Path) -> Config {
             base_url: None,
             api_key_env: None,
             embedding_dimension: Some(HASH_DIM_U32),
+            max_concurrent_requests: None,
             oauth: None,
         },
     );
@@ -147,6 +148,7 @@ fn eval_config(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
+        jobs: quack_core::config::JobsConfig::default(),
     }
 }
 

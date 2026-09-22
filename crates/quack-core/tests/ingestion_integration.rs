@@ -121,6 +121,7 @@ fn test_config(data_dir: &Path) -> Config {
             base_url: Some("http://localhost:9999".into()),
             api_key_env: None,
             embedding_dimension: Some(TEST_DIM_U32),
+            max_concurrent_requests: None,
             oauth: None,
         },
     );
@@ -147,6 +148,7 @@ fn test_config(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
+        jobs: quack_core::config::JobsConfig::default(),
     }
 }
 
@@ -167,6 +169,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
+        jobs: quack_core::config::JobsConfig::default(),
     }
 }
 

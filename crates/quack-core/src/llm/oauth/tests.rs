@@ -496,6 +496,7 @@ fn shared_manager_is_one_per_provider_and_needs_the_oauth_section() {
         base_url: None,
         api_key_env: None,
         embedding_dimension: None,
+        max_concurrent_requests: None,
         oauth: Some(oauth_config("http://127.0.0.1:9", false)),
     };
     let a = shared_manager(dir.path(), "shared", &provider);

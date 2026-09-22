@@ -1,18 +1,20 @@
-//! The upload queue: uploads return 202 with the document id and are
-//! parsed, stored, and embedded by a bounded set of workers per workspace.
-//! Clients poll the document until its status is `ready` or `error`.
+//! Background work in `quack serve` goes through the process's one
+//! [`JobQueue`](quack_core::jobs::JobQueue) (design doc 4.1): uploads,
+//! graph extraction, the ontology document pass, and agent turns. Uploads
+//! return 202 with the document id and the job id; each workspace's uploads
+//! share a lane of `[server].workers_per_workspace`. Clients poll the
+//! document, or the job (`GET .../jobs/{job}`), or follow the job stream.
 
-use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion;
+use quack_core::jobs::{JobId, JobKind, JobQueue, JobResult, JobSpec, JobState, Lane};
 use quack_core::llm;
-use tokio::sync::{Mutex, mpsc};
 
-/// Queued uploads per workspace before `POST` blocks.
-const QUEUE_DEPTH: usize = 64;
+use super::state::App;
 
 pub(crate) struct UploadJob {
     pub document_id: String,
@@ -20,108 +22,81 @@ pub(crate) struct UploadJob {
     pub data: Vec<u8>,
 }
 
-struct Lane {
-    sender: mpsc::Sender<UploadJob>,
-}
-
-pub(crate) struct UploadQueue {
-    workers: u32,
-    lanes: Mutex<HashMap<String, Lane>>,
-}
-
-impl UploadQueue {
-    pub(crate) fn new(workers_per_workspace: u32) -> Self {
-        Self {
-            workers: workers_per_workspace.max(1),
-            lanes: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Queue a job for the workspace, starting its workers on first use.
-    /// Waits when the lane is full.
-    pub(crate) async fn submit(
-        &self,
-        config: &Config,
-        workspace_id: &str,
-        db: SharedDb,
-        job: UploadJob,
-    ) -> Result<(), String> {
-        let sender = {
-            let mut lanes = self.lanes.lock().await;
-            if let Some(lane) = lanes.get(workspace_id) {
-                lane.sender.clone()
-            } else {
-                let (sender, receiver) = mpsc::channel(QUEUE_DEPTH);
-                let receiver = Arc::new(Mutex::new(receiver));
-                for _ in 0..self.workers {
-                    tokio::spawn(worker(
-                        config.clone(),
-                        workspace_id.to_owned(),
-                        Arc::clone(&db),
-                        Arc::clone(&receiver),
-                    ));
-                }
-                lanes.insert(
-                    workspace_id.to_owned(),
-                    Lane {
-                        sender: sender.clone(),
-                    },
-                );
-                sender
-            }
-        };
-        sender
-            .send(job)
-            .await
-            .map_err(|_| String::from("upload workers are gone"))
-    }
-}
-
-async fn worker(
-    config: Config,
-    workspace_id: String,
+/// Queue an upload for processing and return its job id. The document is
+/// already registered as `queued`; whatever happens to the job, it ends
+/// `ready` or `error`, never stuck.
+pub(crate) fn submit_upload(
+    app: &App,
+    workspace_id: &str,
+    owner: Option<String>,
     db: SharedDb,
-    receiver: Arc<Mutex<mpsc::Receiver<UploadJob>>>,
-) {
-    loop {
-        let job = receiver.lock().await.recv().await;
-        let Some(job) = job else {
-            return;
-        };
-        let config = config.clone();
-        let workspace_id = workspace_id.clone();
-        let db = Arc::clone(&db);
+    job: UploadJob,
+) -> JobId {
+    let spec = JobSpec::new(JobKind::Ingest, job.filename.clone())
+        .workspace(workspace_id)
+        .owner(owner)
+        .lane(Lane::new(
+            format!("ingest:{workspace_id}"),
+            app.config.server.workers_per_workspace,
+        ));
+    let config = app.config.clone();
+    let workspace = workspace_id.to_owned();
+    let document_id = job.document_id.clone();
+    let worker_db = Arc::clone(&db);
+    let id = app.jobs.submit(spec, move |_| async move {
         let handle = tokio::runtime::Handle::current();
+        let document_id = job.document_id.clone();
         // Parsing and DuckDB writes are blocking work; the embedding calls
         // inside need the runtime, so block on it from a blocking thread.
-        let document_id = job.document_id.clone();
         let outcome = tokio::task::spawn_blocking({
-            let db = Arc::clone(&db);
-            move || {
-                handle.block_on(process(&config, &workspace_id, &db, job));
-            }
+            let db = Arc::clone(&worker_db);
+            move || handle.block_on(process(&config, &workspace, &db, job))
         })
         .await;
-        if let Err(e) = outcome {
-            // The task died before `process` could record an outcome; the
-            // document must not stay `processing` forever.
-            tracing::error!(error = %e, document = %document_id, "upload worker task failed");
-            mark_error(
-                &db,
-                &document_id,
-                "the ingestion worker failed before finishing this file",
-            );
+        match outcome {
+            Ok(result) => result,
+            Err(e) => {
+                // The task died before `process` could record an outcome;
+                // the document must not stay `processing` forever.
+                tracing::error!(error = %e, document = %document_id, "upload worker task failed");
+                let message = "the ingestion worker failed before finishing this file";
+                mark_error(&worker_db, &document_id, message);
+                Err(String::from(message))
+            }
         }
-    }
+    });
+    when_cancelled_unstarted(&app.jobs, id, move || async move {
+        mark_error(&db, &document_id, "cancelled before processing started");
+    });
+    id
 }
 
-async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: UploadJob) {
+/// Run `record` if job `id` is cancelled while still queued: its work
+/// never ran, so whatever that work would have recorded at its end (a
+/// document's error, a run's closing audit row) is recorded here.
+pub(crate) fn when_cancelled_unstarted<F, Fut>(jobs: &JobQueue, id: JobId, record: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let jobs = jobs.clone();
+    tokio::spawn(async move {
+        if let Some(job) = jobs.wait(id).await
+            && job.state == JobState::Cancelled
+            && job.started_at.is_none()
+        {
+            record().await;
+        }
+    });
+}
+
+async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: UploadJob) -> JobResult {
     let model = match llm::optional_embedding_model(config).await {
         Ok(model) => model,
         Err(e) => {
             tracing::warn!(error = %e, document = %job.document_id, "upload fails: no embedding model");
             mark_error(db, &job.document_id, &e.to_string());
-            return;
+            return Err(e.to_string());
         }
     };
     let result = ingestion::process_document(
@@ -137,9 +112,14 @@ async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: Upload
     match result {
         Ok(r) => {
             tracing::info!(document = %r.document_id, file = %r.filename, chunks = r.chunks_stored, "upload processed");
+            Ok(match r.tables.as_slice() {
+                [] => format!("{} chunks", r.chunks_stored),
+                tables => format!("tables {}", tables.join(", ")),
+            })
         }
         Err(e) => {
             tracing::warn!(document = %job.document_id, error = %e, "upload failed");
+            Err(e.to_string())
         }
     }
 }
