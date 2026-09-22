@@ -83,6 +83,10 @@ impl PermissionRequest {
 /// What happens during a turn, in order.
 #[derive(Debug)]
 pub enum AgentEvent {
+    /// What the turn is waiting on before any output can appear (a model
+    /// Ollama has to load first), in one line. Informational: an
+    /// interface that shows nothing but the answer may drop it.
+    Status(String),
     /// A piece of the assistant's answer, as it streams.
     TextDelta(String),
     ToolStarted {
@@ -125,7 +129,13 @@ pub struct TurnRecorder {
     /// a prior call already resolved), and this keeps a turn from paying
     /// for the same embedding call twice.
     embedding_cache: Arc<Mutex<HashMap<String, Vec<f32>>>>,
+    /// `[analysis].max_turns`, so a tool result can tell the model how
+    /// much of the turn is left; `None` when the limit is not known.
+    turn_limit: Option<usize>,
 }
+
+/// From this many calls left, a tool result tells the model to answer.
+const TURNS_LOW_WATER: usize = 3;
 
 impl TurnRecorder {
     #[must_use]
@@ -136,6 +146,36 @@ impl TurnRecorder {
             citations: CitationRegistry::default(),
             writes_granted: Arc::new(AtomicBool::new(false)),
             embedding_cache: Arc::new(Mutex::new(HashMap::new())),
+            turn_limit: None,
+        }
+    }
+
+    /// Record the turn's tool-call limit so results can report it.
+    #[must_use]
+    pub fn with_turn_limit(mut self, max_turns: usize) -> Self {
+        self.turn_limit = Some(max_turns);
+        self
+    }
+
+    /// One line for the end of a tool result: which call this was out of
+    /// the turn's limit, and, once `TURNS_LOW_WATER` or fewer remain, that
+    /// it is time to answer. Counts the calls recorded so far, which is
+    /// never fewer than the model round-trips rig counts, so the number
+    /// is conservative. Empty without a limit.
+    #[must_use]
+    pub fn budget_note(&self) -> String {
+        let Some(limit) = self.turn_limit else {
+            return String::new();
+        };
+        let used = self.steps.lock().map_or(0, |s| s.len());
+        let remaining = limit.saturating_sub(used);
+        if remaining <= TURNS_LOW_WATER {
+            format!(
+                "(tool call {used} of at most {limit} this turn; {remaining} left, so answer \
+                 from what you have)"
+            )
+        } else {
+            format!("(tool call {used} of at most {limit} this turn)")
         }
     }
 
@@ -234,6 +274,31 @@ impl StepInProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_note_counts_calls_and_warns_near_the_limit() {
+        let (sink, _rx) = channel();
+        let recorder = TurnRecorder::new(sink);
+        assert_eq!(recorder.budget_note(), "");
+        let recorder = recorder.with_turn_limit(5);
+        recorder.start("run_sql", "SELECT 1").finish("1 rows");
+        assert_eq!(
+            recorder.budget_note(),
+            "(tool call 1 of at most 5 this turn)"
+        );
+        recorder.start("run_sql", "SELECT 2").finish("1 rows");
+        assert_eq!(
+            recorder.budget_note(),
+            "(tool call 2 of at most 5 this turn; 3 left, so answer from what you have)"
+        );
+        for _ in 0..4 {
+            recorder.start("run_sql", "SELECT 3").finish("1 rows");
+        }
+        assert_eq!(
+            recorder.budget_note(),
+            "(tool call 6 of at most 5 this turn; 0 left, so answer from what you have)"
+        );
+    }
 
     #[tokio::test]
     async fn steps_are_emitted_and_recorded_in_order() {

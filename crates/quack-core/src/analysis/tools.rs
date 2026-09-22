@@ -366,6 +366,10 @@ pub struct RunSqlTool {
     policy: WritePolicy,
     refused: RefusalFlag,
     recorder: TurnRecorder,
+    /// Each statement run this turn with its parse tree blanked of
+    /// literals (`WorkspaceDb::statement_shape`), to spot the model
+    /// re-running one statement once per value.
+    shapes: Mutex<Vec<(String, String)>>,
 }
 
 impl RunSqlTool {
@@ -384,8 +388,40 @@ impl RunSqlTool {
             policy,
             refused,
             recorder,
+            shapes: Mutex::new(Vec::new()),
         }
     }
+
+    /// An earlier statement this turn that `sql` repeats with only its
+    /// literals changed: the one-query-per-group loop that burns the turn
+    /// (a 20B model asked for deaths by state and weather ran the same
+    /// GROUP BY once per state until it hit `max_turns`). Records `sql`
+    /// for the calls after it.
+    fn repeated_shape(&self, sql: &str, shape: Option<String>) -> Option<String> {
+        let shape = shape?;
+        let mut shapes = self.shapes.lock().ok()?;
+        let earlier = shapes
+            .iter()
+            .find(|(earlier, earlier_shape)| {
+                *earlier_shape == shape && earlier.trim() != sql.trim()
+            })
+            .map(|(earlier, _)| earlier.clone());
+        shapes.push((sql.to_owned(), shape));
+        earlier
+    }
+}
+
+/// The note under a result whose statement repeats `earlier` with other
+/// literals.
+fn per_group_note(earlier: &str) -> String {
+    let (preview, _) = super::events::preview_detail(earlier);
+    format!(
+        "Note: this statement repeats an earlier one with different literal values ({}). \
+         Do not run it once per value: one statement covers every group at once with \
+         GROUP BY (arg_max(label, measure) picks each group's top label), WHERE col IN (...), \
+         or QUALIFY row_number() OVER (PARTITION BY group_col ORDER BY measure DESC) <= n.",
+        preview.join(" ")
+    )
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -443,12 +479,14 @@ impl Tool for RunSqlTool {
                 let sql = args.query.clone();
                 let max_rows = self.max_query_rows;
                 let read_only = matches!(kind, StatementKind::Read);
-                let results = with_db(&self.db, move |db| {
-                    if read_only {
-                        db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))
+                let (results, shape) = with_db(&self.db, move |db| {
+                    let shape = db.statement_shape(&sql)?;
+                    let results = if read_only {
+                        db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))?
                     } else {
-                        Ok(db.execute_query_capped(&sql, max_rows))
-                    }
+                        db.execute_query_capped(&sql, max_rows)
+                    };
+                    Ok((results, shape))
                 })
                 .await
                 .map_err(tool_error)?;
@@ -464,7 +502,16 @@ impl Tool for RunSqlTool {
                 match results {
                     Ok(results) => {
                         step.finish(format!("{} rows", results.total_rows));
-                        text_to_sql::format_query_result(&results).map_err(tool_error)
+                        let mut text =
+                            text_to_sql::format_query_result(&results).map_err(tool_error)?;
+                        if let Some(earlier) = self.repeated_shape(&args.query, shape) {
+                            text.push('\n');
+                            text.push_str(&per_group_note(&earlier));
+                            text.push('\n');
+                        }
+                        text.push('\n');
+                        text.push_str(&self.recorder.budget_note());
+                        Ok(text)
                     }
                     // A failed statement is a result, not a tool failure: rig
                     // hides a tool error's message from the model, but DuckDB's
@@ -2024,6 +2071,56 @@ mod tests {
         assert_eq!(numeric_rows, 2, "{text}");
         let last = recorder.steps().last().map(|s| s.summary.clone());
         assert_eq!(last.as_deref(), Some("5 rows"));
+    }
+
+    /// The one-query-per-group loop: the second statement, the first with
+    /// another literal, comes back with the note and the turn budget; a
+    /// different statement gets the budget alone.
+    #[tokio::test]
+    async fn run_sql_flags_a_statement_repeated_with_other_literals() {
+        let (sink, _rx) = super::super::events::channel();
+        let recorder = TurnRecorder::new(sink).with_turn_limit(15);
+        let db = shared_db();
+        let tool = RunSqlTool::new(
+            Arc::clone(&db),
+            ReaderDb::new(db),
+            100,
+            WritePolicy::Deny,
+            RefusalFlag::default(),
+            recorder,
+        );
+        let run = |query: &str| {
+            let query = query.to_owned();
+            let tool = &tool;
+            async move {
+                match tool
+                    .call(&mut ToolContext::new(), RunSqlArgs { query })
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
+                }
+            }
+        };
+        let first = run("SELECT range AS n FROM range(5) WHERE n = 1").await;
+        assert!(!first.contains("repeats an earlier one"), "{first}");
+        assert!(
+            first.ends_with("(tool call 1 of at most 15 this turn)"),
+            "{first}"
+        );
+        let second = run("SELECT range AS n FROM range(5) WHERE n = 3").await;
+        assert!(second.contains("repeats an earlier one"), "{second}");
+        assert!(second.contains("WHERE n = 1"), "{second}");
+        assert!(second.contains("arg_max"), "{second}");
+        assert!(
+            second.ends_with("(tool call 2 of at most 15 this turn)"),
+            "{second}"
+        );
+        let third = run("SELECT count() FROM range(5)").await;
+        assert!(!third.contains("repeats an earlier one"), "{third}");
+        // The second statement again: still the first with another literal.
+        let again = run("SELECT range AS n FROM range(5) WHERE n = 3").await;
+        assert!(again.contains("WHERE n = 1"), "{again}");
     }
 
     /// The retry loop the prompt promises: a binder error, with `DuckDB`'s

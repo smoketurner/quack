@@ -8,6 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEv
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc;
 
+use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent, EventStream, PermissionRequest};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
@@ -415,6 +416,11 @@ impl App {
 
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::Status(status) => {
+                self.messages
+                    .push(Message::new(MessageRole::System, status));
+                self.scroll_offset = 0;
+            }
             AgentEvent::TextDelta(text) => {
                 if let Some(idx) = self.streaming
                     && let Some(target) = self.messages.get_mut(idx)
@@ -464,53 +470,57 @@ impl App {
                 self.state = AppState::AwaitingPermission;
                 self.scroll_offset = 0;
             }
-            AgentEvent::TurnComplete(response) => {
-                if let Some(idx) = self.streaming
-                    && let Some(target) = self.messages.get_mut(idx)
-                {
-                    // Citation validation may have renumbered or stripped markers.
-                    target.content.clone_from(&response.content);
-                } else if !response.content.trim().is_empty() {
-                    self.messages
-                        .push(Message::new(MessageRole::Assistant, response.content));
-                }
-                if !response.citations.is_empty() {
-                    self.messages.push(Message::new(
-                        MessageRole::System,
-                        sources_footer(&response.citations),
-                    ));
-                }
-                if let Some(spec) = &response.chart {
-                    let chart = ChartData::from_spec(spec);
-                    self.current_chart = Some(chart.clone());
-                    if let Some(last) = self
-                        .messages
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.role == MessageRole::Assistant)
-                    {
-                        last.chart = Some(chart);
-                    }
-                }
-                for result in response.graph.iter().filter(|r| !r.is_empty()) {
-                    self.messages.push(Message::new(
-                        MessageRole::System,
-                        traverse::render_tree(result),
-                    ));
-                }
-                if response.write_refused && !self.allow_write {
-                    self.messages.push(Message::new(
-                        MessageRole::System,
-                        "A write was refused this turn. Answer y next time, or restart with --allow-write.",
-                    ));
-                }
-                self.finish_turn();
-            }
+            AgentEvent::TurnComplete(response) => self.handle_turn_complete(response),
             AgentEvent::Failed(err) => {
                 self.messages.push(Message::new(MessageRole::Error, err));
                 self.finish_turn();
             }
         }
+    }
+
+    /// Put the validated answer, its sources, chart, and graph results in
+    /// the transcript and end the turn.
+    fn handle_turn_complete(&mut self, response: AgentResponse) {
+        if let Some(idx) = self.streaming
+            && let Some(target) = self.messages.get_mut(idx)
+        {
+            // Citation validation may have renumbered or stripped markers.
+            target.content.clone_from(&response.content);
+        } else if !response.content.trim().is_empty() {
+            self.messages
+                .push(Message::new(MessageRole::Assistant, response.content));
+        }
+        if !response.citations.is_empty() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                sources_footer(&response.citations),
+            ));
+        }
+        if let Some(spec) = &response.chart {
+            let chart = ChartData::from_spec(spec);
+            self.current_chart = Some(chart.clone());
+            if let Some(last) = self
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == MessageRole::Assistant)
+            {
+                last.chart = Some(chart);
+            }
+        }
+        for result in response.graph.iter().filter(|r| !r.is_empty()) {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                traverse::render_tree(result),
+            ));
+        }
+        if response.write_refused && !self.allow_write {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "A write was refused this turn. Answer y next time, or restart with --allow-write.",
+            ));
+        }
+        self.finish_turn();
     }
 
     fn finish_turn(&mut self) {

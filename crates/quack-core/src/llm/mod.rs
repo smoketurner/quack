@@ -487,6 +487,60 @@ async fn credential(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct OllamaRunningModels {
+    #[serde(default)]
+    models: Vec<OllamaRunningModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct OllamaRunningModel {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: String,
+}
+
+impl OllamaRunningModels {
+    /// Whether `model` is among the loaded ones; a bare name matches its
+    /// `:latest` tag, which is how Ollama reports it.
+    fn holds(&self, model: &str) -> bool {
+        let wanted = if model.contains(':') {
+            model.to_owned()
+        } else {
+            format!("{model}:latest")
+        };
+        self.models
+            .iter()
+            .any(|m| m.name == wanted || m.model == wanted || m.name == model || m.model == model)
+    }
+}
+
+/// Whether Ollama already has `model` in memory (`GET /api/ps`). A first
+/// request after idle loads the model, which took 5 seconds for a 12 GB
+/// model measured live and shows the user nothing meanwhile, so the turn
+/// says so first. Any failure to ask counts as loaded: the chat call that
+/// follows reports the real error.
+async fn ollama_model_resident(client: &rig::providers::ollama::Client, model: &str) -> bool {
+    use rig::http_client::HttpClientExt;
+
+    let listed = async {
+        let request = client.get("api/ps")?.body(Vec::new())?;
+        let response = client.send::<_, Vec<u8>>(request).await?;
+        let bytes: Vec<u8> = response.into_body().await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(serde_json::from_slice::<
+            OllamaRunningModels,
+        >(&bytes)?)
+    };
+    match listed.await {
+        Ok(running) => running.holds(model),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not list Ollama's loaded models");
+            true
+        }
+    }
+}
+
 async fn build_ollama_client(
     config: &Config,
     name: &str,
@@ -789,6 +843,13 @@ async fn dispatch(
     match chat.provider.provider_type {
         ProviderType::Ollama => {
             let client = build_ollama_client(config, chat.provider_name, chat.provider).await?;
+            if !ollama_model_resident(&client, chat.model).await {
+                drop(sink.send(AgentEvent::Status(format!(
+                    "loading {}, then thinking; Ollama loads a model on its first request and keeps it \
+                     for {OLLAMA_KEEP_ALIVE}",
+                    chat.model
+                ))));
+            }
             agent::run_analysis(
                 db,
                 reader_db,
@@ -926,6 +987,22 @@ mod tests {
             body.pointer("/options/num_ctx"),
             Some(&serde_json::json!(8192))
         );
+    }
+
+    #[test]
+    fn ollama_running_models_match_bare_and_tagged_names() {
+        let running: OllamaRunningModels = serde_json::from_str(
+            r#"{"models":[{"name":"gpt-oss:20b","model":"gpt-oss:20b"},{"name":"llama3:latest","model":"llama3:latest"}]}"#,
+        )
+        .unwrap_or(OllamaRunningModels { models: Vec::new() });
+        assert!(running.holds("gpt-oss:20b"));
+        assert!(running.holds("llama3"));
+        assert!(running.holds("llama3:latest"));
+        assert!(!running.holds("gpt-oss"));
+        assert!(!running.holds("qwen3:8b"));
+        let empty: OllamaRunningModels =
+            serde_json::from_str("{}").unwrap_or(OllamaRunningModels { models: Vec::new() });
+        assert!(!empty.holds("gpt-oss:20b"));
     }
 
     #[test]

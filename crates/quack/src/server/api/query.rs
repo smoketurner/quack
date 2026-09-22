@@ -206,7 +206,8 @@ pub(crate) async fn query(
             AgentEvent::PermissionRequired(request) => request.deny(),
             AgentEvent::TurnComplete(response) => complete = Some(response),
             AgentEvent::Failed(message) => failure = Some(message),
-            AgentEvent::TextDelta(_)
+            AgentEvent::Status(_)
+            | AgentEvent::TextDelta(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished(_) => {}
         }
@@ -268,6 +269,7 @@ pub(crate) async fn stream(
         |(mut events, app, access, session_id, prompt, guard)| async move {
             let event = events.recv().await?;
             let out = match event {
+                AgentEvent::Status(status) => Event::default().event("status").data(status),
                 AgentEvent::TextDelta(text) => Event::default().event("text").data(text),
                 AgentEvent::ToolStarted { tool, detail } => Event::default()
                     .event("tool_started")

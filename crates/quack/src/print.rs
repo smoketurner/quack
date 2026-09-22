@@ -107,6 +107,7 @@ pub(crate) async fn run_prompt(
         };
         spinner.clear(&mut err)?;
         match event {
+            AgentEvent::Status(status) => spinner.set(&status),
             AgentEvent::TextDelta(text) => {
                 if stream_live && !searched {
                     write!(out, "{text}")?;
