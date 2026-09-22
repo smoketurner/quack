@@ -121,9 +121,11 @@ serial lane, so a follow-up waits for the answer before it; a workspace's upload
 extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
 broadcast of `JobInfo` snapshots every interface reports from. There is no job pool:
 resources are limited where they are used. Every rig client is built over
-`llm::LimitedHttp`, which holds one permit of the provider's process-wide
-`[providers.NAME].max_concurrent_requests` (1 for Ollama, 8 otherwise) per request until
-its body or stream ends. The registry is in memory only (labels can be workspace content).
+`llm::LimitedHttp`, which holds one permit of the process-wide gate for the provider and
+the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
+for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
+requests (`run_turn`, `embed_query`, via the `llm::limit::Priority` task-local) before
+background ones. The registry is in memory only (labels can be workspace content).
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:

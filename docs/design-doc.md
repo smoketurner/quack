@@ -170,13 +170,17 @@ and each is limited where it is used:
 
 | Resource | Limit | Where |
 |----------|-------|-------|
-| Model requests to a provider | `[providers.NAME].max_concurrent_requests` (1 for Ollama, which serves one request per model unless `OLLAMA_NUM_PARALLEL` says more; 8 for hosted APIs), process-wide | `llm::LimitedHttp`: every rig client quack builds sends through it; a permit is held from the request until its body is read or its stream ends |
+| Model requests, per provider and model | `[providers.NAME].max_concurrent_requests` for each model (1 for Ollama, which serves one request per model unless `OLLAMA_NUM_PARALLEL` says more; 8 for hosted APIs), process-wide, interactive requests first | `llm::LimitedHttp`: every rig client quack builds sends through it; the model is read from the request body; a permit is held from the request until its body is read or its stream ends |
 | The workspace's writer connection | one statement at a time (the `SharedDb` mutex, section 7.4) | long work takes it per step, never across a model call |
 | Reads | the reader pool (`[analysis].reader_pool_size`) | `ReaderDb` |
 | Uploads per workspace (server) | `[server].workers_per_workspace` | the `ingest:{workspace}` lane |
 
 A turn therefore holds nothing while it waits for the user's answer to a write prompt or
-runs a tool, and a quick `SELECT` never waits behind chat. rig's streaming loop drains a
+runs a tool, and a quick `SELECT` never waits behind chat. Requests carry a priority
+(`llm::limit::Priority`, a Tokio task-local): `run_turn` and `embed_query` run interactive,
+everything else (ingest embeddings, extraction, proposals) background, and a freed permit
+goes to the oldest interactive waiter before any background one, so a question never
+queues behind a whole ingest. rig's streaming loop drains a
 model response before it runs the tool calls in it, so a tool that calls the same
 provider (the query embedding, the model reranker) never waits on a permit its own turn
 still holds. `[analysis].extraction_concurrency` and `[ingestion].embedding_concurrency`

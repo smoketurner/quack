@@ -469,8 +469,8 @@ fn cosine(a: &[f64], b: &[f64]) -> f64 {
 ///
 /// Returns an error when the provider call fails.
 pub async fn embed_query(model: &EmbedModel, text: &str) -> Result<Vec<f32>> {
-    let embedding = model
-        .embed_text(text)
+    // A query embedding is a lookup someone is waiting on.
+    let embedding = limit::with_priority(limit::Priority::Interactive, model.embed_text(text))
         .await
         .map_err(|e| Error::Embedding(e.to_string()))?;
     #[expect(clippy::cast_possible_truncation, reason = "stored vectors are f32")]
@@ -811,17 +811,22 @@ pub async fn run_turn(
             }
         }
     });
-    let turn = dispatch(
-        config,
-        Arc::clone(&db),
-        reader_db,
-        chat,
-        embedding_model,
-        policy,
-        prompt,
-        history,
-        message,
-        inner_sink,
+    // Someone is watching this turn: its model calls, and the tools' calls
+    // inside it, go ahead of background work at the provider (design 4.1).
+    let turn = limit::with_priority(
+        limit::Priority::Interactive,
+        dispatch(
+            config,
+            Arc::clone(&db),
+            reader_db,
+            chat,
+            embedding_model,
+            policy,
+            prompt,
+            history,
+            message,
+            inner_sink,
+        ),
     );
     let outcome = tokio::select! {
         biased;
