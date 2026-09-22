@@ -3,6 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
 mod config_cli;
+mod doctor_cli;
 mod graph_cli;
 mod mcp;
 mod ontology_cli;
@@ -44,7 +45,8 @@ const EXIT_WRITE_REFUSED: u8 = 3;
 /// Exit status when an OAuth provider needs `quack auth login` first.
 const EXIT_AUTH_REQUIRED: u8 = 4;
 /// Exit status when `quack config` finds a configuration every other
-/// command would refuse: the report is still printed.
+/// command would refuse (the report is still printed), or `-p` has no chat
+/// model to answer with.
 const EXIT_BAD_CONFIG: u8 = 2;
 
 /// `--version` names the crypto module as well, so an operator can tell a FIPS
@@ -274,6 +276,19 @@ enum Commands {
         changed: bool,
 
         /// Emit the whole report as one JSON document
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Check the setup and say how to fix what is wrong: the config file,
+    /// the data directory, the workspace, each model's provider (reached
+    /// over the network), and the server's bind address
+    Doctor {
+        /// Skip the network probes
+        #[arg(long)]
+        offline: bool,
+
+        /// Emit the checks as one JSON document
         #[arg(long)]
         json: bool,
     },
@@ -544,6 +559,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Config { changed, json } => run_config(changed, json),
+        Commands::Doctor { offline, json } => run_doctor(cli, offline, json).await,
         Commands::Docs {
             pin,
             unpin,
@@ -580,6 +596,29 @@ fn run_config(changed: bool, json: bool) -> Result<ExitCode> {
     })
 }
 
+/// `quack doctor`: like `quack config`, it inspects the file outside
+/// `Config::load`, so a file every other command refuses is a finding here
+/// rather than the error. Exits 1 when any check fails.
+async fn run_doctor(cli: &Cli, offline: bool, json: bool) -> Result<ExitCode> {
+    init_logging();
+    let inspection = config::inspect::Inspection::load();
+    let options = quack_core::doctor::Options {
+        workspace: cli.workspace.clone(),
+        offline,
+        ..quack_core::doctor::Options::default()
+    };
+    let report = quack_core::doctor::run(&inspection, &options).await;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    doctor_cli::write(&mut out, &report, json)?;
+    out.flush()?;
+    Ok(if report.has_failures() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 /// `quack -p PROMPT`: one turn, answer to stdout, steps to stderr.
 async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<ExitCode> {
     init_logging();
@@ -592,6 +631,12 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         }
     };
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    // Checked before the workspace opens, so a missing model is one line
+    // on stderr rather than a failed turn, and leaves no session behind.
+    if let Err(e) = config.chat_model_ref() {
+        tracing::error!("{e}");
+        return Ok(ExitCode::from(EXIT_BAD_CONFIG));
+    }
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     load_piped_stdin(&config, &ws_db, &workspace.id, cli.stdin).await?;
@@ -733,6 +778,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
         | Commands::Config { .. }
+        | Commands::Doctor { .. }
         | Commands::Docs { .. } => Ok(()),
     }
 }

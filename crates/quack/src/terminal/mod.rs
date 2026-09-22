@@ -14,9 +14,11 @@ use quack_core::config::Config;
 ///
 /// # Errors
 ///
-/// Returns an error if no chat provider is configured or the terminal
-/// cannot be initialized. An embedding provider is optional: without one
-/// document search is keyword-only, as in print mode and the web.
+/// Returns an error if the terminal cannot be initialized. Neither model
+/// is required: without a chat model the session still runs SQL, ingests,
+/// and every slash command, and a question says how to configure one;
+/// without an embedding model document search is keyword-only, as in print
+/// mode and the web.
 pub(crate) fn run(
     config: Config,
     workspace_name: String,
@@ -26,10 +28,6 @@ pub(crate) fn run(
     session_id: String,
     allow_write: bool,
 ) -> Result<()> {
-    config
-        .chat_model_ref()
-        .context("the terminal session needs a chat model")?;
-
     let provider_display = quack_core::llm::chat_model_display(&config);
     let config = Arc::new(config);
 

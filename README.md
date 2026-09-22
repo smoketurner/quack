@@ -123,7 +123,11 @@ quack user add alice --admin             # users, tokens, members, and the audit
 ```bash
 quack config                             # every setting, the value in force, and where it came from
 quack config --changed                   # only what config.toml and the environment set
+quack doctor                             # check config, data dir, workspace, model providers, and bind address; say how to fix each
 ```
+
+No configuration is needed to start: with no chat model, `quack` and `quack -q` still run
+SQL, load files, and take every slash command, and a question says how to set a model up.
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
 

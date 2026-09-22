@@ -1374,6 +1374,7 @@ quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
 quack config [--changed] [--json]
+quack doctor [-w NAME] [--offline] [--json]
 quack serve [--bind ADDR] [--local]
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--json] ; quack token create|list|revoke ;
@@ -1392,7 +1393,7 @@ gets the validated answer alone. Exit codes: 0 ok, 1 runtime error, 2 usage, 3 w
 refused, 4 auth required; a reader that closes stdout early (`| head`) ends the command
 quietly with 0.
 
-`quack config` is the one command that does not go through `Config::load`: it reads the
+`quack config` and `quack doctor` are the commands that do not go through `Config::load`: `config` reads the
 file itself, so it describes a configuration every other command refuses rather than
 failing the same way. It prints every setting this binary recognizes with the value in
 force, where that value came from (built in, the file, or the environment variable that
@@ -1402,6 +1403,26 @@ environment variables the configuration reads are set — never their contents, 
 of them hold credentials. `--changed` keeps only the settings the file or the environment
 has a say in; `--json` emits the whole report as one document. A rejected file exits 2
 after printing the report.
+
+`quack doctor` troubleshoots the whole setup, one line per check with the fix under
+anything that needs one: the config file (rejected, unknown keys with the key each
+resembles), the crypto module (a Linux build without FIPS warns), the data directory
+(writable, and a warning when group or others can read it), `control.db` (opens and
+migrates), the workspace (opens, embedding dimension agrees), each configured model
+(credential present, plain HTTP off this machine with a credential warns, and one `GET`
+of the provider's model list proves it is reachable, the key is accepted, and the model is
+pulled or listed), and `[server]` (a non-loopback bind warns, `local` off loopback fails,
+no users yet is noted). With no chat model it looks for a local Ollama and suggests a
+`config.toml` snippet with the models that Ollama has. It creates nothing: a data
+directory, control database, or workspace that does not exist yet is reported as such.
+`--offline` skips the network; `--json` emits `{ok, failures, warnings, checks}`. Any
+failed check exits 1.
+
+No model is required to run quack. Without `[general].chat_model` the terminal session
+opens, runs typed SQL and every slash command, and answers a question with how to set a
+model up; `-q`, ingest, import, and the server's SQL and table pages work as before. A data
+directory quack creates is `0700` on Unix, since it holds every workspace's content and
+the OAuth token caches.
 
 ### 11.6 Desktop window (`quack desktop`)
 
