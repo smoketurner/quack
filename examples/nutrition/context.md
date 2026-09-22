@@ -33,6 +33,9 @@ Rules:
   `1 large` portion of `Egg, whole, raw, fresh`.
 - Match foods by `description ILIKE '%word%'` and prefer the plain form (`raw`, `whole`,
   no brand, no `with added`) unless the question names one. Say which food you used.
+  Drinks are described as `Beverages, coffee, brewed, ...`, `Beverages, tea, ...`. Never
+  say a food is missing until an `ILIKE` search on the plain word returned nothing; the
+  tables are not documents, so `search_documents` does not find foods.
 - Percent Daily Value is `100 * amount / daily_values.daily_value` for the matching
   `nutrient_id`. Do not compare a per-100 g amount with a per-serving Daily Value
   without saying so.

@@ -15,10 +15,10 @@ examples/nutrition/load.sh WORKSPACE --reset        # delete every document in W
 ```
 
 Loading takes a few minutes after the downloads (about 10 MB, cached under
-`~/.cache/quack/examples/nutrition/`), most of it embedding the documents. It is
-idempotent: files already in the workspace are skipped, derived tables are built only
-when missing, and the ontology and graph are written only once. Nothing in `load.sh`
-calls a chat model.
+`~/.cache/quack/examples/nutrition/`), spent embedding the documents and building the
+graph from the tables. It is idempotent: files already in the workspace are skipped,
+derived tables are built only when missing, and the ontology and graph are written only
+once. Nothing in `load.sh` calls a chat model.
 
 ## What is loaded
 
@@ -64,11 +64,11 @@ quack -w nutrition -p "how were the values for vitamin D measured?" --mode query
 Walk the graph:
 
 ```bash
-quack -w nutrition graph search 'Spinach, raw'        # its category and every nutrient it is a good or excellent source of
+quack -w nutrition graph search 'Spinach, raw' --hops 1   # its category and every nutrient it is a good or excellent source of
 quack -w nutrition graph search 'Iron' --hops 2       # every food with an iron claim
 quack -w nutrition graph path 'Kale, raw' 'Vitamin K' # food -> claim -> nutrient
 quack -w nutrition graph status
-quack -w nutrition -p "which legumes are excellent sources of iron?"   # the agent uses search_graph
+quack -w nutrition -p "which legumes are excellent sources of iron?"   # the agent reads nutrient_claims or walks the graph
 ```
 
 SQL without the agent, or with piped data:

@@ -34,7 +34,7 @@ each get half of: the tables hold the numbers, the documents say what the number
 
 ```bash
 quack -w nutrition -p "which cheeses have the most calcium, and what share of the daily value is 100 g?"   # joins USDA amounts to the FDA table
-quack -w nutrition -p "is a cup of cooked lentils a good source of iron, by the label rules?"
+quack -w nutrition -p "is a cup of cooked lentils an excellent source of iron, by the label rules?"
 ```
 
 **Questions about how things connect.** Once the graph is built the agent walks it —
