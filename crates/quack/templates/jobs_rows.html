@@ -1,0 +1,25 @@
+{% if jobs.is_empty() %}
+<p class="text-slate-600">No jobs yet.</p>
+{% else %}
+<table class="w-full border-collapse text-sm">
+  <thead><tr class="border-b border-slate-300 text-left text-xs uppercase text-slate-500"><th class="py-2">#</th><th>Kind</th><th>Job</th><th>State</th><th>Progress</th><th>Queued</th><th></th></tr></thead>
+  <tbody>
+  {% for j in jobs %}
+  <tr id="job-{{ j.id }}" class="border-b border-slate-200">
+    <td class="py-2 text-slate-500">{{ j.number }}</td>
+    <td class="text-slate-500">{{ j.kind }}</td>
+    <td class="font-medium">{{ j.label }}{% if let Some(outcome) = j.outcome %} <span class="font-normal {% if j.state == "failed" %}text-red-700{% else %}text-slate-500{% endif %}">{{ outcome }}</span>{% endif %}</td>
+    <td>{% if j.active %}<span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">{{ j.state }}</span>{% else %}{{ j.state }}{% endif %}</td>
+    <td class="text-slate-500">{{ j.progress }}</td>
+    <td class="text-slate-500">{{ j.queued_at }}</td>
+    <td class="text-right">
+      {% if j.can_cancel %}
+      <button class="text-red-700 hover:underline" hx-post="/w/{{ ws_id }}/jobs/{{ j.id }}/cancel" hx-target="#rows" hx-swap="innerHTML">Cancel</button>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if pending %}<p class="mt-2 text-xs text-slate-500" data-pending>Jobs are running… this list refreshes itself.</p>{% endif %}
+{% endif %}

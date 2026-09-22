@@ -155,6 +155,50 @@ Every interface calls the same core entry points:
 The LLM layer is `rig`. `quack-core::llm` builds rig clients from config and exposes
 `ChatModel` and `EmbedModel` enums so the rest of the core is provider-agnostic.
 
+### 4.1 Work queues
+
+Every interface is asynchronous: anything slower than a keystroke runs as a job, and the
+interface that submitted it stays responsive and reports its status. `quack_core::jobs`
+is the one mechanism. A `JobQueue` holds a fixed number of worker slots
+(`[jobs].workers`, 4 by default); a submitted job waits `queued` until a slot is free,
+runs, and ends `succeeded`, `failed`, or `cancelled`. A job may name a *lane*: jobs that
+share a lane key run at most the lane's limit at a time, in submission order, and a job
+waiting on its lane does not hold a worker slot.
+
+| Work | Kind | Lane | Where |
+|------|------|------|-------|
+| An agent turn | `chat` | `session:{id}`, serial: a turn's history includes the answer before it | TUI, web chat, REST `query` |
+| A typed statement | `sql` | none | TUI |
+| A file or pasted text | `ingest` | `ingest:{workspace}`, `[server].workers_per_workspace` wide (server); none (TUI) | upload, `/ingest` |
+| An external import | `import` | none | `/import` |
+| Graph extraction | `graph` | `graph:{workspace}`, serial | graph page, REST, `/graph extract` |
+| The ontology document pass | `ontology` | `ontology:{workspace}`, serial | ontology page, REST, `/ontology propose --documents` |
+| Bundle and context exports | `export` | none | `/okf`, `/context export` |
+
+A job carries a v7 id, a short number for people to type (`/cancel 3`), its kind and label,
+the workspace, the submitting user, its lane, progress (`done` of `total`, which
+extraction runs report per chunk), the latest status line, and its outcome (a one-line
+summary or the error). Every change goes out on a broadcast channel as a snapshot: the
+terminal's job strip and `/jobs`, the web console's Jobs page, and
+`GET .../jobs/stream` all read that one source. Cancelling a queued job ends it without
+running; a running one sees its cancel token (an agent turn is then recorded as cancelled,
+as with `Esc`; a statement is interrupted through `storage::workspace::QueryCanceller`,
+which only ever interrupts the connection while that job's statement holds it) and stops
+at its next checkpoint, or finishes when its work has none (an ingest mid-embedding).
+Quitting the terminal cancels every job and waits a few seconds for them to stop; work
+without a checkpoint runs on a detached thread and never holds the process open. Work
+whose end records something (an upload's document status, an extraction's closing audit
+row) records it for a job cancelled while queued as well, so nothing is left `queued`.
+
+The registry is in memory. A job's label can name a file or quote a question, which is
+workspace content (section 5), so it never reaches `control.db`; a restart forgets it, and
+the durable record of what a job did is the document, table, session, or audit row it
+wrote. Uploads a previous process left `queued` are marked failed when the workspace is
+next opened. Jobs share the workspace's one writer connection with everything else
+(section 7.4); long work (graph extraction, the document pass, ingestion) takes the writer
+only around each database step, never across a model call, so a question asked meanwhile
+records its turn between those steps.
+
 ---
 
 ## 5. Workspaces and Storage
@@ -1295,9 +1339,20 @@ GET    /api/v1/workspaces/{id}/members  POST/DELETE ...   (owner)
 GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal log)
 ```
 
-Uploads, extraction, and proposals return `202` and are processed by a bounded in-process
-queue (one worker per workspace); clients poll the resource. Rate limiting per token via
-`tower_governor`.
+Uploads, extraction, and proposals return `202` with a `job` id and run on the work queue
+(section 4.1); clients poll the resource or the job. Agent turns run there too, in their
+session's lane. Rate limiting per token via `tower_governor`.
+
+```
+GET    /api/v1/workspaces/{id}/jobs               queued, running, and recent jobs, newest first,
+                                                  with counts and the worker total (viewer)
+GET    /api/v1/workspaces/{id}/jobs/stream        SSE: `jobs` (the list) then `job` per change
+GET    /api/v1/workspaces/{id}/jobs/{job}         one job
+POST   /api/v1/workspaces/{id}/jobs/{job}/cancel  its submitter, or a workspace owner or admin
+```
+
+A question's text shows in a job only to whoever may read its session (its owner, or a
+workspace owner or admin); other members see "a question in a private session".
 
 ### 11.3 MCP server
 
@@ -1335,8 +1390,18 @@ tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown). Slash comm
 `quack graph` verbs, parsed by the same clap definitions, run in the background with their
 output in the transcript; anything that would ask on stdin is answered yes), `/graph ENTITY`,
 `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/sessions`, `/resume`, `/new`,
-`/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`, `/chart [N]`, `/steps`,
-`/model`, `/workspace`, `/clear`, `/quit`. Answers render Markdown (headings, bullets,
+`/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`, `/jobs`, `/cancel N`,
+`/chart [N]`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
+
+Nothing blocks the input (section 4.1). A question, a statement, a file, an import, and an
+ontology or graph verb are each submitted as a job, and the prompt takes the next line at
+once: ask a follow-up while an answer streams (it is queued behind it in the session's
+lane and says so), run SQL or load a file alongside. A strip above the input shows the
+running and queued jobs with a spinner, number, kind, label, and progress; the status line
+counts them; `/jobs` lists recent ones with their outcomes and `/cancel N` stops one.
+Results land in the transcript as each job finishes. A turn's text renders only while its
+session is on screen; switching sessions leaves it running and a line reports its end.
+Write prompts from concurrent work queue and are answered one at a time. Answers render Markdown (headings, bullets,
 fences, inline marks), tool steps show a three-line preview of their detail until `/steps`
 expands them (print mode folds the same way without `--verbose`), and each chart belongs
 to its answer: the pane shows the latest, `/chart N` any earlier one. Lines wrap to the
@@ -1346,8 +1411,9 @@ existing file ingests it; an embedding provider is optional (keyword search with
 Keys: `Enter` send,
 `Shift+Enter` newline, `Up`/`Down` history, `PageUp`/`PageDown` and the mouse wheel scroll,
 `Home`/`End` jump, `Esc` or `Ctrl+C` cancel
-the running turn (recorded with whatever streamed and a cancelled note), `Ctrl+C` when
-idle quits, `Ctrl+L` clear. The web chat has a Stop button and print mode cancels on
+this session's newest turn, running or queued (recorded with whatever streamed and a
+cancelled note), `Ctrl+C` with no turn quits (twice when other jobs are still running,
+which stop with the session), `Ctrl+L` clear. The web chat has a Stop button and print mode cancels on
 `Ctrl+C`; every interface passes a cancellation token to `run_turn`.
 
 Works on a named workspace (`-w`), resolved through the control plane like every other
@@ -1585,10 +1651,14 @@ min_support_documents = 3
 key_overlap_threshold = 0.8
 enum_max_values = 12                    # distinct values under which a column becomes an enum
 
+[jobs]
+workers = 4                             # jobs running at once in the process; the rest queue
+history = 100                           # finished jobs kept for /jobs and the Jobs page
+
 [server]
 bind = "127.0.0.1:8080"                 # QUACK_BIND
 local = false
-workers_per_workspace = 1
+workers_per_workspace = 1               # uploads processed at once per workspace (a lane)
 session_max_age_hours = 12              # a browser session dies this long after login
 session_idle_minutes = 120              # ... or this long after its last request
 ```
@@ -1894,6 +1964,14 @@ design to the tracker and is updated as issues close. Ordered by risk.
     15 item 3 names it as the supported way to back a workspace up while the server runs;
     there is no `workspace` subcommand and nothing calls `CHECKPOINT`. Backing up today
     means copying the workspace directory while no write is in flight. Sections 15, 19.
+15. **Work queues, first pass** (section 4.1). The terminal, the web chat, REST `query`,
+    uploads, graph extraction, and the document pass run on `quack_core::jobs`. Not yet:
+    MCP `query` calls and print mode run their turn directly (one call, one answer, nothing
+    to keep responsive); the web chat page shows its own turn but not a job strip (the Jobs
+    page does); jobs are not persisted across restarts; and an upload queue no longer
+    pushes back on the client when deep (the old 64-deep bound): `upload_max_mb` and the
+    rate limiter bound it instead. Quick terminal commands (`/tables`, `/docs`, `/pin`,
+    ...) still run inline, taking the writer for one short step.
 
 ---
 

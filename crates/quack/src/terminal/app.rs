@@ -1,12 +1,15 @@
+use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui_textarea::TextArea;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent, EventStream, PermissionRequest};
@@ -15,7 +18,9 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::storage::sessions::{self, ChatMode, MessageRole as StoredRole};
-use quack_core::storage::workspace::{StatementKind, WorkspaceDb, looks_like_direct_sql};
+use quack_core::storage::workspace::{
+    QueryCanceller, StatementKind, WorkspaceDb, looks_like_direct_sql,
+};
 
 use crate::terminal::chart::ChartData;
 use crate::terminal::ui;
@@ -24,7 +29,8 @@ use quack_core::analysis::citations::Citation;
 use quack_core::error::Error as CoreError;
 use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
-use quack_core::llm::{self, CancellationToken};
+use quack_core::jobs::{JobContext, JobId, JobInfo, JobKind, JobQueue, JobSpec, JobState, Lane};
+use quack_core::llm;
 use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -33,6 +39,9 @@ use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
 
 const TICK_RATE_MS: u64 = 50;
+
+/// How long quitting waits for cancelled jobs to stop.
+const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 const WELCOME_TEXT: &str = "\
 Welcome to quack!
@@ -72,6 +81,8 @@ Commands:
   /mode [chat|query] Show or set the answer mode (query = sources only)
   /share, /unshare  Share this session with every member, or take it back
   /export [--sql|--markdown] [FILE]  Save this session
+  /jobs             List running, queued, and recent jobs
+  /cancel N         Cancel job N (queued or running)
   /chart [N]        Show the chart of the Nth chart-bearing answer (default: the last)
   /steps            Expand or collapse the tool call details
   /model            Show the chat and embedding models in use
@@ -79,28 +90,24 @@ Commands:
   /workspace        Show current workspace and session
   /quit, /exit      Exit quack
 
+Everything you send runs as a background job, so you can keep typing: ask
+the next question, run SQL, or load a file while an answer streams. Questions
+in one session are answered in order; other work runs alongside, up to
+[jobs].workers at once. The strip above the input shows what is running.
+
 Shortcuts:
   Enter             Send message
   Up/Down           Browse input history (kept across sessions)
   PageUp/PageDown, mouse wheel   Scroll messages; Home/End jump
   Ctrl+U            Clear input line
   Ctrl+L            Clear screen
-  Esc or Ctrl+C     Cancel the running turn
-  Ctrl+C            Quit (when nothing is running)
+  Esc or Ctrl+C     Cancel this session's newest question (running or queued)
+  Ctrl+C            Quit (twice while background jobs are still running)
 
 Writes:
   SELECT queries always run. When the agent wants to modify the workspace
   you are asked: y runs it, n refuses it, a allows writes for this session.
   Start with --allow-write to skip the prompt.";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AppState {
-    Idle,
-    Thinking,
-    Ingesting,
-    RunningSql,
-    AwaitingPermission,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MessageRole {
@@ -143,10 +150,38 @@ enum BackgroundResult {
     Error(String),
 }
 
+/// A decision the user owes. Prompts are modal, answered in order, while
+/// every job keeps running.
+enum Prompt {
+    /// A write the agent wants to make in the turn run by `job`.
+    Agent {
+        job: JobId,
+        request: PermissionRequest,
+    },
+    /// A typed statement that modifies the workspace.
+    Sql(String),
+}
+
+/// An agent turn submitted as a job: its events and where its text goes.
+struct Turn {
+    job: JobId,
+    /// The session it answers in; its events render only while that
+    /// session is on screen.
+    session_id: String,
+    events: EventStream,
+    /// Index of the assistant message text is streaming into, if any.
+    streaming: Option<usize>,
+    /// Index into `messages` of the step line being filled in.
+    open_step: Option<usize>,
+    /// The turn reported its end (`TurnComplete` or `Failed`).
+    ended: bool,
+    /// Its event stream closed; it stays until its job's end is known.
+    closed: bool,
+}
+
 pub(crate) struct App {
     pub(crate) messages: Vec<Message>,
     pub(crate) textarea: TextArea<'static>,
-    pub(crate) state: AppState,
     pub(crate) scroll_offset: usize,
     pub(crate) should_quit: bool,
     pub(crate) tick: usize,
@@ -154,15 +189,17 @@ pub(crate) struct App {
     pub(crate) provider_display: String,
     pub(crate) session_id: String,
     pub(crate) current_chart: Option<ChartData>,
-    /// The write awaiting a decision, while `state` is `AwaitingPermission`.
-    pending_permission: Option<PermissionRequest>,
-    /// A `/sql` write awaiting a decision, while `state` is
-    /// `AwaitingPermission` and no agent request is pending.
-    pending_sql: Option<String>,
-    /// Index into `messages` of the step line being filled in.
-    open_step: Option<usize>,
-    /// Index of the assistant message text is streaming into, if any.
-    streaming: Option<usize>,
+    /// Decisions owed, oldest first; the front one is on screen.
+    prompts: VecDeque<Prompt>,
+    /// Agent turns queued or running, in submission order.
+    turns: Vec<Turn>,
+    /// The work queue every submission goes through.
+    jobs: JobQueue,
+    job_events: broadcast::Receiver<JobInfo>,
+    /// Jobs still queued or running, for the strip above the input.
+    pub(crate) active_jobs: Vec<JobInfo>,
+    /// Ctrl+C was pressed once while jobs were running; a second quits.
+    quit_armed: bool,
     last_sql: Option<String>,
     input_history: Vec<String>,
     history_cursor: Option<usize>,
@@ -170,17 +207,15 @@ pub(crate) struct App {
     workspace_id: String,
     db: SharedDb,
     reader_db: ReaderDb,
-    allow_write: bool,
-    agent_events: Option<EventStream>,
-    /// Cancels the running turn; set while `state` is `Thinking` or
-    /// `AwaitingPermission` for an agent request.
-    turn_cancel: Option<CancellationToken>,
+    /// Writes allowed for the session (`--allow-write`, or `a` at a
+    /// prompt). Shared with queued turns, which read it when they start.
+    allow_write: Arc<AtomicBool>,
     /// `/steps`: show tool details whole instead of a preview.
     pub(crate) expand_steps: bool,
     /// Where typed input is kept across sessions.
     history_path: PathBuf,
-    response_rx: mpsc::UnboundedReceiver<BackgroundResult>,
-    response_tx: mpsc::UnboundedSender<BackgroundResult>,
+    response_rx: mpsc::UnboundedReceiver<(JobId, BackgroundResult)>,
+    response_tx: mpsc::UnboundedSender<(JobId, BackgroundResult)>,
 }
 
 impl App {
@@ -203,10 +238,11 @@ impl App {
         configure_textarea(&mut textarea);
 
         let history_path = config.data_dir().join("terminal_history");
+        let jobs = JobQueue::from_config(&config.jobs);
+        let job_events = jobs.subscribe();
         let mut app = Self {
             messages: Vec::new(),
             textarea,
-            state: AppState::Idle,
             scroll_offset: 0,
             should_quit: false,
             tick: 0,
@@ -214,10 +250,12 @@ impl App {
             provider_display,
             session_id,
             current_chart: None,
-            pending_permission: None,
-            pending_sql: None,
-            open_step: None,
-            streaming: None,
+            prompts: VecDeque::new(),
+            turns: Vec::new(),
+            jobs,
+            job_events,
+            active_jobs: Vec::new(),
+            quit_armed: false,
             last_sql: None,
             input_history: Vec::new(),
             history_cursor: None,
@@ -225,9 +263,7 @@ impl App {
             workspace_id,
             db,
             reader_db,
-            allow_write,
-            agent_events: None,
-            turn_cancel: None,
+            allow_write: Arc::new(AtomicBool::new(allow_write)),
             expand_steps: false,
             history_path,
             response_rx,
@@ -334,20 +370,16 @@ impl App {
         // nothing on screen changing. `dirty` gates the draw on there
         // being something new to show; the only thing that still needs a
         // steady redraw with nothing else happening is the spinner, which
-        // animates only while a background task is in flight.
+        // animates only while a job is queued or running.
         let mut dirty = true;
 
         loop {
-            if dirty || Self::spinner_active(&self.state) {
+            if dirty || self.spinner_active() {
                 terminal.draw(|frame| ui::draw(frame, &self))?;
                 dirty = false;
             }
 
-            while let Ok(result) = self.response_rx.try_recv() {
-                self.handle_background_result(result);
-                dirty = true;
-            }
-            if self.drain_agent_events() {
+            if self.pump() {
                 dirty = true;
             }
 
@@ -380,81 +412,173 @@ impl App {
             }
         }
 
+        self.cancel_all_jobs();
+        self.wait_for_jobs(QUIT_GRACE);
         self.forget_session_if_empty();
         Ok(())
     }
 
-    /// Whether the state shows an animated spinner, which needs a redraw
-    /// every tick even with no new input or event to react to.
-    fn spinner_active(state: &AppState) -> bool {
-        matches!(
-            state,
-            AppState::Thinking | AppState::Ingesting | AppState::RunningSql
-        )
+    /// After cancelling everything, give the jobs up to `grace` to stop:
+    /// a turn records its cancellation, a statement is interrupted. Work
+    /// with no checkpoint (an ingest mid-embedding) runs on a detached
+    /// thread (see [`on_blocking_thread`]), so it never holds the process
+    /// open past this.
+    fn wait_for_jobs(&mut self, grace: Duration) {
+        let started = std::time::Instant::now();
+        while self.jobs.counts(None).active() > 0 && started.elapsed() < grace {
+            self.pump();
+            std::thread::sleep(Duration::from_millis(TICK_RATE_MS));
+        }
     }
 
-    /// Drains every pending agent event and reports whether it handled
-    /// one (or the stream closed), so the caller knows whether the
-    /// screen has something new to show.
-    fn drain_agent_events(&mut self) -> bool {
-        let mut pending = Vec::new();
-        let mut closed = false;
-        if let Some(rx) = self.agent_events.as_mut() {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => pending.push(event),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        closed = true;
-                        break;
-                    }
-                }
-            }
+    /// Apply everything the background work produced since the last call:
+    /// finished jobs' results, agent events, and job status changes.
+    /// Returns whether anything changed on screen.
+    fn pump(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((job, result)) = self.response_rx.try_recv() {
+            self.handle_background_result(job, result);
+            changed = true;
         }
-        let changed = !pending.is_empty() || closed;
-        for event in pending {
-            self.handle_agent_event(event);
+        if self.drain_agent_events() {
+            changed = true;
         }
-        if closed {
-            self.agent_events = None;
-            if self.state == AppState::Thinking {
-                // The task ended without TurnComplete or Failed.
-                self.finish_turn();
-            }
+        if self.drain_job_events() {
+            changed = true;
         }
         changed
     }
 
-    fn handle_agent_event(&mut self, event: AgentEvent) {
+    /// Whether the spinner is animating, which needs a redraw every tick
+    /// even with no new input or event to react to.
+    fn spinner_active(&self) -> bool {
+        !self.active_jobs.is_empty()
+    }
+
+    /// Whether a permission prompt is on screen (and takes the keys).
+    pub(crate) fn awaiting_permission(&self) -> bool {
+        !self.prompts.is_empty()
+    }
+
+    /// Refresh the job strip when any job changed state.
+    fn drain_job_events(&mut self) -> bool {
+        let mut changed = false;
+        // A lagged receiver lost snapshots, but the list below is rebuilt
+        // from the queue itself.
+        while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) =
+            self.job_events.try_recv()
+        {
+            changed = true;
+        }
+        if changed {
+            self.active_jobs = self
+                .jobs
+                .list()
+                .into_iter()
+                .filter(|j| !j.state.is_finished())
+                .collect();
+        }
+        changed
+    }
+
+    /// Drains every turn's pending events and reports whether it handled
+    /// one (or a stream closed), so the caller knows whether the screen
+    /// has something new to show.
+    fn drain_agent_events(&mut self) -> bool {
+        let mut turns = std::mem::take(&mut self.turns);
+        let mut changed = false;
+        turns.retain_mut(|turn| {
+            let mut pending = Vec::new();
+            while !turn.closed {
+                match turn.events.try_recv() {
+                    Ok(event) => pending.push(event),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        turn.closed = true;
+                        changed = true;
+                        // Nothing will answer its prompts now.
+                        self.prompts.retain(
+                            |p| !matches!(p, Prompt::Agent { job, .. } if *job == turn.job),
+                        );
+                    }
+                }
+            }
+            changed = changed || !pending.is_empty();
+            for event in pending {
+                self.handle_turn_event(turn, event);
+            }
+            if !turn.closed {
+                return true;
+            }
+            if turn.ended {
+                return false;
+            }
+            // Closed without an answer or a failure: it failed before the
+            // turn began (no model, a missing session) or was cancelled
+            // while queued. Its job says which, once it has finished.
+            match self.jobs.get(turn.job) {
+                Some(job) if !job.state.is_finished() => true,
+                Some(job) => {
+                    let outcome = job.outcome.unwrap_or_default();
+                    let (role, text) = if job.state == JobState::Failed {
+                        (MessageRole::Error, outcome)
+                    } else {
+                        (
+                            MessageRole::System,
+                            format!("Job #{} {}: {outcome}.", job.number, job.state),
+                        )
+                    };
+                    self.messages.push(Message::new(role, text));
+                    changed = true;
+                    false
+                }
+                None => false,
+            }
+        });
+        // Nothing handled above submits a turn, but keep any that were.
+        turns.append(&mut self.turns);
+        self.turns = turns;
+        changed
+    }
+
+    /// The job number people see for `job`.
+    fn job_number(&self, job: JobId) -> String {
+        self.jobs
+            .get(job)
+            .map_or_else(|| String::from("?"), |j| j.number.to_string())
+    }
+
+    fn handle_turn_event(&mut self, turn: &mut Turn, event: AgentEvent) {
+        let visible = turn.session_id == self.session_id;
         match event {
-            AgentEvent::Status(status) => {
+            AgentEvent::Status(status) if visible => {
                 self.messages
                     .push(Message::new(MessageRole::System, status));
                 self.scroll_offset = 0;
             }
-            AgentEvent::TextDelta(text) => {
-                if let Some(idx) = self.streaming
+            AgentEvent::TextDelta(text) if visible => {
+                if let Some(idx) = turn.streaming
                     && let Some(target) = self.messages.get_mut(idx)
                 {
                     target.content.push_str(&text);
                 } else {
                     self.messages
                         .push(Message::new(MessageRole::Assistant, text));
-                    self.streaming = Some(self.messages.len().saturating_sub(1));
+                    turn.streaming = Some(self.messages.len().saturating_sub(1));
                 }
                 self.scroll_offset = 0;
             }
-            AgentEvent::ToolStarted { tool, detail } => {
-                self.streaming = None;
+            AgentEvent::ToolStarted { tool, detail } if visible => {
+                turn.streaming = None;
                 let mut message = Message::new(MessageRole::Step, format!("> {tool}"));
                 message.detail = Some(detail);
                 self.messages.push(message);
-                self.open_step = Some(self.messages.len().saturating_sub(1));
+                turn.open_step = Some(self.messages.len().saturating_sub(1));
                 self.scroll_offset = 0;
             }
-            AgentEvent::ToolFinished(step) => {
+            AgentEvent::ToolFinished(step) if visible => {
                 let line = format!("\n  {}, {} ms", step.summary, step.duration_ms);
-                if let Some(idx) = self.open_step.take()
+                if let Some(idx) = turn.open_step.take()
                     && let Some(msg) = self.messages.get_mut(idx)
                 {
                     msg.content.push_str(&line);
@@ -467,32 +591,84 @@ impl App {
                     ));
                 }
             }
+            AgentEvent::Status(_)
+            | AgentEvent::TextDelta(_)
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished(_) => {}
             AgentEvent::PermissionRequired(request) => {
-                self.streaming = None;
+                self.ask_for_turn(turn, visible, request);
+            }
+            AgentEvent::TurnComplete(response) if visible => {
+                turn.ended = true;
+                self.handle_turn_complete(turn, response);
+            }
+            AgentEvent::TurnComplete(response) => {
+                turn.ended = true;
                 self.messages.push(Message::new(
                     MessageRole::System,
                     format!(
-                        "The agent wants to run a statement that modifies the workspace:\n{}\n\
-                         Run it?  y = yes   n = no   a = yes, and allow writes for this session",
-                        request.sql
+                        "Job #{} in session {} {}; /resume {} to read it.",
+                        self.job_number(turn.job),
+                        short_id(&turn.session_id),
+                        if response.cancelled {
+                            "was cancelled"
+                        } else {
+                            "finished"
+                        },
+                        turn.session_id
                     ),
                 ));
-                self.pending_permission = Some(request);
-                self.state = AppState::AwaitingPermission;
-                self.scroll_offset = 0;
             }
-            AgentEvent::TurnComplete(response) => self.handle_turn_complete(response),
             AgentEvent::Failed(err) => {
-                self.messages.push(Message::new(MessageRole::Error, err));
-                self.finish_turn();
+                turn.ended = true;
+                let text = if visible {
+                    err
+                } else {
+                    format!(
+                        "Job #{} in session {} failed: {err}",
+                        self.job_number(turn.job),
+                        short_id(&turn.session_id)
+                    )
+                };
+                self.messages.push(Message::new(MessageRole::Error, text));
+                turn.streaming = None;
+                turn.open_step = None;
             }
         }
     }
 
+    /// Queue a turn's write request as a prompt; one from a session not on
+    /// screen says whose it is.
+    fn ask_for_turn(&mut self, turn: &mut Turn, visible: bool, request: PermissionRequest) {
+        turn.streaming = None;
+        let whose = if visible {
+            String::from("The agent")
+        } else {
+            format!(
+                "Job #{} in session {}",
+                self.job_number(turn.job),
+                short_id(&turn.session_id)
+            )
+        };
+        self.messages.push(Message::new(
+            MessageRole::System,
+            format!(
+                "{whose} wants to run a statement that modifies the workspace:\n{}\n\
+                 Run it?  y = yes   n = no   a = yes, and allow writes for this session",
+                request.sql
+            ),
+        ));
+        self.prompts.push_back(Prompt::Agent {
+            job: turn.job,
+            request,
+        });
+        self.scroll_offset = 0;
+    }
+
     /// Put the validated answer, its sources, chart, and graph results in
-    /// the transcript and end the turn.
-    fn handle_turn_complete(&mut self, response: AgentResponse) {
-        if let Some(idx) = self.streaming
+    /// the transcript.
+    fn handle_turn_complete(&mut self, turn: &mut Turn, response: AgentResponse) {
+        if let Some(idx) = turn.streaming
             && let Some(target) = self.messages.get_mut(idx)
         {
             // Citation validation may have renumbered or stripped markers.
@@ -525,76 +701,202 @@ impl App {
                 traverse::render_tree(result),
             ));
         }
-        if response.write_refused && !self.allow_write {
+        if response.write_refused && !self.writes_allowed() {
             self.messages.push(Message::new(
                 MessageRole::System,
                 "A write was refused this turn. Answer y next time, or restart with --allow-write.",
             ));
         }
-        self.finish_turn();
-    }
-
-    fn finish_turn(&mut self) {
-        self.state = AppState::Idle;
-        self.streaming = None;
-        self.open_step = None;
-        self.pending_permission = None;
-        self.turn_cancel = None;
+        turn.streaming = None;
+        turn.open_step = None;
         self.scroll_offset = 0;
     }
 
-    /// Cancel the running turn (issue #45): a pending permission request
-    /// is refused first so the tool returns, then the token stops the
-    /// turn, which core records as cancelled and completes.
-    fn cancel_turn(&mut self) {
-        if let Some(request) = self.pending_permission.take() {
-            request.deny();
+    fn writes_allowed(&self) -> bool {
+        self.allow_write.load(Ordering::Relaxed)
+    }
+
+    /// The newest turn of the session on screen, queued or running.
+    fn current_turn(&self) -> Option<JobId> {
+        self.turns
+            .iter()
+            .rev()
+            .find(|t| t.session_id == self.session_id)
+            .map(|t| t.job)
+    }
+
+    /// Cancel a turn (issue #45): its pending permission requests are
+    /// refused first so the tool returns, then the job's token stops the
+    /// turn, which core records as cancelled and completes. A queued turn
+    /// ends without running.
+    fn cancel_turn(&mut self, job: JobId) {
+        let mut kept = VecDeque::new();
+        for prompt in self.prompts.drain(..) {
+            match prompt {
+                Prompt::Agent {
+                    job: owner,
+                    request,
+                } if owner == job => request.deny(),
+                other => kept.push_back(other),
+            }
         }
-        if let Some(cancel) = self.turn_cancel.take() {
-            cancel.cancel();
+        self.prompts = kept;
+        if self.jobs.cancel(job) {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!("Cancelling job #{}…", self.job_number(job)),
+            ));
+        }
+    }
+
+    /// `/cancel N`: any job by its number.
+    fn cancel_job(&mut self, args: &str) {
+        let Some(info) = args
+            .trim()
+            .trim_start_matches('#')
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| self.jobs.by_number(n))
+        else {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                "Usage: /cancel N, with N from /jobs",
+            ));
+            return;
+        };
+        if info.state.is_finished() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!("Job #{} already {}.", info.number, info.state),
+            ));
+        } else if info.kind == JobKind::Chat {
+            self.cancel_turn(info.id);
+        } else if self.jobs.cancel(info.id) {
+            let note = if info.state == JobState::Queued {
+                "it will not start"
+            } else {
+                "it stops at its next checkpoint, or finishes if it has none"
+            };
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!("Cancelling job #{}: {note}.", info.number),
+            ));
+        }
+    }
+
+    /// `/jobs`: active jobs, then the most recent finished ones.
+    fn show_jobs(&mut self) {
+        let jobs = self.jobs.list();
+        if jobs.is_empty() {
             self.messages
-                .push(Message::new(MessageRole::System, "Cancelling…"));
-            self.state = AppState::Thinking;
+                .push(Message::new(MessageRole::System, "No jobs yet."));
+            return;
+        }
+        let mut text = format!("Jobs ({} workers; newest last):", self.jobs.workers());
+        let start = jobs.len().saturating_sub(20);
+        for job in jobs.iter().skip(start) {
+            text.push_str("\n  ");
+            text.push_str(&job_line(job));
+        }
+        text.push_str("\n/cancel N stops a queued or running job.");
+        self.messages.push(Message::new(MessageRole::System, text));
+    }
+
+    /// Stop every job when the session ends: a running turn is recorded as
+    /// cancelled rather than cut off mid-write.
+    fn cancel_all_jobs(&mut self) {
+        for prompt in self.prompts.drain(..) {
+            if let Prompt::Agent { request, .. } = prompt {
+                request.deny();
+            }
+        }
+        for job in self.jobs.list() {
+            if !job.state.is_finished() {
+                self.jobs.cancel(job.id);
+            }
+        }
+    }
+
+    /// Clear the transcript; streaming turns start a new message.
+    fn clear_transcript(&mut self) {
+        self.messages.clear();
+        self.current_chart = None;
+        self.scroll_offset = 0;
+        for turn in &mut self.turns {
+            turn.streaming = None;
+            turn.open_step = None;
         }
     }
 
     fn handle_key_event(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        if (code, modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL)
-            && self.turn_cancel.is_some()
-        {
-            self.cancel_turn();
-            return;
+        let ctrl_c = (code, modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL);
+        if !ctrl_c {
+            self.quit_armed = false;
         }
-        if self.state == AppState::AwaitingPermission {
+        if ctrl_c {
+            // The prompt on screen first, then this session's newest turn.
+            match self.prompts.front() {
+                Some(Prompt::Agent { job, .. }) => {
+                    let job = *job;
+                    self.cancel_turn(job);
+                    return;
+                }
+                Some(Prompt::Sql(_)) => {
+                    self.handle_permission_key(KeyCode::Esc);
+                    return;
+                }
+                None => {
+                    if let Some(job) = self.current_turn() {
+                        self.cancel_turn(job);
+                        return;
+                    }
+                }
+            }
+        }
+        if self.awaiting_permission() {
             self.handle_permission_key(code);
             return;
         }
         match (code, modifiers) {
             (KeyCode::Char('c' | 'q'), KeyModifiers::CONTROL) => {
-                self.should_quit = true;
+                let running = self.jobs.counts(None).active();
+                if running > 0 && !self.quit_armed {
+                    self.quit_armed = true;
+                    self.messages.push(Message::new(
+                        MessageRole::System,
+                        format!(
+                            "{running} job{} still running (/jobs). Press Ctrl+C again to quit and stop {}.",
+                            if running == 1 { " is" } else { "s are" },
+                            if running == 1 { "it" } else { "them" }
+                        ),
+                    ));
+                    self.scroll_offset = 0;
+                } else {
+                    self.should_quit = true;
+                }
             }
-            (KeyCode::Esc, _) if self.state == AppState::Thinking => {
-                self.cancel_turn();
+            (KeyCode::Esc, _) => {
+                if let Some(job) = self.current_turn() {
+                    self.cancel_turn(job);
+                }
             }
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-                self.messages.clear();
+                self.clear_transcript();
                 self.messages
                     .push(Message::new(MessageRole::System, WELCOME_TEXT));
-                self.current_chart = None;
-                self.scroll_offset = 0;
             }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) if self.state == AppState::Idle => {
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 self.textarea = TextArea::default();
                 configure_textarea(&mut self.textarea);
                 self.history_cursor = None;
             }
-            (KeyCode::Enter, KeyModifiers::NONE) if self.state == AppState::Idle => {
+            (KeyCode::Enter, KeyModifiers::NONE) => {
                 self.submit_message();
             }
-            (KeyCode::Up, KeyModifiers::NONE) if self.state == AppState::Idle => {
+            (KeyCode::Up, KeyModifiers::NONE) => {
                 self.history_up();
             }
-            (KeyCode::Down, KeyModifiers::NONE) if self.state == AppState::Idle => {
+            (KeyCode::Down, KeyModifiers::NONE) => {
                 self.history_down();
             }
             (KeyCode::PageUp, _) => {
@@ -603,18 +905,17 @@ impl App {
             (KeyCode::PageDown, _) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(15);
             }
-            (KeyCode::Home, _) if self.state != AppState::Idle || self.textarea.is_empty() => {
+            (KeyCode::Home, _) if self.textarea.is_empty() => {
                 self.scroll_offset = usize::MAX;
             }
-            (KeyCode::End, _) if self.state != AppState::Idle || self.textarea.is_empty() => {
+            (KeyCode::End, _) if self.textarea.is_empty() => {
                 self.scroll_offset = 0;
             }
-            _ if self.state == AppState::Idle => {
+            _ => {
                 self.textarea
                     .input(crossterm::event::KeyEvent::new(code, modifiers));
                 self.history_cursor = None;
             }
-            _ => {}
         }
     }
 
@@ -628,16 +929,23 @@ impl App {
         let Some((allow, for_session)) = decision else {
             return;
         };
-        let Some(request) = self.pending_permission.take() else {
-            self.decide_pending_sql(allow, for_session);
+        let Some(prompt) = self.prompts.pop_front() else {
             return;
+        };
+        let request = match prompt {
+            Prompt::Sql(sql) => {
+                self.decide_pending_sql(sql, allow, for_session);
+                return;
+            }
+            Prompt::Agent { request, .. } => request,
         };
         if allow {
             if for_session {
                 // The rest of this turn through the request, the turns
-                // after through the policy the next turn starts with.
+                // after (queued ones included) through the shared flag
+                // each reads when it starts.
                 request.allow_for_turn();
-                self.allow_write = true;
+                self.allow_write.store(true, Ordering::Relaxed);
             } else {
                 request.allow();
             }
@@ -654,29 +962,23 @@ impl App {
             self.messages
                 .push(Message::new(MessageRole::System, "Refused."));
         }
-        self.state = AppState::Thinking;
     }
 
     /// The user's answer to a `/sql` write prompt.
-    fn decide_pending_sql(&mut self, allow: bool, for_session: bool) {
-        let Some(sql) = self.pending_sql.take() else {
-            self.state = AppState::Idle;
-            return;
-        };
+    fn decide_pending_sql(&mut self, sql: String, allow: bool, for_session: bool) {
         if !allow {
             self.messages
                 .push(Message::new(MessageRole::System, "Refused."));
-            self.state = AppState::Idle;
             return;
         }
         if for_session {
-            self.allow_write = true;
+            self.allow_write.store(true, Ordering::Relaxed);
             self.messages.push(Message::new(
                 MessageRole::System,
                 "Allowed. Writes are permitted for the rest of this session.",
             ));
         }
-        self.execute_direct_sql(sql);
+        self.execute_direct_sql(sql, true);
     }
 
     fn history_up(&mut self) {
@@ -731,12 +1033,12 @@ impl App {
                 self.should_quit = true;
             }
             "/clear" => {
-                self.messages.clear();
+                self.clear_transcript();
                 self.messages
                     .push(Message::new(MessageRole::System, WELCOME_TEXT));
-                self.current_chart = None;
-                self.scroll_offset = 0;
             }
+            "/jobs" => self.show_jobs(),
+            "/cancel" => self.cancel_job(args),
             "/help" | "/?" => {
                 self.messages
                     .push(Message::new(MessageRole::System, HELP_TEXT));
@@ -925,8 +1227,7 @@ impl App {
                     ));
                 } else {
                     self.forget_session_if_empty();
-                    self.messages.clear();
-                    self.current_chart = None;
+                    self.clear_transcript();
                     self.session_id.clone_from(&id);
                     if let Err(e) = self.replay_session(&id) {
                         self.messages
@@ -978,8 +1279,7 @@ impl App {
             Ok(session) => {
                 self.forget_session_if_empty();
                 self.session_id = session.id;
-                self.messages.clear();
-                self.current_chart = None;
+                self.clear_transcript();
                 self.messages.push(Message::new(
                     MessageRole::System,
                     format!("New session {}", self.session_id),
@@ -1061,33 +1361,27 @@ impl App {
         }
     }
 
-    /// Run a job on its own thread and runtime (the workspace is opened
-    /// again there, as ingestion does) and show what it printed.
+    /// Run an ontology, graph, bundle, or context command as a job and
+    /// show what it printed. It shares the session's workspace handle,
+    /// locked only around each database step, and reports chunk progress
+    /// to the job strip.
     fn run_job(&mut self, job: CliJob, label: &str) {
         let config = Arc::clone(&self.config);
-        let workspace_id = self.workspace_id.clone();
         let workspace_name = self.workspace_name.clone();
-        let tx = self.response_tx.clone();
-        self.messages
-            .push(Message::new(MessageRole::System, format!("{label}…")));
-        self.state = AppState::Ingesting;
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let result = match rt {
-                Ok(rt) => rt.block_on(async {
-                    match run_job_inner(&config, &workspace_id, &workspace_name, job).await {
-                        Ok(text) => BackgroundResult::Ingested { summary: text },
-                        Err(e) => BackgroundResult::Error(format!("{e:#}")),
-                    }
-                }),
-                Err(e) => BackgroundResult::Error(format!("runtime: {e}")),
-            };
-            drop(tx.send(result));
-        });
+        let db = Arc::clone(&self.db);
+        let kind = job.kind();
+        self.submit_work(
+            kind,
+            label.to_owned(),
+            Some(&format!("{label}…")),
+            move |ctx| async move {
+                on_blocking_thread(move |rt| {
+                    rt.block_on(run_job_inner(&config, &db, &workspace_name, job, &ctx))
+                })
+                .await
+            },
+        );
     }
-
     fn show_schema(&mut self, table: &str) {
         let table = table.trim();
         if table.is_empty() {
@@ -1464,7 +1758,12 @@ impl App {
         }
     }
 
+    /// Drop the session on screen if nothing was ever recorded in it,
+    /// unless a turn of it is still queued or running.
     fn forget_session_if_empty(&self) {
+        if self.turns.iter().any(|t| t.session_id == self.session_id) {
+            return;
+        }
         if let Ok(db) = self.db.lock() {
             drop(sessions::delete_if_empty(&db, &self.session_id));
         }
@@ -1510,7 +1809,7 @@ impl App {
     }
 
     /// `/import URL TABLE [SOURCE_TABLE]`: rows from an external source
-    /// as a workspace table, on the ingest thread.
+    /// as a workspace table, as a job.
     fn start_import(&mut self, args: &str) {
         let tokens = split_args(args);
         let mut positional: Vec<String> = Vec::new();
@@ -1540,59 +1839,41 @@ impl App {
         };
         let config = Arc::clone(&self.config);
         let workspace_id = self.workspace_id.clone();
-        let tx = self.response_tx.clone();
-        self.messages.push(Message::new(
-            MessageRole::System,
-            format!("Importing from {}", import::redact(&url)),
-        ));
-        self.state = AppState::Ingesting;
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let result = match rt {
-                Ok(rt) => rt.block_on(async {
-                    match run_import_inner(&config, &workspace_id, &request).await {
-                        Ok(summary) => BackgroundResult::Ingested { summary },
-                        Err(e) => BackgroundResult::Error(format!("{e:#}")),
-                    }
-                }),
-                Err(e) => BackgroundResult::Error(format!("runtime: {e}")),
-            };
-            drop(tx.send(result));
-        });
+        let db = Arc::clone(&self.db);
+        let source = import::redact(&url);
+        self.submit_work(
+            JobKind::Import,
+            format!("import {source}"),
+            Some(&format!("Importing from {source}")),
+            move |_| async move {
+                on_blocking_thread(move |rt| {
+                    rt.block_on(run_import_inner(&config, &workspace_id, &db, &request))
+                })
+                .await
+            },
+        );
     }
 
     fn start_ingest(&mut self, path: PathBuf) {
         let config = Arc::clone(&self.config);
         let workspace_id = self.workspace_id.clone();
-        let tx = self.response_tx.clone();
-        self.messages.push(Message::new(
-            MessageRole::System,
-            format!("Ingesting {}", path.display()),
-        ));
-        self.state = AppState::Ingesting;
-
-        // WorkspaceDb is !Sync so the ingest future is !Send.
-        // Run on a dedicated thread with its own single-threaded runtime.
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            match rt {
-                Ok(rt) => {
-                    let result = rt.block_on(run_ingest_task(config, workspace_id, path));
-                    drop(tx.send(result));
-                }
-                Err(e) => {
-                    drop(tx.send(BackgroundResult::Error(format!(
-                        "failed to create runtime: {e:#}"
-                    ))));
-                }
-            }
-        });
+        let db = Arc::clone(&self.db);
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        self.submit_work(
+            JobKind::Ingest,
+            name,
+            Some(&format!("Ingesting {}", path.display())),
+            move |_| async move {
+                on_blocking_thread(move |rt| {
+                    rt.block_on(run_ingest_inner(&config, &workspace_id, &db, &path))
+                })
+                .await
+            },
+        );
     }
-
     /// `/sql`: the same gate the agent's statements pass. Internal tables
     /// are refused, an invalid statement is reported, and a write asks
     /// y/n/a unless writes are already allowed for the session.
@@ -1612,16 +1893,15 @@ impl App {
             }
         };
         match kind {
-            Ok(StatementKind::Read) => self.execute_direct_sql(sql),
-            Ok(StatementKind::Write) if self.allow_write => self.execute_direct_sql(sql),
+            Ok(StatementKind::Read) => self.execute_direct_sql(sql, false),
+            Ok(StatementKind::Write) if self.writes_allowed() => self.execute_direct_sql(sql, true),
             Ok(StatementKind::Write) => {
                 self.messages.push(Message::new(
                     MessageRole::System,
                     "This statement modifies the workspace.\n\
                      Run it?  y = yes   n = no   a = yes, and allow writes for this session",
                 ));
-                self.pending_sql = Some(sql);
-                self.state = AppState::AwaitingPermission;
+                self.prompts.push_back(Prompt::Sql(sql));
                 self.scroll_offset = 0;
             }
             Ok(StatementKind::Invalid(message)) => {
@@ -1635,17 +1915,28 @@ impl App {
         }
     }
 
-    fn execute_direct_sql(&mut self, sql: String) {
-        self.state = AppState::RunningSql;
+    /// Run a gated statement as a job: a read on the reader pool, so it
+    /// never waits on a write, and a write on the writer.
+    fn execute_direct_sql(&mut self, sql: String, write: bool) {
         let db = Arc::clone(&self.db);
-        let tx = self.response_tx.clone();
+        let reader = self.reader_db.clone();
         let max_rows = self.config.analysis.max_query_rows;
-        std::thread::spawn(move || {
-            let result = run_sql_task(&db, &sql, max_rows);
-            drop(tx.send(result));
+        self.submit_work(JobKind::Sql, one_line(&sql), None, move |ctx| async move {
+            // A cancel interrupts the statement itself.
+            let canceller = QueryCanceller::new();
+            let token = ctx.cancel_token();
+            let watch = {
+                let canceller = canceller.clone();
+                tokio::spawn(async move {
+                    token.cancelled().await;
+                    canceller.cancel();
+                })
+            };
+            let result = run_sql_task(db, reader, sql, max_rows, write, canceller).await;
+            watch.abort();
+            result
         });
     }
-
     fn show_tables(&mut self) {
         let listing = match self.db.lock() {
             Ok(db) => db.list_tables(),
@@ -1675,47 +1966,109 @@ impl App {
         }
     }
 
+    /// Submit a question as a job in its session's lane: it starts once
+    /// the session's previous turn has finished (its history includes that
+    /// answer) and a worker is free, and streams into the transcript while
+    /// everything else stays usable.
     fn start_agent_turn(&mut self, message: String) {
         self.messages
             .push(Message::new(MessageRole::User, message.clone()));
-        self.state = AppState::Thinking;
-        self.streaming = None;
-        self.open_step = None;
+        let behind = self.current_turn();
 
-        let policy = if self.allow_write {
-            WritePolicy::Allow
-        } else {
-            WritePolicy::Ask
-        };
         let (sink, rx) = events::channel();
-        self.agent_events = Some(rx);
-        let cancel = CancellationToken::new();
-        self.turn_cancel = Some(cancel.clone());
-
         let config = Arc::clone(&self.config);
         let db = Arc::clone(&self.db);
         let reader_db = self.reader_db.clone();
         let session_id = self.session_id.clone();
-        tokio::spawn(async move {
+        let allow_write = Arc::clone(&self.allow_write);
+        let spec = JobSpec::new(JobKind::Chat, one_line(&message))
+            .workspace(self.workspace_id.clone())
+            .lane(Lane::serial(format!("session:{session_id}")));
+        let job = self.jobs.submit(spec, move |ctx| async move {
+            // Read when the turn starts, so an `a` answered while it
+            // waited applies to it.
+            let policy = if allow_write.load(Ordering::Relaxed) {
+                WritePolicy::Allow
+            } else {
+                WritePolicy::Ask
+            };
             // run_turn emits TurnComplete or Failed itself; the returned
-            // value is the same response, so it is not needed here.
-            drop(
-                llm::run_turn(
-                    &config,
-                    db,
-                    reader_db,
-                    &session_id,
-                    policy,
-                    &message,
-                    sink,
-                    cancel,
-                )
-                .await,
-            );
+            // value is the same response, and the job keeps its outline.
+            match llm::run_turn(
+                &config,
+                db,
+                reader_db,
+                &session_id,
+                policy,
+                &message,
+                sink,
+                ctx.cancel_token(),
+            )
+            .await
+            {
+                Ok(response) if response.cancelled => Err(String::from("cancelled")),
+                Ok(response) => Ok(format!(
+                    "answered: {} steps, {} sources",
+                    response.steps.len(),
+                    response.citations.len()
+                )),
+                Err(e) => Err(e.to_string()),
+            }
         });
+        self.turns.push(Turn {
+            job,
+            session_id: self.session_id.clone(),
+            events: rx,
+            streaming: None,
+            open_step: None,
+            ended: false,
+            closed: false,
+        });
+        if let Some(previous) = behind {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!(
+                    "Queued as job #{}: it runs when job #{} has answered. Esc cancels it.",
+                    self.job_number(job),
+                    self.job_number(previous)
+                ),
+            ));
+        }
     }
 
-    fn handle_background_result(&mut self, result: BackgroundResult) {
+    /// Submit background work that is not an agent turn. The work's
+    /// result is posted to the transcript when it finishes; `announce`
+    /// says what started, with the job's number.
+    fn submit_work<F, Fut>(&mut self, kind: JobKind, label: String, announce: Option<&str>, work: F)
+    where
+        F: FnOnce(JobContext) -> Fut + Send + 'static,
+        Fut: Future<Output = BackgroundResult> + Send + 'static,
+    {
+        let tx = self.response_tx.clone();
+        let spec = JobSpec::new(kind, label).workspace(self.workspace_id.clone());
+        let job = self.jobs.submit(spec, move |ctx| async move {
+            let id = ctx.id();
+            let result = work(ctx).await;
+            let outcome = match &result {
+                BackgroundResult::Ingested { summary } => Ok(one_line(summary)),
+                BackgroundResult::SqlResult { text } => {
+                    Ok(one_line(text.lines().last().unwrap_or_default()))
+                }
+                BackgroundResult::Error(e) => Err(e.clone()),
+            };
+            drop(tx.send((id, result)));
+            outcome
+        });
+        if let Some(text) = announce {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!("{text} (job #{})", self.job_number(job)),
+            ));
+        }
+    }
+
+    fn handle_background_result(&mut self, job: JobId, result: BackgroundResult) {
+        let cancelled = self.jobs.get(job).is_some_and(|j| j.cancel_requested);
         match result {
             BackgroundResult::Ingested { summary } => {
                 self.messages
@@ -1724,11 +2077,16 @@ impl App {
             BackgroundResult::SqlResult { text } => {
                 self.messages.push(Message::new(MessageRole::Sql, text));
             }
+            BackgroundResult::Error(err) if cancelled => {
+                self.messages.push(Message::new(
+                    MessageRole::System,
+                    format!("Job #{} cancelled: {err}", self.job_number(job)),
+                ));
+            }
             BackgroundResult::Error(err) => {
                 self.messages.push(Message::new(MessageRole::Error, err));
             }
         }
-        self.state = AppState::Idle;
         self.scroll_offset = 0;
     }
 }
@@ -1825,28 +2183,69 @@ enum CliJob {
     ContextExport(String),
 }
 
+impl CliJob {
+    const fn kind(&self) -> JobKind {
+        match self {
+            Self::Ontology(_) => JobKind::Ontology,
+            Self::Graph(_) => JobKind::Graph,
+            Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
+            Self::ContextImport(_) => JobKind::Import,
+        }
+    }
+}
+
+/// Run long blocking work (`DuckDB` steps between model calls, and
+/// ingestion futures that are not `Send`) on a thread of its own, driving
+/// any async part on the runtime, and turn its answer into a transcript
+/// result. A detached thread rather than the blocking pool: the runtime
+/// waits for its blocking pool when it shuts down, and quitting must not
+/// wait for an ingest that has no checkpoint to stop at.
+async fn on_blocking_thread(
+    work: impl FnOnce(&tokio::runtime::Handle) -> Result<String> + Send + 'static,
+) -> BackgroundResult {
+    let handle = tokio::runtime::Handle::current();
+    let (done, answer) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name(String::from("quack-job"))
+        .spawn(move || drop(done.send(work(&handle))));
+    if let Err(e) = spawned {
+        return BackgroundResult::Error(format!("could not start the job's thread: {e}"));
+    }
+    match answer.await {
+        Ok(Ok(summary)) => BackgroundResult::Ingested { summary },
+        Ok(Err(e)) => BackgroundResult::Error(format!("{e:#}")),
+        Err(_) => {
+            BackgroundResult::Error(String::from("the job's thread ended before it answered"))
+        }
+    }
+}
+
 async fn run_job_inner(
     config: &Config,
-    workspace_id: &str,
+    db: &SharedDb,
     workspace_name: &str,
     job: CliJob,
+    ctx: &JobContext,
 ) -> Result<String> {
-    let ws_db = WorkspaceDb::open(config, workspace_id)
-        .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
+    let progress = |done: quack_core::progress::ChunkDone| ctx.progress(done.done, done.total);
     let mut out: Vec<u8> = Vec::new();
+    let lock = || {
+        db.lock()
+            .map_err(|e| anyhow::anyhow!("workspace lock poisoned: {e}"))
+    };
     match job {
         CliJob::Ontology(action) => {
-            crate::ontology_cli::run(config, &ws_db, action, &mut out).await?;
+            crate::ontology_cli::run(config, db, action, &mut out, &progress).await?;
         }
         CliJob::Graph(action) => {
-            crate::graph_cli::run(config, &ws_db, action, &mut out).await?;
+            crate::graph_cli::run(config, db, action, &mut out, &progress).await?;
         }
         CliJob::Okf(dir) => {
             let dir = dir.trim();
             if dir.is_empty() {
                 anyhow::bail!("Usage: /okf DIR");
             }
-            let bundle = okf::export(&ws_db, workspace_name)?;
+            let bundle = okf::export(&*lock()?, workspace_name)?;
             bundle.write_to(std::path::Path::new(dir))?;
             std::io::Write::write_all(
                 &mut out,
@@ -1856,14 +2255,14 @@ async fn run_job_inner(
         CliJob::ContextImport(file) => {
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-            let stored = context::set(&ws_db, text.trim(), None)?;
+            let stored = context::set(&*lock()?, text.trim(), None)?;
             std::io::Write::write_all(
                 &mut out,
                 format!("Context is now version {}.", stored.version).as_bytes(),
             )?;
         }
         CliJob::ContextExport(file) => {
-            let current = context::current(&ws_db)?
+            let current = context::current(&*lock()?)?
                 .ok_or_else(|| anyhow::anyhow!("no workspace context to export"))?;
             std::fs::write(&file, &current.content)
                 .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
@@ -1931,13 +2330,38 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-fn run_sql_task(db: &SharedDb, sql: &str, max_rows: u32) -> BackgroundResult {
-    let db = match db.lock() {
-        Ok(db) => db,
-        Err(e) => return BackgroundResult::Error(format!("workspace lock poisoned: {e}")),
-    };
+/// Run one gated statement: a read inside a read-only transaction on the
+/// reader pool, a write on the writer (then let the pool notice a temp
+/// object it could not see).
+async fn run_sql_task(
+    db: SharedDb,
+    reader: ReaderDb,
+    sql: String,
+    max_rows: u32,
+    write: bool,
+    canceller: QueryCanceller,
+) -> BackgroundResult {
     let started = std::time::Instant::now();
-    match db.execute_query_capped(sql, max_rows) {
+    let outcome = if write {
+        let result = tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|e| CoreError::Analysis(format!("workspace lock poisoned: {e}")))?;
+            db.cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows))
+        })
+        .await
+        .map_err(|e| CoreError::Analysis(format!("the query task failed: {e}")))
+        .and_then(|r| r);
+        reader.observe_write().await;
+        result
+    } else {
+        reader
+            .with_db(move |db| {
+                db.cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows))
+            })
+            .await
+    };
+    match outcome {
         Ok(capped) => {
             let mut buf = Vec::new();
             if let Err(e) = capped.results.write_table(&mut buf) {
@@ -1954,6 +2378,45 @@ fn run_sql_task(db: &SharedDb, sql: &str, max_rows: u32) -> BackgroundResult {
         }
         Err(e) => BackgroundResult::Error(format!("{e}")),
     }
+}
+
+/// The first line of `text`, cut to fit a job list.
+fn one_line(text: &str) -> String {
+    const MAX: usize = 60;
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > MAX {
+        let cut: String = line.chars().take(MAX.saturating_sub(1)).collect();
+        format!("{cut}…")
+    } else {
+        line.to_owned()
+    }
+}
+
+/// One job as `/jobs` lists it.
+pub(crate) fn job_line(job: &JobInfo) -> String {
+    let progress = job
+        .progress
+        .map(|p| format!(" {}/{}", p.done, p.total))
+        .unwrap_or_default();
+    let outcome = match (&job.outcome, job.state) {
+        (Some(text), JobState::Succeeded | JobState::Failed | JobState::Cancelled)
+            if !text.is_empty() =>
+        {
+            format!(" — {}", one_line(text))
+        }
+        _ => String::new(),
+    };
+    format!(
+        "#{:<3} {:<9} {:<8} {}{progress}{outcome}",
+        job.number,
+        job.state.as_str(),
+        job.kind.as_str(),
+        job.label
+    )
 }
 
 fn detect_file_path(input: &str) -> Option<PathBuf> {
@@ -1978,28 +2441,16 @@ fn detect_file_path(input: &str) -> Option<PathBuf> {
     if path.is_file() { Some(path) } else { None }
 }
 
-async fn run_ingest_task(
-    config: Arc<Config>,
-    workspace_id: String,
-    path: PathBuf,
-) -> BackgroundResult {
-    match run_ingest_inner(&config, &workspace_id, &path).await {
-        Ok(summary) => BackgroundResult::Ingested { summary },
-        Err(e) => BackgroundResult::Error(format!("{e:#}")),
-    }
-}
-
 async fn run_import_inner(
     config: &Config,
     workspace_id: &str,
+    db: &SharedDb,
     request: &ImportRequest,
 ) -> Result<String> {
-    let ws_db = WorkspaceDb::open(config, workspace_id)
-        .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
     let embedding_model = llm::optional_embedding_model(config).await?;
     let summary = import::import(
         config,
-        &ws_db,
+        db,
         workspace_id,
         request,
         ImportPolicy::owner(),
@@ -2018,6 +2469,7 @@ async fn run_import_inner(
 async fn run_ingest_inner(
     config: &Config,
     workspace_id: &str,
+    db: &SharedDb,
     path: &std::path::Path,
 ) -> Result<String> {
     let data = std::fs::read(path)
@@ -2029,14 +2481,11 @@ async fn run_ingest_inner(
         .unwrap_or("unknown")
         .to_owned();
 
-    let ws_db = WorkspaceDb::open(config, workspace_id)
-        .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
-
     let embedding_model = llm::optional_embedding_model(config).await?;
 
     let outcome = ingestion::ingest_file(
         config,
-        &ws_db,
+        db,
         workspace_id,
         &NewFile::new(&filename, &data),
         embedding_model.as_ref(),
@@ -2114,34 +2563,68 @@ mod tests {
     }
 
     /// Wait for the background result a command posted and apply it.
-    fn settle(app: &mut App) {
-        for _ in 0..200 {
-            if let Ok(result) = app.response_rx.try_recv() {
-                app.handle_background_result(result);
+    async fn settle(app: &mut App) {
+        for _ in 0..400 {
+            if let Ok((job, result)) = app.response_rx.try_recv() {
+                app.handle_background_result(job, result);
+                app.pump();
                 return;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         fail("no background result arrived");
+    }
+
+    /// Pump until `done` holds.
+    async fn pump_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        for _ in 0..400 {
+            app.pump();
+            if done(app) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        fail("the condition never held");
+    }
+
+    /// A turn for a job that waits until it is cancelled.
+    fn waiting_turn(app: &mut App) -> (Turn, events::EventSink) {
+        let job = app.jobs.submit(
+            JobSpec::new(JobKind::Chat, "question").lane(Lane::serial("session:test")),
+            |ctx| async move {
+                ctx.cancel_token().cancelled().await;
+                Err(String::from("cancelled"))
+            },
+        );
+        let (sink, events) = events::channel();
+        let turn = Turn {
+            job,
+            session_id: app.session_id.clone(),
+            events,
+            streaming: None,
+            open_step: None,
+            ended: false,
+            closed: false,
+        };
+        (turn, sink)
     }
 
     fn last(app: &App) -> &Message {
         app.messages.last().unwrap_or_else(|| fail("no messages"))
     }
 
-    #[test]
-    fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
 
-        // A write asks first; `y` runs it on the background thread.
+        // A write asks first; `y` runs it as a job.
         app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a, 'x' AS b");
-        assert_eq!(app.state, AppState::AwaitingPermission);
-        assert!(app.pending_sql.is_some());
+        assert!(app.awaiting_permission());
+        assert!(matches!(app.prompts.front(), Some(Prompt::Sql(_))));
         app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
-        assert_eq!(app.state, AppState::RunningSql);
-        settle(&mut app);
-        assert_eq!(app.state, AppState::Idle);
+        assert!(!app.awaiting_permission());
+        settle(&mut app).await;
         assert_eq!(last(&app).role, MessageRole::Sql);
 
         app.handle_slash_command("/tables");
@@ -2160,8 +2643,8 @@ mod tests {
         app.handle_slash_command("/sql SELECT * FROM _quack_documents");
         assert_eq!(last(&app).role, MessageRole::Error);
         app.handle_slash_command("/sql SELECT a FROM t");
-        assert_eq!(app.state, AppState::RunningSql);
-        settle(&mut app);
+        settle(&mut app).await;
+        assert!(last(&app).content.contains('1'), "{}", last(&app).content);
 
         // The CLI verbs: clap parses them, background jobs answer.
         app.handle_slash_command("/ontology --help");
@@ -2171,17 +2654,21 @@ mod tests {
             last(&app).content
         );
         app.handle_slash_command("/graph status");
-        assert_eq!(app.state, AppState::Ingesting);
-        settle(&mut app);
+        assert!(
+            last(&app).content.contains("(job #"),
+            "{}",
+            last(&app).content
+        );
+        settle(&mut app).await;
         assert!(
             last(&app).content.contains("Graph: 0 nodes"),
             "{}",
             last(&app).content
         );
         app.handle_slash_command("/ontology init");
-        settle(&mut app);
+        settle(&mut app).await;
         app.handle_slash_command("/ontology show");
-        settle(&mut app);
+        settle(&mut app).await;
         assert!(
             last(&app).content.contains("entity"),
             "{}",
@@ -2196,27 +2683,46 @@ mod tests {
         assert!(last(&app).content.contains("keyword search only"));
         app.handle_slash_command("/nope");
         assert!(last(&app).content.contains("unknown command"));
+
+        // Every job so far is on record.
+        app.handle_slash_command("/jobs");
+        let listing = &last(&app).content;
+        assert!(listing.contains("succeeded sql"), "{listing}");
+        assert!(listing.contains("graph"), "{listing}");
+        app.handle_slash_command("/cancel 1");
+        assert!(last(&app).content.contains("already succeeded"));
+        app.handle_slash_command("/cancel x");
+        assert!(last(&app).content.contains("Usage"));
     }
 
-    #[test]
-    fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        app.state = AppState::Thinking;
-        app.handle_agent_event(AgentEvent::ToolStarted {
-            tool: String::from("run_sql"),
-            detail: (1..=6)
-                .map(|i| format!("line {i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        });
-        app.handle_agent_event(AgentEvent::ToolFinished(ToolStep {
-            tool: String::from("run_sql"),
-            detail: String::new(),
-            summary: String::from("3 rows"),
-            duration_ms: 4,
-        }));
-        app.handle_agent_event(AgentEvent::TextDelta(String::from("**Three** rows")));
+        let (mut turn, _sink) = waiting_turn(&mut app);
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::ToolStarted {
+                tool: String::from("run_sql"),
+                detail: (1..=6)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+        );
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::ToolFinished(ToolStep {
+                tool: String::from("run_sql"),
+                detail: String::new(),
+                summary: String::from("3 rows"),
+                duration_ms: 4,
+            }),
+        );
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::TextDelta(String::from("**Three** rows")),
+        );
         let spec: ChartSpec = serde_json::from_value(serde_json::json!({
             "title": "Rows by kind",
             "kind": "bar",
@@ -2224,12 +2730,15 @@ mod tests {
             "series": [{ "name": "n", "values": [1.0, 2.0] }]
         }))
         .unwrap_or_else(|e| fail(&e.to_string()));
-        app.handle_agent_event(AgentEvent::TurnComplete(AgentResponse {
-            content: String::from("**Three** rows"),
-            chart: Some(spec),
-            ..AgentResponse::default()
-        }));
-        assert_eq!(app.state, AppState::Idle);
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::TurnComplete(AgentResponse {
+                content: String::from("**Three** rows"),
+                chart: Some(spec),
+                ..AgentResponse::default()
+            }),
+        );
+        assert!(turn.streaming.is_none());
         let assistant = app
             .messages
             .iter()
@@ -2271,33 +2780,104 @@ mod tests {
         app.handle_slash_command("/chart 9");
         assert_eq!(last(&app).role, MessageRole::Error);
 
-        // Esc while a turn runs cancels it; Ctrl+C when idle quits.
-        let token = CancellationToken::new();
-        app.turn_cancel = Some(token.clone());
-        app.state = AppState::Thinking;
+        // Esc while a turn runs cancels it; typing goes on meanwhile.
+        let job = turn.job;
+        app.turns.push(turn);
+        app.handle_key_event(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(app.textarea.lines().join(""), "h");
         app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(token.is_cancelled());
-        assert!(last(&app).content.contains("Cancelling"));
-        app.finish_turn();
+        assert!(last(&app).content.contains("Cancelling job #1"));
+        let finished = tokio::time::timeout(Duration::from_secs(5), app.jobs.wait(job))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("the turn did not end"));
+        assert_eq!(finished.state, JobState::Cancelled);
+        app.turns.clear();
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.should_quit);
+        assert!(app.should_quit, "Ctrl+C with nothing running quits");
     }
 
-    #[test]
-    fn without_a_chat_model_questions_say_how_to_set_one_and_sql_still_runs() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ctrl_c_with_jobs_running_asks_for_a_second_press() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let (sql_sink, sql_rx) = tokio::sync::oneshot::channel::<()>();
+        app.jobs
+            .submit(JobSpec::new(JobKind::Sql, "slow"), |_| async move {
+                drop(sql_rx.await);
+                Ok(String::new())
+            });
+        pump_until(&mut app, |app| !app.active_jobs.is_empty()).await;
+        assert!(!ui::job_strip(&app).is_empty(), "the strip shows it");
+        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit);
+        assert!(last(&app).content.contains("still running"));
+        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert!(sql_sink.send(()).is_ok());
+        pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
+        assert!(ui::job_strip(&app).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn questions_queue_per_session_while_other_work_runs() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        // No chat model: each turn fails fast, but it still goes through
+        // the session's lane in order and leaves the transcript usable.
+        app.start_agent_turn(String::from("first?"));
+        app.start_agent_turn(String::from("second?"));
+        assert_eq!(app.turns.len(), 2);
+        assert!(
+            last(&app).content.contains("Queued as job #2"),
+            "{}",
+            last(&app).content
+        );
+        // SQL runs alongside.
+        app.set_textarea_content("SELECT 6 * 7 AS answer");
+        app.submit_message();
+        pump_until(&mut app, |app| {
+            app.turns.is_empty() && app.active_jobs.is_empty()
+        })
+        .await;
+        // `pump` applied the query's result on the way.
+        assert!(
+            app.messages.iter().any(|m| m.content.contains("42")),
+            "the query answered"
+        );
+        let jobs = app.jobs.list();
+        assert_eq!(jobs.len(), 3);
+        let chats: Vec<_> = jobs.iter().filter(|j| j.kind == JobKind::Chat).collect();
+        assert!(chats.iter().all(|j| j.state == JobState::Failed));
+        // The lane ran them in order.
+        assert!(
+            chats
+                .first()
+                .and_then(|a| a.finished_at)
+                .zip(chats.get(1).and_then(|b| b.started_at))
+                .is_some_and(|(a_end, b_start)| a_end <= b_start)
+        );
+        assert!(
+            app.messages.iter().any(|m| m.role == MessageRole::Error),
+            "the failure is in the transcript"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_chat_model_questions_say_how_to_set_one_and_sql_still_runs() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
         assert!(app.messages.iter().any(|m| m.content == NO_CHAT_MODEL_TEXT));
 
         app.set_textarea_content("how many orders shipped late?");
         app.submit_message();
-        assert_eq!(app.state, AppState::Idle);
-        assert!(app.agent_events.is_none());
+        assert!(app.turns.is_empty());
         assert!(last(&app).content.contains("quack doctor"));
 
         app.set_textarea_content("SELECT 41 + 1 AS answer");
         app.submit_message();
-        settle(&mut app);
+        settle(&mut app).await;
         assert!(last(&app).content.contains("42"), "{}", last(&app).content);
     }
 

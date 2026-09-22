@@ -6,6 +6,7 @@ pub mod error;
 pub mod graph;
 pub mod import;
 pub mod ingestion;
+pub mod jobs;
 pub mod llm;
 pub mod okf;
 pub mod ontology;

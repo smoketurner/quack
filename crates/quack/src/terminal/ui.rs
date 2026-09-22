@@ -4,8 +4,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::terminal::app::{App, AppState, MessageRole};
+use crate::terminal::app::{App, MessageRole};
 use crate::terminal::chart;
+use quack_core::jobs::{JobInfo, JobState};
+
+/// Jobs listed above the input at most; the rest are counted.
+const STRIP_JOBS: usize = 3;
 
 const SPINNER: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -17,44 +21,88 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         .current_chart
         .as_ref()
         .map_or(0, chart::ChartData::height);
+    let strip = job_strip(app);
+    let strip_height = u16::try_from(strip.len()).unwrap_or(u16::MAX);
 
-    if chart_height > 0 {
-        let [
-            header_area,
-            messages_area,
-            chart_area,
-            input_area,
-            status_area,
-        ] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(3),
-            Constraint::Length(chart_height),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
+    let [
+        header_area,
+        messages_area,
+        chart_area,
+        jobs_area,
+        input_area,
+        status_area,
+    ] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(chart_height),
+        Constraint::Length(strip_height),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
 
-        draw_header(frame, header_area, app);
-        draw_messages(frame, messages_area, app);
-        if let Some(chart_data) = &app.current_chart {
-            chart::render_chart(frame, chart_area, chart_data);
-        }
-        draw_input(frame, input_area, app);
-        draw_status(frame, status_area, app);
-    } else {
-        let [header_area, messages_area, input_area, status_area] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-
-        draw_header(frame, header_area, app);
-        draw_messages(frame, messages_area, app);
-        draw_input(frame, input_area, app);
-        draw_status(frame, status_area, app);
+    draw_header(frame, header_area, app);
+    draw_messages(frame, messages_area, app);
+    if let Some(chart_data) = &app.current_chart
+        && chart_height > 0
+    {
+        chart::render_chart(frame, chart_area, chart_data);
     }
+    if strip_height > 0 {
+        frame.render_widget(Paragraph::new(Text::from(strip)), jobs_area);
+    }
+    draw_input(frame, input_area, app);
+    draw_status(frame, status_area, app);
+}
+
+/// The strip above the input: one line per active job (running first),
+/// with a spinner, its number, kind, label, and progress, and a count of
+/// any beyond [`STRIP_JOBS`]. Empty when nothing is queued or running.
+pub(crate) fn job_strip(app: &App) -> Vec<Line<'static>> {
+    let mut jobs: Vec<&JobInfo> = app.active_jobs.iter().collect();
+    jobs.sort_by_key(|j| (j.state != JobState::Running, j.number));
+    let mut lines: Vec<Line<'static>> = jobs
+        .iter()
+        .take(STRIP_JOBS)
+        .map(|job| {
+            let (marker, style) = if job.state == JobState::Running {
+                (spinner_frame(app.tick), Style::default().fg(Color::Yellow))
+            } else {
+                ("\u{00B7}", Style::default().fg(Color::DarkGray))
+            };
+            let mut detail = String::new();
+            if let Some(p) = job.progress {
+                detail = format!("  {}/{}", p.done, p.total);
+            }
+            if let Some(status) = job.status.as_deref() {
+                detail.push_str("  ");
+                detail.push_str(status);
+            }
+            if job.state == JobState::Queued {
+                detail.push_str("  queued");
+            }
+            if job.cancel_requested {
+                detail.push_str("  cancelling");
+            }
+            Line::from(vec![
+                Span::styled(format!(" {marker} #{} ", job.number), style),
+                Span::styled(
+                    format!("{} ", job.kind),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(job.label.clone()),
+                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
+    let more = jobs.len().saturating_sub(STRIP_JOBS);
+    if more > 0 {
+        lines.push(Line::styled(
+            format!("   and {more} more (/jobs)"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -111,7 +159,22 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.state == AppState::Idle {
+    if app.awaiting_permission() {
+        let status_line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Run this statement?",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  [y] run   [n] refuse   [a] run and allow writes this session",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(status_line), inner);
+    } else {
         let [prompt_area, text_area] =
             Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).areas(inner);
 
@@ -123,33 +186,6 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )]));
         frame.render_widget(prompt, prompt_area);
         frame.render_widget(&app.textarea, text_area);
-    } else {
-        let frame_str = spinner_frame(app.tick);
-        let status_line = if app.state == AppState::AwaitingPermission {
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    "Run this statement?",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "  [y] run   [n] refuse   [a] run and allow writes this session",
-                    Style::default().fg(Color::Yellow),
-                ),
-            ])
-        } else {
-            let label = state_label(&app.state);
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    format!("{frame_str} {label}"),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ])
-        };
-        frame.render_widget(Paragraph::new(status_line), inner);
     }
 }
 
@@ -190,9 +226,25 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
         Span::styled(scroll_indicator, Style::default().fg(Color::DarkGray)),
+        Span::styled(jobs_indicator(app), Style::default().fg(Color::DarkGray)),
     ]);
 
     frame.render_widget(Paragraph::new(status), area);
+}
+
+/// ` · 2 running, 1 queued · /jobs`, or nothing when idle.
+fn jobs_indicator(app: &App) -> String {
+    let running = app
+        .active_jobs
+        .iter()
+        .filter(|j| j.state == JobState::Running)
+        .count();
+    let queued = app.active_jobs.len().saturating_sub(running);
+    match (running, queued) {
+        (0, 0) => String::new(),
+        (r, 0) => format!(" \u{00B7} {r} running \u{00B7} /jobs"),
+        (r, q) => format!(" \u{00B7} {r} running, {q} queued \u{00B7} /jobs"),
+    }
 }
 
 pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
@@ -251,18 +303,6 @@ pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
 
-    if app.state != AppState::Idle && app.state != AppState::AwaitingPermission {
-        let frame_str = spinner_frame(app.tick);
-        let label = state_label(&app.state);
-        lines.push(Line::from(vec![
-            Span::raw("   "),
-            Span::styled(
-                format!("{frame_str} {label}"),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    }
-
     lines
 }
 
@@ -300,16 +340,6 @@ fn step_body(
     }
     rows.splice(at..at, detail_rows);
     rows
-}
-
-fn state_label(state: &AppState) -> &'static str {
-    match state {
-        AppState::Thinking => "Thinking...",
-        AppState::Ingesting => "Ingesting file...",
-        AppState::RunningSql => "Running query...",
-        AppState::AwaitingPermission => "Waiting for your answer...",
-        AppState::Idle => "",
-    }
 }
 
 #[expect(

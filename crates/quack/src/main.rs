@@ -512,13 +512,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             outcome?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Ontology { action } => {
-            let ws_db = open_workspace(cli).await?;
-            let config = Config::load().context("failed to load configuration")?;
-            let stdout = std::io::stdout();
-            let mut out = std::io::BufWriter::new(stdout.lock());
-            exit_after(ontology_cli::run(&config, &ws_db, action, &mut out).await)
-        }
+        Commands::Ontology { action } => run_ontology(cli, action).await,
         Commands::Graph { action } => run_graph(cli, action).await,
         Commands::Okf {
             action: OkfAction::Export { dir },
@@ -803,7 +797,33 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
     let config = Config::load().context("failed to load configuration")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    exit_after(graph_cli::run(&config, &ws_db, action, &mut out).await)
+    exit_after(
+        graph_cli::run(
+            &config,
+            &ws_db,
+            action,
+            &mut out,
+            &ontology_cli::chunk_progress,
+        )
+        .await,
+    )
+}
+
+async fn run_ontology(cli: &Cli, action: ontology_cli::OntologyAction) -> Result<ExitCode> {
+    let ws_db = open_workspace(cli).await?;
+    let config = Config::load().context("failed to load configuration")?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    exit_after(
+        ontology_cli::run(
+            &config,
+            &ws_db,
+            action,
+            &mut out,
+            &ontology_cli::chunk_progress,
+        )
+        .await,
+    )
 }
 
 /// The exit code for a command that may have needed a provider login:

@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::queue::UploadJob;
+use crate::server::queue::{UploadJob, submit_upload};
 use crate::server::state::{App, with_db};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::candidates;
@@ -286,22 +286,23 @@ pub(crate) async fn enqueue(
                 Some(serde_json::json!({ "filename": filename, "size_bytes": size })),
             )
             .await?;
-        app.queue
-            .submit(
-                &app.config,
-                &id,
-                Arc::clone(&db),
-                UploadJob {
-                    document_id: document_id.clone(),
-                    filename: filename.clone(),
-                    data,
-                },
-            )
-            .await
-            .map_err(ApiError::internal)?;
-        queued.push(
-            serde_json::json!({ "id": document_id, "filename": filename, "status": "queued" }),
+        let job = submit_upload(
+            app,
+            &id,
+            Some(access.identity.user_id.clone()),
+            Arc::clone(&db),
+            UploadJob {
+                document_id: document_id.clone(),
+                filename: filename.clone(),
+                data,
+            },
         );
+        queued.push(serde_json::json!({
+            "id": document_id,
+            "filename": filename,
+            "status": "queued",
+            "job": job,
+        }));
     }
     Ok(queued)
 }

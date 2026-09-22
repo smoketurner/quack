@@ -147,6 +147,7 @@ fn test_config(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
+        jobs: quack_core::config::JobsConfig::default(),
     }
 }
 
@@ -167,6 +168,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
+        jobs: quack_core::config::JobsConfig::default(),
     }
 }
 

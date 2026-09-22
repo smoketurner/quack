@@ -8,6 +8,7 @@ mod context;
 pub(crate) mod documents;
 pub(crate) mod graph;
 pub(crate) mod import;
+pub(crate) mod jobs;
 mod members;
 pub(crate) mod okf;
 pub(crate) mod ontology;
@@ -95,6 +96,10 @@ pub(crate) fn router() -> Router<App> {
             "/workspaces/{id}/graph/merges/{mid}",
             axum::routing::put(graph::decide_merge),
         )
+        .route("/workspaces/{id}/jobs", get(jobs::list))
+        .route("/workspaces/{id}/jobs/stream", get(jobs::stream))
+        .route("/workspaces/{id}/jobs/{job}", get(jobs::show))
+        .route("/workspaces/{id}/jobs/{job}/cancel", post(jobs::cancel))
         .route("/workspaces/{id}/sessions", get(sessions::list))
         .route(
             "/workspaces/{id}/sessions/{sid}",

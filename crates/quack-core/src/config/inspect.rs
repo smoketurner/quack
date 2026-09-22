@@ -331,6 +331,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "allow_private_hosts",
         ],
     ),
+    ("jobs", &["workers", "history"]),
 ];
 
 /// The table of providers, whose sub-tables are named by the operator.
@@ -376,6 +377,7 @@ fn collect(config: &Config, file: Option<&Table>, in_force: bool) -> Vec<Setting
     ontology(&mut inventory, config, &defaults);
     graph(&mut inventory, config, &defaults);
     import(&mut inventory, config, &defaults);
+    jobs(&mut inventory, config, &defaults);
     inventory.settings
 }
 
@@ -578,6 +580,13 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         server.session_idle_minutes,
         default.session_idle_minutes,
     );
+}
+
+fn jobs(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
+    let (jobs, default) = (&config.jobs, &defaults.jobs);
+    let mut s = inventory.section("jobs");
+    s.number("workers", jobs.workers, default.workers);
+    s.number("history", jobs.history, default.history);
 }
 
 fn ontology(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
@@ -1171,7 +1180,7 @@ top_k = 3
             .collect();
         assert_eq!(sections.first(), Some(&"general"));
         assert!(sections.contains(&"providers.ollama"));
-        assert_eq!(sections.last(), Some(&"import"));
+        assert_eq!(sections.last(), Some(&"jobs"));
     }
 
     #[test]

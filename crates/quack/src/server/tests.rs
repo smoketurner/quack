@@ -3186,3 +3186,140 @@ async fn the_login_form_is_rate_limited_and_healthz_is_not() {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 }
+
+// --- jobs ----------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
+    use quack_core::jobs::{JobKind, JobSpec, JobState, Lane};
+
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let member = h.user("member", false).await;
+    let other = h.user("other", false).await;
+    let viewer = h.user("viewer", false).await;
+    let ws = h.workspace("work", &owner).await;
+    let elsewhere = h.workspace("elsewhere", &owner).await;
+    for (user, role) in [
+        (&member, Role::Member),
+        (&other, Role::Member),
+        (&viewer, Role::Viewer),
+    ] {
+        h.app
+            .control
+            .set_member(&ws, user, role)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let owner_token = h.login("owner").await;
+    let member_token = h.login("member").await;
+    let other_token = h.login("other").await;
+    let viewer_token = h.login("viewer").await;
+    let jobs = format!("/api/v1/workspaces/{ws}/jobs");
+
+    // An upload answers with its job, which the list reports as it ends.
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/documents"),
+            &owner_token,
+            serde_json::json!({ "text": "Jobs run in the background.", "title": "notes" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let upload_job = body["documents"][0]["job"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let doc = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(
+        h.wait_ready(&ws, &doc, &owner_token).await["status"],
+        "ready"
+    );
+    let (status, body) = h.get(&format!("{jobs}/{upload_job}"), &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kind"], "ingest");
+    assert_eq!(body["label"], "notes.md");
+    assert_eq!(body["state"], "succeeded", "{body}");
+    assert_eq!(body["lane"], format!("ingest:{ws}"));
+
+    // A member's question, waiting on its cancel token.
+    let question = h.app.jobs.submit(
+        JobSpec::new(JobKind::Chat, "what is our churn?")
+            .workspace(ws.clone())
+            .owner(Some(member.clone()))
+            .lane(Lane::serial("session:s")),
+        |ctx| async move {
+            ctx.cancel_token().cancelled().await;
+            Err(String::from("cancelled"))
+        },
+    );
+    let (status, body) = h.get(&jobs, &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["jobs"].as_array().map(Vec::len), Some(2));
+    // Newest first; another member's question text stays private.
+    assert_eq!(body["jobs"][0]["kind"], "chat");
+    assert_eq!(body["jobs"][0]["label"], "a question in a private session");
+    let (_, body) = h.get(&jobs, &owner_token).await;
+    assert_eq!(body["jobs"][0]["label"], "what is our churn?");
+    let (_, body) = h.get(&jobs, &member_token).await;
+    assert_eq!(body["jobs"][0]["label"], "what is our churn?");
+    assert_eq!(body["running"], 1);
+
+    // Only the job's owner (or a workspace owner) cancels it; a viewer
+    // cannot write at all.
+    let cancel = format!("{jobs}/{question}/cancel");
+    let (status, _) = h
+        .call(Method::POST, &cancel, Some(&viewer_token), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .call(Method::POST, &cancel, Some(&other_token), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = h
+        .call(Method::POST, &cancel, Some(&member_token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cancel_requested"], true);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), h.app.jobs.wait(question))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("the question never ended"));
+    assert_eq!(ended.state, JobState::Cancelled);
+    let denied = h
+        .audit(AuditFilter {
+            action: Some(String::from("cancel")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(denied.len(), 2, "one denied, one allowed: {denied:?}");
+
+    // A job is found only under its own workspace.
+    let (status, _) = h
+        .get(
+            &format!("/api/v1/workspaces/{elsewhere}/jobs/{upload_job}"),
+            &owner_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h.get(&format!("{jobs}/not-a-job"), &owner_token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The web console lists the same jobs.
+    let (status, html, _) = h.page(&format!("/w/{ws}/jobs"), Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(
+        html.contains("notes.md") && html.contains("what is our churn?"),
+        "{html}"
+    );
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/jobs/rows"), Some(&viewer_token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("a question in a private session"), "{html}");
+    assert!(!html.contains("Cancel</button>"), "{html}");
+}

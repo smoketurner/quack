@@ -218,6 +218,37 @@ struct DocumentsPage {
 }
 
 #[derive(Template)]
+#[template(path = "jobs.html")]
+struct JobsPage {
+    page: Page,
+    rows: String,
+    workers: u32,
+}
+
+/// One job as the Jobs page shows it.
+struct JobView {
+    id: String,
+    number: u64,
+    kind: String,
+    label: String,
+    /// `queued`, `running`, `cancelling`, or a final state.
+    state: String,
+    active: bool,
+    can_cancel: bool,
+    progress: String,
+    outcome: Option<String>,
+    queued_at: String,
+}
+
+#[derive(Template)]
+#[template(path = "jobs_rows.html")]
+struct JobRows {
+    ws_id: String,
+    jobs: Vec<JobView>,
+    pending: bool,
+}
+
+#[derive(Template)]
 #[template(path = "documents_rows.html")]
 struct DocumentRows {
     ws_id: String,
@@ -432,6 +463,9 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
+        .route("/w/{id}/jobs", get(jobs_page))
+        .route("/w/{id}/jobs/rows", get(job_rows))
+        .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
         .route("/w/{id}/tables", get(tables))
         .route("/w/{id}/import", post(import_submit))
         .route("/w/{id}/tables/{name}", get(table))
@@ -855,6 +889,74 @@ async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
         pending,
     }
     .render()?)
+}
+
+fn render_jobs(app: &App, access: &Access) -> WebResult<String> {
+    let jobs: Vec<JobView> = super::api::jobs::visible_jobs(app, access)
+        .into_iter()
+        .map(|j| JobView {
+            id: j.id.to_string(),
+            number: j.number,
+            kind: j.kind.to_string(),
+            can_cancel: !j.state.is_finished() && super::api::jobs::may_cancel(access, &j),
+            label: j.label,
+            state: if j.cancel_requested && !j.state.is_finished() {
+                String::from("cancelling")
+            } else {
+                j.state.to_string()
+            },
+            active: !j.state.is_finished(),
+            progress: j
+                .progress
+                .map(|p| format!("{} / {}", p.done, p.total))
+                .unwrap_or_default(),
+            outcome: j.outcome.or(j.status),
+            queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+        })
+        .collect();
+    let pending = jobs.iter().any(|j| j.active);
+    Ok(JobRows {
+        ws_id: access.workspace.id.clone(),
+        jobs,
+        pending,
+    }
+    .render()?)
+}
+
+async fn jobs_page(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "jobs").await?;
+    let rows = render_jobs(&app, &access)?;
+    html(&JobsPage {
+        page: page(&app, &access.identity, "Jobs", Some(&access)),
+        rows,
+        workers: app.jobs.workers(),
+    })
+}
+
+async fn job_rows(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, "page", "job_rows").await?;
+    Ok(Html(render_jobs(&app, &access)?).into_response())
+}
+
+async fn job_cancel(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, job)): Path<(String, String)>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let cancelled = super::api::jobs::cancel_job(&app, &access, &job).await?;
+    tracing::debug!(job = %cancelled.id, state = %cancelled.state, "cancel requested from the web");
+    Ok(Html(render_jobs(&app, &access)?).into_response())
 }
 
 async fn documents(

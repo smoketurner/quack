@@ -9,7 +9,9 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
+use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::{App, with_db};
+use quack_core::jobs::{JobKind, JobSpec, Lane};
 use quack_core::ontology::{Ontology, candidates, documents, store};
 
 pub(crate) async fn show(
@@ -435,12 +437,20 @@ pub(crate) async fn start_document_run(
             Some(serde_json::json!({ "documents": true, "cost": cost })),
         )
         .await?;
+    let spec = JobSpec::new(JobKind::Ontology, "ontology document pass")
+        .workspace(id)
+        .owner(Some(access.identity.user_id.clone()))
+        .lane(Lane::serial(format!("ontology:{id}")));
+    let (cancel_app, cancel_access, cancel_run) =
+        (std::sync::Arc::clone(app), access.clone(), run.clone());
+    let jobs = app.jobs.clone();
     let app = std::sync::Arc::clone(app);
     let access = access.clone();
     let run_id = run.clone();
-    tokio::spawn(async move {
+    let job = jobs.submit(spec, move |ctx| async move {
         let base = if extend { current.as_ref() } else { None };
         let progress = |done: quack_core::progress::ChunkDone| {
+            ctx.progress(done.done, done.total);
             tracing::info!(
                 run = %run_id,
                 done = done.done,
@@ -468,33 +478,61 @@ pub(crate) async fn start_document_run(
             .map_err(|e| e.message),
             Err(e) => Err(e.to_string()),
         };
-        let (outcome, detail) = match &result {
-            Ok(summary) => (
-                Outcome::Allowed,
-                serde_json::json!({ "finished": true, "summary": summary }),
-            ),
-            Err(e) => (
-                Outcome::Error,
-                serde_json::json!({ "finished": true, "error": e }),
-            ),
-        };
-        if let Err(e) = access
-            .audit(
-                &app,
-                "propose",
-                Some(("induction_run", &run_id)),
-                outcome,
-                Some(detail),
-            )
-            .await
-        {
-            tracing::error!(error = %e.message, "audit write failed after the document pass");
-        }
-        if let Err(e) = result {
-            tracing::warn!(run = %run_id, error = %e, "document induction failed");
-        }
+        finish_document_run(&app, &access, &run_id, result).await
+    });
+    when_cancelled_unstarted(&jobs, job, move || async move {
+        super::graph::audit_cancelled(
+            &cancel_app,
+            &cancel_access,
+            "propose",
+            "induction_run",
+            &cancel_run,
+        )
+        .await;
     });
     Ok(Json(
-        serde_json::json!({ "run": run, "cost": cost, "status": "running" }),
+        serde_json::json!({ "run": run, "cost": cost, "job": job, "status": "running" }),
     ))
+}
+
+/// Audit the end of a document pass under its run id and turn its result
+/// into the job's outcome.
+async fn finish_document_run(
+    app: &App,
+    access: &Access,
+    run_id: &str,
+    result: Result<documents::RunSummary, String>,
+) -> quack_core::jobs::JobResult {
+    let (outcome, detail) = match &result {
+        Ok(summary) => (
+            Outcome::Allowed,
+            serde_json::json!({ "finished": true, "summary": summary }),
+        ),
+        Err(e) => (
+            Outcome::Error,
+            serde_json::json!({ "finished": true, "error": e }),
+        ),
+    };
+    if let Err(e) = access
+        .audit(
+            app,
+            "propose",
+            Some(("induction_run", run_id)),
+            outcome,
+            Some(detail),
+        )
+        .await
+    {
+        tracing::error!(error = %e.message, "audit write failed after the document pass");
+    }
+    match result {
+        Ok(summary) => Ok(format!(
+            "{} candidates from {} chunks",
+            summary.candidates, summary.sampled_chunks
+        )),
+        Err(e) => {
+            tracing::warn!(run = %run_id, error = %e, "document induction failed");
+            Err(e)
+        }
+    }
 }

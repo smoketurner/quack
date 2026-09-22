@@ -35,6 +35,7 @@ pub struct Config {
     pub ontology: OntologyConfig,
     pub graph: GraphConfig,
     pub import: ImportConfig,
+    pub jobs: JobsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -310,6 +311,26 @@ impl GraphConfig {
             max_nodes: self.max_nodes,
             merge_threshold: self.merge_threshold,
             auto_merge_threshold: self.auto_merge_threshold,
+        }
+    }
+}
+
+/// The work queue every interface submits background work to (design doc
+/// 4.1): agent turns, SQL, ingests, imports, ontology and graph runs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JobsConfig {
+    /// Jobs that run at once across the process; the rest wait queued.
+    pub workers: u32,
+    /// Finished jobs kept for the job list, newest first.
+    pub history: u32,
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            workers: 4,
+            history: 100,
         }
     }
 }

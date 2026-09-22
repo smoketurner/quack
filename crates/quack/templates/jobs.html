@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<h1 class="text-xl font-semibold">Jobs</h1>
+<p class="mt-2 text-sm text-slate-600">Uploads, graph extraction, ontology proposals, and questions run in the background, up to {{ workers }} at once across the server; questions in one session are answered in order. This list follows them as they run.</p>
+<div id="rows" class="mt-6" hx-get="/w/{{ ws.id }}/jobs/rows" hx-trigger="every 2s [document.querySelector('#rows [data-pending]')]" hx-swap="innerHTML">
+{{ rows|safe }}
+</div>
+{% endif %}
+{% endblock %}

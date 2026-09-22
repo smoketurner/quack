@@ -12,6 +12,7 @@ use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane};
 use quack_core::llm;
 use quack_core::storage::control::Outcome;
 use quack_core::storage::sessions::{self, ChatMode};
@@ -108,19 +109,23 @@ async fn prepare(
     Ok((access, db, reader_db, session_id, policy))
 }
 
-/// Cancels the turn when dropped: the SSE stream holds one, so a client
-/// that goes away stops the model instead of leaving the turn to finish
-/// unwatched (issue #45).
-struct CancelOnDrop(llm::CancellationToken);
+/// Cancels the turn's job when dropped: the SSE stream holds one, so a
+/// client that goes away stops the model (or takes a queued turn out of
+/// the queue) instead of leaving the turn to finish unwatched (issue #45).
+struct CancelOnDrop(JobQueue, JobId);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.cancel();
+        self.0.cancel(self.1);
     }
 }
 
+/// Submit the turn as a job in its session's lane (one turn at a time per
+/// session, in order) and return its events. When every worker is busy the
+/// stream opens with a `status` saying the turn is queued.
 fn start_turn(
     app: &App,
+    access: &Access,
     db: SharedDb,
     reader_db: ReaderDb,
     session_id: &str,
@@ -128,28 +133,45 @@ fn start_turn(
     prompt: &str,
 ) -> (events::EventStream, CancelOnDrop) {
     let (sink, stream) = events::channel();
+    let counts = app.jobs.counts(None);
+    if counts.active() >= usize::try_from(app.jobs.workers()).unwrap_or(usize::MAX) {
+        drop(sink.send(AgentEvent::Status(format!(
+            "Queued: {} jobs ahead on {} workers.",
+            counts.active(),
+            app.jobs.workers()
+        ))));
+    }
     let config = app.config.clone();
-    let session_id = session_id.to_owned();
-    let prompt = prompt.to_owned();
-    let cancel = llm::CancellationToken::new();
-    let token = cancel.clone();
-    tokio::spawn(async move {
+    let session = session_id.to_owned();
+    let text = prompt.to_owned();
+    let spec = JobSpec::new(JobKind::Chat, prompt.chars().take(80).collect::<String>())
+        .workspace(access.workspace.id.clone())
+        .owner(Some(access.identity.user_id.clone()))
+        .lane(Lane::serial(format!("session:{session_id}")));
+    let job = app.jobs.submit(spec, move |ctx| async move {
         // run_turn emits TurnComplete or Failed itself.
-        drop(
-            llm::run_turn(
-                &config,
-                db,
-                reader_db,
-                &session_id,
-                policy,
-                &prompt,
-                sink,
-                token,
-            )
-            .await,
-        );
+        match llm::run_turn(
+            &config,
+            db,
+            reader_db,
+            &session,
+            policy,
+            &text,
+            sink,
+            ctx.cancel_token(),
+        )
+        .await
+        {
+            Ok(response) if response.cancelled => Err(String::from("cancelled")),
+            Ok(response) => Ok(format!(
+                "answered: {} steps, {} sources",
+                response.steps.len(),
+                response.citations.len()
+            )),
+            Err(e) => Err(e.to_string()),
+        }
     });
-    (stream, CancelOnDrop(cancel))
+    (stream, CancelOnDrop(app.jobs.clone(), job))
 }
 
 /// Audit the turn. A failed turn that left the session without any message
@@ -198,7 +220,15 @@ pub(crate) async fn query(
     let (access, db, reader_db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
     // A client that disconnects drops this future, and the guard with it,
     // which cancels the turn.
-    let (mut stream, _guard) = start_turn(&app, db, reader_db, &session_id, policy, &body.prompt);
+    let (mut stream, _guard) = start_turn(
+        &app,
+        &access,
+        db,
+        reader_db,
+        &session_id,
+        policy,
+        &body.prompt,
+    );
     let mut failure = None;
     let mut complete = None;
     while let Some(event) = stream.recv().await {
@@ -261,7 +291,15 @@ pub(crate) async fn stream(
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let (access, db, reader_db, session_id, policy) = prepare(&app, identity, &id, &body).await?;
-    let (events, guard) = start_turn(&app, db, reader_db, &session_id, policy, &body.prompt);
+    let (events, guard) = start_turn(
+        &app,
+        &access,
+        db,
+        reader_db,
+        &session_id,
+        policy,
+        &body.prompt,
+    );
     let prompt = body.prompt.clone();
     let state = (events, app, access, session_id, prompt, guard);
     let stream = futures::stream::unfold(
