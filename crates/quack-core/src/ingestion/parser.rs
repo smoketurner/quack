@@ -1,5 +1,8 @@
 use std::path::Path;
 
+use pdf_oxide::PdfDocument;
+use pdf_oxide::editor::DocumentInfo;
+
 use crate::error::{Error, Result};
 use crate::okf::parse_front_matter;
 
@@ -75,11 +78,15 @@ impl std::fmt::Display for FileType {
 }
 
 /// What a parse yields: the document's own title when the format carries
-/// one (`<title>`, Office core properties), and its sections.
+/// one (`<title>`, Office core properties, a PDF's Info dictionary), its
+/// sections, and how many pages the parser had to skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
     pub title: Option<String>,
     pub sections: Vec<Section>,
+    /// Pages whose text could not be read; only a paginated source (PDF)
+    /// ever reports any, and the document keeps every other page.
+    pub pages_skipped: u32,
 }
 
 impl Extracted {
@@ -140,10 +147,7 @@ pub fn detect_file_type(filename: &str) -> FileType {
 /// supported).
 pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
     match file_type {
-        FileType::Pdf => Ok(Extracted {
-            title: None,
-            sections: extract_pdf_sections(data)?,
-        }),
+        FileType::Pdf => extract_pdf(data),
         FileType::Markdown => {
             let text = utf8(data)?;
             // YAML front matter (Obsidian, Jekyll, OKF) is metadata, not
@@ -152,6 +156,7 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
             Ok(Extracted {
                 title: front.get("title").map(str::to_owned),
                 sections: markdown_sections(body),
+                pages_skipped: 0,
             })
         }
         FileType::Text => Ok(Extracted {
@@ -161,6 +166,7 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
                 page: None,
                 text: utf8(data)?,
             }],
+            pages_skipped: 0,
         }),
         FileType::Html => super::html::html(&utf8(data)?),
         FileType::Docx => super::office::docx(data),
@@ -212,25 +218,79 @@ fn utf8(data: &[u8]) -> Result<String> {
     String::from_utf8(data.to_vec()).map_err(|e| Error::Ingestion(format!("invalid UTF-8: {e}")))
 }
 
-fn extract_pdf_sections(data: &[u8]) -> Result<Vec<Section>> {
-    let pages = pdf_extract::extract_text_from_mem_by_pages(data)
+/// A PDF, one section per page. A page the parser cannot read is skipped
+/// and counted rather than ending the document there, so one bad font
+/// never drops every page after it.
+fn extract_pdf(data: &[u8]) -> Result<Extracted> {
+    let doc = PdfDocument::from_bytes(data.to_vec())
         .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
-    let sections: Vec<Section> = pages
-        .into_iter()
-        .enumerate()
-        .filter(|(_, text)| !text.trim().is_empty())
-        .map(|(i, text)| Section {
-            heading: None,
-            page: u32::try_from(i.saturating_add(1)).ok(),
-            text,
-        })
-        .collect();
+    if !doc.is_authenticated() {
+        return Err(Error::Ingestion(String::from(
+            "the PDF is password-protected; remove the password and upload it again",
+        )));
+    }
+    let page_count = doc
+        .page_count()
+        .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
+    let (sections, pages_skipped) = extract_pdf_pages(page_count, |index| {
+        doc.extract_text(index).map_err(|e| e.to_string())
+    })?;
+    Ok(Extracted {
+        title: pdf_title(&doc),
+        sections,
+        pages_skipped,
+    })
+}
+
+/// Read `page_count` pages with `read`, one section per page that has
+/// text, skipping and counting the pages that fail.
+///
+/// # Errors
+///
+/// Returns an error when no page yields text: every page failed, or the
+/// file has no text layer (a scanned PDF).
+fn extract_pdf_pages(
+    page_count: usize,
+    read: impl Fn(usize) -> std::result::Result<String, String>,
+) -> Result<(Vec<Section>, u32)> {
+    let mut sections = Vec::new();
+    let mut skipped: u32 = 0;
+    for index in 0..page_count {
+        let page = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
+        match read(index) {
+            Ok(text) if !text.trim().is_empty() => sections.push(Section {
+                heading: None,
+                page: Some(page),
+                text,
+            }),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(page, error = %error, "skipping an unreadable PDF page");
+                skipped = skipped.saturating_add(1);
+            }
+        }
+    }
     if sections.is_empty() {
+        if skipped > 0 {
+            return Err(Error::Ingestion(format!(
+                "no readable text: {skipped} of {page_count} pages failed to parse"
+            )));
+        }
         return Err(Error::Ingestion(String::from(
             "no extractable text: the PDF has no text layer (scanned pages need OCR)",
         )));
     }
-    Ok(sections)
+    Ok((sections, skipped))
+}
+
+/// The Info dictionary's `/Title`, when the file carries one.
+fn pdf_title(doc: &PdfDocument) -> Option<String> {
+    let info_ref = doc.trailer().as_dict()?.get("Info")?.as_reference()?;
+    let info = doc.load_object(info_ref).ok()?;
+    DocumentInfo::from_object(&info)
+        .title
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
 }
 
 /// Split Markdown at ATX (`# Title`) and setext (underlined) headings. Text
@@ -316,6 +376,7 @@ mod tests {
         .unwrap_or_else(|_| Extracted {
             title: None,
             sections: Vec::new(),
+            pages_skipped: 0,
         });
         assert_eq!(extracted.title(), Some("Renewal Guide"));
         assert_eq!(extracted.sections.len(), 1);
@@ -423,5 +484,71 @@ mod tests {
     fn pdf_without_text_layer_is_an_error() {
         let err = extract_sections(&FileType::Pdf, b"%PDF-1.4\n%%EOF").err();
         assert!(err.is_some());
+    }
+
+    /// A PDF with `pages` pages, each carrying one line naming its number.
+    fn long_pdf(pages: u32, title: &str) -> Vec<u8> {
+        let mut doc = pdf_oxide::writer::DocumentBuilder::new().title(title);
+        for page in 1..=pages {
+            doc.letter_page()
+                .at(72.0, 720.0)
+                .text(&format!("Page {page} of the long report"))
+                .done();
+        }
+        doc.build().unwrap_or_default()
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn every_page_of_a_long_pdf_is_kept_with_its_number_and_title() {
+        let extracted = extract(&FileType::Pdf, &long_pdf(60, "Long Report")).unwrap();
+        assert_eq!(extracted.title.as_deref(), Some("Long Report"));
+        assert_eq!(extracted.pages_skipped, 0);
+        assert_eq!(extracted.sections.len(), 60);
+        let pages: Vec<Option<u32>> = extracted.sections.iter().map(|s| s.page).collect();
+        assert_eq!(pages, (1..=60).map(Some).collect::<Vec<_>>());
+        let page_40 = extracted
+            .sections
+            .get(39)
+            .map(|s| (s.text.as_str(), s.heading.as_deref()));
+        assert!(
+            page_40.is_some_and(|(text, heading)| text.contains("Page 40") && heading.is_none()),
+            "{page_40:?}"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn a_page_that_fails_to_read_is_skipped_and_counted_not_the_rest() {
+        let (sections, skipped) = extract_pdf_pages(4, |index| match index {
+            1 => Err(String::from("bad font")),
+            2 => Ok(String::from("   ")),
+            _ => Ok(format!("text {index}")),
+        })
+        .unwrap();
+        assert_eq!(skipped, 1);
+        let pages: Vec<Option<u32>> = sections.iter().map(|s| s.page).collect();
+        assert_eq!(pages, vec![Some(1), Some(4)]);
+        assert_eq!(sections.get(1).map(|s| s.text.as_str()), Some("text 3"));
+    }
+
+    #[test]
+    fn a_pdf_whose_every_page_fails_reports_the_count() {
+        let err = extract_pdf_pages(3, |_| Err(String::from("bad"))).err();
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.to_string().contains("3 of 3 pages failed")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_pdf_whose_every_page_is_blank_is_a_scanned_document() {
+        let err = extract_pdf_pages(2, |_| Ok(String::new())).err();
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.to_string().contains("no text layer")),
+            "{err:?}"
+        );
     }
 }

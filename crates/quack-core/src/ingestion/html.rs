@@ -34,6 +34,7 @@ pub fn html(text: &str) -> Result<Extracted> {
     Ok(Extracted {
         title,
         sections: walker.sections,
+        pages_skipped: 0,
     })
 }
 

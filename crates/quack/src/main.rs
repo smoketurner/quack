@@ -1434,6 +1434,13 @@ async fn run_ingest(
     for table in &result.tables {
         writeln!(out, "  Table: {table}")?;
     }
+    if result.pages_skipped > 0 {
+        writeln!(
+            out,
+            "  Pages skipped: {} (unreadable; the rest of the document was kept)",
+            result.pages_skipped
+        )?;
+    }
     if result.chunks_stored > 0 {
         writeln!(out, "  Chunks: {}", result.chunks_stored)?;
         if embedding_model.is_some() {

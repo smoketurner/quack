@@ -55,6 +55,7 @@ pub fn docx(data: &[u8]) -> Result<Extracted> {
     Ok(Extracted {
         title: core_title.or(style_title),
         sections,
+        pages_skipped: 0,
     })
 }
 
@@ -118,6 +119,7 @@ pub fn pptx(data: &[u8]) -> Result<Extracted> {
     Ok(Extracted {
         title: core_title.or(first_title),
         sections,
+        pages_skipped: 0,
     })
 }
 

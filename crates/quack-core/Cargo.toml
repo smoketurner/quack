@@ -22,7 +22,7 @@ http          = { workspace = true, features = ["std"] }
 jiff          = { workspace = true, features = ["std", "serde"] }
 keyring-core  = { workspace = true }
 oauth2        = { workspace = true }
-pdf-extract   = { workspace = true }
+pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }

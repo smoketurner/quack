@@ -554,7 +554,7 @@ graph is rebuilt with `quack graph extract` once the tables and documents are ba
 
 | Type | Parser | Extracted metadata |
 |------|--------|--------------------|
-| PDF | `pdf-extract` | page numbers |
+| PDF | `pdf_oxide` | page numbers, Info title; an unreadable page is skipped and counted, never the rest of the file |
 | Markdown, plain text | direct | headings (ATX and setext) |
 | HTML | `scraper` (html5ever) | headings, `<title>` |
 | DOCX | `zip` + `quick-xml` | headings from `Heading N` and `Title` styles, core title |

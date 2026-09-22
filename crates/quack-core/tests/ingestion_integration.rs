@@ -1486,6 +1486,51 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
     assert!(matches!(retry, ingestion::Registration::New(_)));
 }
 
+#[tokio::test]
+async fn a_long_pdf_ingests_every_page_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-long-pdf").unwrap();
+
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Long Report");
+    for page in 1..=60 {
+        pdf.letter_page()
+            .at(72.0, 720.0)
+            .text(&format!("Page {page} of the long report"))
+            .done();
+    }
+    let bytes = pdf.build().unwrap();
+
+    let result = ingestion::ingest_file(
+        &config,
+        &db,
+        "ws-long-pdf",
+        &ingestion::NewFile::new("report.pdf", &bytes),
+        None::<&MockEmbeddingModel>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(result.pages_skipped, 0);
+    assert!(result.chunks_stored > 0);
+
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.status, "ready");
+    assert_eq!(doc.title.as_deref(), Some("Long Report"));
+
+    let qr = db
+        .execute_query(&format!(
+            "SELECT min(page), max(page), count(*) FILTER (WHERE content LIKE '%Page 40%')              FROM _quack_chunks WHERE document_id = '{}'",
+            result.document_id
+        ))
+        .unwrap();
+    let row = qr.rows.first().unwrap();
+    assert_eq!(row.first(), Some(&serde_json::Value::Number(1.into())));
+    assert_eq!(row.get(1), Some(&serde_json::Value::Number(60.into())));
+    assert_eq!(row.get(2), Some(&serde_json::Value::Number(1.into())));
+}
+
 #[test]
 fn piped_bytes_load_as_a_temporary_stdin_table() {
     let dir = tempfile::tempdir().unwrap();

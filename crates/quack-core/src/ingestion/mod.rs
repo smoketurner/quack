@@ -51,6 +51,8 @@ pub struct IngestResult {
     pub chunks_stored: u32,
     /// Tables a structured file loaded into: one, or one per workbook sheet.
     pub tables: Vec<String>,
+    /// Pages the parser could not read and skipped (PDF only).
+    pub pages_skipped: u32,
 }
 
 /// What `ingest_file` did: stored the file, or skipped it because a
@@ -265,6 +267,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 file_type,
                 chunks_stored: 0,
                 tables: vec![table_name],
+                pages_skipped: 0,
             })
         }
         parser::FileType::Xlsx => {
@@ -276,6 +279,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 file_type,
                 chunks_stored: 0,
                 tables,
+                pages_skipped: 0,
             })
         }
         parser::FileType::Pdf
@@ -287,6 +291,15 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
             let extracted = parser::extract(&file_type, data)?;
             if let Some(title) = extracted.title() {
                 db.with(|db| db.set_document_title_if_empty(doc_id, title))?;
+            }
+            let pages_skipped = extracted.pages_skipped;
+            if pages_skipped > 0 {
+                tracing::warn!(
+                    document = %doc_id,
+                    file = %filename,
+                    pages_skipped,
+                    "ingested with unreadable pages skipped"
+                );
             }
             let sections = extracted.sections;
             let chunks = chunker::chunk_sections(
@@ -309,6 +322,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 file_type,
                 chunks_stored: chunk_count,
                 tables: Vec::new(),
+                pages_skipped,
             })
         }
         parser::FileType::Unknown => Err(Error::UnsupportedFileType(filename.to_owned())),
