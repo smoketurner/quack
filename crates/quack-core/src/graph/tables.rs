@@ -355,6 +355,14 @@ fn fill_scratch_tables(db: &WorkspaceDb, staged: &Staged) -> Result<()> {
 
 fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Result<()> {
     let conn = db.connection();
+    let started = std::time::Instant::now();
+    let lap = move |stage: &str| {
+        tracing::debug!(
+            stage,
+            elapsed_ms = started.elapsed().as_millis(),
+            "graph merge"
+        );
+    };
     // Nodes: fill in missing property keys and clear the provisional flag
     // on the ones that exist, insert the rest.
     conn.execute(
@@ -368,6 +376,7 @@ fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Res
                 OR (_quack_graph_nodes.provisional AND NOT ?))",
         duckdb::params![provisional, provisional],
     )?;
+    lap("node_update");
     conn.execute(
         "INSERT INTO _quack_graph_nodes (id, label, normalized_label, class_id, properties, provisional) \
          SELECT t.id, t.label, t.normalized_label, t.class_id, t.properties::JSON, ? \
@@ -376,6 +385,7 @@ fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Res
                            WHERE n.normalized_label = t.normalized_label AND n.class_id = t.class_id)",
         duckdb::params![provisional],
     )?;
+    lap("node_insert");
     conn.execute(
         "INSERT OR IGNORE INTO _quack_provenance (subject_id, document_id, chunk_id, table_name, row_key, confidence) \
          SELECT DISTINCT n.id, NULL, '', ?, p.row_key, 1.0 \
@@ -383,40 +393,64 @@ fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Res
          JOIN _quack_graph_nodes n ON n.normalized_label = p.normalized_label AND n.class_id = p.class_id",
         duckdb::params![table],
     )?;
-    // Edges: an existing triple keeps its id and loses the provisional
-    // flag when this evidence is not provisional; the rest are inserted.
+    lap("node_provenance");
+    // Edges. Resolve every staged triple to node ids first, into a scratch
+    // table that carries all three key columns, and settle each triple's
+    // id there (an existing edge keeps its own). Joining the edges table
+    // through the node tables directly lets the planner start from the one
+    // key it can see before the others resolve; when many rows share a
+    // target, that partial join is a cross product of the batch and the
+    // target's edges, which exceeds the workspace memory limit.
     conn.execute(
-        "UPDATE _quack_graph_edges SET provisional = false \
-         FROM _quack_tmp_graph_edges t, _quack_graph_nodes s, _quack_graph_nodes g \
-         WHERE s.normalized_label = t.source_norm AND s.class_id = t.source_class \
-           AND g.normalized_label = t.target_norm AND g.class_id = t.target_class \
-           AND _quack_graph_edges.source_node_id = s.id AND _quack_graph_edges.target_node_id = g.id \
-           AND _quack_graph_edges.relation_id = t.relation_id \
-           AND _quack_graph_edges.provisional AND NOT ?",
-        duckdb::params![provisional],
-    )?;
-    conn.execute(
-        "INSERT INTO _quack_graph_edges (id, source_node_id, target_node_id, relation_id, properties, provisional) \
-         SELECT t.id, s.id, g.id, t.relation_id, '{}'::JSON, ? \
+        "CREATE OR REPLACE TABLE _quack_tmp_graph_edge_ids AS \
+         SELECT t.id, t.source_norm, t.source_class, t.target_norm, t.target_class, t.relation_id, \
+                s.id AS source_id, g.id AS target_id \
          FROM _quack_tmp_graph_edges t \
          JOIN _quack_graph_nodes s ON s.normalized_label = t.source_norm AND s.class_id = t.source_class \
-         JOIN _quack_graph_nodes g ON g.normalized_label = t.target_norm AND g.class_id = t.target_class \
-         WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_edges e \
-                           WHERE e.source_node_id = s.id AND e.target_node_id = g.id AND e.relation_id = t.relation_id)",
-        duckdb::params![provisional],
+         JOIN _quack_graph_nodes g ON g.normalized_label = t.target_norm AND g.class_id = t.target_class",
+        [],
     )?;
     conn.execute(
+        "UPDATE _quack_tmp_graph_edge_ids SET id = e.id \
+         FROM _quack_graph_edges e \
+         WHERE e.source_node_id = _quack_tmp_graph_edge_ids.source_id \
+           AND e.target_node_id = _quack_tmp_graph_edge_ids.target_id \
+           AND e.relation_id = _quack_tmp_graph_edge_ids.relation_id",
+        [],
+    )?;
+    lap("edge_resolve");
+    // An existing triple loses the provisional flag when this evidence is
+    // not provisional; the rest are inserted under their minted ids.
+    conn.execute(
+        "UPDATE _quack_graph_edges SET provisional = false \
+         FROM _quack_tmp_graph_edge_ids r \
+         WHERE _quack_graph_edges.id = r.id AND _quack_graph_edges.provisional AND NOT ?",
+        duckdb::params![provisional],
+    )?;
+    lap("edge_update");
+    conn.execute(
+        "INSERT INTO _quack_graph_edges (id, source_node_id, target_node_id, relation_id, properties, provisional) \
+         SELECT r.id, r.source_id, r.target_id, r.relation_id, '{}'::JSON, ? \
+         FROM _quack_tmp_graph_edge_ids r \
+         WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_edges e WHERE e.id = r.id)",
+        duckdb::params![provisional],
+    )?;
+    lap("edge_insert");
+    conn.execute(
         "INSERT OR IGNORE INTO _quack_provenance (subject_id, document_id, chunk_id, table_name, row_key, confidence) \
-         SELECT DISTINCT e.id, NULL, '', ?, p.row_key, 1.0 \
+         SELECT DISTINCT r.id, NULL, '', ?, p.row_key, 1.0 \
          FROM _quack_tmp_graph_edge_prov p \
-         JOIN _quack_graph_nodes s ON s.normalized_label = p.source_norm AND s.class_id = p.source_class \
-         JOIN _quack_graph_nodes g ON g.normalized_label = p.target_norm AND g.class_id = p.target_class \
-         JOIN _quack_graph_edges e ON e.source_node_id = s.id AND e.target_node_id = g.id AND e.relation_id = p.relation_id",
+         JOIN _quack_tmp_graph_edge_ids r \
+           ON r.source_norm = p.source_norm AND r.source_class = p.source_class \
+          AND r.target_norm = p.target_norm AND r.target_class = p.target_class \
+          AND r.relation_id = p.relation_id",
         duckdb::params![table],
     )?;
+    lap("edge_provenance");
     conn.execute_batch(
         "DROP TABLE _quack_tmp_graph_nodes; DROP TABLE _quack_tmp_graph_node_prov; \
-         DROP TABLE _quack_tmp_graph_edges; DROP TABLE _quack_tmp_graph_edge_prov;",
+         DROP TABLE _quack_tmp_graph_edges; DROP TABLE _quack_tmp_graph_edge_prov; \
+         DROP TABLE _quack_tmp_graph_edge_ids;",
     )?;
     Ok(())
 }
