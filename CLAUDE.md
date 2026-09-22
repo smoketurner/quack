@@ -93,6 +93,7 @@ cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | pat
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
+cargo run --bin quack -- config [--changed] [--json]                            # every recognized setting, its value and origin, the file's unknown keys, the env vars read
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors

@@ -1373,6 +1373,7 @@ quack sessions [--json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
+quack config [--changed] [--json]
 quack serve [--bind ADDR] [--local]
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--json] ; quack token create|list|revoke ;
@@ -1390,6 +1391,17 @@ terminal and shows the validated answer when validation changed what streamed; a
 gets the validated answer alone. Exit codes: 0 ok, 1 runtime error, 2 usage, 3 write
 refused, 4 auth required; a reader that closes stdout early (`| head`) ends the command
 quietly with 0.
+
+`quack config` is the one command that does not go through `Config::load`: it reads the
+file itself, so it describes a configuration every other command refuses rather than
+failing the same way. It prints every setting this binary recognizes with the value in
+force, where that value came from (built in, the file, or the environment variable that
+overrides it), what the file says where that is not what is running, the keys in the file
+no section recognizes with the recognized key each resembles, and which of the
+environment variables the configuration reads are set — never their contents, since some
+of them hold credentials. `--changed` keeps only the settings the file or the environment
+has a say in; `--json` emits the whole report as one document. A rejected file exits 2
+after printing the report.
 
 ### 11.6 Desktop window (`quack desktop`)
 
@@ -1561,7 +1573,10 @@ session_idle_minutes = 120              # ... or this long after its last reques
 ```
 
 Every section sets `deny_unknown_fields`, so a key that is not in this list is a startup
-error rather than a silent no-op. The TUI's tick rate is a constant, not configuration.
+error rather than a silent no-op. `quack config` (section 11.5) is how an operator sees
+that list from the binary itself: every recognized setting with the value in force and
+where it came from, and every key in the file that is not one of them. The TUI's tick
+rate is a constant, not configuration.
 
 ---
 

@@ -120,6 +120,11 @@ quack mcp -w sales                       # MCP over stdio for Claude Code and ed
 quack user add alice --admin             # users, tokens, members, and the audit log for `quack serve`
 ```
 
+```bash
+quack config                             # every setting, the value in force, and where it came from
+quack config --changed                   # only what config.toml and the environment set
+```
+
 Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
 
 ## How it works
