@@ -196,7 +196,9 @@ pub async fn run_analysis<M>(
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    let recorder = TurnRecorder::new(sink);
+    let max_turns = usize::try_from(analysis_config.max_turns)
+        .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
+    let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
     match run_inner(
         db,
         reader_db,
@@ -695,7 +697,10 @@ mod tests {
             prompt: Box::new(rig::message::Message::user("q")),
         });
         let text = explain_stream_error(&limit, &config, false);
-        assert!(text.contains("10 tool calls"), "{text}");
+        assert!(
+            text.contains(&format!("{} tool calls", config.max_turns)),
+            "{text}"
+        );
 
         let provider = rig::agent::StreamingError::Completion(
             rig::completion::CompletionError::ProviderError(String::from("connection refused")),

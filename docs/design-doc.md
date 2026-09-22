@@ -859,6 +859,7 @@ review, extract, observe drift, propose again.
    d. append the result to history; go to 2
 4. On text: emit TextDelta as it streams; validate citations; emit
    TurnComplete { AgentResponse }; then persist the turn
+0. Before 2, when the model has to be loaded first (Ollama, cold): emit Status { line }
 ```
 
 The turn races a `CancellationToken`: a cancelled turn keeps the text streamed so far,
@@ -867,7 +868,11 @@ appends a note, reports `cancelled: true`, and is still recorded.
 `llm::run_turn` yields these events on a channel. The web UI turns them into HTML
 fragments over SSE, REST forwards them as typed SSE events or collects them into one JSON
 response, MCP collects them into the tool result, the TUI renders them inline, print mode
-writes them to stderr. `max_turns` 10, temperature 0.1.
+writes them to stderr. `max_turns` 15, temperature 0.1. Before the first model call an
+Ollama turn asks `GET /api/ps` whether the chat model is already in memory and, when it is
+not, emits `Status` ("loading MODEL ..."), since a cold load of a 12 GB model takes seconds
+during which nothing else can appear; print mode shows it on the spinner, the terminal as a
+system line, SSE as a `status` event.
 
 ### 7.2 System prompt
 
@@ -927,7 +932,7 @@ turn is recorded; only a model that could not be reached at all is an error.
 |------|------------|-------------|
 | `search_documents(query, top_k=8, document_ids?, entity?)` | none | Hybrid retrieval; returns chunks with citation metadata and the entities each was the source of |
 | `list_documents()` | none | Registry with status and pinned flag |
-| `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer |
+| `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer that says to narrow it in one statement, a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
 | `describe_table(table_name)` / `list_tables()` | none | Schema and inventory |
 | `describe_class(class_id)` | none | One ontology class in full, with how many entities of it the graph holds |
 | `search_graph(entity?, class?, relation?, hops=2)` | none | Neighborhood or class listing with provenance |
@@ -1505,11 +1510,11 @@ upload_max_mb = 512
 max_tokens = 4000
 
 [analysis]
-max_query_rows = 100
+max_query_rows = 250
 query_timeout_seconds = 30
 memory_limit_mb = 256
 threads = 4
-max_turns = 10
+max_turns = 15
 history_token_budget = 32000
 max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
 extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)

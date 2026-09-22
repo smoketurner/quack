@@ -25,8 +25,11 @@ place\n\
 FROM t\n\
 - Column aliases are reusable in WHERE, GROUP BY, HAVING, and later select items: SELECT a + 1 \
 AS b, b * 2 AS c\n\
-- Conditional aggregation: count() FILTER (WHERE x > 10); top n per group: \
-arg_max(name, score, 3) or max(score, 3) return lists\n\
+- Conditional aggregation: count() FILTER (WHERE x > 10)\n\
+- One statement per question, never one per group: GROUP BY g with arg_max(label, measure) \
+gives each group's top label, arg_max(label, measure, 3) its top three as a list, and \
+QUALIFY row_number() OVER (PARTITION BY g ORDER BY measure DESC) <= 3 its top three rows; \
+WHERE g IN ('a', 'b') covers a chosen set\n\
 - GROUPING SETS, CUBE, and ROLLUP for multi-level totals; PIVOT t ON col USING sum(v) and \
 UNPIVOT reshape between wide and long\n\
 - DESCRIBE t shows columns and types; SUMMARIZE t profiles every column\n\
@@ -162,8 +165,14 @@ fn append_tool_guidance(prompt: &mut String, graph_enabled: bool, ontology_prese
          3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
          misspelled one and describe_table shows the real names. Fix the statement and run \
          it again; do not give up after one error and do not ask the user to correct SQL\n\
-         4. Explain the results in natural language\n\
-         5. If the user asks for a visualization, use create_chart\n\n\
+         4. A result that ends with \"more rows not shown\" was cut at the row limit and is \
+         not the whole answer: aggregate further, filter with WHERE, or add ORDER BY and \
+         LIMIT, in one statement. Never re-run a statement once per group; GROUP BY, \
+         IN (...), or a window covers every group at once\n\
+         5. Every run_sql result ends with how many tool calls the turn has left; plan \
+         the remaining statements and answer before they run out\n\
+         6. Explain the results in natural language\n\
+         7. If the user asks for a visualization, use create_chart\n\n\
          When answering questions about document content:\n\
          1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
          2. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
@@ -461,8 +470,11 @@ pub fn format_query_result(capped: &CappedResults) -> Result<String> {
     let mut table = capped.results.clone();
     if capped.truncated() {
         table.rows.push(vec![serde_json::Value::String(format!(
-            "... ({} more rows not shown)",
-            capped.omitted()
+            "... ({} more rows not shown: the result was cut at the {}-row limit, so \
+             aggregate, filter, or ORDER BY and LIMIT it in one statement rather than \
+             re-running it per group)",
+            capped.omitted(),
+            capped.results.rows.len()
         ))]);
     }
 
@@ -720,7 +732,9 @@ mod tests {
             "EXCLUDE (a, b)",
             "count() FILTER",
             "ASOF JOIN",
-            "arg_max(name, score, 3)",
+            "arg_max(label, measure, 3)",
+            "QUALIFY row_number() OVER (PARTITION BY g",
+            "never one per group",
         ] {
             assert!(prompt.contains(idiom), "missing {idiom}");
         }

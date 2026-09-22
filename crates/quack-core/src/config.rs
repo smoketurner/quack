@@ -418,11 +418,11 @@ pub struct AnalysisConfig {
 impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
-            max_query_rows: 100,
+            max_query_rows: 250,
             query_timeout_seconds: 30,
             memory_limit_mb: 256,
             threads: 4,
-            max_turns: 10,
+            max_turns: 15,
             history_token_budget: 32_000,
             max_context_tokens: 32_768,
             extraction_timeout_seconds: 120,
@@ -719,7 +719,7 @@ rerank = "model"
         assert_eq!(config.retrieval.rerank_candidates, 24);
         assert_eq!(config.context.max_tokens, 4000);
         assert_eq!(config.analysis.threads, 4);
-        assert_eq!(config.analysis.max_turns, 10);
+        assert_eq!(config.analysis.max_turns, 15);
         assert_eq!(config.analysis.history_token_budget, 32_000);
         assert_eq!(config.ingestion.upload_max_mb, 512);
         assert_eq!(config.server.bind, "127.0.0.1:8080");

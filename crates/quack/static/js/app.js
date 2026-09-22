@@ -256,7 +256,9 @@
   }
 
   function handle(event, data, view, chat, status) {
-    if (event === "text") {
+    if (event === "status") {
+      setWorking(view, data);
+    } else if (event === "text") {
       view.body.textContent += data;
       setWorking(view, "Answering…");
     } else if (event === "tool_started") {

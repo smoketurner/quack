@@ -398,6 +398,32 @@ impl WorkspaceDb {
         })
     }
 
+    /// The statement's parse tree with every constant blanked and the
+    /// source offsets dropped, so two statements that differ only in the
+    /// values they filter on serialize the same; `None` when `DuckDB`
+    /// cannot serialize the statement (anything but a `SELECT` shape).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serialization query itself fails.
+    pub fn statement_shape(&self, sql: &str) -> Result<Option<String>> {
+        let serialized: String = self.conn.query_row(
+            "SELECT json_serialize_sql(?::VARCHAR)",
+            duckdb::params![sql],
+            |row| row.get(0),
+        )?;
+        let mut parsed: serde_json::Value = serde_json::from_str(&serialized)?;
+        let is_error = parsed
+            .get("error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if is_error {
+            return Ok(None);
+        }
+        blank_constants(&mut parsed);
+        Ok(Some(parsed.to_string()))
+    }
+
     /// Names of tables a statement references, as `DuckDB` parsed them, or
     /// `None` when `DuckDB` cannot serialize the statement.
     fn referenced_base_tables(&self, sql: &str) -> Result<Option<Vec<String>>> {
@@ -2140,6 +2166,28 @@ fn is_single_read_only_statement(sql: &str) -> bool {
 
 /// Walk a serialized statement tree collecting `table_name` values from
 /// base-table references.
+/// Null out the `value` of every `CONSTANT` node and drop every
+/// `query_location`, which shifts with a literal's length.
+fn blank_constants(node: &mut serde_json::Value) {
+    match node {
+        serde_json::Value::Object(map) => {
+            map.remove("query_location");
+            if map.get("class").and_then(serde_json::Value::as_str) == Some("CONSTANT") {
+                map.insert(String::from("value"), serde_json::Value::Null);
+            }
+            for child in map.values_mut() {
+                blank_constants(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                blank_constants(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_table_names(node: &serde_json::Value, out: &mut Vec<String>) {
     match node {
         serde_json::Value::Object(map) => {
@@ -2542,6 +2590,29 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.general.data_dir = dir.join("data");
         config
+    }
+
+    /// Two statements that differ only in their literals, spacing, and
+    /// case share a shape; a different column, a different statement kind,
+    /// and anything `DuckDB` cannot serialize do not.
+    #[test]
+    fn statement_shape_ignores_literals_and_source_positions() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let shape = |sql: &str| {
+            db.statement_shape(sql)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        let nevada = shape("SELECT x FROM t WHERE s = 'NEVADA' AND n > 10 LIMIT 5");
+        let carolina = shape("select x\n from t where s='NORTH CAROLINA' and n > 250 limit 5");
+        assert!(nevada.is_some());
+        assert_eq!(nevada, carolina);
+        assert_ne!(
+            nevada,
+            shape("SELECT y FROM t WHERE s = 'NEVADA' AND n > 10 LIMIT 5")
+        );
+        assert_ne!(nevada, shape("SELECT x FROM t WHERE s = 'NEVADA' LIMIT 5"));
+        assert_eq!(shape("CREATE TABLE t2 AS SELECT 1"), None);
+        assert_eq!(shape("SELECT FROM WHERE"), None);
     }
 
     /// Design doc 7.4: a read-classified statement may still name a file, so

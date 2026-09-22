@@ -228,7 +228,7 @@ limiter covers the web UI, the API, and MCP, with a tighter one on the two login
 none on `/healthz` (design doc 12). Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
 through `Access::audit`. `query/stream` forwards the agent event stream as SSE (`text`,
-`tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 and are processed
+`status`, `tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 and are processed
 by `queue.rs`, one bounded lane per workspace, which locks the workspace only around each
 database step. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `access()` checks and the API's helpers; `WebUser` redirects to `/login` instead
