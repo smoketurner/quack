@@ -224,6 +224,7 @@ fn env_json(var: &EnvVar) -> Value {
 #[expect(
     clippy::unwrap_used,
     clippy::indexing_slicing,
+    clippy::panic,
     reason = "tests assert on values they have just built"
 )]
 mod tests {
