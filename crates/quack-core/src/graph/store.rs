@@ -755,13 +755,28 @@ fn class_fits(ontology: &Ontology, class: &str, wanted: &str) -> bool {
     wanted == ontology::ROOT_CLASS || class == wanted || ontology.is_subclass_of(class, wanted)
 }
 
-/// Nodes with no embedding yet, for `embed_missing`.
+/// Up to `limit` nodes whose label still needs an embedding, in id order.
+///
+/// A node that comes from a keyed table row is skipped while every node
+/// of its class does too: such nodes never merge with each other, and an
+/// entry point among them is found by exact label, alias, or text
+/// similarity. Once an extracted node joins the class, its keyed nodes
+/// need embeddings for the merge proposals the pass makes between them.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn nodes_without_embedding(db: &WorkspaceDb, limit: u32) -> Result<Vec<Node>> {
-    let sql = format!("SELECT {NODE_COLUMNS} WHERE embedding IS NULL ORDER BY id LIMIT ?");
+pub fn nodes_needing_embedding(db: &WorkspaceDb, limit: u32) -> Result<Vec<Node>> {
+    let sql = format!(
+        "WITH keyed AS (SELECT DISTINCT subject_id FROM _quack_provenance WHERE table_name <> ''), \
+              open_classes AS (SELECT DISTINCT n.class_id FROM _quack_graph_nodes n \
+                               LEFT JOIN keyed k ON k.subject_id = n.id WHERE k.subject_id IS NULL) \
+         SELECT {NODE_COLUMNS} n \
+         LEFT JOIN keyed k ON k.subject_id = n.id \
+         WHERE n.embedding IS NULL \
+           AND (k.subject_id IS NULL OR n.class_id IN (SELECT class_id FROM open_classes)) \
+         ORDER BY n.id LIMIT ?"
+    );
     let mut stmt = db.connection().prepare(&sql)?;
     let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
     let mut out = Vec::new();
@@ -777,7 +792,16 @@ pub fn nodes_without_embedding(db: &WorkspaceDb, limit: u32) -> Result<Vec<Node>
 ///
 /// Returns an error if the update fails.
 pub fn set_node_embedding(db: &WorkspaceDb, id: &str, embedding: &[f32]) -> Result<()> {
-    db.set_vector("_quack_graph_nodes", "embedding", id, embedding)
+    set_node_embeddings(db, &[(id.to_owned(), embedding.to_vec())])
+}
+
+/// Store label embeddings for a batch of nodes in one statement.
+///
+/// # Errors
+///
+/// Returns an error if the update fails.
+pub fn set_node_embeddings(db: &WorkspaceDb, rows: &[(String, Vec<f32>)]) -> Result<()> {
+    db.set_vectors("_quack_graph_nodes", "embedding", rows)
 }
 
 /// The text a node's embedding is computed from: its label and class.

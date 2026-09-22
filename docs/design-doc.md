@@ -727,9 +727,13 @@ starts and the operation is permission-gated.
 deterministically, with provenance `table_name` and `row_key`. Re-running is idempotent.
 
 **Entity resolution.** Nodes are merged on `(normalized_label, class_id)`. A second pass
+embeds the labels that need it (sixty-four per call, written in one statement) and
 proposes merges for nodes of the same class whose label embeddings are within a cosine
 threshold (default 0.08) and whose labels share a token, looking at each node's five
-nearest neighbours; a pair within `auto_merge_threshold` (default 0.02) merges on the spot,
+nearest neighbours. Nodes from keyed table rows are not embedded while every node of
+their class is keyed: they never merge with each other, and entry among them is by exact
+label, alias, or text similarity; the first extracted node in a class makes its keyed
+nodes eligible, since proposals between the two kinds need both embeddings. A pair within `auto_merge_threshold` (default 0.02) merges on the spot,
 the rest land in `_quack_graph_merges` as pending proposals for review. Provenance rules
 the pass: two nodes that both come from keyed table rows are distinct by construction and
 are never paired (WEST VIRGINIA is not VIRGINIA), a pair with one keyed side is only ever
@@ -1006,7 +1010,10 @@ input: the history trim and Ollama's `num_ctx` still run on their own estimate, 
 both are computed before the call.
 
 **Limits.** The agent's connection runs with `SET memory_limit` and `SET threads` from
-config. A statement runs on the calling thread — for the agent, a `spawn_blocking` one —
+config. The graph's ART indexes are resident for as long as the workspace is open and count
+against that limit, so it also bounds the graph a workspace can hold; a build that runs
+out of memory needs a larger `memory_limit_mb`, not a smaller batch. A statement runs on
+the calling thread — for the agent, a `spawn_blocking` one —
 while a watchdog thread holds `Connection::interrupt_handle()` and calls `interrupt()` after
 `query_timeout_seconds`; a guard disarms the watchdog when the statement returns. User SQL
 has the same limits.
@@ -1512,7 +1519,7 @@ max_tokens = 4000
 [analysis]
 max_query_rows = 250
 query_timeout_seconds = 30
-memory_limit_mb = 256
+memory_limit_mb = 1024                  # the graph's indexes count against it while the workspace is open
 threads = 4
 max_turns = 15
 history_token_budget = 32000

@@ -970,7 +970,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         .unwrap();
         quack_core::graph::store::set_node_embedding(&db, &node, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         assert!(
-            quack_core::graph::store::nodes_without_embedding(&db, 10)
+            quack_core::graph::store::nodes_needing_embedding(&db, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -981,7 +981,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     }
     let db = WorkspaceDb::open(&changed, "ws-adopt").unwrap();
     assert_eq!(db.embedding_dimension(), 8);
-    let unembedded = quack_core::graph::store::nodes_without_embedding(&db, 10).unwrap();
+    let unembedded = quack_core::graph::store::nodes_needing_embedding(&db, 10).unwrap();
     assert_eq!(unembedded.len(), 1);
     let node_id = unembedded.first().map(|n| n.id.clone()).unwrap();
     quack_core::graph::store::set_node_embedding(&db, &node_id, &[0.5; 8]).unwrap();

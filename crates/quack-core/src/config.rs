@@ -392,6 +392,10 @@ pub enum RerankMode {
 pub struct AnalysisConfig {
     pub max_query_rows: u32,
     pub query_timeout_seconds: u32,
+    /// DuckDB memory for the workspace connection. The knowledge graph's
+    /// indexes live inside it as long as the file is open, so it bounds
+    /// how large a graph the workspace can hold, not only what one
+    /// statement may use.
     pub memory_limit_mb: u32,
     pub threads: u32,
     /// Maximum model round-trips (tool calls) per turn.
@@ -420,7 +424,7 @@ impl Default for AnalysisConfig {
         Self {
             max_query_rows: 250,
             query_timeout_seconds: 30,
-            memory_limit_mb: 256,
+            memory_limit_mb: 1024,
             threads: 4,
             max_turns: 15,
             history_token_budget: 32_000,

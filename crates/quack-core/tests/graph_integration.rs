@@ -469,7 +469,10 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     assert_eq!(status.drift.total(), 2);
 
     // Resolution: Orgenics and Orgenics Ltd share a token and embed close,
-    // so a merge is proposed; Aurobindo stays apart.
+    // so a merge is proposed; Aurobindo stays apart. Only the vendors are
+    // embedded: the shipments and countries are all keyed rows (Kenya's
+    // chunk evidence merged into its table node), so nothing in those
+    // classes can be proposed.
     let options = GraphOptions {
         merge_threshold: 0.5,
         auto_merge_threshold: 0.0,
@@ -478,7 +481,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     let resolved = resolve::resolve(&db, Some(&LetterEmbedding), &options)
         .await
         .unwrap();
-    assert_eq!(resolved.embedded, 8);
+    assert_eq!(resolved.embedded, 3, "Orgenics, Aurobindo, Orgenics Ltd");
     assert_eq!(resolved.auto_merged, 0);
     let pending = resolve::pending(&db).unwrap();
     assert_eq!(pending.len(), 1, "{pending:?}");
@@ -531,12 +534,14 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
             }
         })
         .collect();
+    // The countries are all keyed rows and carry no embedding: the unknown
+    // spelling resolves nothing and the text-similar suggestion stands in.
     let fuzzy = traverse::resolve_entry(&db, "Kenia", Some("country"), Some(&vector)).unwrap();
-    assert_eq!(fuzzy.first().map(|n| n.label.as_str()), Some("Kenya"));
+    assert!(fuzzy.is_empty(), "{fuzzy:?}");
+    let suggestions = traverse::suggest_entities(&db, "Kenia", Some("country"), None).unwrap();
     assert!(
-        traverse::resolve_entry(&db, "Kenia", None, None)
-            .unwrap()
-            .is_empty()
+        suggestions.iter().any(|s| s.starts_with("Kenya")),
+        "{suggestions:?}"
     );
 
     paths_merges_and_listing(&db, &options, &hood, &roots, &current, &pending);
@@ -815,7 +820,7 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
 
     // With an embedding, a label sharing no text still comes back: these
     // are the matches `resolve_entry` rejected as too far to be the entity.
-    for node in graph_store::nodes_without_embedding(&db, 10).unwrap() {
+    for node in graph_store::nodes_needing_embedding(&db, 10).unwrap() {
         let label = LetterEmbedding.embed_text(&node.label).await.unwrap();
         graph_store::set_node_embedding(&db, &node.id, &letter_vector(&label.vec)).unwrap();
     }
@@ -843,4 +848,69 @@ fn letter_vector(embedding: &[f64]) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+/// Keyed table nodes are left without an embedding while their class has
+/// nothing extracted to compare them with; the first extracted node in the
+/// class makes them eligible, and a batch of embeddings lands in one write.
+#[test]
+fn keyed_nodes_are_embedded_only_once_their_class_has_an_extracted_node() {
+    let db = WorkspaceDb::open_in_memory(4).unwrap();
+    let node = |label: &str, class_id: &str| {
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from(label),
+                class_id: String::from(class_id),
+                properties: serde_json::json!({}),
+                provisional: false,
+            },
+        )
+        .unwrap()
+    };
+    let kenya = node("Kenya", "country");
+    let uganda = node("Uganda", "country");
+    let orgenics = node("Orgenics", "vendor");
+    for (id, key) in [
+        (&kenya, "Kenya"),
+        (&uganda, "Uganda"),
+        (&orgenics, "Orgenics"),
+    ] {
+        graph_store::add_provenance(&db, id, &graph_store::Source::row("shipments", key)).unwrap();
+    }
+
+    // Every node is keyed: nothing to embed.
+    assert!(
+        graph_store::nodes_needing_embedding(&db, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // An extracted country makes the countries eligible, not the vendor.
+    let nairobi = node("Nairobi", "country");
+    graph_store::add_provenance(
+        &db,
+        &nairobi,
+        &graph_store::Source::chunk("doc-1", "c1", 0.9),
+    )
+    .unwrap();
+    let pending = graph_store::nodes_needing_embedding(&db, 10).unwrap();
+    let mut ids: Vec<&str> = pending.iter().map(|n| n.id.as_str()).collect();
+    ids.sort_unstable();
+    let mut expected = vec![kenya.as_str(), uganda.as_str(), nairobi.as_str()];
+    expected.sort_unstable();
+    assert_eq!(ids, expected);
+
+    // One statement writes the batch; the limit still applies afterwards.
+    let rows: Vec<(String, Vec<f32>)> = pending
+        .iter()
+        .map(|n| (n.id.clone(), vec![1.0, 0.0, 0.0, 0.0]))
+        .collect();
+    graph_store::set_node_embeddings(&db, &rows).unwrap();
+    assert!(
+        graph_store::nodes_needing_embedding(&db, 10)
+            .unwrap()
+            .is_empty()
+    );
+    graph_store::set_node_embeddings(&db, &[]).unwrap();
 }

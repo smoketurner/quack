@@ -163,8 +163,8 @@ turns mapped rows into nodes and edges deterministically; `graph::extract` sends
 ready chunk to the chat model (`llm::graph_extractor`, preamble from
 `extract::prompt_for`) and validates the answer against the ontology, counting unknown
 classes and relations as drift in `_quack_meta.graph_drift`; `graph::resolve` embeds
-node labels, merges near-identical labels of one class, and queues the rest as merge
-proposals; `graph::traverse` resolves an entry point (exact label, alias, then embedding)
+node labels (skipping keyed table nodes while their class has no extracted node), merges
+near-identical labels of one class, and queues the rest as merge proposals; `graph::traverse` resolves an entry point (exact label, alias, then embedding)
 and walks neighborhoods, shortest paths, and classes with subclass expansion, bounded by
 `[graph]`. `graph::store::status` reports size, `provisional` (the newest ontology version
 was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,

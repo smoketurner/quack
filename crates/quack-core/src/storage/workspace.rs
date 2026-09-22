@@ -653,6 +653,39 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Store one embedding per row in a single statement. A statement per
+    /// row rewrote the row and its index entries one at a time, which
+    /// cost more than the embedding call for a batch of sixty-four.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_vectors(
+        &self,
+        table: &str,
+        column: &str,
+        rows: &[(String, Vec<f32>)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let values = vec!["(?, ?)"; rows.len()].join(", ");
+        let sql = format!(
+            "UPDATE {table} SET {column} = v.e::{ty} FROM (VALUES {values}) AS v(id, e) \
+             WHERE {table}.id = v.id",
+            table = quote_ident(table),
+            column = quote_ident(column),
+            ty = self.vector_type(),
+        );
+        let params: Vec<String> = rows
+            .iter()
+            .flat_map(|(id, embedding)| [id.clone(), format_embedding(embedding)])
+            .collect();
+        self.conn
+            .execute(&sql, duckdb::params_from_iter(params.iter()))?;
+        Ok(())
+    }
+
     /// The `FLOAT[N]` type of this workspace's vectors.
     #[must_use]
     pub fn vector_type_public(&self) -> String {

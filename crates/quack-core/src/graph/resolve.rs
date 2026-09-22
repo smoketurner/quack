@@ -46,7 +46,7 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
         return Ok(summary);
     };
     loop {
-        let pending = db.with(|db| store::nodes_without_embedding(db, 64))?;
+        let pending = db.with(|db| store::nodes_needing_embedding(db, 64))?;
         if pending.is_empty() {
             break;
         }
@@ -55,17 +55,19 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
             .embed_texts(inputs)
             .await
             .map_err(|e| Error::Embedding(e.to_string()))?;
-        db.with(|db| {
-            for (node, embedding) in pending.iter().zip(embeddings) {
+        let rows: Vec<(String, Vec<f32>)> = pending
+            .iter()
+            .zip(embeddings)
+            .map(|(node, embedding)| {
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "f64 -> f32 is acceptable for stored embeddings"
                 )]
                 let vector: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
-                store::set_node_embedding(db, &node.id, &vector)?;
-            }
-            Ok(())
-        })?;
+                (node.id.clone(), vector)
+            })
+            .collect();
+        db.with(|db| store::set_node_embeddings(db, &rows))?;
         summary.embedded = summary
             .embedded
             .saturating_add(u32::try_from(pending.len()).unwrap_or(u32::MAX));
