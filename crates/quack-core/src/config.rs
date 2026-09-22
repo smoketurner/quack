@@ -148,6 +148,11 @@ pub struct IngestionConfig {
     pub chunk_size_tokens: u32,
     pub chunk_overlap_tokens: u32,
     pub embedding_batch_size: u32,
+    /// Embedding requests in flight at once. An OpenAI-compatible endpoint
+    /// answers them in parallel; Ollama's runner embeds one input at a
+    /// time unless `OLLAMA_NUM_PARALLEL` is raised, so more only queues
+    /// there.
+    pub embedding_concurrency: u32,
     pub tokenizer_encoding: String,
     /// Largest upload the server accepts, in megabytes.
     pub upload_max_mb: u32,
@@ -159,6 +164,7 @@ impl Default for IngestionConfig {
             chunk_size_tokens: 512,
             chunk_overlap_tokens: 64,
             embedding_batch_size: 64,
+            embedding_concurrency: 2,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
         }
@@ -722,6 +728,7 @@ rerank = "model"
         assert_eq!(config.analysis.max_turns, 15);
         assert_eq!(config.analysis.history_token_budget, 32_000);
         assert_eq!(config.ingestion.upload_max_mb, 512);
+        assert_eq!(config.ingestion.embedding_concurrency, 2);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(!config.server.local);
         assert_eq!(config.server.workers_per_workspace, 1);

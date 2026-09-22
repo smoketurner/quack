@@ -554,7 +554,7 @@ graph is rebuilt with `quack graph extract` once the tables and documents are ba
 
 | Type | Parser | Extracted metadata |
 |------|--------|--------------------|
-| PDF | `pdf-extract` | page numbers |
+| PDF | `pdf_oxide` | page numbers, Info title; an unreadable page is skipped and counted, never the rest of the file |
 | Markdown, plain text | direct | headings (ATX and setext) |
 | HTML | `scraper` (html5ever) | headings, `<title>` |
 | DOCX | `zip` + `quick-xml` | headings from `Heading N` and `Title` styles, core title |
@@ -565,15 +565,26 @@ Scanned PDFs (no text layer) are detected and reported as `error: no extractable
 OCR is deferred.
 
 **Chunking.** A fixed token window: 512-token target, 64-token overlap, stepping by the
-difference. The parser splits at section boundaries first (headings, pages, slides), so a
-chunk never spans two sections, but within a section the window ignores paragraph and
-sentence boundaries. The nearest preceding heading is stored on the chunk and prepended to
-its embedding input; page numbers are recorded where the source has them. Token counts via
-`tiktoken` (`cl100k_base`).
+difference. A sectioned source (Markdown, HTML, DOCX headings, PPTX slides, plain text) is
+split at its section boundaries first, so a chunk never spans two sections, but within a
+section the window ignores paragraph and sentence boundaries. The nearest preceding heading
+is stored on the chunk and prepended to its embedding input. A PDF is one continuous text:
+its pages are joined by a blank line and windowed as a whole, so a paragraph split by a page
+break stays in one chunk; each chunk records the page its first token lies on, and carries
+the document's Info title (else the filename stem) as its heading, since a PDF has no
+heading of its own to give the embedding context. Token counts via `tiktoken`
+(`cl100k_base`).
 
 **Embedding.** Batches of `[ingestion].embedding_batch_size` (64 by default, at least one)
-through the configured embedding provider. There is no index to build on
-either side: vector search is an exact scan, and the term rows for a chunk are appended as
+through the configured embedding provider, with `[ingestion].embedding_concurrency` (2)
+requests in flight; each batch's vectors are written as one transaction as it returns, so
+the writes overlap the requests still running. The provider sets the ceiling: an
+OpenAI-compatible endpoint answers concurrent batches in parallel, while Ollama's runner
+embeds one input at a time whatever the batch size or concurrency (about 14 chunks a second
+for a 0.6B model on Apple silicon, measured) unless `OLLAMA_NUM_PARALLEL` is raised, and a
+smaller embedding model is the other lever. Every ingest logs the chunk count, batches,
+seconds, and chunks per second (`embedded chunks`), and `quack ingest` prints them. There
+is no index to build on either side: vector search is an exact scan, and the term rows for a chunk are appended as
 it is inserted. A full term rebuild happens only when an older workspace is opened
 (schema version below 6). Re-uploading a file with the same SHA-256 is a no-op with a
 message.
@@ -1503,6 +1514,7 @@ always_retrieve = false      # retrieve every turn, not only when the model asks
 chunk_size_tokens = 512
 chunk_overlap_tokens = 64
 embedding_batch_size = 64
+embedding_concurrency = 2     # requests in flight; Ollama needs OLLAMA_NUM_PARALLEL to use more than 1
 tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
 

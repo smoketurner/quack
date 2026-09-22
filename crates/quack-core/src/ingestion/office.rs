@@ -8,7 +8,7 @@ use std::io::{Cursor, Read};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use super::parser::{Extracted, Section};
+use super::parser::{Extracted, Flow, Section};
 use crate::error::{Error, Result};
 
 /// A DOCX package as sections with headings.
@@ -55,6 +55,8 @@ pub fn docx(data: &[u8]) -> Result<Extracted> {
     Ok(Extracted {
         title: core_title.or(style_title),
         sections,
+        flow: Flow::Sectioned,
+        pages_skipped: 0,
     })
 }
 
@@ -118,6 +120,8 @@ pub fn pptx(data: &[u8]) -> Result<Extracted> {
     Ok(Extracted {
         title: core_title.or(first_title),
         sections,
+        flow: Flow::Sectioned,
+        pages_skipped: 0,
     })
 }
 

@@ -1434,10 +1434,27 @@ async fn run_ingest(
     for table in &result.tables {
         writeln!(out, "  Table: {table}")?;
     }
+    if result.pages_skipped > 0 {
+        writeln!(
+            out,
+            "  Pages skipped: {} (unreadable; the rest of the document was kept)",
+            result.pages_skipped
+        )?;
+    }
     if result.chunks_stored > 0 {
         writeln!(out, "  Chunks: {}", result.chunks_stored)?;
-        if embedding_model.is_some() {
-            writeln!(out, "  Embeddings: generated")?;
+        if let Some(took) = result.embedding_time {
+            let seconds = took.as_secs_f64();
+            let per_second = if seconds > 0.0 {
+                f64::from(result.chunks_stored) / seconds
+            } else {
+                0.0
+            };
+            writeln!(
+                out,
+                "  Embeddings: {} chunks in {seconds:.1} s ({per_second:.1}/s)",
+                result.chunks_stored
+            )?;
         }
     }
 

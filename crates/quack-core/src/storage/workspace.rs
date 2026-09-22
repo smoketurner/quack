@@ -1564,6 +1564,22 @@ impl WorkspaceDb {
         Ok(value)
     }
 
+    /// Run `f`'s writes as one transaction: committed when `f` returns
+    /// `Ok`, rolled back when it errors. A document's chunks, or a batch
+    /// of embeddings, then land in one commit instead of one per row. Not
+    /// re-entrant, like [`Self::read_only`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error, or the error from beginning or committing the
+    /// transaction itself.
+    pub fn write_transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        let tx = self.conn.unchecked_transaction()?;
+        let value = f(self)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     /// Start a watchdog that interrupts the connection if the statement runs
     /// past the configured timeout. Dropping the guard disarms it.
     fn arm_timeout(&self) -> TimeoutGuard {

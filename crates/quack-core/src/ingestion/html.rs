@@ -5,7 +5,7 @@
 
 use scraper::{Html, Node, Selector};
 
-use super::parser::{Extracted, Section};
+use super::parser::{Extracted, Flow, Section};
 use crate::error::{Error, Result};
 
 /// An HTML document as sections with headings and its `<title>`.
@@ -34,6 +34,8 @@ pub fn html(text: &str) -> Result<Extracted> {
     Ok(Extracted {
         title,
         sections: walker.sections,
+        flow: Flow::Sectioned,
+        pages_skipped: 0,
     })
 }
 
