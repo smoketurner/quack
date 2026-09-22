@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use jiff::Timestamp;
 use serde::Serialize;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -323,7 +323,7 @@ struct Registry {
 struct Inner {
     workers: Arc<Semaphore>,
     worker_count: u32,
-    lanes: Mutex<HashMap<String, Arc<Semaphore>>>,
+    lanes: Mutex<HashMap<String, LaneState>>,
     registry: Mutex<Registry>,
     history: usize,
     events: broadcast::Sender<JobInfo>,
@@ -379,24 +379,91 @@ impl Inner {
         });
     }
 
-    fn lane_semaphore(&self, lane: &Lane) -> Arc<Semaphore> {
-        let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(lanes.entry(lane.key.clone()).or_insert_with(|| {
-            Arc::new(Semaphore::new(
-                usize::try_from(lane.limit).unwrap_or(usize::MAX),
-            ))
-        }))
+    fn lanes(&self) -> std::sync::MutexGuard<'_, HashMap<String, LaneState>> {
+        self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Forget a lane nobody holds or waits on, so per-session keys do not
-    /// pile up.
-    fn release_lane(&self, key: &str, semaphore: Arc<Semaphore>) {
-        let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
-        drop(semaphore);
-        if lanes.get(key).is_some_and(|s| Arc::strong_count(s) == 1) {
+    /// Take the job's place in its lane, synchronously at submit: a free
+    /// slot now, or the next place in the lane's line. Deciding here rather
+    /// than in the spawned task is what keeps a lane in submission order;
+    /// Tokio does not run spawned tasks in the order they were spawned.
+    fn enter_lane(self: &Arc<Self>, lane: &Lane) -> LaneTicket {
+        let mut lanes = self.lanes();
+        let state = lanes.entry(lane.key.clone()).or_insert_with(|| LaneState {
+            limit: usize::try_from(lane.limit).unwrap_or(usize::MAX),
+            running: 0,
+            waiting: VecDeque::new(),
+        });
+        if state.running < state.limit {
+            state.running = state.running.saturating_add(1);
+            drop(lanes);
+            LaneTicket::Ready(LanePermit::new(self, &lane.key))
+        } else {
+            let (sender, receiver) = oneshot::channel();
+            state.waiting.push_back(sender);
+            LaneTicket::Wait(receiver)
+        }
+    }
+
+    /// A lane slot came free: hand it to the first job still waiting (one
+    /// cancelled while queued has dropped its receiver and is skipped), or
+    /// give it back, forgetting a lane nobody holds or waits on so
+    /// per-session keys do not pile up.
+    fn leave_lane(self: &Arc<Self>, key: &str) {
+        let mut lanes = self.lanes();
+        let Some(state) = lanes.get_mut(key) else {
+            return;
+        };
+        while let Some(next) = state.waiting.pop_front() {
+            match next.send(LanePermit::new(self, key)) {
+                Ok(()) => return,
+                // Disarmed, so dropping it here does not re-enter this lock.
+                Err(mut unclaimed) => unclaimed.armed = false,
+            }
+        }
+        state.running = state.running.saturating_sub(1);
+        if state.running == 0 {
             lanes.remove(key);
         }
     }
+}
+
+/// One lane's slots: how many are held, and who waits for one, in order.
+struct LaneState {
+    limit: usize,
+    running: usize,
+    waiting: VecDeque<oneshot::Sender<LanePermit>>,
+}
+
+/// A held lane slot; dropping it passes the slot on.
+struct LanePermit {
+    inner: Arc<Inner>,
+    key: String,
+    armed: bool,
+}
+
+impl LanePermit {
+    fn new(inner: &Arc<Inner>, key: &str) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            key: key.to_owned(),
+            armed: true,
+        }
+    }
+}
+
+impl Drop for LanePermit {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.leave_lane(&self.key);
+        }
+    }
+}
+
+/// A job's place in its lane, taken at submit.
+enum LaneTicket {
+    Ready(LanePermit),
+    Wait(oneshot::Receiver<LanePermit>),
 }
 
 /// The work queue. Cheap to clone; every clone is the same queue.
@@ -482,11 +549,8 @@ impl JobQueue {
         };
         drop(self.inner.events.send(snapshot));
 
-        // The lane's semaphore is taken now, in submission order: Tokio's
-        // semaphore serves waiters first come, first served.
-        let lane = spec
-            .lane
-            .map(|lane| (lane.key.clone(), self.inner.lane_semaphore(&lane)));
+        // The lane place is taken now, so the lane runs in submission order.
+        let ticket = spec.lane.as_ref().map(|lane| self.inner.enter_lane(lane));
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             let ctx = JobContext {
@@ -494,11 +558,7 @@ impl JobQueue {
                 cancel: cancel.clone(),
                 inner: Arc::clone(&inner),
             };
-            let (state, outcome) = run(&inner, lane.as_ref(), ctx, work).await;
-            inner.finish(id, state, outcome);
-            if let Some((key, semaphore)) = lane {
-                inner.release_lane(&key, semaphore);
-            }
+            run(&inner, ticket, ctx, work).await;
         });
         id
     }
@@ -600,13 +660,29 @@ impl JobQueue {
     }
 }
 
-/// Wait for the lane and a worker, then run the work.
-async fn run<F, Fut>(
+/// Wait for the lane and a worker, run the work, and record its end. The
+/// end is recorded while the permits are still held, so the next job in
+/// the lane never starts before its predecessor reads as finished.
+async fn run<F, Fut>(inner: &Arc<Inner>, lane: Option<LaneTicket>, ctx: JobContext, work: F)
+where
+    F: FnOnce(JobContext) -> Fut + Send + 'static,
+    Fut: Future<Output = JobResult> + Send + 'static,
+{
+    let id = ctx.id;
+    // The permits live in `_held` until the end is recorded.
+    let (state, outcome, _held) = run_held(inner, lane, ctx, work).await;
+    inner.finish(id, state, outcome);
+}
+
+/// The permits a running job holds; dropped after its end is recorded.
+type Held = (Option<LanePermit>, Option<OwnedSemaphorePermit>);
+
+async fn run_held<F, Fut>(
     inner: &Arc<Inner>,
-    lane: Option<&(String, Arc<Semaphore>)>,
+    lane: Option<LaneTicket>,
     ctx: JobContext,
     work: F,
-) -> (JobState, Option<String>)
+) -> (JobState, Option<String>, Held)
 where
     F: FnOnce(JobContext) -> Fut + Send + 'static,
     Fut: Future<Output = JobResult> + Send + 'static,
@@ -616,25 +692,35 @@ where
         (
             JobState::Cancelled,
             Some(String::from("cancelled before it started")),
+            (None, None),
         )
     };
-    let _lane_permit: Option<OwnedSemaphorePermit> = match lane {
-        Some((_, semaphore)) => tokio::select! {
+    let lane_permit: Option<LanePermit> = match lane {
+        Some(LaneTicket::Ready(permit)) => Some(permit),
+        Some(LaneTicket::Wait(receiver)) => tokio::select! {
             biased;
             () = cancel.cancelled() => return cancelled_while_queued(),
-            permit = Arc::clone(semaphore).acquire_owned() => match permit {
+            permit = receiver => match permit {
                 Ok(permit) => Some(permit),
-                Err(_) => return (JobState::Failed, Some(String::from("the lane closed"))),
+                Err(_) => {
+                    return (JobState::Failed, Some(String::from("the lane closed")), (None, None));
+                }
             },
         },
         None => None,
     };
-    let _worker_permit = tokio::select! {
+    let worker_permit = tokio::select! {
         biased;
         () = cancel.cancelled() => return cancelled_while_queued(),
         permit = Arc::clone(&inner.workers).acquire_owned() => match permit {
             Ok(permit) => permit,
-            Err(_) => return (JobState::Failed, Some(String::from("the queue closed"))),
+            Err(_) => {
+                return (
+                    JobState::Failed,
+                    Some(String::from("the queue closed")),
+                    (lane_permit, None),
+                );
+            }
         },
     };
     let id = ctx.id;
@@ -644,7 +730,7 @@ where
     });
     // Its own task, so a panic in the work surfaces as a join error here.
     let outcome = tokio::spawn(work(ctx)).await;
-    match outcome {
+    let (state, text) = match outcome {
         Ok(Ok(summary)) => (JobState::Succeeded, Some(summary)),
         Ok(Err(_)) if cancel.is_cancelled() => {
             (JobState::Cancelled, Some(String::from("cancelled")))
@@ -657,7 +743,8 @@ where
                 Some(format!("the job stopped unexpectedly: {join}")),
             )
         }
-    }
+    };
+    (state, text, (lane_permit, Some(worker_permit)))
 }
 
 #[cfg(test)]
@@ -741,8 +828,14 @@ mod tests {
         let counts = queue.counts(None);
         assert_eq!((counts.running, counts.queued), (1, 2));
         gate.notify_one();
+        let mut previous_end = None;
         for id in ids {
-            finished(&queue, id).await;
+            let job = finished(&queue, id).await;
+            // Each starts only after the one before it reads as finished.
+            if let Some(end) = previous_end {
+                assert!(job.started_at.is_some_and(|start| start >= end));
+            }
+            previous_end = job.finished_at;
         }
         assert_eq!(
             *log.lock().unwrap_or_else(PoisonError::into_inner),
@@ -776,6 +869,42 @@ mod tests {
         gate.notify_one();
         finished(&single, first).await;
         assert_eq!(finished(&single, second).await.state, JobState::Succeeded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lane_keeps_submission_order_on_a_multi_threaded_runtime() {
+        let queue = JobQueue::new(8, 200);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ids = Vec::new();
+        for n in 0..50_u32 {
+            let log = Arc::clone(&log);
+            ids.push(queue.submit(
+                JobSpec::new(JobKind::Chat, format!("{n}")).lane(Lane::serial("session:x")),
+                move |_| async move {
+                    log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
+                    Ok(String::new())
+                },
+            ));
+        }
+        // One cancelled while queued is skipped, not waited on.
+        let skipped = ids.get(10).copied().unwrap_or_else(|| fail("no job 10"));
+        let _ = queue.cancel(skipped);
+        for id in ids {
+            finished(&queue, id).await;
+        }
+        let ran = log.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let mut sorted = ran.clone();
+        sorted.sort_unstable();
+        assert_eq!(ran, sorted, "the lane ran out of order");
+        assert!(ran.len() >= 49);
+        assert!(
+            queue
+                .inner
+                .lanes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[tokio::test]

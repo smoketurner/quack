@@ -2837,15 +2837,14 @@ mod tests {
         // SQL runs alongside.
         app.set_textarea_content("SELECT 6 * 7 AS answer");
         app.submit_message();
+        // A job can finish between the result drain and the job-event drain
+        // of one pump, so wait for the result itself, not just an idle strip.
         pump_until(&mut app, |app| {
-            app.turns.is_empty() && app.active_jobs.is_empty()
+            app.turns.is_empty()
+                && app.active_jobs.is_empty()
+                && app.messages.iter().any(|m| m.content.contains("42"))
         })
         .await;
-        // `pump` applied the query's result on the way.
-        assert!(
-            app.messages.iter().any(|m| m.content.contains("42")),
-            "the query answered"
-        );
         let jobs = app.jobs.list();
         assert_eq!(jobs.len(), 3);
         let chats: Vec<_> = jobs.iter().filter(|j| j.kind == JobKind::Chat).collect();
@@ -2856,7 +2855,8 @@ mod tests {
                 .first()
                 .and_then(|a| a.finished_at)
                 .zip(chats.get(1).and_then(|b| b.started_at))
-                .is_some_and(|(a_end, b_start)| a_end <= b_start)
+                .is_some_and(|(a_end, b_start)| a_end <= b_start),
+            "{chats:#?}"
         );
         assert!(
             app.messages.iter().any(|m| m.role == MessageRole::Error),
