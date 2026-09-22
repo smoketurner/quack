@@ -1911,6 +1911,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         &request,
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await
     .unwrap();
@@ -1966,6 +1967,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         &request,
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await
     .unwrap();
@@ -2197,6 +2199,7 @@ async fn server_policy_refuses_local_sqlite_files() {
         },
         server_policy,
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(local_file.is_err_and(|e| e.to_string().contains("allow_local_files")));
@@ -2237,6 +2240,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         &first,
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await
     .unwrap();
@@ -2255,6 +2259,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(again.is_err_and(|e| e.to_string().contains("identical")));
@@ -2271,6 +2276,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(bad.is_err_and(|e| e.to_string().contains("rejected the query")));
@@ -2287,6 +2293,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(unsupported.is_err());
@@ -2297,4 +2304,101 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             .unwrap()
             .contains(&String::from("Orders_Import"))
     );
+}
+
+/// Answers every batch only after `delay`, so a cancel can land while a
+/// request is in flight.
+struct SlowModel {
+    delay: std::time::Duration,
+}
+
+impl EmbeddingModel for SlowModel {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = ();
+
+    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+        Self {
+            delay: std::time::Duration::from_secs(60),
+        }
+    }
+
+    fn ndims(&self) -> usize {
+        TEST_DIM
+    }
+
+    fn embed_texts(
+        &self,
+        texts: impl IntoIterator<Item = String> + Send,
+    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        let texts: Vec<String> = texts.into_iter().collect();
+        let delay = self.delay;
+        async move {
+            tokio::time::sleep(delay).await;
+            Ok(texts
+                .into_iter()
+                .map(|document| Embedding {
+                    document,
+                    vec: vec![0.1_f64; TEST_DIM],
+                })
+                .collect())
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-cancel";
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let model = SlowModel {
+        delay: std::time::Duration::from_secs(60),
+    };
+    let cancel = quack_core::llm::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        trigger.cancel();
+    });
+    let started = std::time::Instant::now();
+    let outcome = ingestion::ingest_file(
+        &config,
+        &db,
+        workspace_id,
+        &ingestion::NewFile::new("long.md", b"# Long\n\nSome text to embed.").cancel(Some(&cancel)),
+        Some(&model),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(quack_core::error::Error::Cancelled)),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the request in flight was abandoned, not waited out"
+    );
+    let documents = db.list_documents().unwrap();
+    let document = documents.first().unwrap();
+    assert_eq!(document.status, "error");
+    assert_eq!(document.error_message.as_deref(), Some("cancelled"));
+    let qr = db
+        .execute_query("SELECT COUNT(*) AS cnt FROM _quack_chunks")
+        .unwrap();
+    assert_eq!(
+        qr.rows.first().unwrap().first().unwrap(),
+        &serde_json::Value::Number(0.into())
+    );
+
+    // Cancelled before it starts: nothing is parsed or stored.
+    let early = quack_core::llm::CancellationToken::new();
+    early.cancel();
+    let outcome = ingestion::ingest_file(
+        &config,
+        &db,
+        workspace_id,
+        &ingestion::NewFile::new("other.md", b"# Other").cancel(Some(&early)),
+        Some(&model),
+    )
+    .await;
+    assert!(matches!(outcome, Err(quack_core::error::Error::Cancelled)));
 }

@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ingestion::{self, DbHandle, IngestOutcome, NewFile};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
+use tokio_util::sync::CancellationToken;
 
 /// What to import and where to put it.
 #[derive(Debug, Clone)]
@@ -172,7 +173,8 @@ fn table_name(raw: &str) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error when the URL is unsupported, the source cannot be
-/// reached or queried, or the load fails.
+/// reached or queried, or the load fails; [`Error::Cancelled`] when
+/// `cancel` fires first (a download or query in flight is abandoned).
 pub async fn import<M: EmbeddingModel, D: DbHandle>(
     config: &Config,
     db: &D,
@@ -180,6 +182,7 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
     request: &ImportRequest,
     policy: ImportPolicy,
     embedding_model: Option<&M>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<ImportSummary> {
     let table = table_name(&request.table)?;
     let limit = request
@@ -197,7 +200,9 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
                 private_hosts: policy.private_hosts,
                 redirects: policy.private_hosts,
             };
-            let (filename, bytes) = fetch_http(&request.url, &table, &download).await?;
+            let (filename, bytes) =
+                ingestion::or_cancelled(cancel, fetch_http(&request.url, &table, &download))
+                    .await?;
             (filename, bytes, Vec::new(), None)
         }
         SourceKind::Sqlite if !policy.local_files => {
@@ -214,14 +219,17 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         }
         SourceKind::Postgres | SourceKind::Sqlite => {
             let sql = source_query(request)?;
-            let fetched = tokio::time::timeout(timeout, fetch_rows(&request.url, &sql, limit))
-                .await
-                .map_err(|_| {
-                    Error::Ingestion(format!(
-                        "the source did not answer within {} s",
-                        timeout.as_secs()
-                    ))
-                })??;
+            let fetch = async {
+                tokio::time::timeout(timeout, fetch_rows(&request.url, &sql, limit))
+                    .await
+                    .map_err(|_| {
+                        Error::Ingestion(format!(
+                            "the source did not answer within {} s",
+                            timeout.as_secs()
+                        ))
+                    })?
+            };
+            let fetched = ingestion::or_cancelled(cancel, fetch).await?;
             (
                 format!("{table}.csv"),
                 fetched.csv.into_bytes(),
@@ -236,7 +244,8 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         workspace_id,
         &NewFile::new(&filename, &bytes)
             .source(DocumentSource::Import)
-            .title(Some(&source)),
+            .title(Some(&source))
+            .cancel(cancel),
         embedding_model,
     )
     .await?;
@@ -789,6 +798,7 @@ mod tests {
             &request,
             ImportPolicy::owner(),
             None::<&crate::llm::EmbedModel>,
+            None,
         )
         .await
         .unwrap_or_else(|e| no_import(&e.to_string()));
@@ -862,6 +872,7 @@ mod tests {
                 &request,
                 ImportPolicy::owner(),
                 None::<&crate::llm::EmbedModel>,
+                None,
             )
             .await
             .err()

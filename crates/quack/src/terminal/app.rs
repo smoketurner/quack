@@ -30,7 +30,7 @@ use quack_core::error::Error as CoreError;
 use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::jobs::{JobContext, JobId, JobInfo, JobKind, JobQueue, JobSpec, JobState, Lane};
-use quack_core::llm;
+use quack_core::llm::{self, CancellationToken};
 use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -1886,9 +1886,16 @@ impl App {
             JobKind::Import,
             format!("import {source}"),
             Some(&format!("Importing from {source}")),
-            move |_| async move {
+            move |ctx| async move {
+                let cancel = ctx.cancel_token();
                 on_blocking_thread(move |rt| {
-                    rt.block_on(run_import_inner(&config, &workspace_id, &db, &request))
+                    rt.block_on(run_import_inner(
+                        &config,
+                        &workspace_id,
+                        &db,
+                        &request,
+                        &cancel,
+                    ))
                 })
                 .await
             },
@@ -1907,9 +1914,16 @@ impl App {
             JobKind::Ingest,
             name,
             Some(&format!("Ingesting {}", path.display())),
-            move |_| async move {
+            move |ctx| async move {
+                let cancel = ctx.cancel_token();
                 on_blocking_thread(move |rt| {
-                    rt.block_on(run_ingest_inner(&config, &workspace_id, &db, &path))
+                    rt.block_on(run_ingest_inner(
+                        &config,
+                        &workspace_id,
+                        &db,
+                        &path,
+                        &cancel,
+                    ))
                 })
                 .await
             },
@@ -2498,6 +2512,7 @@ async fn run_import_inner(
     workspace_id: &str,
     db: &SharedDb,
     request: &ImportRequest,
+    cancel: &CancellationToken,
 ) -> Result<String> {
     let embedding_model = llm::optional_embedding_model(config).await?;
     let summary = import::import(
@@ -2507,6 +2522,7 @@ async fn run_import_inner(
         request,
         ImportPolicy::owner(),
         embedding_model.as_ref(),
+        Some(cancel),
     )
     .await?;
     Ok(format!(
@@ -2523,6 +2539,7 @@ async fn run_ingest_inner(
     workspace_id: &str,
     db: &SharedDb,
     path: &std::path::Path,
+    cancel: &CancellationToken,
 ) -> Result<String> {
     let data = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
@@ -2539,7 +2556,7 @@ async fn run_ingest_inner(
         config,
         db,
         workspace_id,
-        &NewFile::new(&filename, &data),
+        &NewFile::new(&filename, &data).cancel(Some(cancel)),
         embedding_model.as_ref(),
     )
     .await

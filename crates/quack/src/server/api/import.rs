@@ -64,6 +64,7 @@ pub(crate) async fn run_import(
         request,
         policy,
         embeddings.as_ref(),
+        None,
     )
     .await;
     let detail = serde_json::json!({

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rig::embeddings::EmbeddingModel;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -86,6 +87,8 @@ pub struct NewFile<'a> {
     pub source: DocumentSource,
     pub title: Option<&'a str>,
     pub ingested_by: Option<&'a str>,
+    /// Stops the ingest between steps and mid-embedding when cancelled.
+    pub cancel: Option<&'a CancellationToken>,
 }
 
 impl<'a> NewFile<'a> {
@@ -98,6 +101,7 @@ impl<'a> NewFile<'a> {
             source: DocumentSource::Path,
             title: None,
             ingested_by: None,
+            cancel: None,
         }
     }
 
@@ -117,6 +121,44 @@ impl<'a> NewFile<'a> {
     pub fn ingested_by(mut self, user: Option<&'a str>) -> Self {
         self.ingested_by = user;
         self
+    }
+
+    /// Stop when `cancel` is cancelled (a job's token).
+    #[must_use]
+    pub fn cancel(mut self, cancel: Option<&'a CancellationToken>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+}
+
+/// Run `work` unless `cancel` fires first, in which case it is dropped
+/// (an embedding request in flight is abandoned) and the answer is
+/// [`Error::Cancelled`].
+///
+/// # Errors
+///
+/// `work`'s error, or [`Error::Cancelled`].
+pub async fn or_cancelled<T>(
+    cancel: Option<&CancellationToken>,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match cancel {
+        None => work.await,
+        Some(token) => tokio::select! {
+            biased;
+            () = token.cancelled() => Err(Error::Cancelled),
+            result = work => result,
+        },
+    }
+}
+
+/// [`Error::Cancelled`] when `cancel` has fired, for the checks between
+/// steps.
+fn check_cancel(cancel: Option<&CancellationToken>) -> Result<()> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -156,6 +198,7 @@ pub async fn ingest_file<M: EmbeddingModel, D: DbHandle>(
         file.filename,
         file.data,
         embedding_model,
+        file.cancel,
     )
     .await?;
     Ok(IngestOutcome::Ingested(result))
@@ -210,11 +253,17 @@ pub fn register_document(db: &WorkspaceDb, file: &NewFile<'_>) -> Result<Registr
 }
 
 /// Parse, store, and embed a registered document, moving its status from
-/// `processing` to `ready`, or to `error` with the message when it fails.
+/// `processing` to `ready`, or to `error` with the message when it fails
+/// (`cancelled` when `cancel` fired: the chunks stored so far are
+/// discarded, as for any failure).
 ///
 /// # Errors
 ///
 /// Returns the failure after recording it on the document row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the document's identity, its bytes, the model, and the cancel token"
+)]
 pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     config: &Config,
     db: &D,
@@ -223,18 +272,25 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     filename: &str,
     data: &[u8],
     embedding_model: Option<&M>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<IngestResult> {
     db.with(|db| db.update_document_status(doc_id, "processing"))?;
-    let outcome = process_inner(
-        config,
-        db,
-        workspace_id,
-        doc_id,
-        filename,
-        data,
-        embedding_model,
-    )
-    .await;
+    let outcome = match check_cancel(cancel) {
+        Ok(()) => {
+            process_inner(
+                config,
+                db,
+                workspace_id,
+                doc_id,
+                filename,
+                data,
+                embedding_model,
+                cancel,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
     match &outcome {
         Ok(result) => db.with(|db| {
             db.set_document_chunk_count(doc_id, result.chunks_stored)?;
@@ -249,6 +305,10 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     outcome
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "process_document's arguments, passed through"
+)]
 async fn process_inner<M: EmbeddingModel, D: DbHandle>(
     config: &Config,
     db: &D,
@@ -257,6 +317,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
     filename: &str,
     data: &[u8],
     embedding_model: Option<&M>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<IngestResult> {
     let file_type = parser::detect_file_type(filename);
     match file_type {
@@ -316,13 +377,17 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 config.ingestion.chunk_overlap_tokens,
                 &config.ingestion.tokenizer_encoding,
             )?;
+            check_cancel(cancel)?;
             let (chunk_count, embedding_time) = embed_and_store(
                 db,
                 doc_id,
                 &chunks,
                 embedding_model,
-                config.ingestion.embedding_batch_size,
-                config.ingestion.embedding_concurrency,
+                EmbedPlan {
+                    batch_size: config.ingestion.embedding_batch_size,
+                    concurrency: config.ingestion.embedding_concurrency,
+                    cancel,
+                },
             )
             .await?;
             Ok(IngestResult {
@@ -512,15 +577,28 @@ fn ingest_workbook(
 /// to `concurrency` requests in flight (`[ingestion].embedding_concurrency`),
 /// each batch's vectors written as one transaction as soon as it returns.
 /// Returns the chunk count and, when a model ran, how long embedding took.
+/// How `embed_and_store` sends its batches.
+struct EmbedPlan<'a> {
+    batch_size: u32,
+    concurrency: u32,
+    /// Checked while each batch is in flight: a cancel drops the requests.
+    cancel: Option<&'a CancellationToken>,
+}
+
 async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
     db: &D,
     document_id: &str,
     chunks: &[chunker::Chunk],
     embedding_model: Option<&M>,
-    batch_size: u32,
-    concurrency: u32,
+    plan: EmbedPlan<'_>,
 ) -> Result<(u32, Option<Duration>)> {
     use futures::StreamExt as _;
+
+    let EmbedPlan {
+        batch_size,
+        concurrency,
+        cancel,
+    } = plan;
 
     let stored = db.with(|db| {
         db.write_transaction(|db| {
@@ -577,7 +655,7 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
     });
     let mut batches: u32 = 0;
     let mut stream = futures::stream::iter(calls).buffered(concurrency);
-    while let Some(next) = stream.next().await {
+    while let Some(next) = or_cancelled(cancel, async { Ok(stream.next().await) }).await? {
         let (offset, embeddings) = next?;
         batches = batches.saturating_add(1);
         db.with(|db| {

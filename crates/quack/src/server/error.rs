@@ -63,7 +63,9 @@ impl From<CoreError> for ApiError {
                 StatusCode::BAD_REQUEST
             }
             CoreError::Analysis(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            CoreError::TableTaken { .. } => StatusCode::CONFLICT,
+            // A request is never cancelled through its own handler today (only
+            // background jobs are); should one be, it lost to a later action.
+            CoreError::TableTaken { .. } | CoreError::Cancelled => StatusCode::CONFLICT,
             CoreError::Sqlite(_)
             | CoreError::DuckDb(_)
             | CoreError::Embedding(_)

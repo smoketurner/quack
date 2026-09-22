@@ -43,14 +43,15 @@ pub(crate) fn submit_upload(
     let workspace = workspace_id.to_owned();
     let document_id = job.document_id.clone();
     let worker_db = Arc::clone(&db);
-    let id = app.jobs.submit(spec, move |_| async move {
+    let id = app.jobs.submit(spec, move |ctx| async move {
+        let cancel = ctx.cancel_token();
         let handle = tokio::runtime::Handle::current();
         let document_id = job.document_id.clone();
         // Parsing and DuckDB writes are blocking work; the embedding calls
         // inside need the runtime, so block on it from a blocking thread.
         let outcome = tokio::task::spawn_blocking({
             let db = Arc::clone(&worker_db);
-            move || handle.block_on(process(&config, &workspace, &db, job))
+            move || handle.block_on(process(&config, &workspace, &db, job, &cancel))
         })
         .await;
         match outcome {
@@ -90,7 +91,15 @@ where
     });
 }
 
-async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: UploadJob) -> JobResult {
+/// Process the upload; a cancel stops it between steps or mid-embedding and
+/// leaves the document `error: cancelled`.
+async fn process(
+    config: &Config,
+    workspace_id: &str,
+    db: &SharedDb,
+    job: UploadJob,
+    cancel: &llm::CancellationToken,
+) -> JobResult {
     let model = match llm::optional_embedding_model(config).await {
         Ok(model) => model,
         Err(e) => {
@@ -107,6 +116,7 @@ async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: Upload
         &job.filename,
         &job.data,
         model.as_ref(),
+        Some(cancel),
     )
     .await;
     match result {

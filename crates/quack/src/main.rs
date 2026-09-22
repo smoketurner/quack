@@ -868,6 +868,7 @@ async fn run_import(
         request,
         ImportPolicy::owner(),
         embedding_model.as_ref(),
+        None,
     )
     .await;
     if let Err(e) = &summary
