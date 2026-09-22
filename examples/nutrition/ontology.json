@@ -1,0 +1,122 @@
+{
+  "classes": [
+    {
+      "id": "food",
+      "label": "Food",
+      "description": "One food as USDA describes it (Spinach, raw; Egg, whole, raw, fresh), with its headline nutrients per 100 g",
+      "key": "description",
+      "properties": ["description", "energy_kcal", "protein_g", "fat_g", "carbohydrate_g", "fiber_g", "sugars_g", "sodium_mg"]
+    },
+    {
+      "id": "food_category",
+      "label": "Food category",
+      "description": "One of USDA's 25 food groups: Dairy and Egg Products, Fruits and Fruit Juices, Legumes and Legume Products, ...",
+      "key": "category_name",
+      "properties": ["category_name", "code"]
+    },
+    {
+      "id": "nutrient",
+      "label": "Nutrient",
+      "description": "A nutrient with an FDA Daily Value: Protein, Dietary fiber, Iron, Vitamin C, ...",
+      "key": "nutrient_name",
+      "properties": ["nutrient_name", "daily_value", "unit", "goal"]
+    },
+    {
+      "id": "nutrient_claim",
+      "label": "Nutrient content claim",
+      "description": "A food whose first listed serving is a good source (10% to 19% of the Daily Value) or an excellent source (20% or more) of a nutrient",
+      "key": "claim",
+      "properties": ["claim", "level", "percent_dv", "amount_per_serving", "serving"]
+    }
+  ],
+  "relations": [
+    {
+      "id": "in_category",
+      "label": "in category",
+      "description": "The food group the food belongs to",
+      "domain": "food",
+      "range": "food_category"
+    },
+    {
+      "id": "claim_for",
+      "label": "claim for",
+      "description": "The food the claim is about",
+      "domain": "nutrient_claim",
+      "range": "food"
+    },
+    {
+      "id": "claim_of",
+      "label": "claim of",
+      "description": "The nutrient the food is a source of",
+      "domain": "nutrient_claim",
+      "range": "nutrient"
+    }
+  ],
+  "properties": [
+    { "id": "description", "label": "Description", "type": "string" },
+    { "id": "energy_kcal", "label": "Energy (kcal per 100 g)", "type": "number" },
+    { "id": "protein_g", "label": "Protein (g per 100 g)", "type": "number" },
+    { "id": "fat_g", "label": "Fat (g per 100 g)", "type": "number" },
+    { "id": "carbohydrate_g", "label": "Carbohydrate (g per 100 g)", "type": "number" },
+    { "id": "fiber_g", "label": "Fiber (g per 100 g)", "type": "number" },
+    { "id": "sugars_g", "label": "Sugars (g per 100 g)", "type": "number" },
+    { "id": "sodium_mg", "label": "Sodium (mg per 100 g)", "type": "number" },
+    { "id": "category_name", "label": "Category", "type": "string" },
+    { "id": "code", "label": "SR food group code", "type": "string" },
+    { "id": "nutrient_name", "label": "Nutrient", "type": "string" },
+    { "id": "daily_value", "label": "Daily Value", "type": "number" },
+    { "id": "unit", "label": "Unit", "type": "string" },
+    { "id": "goal", "label": "Goal", "type": "enum", "values": ["get enough", "limit", "reference"] },
+    { "id": "claim", "label": "Claim", "type": "string" },
+    { "id": "level", "label": "Claim level", "type": "enum", "values": ["good source", "excellent source"] },
+    { "id": "percent_dv", "label": "Percent of the Daily Value in one serving", "type": "number" },
+    { "id": "amount_per_serving", "label": "Amount in one serving", "type": "number" },
+    { "id": "serving", "label": "Serving", "type": "string" }
+  ],
+  "mappings": [
+    {
+      "table": "nutrition",
+      "class": "food",
+      "key": "description",
+      "properties": {
+        "energy_kcal": "energy_kcal",
+        "protein_g": "protein_g",
+        "fat_g": "fat_g",
+        "carbohydrate_g": "carbohydrate_g",
+        "fiber_g": "fiber_g",
+        "sugars_g": "sugars_g",
+        "sodium_mg": "sodium_mg"
+      },
+      "relations": [
+        { "relation": "in_category", "column": "category", "target_class": "food_category", "target_key": "category_name" }
+      ]
+    },
+    {
+      "table": "food_category",
+      "class": "food_category",
+      "key": "description",
+      "properties": { "code": "code" }
+    },
+    {
+      "table": "daily_values",
+      "class": "nutrient",
+      "key": "nutrient",
+      "properties": { "daily_value": "daily_value", "unit": "unit", "goal": "goal" }
+    },
+    {
+      "table": "nutrient_claims",
+      "class": "nutrient_claim",
+      "key": "claim",
+      "properties": {
+        "level": "level",
+        "percent_dv": "percent_dv",
+        "amount_per_serving": "amount_per_serving",
+        "serving": "serving"
+      },
+      "relations": [
+        { "relation": "claim_for", "column": "food", "target_class": "food", "target_key": "description" },
+        { "relation": "claim_of", "column": "nutrient", "target_class": "nutrient", "target_key": "nutrient_name" }
+      ]
+    }
+  ]
+}

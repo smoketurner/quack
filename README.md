@@ -16,8 +16,8 @@ choose. These run against the demo workspace below.
 runs it, and explains the rows.
 
 ```bash
-quack -w storms -p "which states had the most direct deaths, and from what kind of weather?"
-quack -w storms -p "chart property damage by month"     # returns a chart plus the numbers
+quack -w nutrition -p "how much protein is in an egg?"
+quack -w nutrition -p "chart the ten fruits with the most vitamin C per 100 g"     # returns a chart plus the numbers
 ```
 
 **Questions your documents answer.** Retrieval is hybrid — vector similarity and a
@@ -25,31 +25,31 @@ keyword index — and every `[n]` in the answer is checked against a chunk actua
 retrieved on that turn. `--mode query` forbids answering from anything else.
 
 ```bash
-quack -w storms -p "what wind speeds define an EF3?" --mode query
-quack -w storms -p "what is the difference between a direct and an indirect fatality?" --mode query
+quack -w nutrition -p "what does the government say about added sugars?" --mode query
+quack -w nutrition -p "what counts as an excellent source of a nutrient on a label?" --mode query
 ```
 
 **Questions that need both at once.** This is the part a SQL tool and a document chatbot
 each get half of: the tables hold the numbers, the documents say what the numbers mean.
 
 ```bash
-quack -w storms -p "deaths per million residents by state, top ten"   # joins the storm table to Census figures imported over HTTPS
-quack -w storms -p "how many people died in mobile homes, and do those count as direct deaths?"
+quack -w nutrition -p "which cheeses have the most calcium, and what share of the daily value is 100 g?"   # joins USDA amounts to the FDA table
+quack -w nutrition -p "is a cup of cooked lentils a good source of iron, by the label rules?"
 ```
 
 **Questions about how things connect.** Once the graph is built the agent walks it —
 neighborhoods, shortest paths, everything of a class — instead of guessing a join.
 
 ```bash
-quack -w storms -p "which forecast offices recorded events that killed people in mobile homes?"
-quack -w storms graph path 58277 GSP    # a fatality -> its flash flood -> the office that recorded it
+quack -w nutrition -p "which legumes are excellent sources of iron?"
+quack -w nutrition graph path 'Kale, raw' 'Vitamin K'    # a food -> its nutrient content claim -> the nutrient
 ```
 
 **Follow-up questions.** Sessions live in the workspace file, resumable and exportable as
 a Markdown transcript or as the SQL that ran.
 
 ```bash
-quack -w storms -p "and how many of those were indirect?" -c
+quack -w nutrition -p "and per large egg?" -c
 ```
 
 What it will not do: write to your data without asking, cite a source it did not
@@ -86,13 +86,14 @@ key, or OAuth. `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data 
 ## Try it
 
 ```bash
-make demo-data      # about two minutes
+make demo-data      # a few minutes, most of it embedding the documents
 ```
 
-That is NOAA's 2024 Storm Events Database: three linked tables, Census population figures
-imported over HTTPS, the government documents defining every code in the tables, an
-ontology, and a knowledge graph. Every question above works against it. [examples/](examples/)
-has the walkthrough and a second workspace built from USAID supply chain shipments.
+That is USDA's FoodData Central: 7,793 foods and 644,000 nutrient measurements in six
+linked tables, the FDA's Daily Values, the Dietary Guidelines for Americans and the
+government documents defining every code in the tables, an ontology, and a knowledge
+graph of which foods are good sources of which nutrients. Every question above works
+against it. [examples/nutrition/](examples/nutrition/) has the walkthrough.
 
 ## Use it
 

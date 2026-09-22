@@ -1,0 +1,36 @@
+nutrient,nutrient_id,daily_value,unit,goal,in_graph
+Added sugars,,50,g,limit,no
+Biotin,,30,mcg,get enough,no
+Calcium,1087,1300,mg,get enough,yes
+Chloride,,2300,mg,get enough,no
+Choline,1180,550,mg,get enough,no
+Cholesterol,1253,300,mg,limit,no
+Chromium,,35,mcg,get enough,no
+Copper,1098,0.9,mg,get enough,no
+Dietary fiber,1079,28,g,get enough,yes
+Fat,1004,78,g,limit,no
+Folate,1190,400,mcg DFE,get enough,yes
+Iodine,,150,mcg,get enough,no
+Iron,1089,18,mg,get enough,yes
+Magnesium,1090,420,mg,get enough,yes
+Manganese,1101,2.3,mg,get enough,no
+Molybdenum,,45,mcg,get enough,no
+Niacin,1167,16,mg NE,get enough,no
+Pantothenic acid,1170,5,mg,get enough,no
+Phosphorus,1091,1250,mg,get enough,no
+Potassium,1092,4700,mg,get enough,yes
+Protein,1003,50,g,get enough,no
+Riboflavin,1166,1.3,mg,get enough,no
+Saturated fat,1258,20,g,limit,no
+Selenium,1103,55,mcg,get enough,no
+Sodium,1093,2300,mg,limit,no
+Thiamin,1165,1.2,mg,get enough,no
+Total carbohydrate,1005,275,g,reference,no
+Vitamin A,1106,900,mcg RAE,get enough,yes
+Vitamin B6,1175,1.7,mg,get enough,no
+Vitamin B12,1178,2.4,mcg,get enough,yes
+Vitamin C,1162,90,mg,get enough,yes
+Vitamin D,1114,20,mcg,get enough,yes
+Vitamin E,1109,15,mg alpha-tocopherol,get enough,yes
+Vitamin K,1185,120,mcg,get enough,yes
+Zinc,1095,11,mg,get enough,yes

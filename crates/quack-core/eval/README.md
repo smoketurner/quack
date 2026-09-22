@@ -1,15 +1,15 @@
 # Eval fixture
 
 The in-tree fixture for `cargo run -p quack-core --example eval` (`make eval`), a
-storms-like corpus written for this harness rather than downloaded: not the full NOAA
-dataset `examples/storms/` uses.
+storm-themed corpus written for this harness rather than downloaded, not a public
+dataset.
 
 - `documents/` — 27 short Markdown documents: a glossary, the EF and Saffir-Simpson
   scales, storm data preparation guidance, tornado safety and damage notation, ten
   episode narratives each carrying a unique `SR-nnnn` report identifier and at least one
   quotable phrase, four forecast office pages, and eight decoy documents (see below).
 - `tables/` — `events.csv` (25 rows), `fatalities.csv` (39 rows, referencing
-  `events.event_id`), and `states.csv` (6 rows), shaped like `examples/storms` but tiny.
+  `events.event_id`), and `states.csv` (6 rows).
 - `gold_questions.json` — questions mapped to the document filename and a content
   substring that identifies the expected chunk (chunk ids are UUID v7, minted at ingest,
   so they cannot be fixed in the fixture ahead of time). Tagged `identifier`, `phrase`,

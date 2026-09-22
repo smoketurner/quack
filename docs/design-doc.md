@@ -1309,7 +1309,7 @@ missing table) are tool errors the client model can read. Resources:
 (JSON), `.../context` (Markdown).
 
 ```json
-{ "mcpServers": { "quack": { "command": "quack", "args": ["mcp", "-w", "logistics"] } } }
+{ "mcpServers": { "quack": { "command": "quack", "args": ["mcp", "-w", "nutrition"] } } }
 ```
 
 ### 11.4 Terminal session (TUI)
@@ -1711,7 +1711,7 @@ workspace) are local-only and not wired into a release. There is no fuzzing.
 
 **Evaluation.** `make eval` (`crates/quack-core/examples/eval.rs`, issue #74) is the
 answer-quality counterpart to the correctness suites above: it ingests a small in-tree
-storms-like fixture (`crates/quack-core/eval/`, 27 documents and three CSV tables written
+storm-themed fixture (`crates/quack-core/eval/`, 27 documents and three CSV tables written
 for the harness, not the NOAA download) into a temporary workspace and prints recall@1/5/8
 and MRR, per question kind (`identifier`, `phrase`, `semantic`) and per backend
 (`search_keyword_chunks`, `search_similar_chunks`, `search_hybrid_chunks`), over a 21-question
