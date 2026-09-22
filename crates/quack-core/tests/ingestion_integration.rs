@@ -136,6 +136,7 @@ fn test_config(data_dir: &Path) -> Config {
             chunk_size_tokens: 50,
             chunk_overlap_tokens: 10,
             embedding_batch_size: 64,
+            embedding_concurrency: 2,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
         },
@@ -237,6 +238,131 @@ async fn ingest_text_with_mock_embeddings() {
         .unwrap();
     let count = qr.rows.first().unwrap().first().unwrap();
     assert_ne!(count, &serde_json::Value::Number(0.into()));
+}
+
+/// Counts how many embed requests are in flight at once and answers each
+/// input with its own length, the first request slowest, so batches
+/// finish out of order.
+struct InFlightModel {
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl EmbeddingModel for InFlightModel {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = ();
+
+    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+        Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn ndims(&self) -> usize {
+        TEST_DIM
+    }
+
+    fn embed_texts(
+        &self,
+        texts: impl IntoIterator<Item = String> + Send,
+    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        use std::sync::atomic::Ordering;
+        let texts: Vec<String> = texts.into_iter().collect();
+        async move {
+            let now = self
+                .in_flight
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1);
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let millis = if call == 0 { 40 } else { 2 };
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(texts
+                .into_iter()
+                .map(|document| {
+                    let len = f64::from(u32::try_from(document.len()).unwrap_or(u32::MAX));
+                    Embedding {
+                        document,
+                        vec: vec![len, 0.0, 0.0, 0.0],
+                    }
+                })
+                .collect())
+        }
+    }
+}
+
+async fn ingest_six_sections(
+    config: &Config,
+    workspace_id: &str,
+    model: &InFlightModel,
+) -> (WorkspaceDb, ingestion::IngestResult) {
+    let db = WorkspaceDb::open(config, workspace_id).unwrap();
+    let sections: Vec<String> = (1..=6)
+        .map(|i| format!("# Section {i}\n\nA short paragraph about topic number {i}.\n"))
+        .collect();
+    let data = sections.join("\n");
+    let result = ingestion::ingest_file(
+        config,
+        &db,
+        workspace_id,
+        &ingestion::NewFile::new("sections.md", data.as_bytes()),
+        Some(model),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    (db, result)
+}
+
+/// Chunks whose stored vector is not the one made from their own text.
+fn mismatched_vectors(db: &WorkspaceDb) -> serde_json::Value {
+    let qr = db
+        .execute_query(
+            "SELECT count(*) FROM _quack_chunks \
+             WHERE embedding IS NULL \
+                OR embedding[1] != length(heading || chr(10) || chr(10) || content)",
+        )
+        .unwrap();
+    qr.rows.first().unwrap().first().unwrap().clone()
+}
+
+#[tokio::test]
+async fn embedding_concurrency_overlaps_requests_and_keeps_vectors_with_their_chunks() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.ingestion.embedding_batch_size = 1;
+    config.ingestion.embedding_concurrency = 3;
+    let model = InFlightModel::make(&(), "mock", None);
+
+    let (db, result) = ingest_six_sections(&config, "ws-concurrent", &model).await;
+
+    assert_eq!(result.chunks_stored, 6);
+    assert!(result.embedding_time.is_some());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 6);
+    let peak = model.peak.load(Ordering::SeqCst);
+    assert!((2..=3).contains(&peak), "peak in-flight requests: {peak}");
+    assert_eq!(mismatched_vectors(&db), serde_json::Value::Number(0.into()));
+}
+
+#[tokio::test]
+async fn embedding_concurrency_of_one_stays_serial() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.ingestion.embedding_batch_size = 1;
+    config.ingestion.embedding_concurrency = 1;
+    let model = InFlightModel::make(&(), "mock", None);
+
+    let (db, _) = ingest_six_sections(&config, "ws-serial", &model).await;
+
+    assert_eq!(model.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(mismatched_vectors(&db), serde_json::Value::Number(0.into()));
 }
 
 #[tokio::test]

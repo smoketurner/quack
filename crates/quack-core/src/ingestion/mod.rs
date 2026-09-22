@@ -5,6 +5,7 @@ pub mod parser;
 pub mod xlsx;
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rig::embeddings::EmbeddingModel;
 
@@ -53,6 +54,8 @@ pub struct IngestResult {
     pub tables: Vec<String>,
     /// Pages the parser could not read and skipped (PDF only).
     pub pages_skipped: u32,
+    /// How long embedding the chunks took, when a model ran.
+    pub embedding_time: Option<Duration>,
 }
 
 /// What `ingest_file` did: stored the file, or skipped it because a
@@ -268,6 +271,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 chunks_stored: 0,
                 tables: vec![table_name],
                 pages_skipped: 0,
+                embedding_time: None,
             })
         }
         parser::FileType::Xlsx => {
@@ -280,6 +284,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 chunks_stored: 0,
                 tables,
                 pages_skipped: 0,
+                embedding_time: None,
             })
         }
         parser::FileType::Pdf
@@ -311,12 +316,13 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 config.ingestion.chunk_overlap_tokens,
                 &config.ingestion.tokenizer_encoding,
             )?;
-            let chunk_count = embed_and_store(
+            let (chunk_count, embedding_time) = embed_and_store(
                 db,
                 doc_id,
                 &chunks,
                 embedding_model,
                 config.ingestion.embedding_batch_size,
+                config.ingestion.embedding_concurrency,
             )
             .await?;
             Ok(IngestResult {
@@ -326,6 +332,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 chunks_stored: chunk_count,
                 tables: Vec::new(),
                 pages_skipped,
+                embedding_time,
             })
         }
         parser::FileType::Unknown => Err(Error::UnsupportedFileType(filename.to_owned())),
@@ -501,56 +508,80 @@ fn ingest_workbook(
 }
 
 /// Store `chunks`, then embed them `batch_size` at a time
-/// (`[ingestion].embedding_batch_size`, at least one per request).
+/// (`[ingestion].embedding_batch_size`, at least one per request) with up
+/// to `concurrency` requests in flight (`[ingestion].embedding_concurrency`),
+/// each batch's vectors written as one transaction as soon as it returns.
+/// Returns the chunk count and, when a model ran, how long embedding took.
 async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
     db: &D,
     document_id: &str,
     chunks: &[chunker::Chunk],
     embedding_model: Option<&M>,
     batch_size: u32,
-) -> Result<u32> {
+    concurrency: u32,
+) -> Result<(u32, Option<Duration>)> {
+    use futures::StreamExt as _;
+
     let stored = db.with(|db| {
-        let mut stored: u32 = 0;
-        for (i, chunk) in chunks.iter().enumerate() {
-            let chunk_id = uuid::Uuid::now_v7().to_string();
-            let idx =
-                u32::try_from(i).map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
-            db.insert_chunk(&NewChunk {
-                id: &chunk_id,
-                document_id,
-                chunk_index: idx,
-                content: &chunk.content,
-                heading: chunk.heading.as_deref(),
-                page: chunk.page,
-                embedding: None,
-            })?;
-            stored = stored
-                .checked_add(1)
-                .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
-        }
-        Ok(stored)
+        db.write_transaction(|db| {
+            let mut stored: u32 = 0;
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_id = uuid::Uuid::now_v7().to_string();
+                let idx = u32::try_from(i)
+                    .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
+                db.insert_chunk(&NewChunk {
+                    id: &chunk_id,
+                    document_id,
+                    chunk_index: idx,
+                    content: &chunk.content,
+                    heading: chunk.heading.as_deref(),
+                    page: chunk.page,
+                    embedding: None,
+                })?;
+                stored = stored
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
+            }
+            Ok(stored)
+        })
     })?;
 
-    if let Some(model) = embedding_model {
-        let batch_size = usize::try_from(batch_size.max(1))
-            .map_err(|_| Error::Ingestion("embedding_batch_size overflow".into()))?;
-        let mut offset = 0usize;
+    let Some(model) = embedding_model else {
+        return Ok((stored, None));
+    };
+    if chunks.is_empty() {
+        return Ok((stored, Some(Duration::ZERO)));
+    }
 
-        while offset < chunks.len() {
-            let end = chunks.len().min(offset.saturating_add(batch_size));
-            let batch_texts: Vec<String> = chunks
-                .get(offset..end)
-                .ok_or_else(|| Error::Ingestion("batch slice out of bounds".into()))?
-                .iter()
-                .map(chunker::Chunk::embedding_input)
-                .collect();
-
-            let embeddings = model
-                .embed_texts(batch_texts)
-                .await
-                .map_err(|e| Error::Embedding(e.to_string()))?;
-
-            db.with(|db| {
+    let started = Instant::now();
+    let batch_size = usize::try_from(batch_size.max(1))
+        .map_err(|_| Error::Ingestion("embedding_batch_size overflow".into()))?;
+    let concurrency = usize::try_from(concurrency.max(1)).unwrap_or(1);
+    // Batches are collected before the futures are built: a closure that
+    // takes the slice by reference would tie each future's type to that
+    // borrow and fail the `Send` check the server's handlers need.
+    let batches_input: Vec<(usize, Vec<String>)> = chunks
+        .chunks(batch_size)
+        .enumerate()
+        .map(|(batch, slice)| {
+            let texts = slice.iter().map(chunker::Chunk::embedding_input).collect();
+            (batch.saturating_mul(batch_size), texts)
+        })
+        .collect();
+    let calls = batches_input.into_iter().map(|(offset, texts)| async move {
+        let embeddings = model
+            .embed_texts(texts)
+            .await
+            .map_err(|e| Error::Embedding(e.to_string()))?;
+        Ok::<_, Error>((offset, embeddings))
+    });
+    let mut batches: u32 = 0;
+    let mut stream = futures::stream::iter(calls).buffered(concurrency);
+    while let Some(next) = stream.next().await {
+        let (offset, embeddings) = next?;
+        batches = batches.saturating_add(1);
+        db.with(|db| {
+            db.write_transaction(|db| {
                 for (j, embedding) in embeddings.into_iter().enumerate() {
                     let chunk_idx = u32::try_from(offset.saturating_add(j))
                         .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
@@ -564,19 +595,27 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
                     db.update_chunk_embedding(document_id, chunk_idx, &vec_f32)?;
                 }
                 Ok(())
-            })?;
-
-            offset = end;
-        }
-
-        tracing::info!(
-            document_id = %document_id,
-            chunk_count = %stored,
-            "embedded chunks"
-        );
+            })
+        })?;
     }
 
-    Ok(stored)
+    let elapsed = started.elapsed();
+    let seconds = elapsed.as_secs_f64();
+    let per_second = if seconds > 0.0 {
+        f64::from(stored) / seconds
+    } else {
+        0.0
+    };
+    tracing::info!(
+        document_id = %document_id,
+        chunk_count = %stored,
+        batches,
+        concurrency,
+        seconds = %format!("{seconds:.1}"),
+        chunks_per_second = %format!("{per_second:.1}"),
+        "embedded chunks"
+    );
+    Ok((stored, Some(elapsed)))
 }
 
 fn sanitize_table_name(filename: &str) -> String {

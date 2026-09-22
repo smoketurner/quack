@@ -576,8 +576,15 @@ heading of its own to give the embedding context. Token counts via `tiktoken`
 (`cl100k_base`).
 
 **Embedding.** Batches of `[ingestion].embedding_batch_size` (64 by default, at least one)
-through the configured embedding provider. There is no index to build on
-either side: vector search is an exact scan, and the term rows for a chunk are appended as
+through the configured embedding provider, with `[ingestion].embedding_concurrency` (2)
+requests in flight; each batch's vectors are written as one transaction as it returns, so
+the writes overlap the requests still running. The provider sets the ceiling: an
+OpenAI-compatible endpoint answers concurrent batches in parallel, while Ollama's runner
+embeds one input at a time whatever the batch size or concurrency (about 14 chunks a second
+for a 0.6B model on Apple silicon, measured) unless `OLLAMA_NUM_PARALLEL` is raised, and a
+smaller embedding model is the other lever. Every ingest logs the chunk count, batches,
+seconds, and chunks per second (`embedded chunks`), and `quack ingest` prints them. There
+is no index to build on either side: vector search is an exact scan, and the term rows for a chunk are appended as
 it is inserted. A full term rebuild happens only when an older workspace is opened
 (schema version below 6). Re-uploading a file with the same SHA-256 is a no-op with a
 message.
@@ -1507,6 +1514,7 @@ always_retrieve = false      # retrieve every turn, not only when the model asks
 chunk_size_tokens = 512
 chunk_overlap_tokens = 64
 embedding_batch_size = 64
+embedding_concurrency = 2     # requests in flight; Ollama needs OLLAMA_NUM_PARALLEL to use more than 1
 tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
 

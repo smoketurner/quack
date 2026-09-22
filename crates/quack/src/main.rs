@@ -1443,8 +1443,18 @@ async fn run_ingest(
     }
     if result.chunks_stored > 0 {
         writeln!(out, "  Chunks: {}", result.chunks_stored)?;
-        if embedding_model.is_some() {
-            writeln!(out, "  Embeddings: generated")?;
+        if let Some(took) = result.embedding_time {
+            let seconds = took.as_secs_f64();
+            let per_second = if seconds > 0.0 {
+                f64::from(result.chunks_stored) / seconds
+            } else {
+                0.0
+            };
+            writeln!(
+                out,
+                "  Embeddings: {} chunks in {seconds:.1} s ({per_second:.1}/s)",
+                result.chunks_stored
+            )?;
         }
     }
 

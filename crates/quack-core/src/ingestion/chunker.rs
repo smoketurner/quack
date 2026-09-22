@@ -62,12 +62,15 @@ fn windows(len: usize, chunk_size: usize, overlap: usize) -> Vec<(usize, usize)>
     ranges
 }
 
+/// The text of `tokens[start..end]`. A BPE token can hold part of a
+/// multi-byte character, so a window edge may cut one; the cut bytes
+/// become U+FFFD, and the overlap carries the whole character in the
+/// neighbouring chunk.
 fn decode(enc: &tiktoken::CoreBpe, tokens: &[u32], start: usize, end: usize) -> Result<String> {
     let slice = tokens
         .get(start..end)
         .ok_or_else(|| Error::Ingestion("chunk slice out of bounds".into()))?;
-    enc.decode_to_string(slice)
-        .map_err(|e| Error::Ingestion(format!("token decode failed: {e}")))
+    Ok(String::from_utf8_lossy(&enc.decode(slice)).into_owned())
 }
 
 #[cfg(test)]
@@ -133,6 +136,18 @@ mod tests {
     fn whitespace_only_returns_single_chunk() {
         let chunks = chunk_text("   \n\t  ", 10, 2, ENC).unwrap();
         assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn a_window_edge_inside_a_multibyte_character_does_not_fail() {
+        // Em dashes and accented letters span several BPE byte tokens;
+        // a one-token window must land inside some of them.
+        let text = "café — naïve — résumé — coöperate — façade — jalapeño";
+        let chunks = chunk_text(text, 1, 0, ENC).unwrap();
+        assert!(chunks.len() > 5);
+        let joined: String = chunks.concat();
+        assert!(joined.contains("caf"));
     }
 
     #[test]
