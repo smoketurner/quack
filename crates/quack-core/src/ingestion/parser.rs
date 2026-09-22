@@ -77,13 +77,28 @@ impl std::fmt::Display for FileType {
     }
 }
 
+/// How a document's sections relate: real divisions of the text, or the
+/// pages of one continuous text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// Sections are headings, slides, or the whole file: a chunk never
+    /// crosses one.
+    Sectioned,
+    /// Sections are pages of one running text: chunks are windowed over
+    /// the whole text and carry the page they start on, so a paragraph
+    /// split by a page break stays in one chunk.
+    Continuous,
+}
+
 /// What a parse yields: the document's own title when the format carries
 /// one (`<title>`, Office core properties, a PDF's Info dictionary), its
-/// sections, and how many pages the parser had to skip.
+/// sections and how they relate, and how many pages the parser had to
+/// skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
     pub title: Option<String>,
     pub sections: Vec<Section>,
+    pub flow: Flow,
     /// Pages whose text could not be read; only a paginated source (PDF)
     /// ever reports any, and the document keeps every other page.
     pub pages_skipped: u32,
@@ -156,6 +171,7 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
             Ok(Extracted {
                 title: front.get("title").map(str::to_owned),
                 sections: markdown_sections(body),
+                flow: Flow::Sectioned,
                 pages_skipped: 0,
             })
         }
@@ -166,6 +182,7 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
                 page: None,
                 text: utf8(data)?,
             }],
+            flow: Flow::Sectioned,
             pages_skipped: 0,
         }),
         FileType::Html => super::html::html(&utf8(data)?),
@@ -238,6 +255,7 @@ fn extract_pdf(data: &[u8]) -> Result<Extracted> {
     Ok(Extracted {
         title: pdf_title(&doc),
         sections,
+        flow: Flow::Continuous,
         pages_skipped,
     })
 }
@@ -376,6 +394,7 @@ mod tests {
         .unwrap_or_else(|_| Extracted {
             title: None,
             sections: Vec::new(),
+            flow: Flow::Sectioned,
             pages_skipped: 0,
         });
         assert_eq!(extracted.title(), Some("Renewal Guide"));

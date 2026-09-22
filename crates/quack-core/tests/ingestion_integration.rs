@@ -1519,16 +1519,22 @@ async fn a_long_pdf_ingests_every_page_in_order() {
     assert_eq!(doc.status, "ready");
     assert_eq!(doc.title.as_deref(), Some("Long Report"));
 
-    let qr = db
-        .execute_query(&format!(
-            "SELECT min(page), max(page), count(*) FILTER (WHERE content LIKE '%Page 40%')              FROM _quack_chunks WHERE document_id = '{}'",
-            result.document_id
-        ))
-        .unwrap();
+    // Pages are windowed as one text: the first chunk starts on page 1,
+    // every page's line survives, and the document title heads each chunk.
+    let sql = format!(
+        "SELECT min(page), \
+                count(*) FILTER (WHERE content LIKE '%Page 40 of%'), \
+                count(*) FILTER (WHERE content LIKE '%Page 60 of%'), \
+                count(*) FILTER (WHERE heading = 'Long Report') = count(*) \
+         FROM _quack_chunks WHERE document_id = '{}'",
+        result.document_id
+    );
+    let qr = db.execute_query(&sql).unwrap();
     let row = qr.rows.first().unwrap();
     assert_eq!(row.first(), Some(&serde_json::Value::Number(1.into())));
-    assert_eq!(row.get(1), Some(&serde_json::Value::Number(60.into())));
+    assert_eq!(row.get(1), Some(&serde_json::Value::Number(1.into())));
     assert_eq!(row.get(2), Some(&serde_json::Value::Number(1.into())));
+    assert_eq!(row.get(3), Some(&serde_json::Value::Bool(true)));
 }
 
 #[test]

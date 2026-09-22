@@ -565,11 +565,15 @@ Scanned PDFs (no text layer) are detected and reported as `error: no extractable
 OCR is deferred.
 
 **Chunking.** A fixed token window: 512-token target, 64-token overlap, stepping by the
-difference. The parser splits at section boundaries first (headings, pages, slides), so a
-chunk never spans two sections, but within a section the window ignores paragraph and
-sentence boundaries. The nearest preceding heading is stored on the chunk and prepended to
-its embedding input; page numbers are recorded where the source has them. Token counts via
-`tiktoken` (`cl100k_base`).
+difference. A sectioned source (Markdown, HTML, DOCX headings, PPTX slides, plain text) is
+split at its section boundaries first, so a chunk never spans two sections, but within a
+section the window ignores paragraph and sentence boundaries. The nearest preceding heading
+is stored on the chunk and prepended to its embedding input. A PDF is one continuous text:
+its pages are joined by a blank line and windowed as a whole, so a paragraph split by a page
+break stays in one chunk; each chunk records the page its first token lies on, and carries
+the document's Info title (else the filename stem) as its heading, since a PDF has no
+heading of its own to give the embedding context. Token counts via `tiktoken`
+(`cl100k_base`).
 
 **Embedding.** Batches of `[ingestion].embedding_batch_size` (64 by default, at least one)
 through the configured embedding provider. There is no index to build on

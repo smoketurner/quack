@@ -301,9 +301,12 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                     "ingested with unreadable pages skipped"
                 );
             }
-            let sections = extracted.sections;
-            let chunks = chunker::chunk_sections(
-                &sections,
+            let stem = std::path::Path::new(filename)
+                .file_stem()
+                .and_then(|s| s.to_str());
+            let chunks = chunker::chunk_document(
+                &extracted,
+                stem,
                 config.ingestion.chunk_size_tokens,
                 config.ingestion.chunk_overlap_tokens,
                 &config.ingestion.tokenizer_encoding,
