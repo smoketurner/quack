@@ -110,7 +110,7 @@ Writes:
   you are asked: y runs it, n refuses it, a allows writes for this session.
   Start with --allow-write to skip the prompt.";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum MessageRole {
     User,
     Assistant,
@@ -226,6 +226,10 @@ pub(crate) struct App {
     allow_write: Arc<AtomicBool>,
     /// `/steps`: show tool details whole instead of a preview.
     pub(crate) expand_steps: bool,
+    /// Each message's wrapped lines, by index, with the fingerprint they
+    /// were rendered from (`ui::format_messages`); interior mutability
+    /// because drawing only borrows the app.
+    pub(crate) wrap_cache: std::cell::RefCell<Vec<Option<ui::WrappedMessage>>>,
     /// Where typed input is kept across sessions.
     history_path: PathBuf,
     msg_rx: mpsc::UnboundedReceiver<AppMsg>,
@@ -279,6 +283,7 @@ impl App {
             reader_db,
             allow_write: Arc::new(AtomicBool::new(allow_write)),
             expand_steps: false,
+            wrap_cache: std::cell::RefCell::new(Vec::new()),
             history_path,
             msg_rx,
             msg_tx,
@@ -2931,6 +2936,63 @@ mod tests {
         assert!(sql_sink.send(()).is_ok());
         pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
         assert!(ui::job_strip(&app).is_empty());
+    }
+
+    #[test]
+    fn the_transcript_rerenders_only_what_changed() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let text = |lines: &[ratatui::text::Line<'_>]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        app.messages.push(Message::new(
+            MessageRole::Assistant,
+            String::from("Streaming"),
+        ));
+        let first = ui::format_messages(&app, 60);
+        let entries = app.wrap_cache.borrow().len();
+        assert_eq!(entries, app.messages.len());
+        let keys: Vec<Option<u64>> = app
+            .wrap_cache
+            .borrow()
+            .iter()
+            .map(|e| e.as_ref().map(|(k, _)| *k))
+            .collect();
+
+        // A streamed delta changes the last message only.
+        if let Some(last) = app.messages.last_mut() {
+            last.content.push_str(" more text");
+        }
+        let second = ui::format_messages(&app, 60);
+        assert!(text(&second).contains("Streaming more text"));
+        assert_ne!(text(&first), text(&second));
+        let after: Vec<Option<u64>> = app
+            .wrap_cache
+            .borrow()
+            .iter()
+            .map(|e| e.as_ref().map(|(k, _)| *k))
+            .collect();
+        let unchanged = keys.iter().zip(&after).filter(|(a, b)| a == b).count();
+        assert_eq!(unchanged, keys.len().saturating_sub(1));
+
+        // A new width, /steps, and /clear all show at once.
+        assert!(
+            ui::format_messages(&app, 20)
+                .iter()
+                .all(|l| l.width() <= 20)
+        );
+        app.clear_transcript();
+        assert!(ui::format_messages(&app, 60).is_empty());
+        assert!(app.wrap_cache.borrow().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

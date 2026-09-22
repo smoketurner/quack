@@ -12,7 +12,9 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::queue::{UploadJob, submit_upload};
+use crate::server::queue::{
+    MAX_WAITING_UPLOADS, UPLOAD_RETRY_SECONDS, UploadJob, submit_upload, upload_lane,
+};
 use crate::server::state::{App, with_db};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::candidates;
@@ -220,6 +222,15 @@ pub(crate) async fn enqueue(
         return Err(ApiError::bad_request("no file or text in the request"));
     }
     let id = access.workspace.id.clone();
+    // Backpressure: every queued upload holds its bytes in memory, so a
+    // workspace with a deep line of them turns more away until it drains.
+    let waiting = app.jobs.lane_active(&upload_lane(&id));
+    if waiting.saturating_add(files.len()) > MAX_WAITING_UPLOADS {
+        return Err(ApiError::busy(
+            format!("{waiting} uploads are already waiting in this workspace; try again shortly"),
+            UPLOAD_RETRY_SECONDS,
+        ));
+    }
     let db = app.workspace_db(&id).await?;
     let mut queued = Vec::new();
     for (filename, data) in files {

@@ -327,9 +327,29 @@
     }
   }
 
+  // The Jobs page follows the job stream instead of polling: every change
+  // asks htmx to refetch the rows, at most once per quarter second. If the
+  // stream drops, the browser reconnects on its own (EventSource retries).
+  function followJobs() {
+    var rows = document.querySelector("[data-jobs-stream]");
+    if (!rows || !window.EventSource) return;
+    var pending = null;
+    function refresh() {
+      if (pending) return;
+      pending = setTimeout(function () {
+        pending = null;
+        document.body.dispatchEvent(new CustomEvent("jobs-changed"));
+      }, 250);
+    }
+    var source = new EventSource(rows.getAttribute("data-jobs-stream"));
+    source.addEventListener("job", refresh);
+    source.addEventListener("jobs", refresh);
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     renderStoredCharts();
     renderGraphs();
+    followJobs();
     var chat = document.getElementById("chat");
     var form = document.getElementById("ask");
     if (chat && form) {

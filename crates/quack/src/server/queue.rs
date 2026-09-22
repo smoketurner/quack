@@ -16,6 +16,19 @@ use quack_core::llm;
 
 use super::state::App;
 
+/// Uploads a workspace may have queued or processing before another is
+/// turned away with 503 and `Retry-After` (each holds its file's bytes in
+/// memory until it runs).
+pub(crate) const MAX_WAITING_UPLOADS: usize = 64;
+
+/// How long a turned-away uploader is told to wait.
+pub(crate) const UPLOAD_RETRY_SECONDS: u32 = 30;
+
+/// The workspace's upload lane key.
+pub(crate) fn upload_lane(workspace_id: &str) -> String {
+    format!("ingest:{workspace_id}")
+}
+
 pub(crate) struct UploadJob {
     pub document_id: String,
     pub filename: String,
@@ -36,7 +49,7 @@ pub(crate) fn submit_upload(
         .workspace(workspace_id)
         .owner(owner)
         .lane(Lane::new(
-            format!("ingest:{workspace_id}"),
+            upload_lane(workspace_id),
             app.config.server.workers_per_workspace,
         ));
     let config = app.config.clone();

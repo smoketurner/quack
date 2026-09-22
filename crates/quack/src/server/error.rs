@@ -10,6 +10,8 @@ use quack_core::error::Error as CoreError;
 pub(crate) struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    /// Seconds for a `Retry-After` header, on a 503 that is only busy.
+    pub retry_after: Option<u32>,
 }
 
 impl ApiError {
@@ -17,6 +19,15 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// 503 with `Retry-After`: the request is fine, the server is full.
+    pub(crate) fn busy(message: impl Into<String>, retry_after_seconds: u32) -> Self {
+        Self {
+            retry_after: Some(retry_after_seconds),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
         }
     }
 
@@ -43,14 +54,21 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        if self.status.is_server_error() {
+        if self.status.is_server_error() && self.retry_after.is_none() {
             tracing::error!(status = %self.status, "{}", self.message);
         }
-        (
+        let mut response = (
             self.status,
             Json(serde_json::json!({ "error": self.message })),
         )
-            .into_response()
+            .into_response();
+        if let Some(seconds) = self.retry_after {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(seconds),
+            );
+        }
+        response
     }
 }
 

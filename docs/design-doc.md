@@ -1990,13 +1990,15 @@ design to the tracker and is updated as issues close. Ordered by risk.
     means copying the workspace directory while no write is in flight. Sections 15, 19.
 15. **Work queues, first pass** (section 4.1). The terminal, the web chat, REST `query`,
     uploads, graph extraction, and the document pass run on `quack_core::jobs`, and model
-    requests are limited per provider in `llm::LimitedHttp`. Not yet:
-    MCP `query` calls and print mode run their turn directly (one call, one answer, nothing
-    to keep responsive); the web chat page shows its own turn but not a job strip (the Jobs
-    page does); jobs are not persisted across restarts; and an upload queue no longer
-    pushes back on the client when deep (the old 64-deep bound): `upload_max_mb` and the
-    rate limiter bound it instead. Quick terminal commands (`/tables`, `/docs`, `/pin`,
-    ...) still run inline, taking the writer for one short step.
+    requests are limited per provider and model in `llm::LimitedHttp`, interactive first.
+    Ingest and import stop on cancel, mid-embedding included. A workspace with 64 uploads
+    waiting answers the next with 503 and `Retry-After: 30`; the web Jobs page follows
+    `.../jobs/stream` instead of polling; the terminal re-renders only the messages that
+    changed. Not yet: MCP `query` calls and print mode run their turn directly (one call,
+    one answer, nothing to keep responsive); the web chat page shows its own turn but not
+    a job strip (the Jobs page does); jobs are not persisted across restarts. Quick
+    terminal commands (`/tables`, `/docs`, `/pin`, ...) still run inline, taking the writer
+    for one short step.
 
 ---
 
