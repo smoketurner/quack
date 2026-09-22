@@ -38,6 +38,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | Module | Owns | Design doc |
 |---|---|---|
 | `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[import]`), unknown keys rejected, `QUACK_*` overrides | 13 |
+| `config::inspect` | the same file read outside `Config::load`: every recognized setting with the value in force and its origin, the file's unrecognized keys, the environment variables read (`quack config`) | 13 |
 | `crypto` | installs the aws-lc-rs provider once | 14 |
 | `error` | the `thiserror` enum every layer returns | |
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |

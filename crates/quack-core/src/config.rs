@@ -8,6 +8,17 @@ use crate::graph::GraphOptions;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
 
+pub mod inspect;
+
+/// Directory holding `config.toml`.
+pub const ENV_CONFIG_DIR: &str = "QUACK_CONFIG_DIR";
+/// Overrides `[general].data_dir`.
+pub const ENV_DATA_DIR: &str = "QUACK_DATA_DIR";
+/// Overrides `[general].chat_model`.
+pub const ENV_MODEL: &str = "QUACK_MODEL";
+/// Overrides `[server].bind`.
+pub const ENV_BIND: &str = "QUACK_BIND";
+
 /// The whole `config.toml`. Unknown keys anywhere are an error so a typo can
 /// never silently disable a setting.
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -81,6 +92,16 @@ pub enum AuthMode {
     /// OAuth 2.0 against an identity provider (design doc 10.2): the access
     /// token from `[providers.NAME.oauth]` is the bearer for the endpoint.
     Oauth,
+}
+
+impl std::fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::ApiKey => "api-key",
+            Self::Oauth => "oauth",
+        })
+    }
 }
 
 /// `[providers.NAME.oauth]`: Authorization Code with PKCE, or the device-code
@@ -393,6 +414,15 @@ pub enum RerankMode {
     Model,
 }
 
+impl std::fmt::Display for RerankMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Model => "model",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
@@ -444,7 +474,7 @@ const APP_NAME: &str = "quack";
 #[must_use]
 pub fn config_file_path() -> PathBuf {
     let config_dir =
-        std::env::var("QUACK_CONFIG_DIR").map_or_else(|_| default_config_dir(), PathBuf::from);
+        std::env::var(ENV_CONFIG_DIR).map_or_else(|_| default_config_dir(), PathBuf::from);
     config_dir.join("config.toml")
 }
 
@@ -486,18 +516,24 @@ impl Config {
             Self::default()
         };
 
-        if let Ok(data_dir) = std::env::var("QUACK_DATA_DIR") {
-            config.general.data_dir = PathBuf::from(data_dir);
-        }
-        if let Ok(model) = std::env::var("QUACK_MODEL") {
-            config.general.chat_model = Some(model);
-        }
-        if let Ok(bind) = std::env::var("QUACK_BIND") {
-            config.server.bind = bind;
-        }
-
+        config.apply_env();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Apply the environment overrides, after the file and before
+    /// validation. `quack config` replays this to report which values the
+    /// environment, rather than the file, put in force.
+    pub fn apply_env(&mut self) {
+        if let Ok(data_dir) = std::env::var(ENV_DATA_DIR) {
+            self.general.data_dir = PathBuf::from(data_dir);
+        }
+        if let Ok(model) = std::env::var(ENV_MODEL) {
+            self.general.chat_model = Some(model);
+        }
+        if let Ok(bind) = std::env::var(ENV_BIND) {
+            self.server.bind = bind;
+        }
     }
 
     /// Parse and validate TOML text.

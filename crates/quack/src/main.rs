@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
+mod config_cli;
 mod graph_cli;
 mod mcp;
 mod ontology_cli;
@@ -13,6 +14,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{SharedDb, open_reader};
+use quack_core::config;
 use quack_core::config::AuthMode;
 use quack_core::config::Config;
 use quack_core::crypto;
@@ -41,6 +43,9 @@ const EXIT_USAGE: u8 = 2;
 const EXIT_WRITE_REFUSED: u8 = 3;
 /// Exit status when an OAuth provider needs `quack auth login` first.
 const EXIT_AUTH_REQUIRED: u8 = 4;
+/// Exit status when `quack config` finds a configuration every other
+/// command would refuse: the report is still printed.
+const EXIT_BAD_CONFIG: u8 = 2;
 
 /// `--version` names the crypto module as well, so an operator can tell a FIPS
 /// binary from a non-FIPS one without turning on `RUST_LOG=info`. `-V` stays
@@ -258,6 +263,19 @@ enum Commands {
     Okf {
         #[command(subcommand)]
         action: OkfAction,
+    },
+
+    /// Show what this binary makes of config.toml: every setting it
+    /// recognizes, the value in force and where it came from, and the
+    /// keys in the file it does not recognize
+    Config {
+        /// Only the settings the file or the environment has a say in
+        #[arg(long)]
+        changed: bool,
+
+        /// Emit the whole report as one JSON document
+        #[arg(long)]
+        json: bool,
     },
 
     /// List ingested documents, or pin and unpin one
@@ -525,6 +543,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_admin(&config, cli.workspace.as_deref(), command).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Config { changed, json } => run_config(changed, json),
         Commands::Docs {
             pin,
             unpin,
@@ -542,6 +561,23 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `quack config`: what this binary makes of `config.toml`. It reads the
+/// file outside `Config::load`, so it reports a file every other command
+/// refuses rather than failing the same way, and says so in its status.
+fn run_config(changed: bool, json: bool) -> Result<ExitCode> {
+    init_logging();
+    let inspection = config::inspect::Inspection::load();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let usable = config_cli::run(&mut out, &inspection, json, changed)?;
+    out.flush()?;
+    Ok(if usable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_BAD_CONFIG)
+    })
 }
 
 /// `quack -p PROMPT`: one turn, answer to stdout, steps to stderr.
@@ -696,6 +732,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Auth { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
+        | Commands::Config { .. }
         | Commands::Docs { .. } => Ok(()),
     }
 }
