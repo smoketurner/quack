@@ -659,7 +659,8 @@ impl Config {
         let spec = self.general.chat_model.as_deref().ok_or_else(|| {
             Error::Config(format!(
                 "no chat model configured — set [general].chat_model = \"PROVIDER/MODEL\" \
-                 in {} or QUACK_MODEL",
+                 in {} or QUACK_MODEL; `quack doctor` checks the setup and suggests one \
+                 (SQL with `quack -q` needs no model)",
                 config_file_path().display()
             ))
         })?;
@@ -705,14 +706,26 @@ impl Config {
         self.workspace_dir(workspace_id).join("files")
     }
 
-    /// Ensure the data directory and its subdirectories exist.
+    /// Ensure the data directory and its subdirectories exist. A data
+    /// directory this call creates is private to the user (0700 on Unix):
+    /// it holds every workspace's content, the control database, and the
+    /// OAuth token caches. An existing one keeps its mode, which
+    /// `quack doctor` reports when others can read it.
     ///
     /// # Errors
     ///
     /// Returns an error if the directories cannot be created.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.general.data_dir)?;
-        std::fs::create_dir_all(self.general.data_dir.join("workspaces"))?;
+        let data_dir = &self.general.data_dir;
+        if !data_dir.exists() {
+            std::fs::create_dir_all(data_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        std::fs::create_dir_all(data_dir.join("workspaces"))?;
         Ok(())
     }
 

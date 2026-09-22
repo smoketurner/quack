@@ -94,6 +94,7 @@ cargo run --bin quack -- okf export DIR|-                                       
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- config [--changed] [--json]                            # every recognized setting, its value and origin, the file's unknown keys, the env vars read
+cargo run --bin quack -- doctor [--offline] [--json]                            # every check with its fix: config, data dir mode, workspace, model providers (probed), bind; exit 1 on a failure
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
