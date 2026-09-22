@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod config;
 pub mod crypto;
+pub mod doctor;
 pub mod error;
 pub mod graph;
 pub mod import;

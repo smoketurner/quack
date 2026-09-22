@@ -487,16 +487,18 @@ async fn credential(
     }
 }
 
+/// Ollama's model listings, `GET /api/ps` (loaded) and `GET /api/tags`
+/// (pulled), which share this shape.
 #[derive(serde::Deserialize)]
-struct OllamaRunningModels {
+pub(crate) struct OllamaRunningModels {
     #[serde(default)]
-    models: Vec<OllamaRunningModel>,
+    pub(crate) models: Vec<OllamaRunningModel>,
 }
 
 #[derive(serde::Deserialize)]
-struct OllamaRunningModel {
+pub(crate) struct OllamaRunningModel {
     #[serde(default)]
-    name: String,
+    pub(crate) name: String,
     #[serde(default)]
     model: String,
 }
@@ -504,7 +506,7 @@ struct OllamaRunningModel {
 impl OllamaRunningModels {
     /// Whether `model` is among the loaded ones; a bare name matches its
     /// `:latest` tag, which is how Ollama reports it.
-    fn holds(&self, model: &str) -> bool {
+    pub(crate) fn holds(&self, model: &str) -> bool {
         let wanted = if model.contains(':') {
             model.to_owned()
         } else {

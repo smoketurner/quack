@@ -94,12 +94,23 @@ async fn worker(
         let handle = tokio::runtime::Handle::current();
         // Parsing and DuckDB writes are blocking work; the embedding calls
         // inside need the runtime, so block on it from a blocking thread.
-        let outcome = tokio::task::spawn_blocking(move || {
-            handle.block_on(process(&config, &workspace_id, &db, job));
+        let document_id = job.document_id.clone();
+        let outcome = tokio::task::spawn_blocking({
+            let db = Arc::clone(&db);
+            move || {
+                handle.block_on(process(&config, &workspace_id, &db, job));
+            }
         })
         .await;
         if let Err(e) = outcome {
-            tracing::error!(error = %e, "upload worker task failed");
+            // The task died before `process` could record an outcome; the
+            // document must not stay `processing` forever.
+            tracing::error!(error = %e, document = %document_id, "upload worker task failed");
+            mark_error(
+                &db,
+                &document_id,
+                "the ingestion worker failed before finishing this file",
+            );
         }
     }
 }
@@ -109,16 +120,7 @@ async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: Upload
         Ok(model) => model,
         Err(e) => {
             tracing::warn!(error = %e, document = %job.document_id, "upload fails: no embedding model");
-            match db.lock() {
-                Ok(guard) => {
-                    if let Err(mark) = guard.mark_document_error(&job.document_id, &e.to_string()) {
-                        tracing::error!(error = %mark, document = %job.document_id, "could not record the upload failure");
-                    }
-                }
-                Err(poisoned) => {
-                    tracing::error!(error = %poisoned, document = %job.document_id, "workspace lock poisoned; upload failure not recorded");
-                }
-            }
+            mark_error(db, &job.document_id, &e.to_string());
             return;
         }
     };
@@ -138,6 +140,21 @@ async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: Upload
         }
         Err(e) => {
             tracing::warn!(document = %job.document_id, error = %e, "upload failed");
+        }
+    }
+}
+
+/// Record `message` as the document's error, so a client polling it sees
+/// `error` rather than `processing` without end.
+fn mark_error(db: &SharedDb, document_id: &str, message: &str) {
+    match db.lock() {
+        Ok(guard) => {
+            if let Err(mark) = guard.mark_document_error(document_id, message) {
+                tracing::error!(error = %mark, document = %document_id, "could not record the upload failure");
+            }
+        }
+        Err(poisoned) => {
+            tracing::error!(error = %poisoned, document = %document_id, "workspace lock poisoned; upload failure not recorded");
         }
     }
 }

@@ -42,6 +42,13 @@ SUMMARIZE, PIVOT) to run it directly. Drop a file path here to load it
 (CSV, TSV, Parquet, JSON, Excel as tables; PDF, Word, PowerPoint, HTML,
 Markdown, text as documents). Type /help for commands.";
 
+/// Shown at start and in place of an answer when `[general].chat_model`
+/// is unset: everything but the agent still works.
+const NO_CHAT_MODEL_TEXT: &str = "\
+No chat model is configured, so questions cannot be answered yet. SQL, file
+loading, and every /command work without one. Set [general].chat_model (or
+QUACK_MODEL) to PROVIDER/MODEL; `quack doctor` checks the setup and suggests one.";
+
 const HELP_TEXT: &str = "\
 Commands:
   /help             Show this help message
@@ -229,6 +236,10 @@ impl App {
         app.input_history = load_history(&app.history_path);
         app.messages
             .push(Message::new(MessageRole::System, WELCOME_TEXT));
+        if app.config.general.chat_model.is_none() {
+            app.messages
+                .push(Message::new(MessageRole::System, NO_CHAT_MODEL_TEXT));
+        }
         let current = app.session_id.clone();
         app.replay_session(&current)?;
         Ok(app)
@@ -1488,6 +1499,13 @@ impl App {
             return;
         }
 
+        if self.config.general.chat_model.is_none() {
+            self.messages.push(Message::new(MessageRole::User, trimmed));
+            self.messages
+                .push(Message::new(MessageRole::System, NO_CHAT_MODEL_TEXT));
+            return;
+        }
+
         self.start_agent_turn(trimmed);
     }
 
@@ -2263,6 +2281,24 @@ mod tests {
         app.finish_turn();
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn without_a_chat_model_questions_say_how_to_set_one_and_sql_still_runs() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        assert!(app.messages.iter().any(|m| m.content == NO_CHAT_MODEL_TEXT));
+
+        app.set_textarea_content("how many orders shipped late?");
+        app.submit_message();
+        assert_eq!(app.state, AppState::Idle);
+        assert!(app.agent_events.is_none());
+        assert!(last(&app).content.contains("quack doctor"));
+
+        app.set_textarea_content("SELECT 41 + 1 AS answer");
+        app.submit_message();
+        settle(&mut app);
+        assert!(last(&app).content.contains("42"), "{}", last(&app).content);
     }
 
     #[test]

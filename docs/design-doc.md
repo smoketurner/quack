@@ -554,7 +554,7 @@ graph is rebuilt with `quack graph extract` once the tables and documents are ba
 
 | Type | Parser | Extracted metadata |
 |------|--------|--------------------|
-| PDF | `pdf-extract` | page numbers |
+| PDF | `pdf_oxide` | page numbers, Info title; an unreadable page is skipped and counted, never the rest of the file |
 | Markdown, plain text | direct | headings (ATX and setext) |
 | HTML | `scraper` (html5ever) | headings, `<title>` |
 | DOCX | `zip` + `quick-xml` | headings from `Heading N` and `Title` styles, core title |
@@ -565,15 +565,26 @@ Scanned PDFs (no text layer) are detected and reported as `error: no extractable
 OCR is deferred.
 
 **Chunking.** A fixed token window: 512-token target, 64-token overlap, stepping by the
-difference. The parser splits at section boundaries first (headings, pages, slides), so a
-chunk never spans two sections, but within a section the window ignores paragraph and
-sentence boundaries. The nearest preceding heading is stored on the chunk and prepended to
-its embedding input; page numbers are recorded where the source has them. Token counts via
-`tiktoken` (`cl100k_base`).
+difference. A sectioned source (Markdown, HTML, DOCX headings, PPTX slides, plain text) is
+split at its section boundaries first, so a chunk never spans two sections, but within a
+section the window ignores paragraph and sentence boundaries. The nearest preceding heading
+is stored on the chunk and prepended to its embedding input. A PDF is one continuous text:
+its pages are joined by a blank line and windowed as a whole, so a paragraph split by a page
+break stays in one chunk; each chunk records the page its first token lies on, and carries
+the document's Info title (else the filename stem) as its heading, since a PDF has no
+heading of its own to give the embedding context. Token counts via `tiktoken`
+(`cl100k_base`).
 
 **Embedding.** Batches of `[ingestion].embedding_batch_size` (64 by default, at least one)
-through the configured embedding provider. There is no index to build on
-either side: vector search is an exact scan, and the term rows for a chunk are appended as
+through the configured embedding provider, with `[ingestion].embedding_concurrency` (2)
+requests in flight; each batch's vectors are written as one transaction as it returns, so
+the writes overlap the requests still running. The provider sets the ceiling: an
+OpenAI-compatible endpoint answers concurrent batches in parallel, while Ollama's runner
+embeds one input at a time whatever the batch size or concurrency (about 14 chunks a second
+for a 0.6B model on Apple silicon, measured) unless `OLLAMA_NUM_PARALLEL` is raised, and a
+smaller embedding model is the other lever. Every ingest logs the chunk count, batches,
+seconds, and chunks per second (`embedded chunks`), and `quack ingest` prints them. There
+is no index to build on either side: vector search is an exact scan, and the term rows for a chunk are appended as
 it is inserted. A full term rebuild happens only when an older workspace is opened
 (schema version below 6). Re-uploading a file with the same SHA-256 is a no-op with a
 message.
@@ -1369,6 +1380,8 @@ quack sessions [--json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
+quack config [--changed] [--json]
+quack doctor [-w NAME] [--offline] [--json]
 quack serve [--bind ADDR] [--local]
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--json] ; quack token create|list|revoke ;
@@ -1386,6 +1399,37 @@ terminal and shows the validated answer when validation changed what streamed; a
 gets the validated answer alone. Exit codes: 0 ok, 1 runtime error, 2 usage, 3 write
 refused, 4 auth required; a reader that closes stdout early (`| head`) ends the command
 quietly with 0.
+
+`quack config` and `quack doctor` are the commands that do not go through `Config::load`: `config` reads the
+file itself, so it describes a configuration every other command refuses rather than
+failing the same way. It prints every setting this binary recognizes with the value in
+force, where that value came from (built in, the file, or the environment variable that
+overrides it), what the file says where that is not what is running, the keys in the file
+no section recognizes with the recognized key each resembles, and which of the
+environment variables the configuration reads are set — never their contents, since some
+of them hold credentials. `--changed` keeps only the settings the file or the environment
+has a say in; `--json` emits the whole report as one document. A rejected file exits 2
+after printing the report.
+
+`quack doctor` troubleshoots the whole setup, one line per check with the fix under
+anything that needs one: the config file (rejected, unknown keys with the key each
+resembles), the crypto module (a Linux build without FIPS warns), the data directory
+(writable, and a warning when group or others can read it), `control.db` (opens and
+migrates), the workspace (opens, embedding dimension agrees), each configured model
+(credential present, plain HTTP off this machine with a credential warns, and one `GET`
+of the provider's model list proves it is reachable, the key is accepted, and the model is
+pulled or listed), and `[server]` (a non-loopback bind warns, `local` off loopback fails,
+no users yet is noted). With no chat model it looks for a local Ollama and suggests a
+`config.toml` snippet with the models that Ollama has. It creates nothing: a data
+directory, control database, or workspace that does not exist yet is reported as such.
+`--offline` skips the network; `--json` emits `{ok, failures, warnings, checks}`. Any
+failed check exits 1.
+
+No model is required to run quack. Without `[general].chat_model` the terminal session
+opens, runs typed SQL and every slash command, and answers a question with how to set a
+model up; `-q`, ingest, import, and the server's SQL and table pages work as before. A data
+directory quack creates is `0700` on Unix, since it holds every workspace's content and
+the OAuth token caches.
 
 ### 11.6 Desktop window (`quack desktop`)
 
@@ -1510,6 +1554,7 @@ always_retrieve = false      # retrieve every turn, not only when the model asks
 chunk_size_tokens = 512
 chunk_overlap_tokens = 64
 embedding_batch_size = 64
+embedding_concurrency = 2     # requests in flight; Ollama needs OLLAMA_NUM_PARALLEL to use more than 1
 tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
 
@@ -1556,7 +1601,10 @@ session_idle_minutes = 120              # ... or this long after its last reques
 ```
 
 Every section sets `deny_unknown_fields`, so a key that is not in this list is a startup
-error rather than a silent no-op. The TUI's tick rate is a constant, not configuration.
+error rather than a silent no-op. `quack config` (section 11.5) is how an operator sees
+that list from the binary itself: every recognized setting with the value in force and
+where it came from, and every key in the file that is not one of them. The TUI's tick
+rate is a constant, not configuration.
 
 ---
 

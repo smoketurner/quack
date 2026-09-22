@@ -22,7 +22,7 @@ http          = { workspace = true, features = ["std"] }
 jiff          = { workspace = true, features = ["std", "serde"] }
 keyring-core  = { workspace = true }
 oauth2        = { workspace = true }
-pdf-extract   = { workspace = true }
+pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
@@ -40,7 +40,7 @@ thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-util    = { workspace = true }
-toml          = { workspace = true, features = ["std", "parse", "serde"] }
+toml          = { workspace = true, features = ["std", "parse", "serde", "display"] }
 tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }

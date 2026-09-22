@@ -8,6 +8,17 @@ use crate::graph::GraphOptions;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
 
+pub mod inspect;
+
+/// Directory holding `config.toml`.
+pub const ENV_CONFIG_DIR: &str = "QUACK_CONFIG_DIR";
+/// Overrides `[general].data_dir`.
+pub const ENV_DATA_DIR: &str = "QUACK_DATA_DIR";
+/// Overrides `[general].chat_model`.
+pub const ENV_MODEL: &str = "QUACK_MODEL";
+/// Overrides `[server].bind`.
+pub const ENV_BIND: &str = "QUACK_BIND";
+
 /// The whole `config.toml`. Unknown keys anywhere are an error so a typo can
 /// never silently disable a setting.
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -83,6 +94,16 @@ pub enum AuthMode {
     Oauth,
 }
 
+impl std::fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::ApiKey => "api-key",
+            Self::Oauth => "oauth",
+        })
+    }
+}
+
 /// `[providers.NAME.oauth]`: Authorization Code with PKCE, or the device-code
 /// flow, against an `OpenID` Connect issuer.
 #[derive(Debug, Clone, Deserialize)]
@@ -148,6 +169,11 @@ pub struct IngestionConfig {
     pub chunk_size_tokens: u32,
     pub chunk_overlap_tokens: u32,
     pub embedding_batch_size: u32,
+    /// Embedding requests in flight at once. An OpenAI-compatible endpoint
+    /// answers them in parallel; Ollama's runner embeds one input at a
+    /// time unless `OLLAMA_NUM_PARALLEL` is raised, so more only queues
+    /// there.
+    pub embedding_concurrency: u32,
     pub tokenizer_encoding: String,
     /// Largest upload the server accepts, in megabytes.
     pub upload_max_mb: u32,
@@ -159,6 +185,7 @@ impl Default for IngestionConfig {
             chunk_size_tokens: 512,
             chunk_overlap_tokens: 64,
             embedding_batch_size: 64,
+            embedding_concurrency: 2,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
         }
@@ -387,6 +414,15 @@ pub enum RerankMode {
     Model,
 }
 
+impl std::fmt::Display for RerankMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Model => "model",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
@@ -442,7 +478,7 @@ const APP_NAME: &str = "quack";
 #[must_use]
 pub fn config_file_path() -> PathBuf {
     let config_dir =
-        std::env::var("QUACK_CONFIG_DIR").map_or_else(|_| default_config_dir(), PathBuf::from);
+        std::env::var(ENV_CONFIG_DIR).map_or_else(|_| default_config_dir(), PathBuf::from);
     config_dir.join("config.toml")
 }
 
@@ -484,18 +520,24 @@ impl Config {
             Self::default()
         };
 
-        if let Ok(data_dir) = std::env::var("QUACK_DATA_DIR") {
-            config.general.data_dir = PathBuf::from(data_dir);
-        }
-        if let Ok(model) = std::env::var("QUACK_MODEL") {
-            config.general.chat_model = Some(model);
-        }
-        if let Ok(bind) = std::env::var("QUACK_BIND") {
-            config.server.bind = bind;
-        }
-
+        config.apply_env();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Apply the environment overrides, after the file and before
+    /// validation. `quack config` replays this to report which values the
+    /// environment, rather than the file, put in force.
+    pub fn apply_env(&mut self) {
+        if let Ok(data_dir) = std::env::var(ENV_DATA_DIR) {
+            self.general.data_dir = PathBuf::from(data_dir);
+        }
+        if let Ok(model) = std::env::var(ENV_MODEL) {
+            self.general.chat_model = Some(model);
+        }
+        if let Ok(bind) = std::env::var(ENV_BIND) {
+            self.server.bind = bind;
+        }
     }
 
     /// Parse and validate TOML text.
@@ -621,7 +663,8 @@ impl Config {
         let spec = self.general.chat_model.as_deref().ok_or_else(|| {
             Error::Config(format!(
                 "no chat model configured — set [general].chat_model = \"PROVIDER/MODEL\" \
-                 in {} or QUACK_MODEL",
+                 in {} or QUACK_MODEL; `quack doctor` checks the setup and suggests one \
+                 (SQL with `quack -q` needs no model)",
                 config_file_path().display()
             ))
         })?;
@@ -667,14 +710,26 @@ impl Config {
         self.workspace_dir(workspace_id).join("files")
     }
 
-    /// Ensure the data directory and its subdirectories exist.
+    /// Ensure the data directory and its subdirectories exist. A data
+    /// directory this call creates is private to the user (0700 on Unix):
+    /// it holds every workspace's content, the control database, and the
+    /// OAuth token caches. An existing one keeps its mode, which
+    /// `quack doctor` reports when others can read it.
     ///
     /// # Errors
     ///
     /// Returns an error if the directories cannot be created.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.general.data_dir)?;
-        std::fs::create_dir_all(self.general.data_dir.join("workspaces"))?;
+        let data_dir = &self.general.data_dir;
+        if !data_dir.exists() {
+            std::fs::create_dir_all(data_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        std::fs::create_dir_all(data_dir.join("workspaces"))?;
         Ok(())
     }
 
@@ -726,6 +781,7 @@ rerank = "model"
         assert_eq!(config.analysis.max_turns, 15);
         assert_eq!(config.analysis.history_token_budget, 32_000);
         assert_eq!(config.ingestion.upload_max_mb, 512);
+        assert_eq!(config.ingestion.embedding_concurrency, 2);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(!config.server.local);
         assert_eq!(config.server.workers_per_workspace, 1);

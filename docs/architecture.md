@@ -38,7 +38,9 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | Module | Owns | Design doc |
 |---|---|---|
 | `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[import]`), unknown keys rejected, `QUACK_*` overrides | 13 |
+| `config::inspect` | the same file read outside `Config::load`: every recognized setting with the value in force and its origin, the file's unrecognized keys, the environment variables read (`quack config`) | 13 |
 | `crypto` | installs the aws-lc-rs provider once | 14 |
+| `doctor` | `quack doctor`'s checks over a `config::inspect` result: config file, crypto module, data directory mode, `control.db`, the workspace, each model's credential and a model-list probe of its provider, the server bind; creates nothing | 11.5 |
 | `error` | the `thiserror` enum every layer returns | |
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |
 | `migrations/*.sql` | `control.db` schema versions | [migrations.md](migrations.md) |

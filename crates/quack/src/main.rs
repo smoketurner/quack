@@ -2,6 +2,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
+mod config_cli;
+mod doctor_cli;
 mod graph_cli;
 mod mcp;
 mod ontology_cli;
@@ -13,6 +15,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{SharedDb, open_reader};
+use quack_core::config;
 use quack_core::config::AuthMode;
 use quack_core::config::Config;
 use quack_core::crypto;
@@ -41,6 +44,10 @@ const EXIT_USAGE: u8 = 2;
 const EXIT_WRITE_REFUSED: u8 = 3;
 /// Exit status when an OAuth provider needs `quack auth login` first.
 const EXIT_AUTH_REQUIRED: u8 = 4;
+/// Exit status when `quack config` finds a configuration every other
+/// command would refuse (the report is still printed), or `-p` has no chat
+/// model to answer with.
+const EXIT_BAD_CONFIG: u8 = 2;
 
 /// `--version` names the crypto module as well, so an operator can tell a FIPS
 /// binary from a non-FIPS one without turning on `RUST_LOG=info`. `-V` stays
@@ -258,6 +265,32 @@ enum Commands {
     Okf {
         #[command(subcommand)]
         action: OkfAction,
+    },
+
+    /// Show what this binary makes of config.toml: every setting it
+    /// recognizes, the value in force and where it came from, and the
+    /// keys in the file it does not recognize
+    Config {
+        /// Only the settings the file or the environment has a say in
+        #[arg(long)]
+        changed: bool,
+
+        /// Emit the whole report as one JSON document
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Check the setup and say how to fix what is wrong: the config file,
+    /// the data directory, the workspace, each model's provider (reached
+    /// over the network), and the server's bind address
+    Doctor {
+        /// Skip the network probes
+        #[arg(long)]
+        offline: bool,
+
+        /// Emit the checks as one JSON document
+        #[arg(long)]
+        json: bool,
     },
 
     /// List ingested documents, or pin and unpin one
@@ -525,6 +558,8 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_admin(&config, cli.workspace.as_deref(), command).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Config { changed, json } => run_config(changed, json),
+        Commands::Doctor { offline, json } => run_doctor(cli, offline, json).await,
         Commands::Docs {
             pin,
             unpin,
@@ -544,6 +579,46 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
     }
 }
 
+/// `quack config`: what this binary makes of `config.toml`. It reads the
+/// file outside `Config::load`, so it reports a file every other command
+/// refuses rather than failing the same way, and says so in its status.
+fn run_config(changed: bool, json: bool) -> Result<ExitCode> {
+    init_logging();
+    let inspection = config::inspect::Inspection::load();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let usable = config_cli::run(&mut out, &inspection, json, changed)?;
+    out.flush()?;
+    Ok(if usable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_BAD_CONFIG)
+    })
+}
+
+/// `quack doctor`: like `quack config`, it inspects the file outside
+/// `Config::load`, so a file every other command refuses is a finding here
+/// rather than the error. Exits 1 when any check fails.
+async fn run_doctor(cli: &Cli, offline: bool, json: bool) -> Result<ExitCode> {
+    init_logging();
+    let inspection = config::inspect::Inspection::load();
+    let options = quack_core::doctor::Options {
+        workspace: cli.workspace.clone(),
+        offline,
+        ..quack_core::doctor::Options::default()
+    };
+    let report = quack_core::doctor::run(&inspection, &options).await;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    doctor_cli::write(&mut out, &report, json)?;
+    out.flush()?;
+    Ok(if report.has_failures() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 /// `quack -p PROMPT`: one turn, answer to stdout, steps to stderr.
 async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<ExitCode> {
     init_logging();
@@ -556,6 +631,12 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         }
     };
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    // Checked before the workspace opens, so a missing model is one line
+    // on stderr rather than a failed turn, and leaves no session behind.
+    if let Err(e) = config.chat_model_ref() {
+        tracing::error!("{e}");
+        return Ok(ExitCode::from(EXIT_BAD_CONFIG));
+    }
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     load_piped_stdin(&config, &ws_db, &workspace.id, cli.stdin).await?;
@@ -696,6 +777,8 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Auth { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
+        | Commands::Config { .. }
+        | Commands::Doctor { .. }
         | Commands::Docs { .. } => Ok(()),
     }
 }
@@ -1434,10 +1517,27 @@ async fn run_ingest(
     for table in &result.tables {
         writeln!(out, "  Table: {table}")?;
     }
+    if result.pages_skipped > 0 {
+        writeln!(
+            out,
+            "  Pages skipped: {} (unreadable; the rest of the document was kept)",
+            result.pages_skipped
+        )?;
+    }
     if result.chunks_stored > 0 {
         writeln!(out, "  Chunks: {}", result.chunks_stored)?;
-        if embedding_model.is_some() {
-            writeln!(out, "  Embeddings: generated")?;
+        if let Some(took) = result.embedding_time {
+            let seconds = took.as_secs_f64();
+            let per_second = if seconds > 0.0 {
+                f64::from(result.chunks_stored) / seconds
+            } else {
+                0.0
+            };
+            writeln!(
+                out,
+                "  Embeddings: {} chunks in {seconds:.1} s ({per_second:.1}/s)",
+                result.chunks_stored
+            )?;
         }
     }
 
