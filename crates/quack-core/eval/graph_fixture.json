@@ -1,0 +1,155 @@
+{
+  "ontology": {
+    "version": 1,
+    "classes": [
+      { "id": "episode", "parent": "entity" },
+      { "id": "forecast_office", "parent": "entity" }
+    ],
+    "relations": [{ "id": "reported_by", "domain": "episode", "range": "forecast_office" }],
+    "properties": [],
+    "mappings": []
+  },
+  "chunks": [
+    {
+      "anchor": "SR-8841",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-8841", "class": "episode", "properties": {} },
+          { "label": "OHX", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-8841", "target": "OHX", "relation": "reported_by", "properties": {} }]
+      }
+    },
+    {
+      "anchor": "SR-1147",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-1147", "class": "episode", "properties": {} },
+          { "label": "OUN", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-1147", "target": "OUN", "relation": "reported_by", "properties": {} }]
+      }
+    },
+    {
+      "anchor": "SR-3320",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-3320", "class": "episode", "properties": {} },
+          { "label": "TWC", "class": "forecast_office", "properties": {} },
+          { "label": "Pima County", "class": "county", "properties": {} }
+        ],
+        "edges": [
+          { "source": "SR-3320", "target": "TWC", "relation": "reported_by", "properties": {} },
+          { "source": "SR-3320", "target": "Pima County", "relation": "located_in", "properties": {} }
+        ]
+      }
+    },
+    {
+      "anchor": "SR-5502",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-5502", "class": "episode", "properties": {} },
+          { "label": "HGX", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-5502", "target": "HGX", "relation": "reported_by", "properties": {} }]
+      }
+    },
+    {
+      "anchor": "SR-6688",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-6688", "class": "episode", "properties": {} },
+          { "label": "LOT", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-6688", "target": "LOT", "relation": "reported_by", "properties": {} }]
+      }
+    },
+    {
+      "anchor": "SR-2214",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-2214", "class": "episode", "properties": {} },
+          { "label": "DVN", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-2214", "target": "DVN", "relation": "reported_by", "properties": {} }]
+      }
+    },
+    {
+      "anchor": "SR-9901",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-9901", "class": "episode", "properties": {} },
+          { "label": "STO", "class": "forecast_office", "properties": {} },
+          { "label": "Shasta County", "class": "county", "properties": {} }
+        ],
+        "edges": [
+          { "source": "SR-9901", "target": "STO", "relation": "reported_by", "properties": {} },
+          { "source": "SR-9901", "target": "Shasta County", "relation": "located_in", "properties": {} }
+        ]
+      }
+    },
+    {
+      "anchor": "SR-4437",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-4437", "class": "episode", "properties": {} },
+          { "label": "OUN", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-4437", "target": "OUN", "relation": "reported_by", "properties": {} }]
+      }
+    },
+    {
+      "anchor": "SR-7765",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-7765", "class": "episode", "properties": {} },
+          { "label": "MOB", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-7765", "target": "MOB", "relation": "reported_by", "properties": {} }]
+      }
+    },
+    {
+      "anchor": "SR-3009",
+      "canned_answer": {
+        "nodes": [
+          { "label": "SR-3009", "class": "episode", "properties": {} },
+          { "label": "BOU", "class": "forecast_office", "properties": {} }
+        ],
+        "edges": [{ "source": "SR-3009", "target": "BOU", "relation": "reported_by", "properties": {} }]
+      }
+    }
+  ],
+  "expected_nodes": [
+    { "label": "SR-8841", "class": "episode" },
+    { "label": "SR-1147", "class": "episode" },
+    { "label": "SR-3320", "class": "episode" },
+    { "label": "SR-5502", "class": "episode" },
+    { "label": "SR-6688", "class": "episode" },
+    { "label": "SR-2214", "class": "episode" },
+    { "label": "SR-9901", "class": "episode" },
+    { "label": "SR-4437", "class": "episode" },
+    { "label": "SR-7765", "class": "episode" },
+    { "label": "SR-3009", "class": "episode" },
+    { "label": "OHX", "class": "forecast_office" },
+    { "label": "OUN", "class": "forecast_office" },
+    { "label": "TWC", "class": "forecast_office" },
+    { "label": "HGX", "class": "forecast_office" },
+    { "label": "LOT", "class": "forecast_office" },
+    { "label": "DVN", "class": "forecast_office" },
+    { "label": "STO", "class": "forecast_office" },
+    { "label": "MOB", "class": "forecast_office" },
+    { "label": "BOU", "class": "forecast_office" }
+  ],
+  "expected_edges": [
+    { "source": "SR-8841", "target": "OHX", "relation": "reported_by" },
+    { "source": "SR-1147", "target": "OUN", "relation": "reported_by" },
+    { "source": "SR-3320", "target": "TWC", "relation": "reported_by" },
+    { "source": "SR-5502", "target": "HGX", "relation": "reported_by" },
+    { "source": "SR-6688", "target": "LOT", "relation": "reported_by" },
+    { "source": "SR-2214", "target": "DVN", "relation": "reported_by" },
+    { "source": "SR-9901", "target": "STO", "relation": "reported_by" },
+    { "source": "SR-4437", "target": "OUN", "relation": "reported_by" },
+    { "source": "SR-7765", "target": "MOB", "relation": "reported_by" },
+    { "source": "SR-3009", "target": "BOU", "relation": "reported_by" }
+  ]
+}

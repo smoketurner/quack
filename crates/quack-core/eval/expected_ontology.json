@@ -1,0 +1,27 @@
+{
+  "classes": [
+    {
+      "id": "event",
+      "properties": [
+        "event_id",
+        "event_type",
+        "state",
+        "deaths_direct",
+        "damage_property_usd",
+        "begin_date"
+      ]
+    },
+    {
+      "id": "fatality",
+      "properties": ["fatality_id", "event_id", "fatality_type", "age"]
+    },
+    {
+      "id": "state",
+      "properties": ["name", "fips", "population"]
+    }
+  ],
+  "relations": [
+    { "id": "has_state", "domain": "event", "range": "state" },
+    { "id": "has_event", "domain": "fatality", "range": "event" }
+  ]
+}
