@@ -11,10 +11,10 @@
 //! [`Profile`]. Vectors made under one profile are not comparable with
 //! vectors made under another, so the workspace records the profile of
 //! every stored vector and searches only those made under the current one
-//! (`storage::workspace`); `reembed` brings the rest up to date.
+//! (`storage::workspace`); `refresh` brings the rest up to date.
 
 pub mod presets;
-pub mod reembed;
+pub mod refresh;
 mod status;
 mod vector;
 

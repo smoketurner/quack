@@ -48,7 +48,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `storage::writer` | the workspace's one writer connection as an actor: a thread of its own runs the closures sent to it, interactive before background; callers await `run` / `run_at` | 4.1, 7.4 |
 | `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
 | `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the server's insert-only audit connection) | 5.3, 8 |
-| `embedding` | the role every text is embedded in (query, document, similarity), the prefixes each model family was trained with (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, and `reembed` | 6.1, 5.4 |
+| `embedding` | the role every text is embedded in (query, document, similarity), the prefixes each model family was trained with (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, and `refresh` | 6.1, 5.4 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
 | `import` | rows from Postgres, SQLite, or an HTTP data file as a workspace table | 6.2 |
 | `analysis` | the agent loop as an event stream (`agent`, `events`), the tools (`tools`), the system prompt (`text_to_sql`), write policy, citations, the chart spec, the reranking hook (`rerank`) | 7, 9 |
@@ -66,7 +66,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `main` | the clap command tree, print mode entry, the workspace-local subcommands (`ingest`, `docs`, `sessions`, `export`, `context`, `import`, `okf`, `auth`) |
 | `print` | `-p`: one turn, answer to stdout, steps to stderr, text or JSON |
 | `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts |
-| `ontology_cli`, `graph_cli`, `reembed_cli`, `admin` | `quack ontology`, `quack graph`, `quack reembed`, and the server administration commands |
+| `ontology_cli`, `graph_cli`, `embeddings_cli`, `admin` | `quack ontology`, `quack graph`, `quack embeddings`, and the server administration commands |
 | `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
 | `server` | `quack serve`: `auth` (identity and `access()`), `api` (REST handlers), `web` (askama pages over the same helpers, [web-ui.md](web-ui.md)), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
 

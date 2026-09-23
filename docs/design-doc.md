@@ -501,12 +501,12 @@ Every stored vector carries the fingerprint of the embedding profile it was made
 (section 6.1), and vector search, label matching, and merge proposals compare only vectors
 of the current profile, so a changed model, width, or prefix never mixes two vector spaces.
 Vectors of another profile stay where they are; their chunks are found by keyword search
-until `quack reembed` (terminal `/reembed`, `POST .../embeddings/reembed`, the Documents
-page's button) re-embeds them, and the terminal, print mode, `quack doctor`, and the
+until `quack embeddings refresh` (terminal `/embeddings refresh`, `POST .../embeddings/refresh`, the
+Documents page's button) embeds them again, and the terminal, print mode, `quack doctor`, and the
 Documents page say how many there are. When the configured width differs from the stored
 one, the workspace keeps the old columns and vectors rather than discarding them on open
 (a mistyped `embedding_dimension` must not cost a workspace its embeddings): new chunks are
-stored without vectors, and the re-embed retypes the `embedding` columns of `_quack_chunks`
+stored without vectors, and the refresh retypes the `embedding` columns of `_quack_chunks`
 and `_quack_graph_nodes` through NULL before embedding everything. With no chunk vector
 stored, open adopts the new width at once. Schema version 8 tags vectors made before
 profiles existed with the profile they were made under: the model the workspace recorded,
@@ -1230,7 +1230,7 @@ rendering.
 workspace's `allowed_providers` filters the choice; the session records the model it used.
 Changing the embedding model, its width, or its prefixes leaves a workspace's vectors
 stale rather than wrong: they are not searched, their chunks are found by keyword, and
-`quack reembed` shows what it will re-embed, asks, and brings them up to date in place
+`quack embeddings refresh` shows what it will refresh, asks, and brings them up to date in place
 (section 5.4).
 
 ### 10.2 Authentication
@@ -1383,7 +1383,7 @@ POST   /api/v1/workspaces/{id}/graph/review        mark a provisional graph revi
 GET    /api/v1/workspaces/{id}/graph/merges        PUT .../graph/merges/{mid} {action: accept|reject}
 POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?}
 GET    /api/v1/workspaces/{id}/embeddings          current, stale, and missing vectors against the configured profile, and the plan
-POST   /api/v1/workspaces/{id}/embeddings/reembed  200 when current, else 202 with the plan and the job
+POST   /api/v1/workspaces/{id}/embeddings/refresh  200 when current, else 202 with the plan and the job
 GET    /api/v1/workspaces/{id}/okf                 the bundle as a tar (import is POST .../documents with a tar)
 GET    /api/v1/workspaces/{id}/ontology            current version, JSON
 PUT    /api/v1/workspaces/{id}/ontology            import: validate, write a new version
@@ -1499,7 +1499,7 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
 quack docs [--json] [--pin ID | --unpin ID | --delete ID]
-quack reembed [-w NAME] [-y]
+quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--tables-only|--documents-only]
             [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | reject ID..

@@ -419,7 +419,7 @@ impl Default for ContextConfig {
 /// (`quack_core::embedding`). Unset keeps the built-in prefix for the
 /// model's family; an empty string sends that role unprefixed. Changing
 /// one changes the embedding profile: stored vectors stop being searched
-/// until `quack reembed` brings them up to date.
+/// until `quack embeddings refresh` brings them up to date.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[expect(

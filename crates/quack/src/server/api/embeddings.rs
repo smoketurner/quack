@@ -1,5 +1,5 @@
 //! The workspace's vectors against the configured embedding profile, and
-//! the re-embed that brings stale ones up to date (202, background, in a
+//! the refresh that brings stale ones up to date (202, background, in a
 //! lane of its own per workspace).
 
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use quack_core::embedding::reembed::{self, Plan};
+use quack_core::embedding::refresh::{self, Plan};
 use quack_core::jobs::{JobId, JobKind, JobSpec, Lane};
 use quack_core::llm::{self, Embeddings};
 use quack_core::progress::{ChunkDone, RunControl};
@@ -21,7 +21,7 @@ use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::App;
 
 /// `GET .../embeddings`: how many vectors are current, stale (made under
-/// another profile), or missing, and what a re-embed would do.
+/// another profile), or missing, and what a refresh would do.
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
@@ -40,9 +40,9 @@ pub(crate) async fn show(
     })))
 }
 
-/// `POST .../embeddings/reembed`: 200 with nothing to do, else 202 with
-/// the job re-embedding every stale or missing vector.
-pub(crate) async fn reembed(
+/// `POST .../embeddings/refresh`: 200 with nothing to do, else 202 with
+/// the job embedding every stale or missing vector again.
+pub(crate) async fn refresh(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<String>,
@@ -52,7 +52,7 @@ pub(crate) async fn reembed(
     Ok((code, Json(body)))
 }
 
-/// The re-embed the API and the web page share: `{status: "current"}`
+/// The refresh the API and the web page share: `{status: "current"}`
 /// with nothing to do, else `{plan, run, job, status: "running"}`.
 pub(crate) async fn start(
     app: &App,
@@ -67,7 +67,7 @@ pub(crate) async fn start(
         access
             .audit(
                 app,
-                "reembed",
+                "embeddings_refresh",
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "plan": plan, "finished": true })),
@@ -82,8 +82,8 @@ pub(crate) async fn start(
     access
         .audit(
             app,
-            "reembed",
-            Some(("reembed_run", &run)),
+            "embeddings_refresh",
+            Some(("embeddings_run", &run)),
             Outcome::Allowed,
             Some(serde_json::json!({ "plan": plan, "profile": embedder.profile() })),
         )
@@ -95,13 +95,13 @@ pub(crate) async fn start(
     ))
 }
 
-/// Run the re-embed as a job and audit its end under `run_id`.
+/// Run the refresh as a job and audit its end under `run_id`.
 fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobId {
     let workspace_id = access.workspace.id.clone();
-    let spec = JobSpec::new(JobKind::Reembed, "re-embed")
+    let spec = JobSpec::new(JobKind::Embeddings, "embeddings refresh")
         .workspace(workspace_id.clone())
         .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(format!("reembed:{workspace_id}")));
+        .lane(Lane::serial(format!("embeddings:{workspace_id}")));
     let jobs = app.jobs.clone();
     let (cancel_app, cancel_access, cancel_run) =
         (Arc::clone(&app), access.clone(), run_id.clone());
@@ -113,7 +113,7 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
             cancel: Some(&cancel),
         };
         let outcome = match app.workspace_db(&workspace_id).await {
-            Ok(db) => reembed::run(
+            Ok(db) => refresh::run(
                 &db,
                 &embedder,
                 app.config.ingestion.embedding_batch_size,
@@ -136,18 +136,18 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
         if let Err(e) = access
             .audit(
                 &app,
-                "reembed",
-                Some(("reembed_run", &run_id)),
+                "embeddings_refresh",
+                Some(("embeddings_run", &run_id)),
                 audit_outcome,
                 Some(detail),
             )
             .await
         {
-            tracing::error!(error = %e.message, "audit write failed after re-embedding");
+            tracing::error!(error = %e.message, "audit write failed after refreshing embeddings");
         }
         outcome.map(|summary| {
             format!(
-                "{} chunks and {} graph node labels re-embedded",
+                "{} chunks and {} graph node labels refreshed",
                 summary.chunks, summary.nodes
             )
         })
@@ -156,8 +156,8 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
         audit_cancelled(
             &cancel_app,
             &cancel_access,
-            "reembed",
-            "reembed_run",
+            "embeddings_refresh",
+            "embeddings_run",
             &cancel_run,
         )
         .await;

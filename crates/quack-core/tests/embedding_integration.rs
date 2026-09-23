@@ -2,14 +2,14 @@
 
 //! Embedding profiles end to end: which prefix each role gets, how a
 //! workspace records the profile of every stored vector, what happens to
-//! vectors made under an older profile or width, and the re-embed that
+//! vectors made under an older profile or width, and the refresh that
 //! brings them up to date.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use quack_core::config::Config;
-use quack_core::embedding::reembed::{self, Plan, Retype};
+use quack_core::embedding::refresh::{self, Plan, Retype};
 use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::store::{self as graph_store, NewNode};
@@ -185,7 +185,7 @@ fn vectors_made_before_prefixes_are_stale_for_a_prefixed_model() {
 }
 
 #[tokio::test]
-async fn reembed_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes() {
+async fn refresh_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes() {
     let dir = tempfile::tempdir().unwrap();
     let gemma = config(dir.path(), "embeddinggemma", 4, "");
     {
@@ -221,7 +221,7 @@ async fn reembed_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
         progress: &progress,
         cancel: None,
     };
-    let summary = reembed::run(&writer, &embedder(&gemma, tape.clone()), 2, control)
+    let summary = refresh::run(&writer, &embedder(&gemma, tape.clone()), 2, control)
         .await
         .unwrap();
     assert_eq!(
@@ -257,7 +257,7 @@ async fn reembed_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
         1
     );
     // A second run has nothing to do.
-    let again = reembed::run(
+    let again = refresh::run(
         &writer,
         &embedder(&gemma, Tape::new(4)),
         2,
@@ -304,7 +304,7 @@ async fn a_configured_prefix_change_makes_vectors_stale() {
         .unwrap();
     assert_eq!(old.prompts.document, "search_document: ");
     let tape = Tape::new(4);
-    reembed::run(
+    refresh::run(
         &writer_of(&db),
         &embedder(&after, tape.clone()),
         8,
@@ -317,7 +317,7 @@ async fn a_configured_prefix_change_makes_vectors_stale() {
 }
 
 #[tokio::test]
-async fn a_width_change_stores_new_chunks_without_vectors_until_reembed_retypes() {
+async fn a_width_change_stores_new_chunks_without_vectors_until_refresh_retypes() {
     let dir = tempfile::tempdir().unwrap();
     let narrow = config(dir.path(), "all-minilm", 4, "");
     {
@@ -361,7 +361,7 @@ async fn a_width_change_stores_new_chunks_without_vectors_until_reembed_retypes(
         )
     );
 
-    let summary = reembed::run(
+    let summary = refresh::run(
         &writer,
         &embedder(&wide, Tape::new(8)),
         8,
@@ -383,7 +383,7 @@ async fn a_width_change_stores_new_chunks_without_vectors_until_reembed_retypes(
 }
 
 #[tokio::test]
-async fn a_cancelled_reembed_keeps_the_batches_it_finished() {
+async fn a_cancelled_refresh_keeps_the_batches_it_finished() {
     let dir = tempfile::tempdir().unwrap();
     let gemma = config(dir.path(), "embeddinggemma", 4, "");
     {
@@ -400,7 +400,7 @@ async fn a_cancelled_reembed_keeps_the_batches_it_finished() {
             trigger.cancel();
         }
     };
-    let outcome = reembed::run(
+    let outcome = refresh::run(
         &writer_of(&db),
         &embedder(&gemma, Tape::new(4)),
         1,
@@ -416,7 +416,7 @@ async fn a_cancelled_reembed_keeps_the_batches_it_finished() {
 }
 
 #[tokio::test]
-async fn reembed_refuses_an_embedder_under_another_profile() {
+async fn refresh_refuses_an_embedder_under_another_profile() {
     let dir = tempfile::tempdir().unwrap();
     let gemma = config(dir.path(), "embeddinggemma", 4, "");
     let db = WorkspaceDb::open(&gemma, "ws").unwrap();
@@ -424,7 +424,7 @@ async fn reembed_refuses_an_embedder_under_another_profile() {
         Tape::new(4),
         Profile::new("other", Dimension::new(4), Prompts::default()),
     );
-    let err = reembed::run(&writer_of(&db), &other, 8, RunControl::unobserved())
+    let err = refresh::run(&writer_of(&db), &other, 8, RunControl::unobserved())
         .await
         .unwrap_err()
         .to_string();

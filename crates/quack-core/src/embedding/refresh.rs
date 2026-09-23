@@ -2,7 +2,7 @@
 //!
 //! A chunk or graph node whose vector is missing, or was made under another
 //! profile, is found by keyword search only (and never merged or matched
-//! by label). `run` re-embeds them in place, oldest first, one batch per
+//! by label). `run` embeds them again in place, oldest first, one batch per
 //! model call and one transaction per batch, so a cancelled or failed run
 //! keeps what it finished and a later run picks up the rest. When the
 //! configured width differs from the stored one, the vector columns are
@@ -92,7 +92,7 @@ impl fmt::Display for Plan {
                 f,
                 "The workspace stores {stored}-dimensional vectors and the configured model \
                  makes {configured}-dimensional ones: every stored vector is dropped first, and \
-                 chunks are found by keyword search until they are re-embedded."
+                 chunks are found by keyword search until they are refreshed."
             )?;
         }
         for group in &self.stale {
@@ -108,7 +108,7 @@ impl fmt::Display for Plan {
         }
         write!(
             f,
-            "Re-embed {} chunks and {} graph node labels",
+            "Refresh {} chunks and {} graph node labels",
             self.chunks, self.nodes
         )?;
         match &self.profile {
@@ -136,7 +136,7 @@ impl fmt::Display for Summary {
         }
         write!(
             f,
-            "Re-embedded {} chunks and {} graph node labels with {}.",
+            "Refreshed {} chunks and {} graph node labels with {}.",
             self.chunks,
             self.nodes,
             self.profile.describe()
@@ -162,7 +162,7 @@ impl Prepared {
             if db.embedding_fingerprint() != Some(&fingerprint) {
                 return Err(Error::Config(
                     "the workspace was opened under a different embedding profile than the \
-                     model re-embedding it; reopen it with the current configuration"
+                     model refreshing it; reopen it with the current configuration"
                         .into(),
                 ));
             }
@@ -184,7 +184,7 @@ impl Prepared {
     }
 }
 
-/// Re-embed every chunk and node whose vector is missing or stale, in
+/// Embed again every chunk and node whose vector is missing or stale, in
 /// batches of `batch_size`. Progress counts chunks and node labels
 /// together; a cancel stops between batches, keeping what was done.
 ///
@@ -345,10 +345,10 @@ mod tests {
             text,
             "The workspace stores 768-dimensional vectors and the configured model makes \
              1024-dimensional ones: every stored vector is dropped first, and chunks are found \
-             by keyword search until they are re-embedded.\n\
+             by keyword search until they are refreshed.\n\
              40 chunks were embedded with nomic-embed-text (768 dimensions, no prefixes).\n\
              2 chunks have no vector.\n\
-             Re-embed 42 chunks and 3 graph node labels with embeddinggemma (1024 dimensions, \
+             Refresh 42 chunks and 3 graph node labels with embeddinggemma (1024 dimensions, \
              no prefixes)."
         );
     }

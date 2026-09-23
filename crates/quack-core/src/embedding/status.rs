@@ -20,7 +20,7 @@ pub struct EmbeddingStatus {
     /// `None` without an embedding model.
     pub profile: Option<Profile>,
     /// Width of the stored vectors, which differs from the profile's
-    /// until `reembed` runs after an `embedding_dimension` change.
+    /// until `quack embeddings refresh` runs after an `embedding_dimension` change.
     pub column_dimension: Dimension,
     /// Chunks searchable by vector now.
     pub current_chunks: u64,
@@ -45,8 +45,8 @@ impl EmbeddingStatus {
     }
 
     /// What the out-of-date chunk vectors mean for search, in one sentence,
-    /// `None` when every one is current or there is no model to re-embed
-    /// with. Each interface adds how to re-embed from where the operator is.
+    /// `None` when every one is current or there is no model to refresh
+    /// with. Each interface adds how to refresh from where the operator is.
     #[must_use]
     pub fn note(&self) -> Option<String> {
         let profile = self.profile.as_ref()?;

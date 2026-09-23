@@ -177,7 +177,7 @@ const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontolo
             );";
 
 /// The embedding side of a workspace, shared by every connection to it:
-/// the width of its vector columns, which a re-embed can change, and the
+/// the width of its vector columns, which a refresh can change, and the
 /// profile the configured model runs under.
 #[derive(Debug)]
 struct Vectors {
@@ -788,7 +788,7 @@ impl WorkspaceDb {
     }
 
     /// The width of the stored vectors: of the vector columns, which a
-    /// re-embed can change.
+    /// refresh can change.
     #[must_use]
     pub fn embedding_dimension(&self) -> Dimension {
         Dimension::new(self.vectors.column_dimension.load(Ordering::Acquire))
@@ -796,7 +796,7 @@ impl WorkspaceDb {
 
     /// Bring the vector columns to the configured profile's width when no
     /// chunk vector would be lost doing it. When chunk vectors of another
-    /// width exist they stay as they are, unsearched, until `reembed`
+    /// width exist they stay as they are, unsearched, until `refresh`
     /// retypes the columns: a mistyped `embedding_dimension` must not
     /// discard a workspace's embeddings.
     fn reconcile_dimension(&self) -> Result<()> {
@@ -817,7 +817,7 @@ impl WorkspaceDb {
                 stored = %column,
                 configured = %profile.dimension,
                 "the workspace's vectors are a different width from the configured model's; \
-                 vector search is off until `quack reembed` re-embeds them"
+                 vector search is off until `quack embeddings refresh` updates them"
             );
             return Ok(());
         }
@@ -869,7 +869,7 @@ impl WorkspaceDb {
     }
 
     /// The error for storing a vector the columns cannot hold: the
-    /// configured width changed and `reembed` has not run yet.
+    /// configured width changed and `refresh` has not run yet.
     fn check_vector_width(&self, width: usize) -> Result<()> {
         let column = self.embedding_dimension();
         if column.fits(width) {
@@ -877,7 +877,7 @@ impl WorkspaceDb {
         }
         Err(Error::Embedding(format!(
             "the workspace stores {column}-dimensional vectors and this one has {width}; \
-             run `quack reembed` to re-embed the workspace at the new width"
+             run `quack embeddings refresh` to embed the workspace again at the new width"
         )))
     }
 
@@ -1361,7 +1361,7 @@ impl WorkspaceDb {
     }
 
     /// Chunks of ready documents whose vector is missing or was made under
-    /// another profile, oldest first: what `reembed` works through.
+    /// another profile, oldest first: what `refresh` works through.
     ///
     /// # Errors
     ///
@@ -1595,7 +1595,7 @@ impl WorkspaceDb {
             tracing::warn!(
                 query = query_embedding.len(),
                 stored = %self.embedding_dimension(),
-                "vector search skipped: the workspace's vectors are another width until `quack reembed` runs"
+                "vector search skipped: the workspace's vectors are another width until `quack embeddings refresh` runs"
             );
             return Ok(Vec::new());
         }

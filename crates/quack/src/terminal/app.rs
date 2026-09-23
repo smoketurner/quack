@@ -37,9 +37,9 @@ use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 
+use crate::embeddings_cli::{self, EmbeddingsAction};
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
-use crate::reembed_cli::{self, Confirm};
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -79,7 +79,7 @@ Commands:
   /path FROM -> TO  Shortest relation chain between two entities
   /context [import FILE | export FILE]  Show, replace, or save the workspace context
   /okf DIR          Export the workspace as an Open Knowledge Format bundle
-  /reembed          Re-embed what the embedding model, width, or prefixes left stale
+  /embeddings refresh  Refresh what the embedding model, width, or prefixes left stale
   /sessions         List recent sessions
   /resume ID        Switch to a session (id prefix accepted) and replay it
   /new              Start a fresh session
@@ -353,13 +353,13 @@ impl App {
 
     /// Say so at startup when some vectors were made under another
     /// embedding profile or are missing: those chunks are found by keyword
-    /// only until `/reembed` runs.
+    /// only until `/embeddings refresh` runs.
     pub(crate) async fn note_embedding_status(&mut self) -> Result<()> {
         let status = self.db.run(WorkspaceDb::embedding_status).await?;
         if let Some(note) = status.note() {
             self.messages.push(Message::new(
                 MessageRole::System,
-                format!("{note} /reembed re-embeds them in the background."),
+                format!("{note} /embeddings refresh updates them in the background."),
             ));
         }
         Ok(())
@@ -1225,7 +1225,7 @@ impl App {
             "/unshare" => self.set_shared(false),
             "/export" => self.export_session(args),
             "/okf" => self.run_job(CliJob::Okf(args.to_owned()), "Exporting the bundle"),
-            "/reembed" => self.run_job(CliJob::Reembed, "Re-embedding"),
+            "/embeddings" => self.run_embeddings_command(args),
             "/chart" => self.show_chart(args),
             "/steps" => {
                 self.expand_steps = !self.expand_steps;
@@ -1433,6 +1433,22 @@ impl App {
                     *yes = true;
                 }
                 self.run_job(CliJob::Ontology(action), "Running ontology command");
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(MessageRole::Error, e.to_string())),
+        }
+    }
+
+    /// `/embeddings refresh`: the CLI's `quack embeddings` verbs. The
+    /// terminal owns stdin, so a refresh never asks.
+    fn run_embeddings_command(&mut self, args: &str) {
+        match EmbeddingsArgs::try_parse_from(split_args(args)) {
+            Ok(parsed) => {
+                let action = match parsed.action {
+                    EmbeddingsAction::Refresh { .. } => EmbeddingsAction::Refresh { yes: true },
+                };
+                self.run_job(CliJob::Embeddings(action), "Refreshing embeddings");
             }
             Err(e) => self
                 .messages
@@ -2234,6 +2250,13 @@ struct OntologyArgs {
 }
 
 #[derive(Parser)]
+#[command(name = "/embeddings", no_binary_name = true)]
+struct EmbeddingsArgs {
+    #[command(subcommand)]
+    action: EmbeddingsAction,
+}
+
+#[derive(Parser)]
 #[command(name = "/graph", no_binary_name = true)]
 struct GraphArgs {
     #[command(subcommand)]
@@ -2312,7 +2335,7 @@ fn resolve_document(
 enum CliJob {
     Ontology(OntologyAction),
     Graph(GraphAction),
-    Reembed,
+    Embeddings(EmbeddingsAction),
     Okf(String),
     ContextImport(String),
     ContextExport(String),
@@ -2323,7 +2346,7 @@ impl CliJob {
         match self {
             Self::Ontology(_) => JobKind::Ontology,
             Self::Graph(_) => JobKind::Graph,
-            Self::Reembed => JobKind::Reembed,
+            Self::Embeddings(_) => JobKind::Embeddings,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
             Self::ContextImport(_) => JobKind::Import,
         }
@@ -2354,7 +2377,7 @@ async fn run_job_inner(
         CliJob::Graph(action) => {
             crate::graph_cli::run(config, db, action, &mut out, &progress).await?;
         }
-        CliJob::Reembed => {
+        CliJob::Embeddings(action) => {
             // The terminal owns stdin, so the job never asks; `/cancel`
             // stops it between batches.
             let cancel = ctx.cancel_token();
@@ -2362,7 +2385,7 @@ async fn run_job_inner(
                 progress: &progress,
                 cancel: Some(&cancel),
             };
-            reembed_cli::run(config, db, Confirm::Assume, &mut out, control).await?;
+            embeddings_cli::run(config, db, action, &mut out, control).await?;
         }
         CliJob::Okf(dir) => {
             let dir = dir.trim();
@@ -3073,14 +3096,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn reembed_is_a_job_and_stale_vectors_are_noted_at_startup() {
+    async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
         use quack_core::config::{AuthMode, ProviderConfig, ProviderType};
         use quack_core::storage::workspace::{NewChunk, NewDocument};
 
         // Without an embedding model the job says what is missing.
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        app.handle_slash_command("/reembed");
+        app.handle_slash_command("/embeddings refresh");
         settle(&mut app).await;
         assert_eq!(last(&app).role, MessageRole::Error);
         assert!(
@@ -3135,7 +3158,7 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let note = &last(&app).content;
         assert!(
-            note.contains("keyword search only") && note.contains("/reembed"),
+            note.contains("keyword search only") && note.contains("/embeddings refresh"),
             "{note}"
         );
     }

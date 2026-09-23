@@ -8,8 +8,8 @@ use quack_core::config::{
     ImportConfig, IngestionConfig, OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig,
     ServerConfig,
 };
-use quack_core::embedding::reembed::Plan;
-use quack_core::embedding::reembed::Retype;
+use quack_core::embedding::refresh::Plan;
+use quack_core::embedding::refresh::Retype;
 use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::graph::store as graph_store;
 use quack_core::ingestion;
@@ -1092,7 +1092,7 @@ fn reopen_without_provider_keeps_recorded_dimension() {
 }
 
 #[test]
-fn dimension_change_with_stored_embeddings_keeps_them_until_reembed() {
+fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     {
@@ -1134,7 +1134,7 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_reembed() {
         .set_chunk_embedding("c", &vector(&[0.5; 8]))
         .unwrap_err()
         .to_string();
-    assert!(err.contains("quack reembed"), "{err}");
+    assert!(err.contains("quack embeddings refresh"), "{err}");
     let status = db.embedding_status().unwrap();
     assert_eq!(status.column_dimension, Dimension::new(4));
     assert_eq!(status.stale_chunks(), 1);

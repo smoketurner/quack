@@ -217,7 +217,7 @@ struct DocumentsPage {
     rows: String,
     error: Option<String>,
     notice: Option<String>,
-    /// Chunks found by keyword only until a re-embed, when there are any.
+    /// Chunks found by keyword only until a refresh, when there are any.
     embeddings_note: Option<String>,
 }
 
@@ -466,7 +466,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
-        .route("/w/{id}/embeddings/reembed", post(reembed))
+        .route("/w/{id}/embeddings/refresh", post(refresh_embeddings))
         .route("/w/{id}/jobs", get(jobs_page))
         .route("/w/{id}/jobs/rows", get(job_rows))
         .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
@@ -980,9 +980,9 @@ async fn documents(
     })
 }
 
-/// The Documents page's re-embed button: the API's re-embed, then back
+/// The Documents page's refresh button: the API's refresh, then back
 /// to the page with what it started.
-async fn reembed(
+async fn refresh_embeddings(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
@@ -992,7 +992,9 @@ async fn reembed(
         Ok((_, body)) if body.get("status").and_then(|s| s.as_str()) == Some("running") => {
             format!(
                 "/w/{id}/documents?notice={}",
-                urlencoded("re-embedding in the background; the Jobs page shows its progress")
+                urlencoded(
+                    "refreshing embeddings in the background; the Jobs page shows its progress"
+                )
             )
         }
         Ok(_) => format!(

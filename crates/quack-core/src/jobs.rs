@@ -84,7 +84,7 @@ pub enum JobKind {
     /// A graph command or extraction run.
     Graph,
     /// Vectors brought up to the current embedding profile.
-    Reembed,
+    Embeddings,
     /// A bundle, context, or session written out.
     Export,
 }
@@ -100,7 +100,7 @@ impl JobKind {
             Self::Import => "import",
             Self::Ontology => "ontology",
             Self::Graph => "graph",
-            Self::Reembed => "reembed",
+            Self::Embeddings => "embeddings",
             Self::Export => "export",
         }
     }
@@ -118,7 +118,7 @@ impl JobKind {
             | Self::Import
             | Self::Ontology
             | Self::Graph
-            | Self::Reembed
+            | Self::Embeddings
             | Self::Export => Priority::Background,
         }
     }

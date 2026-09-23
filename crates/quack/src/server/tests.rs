@@ -3509,8 +3509,8 @@ async fn wait_for_job(h: &Harness, ws: &str, job: &str, token: &str) -> serde_js
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stale_vectors_are_reported_and_reembedded_over_the_api_and_the_page() {
-    // An embedding model the job cannot reach: the re-embed starts, then
+async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
+    // An embedding model the job cannot reach: the refresh starts, then
     // fails in the background with the provider's error.
     let mut config = Config::default();
     config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
@@ -3546,7 +3546,7 @@ async fn stale_vectors_are_reported_and_reembedded_over_the_api_and_the_page() {
     assert_eq!(body["status"]["profile"]["model"], "embeddinggemma");
     let (status, body) = h
         .post(
-            &format!("{base}/reembed"),
+            &format!("{base}/refresh"),
             &owner_token,
             serde_json::json!({}),
         )
@@ -3595,21 +3595,21 @@ async fn stale_vectors_are_reported_and_reembedded_over_the_api_and_the_page() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("an unrecorded profile") && html.contains("/embeddings/reembed"),
+        html.contains("an unrecorded profile") && html.contains("/embeddings/refresh"),
         "{html}"
     );
     let (_, html, _) = h
         .page(&format!("/w/{ws}/documents"), Some(&viewer_token))
         .await;
     assert!(
-        html.contains("an unrecorded profile") && !html.contains("/embeddings/reembed"),
+        html.contains("an unrecorded profile") && !html.contains("/embeddings/refresh"),
         "{html}"
     );
 
     // A viewer may not start it.
     let (status, _) = h
         .post(
-            &format!("{base}/reembed"),
+            &format!("{base}/refresh"),
             &viewer_token,
             serde_json::json!({}),
         )
@@ -3618,7 +3618,7 @@ async fn stale_vectors_are_reported_and_reembedded_over_the_api_and_the_page() {
 
     let (status, body) = h
         .post(
-            &format!("{base}/reembed"),
+            &format!("{base}/refresh"),
             &owner_token,
             serde_json::json!({}),
         )
@@ -3629,12 +3629,12 @@ async fn stale_vectors_are_reported_and_reembedded_over_the_api_and_the_page() {
     let run = body["run"].as_str().unwrap_or_default().to_owned();
     let last = wait_for_job(&h, &ws, &job, &owner_token).await;
     assert_eq!(last["state"], "failed", "{last}");
-    assert_eq!(last["kind"], "reembed", "{last}");
+    assert_eq!(last["kind"], "embeddings", "{last}");
 
     // Both ends of the run are in the access audit, under its run id.
     let rows = h
         .audit(AuditFilter {
-            action: Some(String::from("reembed")),
+            action: Some(String::from("embeddings_refresh")),
             ..AuditFilter::default()
         })
         .await;
@@ -3651,7 +3651,7 @@ async fn stale_vectors_are_reported_and_reembedded_over_the_api_and_the_page() {
     // The page's button starts another run and comes back with a notice.
     let (status, _, headers) = h
         .form(
-            &format!("/w/{ws}/embeddings/reembed"),
+            &format!("/w/{ws}/embeddings/refresh"),
             Some(&owner_token),
             "",
         )

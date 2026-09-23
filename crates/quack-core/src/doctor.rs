@@ -372,7 +372,7 @@ async fn check_workspace(
             if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
                 report.push(
                     Check::new("workspace", Status::Warn, format!("'{name}': {note}"))
-                        .fix(format!("quack reembed -w {name}")),
+                        .fix(format!("quack embeddings refresh -w {name}")),
                 );
             }
         }

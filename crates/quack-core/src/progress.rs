@@ -1,5 +1,5 @@
 //! Progress of a long model run (ontology document evidence, graph
-//! extraction, re-embedding), for the interface that shows it, and the
+//! extraction, embeddings refresh), for the interface that shows it, and the
 //! cancel token that stops it (issue #67).
 
 use std::time::Duration;
@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
 
-/// One unit of work finished (a chunk; for a re-embed, a batch of chunks
+/// One unit of work finished (a chunk; for an embeddings refresh, a batch of chunks
 /// or node labels), with the run's totals so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkDone {

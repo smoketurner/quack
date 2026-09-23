@@ -85,7 +85,7 @@ key, or OAuth. `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data 
 `embedding_dimension` must be the width your embedding model produces; `quack doctor`
 checks it. quack adds the query and document prefixes each known embedding model was
 trained with (`[embedding]` overrides them). After you change the embedding model, its
-width, or those prefixes, `quack reembed -w NAME` updates each workspace's vectors. Until
+width, or those prefixes, `quack embeddings refresh -w NAME` updates each workspace's vectors. Until
 you do, documents are still found by keyword search.
 
 ## Try it

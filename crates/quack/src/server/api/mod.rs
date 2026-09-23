@@ -53,8 +53,8 @@ pub(crate) fn router() -> Router<App> {
         )
         .route("/workspaces/{id}/embeddings", get(embeddings::show))
         .route(
-            "/workspaces/{id}/embeddings/reembed",
-            post(embeddings::reembed),
+            "/workspaces/{id}/embeddings/refresh",
+            post(embeddings::refresh),
         )
         .route("/workspaces/{id}/tables", get(tables::list))
         .route("/workspaces/{id}/tables/{name}", get(tables::describe))

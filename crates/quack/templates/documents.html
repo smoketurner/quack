@@ -10,8 +10,8 @@
 <div class="mt-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
   <p>{{ note }}</p>
   {% if ws.can_write %}
-  <form method="post" action="/w/{{ ws.id }}/embeddings/reembed" class="mt-2">
-    <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-700">Re-embed</button>
+  <form method="post" action="/w/{{ ws.id }}/embeddings/refresh" class="mt-2">
+    <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-700">Refresh embeddings</button>
   </form>
   {% endif %}
 </div>

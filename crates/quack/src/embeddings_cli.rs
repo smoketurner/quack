@@ -1,19 +1,32 @@
-//! `quack reembed`: bring a workspace's vectors up to the configured
-//! embedding profile, after the embedding model, its width, or its input
-//! prefixes changed. Until then the chunks those vectors belong to are
-//! found by keyword search only.
+//! `quack embeddings`: the workspace's vectors. `refresh` brings them up
+//! to the configured embedding profile, after the embedding model, its
+//! width, or its input prefixes changed. Until then the chunks those
+//! vectors belong to are found by keyword search only.
 
 use std::io::{self, Write};
 
 use anyhow::Result;
+use clap::Subcommand;
 use quack_core::config::Config;
-use quack_core::embedding::reembed::{self, Plan};
+use quack_core::embedding::refresh::{self, Plan};
 use quack_core::llm;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
 use crate::graph_cli::confirm;
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum EmbeddingsAction {
+    /// Embed again the chunks and graph labels whose vectors were made
+    /// with another embedding model, width, or input prefixes, or have
+    /// none; until then they are found by keyword search only
+    Refresh {
+        /// Do not ask before spending the model calls
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
 
 /// Whether to ask before spending the model calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,13 +37,30 @@ pub(crate) enum Confirm {
     Assume,
 }
 
-/// Say what a run would do, ask when `confirm_first` says to, then run it.
+/// Run `action` against the workspace behind `db`.
 ///
 /// # Errors
 ///
 /// Returns an error when no embedding model is configured, or the run
 /// fails.
 pub(crate) async fn run(
+    config: &Config,
+    db: &Writer,
+    action: EmbeddingsAction,
+    out: &mut impl Write,
+    control: RunControl<'_>,
+) -> Result<()> {
+    match action {
+        EmbeddingsAction::Refresh { yes } => {
+            let confirm_first = if yes { Confirm::Assume } else { Confirm::Ask };
+            refresh(config, db, confirm_first, out, control).await
+        }
+    }
+}
+
+/// Say what a refresh would do, ask when `confirm_first` says to, then
+/// run it.
+async fn refresh(
     config: &Config,
     db: &Writer,
     confirm_first: Confirm,
@@ -42,7 +72,7 @@ pub(crate) async fn run(
     if plan.is_empty() {
         writeln!(
             out,
-            "Every vector was made with {}; nothing to re-embed.",
+            "Every vector was made with {}; nothing to refresh.",
             embedder.profile().describe()
         )?;
         return Ok(());
@@ -52,7 +82,7 @@ pub(crate) async fn run(
         writeln!(out, "Nothing changed.")?;
         return Ok(());
     }
-    let summary = reembed::run(
+    let summary = refresh::run(
         db,
         &embedder,
         config.ingestion.embedding_batch_size,
@@ -67,7 +97,7 @@ pub(crate) async fn run(
 pub(crate) fn print_progress(done: ChunkDone) {
     drop(writeln!(
         io::stderr(),
-        "{}/{} re-embedded; {} s elapsed",
+        "{}/{} refreshed; {} s elapsed",
         done.done,
         done.total,
         done.elapsed.as_secs()

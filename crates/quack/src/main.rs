@@ -4,11 +4,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod admin;
 mod config_cli;
 mod doctor_cli;
+mod embeddings_cli;
 mod graph_cli;
 mod mcp;
 mod ontology_cli;
 mod print;
-mod reembed_cli;
 mod server;
 mod terminal;
 
@@ -316,13 +316,11 @@ enum Commands {
         json: bool,
     },
 
-    /// Re-embed the chunks and graph labels whose vectors were made with
-    /// another embedding model, width, or input prefixes, or have none;
-    /// until then they are found by keyword search only
-    Reembed {
-        /// Do not ask before spending the model calls
-        #[arg(long, short = 'y')]
-        yes: bool,
+    /// The workspace's vectors: refresh the ones made with another
+    /// embedding model, width, or input prefixes
+    Embeddings {
+        #[command(subcommand)]
+        action: embeddings_cli::EmbeddingsAction,
     },
 }
 
@@ -526,7 +524,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Ontology { action } => run_ontology(cli, action).await,
         Commands::Graph { action } => run_graph(cli, action).await,
-        Commands::Reembed { yes } => run_reembed(cli, yes).await,
+        Commands::Embeddings { action } => run_embeddings(cli, action).await,
         Commands::Okf {
             action: OkfAction::Export { dir },
         } => run_okf_export(cli, &dir).await,
@@ -648,7 +646,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     load_piped_stdin(&config, &ws_db, &workspace.id, cli.stdin).await?;
     if let Some(note) = ws_db.embedding_status()?.note() {
-        tracing::warn!("{note} Run `quack reembed -w {workspace_name}` to re-embed them.");
+        tracing::warn!("{note} Run `quack embeddings refresh -w {workspace_name}` to update them.");
     }
     let session_id = resolve_session(
         &config,
@@ -804,7 +802,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Mcp { .. }
         | Commands::Config { .. }
         | Commands::Doctor { .. }
-        | Commands::Reembed { .. }
+        | Commands::Embeddings { .. }
         | Commands::Docs { .. } => Ok(()),
     }
 }
@@ -841,23 +839,19 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
     )
 }
 
-async fn run_reembed(cli: &Cli, yes: bool) -> Result<ExitCode> {
+async fn run_embeddings(cli: &Cli, action: embeddings_cli::EmbeddingsAction) -> Result<ExitCode> {
     let ws_db = open_writer(cli).await?;
     let config = Config::load().context("failed to load configuration")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     exit_after(
-        reembed_cli::run(
+        embeddings_cli::run(
             &config,
             &ws_db,
-            if yes {
-                reembed_cli::Confirm::Assume
-            } else {
-                reembed_cli::Confirm::Ask
-            },
+            action,
             &mut out,
             RunControl {
-                progress: &reembed_cli::print_progress,
+                progress: &embeddings_cli::print_progress,
                 cancel: None,
             },
         )

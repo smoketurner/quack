@@ -64,7 +64,7 @@ every open.
   and refused in user and agent SQL.
 - The embedding dimension is fixed per workspace and recorded in `_quack_meta`; a schema
   version never changes it. Changing the embedding model, its width, or its input
-  prefixes leaves vectors stale, never dropped on open; `quack reembed` brings them up to
+  prefixes leaves vectors stale, never dropped on open; `quack embeddings refresh` brings them up to
   date, retyping the vector columns first when the width changed.
 - The ontology and the workspace context are versioned as data
   (`_quack_ontology_versions`, `_quack_context`), not by schema versions.

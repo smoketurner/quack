@@ -68,7 +68,7 @@ const NODE_BATCH: u32 = 64;
 
 /// Give every node whose label vector is missing or stale one made under
 /// the current profile, `NODE_BATCH` at a time; returns how many. Nothing
-/// is embedded while the workspace's vectors are another width (`reembed`
+/// is embedded while the workspace's vectors are another width (`refresh`
 /// retypes them first). Progress is reported after each batch; a cancel
 /// stops between batches.
 ///
@@ -93,7 +93,7 @@ pub async fn embed_nodes<M: EmbeddingModel>(
         .await?;
     let Some(total) = total else {
         tracing::warn!(
-            "node label vectors not embedded: run `quack reembed` after the width change"
+            "node label vectors not embedded: run `quack embeddings refresh` after the width change"
         );
         return Ok(0);
     };

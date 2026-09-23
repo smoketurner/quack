@@ -785,10 +785,10 @@ async fn embed_and_store<M: EmbeddingModel>(
     if db.run(move |db| Ok(db.embedding_dimension())).await? != dimension {
         // The configured width changed and the workspace still holds
         // vectors of the old one: the chunks are found by keyword until
-        // `reembed` retypes the columns and embeds them.
+        // `quack embeddings refresh` retypes the columns and embeds them.
         tracing::warn!(
             document_id = %document_id,
-            "chunks stored without vectors: run `quack reembed` after the embedding width change"
+            "chunks stored without vectors: run `quack embeddings refresh` after the embedding width change"
         );
         return Ok((stored, None));
     }
