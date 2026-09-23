@@ -19,6 +19,7 @@ use sqlx::{
 };
 
 use crate::config::Config;
+use crate::csv::CsvField;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ingestion::{self, IngestOutcome, NewFile};
@@ -421,13 +422,7 @@ impl Csv {
             let Some(value) = cell else {
                 continue;
             };
-            if value.contains([',', '"', '\n', '\r']) {
-                self.text.push('"');
-                self.text.push_str(&value.replace('"', "\"\""));
-                self.text.push('"');
-            } else {
-                self.text.push_str(value);
-            }
+            self.text.push_str(&CsvField(value).to_string());
         }
         self.text.push('\n');
     }

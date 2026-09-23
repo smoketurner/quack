@@ -884,7 +884,9 @@ three nearest node embeddings within a distance of 0.25, and nothing if none qua
 Operations: `neighborhood(entity, hops, relation?)`, `path(a, b, max_hops)` (single-source
 BFS with a parent map, bounded by `max_traversal_depth * 2`), `by_class(class, limit)` with
 subclass expansion. Limits: `max_traversal_depth` (3) and `max_nodes` (200), the cap on
-nodes visited.
+nodes visited. Every interface reads a caller's hop count through `traverse::Hops`: at
+least 1, 2 for a neighborhood and 4 for a path when unset, so `--hops 0`, `hops: 0`, and
+`/graph X 0` mean the same thing.
 
 **Rendering.** TUI and `quack graph` print a depth-first tree; the web UI renders an
 ECharts `graph` series with class-colored nodes and an inspector showing properties and
@@ -1528,6 +1530,8 @@ quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
               | accept ID... [--rename N|--merge-into ID|--reparent C] | reject ID...
               | export FILE | import FILE | versions | diff [FROM] [TO] | restore V
 quack context show | edit | history | export FILE | import FILE
+# Commands that spend model calls ask first ([y/N]) on a terminal; with no
+# terminal the answer is no, and -y / --yes goes ahead.
 quack sessions [--json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-

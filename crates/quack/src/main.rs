@@ -3,6 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
 mod config_cli;
+mod confirm;
 mod doctor_cli;
 mod embeddings_cli;
 mod graph_cli;
@@ -36,6 +37,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::confirm::Confirm;
 
 /// Exit status for a usage error (bad flags, no terminal for the session).
 const EXIT_USAGE: u8 = 2;
@@ -1640,19 +1643,15 @@ async fn ingest_bundle(
         if existing.as_deref() == Some(body.as_str()) {
             writeln!(out, "index.md already is the workspace context.")?;
         } else {
-            write!(
-                out,
-                "index.md can become the workspace context{}. Apply it? [y/N] ",
+            let question = format!(
+                "index.md can become the workspace context{}. Apply it?",
                 if existing.is_some() {
                     " (replacing the current one)"
                 } else {
                     ""
                 }
-            )?;
-            out.flush()?;
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            if matches!(answer.trim(), "y" | "Y" | "yes") {
+            );
+            if Confirm::Ask.ask(&mut out, &question, None)? {
                 let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
                 writeln!(out, "context is now version {}", stored.version)?;
             } else {

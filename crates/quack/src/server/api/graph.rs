@@ -9,6 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::embedding::{Input, Vector};
 use quack_core::graph::resolve::MergeDecision;
+use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphResult, extract, resolve, store as graph_store, tables,
     traverse,
@@ -72,7 +73,7 @@ pub(crate) async fn search(
         Some(e) => entity_embedding(&app, e).await?,
         None => None,
     };
-    let hops = q.hops.unwrap_or(2).max(1);
+    let hops = Hops::neighborhood(q.hops);
     let relation = q.relation.clone();
     let options = app.config.graph.options();
     let detail =
@@ -127,7 +128,7 @@ pub(crate) async fn path(
     }
     let a = entity_embedding(&app, &from).await?;
     let b = entity_embedding(&app, &to).await?;
-    let max_hops = q.max_hops.unwrap_or(4).max(1);
+    let max_hops = Hops::path(q.max_hops);
     let options = app.config.graph.options();
     let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
     let (from_label, to_label) = (from.clone(), to.clone());

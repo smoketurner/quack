@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::csv::CsvField;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Profile, Prompts, StaleVectors, Vector,
 };
@@ -2886,21 +2887,18 @@ impl QueryResults {
     ///
     /// Returns an error if writing fails.
     pub fn write_csv(&self, out: &mut impl Write) -> Result<()> {
-        fn field(value: &str) -> String {
-            if value.contains([',', '"', '\n', '\r']) {
-                format!("\"{}\"", value.replace('"', "\"\""))
-            } else {
-                value.to_owned()
-            }
-        }
-        let header: Vec<String> = self.columns.iter().map(|c| field(c)).collect();
+        let header: Vec<String> = self
+            .columns
+            .iter()
+            .map(|c| CsvField(c).to_string())
+            .collect();
         writeln!(out, "{}", header.join(","))?;
         for row in &self.rows {
             let cells: Vec<String> = row
                 .iter()
                 .map(|v| match v {
                     serde_json::Value::Null => String::new(),
-                    other => field(&display_json_value(other)),
+                    other => CsvField(&display_json_value(other)).to_string(),
                 })
                 .collect();
             writeln!(out, "{}", cells.join(","))?;

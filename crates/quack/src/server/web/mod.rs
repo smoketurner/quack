@@ -44,9 +44,11 @@ use super::auth::{
 };
 use super::error::ApiError;
 use super::state::{App, with_db};
+use quack_core::csv::CsvField;
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::resolve::MergeDecision;
+use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, store as graph_store,
     traverse,
@@ -1330,7 +1332,7 @@ async fn sql_csv(
         &outcome
             .columns
             .iter()
-            .map(|c| csv_field(c))
+            .map(|c| CsvField(c).to_string())
             .collect::<Vec<_>>()
             .join(","),
     );
@@ -1338,7 +1340,7 @@ async fn sql_csv(
     for row in &outcome.rows {
         csv.push_str(
             &row.iter()
-                .map(|v| csv_field(&cell(v)))
+                .map(|v| CsvField(&cell(v)).to_string())
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -1355,14 +1357,6 @@ async fn sql_csv(
         csv,
     )
         .into_response())
-}
-
-fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 fn class_rows(ontology: &Ontology) -> Vec<ClassRow> {
@@ -2273,13 +2267,6 @@ mod tests {
     }
 
     #[test]
-    fn csv_fields_quote_when_needed() {
-        assert_eq!(csv_field("x"), "x");
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("q\"q"), "\"q\"\"q\"");
-    }
-
-    #[test]
     fn cells_render_strings_bare_and_null_empty() {
         assert_eq!(cell(&serde_json::json!("s")), "s");
         assert_eq!(cell(&serde_json::Value::Null), "");
@@ -2319,10 +2306,10 @@ async fn graph_page(
         entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
         class: non_empty(q.class.as_ref()).unwrap_or_default(),
         relation: non_empty(q.relation.as_ref()).unwrap_or_default(),
-        hops: q.hops.unwrap_or(2).clamp(1, 6),
+        hops: Hops::neighborhood(q.hops).get(),
         from: non_empty(q.from.as_ref()).unwrap_or_default(),
         to: non_empty(q.to.as_ref()).unwrap_or_default(),
-        max_hops: q.max_hops.unwrap_or(4).clamp(1, 8),
+        max_hops: Hops::path(q.max_hops).get(),
     };
     let embedding = if query.entity.is_empty() {
         None
@@ -2417,7 +2404,7 @@ fn graph_page_data(
         let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
         let to = traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
         let found = match (from.first(), to.first()) {
-            (Some(a), Some(b)) => traverse::path(db, a, b, wanted.max_hops, &options)?,
+            (Some(a), Some(b)) => traverse::path(db, a, b, Hops::new(wanted.max_hops), &options)?,
             _ => GraphResult::default(),
         };
         Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
@@ -2425,7 +2412,7 @@ fn graph_page_data(
         let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
         let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
         let roots = traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
-        let found = traverse::neighborhood(db, &roots, wanted.hops, relation, &options)?;
+        let found = traverse::neighborhood(db, &roots, Hops::new(wanted.hops), relation, &options)?;
         Some((format!("Around {}", wanted.entity), found))
     } else if !wanted.class.is_empty() {
         let found = traverse::by_class(

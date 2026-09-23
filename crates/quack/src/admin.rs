@@ -7,6 +7,7 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use quack_core::config::Config;
+use quack_core::csv::CsvField;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, ResourceKind, Role,
     Scope, WorkspaceRow,
@@ -408,7 +409,7 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
                 r.client_addr.as_deref().unwrap_or(""),
                 r.request_id.as_deref().unwrap_or(""),
             ];
-            let line: Vec<String> = fields.iter().map(|f| csv_field(f)).collect();
+            let line: Vec<String> = fields.iter().map(|f| CsvField(f).to_string()).collect();
             writeln!(out, "{}", line.join(","))?;
         }
     } else if rows.is_empty() {
@@ -432,14 +433,6 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
     }
     out.flush()?;
     Ok(())
-}
-
-fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 async fn resolve_workspace(
@@ -545,12 +538,5 @@ mod tests {
             .is_err()
         );
         assert!(parse(&["audit", "--outcome", "maybe"]).is_err());
-    }
-
-    #[test]
-    fn csv_fields_are_quoted_only_when_needed() {
-        assert_eq!(csv_field("plain"), "plain");
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 }

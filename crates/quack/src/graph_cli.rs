@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::embedding::{Input, Vector};
+use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphResult, GraphStatus, extract, resolve, store as graph_store, tables,
     traverse,
@@ -17,6 +18,8 @@ use quack_core::ontology::store as ontology_store;
 use quack_core::progress::Progress;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
+
+use crate::confirm::Confirm;
 
 #[derive(Subcommand)]
 pub(crate) enum GraphAction {
@@ -31,7 +34,7 @@ pub(crate) enum GraphAction {
         #[arg(long)]
         relation: Option<String>,
         /// Hops out from the entity
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = Hops::NEIGHBORHOOD.get())]
         hops: u32,
         /// Print the result as JSON (nodes, edges, provenance)
         #[arg(long)]
@@ -41,7 +44,7 @@ pub(crate) enum GraphAction {
     Path {
         from: String,
         to: String,
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = Hops::PATH.get())]
         max_hops: u32,
         #[arg(long)]
         json: bool,
@@ -234,7 +237,7 @@ async fn run_search(
                 anyhow::bail!("no entity matches '{entity}'");
             }
             db.run(move |db| {
-                traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options)
+                traverse::neighborhood(db, &roots, Hops::new(hops), relation.as_deref(), &options)
             })
             .await?
         }
@@ -282,6 +285,7 @@ async fn run_path(
         );
     };
     let (a, b) = (a.clone(), b.clone());
+    let max_hops = Hops::new(max_hops);
     let result = db
         .run(move |db| traverse::path(db, &a, &b, max_hops, &options))
         .await?;
@@ -347,7 +351,7 @@ async fn run_extract(
                 chunks.len()
             )?;
             out.flush()?;
-            if args.yes || confirm(out)? {
+            if Confirm::from_yes(args.yes).ask(out, "Proceed?", Some("--yes"))? {
                 let extractor = llm::graph_extractor(config, &ontology).await?;
                 let summary = extract::run(
                     db,
@@ -405,14 +409,6 @@ pub(crate) fn rendered(
     let mut buf = Vec::new();
     write(&mut buf).map_err(|e| format!("{e:#}"))?;
     Ok(buf)
-}
-
-pub(crate) fn confirm(out: &mut impl Write) -> Result<bool> {
-    write!(out, "Proceed? [y/N] ")?;
-    out.flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 /// `None` without an embedding model; a failing model is an error, not a
