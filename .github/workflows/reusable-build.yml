@@ -1,5 +1,6 @@
 # Builds, signs, and attests every release artifact: the five `quack` binaries,
-# their archives, the CycloneDX SBOMs, and the `quack serve` image. Build and
+# their archives, the CycloneDX SBOMs, the Linux .deb and .rpm packages, and
+# the `quack serve` image. Build and
 # attest run inside this reusable workflow so the Sigstore certificate records
 # it — not the caller — as the signer identity, which is what makes the
 # provenance SLSA Build Level 3. Nothing here may hold `contents: write`; the
@@ -48,6 +49,13 @@ on:
       AZURE_CLIENT_ID:
         required: false
       AZURE_TENANT_ID:
+        required: false
+      # The packages.smoketurner.com signing key, which signs the RPMs. Unlike
+      # the credentials above it is required on a tag: that repository sets
+      # gpgcheck=1, so an unsigned RPM published there would not install.
+      GPG_PRIVATE_KEY:
+        required: false
+      GPG_PASSPHRASE:
         required: false
 
 permissions: {}
@@ -400,6 +408,132 @@ jobs:
       - name: Clean up the macOS keychain
         if: always() && matrix.platform == 'macos'
         run: security delete-keychain build.keychain || true
+
+  linux-packages:
+    name: Linux packages (${{ matrix.arch }})
+    needs: binaries
+    # nfpm only lays files into an archive, so one x86_64 runner packages both
+    # architectures' prebuilt binaries without emulation.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            artifact: binaries-linux-amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            artifact: binaries-linux-arm64
+            target: aarch64-unknown-linux-musl
+    env:
+      NFPM_VERSION: 2.47.0
+      NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: binaries
+
+      - name: Unpack the binary
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          tar -xzf "binaries/quack-${VERSION}-${TARGET}.tar.gz" -C staging
+
+      # From the release tarball, checksum pinned, rather than goreleaser's apt
+      # repository, which is only reachable as [trusted=yes].
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          tarball="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSL -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/${tarball}"
+          echo "${NFPM_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/nfpm"
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/nfpm" nfpm
+          echo "${RUNNER_TEMP}/nfpm" >> "$GITHUB_PATH"
+
+      - name: Stage the signing key
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY}" ]; then
+            if [ "${REF_TYPE}" = "tag" ]; then
+              echo "::error title=Missing signing key::GPG_PRIVATE_KEY is not set; packages.smoketurner.com rejects unsigned RPMs."
+              exit 1
+            fi
+            echo "::warning title=Unsigned RPM::GPG_PRIVATE_KEY is not set, so this dry run's RPM is unsigned."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "${GPG_PRIVATE_KEY}" > "${RUNNER_TEMP}/signing-key.asc"
+          echo "GPG_KEY_FILE=${RUNNER_TEMP}/signing-key.asc" >> "$GITHUB_ENV"
+          gpg --batch --import "${RUNNER_TEMP}/signing-key.asc"
+          gpg --batch --armor --export > "${RUNNER_TEMP}/signing-key.pub.asc"
+
+      - name: Build the .deb and .rpm
+        env:
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ matrix.arch }}
+          NFPM_RPM_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+          nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+          (cd dist && for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done)
+          ls -l dist
+
+      - name: Verify the packages
+        run: |
+          set -euo pipefail
+          for deb in dist/*.deb; do
+            dpkg-deb --info "$deb"
+            contents="$(dpkg-deb --contents "$deb")"
+            grep -q ' ./usr/bin/quack$' <<< "$contents"
+          done
+          if [ -n "${GPG_KEY_FILE:-}" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+            db="$(mktemp -d)"
+            rpm --dbpath "$db" --initdb
+            rpmkeys --dbpath "$db" --import "${RUNNER_TEMP}/signing-key.pub.asc"
+            rpmkeys --dbpath "$db" --checksig -v dist/*.rpm
+            for rpm in dist/*.rpm; do
+              result="$(rpmkeys --dbpath "$db" --checksig "$rpm")"
+              grep -q 'signatures OK' <<< "$result"
+            done
+          fi
+
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/signing-key.asc"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packages-linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
 
   image:
     name: Container image (${{ matrix.arch }})
