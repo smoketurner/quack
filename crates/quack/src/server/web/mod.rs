@@ -8,13 +8,12 @@ pub(crate) mod markdown;
 use std::fmt;
 
 use askama::Template;
-use axum::Form;
-use axum::Router;
 use axum::extract::{FromRequestParts, Multipart, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use axum::{Form, Router};
 use axum_extra::extract::CookieJar;
 // Multi-valued fields (checkboxes) need serde_html_form, which axum's own
 // Form extractor does not use.
@@ -22,8 +21,7 @@ use axum_extra::extract::Form as MultiForm;
 use axum_extra::extract::cookie::Cookie;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, ItemKind, Proposal, propose_from_tables};
-use quack_core::ontology::store as ontology_store;
-use quack_core::ontology::{Ontology, OntologyDiff, candidates};
+use quack_core::ontology::{Ontology, OntologyDiff, candidates, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
@@ -34,14 +32,10 @@ use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
 use rust_embed::Embed;
 use serde::Deserialize;
 
-use super::api::documents as docs_api;
-use super::api::embeddings as embeddings_api;
-use super::api::graph as graph_api;
-use super::api::import as import_api;
-use super::api::jobs as jobs_api;
-use super::api::ontology as ontology_api;
-use super::api::query as query_api;
-use super::api::sessions as sessions_api;
+use super::api::{
+    documents as docs_api, embeddings as embeddings_api, graph as graph_api, import as import_api,
+    jobs as jobs_api, ontology as ontology_api, query as query_api, sessions as sessions_api,
+};
 use super::auth::{
     Access, Credential, Identity, Need, Peer, SESSION_COOKIE, access, password_login, request_id,
     require_admin, session_cookie,
@@ -51,9 +45,9 @@ use super::state::{App, with_db};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::resolve::MergeDecision;
-use quack_core::graph::store as graph_store;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse,
+    ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, store as graph_store,
+    traverse,
 };
 use quack_core::import::ImportRequest;
 use quack_core::ontology::ROOT_CLASS;

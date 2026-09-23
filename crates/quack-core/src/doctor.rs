@@ -13,16 +13,14 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config;
-use crate::config::ProviderConfig;
 use crate::config::inspect::{FileState, Inspection};
-use crate::config::{AuthMode, Config, ModelRef, ProviderType};
-use crate::crypto;
+use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::{OllamaRunningModels, oauth};
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
+use crate::{config, crypto};
 use secrecy::ExposeSecret;
 
 /// Where Ollama listens when nothing says otherwise.

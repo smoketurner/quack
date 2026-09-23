@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
-use quack_core::graph::GraphResult;
-use quack_core::graph::Node;
 use quack_core::graph::extract::{Extraction, GraphExtractor};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
-use quack_core::graph::{GraphOptions, extract, resolve, store as graph_store, tables, traverse};
+use quack_core::graph::{
+    GraphOptions, GraphResult, Node, extract, resolve, store as graph_store, tables, traverse,
+};
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
 use quack_core::storage::writer::Writer;

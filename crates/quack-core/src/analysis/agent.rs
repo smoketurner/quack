@@ -20,8 +20,7 @@ use super::tools::{
     SharedDb,
 };
 use super::vector_index::DuckDbVectorIndex;
-use crate::graph::store as graph_store;
-use crate::graph::{GraphOptions, GraphResult};
+use crate::graph::{GraphOptions, GraphResult, store as graph_store};
 use crate::llm::OLLAMA_KEEP_ALIVE;
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;

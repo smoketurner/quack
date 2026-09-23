@@ -7,8 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::config::AuthMode;
-use crate::config::ProviderType;
+use crate::config::{AuthMode, ProviderType};
 
 /// What the mock issuer does and what it saw.
 #[derive(Default)]

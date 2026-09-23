@@ -4,8 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::terminal::app::Message;
-use crate::terminal::app::{App, MessageRole};
+use crate::terminal::app::{App, Message, MessageRole};
 use crate::terminal::chart;
 use crate::terminal::commands::Suggestion;
 use quack_core::analysis::events;

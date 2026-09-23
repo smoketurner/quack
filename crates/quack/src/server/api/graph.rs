@@ -21,11 +21,9 @@ use serde::Deserialize;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::when_cancelled_unstarted;
-use crate::server::state::ExtractionSlot;
-use crate::server::state::{App, with_db};
+use crate::server::state::{App, ExtractionSlot, with_db};
 use quack_core::analysis::tools::SharedDb;
-use quack_core::jobs::JobId;
-use quack_core::jobs::{JobKind, JobSpec, Lane, LaneKey};
+use quack_core::jobs::{JobId, JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::Ontology;
 use quack_core::progress::ChunkDone;
 

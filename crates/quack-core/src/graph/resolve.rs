@@ -8,8 +8,7 @@ use std::time::Instant;
 
 use rig::embeddings::EmbeddingModel;
 
-use super::store;
-use super::{GraphOptions, Node};
+use super::{GraphOptions, Node, store};
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Record, Result};
 use crate::progress::{ChunkDone, RunControl};

@@ -23,8 +23,7 @@ use super::state::{App, AppState, with_db};
 use crate::server::queue::MAX_WAITING_UPLOADS;
 use quack_core::jobs::LaneKey;
 use quack_core::llm::CancellationToken;
-use quack_core::okf::Bundle;
-use quack_core::okf::BundleFile;
+use quack_core::okf::{Bundle, BundleFile};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope,
@@ -3180,8 +3179,7 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
     let source_dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let source_path = source_dir.path().join("source.db");
     {
-        use sqlx::Connection as _;
-        use sqlx::Executor as _;
+        use sqlx::{Connection as _, Executor as _};
         let url = format!("sqlite://{}?mode=rwc", source_path.display());
         let mut conn = sqlx::SqliteConnection::connect(&url)
             .await
