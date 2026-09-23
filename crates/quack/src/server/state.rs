@@ -15,6 +15,8 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
+use crate::mcp::McpServer;
+use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::storage::control::{ControlPlane, random_bytes};
 
 /// A workspace's writer connection plus its reader pool and its audit
@@ -47,7 +49,7 @@ pub(crate) struct AppState {
     pub jobs: JobQueue,
     /// One MCP transport per workspace, user, and write permission; each
     /// carries its own MCP sessions. See `server::mcp_http`.
-    mcp: tokio::sync::Mutex<HashMap<String, (McpTransport, crate::mcp::McpServer)>>,
+    mcp: tokio::sync::Mutex<HashMap<String, (McpTransport, McpServer)>>,
     /// Workspaces with a graph extraction in flight: one at a time each,
     /// so a reset cannot clear a run part way (issue #48).
     extractions: Mutex<HashSet<String>>,
@@ -88,7 +90,7 @@ impl Drop for ExtractionSlot {
     }
 }
 
-pub(crate) type McpTransport = StreamableHttpService<crate::mcp::McpServer, LocalSessionManager>;
+pub(crate) type McpTransport = StreamableHttpService<McpServer, LocalSessionManager>;
 
 pub(crate) type App = Arc<AppState>;
 
@@ -123,8 +125,8 @@ impl AppState {
     pub(crate) async fn mcp_transport(
         &self,
         key: &str,
-        make: impl FnOnce() -> crate::mcp::McpServer,
-    ) -> (McpTransport, crate::mcp::McpServer) {
+        make: impl FnOnce() -> McpServer,
+    ) -> (McpTransport, McpServer) {
         let mut open = self.mcp.lock().await;
         if let Some(entry) = open.get(key) {
             return entry.clone();
@@ -179,7 +181,7 @@ impl AppState {
                     tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
                 }
                 let audit = AuditLog::open(&db)?;
-                Ok::<_, quack_core::error::Error>((db, audit))
+                Ok::<_, CoreError>((db, audit))
             })
             .await
             .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
@@ -221,7 +223,7 @@ impl AppState {
     pub(crate) async fn read<T, F>(&self, workspace_id: &str, f: F) -> ApiResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
+        F: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
     {
         self.reader_db(workspace_id)
             .await?
@@ -306,7 +308,7 @@ fn aws_lc_rs_fill(bytes: &mut [u8]) -> ApiResult<()> {
 pub(crate) async fn with_db<T, F>(db: SharedDb, f: F) -> ApiResult<T>
 where
     T: Send + 'static,
-    F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
+    F: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
 {
     db.run(f).await.map_err(ApiError::from)
 }

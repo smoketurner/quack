@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::llm;
 
 /// Run the terminal session against a resolved workspace until the user quits.
 ///
@@ -29,7 +30,7 @@ pub(crate) async fn run(
     session_id: String,
     allow_write: bool,
 ) -> Result<()> {
-    let provider_display = quack_core::llm::chat_model_display(&config);
+    let provider_display = llm::chat_model_display(&config);
     let config = Arc::new(config);
 
     let mut tui_app = app::App::new(

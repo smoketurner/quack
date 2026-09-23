@@ -22,6 +22,7 @@ use super::tools::{
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::store as graph_store;
 use crate::graph::{GraphOptions, GraphResult};
+use crate::llm::OLLAMA_KEEP_ALIVE;
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
@@ -589,7 +590,7 @@ where
         // model warm through longer gaps regardless of the server's
         // default.
         builder = builder.additional_params(
-            serde_json::json!({ "num_ctx": num_ctx, "keep_alive": crate::llm::OLLAMA_KEEP_ALIVE }),
+            serde_json::json!({ "num_ctx": num_ctx, "keep_alive": OLLAMA_KEEP_ALIVE }),
         );
     }
 

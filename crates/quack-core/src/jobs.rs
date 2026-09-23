@@ -33,6 +33,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::config::JobsConfig;
 use crate::priority::{Priority, with_priority};
 
 /// Snapshots the broadcast channel holds for a slow subscriber before it
@@ -566,7 +567,7 @@ impl JobQueue {
 
     /// The queue `[jobs]` describes.
     #[must_use]
-    pub fn from_config(config: &crate::config::JobsConfig) -> Self {
+    pub fn from_config(config: &JobsConfig) -> Self {
         Self::new(config.history)
     }
 

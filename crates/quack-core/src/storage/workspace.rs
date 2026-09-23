@@ -9,6 +9,7 @@ use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Profile, Prompts, StaleVectors, Vector,
 };
 use crate::error::{Error, Record, Result};
+use crate::graph;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -657,7 +658,7 @@ impl WorkspaceDb {
         );
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
-        self.conn.execute_batch(&crate::graph::ddl(dim))?;
+        self.conn.execute_batch(&graph::ddl(dim))?;
         self.upgrade_data(dim)?;
         self.set_meta(MetaKey::SchemaVersion, WORKSPACE_SCHEMA_VERSION)?;
         self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
@@ -3010,8 +3011,8 @@ mod tests {
         assert!(db.document("d1").is_err());
     }
 
-    fn config_in(dir: &Path) -> crate::config::Config {
-        let mut config = crate::config::Config::default();
+    fn config_in(dir: &Path) -> Config {
+        let mut config = Config::default();
         config.general.data_dir = dir.join("data");
         config
     }

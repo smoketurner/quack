@@ -37,7 +37,11 @@ use serde::Deserialize;
 use super::api::documents as docs_api;
 use super::api::embeddings as embeddings_api;
 use super::api::graph as graph_api;
+use super::api::import as import_api;
+use super::api::jobs as jobs_api;
+use super::api::ontology as ontology_api;
 use super::api::query as query_api;
+use super::api::sessions as sessions_api;
 use super::auth::{
     Access, Credential, Identity, Need, Peer, SESSION_COOKIE, access, password_login, request_id,
     require_admin, session_cookie,
@@ -862,7 +866,7 @@ async fn delete_session(
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    super::api::sessions::delete_session(&app, &access, &sid).await?;
+    sessions_api::delete_session(&app, &access, &sid).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat")).into_response())
 }
 
@@ -872,7 +876,7 @@ async fn share_session(
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    super::api::sessions::set_shared(&app, &access, &sid, true).await?;
+    sessions_api::set_shared(&app, &access, &sid, true).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
@@ -882,7 +886,7 @@ async fn unshare_session(
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    super::api::sessions::set_shared(&app, &access, &sid, false).await?;
+    sessions_api::set_shared(&app, &access, &sid, false).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
@@ -901,13 +905,13 @@ async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
 }
 
 fn render_jobs(app: &App, access: &Access) -> WebResult<String> {
-    let jobs: Vec<JobView> = super::api::jobs::visible_jobs(app, access)
+    let jobs: Vec<JobView> = jobs_api::visible_jobs(app, access)
         .into_iter()
         .map(|j| JobView {
             id: j.id.to_string(),
             number: j.number,
             kind: j.kind.to_string(),
-            can_cancel: !j.state.is_finished() && super::api::jobs::may_cancel(access, &j),
+            can_cancel: !j.state.is_finished() && jobs_api::may_cancel(access, &j),
             label: j.label,
             state: if j.cancel_requested && !j.state.is_finished() {
                 String::from("cancelling")
@@ -961,7 +965,7 @@ async fn job_cancel(
     Path((id, job)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let cancelled = super::api::jobs::cancel_job(&app, &access, &job).await?;
+    let cancelled = jobs_api::cancel_job(&app, &access, &job).await?;
     tracing::debug!(job = %cancelled.id, state = %cancelled.state, "cancel requested from the web");
     Ok(Html(render_jobs(&app, &access)?).into_response())
 }
@@ -1191,7 +1195,7 @@ async fn import_submit(
         source_table: (!form.source_table.trim().is_empty()).then(|| form.source_table.clone()),
         limit: None,
     };
-    let target = match super::api::import::run_import(&app, &access, &request).await {
+    let target = match import_api::run_import(&app, &access, &request).await {
         Ok(summary) => format!("/w/{id}/tables/{}", summary.table),
         Err(e) => format!("/w/{id}/tables?error={}", urlencoded(&e.message)),
     };
@@ -1684,8 +1688,7 @@ async fn ontology_propose(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     if form.documents {
-        let target = match super::api::ontology::start_document_run(&app, &access, &id, None).await
-        {
+        let target = match ontology_api::start_document_run(&app, &access, &id, None).await {
             Ok(_) => format!(
                 "/w/{id}/ontology?notice=document+pass+started%3B+candidates+appear+here+when+it+finishes"
             ),

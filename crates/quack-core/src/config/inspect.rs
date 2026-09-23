@@ -23,6 +23,7 @@ use super::{
     AuthMode, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, config_file_path,
     default_redirect_uri,
 };
+use crate::error::Result;
 
 /// How an unset optional setting is rendered.
 pub const UNSET: &str = "(unset)";
@@ -222,7 +223,7 @@ impl Inspection {
 
 /// `Config::load` without the file lookup: parse, apply the environment,
 /// validate — the same order, so this reports exactly what that would.
-fn load_from(contents: Option<&str>) -> crate::error::Result<Config> {
+fn load_from(contents: Option<&str>) -> Result<Config> {
     let mut config = match contents {
         Some(text) => Config::parse(text)?,
         None => Config::default(),

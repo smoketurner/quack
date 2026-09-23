@@ -42,8 +42,11 @@ use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 
 use crate::embeddings_cli::{self, EmbeddingsAction};
+use crate::graph_cli;
 use crate::graph_cli::GraphAction;
+use crate::ontology_cli;
 use crate::ontology_cli::OntologyAction;
+use quack_core::storage::workspace::DocumentInfo;
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -2325,10 +2328,7 @@ fn split_args(args: &str) -> Vec<String> {
 }
 
 /// The document whose id starts with `prefix`, when exactly one does.
-fn resolve_document(
-    db: &WorkspaceDb,
-    prefix: &str,
-) -> quack_core::error::Result<quack_core::storage::workspace::DocumentInfo> {
+fn resolve_document(db: &WorkspaceDb, prefix: &str) -> CoreResult<DocumentInfo> {
     let matches: Vec<_> = db
         .list_documents()?
         .into_iter()
@@ -2389,10 +2389,10 @@ async fn run_job_inner(
     let mut out: Vec<u8> = Vec::new();
     match job {
         CliJob::Ontology(action) => {
-            crate::ontology_cli::run(config, db, action, &mut out, &progress).await?;
+            ontology_cli::run(config, db, action, &mut out, &progress).await?;
         }
         CliJob::Graph(action) => {
-            crate::graph_cli::run(config, db, action, &mut out, &progress).await?;
+            graph_cli::run(config, db, action, &mut out, &progress).await?;
         }
         CliJob::Embeddings(action) => {
             // The terminal owns stdin, so the job never asks; `/cancel`

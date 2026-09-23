@@ -4,9 +4,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::terminal::app::Message;
 use crate::terminal::app::{App, MessageRole};
 use crate::terminal::chart;
 use crate::terminal::commands::Suggestion;
+use quack_core::analysis::events;
 use quack_core::jobs::{JobInfo, JobState};
 
 /// Jobs listed above the input at most; the rest are counted.
@@ -353,7 +355,7 @@ pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 /// What decides a message's rendering.
-fn fingerprint(msg: &crate::terminal::app::Message, width: usize, expand: bool) -> u64 {
+fn fingerprint(msg: &Message, width: usize, expand: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     msg.role.hash(&mut hasher);
@@ -369,11 +371,7 @@ fn fingerprint(msg: &crate::terminal::app::Message, width: usize, expand: bool) 
 }
 
 /// One message's lines, wrapped to `width`, with the blank line after it.
-fn message_lines(
-    msg: &crate::terminal::app::Message,
-    width: usize,
-    expand_steps: bool,
-) -> Vec<Line<'static>> {
+fn message_lines(msg: &Message, width: usize, expand_steps: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     {
         let (prefix, style) = match msg.role {
@@ -433,11 +431,7 @@ fn message_lines(
 
 /// A step: its header and outcome, then the detail in full when expanded
 /// or its first lines with a count of the rest.
-fn step_body(
-    msg: &crate::terminal::app::Message,
-    expanded: bool,
-    style: Style,
-) -> Vec<Vec<Span<'static>>> {
+fn step_body(msg: &Message, expanded: bool, style: Style) -> Vec<Vec<Span<'static>>> {
     let mut rows: Vec<Vec<Span<'static>>> = msg
         .content
         .lines()
@@ -450,7 +444,7 @@ fn step_body(
     let (shown, more): (Vec<&str>, usize) = if expanded {
         (detail.lines().collect(), 0)
     } else {
-        quack_core::analysis::events::preview_detail(detail)
+        events::preview_detail(detail)
     };
     let at = rows.len().min(1);
     let mut detail_rows: Vec<Vec<Span<'static>>> = shown

@@ -104,6 +104,7 @@ pub fn list(db: &WorkspaceDb, limit: u32) -> Result<Vec<AuditDetailRow>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -159,7 +160,7 @@ mod tests {
     #[test]
     fn detail_rows_commit_while_the_writer_is_mid_write() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut config = crate::config::Config::default();
+        let mut config = Config::default();
         config.general.data_dir = dir.path().to_path_buf();
         let ok = |r: Result<()>| r.unwrap_or_else(|e| fail(&e.to_string()));
         let open = || WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));

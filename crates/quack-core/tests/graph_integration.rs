@@ -7,6 +7,9 @@
 use std::collections::BTreeMap;
 
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
+use quack_core::error::Error;
+use quack_core::graph::GraphResult;
+use quack_core::graph::Node;
 use quack_core::graph::extract::{Extraction, GraphExtractor};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
@@ -201,7 +204,7 @@ impl GraphExtractor for Canned {
     fn extract<'a>(&'a self, text: &'a str) -> extract::ExtractFuture<'a> {
         Box::pin(async move {
             if text.contains("FAIL") {
-                return Err(quack_core::error::Error::Llm(String::from("boom")));
+                return Err(Error::Llm(String::from("boom")));
             }
             let extraction: Extraction = serde_json::from_str(
                 r#"{"nodes": [
@@ -562,8 +565,8 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 fn paths_merges_and_listing(
     db: &WorkspaceDb,
     options: &GraphOptions,
-    hood: &quack_core::graph::GraphResult,
-    roots: &[quack_core::graph::Node],
+    hood: &GraphResult,
+    roots: &[Node],
     current: &Ontology,
     pending: &[resolve::MergeProposal],
 ) {

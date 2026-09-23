@@ -1092,6 +1092,7 @@ pub fn document_name(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::ontology::induction::ItemKind;
+    use crate::storage::audit;
 
     #[test]
     fn front_matter_parses_scalars_and_both_tag_forms() {
@@ -1181,7 +1182,7 @@ mod tests {
         });
         let saved = ontology_store::save(&db, &ontology, None, None)
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
-        crate::storage::audit::record(
+        audit::record(
             &db,
             "a1",
             Some("u"),

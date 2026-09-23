@@ -9,10 +9,13 @@ use clap::Subcommand;
 use quack_core::config::Config;
 
 use crate::graph_cli::rendered;
+use quack_core::llm;
 use quack_core::ontology::Ontology;
+use quack_core::ontology::ROOT_CLASS;
 use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::{candidates, documents, store};
+use quack_core::progress::ChunkDone;
 use quack_core::progress::Progress;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
@@ -392,7 +395,7 @@ async fn propose(
             cost.chunks,
             cost.documents,
             cost.model_calls,
-            quack_core::llm::chat_model_display(config)
+            llm::chat_model_display(config)
         )?;
         // Shown before the model calls, ahead of the progress lines on
         // stderr.
@@ -448,7 +451,7 @@ async fn propose(
 
 /// One progress line per extracted chunk on stderr, for the ontology and
 /// graph document passes (issue #67): stdout keeps the summary.
-pub(crate) fn chunk_progress(done: quack_core::progress::ChunkDone) {
+pub(crate) fn chunk_progress(done: ChunkDone) {
     let failed = if done.failed > 0 {
         format!(", {} failed", done.failed)
     } else {
@@ -477,8 +480,8 @@ async fn run_documents(
     let sample = db
         .run(move |db| documents::sample_chunks(db, count))
         .await?;
-    let extractor = quack_core::llm::chat_extractor(config).await?;
-    let embeddings = quack_core::llm::optional_embedding_model(config).await?;
+    let extractor = llm::chat_extractor(config).await?;
+    let embeddings = llm::optional_embedding_model(config).await?;
     let (candidates, summary) = documents::run(
         sample,
         extractor.as_ref(),
@@ -618,7 +621,7 @@ fn summary(ontology: &Ontology) -> String {
         format!("Ontology version {}", ontology.version),
         String::from("classes:"),
     ];
-    children(ontology, quack_core::ontology::ROOT_CLASS, 0, &mut lines);
+    children(ontology, ROOT_CLASS, 0, &mut lines);
     lines.push(String::from("relations:"));
     for r in &ontology.relations {
         lines.push(format!("  - {}: {} -> {}", r.id, r.domain, r.range));
@@ -653,11 +656,12 @@ fn summary(ontology: &Ontology) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quack_core::ontology::Class;
 
     #[test]
     fn summary_nests_subclasses_under_parents() {
         let mut ontology = Ontology::builtin_default();
-        ontology.classes.push(quack_core::ontology::Class {
+        ontology.classes.push(Class {
             id: String::from("vendor"),
             parent: String::from("organization"),
             label: None,
