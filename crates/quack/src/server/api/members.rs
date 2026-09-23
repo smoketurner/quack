@@ -3,7 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use quack_core::storage::control::{Outcome, Role};
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind, Role};
 use serde::Deserialize;
 
 use crate::server::auth::{Identity, Need, access};
@@ -20,7 +20,9 @@ pub(crate) async fn list(
         ..Need::READ
     };
     let access = access(&app, identity, &id, need).await?;
-    access.audit_read(&app, "list", "members").await?;
+    access
+        .audit_read(&app, AuditAction::List, "members")
+        .await?;
     let members = app.control.list_members(&id).await?;
     Ok(Json(serde_json::json!({ "members": members })))
 }
@@ -52,8 +54,8 @@ pub(crate) async fn add(
     access
         .audit(
             &app,
-            "member",
-            Some(("user", &user.id)),
+            AuditAction::Member,
+            Some(ResourceKind::User.id(&user.id)),
             Outcome::Allowed,
             None,
         )
@@ -73,8 +75,8 @@ pub(crate) async fn remove(
     access
         .audit(
             &app,
-            "member",
-            Some(("user", &user_id)),
+            AuditAction::Member,
+            Some(ResourceKind::User.id(&user_id)),
             Outcome::Allowed,
             None,
         )

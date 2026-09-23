@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::jobs::{JobId, JobInfo, JobKind};
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use tokio::sync::broadcast;
 
 use crate::server::auth::{Access, Identity, Need, access};
@@ -58,7 +58,7 @@ pub(crate) async fn list(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "jobs").await?;
+    access.audit_read(&app, AuditAction::List, "jobs").await?;
     let jobs = visible_jobs(&app, &access);
     let counts = app.jobs.counts(Some(&id));
     Ok(Json(serde_json::json!({
@@ -83,7 +83,7 @@ pub(crate) async fn show(
     Path((id, job)): Path<(String, String)>,
 ) -> ApiResult<Json<JobInfo>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "show", "job").await?;
+    access.audit_read(&app, AuditAction::Show, "job").await?;
     let job = find(&app, &id, &job)?;
     Ok(Json(redact(&access, job)))
 }
@@ -105,7 +105,13 @@ pub(crate) async fn cancel_job(app: &App, access: &Access, job: &str) -> ApiResu
     let job_id = found.id.to_string();
     if !may_cancel(access, &found) {
         access
-            .audit(app, "cancel", Some(("job", &job_id)), Outcome::Denied, None)
+            .audit(
+                app,
+                AuditAction::Cancel,
+                Some(ResourceKind::Job.id(&job_id)),
+                Outcome::Denied,
+                None,
+            )
             .await?;
         return Err(ApiError::forbidden(
             "only the job's owner, a workspace owner, or an admin may cancel it",
@@ -115,8 +121,8 @@ pub(crate) async fn cancel_job(app: &App, access: &Access, job: &str) -> ApiResu
     access
         .audit(
             app,
-            "cancel",
-            Some(("job", &job_id)),
+            AuditAction::Cancel,
+            Some(ResourceKind::Job.id(&job_id)),
             Outcome::Allowed,
             Some(serde_json::json!({ "kind": found.kind, "was_active": active })),
         )
@@ -134,7 +140,7 @@ pub(crate) async fn stream(
     Path(id): Path<String>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "stream", "jobs").await?;
+    access.audit_read(&app, AuditAction::Stream, "jobs").await?;
     let receiver = app.jobs.subscribe();
     let first = super::StreamEvent::Jobs
         .event()

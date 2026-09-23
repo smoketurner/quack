@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
@@ -21,7 +21,9 @@ pub(crate) async fn show(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "ontology").await?;
+    access
+        .audit_read(&app, AuditAction::List, "ontology")
+        .await?;
     let current = app.read(&id, store::current).await?;
     let ontology = current.ok_or_else(|| ApiError::not_found("no ontology yet"))?;
     Ok(Json(serde_json::to_value(ontology)?))
@@ -45,8 +47,8 @@ pub(crate) async fn replace(
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", &stored.version.to_string())),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version, "classes": stored.classes.len() })),
         )
@@ -85,8 +87,8 @@ pub(crate) async fn init(
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", "1")),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id("1")),
             Outcome::Allowed,
             None,
         )
@@ -111,7 +113,9 @@ pub(crate) async fn versions(
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "ontology_versions").await?;
+    access
+        .audit_read(&app, AuditAction::List, "ontology_versions")
+        .await?;
     let limit = q.limit;
     let rows = app.read(&id, move |db| store::versions(db, limit)).await?;
     Ok(Json(serde_json::json!({ "versions": rows })))
@@ -133,8 +137,8 @@ pub(crate) async fn version(
     access
         .audit(
             &app,
-            "open",
-            Some(("ontology_version", &v.to_string())),
+            AuditAction::Open,
+            Some(ResourceKind::OntologyVersion.id(&v.to_string())),
             Outcome::Allowed,
             None,
         )
@@ -170,8 +174,8 @@ pub(crate) async fn restore(
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", &stored.version.to_string())),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "restored": v, "version": stored.version })),
         )
@@ -242,8 +246,8 @@ pub(crate) async fn propose(
     access
         .audit(
             &app,
-            "propose",
-            run.as_deref().map(|r| ("induction_run", r)),
+            AuditAction::Propose,
+            run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
             Outcome::Allowed,
             Some(serde_json::json!({ "candidates": count, "auto_accept": request.auto_accept, "version": version })),
         )
@@ -269,7 +273,7 @@ pub(crate) async fn list_candidates(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access
-        .audit_read(&app, "list", "ontology_candidates")
+        .audit_read(&app, AuditAction::List, "ontology_candidates")
         .await?;
     let queue = q.status;
     let rows = app
@@ -326,7 +330,7 @@ pub(crate) async fn decide_many(
     access
         .audit(
             &app,
-            "ontology",
+            AuditAction::Ontology,
             None,
             Outcome::Allowed,
             Some(serde_json::json!({
@@ -374,8 +378,8 @@ pub(crate) async fn decide(
     access
         .audit(
             &app,
-            "ontology",
-            Some(("candidate", &cid)),
+            AuditAction::Ontology,
+            Some(ResourceKind::Candidate.id(&cid)),
             Outcome::Allowed,
             Some(serde_json::json!({ "action": body.action, "version": version })),
         )
@@ -415,8 +419,8 @@ pub(crate) async fn start_document_run(
     access
         .audit(
             app,
-            "propose",
-            Some(("induction_run", &run)),
+            AuditAction::Propose,
+            Some(ResourceKind::InductionRun.id(&run)),
             Outcome::Allowed,
             Some(serde_json::json!({ "documents": true, "cost": cost })),
         )
@@ -468,8 +472,8 @@ pub(crate) async fn start_document_run(
         super::graph::audit_cancelled(
             &cancel_app,
             &cancel_access,
-            "propose",
-            "induction_run",
+            AuditAction::Propose,
+            ResourceKind::InductionRun,
             &cancel_run,
         )
         .await;
@@ -500,8 +504,8 @@ async fn finish_document_run(
     if let Err(e) = access
         .audit(
             app,
-            "propose",
-            Some(("induction_run", run_id)),
+            AuditAction::Propose,
+            Some(ResourceKind::InductionRun.id(run_id)),
             outcome,
             Some(detail),
         )

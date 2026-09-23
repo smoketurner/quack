@@ -22,7 +22,9 @@ use quack_core::embedding::{Input, Vector};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
-use quack_core::storage::control::{Outcome, WorkspaceRow};
+use quack_core::storage::control::{
+    AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
+};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{ChunkScope, StatementKind, WorkspaceDb};
 use rmcp::ErrorData as McpError;
@@ -62,8 +64,8 @@ impl Auditor {
     /// audited proceeds unlogged.
     async fn record(
         &self,
-        action: &str,
-        resource: Option<(&str, &str)>,
+        action: AuditAction,
+        resource: Option<AuditResource<'_>>,
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> Result<(), McpError> {
@@ -79,7 +81,7 @@ impl Auditor {
             .audit(&server.app, action, resource, outcome, detail)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e.message, action, "audit write failed");
+                tracing::error!(error = %e.message, %action, "audit write failed");
                 internal(format!("audit write failed: {}", e.message))
             })?;
         Ok(())
@@ -292,8 +294,8 @@ impl McpServer {
                 self.inner
                     .auditor
                     .record(
-                        "query",
-                        Some(("session", &session_id)),
+                        AuditAction::Query,
+                        Some(ResourceKind::Session.id(&session_id)),
                         Outcome::Allowed,
                         Some(detail),
                     )
@@ -322,8 +324,8 @@ impl McpServer {
                 self.inner
                     .auditor
                     .record(
-                        "query",
-                        Some(("session", &session_id)),
+                        AuditAction::Query,
+                        Some(ResourceKind::Session.id(&session_id)),
                         Outcome::Error,
                         Some(detail),
                     )
@@ -378,7 +380,7 @@ impl McpServer {
         self.inner
             .auditor
             .record(
-                "search",
+                AuditAction::Search,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "q": query })),
@@ -414,14 +416,14 @@ impl McpServer {
         if is_write && quack_core::analysis::tools::creates_temp_object(&statement) {
             self.inner
                 .auditor
-                .record("sql", None, Outcome::Denied, Some(detail))
+                .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
             return Ok(failure(quack_core::analysis::tools::TEMP_OBJECT_REFUSED));
         }
         if is_write && self.inner.policy != WritePolicy::Allow {
             self.inner
                 .auditor
-                .record("sql", None, Outcome::Denied, Some(detail))
+                .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
             return Ok(failure(
                 "this statement modifies data and this connection cannot write",
@@ -453,7 +455,7 @@ impl McpServer {
         };
         self.inner
             .auditor
-            .record("sql", None, outcome, Some(detail))
+            .record(AuditAction::Sql, None, outcome, Some(detail))
             .await?;
         let capped = match result {
             Ok(capped) => capped,
@@ -475,7 +477,7 @@ impl McpServer {
         self.inner
             .auditor
             .record(
-                "list",
+                AuditAction::List,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "what": "tables" })),
@@ -501,7 +503,7 @@ impl McpServer {
                 self.inner
                     .auditor
                     .record(
-                        "open",
+                        AuditAction::Open,
                         None,
                         Outcome::Allowed,
                         Some(serde_json::json!({ "table": name })),
@@ -569,7 +571,7 @@ impl McpServer {
             .await?;
         self.inner
             .auditor
-            .record("graph", None, Outcome::Allowed, Some(detail))
+            .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
             .await?;
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
         out.content = vec![ContentBlock::text(traverse::render_tree(&result))];
@@ -607,7 +609,7 @@ impl McpServer {
             .await?;
         self.inner
             .auditor
-            .record("graph", None, Outcome::Allowed, Some(detail))
+            .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
             .await?;
         if result.is_empty() {
             return Ok(failure(format!(
@@ -627,7 +629,7 @@ impl McpServer {
         self.inner
             .auditor
             .record(
-                "list",
+                AuditAction::List,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "what": "documents" })),
@@ -845,8 +847,8 @@ impl ServerHandler for McpServer {
         self.inner
             .auditor
             .record(
-                "open",
-                Some(("resource", &uri)),
+                AuditAction::Open,
+                Some(ResourceKind::Resource.id(&uri)),
                 Outcome::Allowed,
                 Some(serde_json::json!({ "uri": uri })),
             )

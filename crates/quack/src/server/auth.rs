@@ -15,7 +15,8 @@ use axum::http::{StatusCode, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::storage::control::{
-    AuditEntry, Channel, Outcome, Role, Scope, TokenRow, UserRow, WorkspaceRow, sha256_hex,
+    AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
+    WorkspaceRow, sha256_hex,
 };
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -30,7 +31,7 @@ pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 pub(crate) const LOCAL_USER_ID: &str = "local";
 
 /// The audit action both login paths record, under either outcome.
-const LOGIN_ACTION: &str = "login";
+const LOGIN_ACTION: AuditAction = AuditAction::Login;
 
 /// How the caller authenticated.
 #[derive(Debug, Clone)]
@@ -74,7 +75,7 @@ impl Identity {
     }
 
     /// An audit entry attributed to this caller.
-    pub(crate) fn audit(&self, action: &str, outcome: Outcome) -> AuditEntry {
+    pub(crate) fn audit(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
         let mut entry = AuditEntry::new(action, outcome, self.channel());
         entry.user_id = Some(self.user_id.clone());
         entry.token_hash = self.token_hash();
@@ -263,7 +264,8 @@ impl FromRequestParts<App> for Identity {
             // Saying so, rather than falling through to "unknown token",
             // is what lets a browser tell an expired login from a bad one.
             SessionLookup::Expired => {
-                let mut entry = AuditEntry::new("session", Outcome::Denied, Channel::Web);
+                let mut entry =
+                    AuditEntry::new(AuditAction::Session, Outcome::Denied, Channel::Web);
                 entry.client_addr = client_addr;
                 entry.request_id = request_id;
                 app.control.record_audit(&entry).await?;
@@ -274,7 +276,7 @@ impl FromRequestParts<App> for Identity {
 
         let hash = sha256_hex(presented.as_bytes());
         let Some(token) = app.control.find_token(&hash).await? else {
-            let mut entry = AuditEntry::new("token", Outcome::Denied, Channel::Api);
+            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
             entry.client_addr = client_addr;
             entry.request_id = request_id;
             app.control.record_audit(&entry).await?;
@@ -284,7 +286,7 @@ impl FromRequestParts<App> for Identity {
             .strftime("%Y-%m-%d %H:%M:%S")
             .to_string();
         if token.is_expired(&now) {
-            let mut entry = AuditEntry::new("token", Outcome::Denied, Channel::Api);
+            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
             entry.user_id = Some(token.user_id.clone());
             entry.token_hash = Some(token.token_hash.clone());
             entry.workspace_id = Some(token.workspace_id.clone());
@@ -374,16 +376,15 @@ impl Access {
     pub(crate) async fn audit(
         &self,
         app: &App,
-        action: &str,
-        resource: Option<(&str, &str)>,
+        action: AuditAction,
+        resource: Option<AuditResource<'_>>,
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> ApiResult<String> {
         let mut entry = self.identity.audit(action, outcome);
         entry.workspace_id = Some(self.workspace.id.clone());
-        if let Some((kind, id)) = resource {
-            entry.resource_type = Some(kind.to_owned());
-            entry.resource_id = Some(id.to_owned());
+        if let Some(resource) = resource {
+            entry = entry.on(resource);
         }
         app.control.record_audit(&entry).await?;
         let detail = detail.unwrap_or_else(|| serde_json::json!({}));
@@ -394,7 +395,7 @@ impl Access {
             .record(
                 entry.id.clone(),
                 Some(self.identity.user_id.clone()),
-                action.to_owned(),
+                action.to_string(),
                 detail,
             )
             .await?;
@@ -403,7 +404,12 @@ impl Access {
 
     /// The allowed row for a read that returns a listing or a page:
     /// action `list` or `page`, what was read in the detail.
-    pub(crate) async fn audit_read(&self, app: &App, action: &str, what: &str) -> ApiResult<()> {
+    pub(crate) async fn audit_read(
+        &self,
+        app: &App,
+        action: AuditAction,
+        what: &str,
+    ) -> ApiResult<()> {
         self.audit(
             app,
             action,
@@ -425,7 +431,7 @@ pub(crate) async fn access(
     need: Need,
 ) -> ApiResult<Access> {
     let Some(workspace) = app.control.get_workspace(workspace_id).await? else {
-        let mut entry = identity.audit("open", Outcome::Denied);
+        let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
         entry.workspace_id = Some(workspace_id.to_owned());
         app.control.record_audit(&entry).await?;
         return Err(ApiError::not_found("no such workspace"));
@@ -471,7 +477,7 @@ async fn deny(
     workspace: &WorkspaceRow,
     reason: &str,
 ) -> ApiResult<()> {
-    let mut entry = identity.audit("open", Outcome::Denied);
+    let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
     entry.workspace_id = Some(workspace.id.clone());
     app.control.record_audit(&entry).await?;
     Err(ApiError::forbidden(reason))

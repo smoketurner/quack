@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use quack_core::storage::context;
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Identity, Need, access};
@@ -19,7 +19,9 @@ pub(crate) async fn show(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "context").await?;
+    access
+        .audit_read(&app, AuditAction::List, "context")
+        .await?;
     let current = app.read(&id, context::current).await?;
     let wants_markdown = headers
         .get(header::ACCEPT)
@@ -54,8 +56,8 @@ pub(crate) async fn replace(
     access
         .audit(
             &app,
-            "context",
-            Some(("context", &stored.version.to_string())),
+            AuditAction::Context,
+            Some(ResourceKind::Context.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version, "chars": stored.content.chars().count() })),
         )
@@ -80,7 +82,9 @@ pub(crate) async fn versions(
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "context_versions").await?;
+    access
+        .audit_read(&app, AuditAction::List, "context_versions")
+        .await?;
     let limit = q.limit;
     let history = app.read(&id, move |db| context::history(db, limit)).await?;
     Ok(Json(serde_json::json!({ "versions": history })))

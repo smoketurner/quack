@@ -24,8 +24,8 @@ use quack_core::ontology::store as ontology_store;
 use quack_core::ontology::{Ontology, OntologyDiff, candidates};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, Role, Scope, TokenRow, UserRow,
-    WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
+    Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
@@ -606,7 +606,7 @@ async fn logout(
         app.close_web_session(token);
     }
     app.control
-        .record_audit(&identity.audit("logout", Outcome::Allowed))
+        .record_audit(&identity.audit(AuditAction::Logout, Outcome::Allowed))
         .await?;
     Ok((
         jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()),
@@ -695,10 +695,9 @@ async fn create_workspace(
             .set_member(&ws.id, &identity.user_id, Role::Owner)
             .await?;
     }
-    let mut entry = identity.audit("workspace", Outcome::Allowed);
+    let mut entry = identity.audit(AuditAction::Workspace, Outcome::Allowed);
     entry.workspace_id = Some(ws.id.clone());
-    entry.resource_type = Some(String::from("workspace"));
-    entry.resource_id = Some(ws.id.clone());
+    entry = entry.on(ResourceKind::Workspace.id(&ws.id));
     app.control.record_audit(&entry).await?;
     Ok(Redirect::to(&format!("/w/{}/chat", ws.id)).into_response())
 }
@@ -830,8 +829,8 @@ async fn chat(
         access
             .audit(
                 &app,
-                "session_read",
-                Some(("session", &current.id)),
+                AuditAction::SessionRead,
+                Some(ResourceKind::Session.id(&current.id)),
                 Outcome::Allowed,
                 None,
             )
@@ -933,7 +932,7 @@ async fn jobs_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "jobs").await?;
+    access.audit_read(&app, AuditAction::Page, "jobs").await?;
     let rows = render_jobs(&app, &access)?;
     html(&JobsPage {
         page: page(&app, &access.identity, "Jobs", Some(&access)),
@@ -947,7 +946,9 @@ async fn job_rows(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "job_rows").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "job_rows")
+        .await?;
     Ok(Html(render_jobs(&app, &access)?).into_response())
 }
 
@@ -969,7 +970,9 @@ async fn documents(
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "documents").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "documents")
+        .await?;
     let rows = render_rows(&app, &access).await?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
@@ -1013,7 +1016,9 @@ async fn document_rows(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "document_rows").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "document_rows")
+        .await?;
     Ok(Html(render_rows(&app, &access).await?).into_response())
 }
 
@@ -1149,7 +1154,7 @@ async fn tables(
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "tables").await?;
+    access.audit_read(&app, AuditAction::Page, "tables").await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
         page: page(&app, &access.identity, "Tables", Some(&access)),
@@ -1220,7 +1225,7 @@ async fn table(
     access
         .audit(
             &app,
-            "open",
+            AuditAction::Open,
             None,
             Outcome::Allowed,
             Some(serde_json::json!({ "table": name })),
@@ -1254,7 +1259,7 @@ async fn sql_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "sql").await?;
+    access.audit_read(&app, AuditAction::Page, "sql").await?;
     html(&SqlPage {
         page: page(&app, &access.identity, "SQL", Some(&access)),
         sql: String::new(),
@@ -1385,7 +1390,9 @@ async fn ontology_page(
     Query(q): Query<OntologyQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "ontology").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "ontology")
+        .await?;
     let queue_status = q.status.unwrap_or_default();
     let (ontology, versions, diff, pending, low_support, has_tables) = app
         .read(&id, |db| {
@@ -1497,7 +1504,7 @@ async fn ontology_decide_many(
             access
                 .audit(
                     &app,
-                    "ontology",
+                    AuditAction::Ontology,
                     None,
                     Outcome::Allowed,
                     Some(serde_json::json!({
@@ -1707,8 +1714,8 @@ async fn ontology_propose(
             access
                 .audit(
                     &app,
-                    "propose",
-                    run.as_deref().map(|r| ("induction_run", r)),
+                    AuditAction::Propose,
+                    run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
                     Outcome::Allowed,
                     Some(serde_json::json!({ "candidates": count })),
                 )
@@ -1758,8 +1765,8 @@ async fn ontology_decide(
             access
                 .audit(
                     &app,
-                    "ontology",
-                    Some(("candidate", &cid)),
+                    AuditAction::Ontology,
+                    Some(ResourceKind::Candidate.id(&cid)),
                     Outcome::Allowed,
                     Some(serde_json::json!({ "action": form.action, "version": version })),
                 )
@@ -1801,8 +1808,8 @@ async fn ontology_import(
             access
                 .audit(
                     &app,
-                    "ontology",
-                    Some(("ontology_version", &stored.version.to_string())),
+                    AuditAction::Ontology,
+                    Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
                     Outcome::Allowed,
                     Some(serde_json::json!({ "version": stored.version })),
                 )
@@ -1842,8 +1849,8 @@ async fn ontology_init(
         access
             .audit(
                 &app,
-                "ontology",
-                Some(("ontology_version", &stored.version.to_string())),
+                AuditAction::Ontology,
+                Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
                 Outcome::Allowed,
                 None,
             )
@@ -1868,8 +1875,8 @@ async fn ontology_restore(
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", &stored.version.to_string())),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "restored": v })),
         )
@@ -1883,7 +1890,9 @@ async fn context_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "context").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "context")
+        .await?;
     let (current, versions) = app
         .read(&id, |db| {
             Ok((context::current(db)?, context::history(db, 20)?))
@@ -1918,8 +1927,8 @@ async fn context_save(
     access
         .audit(
             &app,
-            "context",
-            Some(("context", &stored.version.to_string())),
+            AuditAction::Context,
+            Some(ResourceKind::Context.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version })),
         )
@@ -1980,7 +1989,9 @@ async fn settings(
         ..Need::READ
     };
     let access = access(&app, identity, &id, need).await?;
-    access.audit_read(&app, "page", "settings").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "settings")
+        .await?;
     settings_view(&app, &access, None, q.error).await
 }
 
@@ -2016,8 +2027,8 @@ async fn settings_save(
     access
         .audit(
             &app,
-            "workspace",
-            Some(("workspace", &id)),
+            AuditAction::Workspace,
+            Some(ResourceKind::Workspace.id(&id)),
             Outcome::Allowed,
             None,
         )
@@ -2045,8 +2056,8 @@ async fn member_add(
     access
         .audit(
             &app,
-            "member",
-            Some(("user", &user.id)),
+            AuditAction::Member,
+            Some(ResourceKind::User.id(&user.id)),
             Outcome::Allowed,
             None,
         )
@@ -2064,8 +2075,8 @@ async fn member_remove(
     access
         .audit(
             &app,
-            "member",
-            Some(("user", &user_id)),
+            AuditAction::Member,
+            Some(ResourceKind::User.id(&user_id)),
             Outcome::Allowed,
             None,
         )
@@ -2116,8 +2127,8 @@ async fn token_create(
     access
         .audit(
             &app,
-            "token",
-            Some(("token", &row.token_hash)),
+            AuditAction::Token,
+            Some(ResourceKind::Token.id(&row.token_hash)),
             Outcome::Allowed,
             None,
         )
@@ -2146,8 +2157,8 @@ async fn token_revoke(
     access
         .audit(
             &app,
-            "token",
-            Some(("token", &hash)),
+            AuditAction::Token,
+            Some(ResourceKind::Token.id(&hash)),
             Outcome::Allowed,
             None,
         )
@@ -2191,9 +2202,8 @@ async fn admin_user_add(
         .await
     {
         Ok(user) => {
-            let mut entry = identity.audit("admin", Outcome::Allowed);
-            entry.resource_type = Some(String::from("user"));
-            entry.resource_id = Some(user.id);
+            let mut entry = identity.audit(AuditAction::Admin, Outcome::Allowed);
+            entry = entry.on(ResourceKind::User.id(&user.id));
             app.control.record_audit(&entry).await?;
             Ok(Redirect::to("/admin/users").into_response())
         }
@@ -2309,7 +2319,7 @@ async fn graph_page(
     Query(q): Query<GraphPageQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "graph").await?;
+    access.audit_read(&app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
     let query = GraphQueryView {
         entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
@@ -2566,7 +2576,7 @@ async fn graph_revalidate(
             access
                 .audit(
                     &app,
-                    "graph_revalidate",
+                    AuditAction::GraphRevalidate,
                     None,
                     Outcome::Allowed,
                     Some(serde_json::json!({
@@ -2598,7 +2608,7 @@ async fn graph_review(
     let db = app.workspace_db(&id).await?;
     with_db(db, graph_store::mark_reviewed).await?;
     access
-        .audit(&app, "graph_review", None, Outcome::Allowed, None)
+        .audit(&app, AuditAction::GraphReview, None, Outcome::Allowed, None)
         .await?;
     Ok(Redirect::to(&format!("/w/{id}/graph")).into_response())
 }
@@ -2636,8 +2646,8 @@ async fn graph_merge_decide(
             access
                 .audit(
                     &app,
-                    "graph_merge",
-                    Some(("graph_merge", &mid)),
+                    AuditAction::GraphMerge,
+                    Some(ResourceKind::GraphMerge.id(&mid)),
                     Outcome::Allowed,
                     Some(serde_json::json!({ "accept": decision == resolve::MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
                 )

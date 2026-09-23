@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::{Json, response::IntoResponse};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    Outcome, ProviderAllowList, Role, WorkspaceChanges, WorkspaceRow,
+    AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, WorkspaceChanges, WorkspaceRow,
 };
 use serde::Deserialize;
 
@@ -95,10 +95,9 @@ pub(crate) async fn create(
             .await?;
         Some(Role::Owner)
     };
-    let mut entry = identity.audit("workspace", Outcome::Allowed);
+    let mut entry = identity.audit(AuditAction::Workspace, Outcome::Allowed);
     entry.workspace_id = Some(ws.id.clone());
-    entry.resource_type = Some(String::from("workspace"));
-    entry.resource_id = Some(ws.id.clone());
+    entry = entry.on(ResourceKind::Workspace.id(&ws.id));
     app.control.record_audit(&entry).await?;
     Ok((StatusCode::CREATED, Json(workspace_json(&ws, role))))
 }
@@ -114,7 +113,7 @@ pub(crate) async fn show(
     };
     let access = access(&app, identity, &id, need).await?;
     access
-        .audit(&app, "open", None, Outcome::Allowed, None)
+        .audit(&app, AuditAction::Open, None, Outcome::Allowed, None)
         .await?;
     Ok(Json(workspace_json(&access.workspace, access.role)))
 }
@@ -154,8 +153,8 @@ pub(crate) async fn update(
     access
         .audit(
             &app,
-            "workspace",
-            Some(("workspace", &ws.id)),
+            AuditAction::Workspace,
+            Some(ResourceKind::Workspace.id(&ws.id)),
             Outcome::Allowed,
             None,
         )
@@ -186,8 +185,8 @@ pub(crate) async fn audit_detail(
     access
         .audit(
             &app,
-            "session_read",
-            Some(("audit", "detail")),
+            AuditAction::SessionRead,
+            Some(ResourceKind::Audit.id("detail")),
             Outcome::Allowed,
             None,
         )

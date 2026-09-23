@@ -144,8 +144,8 @@ pub struct AuditEntry {
     pub user_id: Option<String>,
     pub token_hash: Option<String>,
     pub workspace_id: Option<String>,
-    pub action: String,
-    pub resource_type: Option<String>,
+    pub action: AuditAction,
+    pub resource_type: Option<ResourceKind>,
     /// An opaque id or a table name; never content.
     pub resource_id: Option<String>,
     pub outcome: Outcome,
@@ -157,13 +157,13 @@ pub struct AuditEntry {
 impl AuditEntry {
     /// A fresh entry with a new UUID v7 and nothing else set.
     #[must_use]
-    pub fn new(action: &str, outcome: Outcome, channel: Channel) -> Self {
+    pub fn new(action: AuditAction, outcome: Outcome, channel: Channel) -> Self {
         Self {
             id: uuid::Uuid::now_v7().to_string(),
             user_id: None,
             token_hash: None,
             workspace_id: None,
-            action: action.to_owned(),
+            action,
             resource_type: None,
             resource_id: None,
             outcome,
@@ -172,6 +172,151 @@ impl AuditEntry {
             request_id: None,
         }
     }
+
+    /// The resource the action touched.
+    #[must_use]
+    pub fn on(mut self, resource: AuditResource<'_>) -> Self {
+        self.resource_type = Some(resource.kind);
+        self.resource_id = Some(resource.id.to_owned());
+        self
+    }
+}
+
+/// What an access-audit row records was done. Rows are written with one of
+/// these; they are read back as text, since the log is history and keeps
+/// what older versions wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditAction {
+    Login,
+    Logout,
+    /// A session that expired or no longer exists was presented.
+    Session,
+    /// Server administration: users.
+    Admin,
+    Workspace,
+    Member,
+    Token,
+    /// Opened one resource: a document, table, version, or session.
+    Open,
+    /// Listed resources of a kind.
+    List,
+    /// Rendered a web page.
+    Page,
+    Show,
+    Stream,
+    Query,
+    Search,
+    Sql,
+    Ingest,
+    Import,
+    Export,
+    Delete,
+    Context,
+    Ontology,
+    Propose,
+    Graph,
+    GraphExtract,
+    GraphReview,
+    GraphRevalidate,
+    GraphMerge,
+    EmbeddingsRefresh,
+    EmbeddingsStatus,
+    SessionRead,
+    Share,
+    Mode,
+    Cancel,
+}
+
+text_enum!(AuditAction, "audit action", {
+    Login => "login",
+    Logout => "logout",
+    Session => "session",
+    Admin => "admin",
+    Workspace => "workspace",
+    Member => "member",
+    Token => "token",
+    Open => "open",
+    List => "list",
+    Page => "page",
+    Show => "show",
+    Stream => "stream",
+    Query => "query",
+    Search => "search",
+    Sql => "sql",
+    Ingest => "ingest",
+    Import => "import",
+    Export => "export",
+    Delete => "delete",
+    Context => "context",
+    Ontology => "ontology",
+    Propose => "propose",
+    Graph => "graph",
+    GraphExtract => "graph_extract",
+    GraphReview => "graph_review",
+    GraphRevalidate => "graph_revalidate",
+    GraphMerge => "graph_merge",
+    EmbeddingsRefresh => "embeddings_refresh",
+    EmbeddingsStatus => "embeddings_status",
+    SessionRead => "session_read",
+    Share => "share",
+    Mode => "mode",
+    Cancel => "cancel",
+});
+
+/// The kinds of resource an audit row names by opaque id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    Session,
+    Document,
+    User,
+    Workspace,
+    Token,
+    Job,
+    Candidate,
+    Context,
+    OntologyVersion,
+    InductionRun,
+    GraphRun,
+    GraphMerge,
+    EmbeddingsRun,
+    /// An MCP resource URI.
+    Resource,
+    Audit,
+}
+
+text_enum!(ResourceKind, "resource kind", {
+    Session => "session",
+    Document => "document",
+    User => "user",
+    Workspace => "workspace",
+    Token => "token",
+    Job => "job",
+    Candidate => "candidate",
+    Context => "context",
+    OntologyVersion => "ontology_version",
+    InductionRun => "induction_run",
+    GraphRun => "graph_run",
+    GraphMerge => "graph_merge",
+    EmbeddingsRun => "embeddings_run",
+    Resource => "resource",
+    Audit => "audit",
+});
+
+impl ResourceKind {
+    /// This kind of resource with `id`, as an audit row names it.
+    #[must_use]
+    pub fn id(self, id: &str) -> AuditResource<'_> {
+        AuditResource { kind: self, id }
+    }
+}
+
+/// The resource an audit row names: its kind and opaque id, never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditResource<'a> {
+    pub kind: ResourceKind,
+    pub id: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1010,7 +1155,7 @@ impl ControlPlane {
                 entry.token_hash.as_deref().into(),
                 entry.workspace_id.as_deref().into(),
                 entry.action.as_str().into(),
-                entry.resource_type.as_deref().into(),
+                entry.resource_type.map(ResourceKind::as_str).into(),
                 entry.resource_id.as_deref().into(),
                 entry.outcome.as_str().into(),
                 entry.channel.as_str().into(),
@@ -1413,13 +1558,13 @@ mod tests {
     #[tokio::test]
     async fn audit_rows_append_and_filter() {
         let (_dir, cp) = open().await;
-        let mut allowed = AuditEntry::new("open", Outcome::Allowed, Channel::Api);
+        let mut allowed = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api);
         allowed.user_id = Some(String::from("u1"));
         allowed.workspace_id = Some(String::from("w1"));
-        let mut denied = AuditEntry::new("open", Outcome::Denied, Channel::Web);
+        let mut denied = AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Web);
         denied.user_id = Some(String::from("u2"));
         denied.workspace_id = Some(String::from("w1"));
-        let login = AuditEntry::new("login", Outcome::Error, Channel::Web);
+        let login = AuditEntry::new(AuditAction::Login, Outcome::Error, Channel::Web);
         for e in [&allowed, &denied, &login] {
             assert!(cp.record_audit(e).await.is_ok());
         }

@@ -89,7 +89,7 @@ mod tests {
     use crate::ontology::PropertyType;
     use crate::ontology::candidates::{CandidateAction, CandidateStatus, Queue};
     use crate::ontology::induction::ItemKind;
-    use crate::storage::control::{Channel, Outcome, Role, Scope};
+    use crate::storage::control::{AuditAction, Channel, Outcome, ResourceKind, Role, Scope};
     use crate::storage::sessions::{ChatMode, MessageRole};
     use crate::storage::workspace::{DocumentSource, DocumentStatus};
 
@@ -135,6 +135,8 @@ mod tests {
         round_trips(CandidateAction::ALL);
         round_trips(ItemKind::ALL);
         round_trips(ExtractSource::ALL);
+        round_trips(AuditAction::ALL);
+        round_trips(ResourceKind::ALL);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use quack_core::embedding::{Input, Vector};
 use quack_core::error::Record;
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm;
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{ChunkScope, StatementKind};
 use serde::Deserialize;
@@ -51,7 +51,7 @@ async fn prepare(
     let access = access(app, identity, workspace_id, Need::READ).await?;
     if body.allow_write && !access.permits(Need::WRITE) {
         access
-            .audit(app, "query", None, Outcome::Denied, None)
+            .audit(app, AuditAction::Query, None, Outcome::Denied, None)
             .await?;
         return Err(ApiError::forbidden(
             "allow_write needs the member role and the write scope",
@@ -191,8 +191,8 @@ async fn record_turn(
     if let Err(e) = access
         .audit(
             app,
-            "query",
-            Some(("session", session_id)),
+            AuditAction::Query,
+            Some(ResourceKind::Session.id(session_id)),
             outcome,
             Some(detail),
         )
@@ -394,7 +394,7 @@ pub(crate) async fn execute_sql(
     let detail = serde_json::json!({ "sql": statement });
     if is_write && quack_core::analysis::tools::creates_temp_object(statement) {
         access
-            .audit(app, "sql", None, Outcome::Denied, Some(detail))
+            .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
             .await?;
         return Err(ApiError::bad_request(
             quack_core::analysis::tools::TEMP_OBJECT_REFUSED,
@@ -402,7 +402,7 @@ pub(crate) async fn execute_sql(
     }
     if is_write && !access.permits(Need::WRITE) {
         access
-            .audit(app, "sql", None, Outcome::Denied, Some(detail))
+            .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
             .await?;
         return Err(ApiError::forbidden(
             "writes need the member role and the write scope",
@@ -435,7 +435,7 @@ pub(crate) async fn execute_sql(
         Outcome::Error
     };
     access
-        .audit(app, "sql", None, outcome, Some(detail))
+        .audit(app, AuditAction::Sql, None, outcome, Some(detail))
         .await?;
     let capped = result
         .map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.message))?;
@@ -491,7 +491,7 @@ pub(crate) async fn search(
     access
         .audit(
             &app,
-            "search",
+            AuditAction::Search,
             None,
             Outcome::Allowed,
             Some(serde_json::json!({ "q": query })),

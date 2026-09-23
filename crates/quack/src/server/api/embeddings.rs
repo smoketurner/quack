@@ -11,7 +11,7 @@ use quack_core::embedding::refresh::{self, Plan};
 use quack_core::jobs::{JobId, JobKind, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::workspace::WorkspaceDb;
 
 use crate::server::api::graph::audit_cancelled;
@@ -30,7 +30,7 @@ pub(crate) async fn show(
     let access = access(&app, identity, &id, Need::READ).await?;
     let status = app.read(&id, WorkspaceDb::embedding_status).await?;
     access
-        .audit_read(&app, "embeddings_status", "embedding status")
+        .audit_read(&app, AuditAction::EmbeddingsStatus, "embedding status")
         .await?;
     Ok(Json(serde_json::json!({
         "status": status,
@@ -67,7 +67,7 @@ pub(crate) async fn start(
         access
             .audit(
                 app,
-                "embeddings_refresh",
+                AuditAction::EmbeddingsRefresh,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "plan": plan, "finished": true })),
@@ -82,8 +82,8 @@ pub(crate) async fn start(
     access
         .audit(
             app,
-            "embeddings_refresh",
-            Some(("embeddings_run", &run)),
+            AuditAction::EmbeddingsRefresh,
+            Some(ResourceKind::EmbeddingsRun.id(&run)),
             Outcome::Allowed,
             Some(serde_json::json!({ "plan": plan, "profile": embedder.profile() })),
         )
@@ -136,8 +136,8 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
         if let Err(e) = access
             .audit(
                 &app,
-                "embeddings_refresh",
-                Some(("embeddings_run", &run_id)),
+                AuditAction::EmbeddingsRefresh,
+                Some(ResourceKind::EmbeddingsRun.id(&run_id)),
                 audit_outcome,
                 Some(detail),
             )
@@ -156,8 +156,8 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
         audit_cancelled(
             &cancel_app,
             &cancel_access,
-            "embeddings_refresh",
-            "embeddings_run",
+            AuditAction::EmbeddingsRefresh,
+            ResourceKind::EmbeddingsRun,
             &cancel_run,
         )
         .await;

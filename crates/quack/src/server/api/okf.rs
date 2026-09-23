@@ -6,7 +6,7 @@
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 
 use crate::server::auth::{Identity, Need, access};
 use crate::server::error::ApiResult;
@@ -29,8 +29,8 @@ pub(crate) async fn export(
     access
         .audit(
             &app,
-            "export",
-            Some(("workspace", &id)),
+            AuditAction::Export,
+            Some(ResourceKind::Workspace.id(&id)),
             Outcome::Allowed,
             Some(serde_json::json!({ "format": "okf", "files": files })),
         )

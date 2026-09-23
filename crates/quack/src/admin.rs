@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use quack_core::config::Config;
 use quack_core::storage::control::{
-    AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, Role, Scope, WorkspaceRow,
+    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, ResourceKind, Role,
+    Scope, WorkspaceRow,
 };
 
 #[derive(Subcommand)]
@@ -108,9 +109,8 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
         UserAction::Add { username, admin } => {
             let password = read_password(&format!("Password for {username}: "))?;
             let user = control.create_user(&username, &password, admin).await?;
-            let mut entry = AuditEntry::new("admin", Outcome::Allowed, Channel::Cli);
-            entry.resource_type = Some(String::from("user"));
-            entry.resource_id = Some(user.id.clone());
+            let mut entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+            entry = entry.on(ResourceKind::User.id(&user.id));
             control.record_audit(&entry).await?;
             let mut out = stdout.lock();
             writeln!(
@@ -202,10 +202,9 @@ async fn create_token(
     let (token, row) = control
         .create_token(&ws.id, &user_row.id, name, scopes, expires_at.as_deref())
         .await?;
-    let mut entry = AuditEntry::new("token", Outcome::Allowed, Channel::Cli);
+    let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
     entry.workspace_id = Some(ws.id.clone());
-    entry.resource_type = Some(String::from("token"));
-    entry.resource_id = Some(row.token_hash.clone());
+    entry = entry.on(ResourceKind::Token.id(&row.token_hash));
     control.record_audit(&entry).await?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -270,10 +269,9 @@ async fn revoke_token(control: &ControlPlane, ws: &WorkspaceRow, prefix: &str) -
         ),
     };
     control.delete_token(&hash).await?;
-    let mut entry = AuditEntry::new("token", Outcome::Allowed, Channel::Cli);
+    let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
     entry.workspace_id = Some(ws.id.clone());
-    entry.resource_type = Some(String::from("token"));
-    entry.resource_id = Some(hash.clone());
+    entry = entry.on(ResourceKind::Token.id(&hash));
     control.record_audit(&entry).await?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -343,10 +341,9 @@ pub(crate) async fn run_member(
 }
 
 async fn audit_member(control: &ControlPlane, ws: &WorkspaceRow, user_id: &str) -> Result<()> {
-    let mut entry = AuditEntry::new("member", Outcome::Allowed, Channel::Cli);
+    let mut entry = AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli);
     entry.workspace_id = Some(ws.id.clone());
-    entry.resource_type = Some(String::from("user"));
-    entry.resource_id = Some(user_id.to_owned());
+    entry = entry.on(ResourceKind::User.id(user_id));
     control.record_audit(&entry).await?;
     Ok(())
 }

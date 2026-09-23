@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use serde::Deserialize;
 
@@ -31,7 +31,9 @@ pub(crate) async fn list(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "sessions").await?;
+    access
+        .audit_read(&app, AuditAction::List, "sessions")
+        .await?;
     let user = access.identity.user_id.clone();
     let sees_all = access.sees_all_sessions();
     let limit = q.limit;
@@ -75,8 +77,8 @@ pub(crate) async fn show(
     access
         .audit(
             &app,
-            "session_read",
-            Some(("session", &sid)),
+            AuditAction::SessionRead,
+            Some(ResourceKind::Session.id(&sid)),
             Outcome::Allowed,
             None,
         )
@@ -127,7 +129,13 @@ pub(crate) async fn set_mode(
     let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
     if !mine && !access.sees_all_sessions() {
         access
-            .audit(app, "mode", Some(("session", sid)), Outcome::Denied, None)
+            .audit(
+                app,
+                AuditAction::Mode,
+                Some(ResourceKind::Session.id(sid)),
+                Outcome::Denied,
+                None,
+            )
             .await?;
         return Err(ApiError::forbidden(
             "only the session's creator or an owner may change its mode",
@@ -144,8 +152,8 @@ pub(crate) async fn set_mode(
     access
         .audit(
             app,
-            "mode",
-            Some(("session", sid)),
+            AuditAction::Mode,
+            Some(ResourceKind::Session.id(sid)),
             Outcome::Allowed,
             Some(serde_json::json!({ "mode": mode.as_str() })),
         )
@@ -164,7 +172,13 @@ pub(crate) async fn set_shared(
     let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
     if !mine && !access.sees_all_sessions() {
         access
-            .audit(app, "share", Some(("session", sid)), Outcome::Denied, None)
+            .audit(
+                app,
+                AuditAction::Share,
+                Some(ResourceKind::Session.id(sid)),
+                Outcome::Denied,
+                None,
+            )
             .await?;
         return Err(ApiError::forbidden(
             "only the session's creator or an owner may share it",
@@ -181,8 +195,8 @@ pub(crate) async fn set_shared(
     access
         .audit(
             app,
-            "share",
-            Some(("session", sid)),
+            AuditAction::Share,
+            Some(ResourceKind::Session.id(sid)),
             Outcome::Allowed,
             Some(serde_json::json!({ "shared": shared })),
         )
@@ -207,7 +221,13 @@ pub(crate) async fn delete_session(app: &App, access: &Access, sid: &str) -> Api
     let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
     if !mine && !access.sees_all_sessions() {
         access
-            .audit(app, "delete", Some(("session", sid)), Outcome::Denied, None)
+            .audit(
+                app,
+                AuditAction::Delete,
+                Some(ResourceKind::Session.id(sid)),
+                Outcome::Denied,
+                None,
+            )
             .await?;
         return Err(ApiError::forbidden(
             "only the session's creator or an owner may delete it",
@@ -219,8 +239,8 @@ pub(crate) async fn delete_session(app: &App, access: &Access, sid: &str) -> Api
     access
         .audit(
             app,
-            "delete",
-            Some(("session", sid)),
+            AuditAction::Delete,
+            Some(ResourceKind::Session.id(sid)),
             Outcome::Allowed,
             None,
         )
@@ -264,8 +284,8 @@ pub(crate) async fn export(
     access
         .audit(
             &app,
-            "export",
-            Some(("session", &sid)),
+            AuditAction::Export,
+            Some(ResourceKind::Session.id(&sid)),
             Outcome::Allowed,
             Some(serde_json::json!({ "format": q.format })),
         )

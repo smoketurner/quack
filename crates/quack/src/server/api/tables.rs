@@ -2,7 +2,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome};
 
 use crate::server::auth::{Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
@@ -15,7 +15,7 @@ pub(crate) async fn list(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "tables").await?;
+    access.audit_read(&app, AuditAction::List, "tables").await?;
     let tables = app.read(&id, WorkspaceDb::list_tables).await?;
     Ok(Json(serde_json::json!({ "tables": tables })))
 }
@@ -44,7 +44,7 @@ pub(crate) async fn describe(
     access
         .audit(
             &app,
-            "open",
+            AuditAction::Open,
             None,
             Outcome::Allowed,
             Some(serde_json::json!({ "table": name })),

@@ -8,7 +8,7 @@ use axum::http::{StatusCode, header};
 use axum::{Json, response::IntoResponse};
 use quack_core::error::Record;
 use quack_core::ingestion;
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
@@ -26,7 +26,9 @@ pub(crate) async fn list(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "documents").await?;
+    access
+        .audit_read(&app, AuditAction::List, "documents")
+        .await?;
     let docs = app.read(&id, WorkspaceDb::list_documents).await?;
     Ok(Json(serde_json::json!({ "documents": docs })))
 }
@@ -40,8 +42,8 @@ pub(crate) async fn show(
     access
         .audit(
             &app,
-            "open",
-            Some(("document", &doc)),
+            AuditAction::Open,
+            Some(ResourceKind::Document.id(&doc)),
             Outcome::Allowed,
             None,
         )
@@ -272,8 +274,8 @@ pub(crate) async fn enqueue(
                 access
                     .audit(
                         app,
-                        "ingest",
-                        Some(("document", &existing.id)),
+                        AuditAction::Ingest,
+                        Some(ResourceKind::Document.id(&existing.id)),
                         Outcome::Allowed,
                         Some(serde_json::json!({
                             "filename": filename,
@@ -294,8 +296,8 @@ pub(crate) async fn enqueue(
         access
             .audit(
                 app,
-                "ingest",
-                Some(("document", &document_id)),
+                AuditAction::Ingest,
+                Some(ResourceKind::Document.id(&document_id)),
                 Outcome::Allowed,
                 Some(serde_json::json!({ "filename": filename, "size_bytes": size })),
             )
@@ -355,8 +357,8 @@ pub(crate) async fn set_pinned(
     access
         .audit(
             app,
-            "context",
-            Some(("document", doc)),
+            AuditAction::Context,
+            Some(ResourceKind::Document.id(doc)),
             Outcome::Allowed,
             Some(serde_json::json!({ "pinned": pinned })),
         )
@@ -393,8 +395,8 @@ pub(crate) async fn delete_document(app: &App, access: &Access, doc: &str) -> Ap
     access
         .audit(
             app,
-            "delete",
-            Some(("document", doc)),
+            AuditAction::Delete,
+            Some(ResourceKind::Document.id(doc)),
             Outcome::Allowed,
             Some(serde_json::json!({ "filename": filename })),
         )
