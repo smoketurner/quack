@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Profile, Prompts, StaleVectors, Vector,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Record, Result};
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -219,7 +219,7 @@ pub struct WorkspaceDb {
     query_timeout: Duration,
     /// `files/` under the workspace directory, where ingested files are
     /// kept; `None` in memory.
-    files_dir: Option<std::path::PathBuf>,
+    files_dir: Option<PathBuf>,
 }
 
 impl WorkspaceDb {
@@ -1243,7 +1243,7 @@ impl WorkspaceDb {
         let Some(files_dir) = &self.files_dir else {
             return;
         };
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(name) = Path::new(filename).file_name() {
             candidates.push(files_dir.join(name));
         }
@@ -1703,7 +1703,7 @@ impl WorkspaceDb {
             duckdb::params![pinned, document_id],
         )?;
         if changed == 0 {
-            return Err(crate::error::Record::Document.missing(document_id));
+            return Err(Record::Document.missing(document_id));
         }
         Ok(())
     }
@@ -3739,8 +3739,7 @@ mod tests {
 
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {
         db.insert_document(
-            &NewDocument::new(id, "doc.txt", "text/plain", 10)
-                .with_status(crate::storage::workspace::DocumentStatus::Ready),
+            &NewDocument::new(id, "doc.txt", "text/plain", 10).with_status(DocumentStatus::Ready),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
     }

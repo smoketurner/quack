@@ -5,6 +5,7 @@
 //! the server forwards them as SSE and the session store persists them.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -14,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
 use crate::embedding::{Input, Vector};
+use crate::error::Error;
 
 /// A turn's embeddings, by input (the role is part of it).
 type EmbeddingCache = HashMap<Input, Vector>;
@@ -129,9 +131,8 @@ pub enum FailureKind {
     Other,
 }
 
-impl From<&crate::error::Error> for TurnFailure {
-    fn from(error: &crate::error::Error) -> Self {
-        use crate::error::Error;
+impl From<&Error> for TurnFailure {
+    fn from(error: &Error) -> Self {
         let kind = match error {
             Error::AuthRequired { .. } => FailureKind::AuthRequired,
             Error::NoChatModel { .. } => FailureKind::NoChatModel,
@@ -145,8 +146,8 @@ impl From<&crate::error::Error> for TurnFailure {
     }
 }
 
-impl std::fmt::Display for TurnFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for TurnFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
 }
@@ -322,9 +323,11 @@ impl StepInProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::embedding::Dimension;
-    use crate::error::{AuthReason, Error, Record};
+    use crate::error::{AuthReason, Record};
 
     /// Interfaces choose their answer from the kind, never the text.
     #[test]
@@ -339,7 +342,7 @@ mod tests {
         );
         assert_eq!(
             kind(Error::NoChatModel {
-                config_file: std::path::PathBuf::from("config.toml"),
+                config_file: PathBuf::from("config.toml"),
             }),
             FailureKind::NoChatModel
         );

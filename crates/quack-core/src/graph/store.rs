@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::resolve::MergeStatus;
 use super::{Drift, Edge, GraphStatus, Node, Provenance, normalize_label};
 use crate::error::{Error, Result};
 use crate::ontology::{self, Ontology, store as ontology_store};
@@ -495,7 +496,7 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     let edges: i64 = conn.query_row("SELECT count(*) FROM _quack_graph_edges", [], |r| r.get(0))?;
     let pending_merges: i64 = conn.query_row(
         "SELECT count(*) FROM _quack_graph_merges WHERE status = ?",
-        [super::resolve::MergeStatus::Pending],
+        [MergeStatus::Pending],
         |r| r.get(0),
     )?;
     let built_with_version = built_with(db)?;

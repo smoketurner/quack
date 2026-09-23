@@ -16,7 +16,8 @@ use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentSource, MetaKey, NewChunk, NewDocument, StatementKind, WorkspaceDb,
+    ChunkScope, DocumentSource, DocumentStatus, MetaKey, NewChunk, NewDocument, StatementKind,
+    WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -617,7 +618,7 @@ fn workspace_db_document_crud() {
 
     db.insert_document(
         &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Queued),
+            .with_status(DocumentStatus::Queued),
     )
     .unwrap();
 
@@ -626,11 +627,8 @@ fn workspace_db_document_crud() {
         .unwrap();
     assert_eq!(qr.rows.len(), 1);
 
-    db.update_document_status(
-        "doc-1",
-        quack_core::storage::workspace::DocumentStatus::Ready,
-    )
-    .unwrap();
+    db.update_document_status("doc-1", DocumentStatus::Ready)
+        .unwrap();
 
     let qr = db
         .execute_query("SELECT status FROM _quack_documents WHERE id = 'doc-1'")
@@ -648,7 +646,7 @@ fn workspace_db_chunk_without_embedding() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
         &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
@@ -680,7 +678,7 @@ fn workspace_db_chunk_with_embedding() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
         &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
@@ -711,7 +709,7 @@ fn workspace_db_set_chunk_embedding() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
         &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
@@ -775,12 +773,12 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
 
     db.insert_document(
         &NewDocument::new("doc-a", "policy.pdf", "application/pdf", 10)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_document(
         &NewDocument::new("doc-b", "faq.md", "text/markdown", 10)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -835,7 +833,7 @@ fn workspace_db_search_similar_chunks() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
         &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
@@ -1112,8 +1110,7 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
     {
         let db = WorkspaceDb::open(&config, "ws-mismatch").unwrap();
         db.insert_document(
-            &NewDocument::new("d", "a.txt", "text/plain", 1)
-                .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            &NewDocument::new("d", "a.txt", "text/plain", 1).with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_chunk(&NewChunk {
@@ -1188,8 +1185,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     {
         let db = WorkspaceDb::open(&config, "ws-adopt").unwrap();
         db.insert_document(
-            &NewDocument::new("d", "a.txt", "text/plain", 1)
-                .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            &NewDocument::new("d", "a.txt", "text/plain", 1).with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_chunk(&NewChunk {
@@ -1294,10 +1290,7 @@ fn legacy_unprefixed_tables_are_renamed_on_open() {
     let old = docs.first().unwrap();
     assert_eq!(old.filename, "old.txt");
     // The old default status, `pending`, was never processed.
-    assert_eq!(
-        old.status,
-        quack_core::storage::workspace::DocumentStatus::Error
-    );
+    assert_eq!(old.status, DocumentStatus::Error);
     assert!(
         old.error_message
             .as_deref()
@@ -1377,12 +1370,12 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
     let db = WorkspaceDb::open(config, ws).unwrap();
     db.insert_document(
         &NewDocument::new("doc-a", "policy.pdf", "application/pdf", 10)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_document(
         &NewDocument::new("doc-b", "faq.md", "text/markdown", 10)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -1560,8 +1553,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     {
         let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
         db.insert_document(
-            &NewDocument::new("d", "a.md", "text/markdown", 1)
-                .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_chunk(&NewChunk {
@@ -1752,10 +1744,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         .into_iter()
         .find(|d| d.filename == "scan.pdf")
         .unwrap();
-    assert_eq!(
-        errored.status,
-        quack_core::storage::workspace::DocumentStatus::Error
-    );
+    assert_eq!(errored.status, DocumentStatus::Error);
     let retry =
         ingestion::register_document(&db, &ingestion::NewFile::new("scan.pdf", bad)).unwrap();
     assert!(matches!(retry, ingestion::Registration::New(_)));
@@ -1792,10 +1781,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
     assert!(result.chunks_stored > 0);
 
     let doc = db.document(&result.document_id).unwrap().unwrap();
-    assert_eq!(
-        doc.status,
-        quack_core::storage::workspace::DocumentStatus::Ready
-    );
+    assert_eq!(doc.status, DocumentStatus::Ready);
     assert_eq!(doc.title.as_deref(), Some("Long Report"));
 
     // Pages are windowed as one text: the first chunk starts on page 1,
@@ -2132,8 +2118,7 @@ fn keyword_search_treats_null_as_a_word() {
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-null").unwrap();
     db.insert_document(
-        &NewDocument::new("d", "a.md", "text/markdown", 1)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+        &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -2169,8 +2154,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
     let db = WorkspaceDb::open(&config, "ws-failed").unwrap();
     let writer = writer_of(&db);
     db.insert_document(
-        &NewDocument::new("d", "a.md", "text/markdown", 1)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Error),
+        &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Error),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -2193,7 +2177,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
             .unwrap()
             .is_empty()
     );
-    db.update_document_status("d", quack_core::storage::workspace::DocumentStatus::Ready)
+    db.update_document_status("d", DocumentStatus::Ready)
         .unwrap();
     assert_eq!(
         db.search_keyword_chunks("zebra", 5, &ChunkScope::all())
@@ -2225,10 +2209,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
         .into_iter()
         .find(|d| d.filename == "notes.md")
         .unwrap();
-    assert_eq!(
-        doc.status,
-        quack_core::storage::workspace::DocumentStatus::Error
-    );
+    assert_eq!(doc.status, DocumentStatus::Error);
     assert_eq!(doc.chunk_count, None);
     let orphans: i64 = db
         .connection()
@@ -2317,10 +2298,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     assert_ne!(reloaded.document_id, first.document_id);
     assert!(db.list_tables().unwrap().contains(&String::from("sales")));
     let stale = db.document(&first.document_id).unwrap().unwrap();
-    assert_eq!(
-        stale.status,
-        quack_core::storage::workspace::DocumentStatus::Error
-    );
+    assert_eq!(stale.status, DocumentStatus::Error);
     assert!(
         db.table_owner("sales")
             .unwrap()
@@ -2337,10 +2315,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     };
     assert_eq!(db.fail_stale_uploads().unwrap(), 1);
     let failed = db.document(&queued).unwrap().unwrap();
-    assert_eq!(
-        failed.status,
-        quack_core::storage::workspace::DocumentStatus::Error
-    );
+    assert_eq!(failed.status, DocumentStatus::Error);
     assert!(failed.error_message.is_some_and(|m| m.contains("restart")));
     assert_eq!(db.fail_stale_uploads().unwrap(), 0);
 }
@@ -2551,10 +2526,7 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     );
     let documents = db.list_documents().unwrap();
     let document = documents.first().unwrap();
-    assert_eq!(
-        document.status,
-        quack_core::storage::workspace::DocumentStatus::Error
-    );
+    assert_eq!(document.status, DocumentStatus::Error);
     assert_eq!(document.error_message.as_deref(), Some("cancelled"));
     let qr = db
         .execute_query("SELECT COUNT(*) AS cnt FROM _quack_chunks")

@@ -19,6 +19,7 @@ mod tables;
 mod workspaces;
 
 use axum::Router;
+use axum::response::sse::Event;
 use axum::routing::{delete, get, post};
 
 use super::state::App;
@@ -54,8 +55,8 @@ impl StreamEvent {
     }
 
     /// An SSE event carrying this name.
-    pub(crate) fn event(self) -> axum::response::sse::Event {
-        axum::response::sse::Event::default().event(self.as_str())
+    pub(crate) fn event(self) -> Event {
+        Event::default().event(self.as_str())
     }
 }
 

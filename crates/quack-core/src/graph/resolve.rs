@@ -11,7 +11,7 @@ use rig::embeddings::EmbeddingModel;
 use super::store;
 use super::{GraphOptions, Node};
 use crate::embedding::{Embedder, Input};
-use crate::error::{Error, Result};
+use crate::error::{Error, Record, Result};
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{WorkspaceDb, tokenize};
 use crate::storage::writer::Writer;
@@ -122,7 +122,7 @@ const NODE_BATCH: u32 = 64;
 /// # Errors
 ///
 /// Returns an error when embedding or a write fails, or
-/// [`Error::Cancelled`](crate::error::Error::Cancelled).
+/// [`Error::Cancelled`].
 pub async fn embed_nodes<M: EmbeddingModel>(
     db: &Writer,
     embedder: &Embedder<M>,
@@ -503,7 +503,7 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<MergeProposal> {
         .filter(|m| m.id.starts_with(prefix))
         .collect();
     match matches.len() {
-        0 => Err(crate::error::Record::MergeProposal.missing(prefix)),
+        0 => Err(Record::MergeProposal.missing(prefix)),
         1 => matches
             .into_iter()
             .next()

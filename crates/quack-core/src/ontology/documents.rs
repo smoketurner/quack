@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::induction::{Candidate, Proposal, snake_id};
-use super::{Class, Ontology, Property, PropertyType, Relation};
+use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation};
 use crate::error::{Error, Result};
 use crate::llm::{Embeddings, name_similarity};
 use crate::progress::{ChunkDone, Progress};
@@ -595,14 +595,14 @@ fn propose_classes(
     candidates: &mut Vec<Candidate>,
 ) {
     for (class, support) in &evidence.class_support {
-        if class == super::ROOT_CLASS || current.is_some_and(|o| o.class(class).is_some()) {
+        if class == ROOT_CLASS || current.is_some_and(|o| o.class(class).is_some()) {
             continue;
         }
         let parent = evidence
             .parents
             .get(class)
             .cloned()
-            .unwrap_or_else(|| String::from(super::ROOT_CLASS));
+            .unwrap_or_else(|| String::from(ROOT_CLASS));
         candidates.push(Candidate {
             proposal: Proposal::Class(Class {
                 id: class.clone(),
@@ -758,10 +758,10 @@ fn infer_hierarchy(
 fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>) -> String {
     let total: u32 = counts.values().sum();
     let Some((top, n)) = counts.iter().max_by_key(|(_, n)| **n) else {
-        return String::from(super::ROOT_CLASS);
+        return String::from(ROOT_CLASS);
     };
     if total == 0 {
-        return String::from(super::ROOT_CLASS);
+        return String::from(ROOT_CLASS);
     }
     if f64::from(*n) / f64::from(total) >= 0.8 {
         return top.clone();
@@ -785,7 +785,7 @@ fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>
             return ancestor.clone();
         }
     }
-    String::from(super::ROOT_CLASS)
+    String::from(ROOT_CLASS)
 }
 
 #[cfg(test)]
@@ -823,7 +823,7 @@ mod tests {
             assert!(
                 db.insert_document(
                     &NewDocument::new(&doc, &format!("{doc}.md"), "text/markdown", 10)
-                        .with_status(crate::storage::workspace::DocumentStatus::Ready)
+                        .with_status(DocumentStatus::Ready)
                 )
                 .is_ok()
             );
@@ -849,7 +849,7 @@ mod tests {
         assert!(
             db.insert_document(
                 &NewDocument::new("pending", "p.md", "text/markdown", 1)
-                    .with_status(crate::storage::workspace::DocumentStatus::Queued)
+                    .with_status(DocumentStatus::Queued)
             )
             .is_ok()
         );

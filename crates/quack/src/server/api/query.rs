@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
@@ -21,6 +22,7 @@ use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{ChunkScope, StatementKind};
 use serde::Deserialize;
 
+use super::StreamEvent;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
@@ -289,19 +291,19 @@ pub(crate) async fn stream(
         |(mut events, app, access, session_id, prompt, guard)| async move {
             let event = events.recv().await?;
             let out = match event {
-                AgentEvent::Status(status) => super::StreamEvent::Status.event().data(status),
-                AgentEvent::TextDelta(text) => super::StreamEvent::Text.event().data(text),
-                AgentEvent::ToolStarted { tool, detail } => super::StreamEvent::ToolStarted
+                AgentEvent::Status(status) => StreamEvent::Status.event().data(status),
+                AgentEvent::TextDelta(text) => StreamEvent::Text.event().data(text),
+                AgentEvent::ToolStarted { tool, detail } => StreamEvent::ToolStarted
                     .event()
                     .json_data(serde_json::json!({ "tool": tool, "detail": detail }))
                     .unwrap_or_default(),
-                AgentEvent::ToolFinished(step) => super::StreamEvent::ToolFinished
+                AgentEvent::ToolFinished(step) => StreamEvent::ToolFinished
                     .event()
                     .json_data(&step)
                     .unwrap_or_default(),
                 AgentEvent::PermissionRequired(request) => {
                     request.deny();
-                    super::StreamEvent::WriteRefused
+                    StreamEvent::WriteRefused
                         .event()
                         .data("writes are off for this request")
                 }
@@ -323,14 +325,14 @@ pub(crate) async fn stream(
                             serde_json::Value::String(to_html(&response.content)),
                         );
                     }
-                    super::StreamEvent::Complete
+                    StreamEvent::Complete
                         .event()
                         .json_data(payload)
                         .unwrap_or_default()
                 }
                 AgentEvent::Failed(failure) => {
                     record_turn(&app, &access, &session_id, &prompt, Outcome::Error, None).await;
-                    super::StreamEvent::Error.event().data(failure.message)
+                    StreamEvent::Error.event().data(failure.message)
                 }
             };
             Some((Ok(out), (events, app, access, session_id, prompt, guard)))
@@ -437,8 +439,7 @@ pub(crate) async fn execute_sql(
     access
         .audit(app, AuditAction::Sql, None, outcome, Some(detail))
         .await?;
-    let capped = result
-        .map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.message))?;
+    let capped = result.map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e.message))?;
     Ok(SqlOutcome {
         truncated: capped.truncated(),
         columns: capped.results.columns,

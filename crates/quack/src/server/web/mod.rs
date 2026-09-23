@@ -5,6 +5,8 @@
 
 pub(crate) mod markdown;
 
+use std::fmt;
+
 use askama::Template;
 use axum::Form;
 use axum::Router;
@@ -44,6 +46,7 @@ use super::error::ApiError;
 use super::state::{App, with_db};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store as graph_store;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse,
@@ -2229,7 +2232,7 @@ fn blank_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: std::str::FromStr,
-    T::Err: std::fmt::Display,
+    T::Err: fmt::Display,
 {
     match Option::<String>::deserialize(deserializer)?
         .as_deref()
@@ -2627,7 +2630,7 @@ async fn graph_merge_decide(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     // Parsed rather than extracted, so a bad value comes back as a notice
     // on the page instead of an error page.
-    let decision = match form.action.parse::<resolve::MergeDecision>() {
+    let decision = match form.action.parse::<MergeDecision>() {
         Ok(decision) => decision,
         Err(e) => {
             let target = format!("/w/{id}/graph?error={}", urlencoded(&e.to_string()));
@@ -2649,7 +2652,7 @@ async fn graph_merge_decide(
                     AuditAction::GraphMerge,
                     Some(ResourceKind::GraphMerge.id(&mid)),
                     Outcome::Allowed,
-                    Some(serde_json::json!({ "accept": decision == resolve::MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
+                    Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
                 )
                 .await?;
             format!("/w/{id}/graph")

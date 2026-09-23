@@ -3205,7 +3205,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
         use quack_core::config::{AuthMode, ProviderConfig, ProviderType};
-        use quack_core::storage::workspace::{NewChunk, NewDocument};
+        use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
         // Without an embedding model the job says what is missing.
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -3245,7 +3245,7 @@ mod tests {
             .run(|db| {
                 db.insert_document(
                     &NewDocument::new("d", "a.md", "text/markdown", 1)
-                        .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+                        .with_status(DocumentStatus::Ready),
                 )?;
                 db.insert_chunk(&NewChunk {
                     id: "c",

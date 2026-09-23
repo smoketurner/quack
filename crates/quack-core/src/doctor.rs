@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{AuthMode, Config, ModelRef, ProviderType};
 use crate::embedding::{PromptSource, ResolvedPrompts};
+use crate::error::Error;
 use crate::llm::{OllamaRunningModels, oauth};
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -406,7 +407,7 @@ async fn check_workspace(
                 );
             }
         }
-        Err(crate::error::Error::WorkspaceLocked { .. }) => {
+        Err(Error::WorkspaceLocked { .. }) => {
             report.push(Check::new(
                 Area::Workspace,
                 Status::Info,

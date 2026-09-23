@@ -3,6 +3,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -78,12 +79,7 @@ pub(crate) async fn init(
         .map(Some)
     })
     .await?
-    .ok_or_else(|| {
-        ApiError::new(
-            axum::http::StatusCode::CONFLICT,
-            "an ontology already exists",
-        )
-    })?;
+    .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "an ontology already exists"))?;
     access
         .audit(
             &app,
@@ -210,7 +206,7 @@ pub(crate) async fn propose(
     identity: Identity,
     Path(id): Path<String>,
     body: Option<Json<ProposeRequest>>,
-) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     if let Some(mode) = request.mode.as_deref()
@@ -222,7 +218,7 @@ pub(crate) async fn propose(
     }
     if request.documents {
         let started = start_document_run(&app, &access, &id, request.sample).await?;
-        return Ok((axum::http::StatusCode::ACCEPTED, started));
+        return Ok((StatusCode::ACCEPTED, started));
     }
     let options = app.config.ontology.table_evidence();
     let db = app.workspace_db(&id).await?;
@@ -253,7 +249,7 @@ pub(crate) async fn propose(
         )
         .await?;
     Ok((
-        axum::http::StatusCode::OK,
+        StatusCode::OK,
         Json(serde_json::json!({ "candidates": count, "run": run, "version": version })),
     ))
 }

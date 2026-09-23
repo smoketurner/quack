@@ -2,7 +2,7 @@
 //! one or all at once, and applied as a new ontology version.
 
 use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
-use super::{Ontology, store};
+use super::{Ontology, ROOT_CLASS, store};
 use crate::error::{Error, Record, Result};
 use crate::storage::workspace::WorkspaceDb;
 
@@ -191,7 +191,7 @@ fn row_from(row: &duckdb::Row<'_>) -> duckdb::Result<CandidateRow> {
         kind: row.get(1)?,
         proposal: serde_json::from_str(&proposal).unwrap_or(Proposal::Class(super::Class {
             id: String::from("unparseable"),
-            parent: String::from(super::ROOT_CLASS),
+            parent: String::from(ROOT_CLASS),
             label: None,
             description: None,
             key: None,
@@ -228,7 +228,7 @@ pub fn queue(db: &WorkspaceDb, queue: Queue) -> Result<Vec<CandidateRow>> {
     );
     let mut stmt = db.connection().prepare(&sql)?;
     let rows = stmt.query_map([queue.status()], row_from)?;
-    Ok(rows.filter_map(std::result::Result::ok).collect())
+    Ok(rows.flatten().collect())
 }
 
 /// One candidate by id or unique prefix.
@@ -353,8 +353,9 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
 
 #[cfg(test)]
 mod tests {
-    use super::super::induction::{Candidate, TableEvidenceOptions, propose_from_tables};
     use super::*;
+    use crate::ontology::Class;
+    use crate::ontology::induction::{Candidate, TableEvidenceOptions, propose_from_tables};
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -365,9 +366,9 @@ mod tests {
     fn low_support_candidates_are_kept_aside_but_reviewable() {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
         let thin = Candidate {
-            proposal: Proposal::Class(super::super::Class {
+            proposal: Proposal::Class(Class {
                 id: String::from("rumor"),
-                parent: String::from(super::super::ROOT_CLASS),
+                parent: String::from(ROOT_CLASS),
                 label: None,
                 description: None,
                 key: None,
@@ -455,9 +456,7 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()))
             .into_iter()
             .map(|c| {
-                let d = if c.proposal.id() == "vendor"
-                    && c.kind == crate::ontology::induction::ItemKind::Class
-                {
+                let d = if c.proposal.id() == "vendor" && c.kind == ItemKind::Class {
                     Decision::Rename(String::from("supplier"))
                 } else {
                     Decision::Accept

@@ -1091,6 +1091,7 @@ pub fn document_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ontology::induction::ItemKind;
 
     #[test]
     fn front_matter_parses_scalars_and_both_tag_forms() {
@@ -1303,9 +1304,11 @@ mod tests {
         // With a document class in the ontology, `resource` is proposed on it.
         let with_documents = Ontology::builtin_default();
         let candidates = propose(&bundle, Some(&with_documents));
-        assert!(candidates.iter().any(|c| c.proposal.kind()
-            == crate::ontology::induction::ItemKind::Property
-            && c.proposal.id() == "resource"));
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.proposal.kind() == ItemKind::Property && c.proposal.id() == "resource")
+        );
         let mut current = Ontology::default();
         current.classes.push(Class {
             id: String::from("vendor"),
@@ -1339,7 +1342,7 @@ mod tests {
         let ids = |candidates: &[Candidate]| -> Vec<String> {
             candidates
                 .iter()
-                .filter(|c| c.proposal.kind() == crate::ontology::induction::ItemKind::Relation)
+                .filter(|c| c.proposal.kind() == ItemKind::Relation)
                 .map(|c| c.proposal.id().to_owned())
                 .collect()
         };

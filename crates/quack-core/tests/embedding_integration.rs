@@ -15,7 +15,9 @@ use quack_core::error::Error;
 use quack_core::graph::store::{self as graph_store, NewNode};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::workspace::{ChunkScope, MetaKey, NewChunk, NewDocument, WorkspaceDb};
+use quack_core::storage::workspace::{
+    ChunkScope, DocumentStatus, MetaKey, NewChunk, NewDocument, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use tokio_util::sync::CancellationToken;
@@ -99,8 +101,7 @@ fn writer_of(db: &WorkspaceDb) -> Writer {
 /// One ready document with `chunks` chunks, each with a vector of `width`.
 fn seed(db: &WorkspaceDb, chunks: u32, width: usize) {
     db.insert_document(
-        &NewDocument::new("d", "a.md", "text/markdown", 1)
-            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+        &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
     )
     .unwrap();
     let vector = vec![1.0_f32; width];

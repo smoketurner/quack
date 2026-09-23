@@ -77,13 +77,14 @@ macro_rules! text_enum {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Display;
+    use std::fmt::{Debug, Display};
     use std::str::FromStr;
 
     use serde::Serialize;
+    use serde_json::Value;
 
     use crate::analysis::chart::ChartKind;
-    use crate::doctor;
+    use crate::doctor::{Area, Status};
     use crate::error::{Error, Record};
     use crate::graph::ExtractSource;
     use crate::graph::resolve::{MergeDecision, MergeStatus};
@@ -98,12 +99,12 @@ mod tests {
     /// Every value's text form is its serde name, and reads back.
     fn round_trips<T>(all: &[T])
     where
-        T: Copy + PartialEq + std::fmt::Debug + Display + FromStr<Err = Error> + Serialize,
+        T: Copy + PartialEq + Debug + Display + FromStr<Err = Error> + Serialize,
     {
         for &value in all {
             assert_eq!(
                 serde_json::to_value(value).ok(),
-                Some(serde_json::Value::String(value.to_string())),
+                Some(Value::String(value.to_string())),
                 "{value:?}"
             );
         }
@@ -114,7 +115,7 @@ mod tests {
     /// `Display` honors width.
     fn text_round_trips<T>(all: &[T])
     where
-        T: Copy + PartialEq + std::fmt::Debug + Display + FromStr<Err = Error>,
+        T: Copy + PartialEq + Debug + Display + FromStr<Err = Error>,
     {
         for &value in all {
             let text = value.to_string();
@@ -151,8 +152,8 @@ mod tests {
         round_trips(AuditAction::ALL);
         round_trips(ResourceKind::ALL);
         text_round_trips(Record::ALL);
-        text_round_trips(doctor::Status::ALL);
-        text_round_trips(doctor::Area::ALL);
+        text_round_trips(Status::ALL);
+        text_round_trips(Area::ALL);
         text_round_trips(MetaKey::ALL);
         text_round_trips(ConceptType::ALL);
     }

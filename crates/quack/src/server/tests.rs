@@ -20,10 +20,11 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState};
+use quack_core::jobs::LaneKey;
 use quack_core::storage::control::{
     AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope,
 };
-use quack_core::storage::workspace::{NewChunk, NewDocument};
+use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -3522,9 +3523,7 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
         JobSpec::new(JobKind::Chat, "what is our churn?")
             .workspace(ws.clone())
             .owner(Some(member.clone()))
-            .lane(Lane::serial(&quack_core::jobs::LaneKey::Session(
-                String::from("s"),
-            ))),
+            .lane(Lane::serial(&LaneKey::Session(String::from("s")))),
         |ctx| async move {
             ctx.cancel_token().cancelled().await;
             Err(String::from("cancelled"))
@@ -3607,7 +3606,7 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
     let ws = h.workspace("busy", &owner).await;
     let token = h.login("owner").await;
     let release = quack_core::llm::CancellationToken::new();
-    let lane = quack_core::jobs::LaneKey::Ingest(ws.clone());
+    let lane = LaneKey::Ingest(ws.clone());
     for n in 0..crate::server::queue::MAX_WAITING_UPLOADS {
         let release = release.clone();
         h.app.jobs.submit(
@@ -3771,8 +3770,7 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         .unwrap_or_else(|e| fail(&e.message));
     db.run(|db| {
         db.insert_document(
-            &NewDocument::new("d", "a.md", "text/markdown", 1)
-                .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
         )?;
         db.insert_chunk(&NewChunk {
             id: "c",

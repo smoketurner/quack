@@ -8,8 +8,10 @@
 
 use std::collections::BTreeMap;
 
-use super::{Class, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation};
-use crate::error::{Error, Result};
+use super::{
+    Class, Mapping, MappingRelation, Ontology, Property, PropertyType, ROOT_CLASS, Relation,
+};
+use crate::error::{Error, Record, Result};
 use crate::storage::workspace::WorkspaceDb;
 
 /// A stored version's header.
@@ -74,7 +76,7 @@ pub fn current(db: &WorkspaceDb) -> Result<Option<Ontology>> {
             id: row.get(0)?,
             parent: row
                 .get::<_, Option<String>>(1)?
-                .unwrap_or_else(|| String::from(super::ROOT_CLASS)),
+                .unwrap_or_else(|| String::from(ROOT_CLASS)),
             label: row.get(2)?,
             description: row.get(3)?,
             key: row.get(4)?,
@@ -391,8 +393,8 @@ fn check_mappings(db: &WorkspaceDb, ontology: &Ontology) -> Result<()> {
 ///
 /// Returns an error when the version does not exist or the save fails.
 pub fn restore(db: &WorkspaceDb, target: u32, author: Option<&str>) -> Result<Ontology> {
-    let snapshot = version(db, target)?
-        .ok_or_else(|| crate::error::Record::OntologyVersion.missing(target.to_string()))?;
+    let snapshot =
+        version(db, target)?.ok_or_else(|| Record::OntologyVersion.missing(target.to_string()))?;
     save(
         db,
         &snapshot,

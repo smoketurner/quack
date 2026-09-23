@@ -8,6 +8,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::embedding::{Input, Vector};
+use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphResult, extract, resolve, store as graph_store, tables,
     traverse,
@@ -536,7 +537,7 @@ pub(crate) async fn merges(
 #[derive(Deserialize)]
 pub(crate) struct DecideMerge {
     /// `accept` or `reject`; anything else is refused while the body is read.
-    pub action: resolve::MergeDecision,
+    pub action: MergeDecision,
 }
 
 pub(crate) async fn decide_merge(
@@ -560,7 +561,7 @@ pub(crate) async fn decide_merge(
             AuditAction::GraphMerge,
             Some(ResourceKind::GraphMerge.id(&mid)),
             Outcome::Allowed,
-            Some(serde_json::json!({ "accept": decision == resolve::MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
+            Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
         )
         .await?;
     Ok(Json(serde_json::to_value(proposal)?))

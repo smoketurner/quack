@@ -1,3 +1,6 @@
+use std::fmt;
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,7 +38,7 @@ pub enum Error {
          needs no model)",
         config_file.display()
     )]
-    NoChatModel { config_file: std::path::PathBuf },
+    NoChatModel { config_file: PathBuf },
 
     /// A record the caller named does not exist.
     #[error("{record} '{id}' does not exist")]
@@ -43,7 +46,7 @@ pub enum Error {
 
     /// Another process holds the workspace file open.
     #[error("workspace file {} is open in another quack process", path.display())]
-    WorkspaceLocked { path: std::path::PathBuf },
+    WorkspaceLocked { path: PathBuf },
 
     /// The workspace's writer thread is gone, so no write can run.
     #[error("the workspace writer has stopped")]
@@ -117,8 +120,8 @@ pub enum AuthReason {
     RefreshFailed(String),
 }
 
-impl std::fmt::Display for AuthReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for AuthReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoToken => f.write_str("no token is cached"),
             Self::ExpiredNoRefresh => {

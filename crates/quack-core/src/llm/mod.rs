@@ -17,11 +17,11 @@ use crate::analysis::agent::{self, AgentResponse};
 use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
-use crate::analysis::tools::{ReaderDb, SharedDb};
+use crate::analysis::tools::{ReaderDb, SharedDb, with_db};
 use crate::config::config_file_path;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::embedding::{Embedder, Input, Profile};
-use crate::error::{Error, Result};
+use crate::error::{Error, Record, Result};
 use crate::graph::extract as graph_extract;
 use crate::ontology::{Ontology, documents};
 use crate::priority::{Priority, with_priority};
@@ -282,9 +282,7 @@ pub async fn stream_answer(
     use futures::StreamExt;
     use rig::streaming::StreamedAssistantContent;
     let collect = async {
-        let mut stream = agent
-            .stream_chat(text, Vec::<rig::message::Message>::new())
-            .await;
+        let mut stream = agent.stream_chat(text, Vec::<Message>::new()).await;
         let mut answer = String::new();
         let mut final_text: Option<String> = None;
         while let Some(item) = stream.next().await {
@@ -847,7 +845,7 @@ pub async fn run_turn(
     };
 
     let (session, text, recorded) = (session_id.to_owned(), message.to_owned(), response.clone());
-    crate::analysis::tools::with_db(&db, move |guard| {
+    with_db(&db, move |guard| {
         sessions::record_turn(guard, &session, &text, &recorded)
     })
     .await?;
@@ -861,7 +859,7 @@ struct StartedTurn<'c> {
     embedding_model: Option<Embeddings>,
     prompt: PromptOptions,
     /// The session's earlier messages, replayed to the model.
-    history: Vec<rig::message::Message>,
+    history: Vec<Message>,
 }
 
 async fn start_turn<'c>(
@@ -882,9 +880,9 @@ async fn start_turn<'c>(
     let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
         .then_some(config.analysis.max_context_tokens);
     let history_budget = config.analysis.history_token_budget;
-    let (prompt, history) = crate::analysis::tools::with_db(db, move |guard| {
+    let (prompt, history) = with_db(db, move |guard| {
         let session = sessions::get_session(guard, &session_id)?
-            .ok_or_else(|| crate::error::Record::Session.missing(session_id.as_str()))?;
+            .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
         let prompt = PromptOptions {
             mode: session.mode,
             write_policy: policy,
@@ -922,7 +920,7 @@ async fn dispatch(
     embedding_model: Option<Embeddings>,
     policy: WritePolicy,
     prompt: PromptOptions,
-    history: Vec<rig::message::Message>,
+    history: Vec<Message>,
     message: &str,
     sink: EventSink,
 ) -> Result<AgentResponse> {

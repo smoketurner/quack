@@ -240,7 +240,7 @@ impl From<std::fmt::Error> for ToolError {
 /// `Error::Analysis` already reads as `"analysis error: ..."`, so wrapping
 /// it again in `ToolError::Query` would show the model
 /// `"query error: analysis error: ..."`.
-fn tool_error(e: crate::error::Error) -> ToolError {
+fn tool_error(e: Error) -> ToolError {
     match e {
         Error::Analysis(msg) => ToolError::Analysis(msg),
         other => ToolError::Query(other.to_string()),
@@ -1263,7 +1263,7 @@ mod tests {
 
     use super::*;
     use crate::embedding::{Dimension, Profile, Prompts};
-    use crate::storage::workspace::NewDocument;
+    use crate::storage::workspace::{DocumentStatus, NewDocument};
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail_test(msg: &str) -> ! {
@@ -1374,7 +1374,7 @@ mod tests {
         db.run(|guard| {
             guard.insert_document(
                 &NewDocument::new("d", "storms.md", "text/markdown", 1)
-                    .with_status(crate::storage::workspace::DocumentStatus::Ready),
+                    .with_status(DocumentStatus::Ready),
             )?;
             for (i, text) in [
                 "Hail fell on Denver.",
@@ -1405,7 +1405,7 @@ mod tests {
         assert!(
             db.insert_document(
                 &NewDocument::new("doc-1", "notes.md", "text/markdown", 1)
-                    .with_status(crate::storage::workspace::DocumentStatus::Ready)
+                    .with_status(DocumentStatus::Ready)
             )
             .is_ok()
         );
@@ -1624,14 +1624,14 @@ mod tests {
         assert!(
             db.insert_document(
                 &NewDocument::new("01a0-first", "policy.pdf", "application/pdf", 1)
-                    .with_status(crate::storage::workspace::DocumentStatus::Ready)
+                    .with_status(DocumentStatus::Ready)
             )
             .is_ok()
         );
         assert!(
             db.insert_document(
                 &NewDocument::new("01b0-second", "notes.md", "text/markdown", 1)
-                    .with_status(crate::storage::workspace::DocumentStatus::Ready)
+                    .with_status(DocumentStatus::Ready)
             )
             .is_ok()
         );
@@ -2031,7 +2031,7 @@ mod tests {
         db.run(|guard| {
             guard.insert_document(
                 &NewDocument::new("d", "storms.md", "text/markdown", 1)
-                    .with_status(crate::storage::workspace::DocumentStatus::Ready),
+                    .with_status(DocumentStatus::Ready),
             )?;
             for i in 0..(MAX_SEARCH_TOP_K * 2) {
                 guard.insert_chunk(&crate::storage::workspace::NewChunk {

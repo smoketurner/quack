@@ -14,6 +14,7 @@ use quack_core::jobs::{JobId, JobInfo, JobKind};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use tokio::sync::broadcast;
 
+use super::StreamEvent;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
@@ -142,7 +143,7 @@ pub(crate) async fn stream(
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Stream, "jobs").await?;
     let receiver = app.jobs.subscribe();
-    let first = super::StreamEvent::Jobs
+    let first = StreamEvent::Jobs
         .event()
         .json_data(visible_jobs(&app, &access))
         .unwrap_or_default();
@@ -154,7 +155,7 @@ pub(crate) async fn stream(
         loop {
             match receiver.recv().await {
                 Ok(job) if job.workspace_id.as_deref() == Some(&access.workspace.id) => {
-                    let event = super::StreamEvent::Job
+                    let event = StreamEvent::Job
                         .event()
                         .json_data(redact(&access, job))
                         .unwrap_or_default();
@@ -162,7 +163,7 @@ pub(crate) async fn stream(
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let event = super::StreamEvent::Jobs
+                    let event = StreamEvent::Jobs
                         .event()
                         .json_data(visible_jobs(&app, &access))
                         .unwrap_or_default();
