@@ -1,0 +1,31 @@
+# The .deb and .rpm packages published to packages.smoketurner.com, built by
+# reusable-build.yml's linux-packages job from the static musl binary it
+# unpacks into staging/. The binary links nothing at runtime, so neither
+# package declares dependencies. nfpm expands the ${...} variables from the
+# environment; an empty GPG_KEY_FILE (a dry run without the signing key)
+# leaves the RPM unsigned.
+name: quack
+arch: "${ARCH}"
+platform: linux
+version: "${VERSION}"
+section: utils
+priority: optional
+maintainer: "Smoke Turner <packages@smoketurner.com>"
+description: "Air-gapped knowledge engine: documents, tables, and a knowledge graph, with a web UI, REST API, and MCP server"
+vendor: "Smoke Turner, LLC"
+homepage: "https://github.com/smoketurner/quack"
+license: "Apache-2.0 OR MIT"
+
+rpm:
+  signature:
+    key_file: "${GPG_KEY_FILE}"
+
+contents:
+  - src: ./staging/quack
+    dst: /usr/bin/quack
+    file_info:
+      mode: 0755
+  - src: ./LICENSE-APACHE
+    dst: /usr/share/doc/quack/LICENSE-APACHE
+  - src: ./LICENSE-MIT
+    dst: /usr/share/doc/quack/LICENSE-MIT
