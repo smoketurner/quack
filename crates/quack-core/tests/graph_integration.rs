@@ -417,7 +417,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     graph_store::add_provenance(&db, &edge, &source).unwrap();
     assert_eq!(graph_store::status(&db).unwrap().nodes, 8);
 
-    assert!(db.delete_document("doc-2", None).unwrap());
+    assert!(db.delete_document("doc-2").unwrap());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (7, 6));
     assert!(graph_store::node(&db, &nowhere).unwrap().is_none());
@@ -438,7 +438,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     .unwrap();
     db.set_document_tables("doc-t", &[String::from("shipments")])
         .unwrap();
-    assert!(db.delete_document("doc-t", None).unwrap());
+    assert!(db.delete_document("doc-t").unwrap());
     assert!(db.list_tables().unwrap().is_empty());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (0, 0));

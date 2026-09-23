@@ -1596,11 +1596,7 @@ impl App {
             Side::Write,
             move |db| {
                 let doc = resolve_document(db, &prefix)?;
-                let table = ingestion::parser::detect_file_type(&doc.filename)
-                    .is_structured()
-                    .then(|| ingestion::table_name_for(&doc.filename));
-                db.delete_document(&doc.id, table.as_deref())
-                    .map(|_| doc.filename)
+                db.delete_document(&doc.id).map(|_| doc.filename)
             },
             |app, outcome| match outcome {
                 Ok(filename) => app.note(

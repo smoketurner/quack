@@ -1292,14 +1292,7 @@ fn run_docs(
     }
     if let Some(prefix) = delete {
         let id = find_document(db, prefix)?;
-        let filename = db
-            .document(&id)?
-            .map(|d| d.filename)
-            .context("document vanished")?;
-        let table = ingestion::parser::detect_file_type(&filename)
-            .is_structured()
-            .then(|| ingestion::table_name_for(&filename));
-        db.delete_document(&id, table.as_deref())?;
+        db.delete_document(&id)?;
     }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
