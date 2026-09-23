@@ -819,6 +819,28 @@ mod tests {
             .unwrap_or_else(|| fail("job forgotten"))
     }
 
+    /// Whether every lane is forgotten within a few seconds. A job reads as
+    /// finished just before it releases its lane slot (so the next job in the
+    /// lane cannot start first), and on a multi-threaded runtime the release
+    /// can land a moment after `finished` returns.
+    async fn lanes_drained(queue: &JobQueue) -> bool {
+        let empty = || {
+            queue
+                .inner
+                .lanes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     #[tokio::test]
     async fn jobs_run_report_and_finish() {
         let queue = JobQueue::new(10);
@@ -896,14 +918,7 @@ mod tests {
             vec![0, 1, 2]
         );
         // The lane is forgotten once nobody holds it.
-        assert!(
-            queue
-                .inner
-                .lanes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(lanes_drained(&queue).await);
 
         // A lane two wide runs two at once and queues the third; work
         // outside any lane is never held up by it.
@@ -964,14 +979,7 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(ran, sorted, "the lane ran out of order");
         assert!(ran.len() >= 49);
-        assert!(
-            queue
-                .inner
-                .lanes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(lanes_drained(&queue).await);
     }
 
     #[tokio::test]
