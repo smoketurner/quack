@@ -72,7 +72,7 @@ pub(crate) fn job_strip(app: &App) -> Vec<Line<'static>> {
             };
             let mut detail = String::new();
             if let Some(p) = job.progress {
-                detail = format!("  {}/{}", p.done, p.total);
+                detail = format!("  {p}");
             }
             if let Some(status) = job.status.as_deref() {
                 detail.push_str("  ");
