@@ -2031,32 +2031,23 @@ pub enum DocumentSource {
     Import,
 }
 
+text_enum!(DocumentSource, "document source", {
+    Upload => "upload",
+    Paste => "paste",
+    Path => "path",
+    Stdin => "stdin",
+    Import => "import",
+});
+
 impl DocumentSource {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Upload => "upload",
-            Self::Paste => "paste",
-            Self::Path => "path",
-            Self::Stdin => "stdin",
-            Self::Import => "import",
-        }
-    }
-
-    fn from_column(value: Option<&str>) -> Self {
-        match value {
-            Some("paste") => Self::Paste,
-            Some("path") => Self::Path,
-            Some("stdin") => Self::Stdin,
-            Some("import") => Self::Import,
-            _ => Self::Upload,
-        }
-    }
-}
-
-impl std::fmt::Display for DocumentSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+    /// The stored column: rows written before it existed are uploads; any
+    /// other unknown text is an error rather than a silent guess.
+    fn from_column(value: Option<String>) -> duckdb::Result<Self> {
+        value.map_or(Ok(Self::Upload), |text| {
+            text.parse().map_err(|e: Error| {
+                duckdb::Error::FromSqlConversionFailure(10, duckdb::types::Type::Text, Box::new(e))
+            })
+        })
     }
 }
 
@@ -2115,7 +2106,7 @@ fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
         ingested_at: row.get(7)?,
         title: row.get(8)?,
         sha256: row.get(9)?,
-        source: DocumentSource::from_column(row.get::<_, Option<String>>(10)?.as_deref()),
+        source: DocumentSource::from_column(row.get(10)?)?,
         chunk_count: row.get(11)?,
         ingested_by: row.get(12)?,
         tables: row
@@ -2913,6 +2904,28 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// A stored source reads back as written; a NULL (rows from before the
+    /// column) is an upload; anything else is an error, not a guess.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn document_sources_read_back_and_unknown_ones_are_refused() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap();
+        let mut doc = NewDocument::new("d1", "a.txt", "text/plain", 1);
+        doc.source = DocumentSource::Import;
+        db.insert_document(&doc).unwrap();
+        let read = db.document("d1").unwrap().map(|d| d.source);
+        assert_eq!(read, Some(DocumentSource::Import));
+        db.connection()
+            .execute("UPDATE _quack_documents SET source = NULL", [])
+            .unwrap();
+        let read = db.document("d1").unwrap().map(|d| d.source);
+        assert_eq!(read, Some(DocumentSource::Upload));
+        db.connection()
+            .execute("UPDATE _quack_documents SET source = 'fax'", [])
+            .unwrap();
+        assert!(db.document("d1").is_err());
     }
 
     fn config_in(dir: &Path) -> crate::config::Config {

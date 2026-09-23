@@ -40,7 +40,7 @@ pub(crate) enum TokenAction {
         name: String,
         /// Comma-separated scopes: read, write, admin
         #[arg(long, default_value = "read", value_delimiter = ',')]
-        scopes: Vec<String>,
+        scopes: Vec<Scope>,
         /// Expire after this many days
         #[arg(long, value_name = "DAYS")]
         expires: Option<u32>,
@@ -60,7 +60,7 @@ pub(crate) enum MemberAction {
     Add {
         username: String,
         #[arg(long, default_value = "member")]
-        role: String,
+        role: Role,
     },
     /// Remove a user from the workspace
     Remove { username: String },
@@ -84,7 +84,7 @@ pub(crate) struct AuditArgs {
     action: Option<String>,
     /// Filter by outcome: allowed, denied, error
     #[arg(long)]
-    outcome: Option<String>,
+    outcome: Option<Outcome>,
     /// Rows at or after this time (YYYY-MM-DD HH:MM:SS, UTC)
     #[arg(long)]
     since: Option<String>,
@@ -172,7 +172,7 @@ pub(crate) async fn run_token(
 fn scope_list(scopes: &[Scope]) -> String {
     scopes
         .iter()
-        .map(|s| format!("{s:?}").to_ascii_lowercase())
+        .map(|s| s.as_str())
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -182,17 +182,13 @@ async fn create_token(
     ws: &WorkspaceRow,
     user: &str,
     name: &str,
-    scopes: &[String],
+    scopes: &[Scope],
     expires: Option<u32>,
 ) -> Result<()> {
     let user_row = control
         .find_user_by_username(user)
         .await?
         .with_context(|| format!("no user named '{user}'"))?;
-    let scopes = scopes
-        .iter()
-        .map(|s| Scope::parse(s))
-        .collect::<quack_core::error::Result<Vec<_>>>()?;
     let expires_at = expires
         .map(|days| {
             jiff::Timestamp::now()
@@ -204,7 +200,7 @@ async fn create_token(
         .transpose()
         .context("expiry is too far in the future")?;
     let (token, row) = control
-        .create_token(&ws.id, &user_row.id, name, &scopes, expires_at.as_deref())
+        .create_token(&ws.id, &user_row.id, name, scopes, expires_at.as_deref())
         .await?;
     let mut entry = AuditEntry::new("token", Outcome::Allowed, Channel::Cli);
     entry.workspace_id = Some(ws.id.clone());
@@ -300,7 +296,6 @@ pub(crate) async fn run_member(
                 .find_user_by_username(&username)
                 .await?
                 .with_context(|| format!("no user named '{username}'"))?;
-            let role = Role::parse(&role)?;
             control.set_member(&ws.id, &user.id, role).await?;
             audit_member(&control, &ws, &user.id).await?;
             let mut out = stdout.lock();
@@ -503,6 +498,57 @@ fn read_hidden_line() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(clap::Parser)]
+    #[command(no_binary_name = true)]
+    enum Line {
+        #[command(subcommand)]
+        Token(TokenAction),
+        #[command(subcommand)]
+        Member(MemberAction),
+        Audit(AuditArgs),
+    }
+
+    /// Roles, scopes, and outcomes are checked by clap as they are typed,
+    /// with the values each accepts.
+    #[test]
+    fn roles_scopes_and_outcomes_parse_at_the_command_line() {
+        let parse = |args: &[&str]| <Line as clap::Parser>::try_parse_from(args);
+        assert!(matches!(
+            parse(&["member", "add", "ann", "--role", "Owner"]),
+            Ok(Line::Member(MemberAction::Add {
+                role: Role::Owner,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(&["token", "create", "--user", "u", "--name", "n", "--scopes", "read,write"]),
+            Ok(Line::Token(TokenAction::Create { scopes, .. }))
+                if scopes == [Scope::Read, Scope::Write]
+        ));
+        assert!(matches!(
+            parse(&["audit", "--outcome", "denied"]),
+            Ok(Line::Audit(AuditArgs {
+                outcome: Some(Outcome::Denied),
+                ..
+            }))
+        ));
+        let refused = parse(&["member", "add", "ann", "--role", "boss"])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("use one of: viewer, member, owner"),
+            "{refused}"
+        );
+        assert!(
+            parse(&[
+                "token", "create", "--user", "u", "--name", "n", "--scopes", "root"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["audit", "--outcome", "maybe"]).is_err());
+    }
 
     #[test]
     fn csv_fields_are_quoted_only_when_needed() {

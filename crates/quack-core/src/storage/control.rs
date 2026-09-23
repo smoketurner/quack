@@ -79,38 +79,11 @@ pub enum Role {
     Owner,
 }
 
-impl Role {
-    /// Parse `viewer`, `member`, or `owner`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `Config` error for any other text.
-    pub fn parse(text: &str) -> Result<Self> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "viewer" => Ok(Self::Viewer),
-            "member" => Ok(Self::Member),
-            "owner" => Ok(Self::Owner),
-            other => Err(Error::Config(format!(
-                "unknown role '{other}'; use viewer, member, or owner"
-            ))),
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Viewer => "viewer",
-            Self::Member => "member",
-            Self::Owner => "owner",
-        }
-    }
-}
-
-impl std::fmt::Display for Role {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+text_enum!(Role, "role", {
+    Viewer => "viewer",
+    Member => "member",
+    Owner => "owner",
+});
 
 /// One membership, with the username for listings.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -131,23 +104,11 @@ pub enum Scope {
     Admin,
 }
 
-impl Scope {
-    /// Parse `read`, `write`, or `admin`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `Config` error for any other text.
-    pub fn parse(text: &str) -> Result<Self> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "read" => Ok(Self::Read),
-            "write" => Ok(Self::Write),
-            "admin" => Ok(Self::Admin),
-            other => Err(Error::Config(format!(
-                "unknown scope '{other}'; use read, write, or admin"
-            ))),
-        }
-    }
-}
+text_enum!(Scope, "scope", {
+    Read => "read",
+    Write => "write",
+    Admin => "admin",
+});
 
 /// An API token row; the token itself is shown once at creation.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -221,16 +182,11 @@ pub enum Outcome {
     Error,
 }
 
-impl Outcome {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Allowed => "allowed",
-            Self::Denied => "denied",
-            Self::Error => "error",
-        }
-    }
-}
+text_enum!(Outcome, "outcome", {
+    Allowed => "allowed",
+    Denied => "denied",
+    Error => "error",
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -243,19 +199,14 @@ pub enum Channel {
     Cli,
 }
 
-impl Channel {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Web => "web",
-            Self::Api => "api",
-            Self::Mcp => "mcp",
-            Self::Tui => "tui",
-            Self::Desktop => "desktop",
-            Self::Cli => "cli",
-        }
-    }
-}
+text_enum!(Channel, "channel", {
+    Web => "web",
+    Api => "api",
+    Mcp => "mcp",
+    Tui => "tui",
+    Desktop => "desktop",
+    Cli => "cli",
+});
 
 /// A stored access-audit row.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -268,8 +219,8 @@ pub struct AuditRow {
     pub action: String,
     pub resource_type: Option<String>,
     pub resource_id: Option<String>,
-    pub outcome: String,
-    pub channel: String,
+    pub outcome: Outcome,
+    pub channel: Channel,
     pub client_addr: Option<String>,
     pub request_id: Option<String>,
 }
@@ -280,7 +231,7 @@ pub struct AuditFilter {
     pub user_id: Option<String>,
     pub workspace_id: Option<String>,
     pub action: Option<String>,
-    pub outcome: Option<String>,
+    pub outcome: Option<Outcome>,
     /// Inclusive lower bound on `timestamp` (SQLite text form).
     pub since: Option<String>,
     /// Exclusive upper bound on `timestamp`.
@@ -603,7 +554,7 @@ impl ControlPlane {
         rows.iter()
             .map(|r| {
                 let role: String = r.try_get("role")?;
-                Ok((Self::workspace_from_row(r)?, Role::parse(&role)?))
+                Ok((Self::workspace_from_row(r)?, role.parse::<Role>()?))
             })
             .collect()
     }
@@ -828,7 +779,7 @@ impl ControlPlane {
             .await?;
         row.map(|r| {
             let role: String = r.try_get("role")?;
-            Role::parse(&role)
+            role.parse::<Role>()
         })
         .transpose()
     }
@@ -865,7 +816,7 @@ impl ControlPlane {
                     workspace_id: r.try_get("workspace_id")?,
                     user_id: r.try_get("user_id")?,
                     username: r.try_get("username")?,
-                    role: Role::parse(&role)?,
+                    role: role.parse::<Role>()?,
                     created_at: r.try_get("created_at")?,
                 })
             })
@@ -1094,8 +1045,8 @@ impl ControlPlane {
                     action: r.try_get("action")?,
                     resource_type: r.try_get("resource_type")?,
                     resource_id: r.try_get("resource_id")?,
-                    outcome: r.try_get("outcome")?,
-                    channel: r.try_get("channel")?,
+                    outcome: r.try_get::<String, _>("outcome")?.parse()?,
+                    channel: r.try_get::<String, _>("channel")?.parse()?,
                     client_addr: r.try_get("client_addr")?,
                     request_id: r.try_get("request_id")?,
                 })
@@ -1136,7 +1087,7 @@ fn audit_query_sql(filter: &AuditFilter) -> String {
     if let Some(v) = &filter.action {
         select.and_where(Expr::col(AuditLog::Action).eq(v.as_str()));
     }
-    if let Some(v) = &filter.outcome {
+    if let Some(v) = filter.outcome {
         select.and_where(Expr::col(AuditLog::Outcome).eq(v.as_str()));
     }
     if let Some(v) = &filter.since {
@@ -1402,7 +1353,7 @@ mod tests {
                 .is_ok_and(|removed| !removed)
         );
         assert!(Role::Viewer < Role::Member && Role::Member < Role::Owner);
-        assert!(Role::parse("boss").is_err());
+        assert!("boss".parse::<Role>().is_err());
     }
 
     #[tokio::test]
@@ -1456,7 +1407,7 @@ mod tests {
                 .await
                 .is_ok_and(|t| t.is_none())
         );
-        assert!(Scope::parse("root").is_err());
+        assert!("root".parse::<Scope>().is_err());
     }
 
     #[tokio::test]
@@ -1481,7 +1432,7 @@ mod tests {
         assert!(all.is_ok_and(|r| r.len() == 3 && r.first().is_some_and(|r| r.action == "login")));
         let denied_only = cp
             .query_audit(&AuditFilter {
-                outcome: Some(String::from("denied")),
+                outcome: Some(Outcome::Denied),
                 limit: 10,
                 ..AuditFilter::default()
             })

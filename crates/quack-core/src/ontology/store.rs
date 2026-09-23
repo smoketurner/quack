@@ -90,7 +90,7 @@ pub fn current(db: &WorkspaceDb) -> Result<Option<Ontology>> {
         let id: String = row.get(0)?;
         let class_id: String = row.get(1)?;
         let label: Option<String> = row.get(2)?;
-        let kind = PropertyType::parse(&row.get::<_, String>(3)?)?;
+        let kind: PropertyType = row.get::<_, String>(3)?.parse()?;
         let values: Option<String> = row.get(4)?;
         let values: Vec<String> = values
             .map(|v| serde_json::from_str(&v))

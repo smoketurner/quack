@@ -70,7 +70,8 @@ pub(crate) async fn list(
 
 /// The job, if it belongs to this workspace.
 fn find(app: &App, workspace_id: &str, job: &str) -> ApiResult<JobInfo> {
-    JobId::parse(job)
+    job.parse::<JobId>()
+        .ok()
         .and_then(|id| app.jobs.get(id))
         .filter(|j| j.workspace_id.as_deref() == Some(workspace_id))
         .ok_or_else(|| ApiError::not_found(format!("job '{job}' not found")))

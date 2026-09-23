@@ -49,7 +49,7 @@ pub(crate) struct AuditQuery {
     pub user_id: Option<String>,
     pub workspace_id: Option<String>,
     pub action: Option<String>,
-    pub outcome: Option<String>,
+    pub outcome: Option<Outcome>,
     pub since: Option<String>,
     pub until: Option<String>,
     #[serde(default = "default_limit")]

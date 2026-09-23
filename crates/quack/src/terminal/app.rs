@@ -1478,12 +1478,12 @@ impl App {
             );
             return;
         }
-        let Some(mode) = ChatMode::parse(args) else {
-            self.note(
-                MessageRole::Error,
-                format!("unknown mode '{args}'; use chat or query"),
-            );
-            return;
+        let mode = match args.parse::<ChatMode>() {
+            Ok(mode) => mode,
+            Err(e) => {
+                self.note(MessageRole::Error, e.to_string());
+                return;
+            }
         };
         // A question typed right after must start in the new mode.
         self.switching.get_or_insert_with(VecDeque::new);

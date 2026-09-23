@@ -80,7 +80,9 @@ impl From<CoreError> for ApiError {
             CoreError::Config(_) | CoreError::UnsupportedFileType(_) | CoreError::Ontology(_) => {
                 StatusCode::BAD_REQUEST
             }
-            CoreError::Analysis(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            CoreError::Analysis(_) | CoreError::UnknownValue { .. } => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             // A request is never cancelled through its own handler today (only
             // background jobs are); should one be, it lost to a later action.
             CoreError::TableTaken { .. } | CoreError::Cancelled => StatusCode::CONFLICT,

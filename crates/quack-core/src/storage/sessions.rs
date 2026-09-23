@@ -13,7 +13,17 @@ use crate::error::{Error, Result};
 use super::workspace::WorkspaceDb;
 
 /// How the agent may answer in a session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatMode {
     /// General knowledge allowed; cite when a source was used.
@@ -24,31 +34,7 @@ pub enum ChatMode {
     Query,
 }
 
-impl ChatMode {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Chat => "chat",
-            Self::Query => "query",
-        }
-    }
-
-    /// Parse `chat` or `query`, case-insensitively.
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "chat" => Some(Self::Chat),
-            "query" => Some(Self::Query),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for ChatMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+text_enum!(ChatMode, "mode", { Chat => "chat", Query => "query" });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,24 +44,11 @@ pub enum MessageRole {
     Tool,
 }
 
-impl MessageRole {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Tool => "tool",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "user" => Ok(Self::User),
-            "assistant" => Ok(Self::Assistant),
-            "tool" => Ok(Self::Tool),
-            other => Err(Error::Analysis(format!("unknown message role '{other}'"))),
-        }
-    }
-}
+text_enum!(MessageRole, "message role", {
+    User => "user",
+    Assistant => "assistant",
+    Tool => "tool",
+});
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionRow {
@@ -116,7 +89,7 @@ fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
     Ok(SessionRow {
         id: row.get(0)?,
         title: row.get(1)?,
-        mode: ChatMode::parse(&mode).unwrap_or_default(),
+        mode: mode.parse().unwrap_or_default(),
         model: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
@@ -322,7 +295,7 @@ pub fn messages(db: &WorkspaceDb, session_id: &str) -> Result<Vec<MessageRow>> {
             id: row.get(0)?,
             session_id: row.get(1)?,
             seq: row.get(2)?,
-            role: MessageRole::parse(&role)?,
+            role: role.parse()?,
             content: row.get(4)?,
             metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
             created_at: row.get(6)?,
