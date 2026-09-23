@@ -31,7 +31,9 @@ use quack_core::analysis::citations::Citation;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
-use quack_core::jobs::{JobContext, JobId, JobInfo, JobKind, JobQueue, JobSpec, JobState, Lane};
+use quack_core::jobs::{
+    JobContext, JobId, JobInfo, JobKind, JobQueue, JobSpec, JobState, Lane, LaneKey,
+};
 use quack_core::llm::{self, CancellationToken};
 use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
@@ -696,7 +698,7 @@ impl App {
             AgentEvent::Failed(err) => {
                 turn.ended = true;
                 let text = if visible {
-                    err
+                    err.message
                 } else {
                     format!(
                         "Job #{} in session {} failed: {err}",
@@ -2180,7 +2182,7 @@ impl App {
         let allow_write = Arc::clone(&self.allow_write);
         let spec = JobSpec::new(JobKind::Chat, one_line(&message))
             .workspace(self.workspace_id.clone())
-            .lane(Lane::serial(format!("session:{session_id}")));
+            .lane(Lane::serial(&LaneKey::Session(session_id.clone())));
         let job = self.jobs.submit(spec, move |ctx| async move {
             // Read when the turn starts, so an `a` answered while it
             // waited applies to it.
@@ -2772,7 +2774,8 @@ mod tests {
     /// A turn for a job that waits until it is cancelled.
     fn waiting_turn(app: &mut App) -> Turn {
         let job = app.jobs.submit(
-            JobSpec::new(JobKind::Chat, "question").lane(Lane::serial("session:test")),
+            JobSpec::new(JobKind::Chat, "question")
+                .lane(Lane::serial(&LaneKey::Session(String::from("test")))),
             |ctx| async move {
                 ctx.cancel_token().cancelled().await;
                 Err(String::from("cancelled"))
@@ -3202,7 +3205,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
         use quack_core::config::{AuthMode, ProviderConfig, ProviderType};
-        use quack_core::storage::workspace::{NewChunk, NewDocument};
+        use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
         // Without an embedding model the job says what is missing.
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -3241,7 +3244,8 @@ mod tests {
         app.db
             .run(|db| {
                 db.insert_document(
-                    &NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"),
+                    &NewDocument::new("d", "a.md", "text/markdown", 1)
+                        .with_status(DocumentStatus::Ready),
                 )?;
                 db.insert_chunk(&NewChunk {
                     id: "c",

@@ -303,7 +303,7 @@ async fn ingest_tables(
 
 fn list_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(std::result::Result::ok)
+        .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == extension))
         .collect();

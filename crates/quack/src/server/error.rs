@@ -4,6 +4,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use quack_core::analysis::events::{FailureKind, TurnFailure};
 use quack_core::error::Error as CoreError;
 
 #[derive(Debug)]
@@ -75,11 +76,16 @@ impl IntoResponse for ApiError {
 impl From<CoreError> for ApiError {
     fn from(err: CoreError) -> Self {
         let status = match &err {
-            CoreError::AuthRequired { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            CoreError::WorkspaceNotFound(_) => StatusCode::NOT_FOUND,
-            CoreError::Config(_) | CoreError::UnsupportedFileType(_) | CoreError::Ontology(_) => {
-                StatusCode::BAD_REQUEST
+            // The request is fine; the server cannot serve it until a login
+            // happens or another process lets go of the workspace file.
+            CoreError::AuthRequired { .. } | CoreError::WorkspaceLocked { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
             }
+            CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+            CoreError::Config(_)
+            | CoreError::NoChatModel { .. }
+            | CoreError::UnsupportedFileType(_)
+            | CoreError::Ontology(_) => StatusCode::BAD_REQUEST,
             CoreError::Analysis(_) | CoreError::UnknownValue { .. } => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -95,9 +101,24 @@ impl From<CoreError> for ApiError {
             | CoreError::TomlParse(_)
             | CoreError::Json(_)
             | CoreError::SeaQuery(_)
-            | CoreError::Fmt(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | CoreError::Fmt(_)
+            | CoreError::WriterStopped
+            | CoreError::WritePanicked(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, err.to_string())
+    }
+}
+
+/// A failed agent turn, answered by what kind of failure it was.
+impl From<TurnFailure> for ApiError {
+    fn from(failure: TurnFailure) -> Self {
+        let status = match failure.kind {
+            FailureKind::AuthRequired => StatusCode::SERVICE_UNAVAILABLE,
+            FailureKind::NoChatModel => StatusCode::BAD_REQUEST,
+            FailureKind::NotFound => StatusCode::NOT_FOUND,
+            FailureKind::Other => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(status, failure.message)
     }
 }
 

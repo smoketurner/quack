@@ -2,6 +2,29 @@
 //! typed at a prompt, or sent over the API: `as_str`, `Display`, `FromStr`,
 //! and `ALL`, generated from a single list so the four cannot disagree.
 
+/// Store a [`text_enum!`] enum in a `DuckDB` column as its text form: bound
+/// as a parameter, and read back through `FromStr`, so an unknown stored
+/// value is a conversion error rather than a guess.
+macro_rules! text_enum_sql {
+    ($name:ident) => {
+        impl ::duckdb::ToSql for $name {
+            fn to_sql(&self) -> ::duckdb::Result<::duckdb::types::ToSqlOutput<'_>> {
+                Ok(::duckdb::types::ToSqlOutput::from(self.as_str()))
+            }
+        }
+
+        impl ::duckdb::types::FromSql for $name {
+            fn column_result(
+                value: ::duckdb::types::ValueRef<'_>,
+            ) -> ::duckdb::types::FromSqlResult<Self> {
+                value.as_str()?.parse().map_err(|e: $crate::error::Error| {
+                    ::duckdb::types::FromSqlError::Other(Box::new(e))
+                })
+            }
+        }
+    };
+}
+
 /// Implement `as_str`, `ALL`, `Display`, and `FromStr` for a fieldless,
 /// `Copy` enum from its variants' text forms, which must be the names its
 /// serde attributes give. Parsing trims and ignores ASCII case; anything
@@ -24,7 +47,7 @@ macro_rules! text_enum {
 
         impl ::std::fmt::Display for $name {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                f.write_str(self.as_str())
+                f.pad(self.as_str())
             }
         }
 
@@ -54,31 +77,49 @@ macro_rules! text_enum {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Display;
+    use std::fmt::{Debug, Display};
     use std::str::FromStr;
 
     use serde::Serialize;
+    use serde_json::Value;
 
     use crate::analysis::chart::ChartKind;
-    use crate::error::Error;
+    use crate::doctor::{Area, Status};
+    use crate::error::{Error, Record};
+    use crate::graph::ExtractSource;
+    use crate::graph::resolve::{MergeDecision, MergeStatus};
+    use crate::okf::ConceptType;
     use crate::ontology::PropertyType;
-    use crate::storage::control::{Channel, Outcome, Role, Scope};
+    use crate::ontology::candidates::{CandidateAction, CandidateStatus, Queue};
+    use crate::ontology::induction::ItemKind;
+    use crate::storage::control::{AuditAction, Channel, Outcome, ResourceKind, Role, Scope};
     use crate::storage::sessions::{ChatMode, MessageRole};
-    use crate::storage::workspace::DocumentSource;
+    use crate::storage::workspace::{DocumentSource, DocumentStatus, MetaKey};
 
-    /// Every value's text form is its serde name, and reads back, trimmed
-    /// and in any case.
+    /// Every value's text form is its serde name, and reads back.
     fn round_trips<T>(all: &[T])
     where
-        T: Copy + PartialEq + std::fmt::Debug + Display + FromStr<Err = Error> + Serialize,
+        T: Copy + PartialEq + Debug + Display + FromStr<Err = Error> + Serialize,
+    {
+        for &value in all {
+            assert_eq!(
+                serde_json::to_value(value).ok(),
+                Some(Value::String(value.to_string())),
+                "{value:?}"
+            );
+        }
+        text_round_trips(all);
+    }
+
+    /// Every value's text form reads back, trimmed and in any case, and
+    /// `Display` honors width.
+    fn text_round_trips<T>(all: &[T])
+    where
+        T: Copy + PartialEq + Debug + Display + FromStr<Err = Error>,
     {
         for &value in all {
             let text = value.to_string();
-            assert_eq!(
-                serde_json::to_value(value).ok(),
-                Some(serde_json::Value::String(text.clone())),
-                "{value:?}"
-            );
+            assert_eq!(format!("{value:>30}"), format!("{text:>30}"));
             assert_eq!(text.parse::<T>().ok(), Some(value));
             assert_eq!(
                 format!("  {}  ", text.to_ascii_uppercase())
@@ -100,6 +141,21 @@ mod tests {
         round_trips(ChartKind::ALL);
         round_trips(PropertyType::ALL);
         round_trips(DocumentSource::ALL);
+        round_trips(DocumentStatus::ALL);
+        round_trips(MergeStatus::ALL);
+        round_trips(MergeDecision::ALL);
+        round_trips(CandidateStatus::ALL);
+        round_trips(Queue::ALL);
+        round_trips(CandidateAction::ALL);
+        round_trips(ItemKind::ALL);
+        round_trips(ExtractSource::ALL);
+        round_trips(AuditAction::ALL);
+        round_trips(ResourceKind::ALL);
+        text_round_trips(Record::ALL);
+        text_round_trips(Status::ALL);
+        text_round_trips(Area::ALL);
+        text_round_trips(MetaKey::ALL);
+        text_round_trips(ConceptType::ALL);
     }
 
     #[test]

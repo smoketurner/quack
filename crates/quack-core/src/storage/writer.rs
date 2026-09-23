@@ -97,8 +97,8 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// `f`'s error; [`Error::Analysis`] when `f` panicked or the writer has
-    /// stopped.
+    /// `f`'s error; [`Error::WritePanicked`] when `f` panicked, or
+    /// [`Error::WriterStopped`] when the writer has stopped.
     pub async fn run<T: Send + 'static>(
         &self,
         f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
@@ -118,7 +118,7 @@ impl Writer {
     ) -> Result<T> {
         let (answer, answered) = oneshot::channel();
         self.submit(priority, f, answer)?;
-        answered.await.unwrap_or_else(|_| Err(stopped()))
+        answered.await.unwrap_or_else(|_| Err(Error::WriterStopped))
     }
 
     /// Queue `f`; `reply` gets its outcome on the writer's thread.
@@ -128,23 +128,22 @@ impl Writer {
         f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
         reply: oneshot::Sender<Result<T>>,
     ) -> Result<()> {
-        let job: Job =
-            Box::new(move |db| {
-                let outcome = catch_unwind(AssertUnwindSafe(|| f(db))).unwrap_or_else(|panic| {
+        let job: Job = Box::new(move |db| {
+            let outcome = catch_unwind(AssertUnwindSafe(|| f(db))).unwrap_or_else(|panic| {
                 let what = panic
                     .downcast_ref::<&str>()
                     .map(|s| (*s).to_owned())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
                 tracing::error!(panic = %what, "a workspace write panicked; the writer carries on");
-                Err(Error::Analysis(format!("the workspace write failed: {what}")))
+                Err(Error::WritePanicked(what))
             });
-                // A caller that stopped waiting (a dropped future) is fine.
-                drop(reply.send(outcome));
-            });
+            // A caller that stopped waiting (a dropped future) is fine.
+            drop(reply.send(outcome));
+        });
         let mut lines = self.shared.lines();
         if lines.closed {
-            return Err(stopped());
+            return Err(Error::WriterStopped);
         }
         match priority {
             Priority::Interactive => lines.interactive.push_back(job),
@@ -203,10 +202,6 @@ impl Drop for Writer {
             tracing::error!("the workspace writer thread panicked");
         }
     }
-}
-
-fn stopped() -> Error {
-    Error::Analysis(String::from("the workspace writer has stopped"))
 }
 
 #[cfg(test)]
@@ -295,7 +290,9 @@ mod tests {
         let writer = writer();
         #[expect(clippy::panic, reason = "the panic under test")]
         let outcome = writer.run(|_| -> Result<()> { panic!("mid-write") }).await;
-        assert!(outcome.is_err_and(|e| e.to_string().contains("mid-write")));
+        assert!(outcome.is_err_and(
+            |e| matches!(&e, Error::WritePanicked(what) if what.contains("mid-write"))
+        ));
         assert!(writer.run(WorkspaceDb::list_tables).await.is_ok());
     }
 

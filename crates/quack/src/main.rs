@@ -1752,6 +1752,7 @@ fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quack_core::error::AuthReason;
 
     /// A closed reader surfaces as an `io::Error`, a `serde_json` error, or
     /// core's transparent `Io` and `Json` variants; each one ends the
@@ -1763,12 +1764,10 @@ mod tests {
         assert!(is_broken_pipe(
             &anyhow::Error::from(pipe()).context("failed to print")
         ));
-        assert!(is_broken_pipe(&anyhow::Error::from(
-            quack_core::error::Error::Io(pipe())
-        )));
-        assert!(is_broken_pipe(&anyhow::Error::from(
-            quack_core::error::Error::Json(serde_json::Error::io(pipe()))
-        )));
+        assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Io(pipe()))));
+        assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Json(
+            serde_json::Error::io(pipe())
+        ))));
         assert!(!is_broken_pipe(&anyhow::Error::from(std::io::Error::from(
             std::io::ErrorKind::NotFound
         ))));
@@ -1804,9 +1803,9 @@ mod tests {
     /// which is how `quack import` lost its exit 4.
     #[test]
     fn auth_required_is_recognised_through_context_only_while_typed() {
-        let auth = || quack_core::error::Error::AuthRequired {
+        let auth = || CoreError::AuthRequired {
             provider: String::from("corp"),
-            reason: String::from("no cached token"),
+            reason: AuthReason::NoToken,
         };
         assert!(auth_exit_code(&anyhow::Error::from(auth())).is_some());
         assert!(auth_exit_code(&anyhow::Error::from(auth()).context("import failed")).is_some());

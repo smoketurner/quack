@@ -22,7 +22,9 @@ use quack_core::embedding::{Input, Vector};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
-use quack_core::storage::control::{Outcome, WorkspaceRow};
+use quack_core::storage::control::{
+    AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
+};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{ChunkScope, StatementKind, WorkspaceDb};
 use rmcp::ErrorData as McpError;
@@ -62,8 +64,8 @@ impl Auditor {
     /// audited proceeds unlogged.
     async fn record(
         &self,
-        action: &str,
-        resource: Option<(&str, &str)>,
+        action: AuditAction,
+        resource: Option<AuditResource<'_>>,
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> Result<(), McpError> {
@@ -79,7 +81,7 @@ impl Auditor {
             .audit(&server.app, action, resource, outcome, detail)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e.message, action, "audit write failed");
+                tracing::error!(error = %e.message, %action, "audit write failed");
                 internal(format!("audit write failed: {}", e.message))
             })?;
         Ok(())
@@ -184,11 +186,88 @@ fn failure(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
-const RESOURCE_TABLES: &str = "quack://workspace/tables";
-const RESOURCE_DOCUMENTS: &str = "quack://workspace/documents";
-const RESOURCE_ONTOLOGY: &str = "quack://workspace/ontology";
-const RESOURCE_CONTEXT: &str = "quack://workspace/context";
-const RESOURCE_SCHEMA_TEMPLATE: &str = "quack://workspace/tables/{name}/schema";
+/// A `quack://workspace/...` resource: four fixed ones and one schema per table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceResource<'a> {
+    Tables,
+    Documents,
+    Ontology,
+    Context,
+    Schema(&'a str),
+}
+
+impl<'a> WorkspaceResource<'a> {
+    const PREFIX: &'static str = "quack://workspace/";
+    const SCHEMA_TEMPLATE: &'static str = "quack://workspace/tables/{name}/schema";
+    const FIXED: [WorkspaceResource<'static>; 4] = [
+        WorkspaceResource::Tables,
+        WorkspaceResource::Documents,
+        WorkspaceResource::Ontology,
+        WorkspaceResource::Context,
+    ];
+
+    fn parse(uri: &'a str) -> Option<Self> {
+        let path = uri.strip_prefix(Self::PREFIX)?;
+        match path {
+            "tables" => Some(Self::Tables),
+            "documents" => Some(Self::Documents),
+            "ontology" => Some(Self::Ontology),
+            "context" => Some(Self::Context),
+            _ => path
+                .strip_prefix("tables/")?
+                .strip_suffix("/schema")
+                .map(Self::Schema),
+        }
+    }
+
+    fn uri(self) -> String {
+        match self {
+            Self::Schema(table) => format!("{}tables/{table}/schema", Self::PREFIX),
+            Self::Tables | Self::Documents | Self::Ontology | Self::Context => {
+                format!("{}{}", Self::PREFIX, self.name())
+            }
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::Tables => String::from("tables"),
+            Self::Documents => String::from("documents"),
+            Self::Ontology => String::from("ontology"),
+            Self::Context => String::from("context"),
+            Self::Schema(table) => format!("{table} schema"),
+        }
+    }
+
+    fn description(self) -> String {
+        match self {
+            Self::Tables => String::from("The workspace's tables, as JSON"),
+            Self::Documents => {
+                String::from("The ingested documents with status, title, and source")
+            }
+            Self::Ontology => {
+                String::from("The ontology (classes, relations, properties, mappings) as JSON")
+            }
+            Self::Context => {
+                String::from("The owner's instructions and definitions for the agent, as Markdown")
+            }
+            Self::Schema(table) => format!("Columns, row count, and sample rows of {table}"),
+        }
+    }
+
+    fn mime_type(self) -> &'static str {
+        match self {
+            Self::Context => "text/markdown",
+            Self::Tables | Self::Documents | Self::Ontology | Self::Schema(_) => "application/json",
+        }
+    }
+
+    fn listing(self) -> Resource {
+        Resource::new(self.uri(), self.name())
+            .with_description(self.description())
+            .with_mime_type(self.mime_type())
+    }
+}
 
 #[tool_router]
 impl McpServer {
@@ -292,8 +371,8 @@ impl McpServer {
                 self.inner
                     .auditor
                     .record(
-                        "query",
-                        Some(("session", &session_id)),
+                        AuditAction::Query,
+                        Some(ResourceKind::Session.id(&session_id)),
                         Outcome::Allowed,
                         Some(detail),
                     )
@@ -322,8 +401,8 @@ impl McpServer {
                 self.inner
                     .auditor
                     .record(
-                        "query",
-                        Some(("session", &session_id)),
+                        AuditAction::Query,
+                        Some(ResourceKind::Session.id(&session_id)),
                         Outcome::Error,
                         Some(detail),
                     )
@@ -378,7 +457,7 @@ impl McpServer {
         self.inner
             .auditor
             .record(
-                "search",
+                AuditAction::Search,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "q": query })),
@@ -414,14 +493,14 @@ impl McpServer {
         if is_write && quack_core::analysis::tools::creates_temp_object(&statement) {
             self.inner
                 .auditor
-                .record("sql", None, Outcome::Denied, Some(detail))
+                .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
             return Ok(failure(quack_core::analysis::tools::TEMP_OBJECT_REFUSED));
         }
         if is_write && self.inner.policy != WritePolicy::Allow {
             self.inner
                 .auditor
-                .record("sql", None, Outcome::Denied, Some(detail))
+                .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
             return Ok(failure(
                 "this statement modifies data and this connection cannot write",
@@ -453,7 +532,7 @@ impl McpServer {
         };
         self.inner
             .auditor
-            .record("sql", None, outcome, Some(detail))
+            .record(AuditAction::Sql, None, outcome, Some(detail))
             .await?;
         let capped = match result {
             Ok(capped) => capped,
@@ -475,7 +554,7 @@ impl McpServer {
         self.inner
             .auditor
             .record(
-                "list",
+                AuditAction::List,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "what": "tables" })),
@@ -501,7 +580,7 @@ impl McpServer {
                 self.inner
                     .auditor
                     .record(
-                        "open",
+                        AuditAction::Open,
                         None,
                         Outcome::Allowed,
                         Some(serde_json::json!({ "table": name })),
@@ -569,7 +648,7 @@ impl McpServer {
             .await?;
         self.inner
             .auditor
-            .record("graph", None, Outcome::Allowed, Some(detail))
+            .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
             .await?;
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
         out.content = vec![ContentBlock::text(traverse::render_tree(&result))];
@@ -607,7 +686,7 @@ impl McpServer {
             .await?;
         self.inner
             .auditor
-            .record("graph", None, Outcome::Allowed, Some(detail))
+            .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
             .await?;
         if result.is_empty() {
             return Ok(failure(format!(
@@ -627,7 +706,7 @@ impl McpServer {
         self.inner
             .auditor
             .record(
-                "list",
+                AuditAction::List,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "what": "documents" })),
@@ -732,34 +811,31 @@ impl McpServer {
         }))
     }
 
-    async fn resource_text(&self, uri: &str) -> Result<Option<String>, McpError> {
-        if uri == RESOURCE_TABLES {
-            let tables = self.reader_db(WorkspaceDb::list_tables).await?;
-            return Ok(Some(serde_json::json!({ "tables": tables }).to_string()));
-        }
-        if uri == RESOURCE_DOCUMENTS {
-            let documents = self.reader_db(WorkspaceDb::list_documents).await?;
-            return Ok(Some(
-                serde_json::json!({ "documents": documents }).to_string(),
-            ));
-        }
-        if uri == RESOURCE_ONTOLOGY {
-            let ontology = self.reader_db(ontology_store::current).await?;
-            return Ok(Some(match ontology {
+    async fn resource_text(
+        &self,
+        resource: WorkspaceResource<'_>,
+    ) -> Result<Option<String>, McpError> {
+        Ok(Some(match resource {
+            WorkspaceResource::Tables => {
+                let tables = self.reader_db(WorkspaceDb::list_tables).await?;
+                serde_json::json!({ "tables": tables }).to_string()
+            }
+            WorkspaceResource::Documents => {
+                let documents = self.reader_db(WorkspaceDb::list_documents).await?;
+                serde_json::json!({ "documents": documents }).to_string()
+            }
+            WorkspaceResource::Ontology => match self.reader_db(ontology_store::current).await? {
                 Some(ontology) => ontology.to_json().map_err(internal)?,
                 None => String::from("{}"),
-            }));
-        }
-        if uri == RESOURCE_CONTEXT {
-            let current = self.reader_db(context::current).await?;
-            return Ok(Some(current.map(|c| c.content).unwrap_or_default()));
-        }
-        if let Some(rest) = uri.strip_prefix("quack://workspace/tables/")
-            && let Some(name) = rest.strip_suffix("/schema")
-        {
-            return Ok(self.describe(name).await?.map(|d| d.to_string()));
-        }
-        Ok(None)
+            },
+            WorkspaceResource::Context => {
+                let current = self.reader_db(context::current).await?;
+                current.map(|c| c.content).unwrap_or_default()
+            }
+            WorkspaceResource::Schema(table) => {
+                return Ok(self.describe(table).await?.map(|d| d.to_string()));
+            }
+        }))
     }
 }
 
@@ -795,31 +871,12 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let mut resources = vec![
-            Resource::new(RESOURCE_TABLES, "tables")
-                .with_description("The workspace's tables, as JSON")
-                .with_mime_type("application/json"),
-            Resource::new(RESOURCE_DOCUMENTS, "documents")
-                .with_description("The ingested documents with status, title, and source")
-                .with_mime_type("application/json"),
-            Resource::new(RESOURCE_ONTOLOGY, "ontology")
-                .with_description("The ontology (classes, relations, properties, mappings) as JSON")
-                .with_mime_type("application/json"),
-            Resource::new(RESOURCE_CONTEXT, "context")
-                .with_description(
-                    "The owner's instructions and definitions for the agent, as Markdown",
-                )
-                .with_mime_type("text/markdown"),
-        ];
+        let mut resources: Vec<Resource> = WorkspaceResource::FIXED
+            .into_iter()
+            .map(WorkspaceResource::listing)
+            .collect();
         for table in self.reader_db(WorkspaceDb::list_tables).await? {
-            resources.push(
-                Resource::new(
-                    format!("quack://workspace/tables/{table}/schema"),
-                    format!("{table} schema"),
-                )
-                .with_description(format!("Columns, row count, and sample rows of {table}"))
-                .with_mime_type("application/json"),
-            );
+            resources.push(WorkspaceResource::Schema(&table).listing());
         }
         Ok(ListResourcesResult::with_all_items(resources))
     }
@@ -830,7 +887,7 @@ impl ServerHandler for McpServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
         std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
-            ResourceTemplate::new(RESOURCE_SCHEMA_TEMPLATE, "table schema")
+            ResourceTemplate::new(WorkspaceResource::SCHEMA_TEMPLATE, "table schema")
                 .with_description("Columns, row count, and sample rows of one table")
                 .with_mime_type("application/json"),
         ])))
@@ -845,23 +902,16 @@ impl ServerHandler for McpServer {
         self.inner
             .auditor
             .record(
-                "open",
-                Some(("resource", &uri)),
+                AuditAction::Open,
+                Some(ResourceKind::Resource.id(&uri)),
                 Outcome::Allowed,
                 Some(serde_json::json!({ "uri": uri })),
             )
             .await?;
-        let Some(text) = self.resource_text(&uri).await? else {
-            return Err(McpError::resource_not_found(
-                format!("no resource at {uri}"),
-                None,
-            ));
-        };
-        let mime = if uri == RESOURCE_CONTEXT {
-            "text/markdown"
-        } else {
-            "application/json"
-        };
+        let not_found = || McpError::resource_not_found(format!("no resource at {uri}"), None);
+        let resource = WorkspaceResource::parse(&uri).ok_or_else(not_found)?;
+        let text = self.resource_text(resource).await?.ok_or_else(not_found)?;
+        let mime = resource.mime_type();
         Ok(
             ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                 uri,
@@ -1122,7 +1172,7 @@ mod tests {
         assert_eq!(created.is_error, Some(false));
         assert_eq!(
             writer
-                .resource_text(RESOURCE_TABLES)
+                .resource_text(WorkspaceResource::Tables)
                 .await
                 .unwrap_or_else(|e| fail(&e.message))
                 .as_deref(),
@@ -1130,7 +1180,7 @@ mod tests {
         );
         assert_eq!(
             writer
-                .resource_text(RESOURCE_CONTEXT)
+                .resource_text(WorkspaceResource::Context)
                 .await
                 .unwrap_or_else(|e| fail(&e.message))
                 .as_deref(),
@@ -1138,26 +1188,35 @@ mod tests {
         );
         assert!(
             writer
-                .resource_text("quack://workspace/tables/t/schema")
+                .resource_text(WorkspaceResource::Schema("t"))
                 .await
                 .unwrap_or_else(|e| fail(&e.message))
                 .is_some_and(|t| t.contains("\"row_count\":2"))
         );
         assert_eq!(
             writer
-                .resource_text("quack://workspace/tables/zz/schema")
-                .await
-                .unwrap_or_else(|e| fail(&e.message)),
-            None
-        );
-        assert_eq!(
-            writer
-                .resource_text("quack://elsewhere")
+                .resource_text(WorkspaceResource::Schema("zz"))
                 .await
                 .unwrap_or_else(|e| fail(&e.message)),
             None
         );
         let info = writer.get_info();
         assert!(info.instructions.is_some_and(|i| i.contains("'stdio'")));
+    }
+
+    #[test]
+    fn resource_uris_round_trip() {
+        let schema = WorkspaceResource::Schema("orders");
+        for resource in WorkspaceResource::FIXED.into_iter().chain([schema]) {
+            assert_eq!(WorkspaceResource::parse(&resource.uri()), Some(resource));
+        }
+        assert_eq!(
+            schema.uri(),
+            "quack://workspace/tables/orders/schema",
+            "the template's shape"
+        );
+        assert_eq!(WorkspaceResource::parse("quack://elsewhere"), None);
+        assert_eq!(WorkspaceResource::parse("quack://workspace/tables/t"), None);
+        assert_eq!(WorkspaceResource::parse("quack://workspace/sessions"), None);
     }
 }

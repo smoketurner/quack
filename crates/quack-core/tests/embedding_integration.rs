@@ -15,7 +15,9 @@ use quack_core::error::Error;
 use quack_core::graph::store::{self as graph_store, NewNode};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::workspace::{ChunkScope, NewChunk, NewDocument, WorkspaceDb};
+use quack_core::storage::workspace::{
+    ChunkScope, DocumentStatus, MetaKey, NewChunk, NewDocument, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use tokio_util::sync::CancellationToken;
@@ -98,8 +100,10 @@ fn writer_of(db: &WorkspaceDb) -> Writer {
 
 /// One ready document with `chunks` chunks, each with a vector of `width`.
 fn seed(db: &WorkspaceDb, chunks: u32, width: usize) {
-    db.insert_document(&NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"))
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
     let vector = vec![1.0_f32; width];
     for i in 0..chunks {
         db.insert_chunk(&NewChunk {
@@ -126,7 +130,7 @@ fn make_legacy(db: &WorkspaceDb, model: &str) {
     ] {
         db.execute_statement(sql).unwrap();
     }
-    db.set_meta_public("embedding_model", model).unwrap();
+    db.set_meta(MetaKey::EmbeddingModel, model).unwrap();
 }
 
 fn vector_hits(db: &WorkspaceDb, width: usize) -> usize {
@@ -152,7 +156,7 @@ fn vectors_made_before_profiles_keep_working_when_nothing_changed() {
     assert_eq!(status.note(), None);
     assert!(Plan::from_status(&status).is_empty());
     assert_eq!(vector_hits(&db, 4), 3);
-    assert_eq!(db.meta("embedding_model").unwrap(), None);
+    assert_eq!(db.meta(MetaKey::EmbeddingModel).unwrap(), None);
 }
 
 #[test]
@@ -377,7 +381,7 @@ async fn a_width_change_stores_new_chunks_without_vectors_until_refresh_retypes(
     assert_eq!(reader.embedding_dimension(), Dimension::new(8));
     assert_eq!(vector_hits(&reader, 8), 3);
     assert_eq!(
-        db.meta("embedding_dimension").unwrap().as_deref(),
+        db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
         Some("8")
     );
 }

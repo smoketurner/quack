@@ -3,15 +3,17 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::{App, with_db};
-use quack_core::jobs::{JobKind, JobSpec, Lane};
+use quack_core::jobs::{JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::{Ontology, candidates, documents, store};
 
 pub(crate) async fn show(
@@ -20,7 +22,9 @@ pub(crate) async fn show(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "ontology").await?;
+    access
+        .audit_read(&app, AuditAction::List, "ontology")
+        .await?;
     let current = app.read(&id, store::current).await?;
     let ontology = current.ok_or_else(|| ApiError::not_found("no ontology yet"))?;
     Ok(Json(serde_json::to_value(ontology)?))
@@ -44,8 +48,8 @@ pub(crate) async fn replace(
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", &stored.version.to_string())),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version, "classes": stored.classes.len() })),
         )
@@ -64,9 +68,7 @@ pub(crate) async fn init(
     let author = access.identity.username.clone();
     let stored = with_db(db, move |db| {
         if store::latest_version(db)? > 0 {
-            return Err(quack_core::error::Error::Ontology(String::from(
-                "an ontology already exists",
-            )));
+            return Ok(None);
         }
         store::save(
             db,
@@ -74,14 +76,15 @@ pub(crate) async fn init(
             Some(&author),
             Some("built-in default"),
         )
+        .map(Some)
     })
-    .await
-    .map_err(|e| ApiError::new(axum::http::StatusCode::CONFLICT, e.message))?;
+    .await?
+    .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "an ontology already exists"))?;
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", "1")),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id("1")),
             Outcome::Allowed,
             None,
         )
@@ -106,7 +109,9 @@ pub(crate) async fn versions(
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "ontology_versions").await?;
+    access
+        .audit_read(&app, AuditAction::List, "ontology_versions")
+        .await?;
     let limit = q.limit;
     let rows = app.read(&id, move |db| store::versions(db, limit)).await?;
     Ok(Json(serde_json::json!({ "versions": rows })))
@@ -128,8 +133,8 @@ pub(crate) async fn version(
     access
         .audit(
             &app,
-            "open",
-            Some(("ontology_version", &v.to_string())),
+            AuditAction::Open,
+            Some(ResourceKind::OntologyVersion.id(&v.to_string())),
             Outcome::Allowed,
             None,
         )
@@ -161,14 +166,12 @@ pub(crate) async fn restore(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
-    let stored = with_db(db, move |db| store::restore(db, v, Some(&author)))
-        .await
-        .map_err(|e| ApiError::not_found(e.message))?;
+    let stored = with_db(db, move |db| store::restore(db, v, Some(&author))).await?;
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", &stored.version.to_string())),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "restored": v, "version": stored.version })),
         )
@@ -203,7 +206,7 @@ pub(crate) async fn propose(
     identity: Identity,
     Path(id): Path<String>,
     body: Option<Json<ProposeRequest>>,
-) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     if let Some(mode) = request.mode.as_deref()
@@ -215,7 +218,7 @@ pub(crate) async fn propose(
     }
     if request.documents {
         let started = start_document_run(&app, &access, &id, request.sample).await?;
-        return Ok((axum::http::StatusCode::ACCEPTED, started));
+        return Ok((StatusCode::ACCEPTED, started));
     }
     let options = app.config.ontology.table_evidence();
     let db = app.workspace_db(&id).await?;
@@ -239,14 +242,14 @@ pub(crate) async fn propose(
     access
         .audit(
             &app,
-            "propose",
-            run.as_deref().map(|r| ("induction_run", r)),
+            AuditAction::Propose,
+            run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
             Outcome::Allowed,
             Some(serde_json::json!({ "candidates": count, "auto_accept": request.auto_accept, "version": version })),
         )
         .await?;
     Ok((
-        axum::http::StatusCode::OK,
+        StatusCode::OK,
         Json(serde_json::json!({ "candidates": count, "run": run, "version": version })),
     ))
 }
@@ -254,7 +257,8 @@ pub(crate) async fn propose(
 #[derive(Deserialize, Default)]
 pub(crate) struct CandidatesQuery {
     /// `pending` (default) or `low_support`.
-    pub status: Option<String>,
+    #[serde(default)]
+    pub status: Queue,
 }
 
 pub(crate) async fn list_candidates(
@@ -265,17 +269,12 @@ pub(crate) async fn list_candidates(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access
-        .audit_read(&app, "list", "ontology_candidates")
+        .audit_read(&app, AuditAction::List, "ontology_candidates")
         .await?;
-    let rows = match q.status.as_deref() {
-        None | Some("pending") => app.read(&id, candidates::pending).await?,
-        Some("low_support") => app.read(&id, candidates::low_support).await?,
-        Some(other) => {
-            return Err(ApiError::bad_request(format!(
-                "status must be pending or low_support, not '{other}'"
-            )));
-        }
-    };
+    let queue = q.status;
+    let rows = app
+        .read(&id, move |db| candidates::queue(db, queue))
+        .await?;
     Ok(Json(serde_json::json!({ "candidates": rows })))
 }
 
@@ -323,12 +322,11 @@ pub(crate) async fn decide_many(
         };
         Ok((version, rejected))
     })
-    .await
-    .map_err(|e| ApiError::bad_request(e.message))?;
+    .await?;
     access
         .audit(
             &app,
-            "ontology",
+            AuditAction::Ontology,
             None,
             Outcome::Allowed,
             Some(serde_json::json!({
@@ -348,7 +346,7 @@ pub(crate) async fn decide_many(
 #[derive(Deserialize)]
 pub(crate) struct DecideRequest {
     /// `accept`, `rename`, `merge_into`, `reparent`, or `reject`.
-    pub action: String,
+    pub action: CandidateAction,
     /// The new id for `rename`, the target for `merge_into`, or the parent for `reparent`.
     pub target: Option<String>,
 }
@@ -362,20 +360,7 @@ pub(crate) async fn decide(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
-    let target = || {
-        body.target
-            .clone()
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| ApiError::bad_request("this action needs a target"))
-    };
-    let decision = match body.action.as_str() {
-        "accept" => Some(Decision::Accept),
-        "rename" => Some(Decision::Rename(target()?)),
-        "merge_into" => Some(Decision::MergeInto(target()?)),
-        "reparent" => Some(Decision::Reparent(target()?)),
-        "reject" => None,
-        other => return Err(ApiError::bad_request(format!("unknown action '{other}'"))),
-    };
+    let decision = body.action.decision(body.target.as_deref())?;
     let candidate_id = cid.clone();
     let version = with_db(db, move |db| {
         if let Some(decision) = decision {
@@ -385,13 +370,12 @@ pub(crate) async fn decide(
         candidates::reject(db, &[candidate_id], Some(&author))?;
         Ok(None)
     })
-    .await
-    .map_err(|e| ApiError::bad_request(e.message))?;
+    .await?;
     access
         .audit(
             &app,
-            "ontology",
-            Some(("candidate", &cid)),
+            AuditAction::Ontology,
+            Some(ResourceKind::Candidate.id(&cid)),
             Outcome::Allowed,
             Some(serde_json::json!({ "action": body.action, "version": version })),
         )
@@ -431,8 +415,8 @@ pub(crate) async fn start_document_run(
     access
         .audit(
             app,
-            "propose",
-            Some(("induction_run", &run)),
+            AuditAction::Propose,
+            Some(ResourceKind::InductionRun.id(&run)),
             Outcome::Allowed,
             Some(serde_json::json!({ "documents": true, "cost": cost })),
         )
@@ -441,7 +425,7 @@ pub(crate) async fn start_document_run(
     let spec = JobSpec::new(JobKind::Ontology, "ontology document pass")
         .workspace(id)
         .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(format!("ontology:{id}")));
+        .lane(Lane::serial(&LaneKey::Ontology(id.to_owned())));
     let (cancel_app, cancel_access, cancel_run) =
         (std::sync::Arc::clone(app), access.clone(), run.clone());
     let jobs = app.jobs.clone();
@@ -484,8 +468,8 @@ pub(crate) async fn start_document_run(
         super::graph::audit_cancelled(
             &cancel_app,
             &cancel_access,
-            "propose",
-            "induction_run",
+            AuditAction::Propose,
+            ResourceKind::InductionRun,
             &cancel_run,
         )
         .await;
@@ -516,8 +500,8 @@ async fn finish_document_run(
     if let Err(e) = access
         .audit(
             app,
-            "propose",
-            Some(("induction_run", run_id)),
+            AuditAction::Propose,
+            Some(ResourceKind::InductionRun.id(run_id)),
             outcome,
             Some(detail),
         )

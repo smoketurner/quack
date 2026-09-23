@@ -6,15 +6,15 @@ use std::sync::Arc;
 use axum::extract::{Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::{Json, response::IntoResponse};
+use quack_core::error::Record;
 use quack_core::ingestion;
-use quack_core::storage::control::Outcome;
+use quack_core::jobs::LaneKey;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::queue::{
-    MAX_WAITING_UPLOADS, UPLOAD_RETRY_SECONDS, UploadJob, submit_upload, upload_lane,
-};
+use crate::server::queue::{MAX_WAITING_UPLOADS, UPLOAD_RETRY_SECONDS, UploadJob, submit_upload};
 use crate::server::state::{App, with_db};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::candidates;
@@ -27,7 +27,9 @@ pub(crate) async fn list(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "documents").await?;
+    access
+        .audit_read(&app, AuditAction::List, "documents")
+        .await?;
     let docs = app.read(&id, WorkspaceDb::list_documents).await?;
     Ok(Json(serde_json::json!({ "documents": docs })))
 }
@@ -41,14 +43,18 @@ pub(crate) async fn show(
     access
         .audit(
             &app,
-            "open",
-            Some(("document", &doc)),
+            AuditAction::Open,
+            Some(ResourceKind::Document.id(&doc)),
             Outcome::Allowed,
             None,
         )
         .await?;
-    let found = app.read(&id, move |db| db.document(&doc)).await?;
-    let document = found.ok_or_else(|| ApiError::not_found("no such document"))?;
+    let document = app
+        .read(&id, move |db| {
+            db.document(&doc)?
+                .ok_or_else(|| Record::Document.missing(doc.as_str()))
+        })
+        .await?;
     Ok(Json(serde_json::to_value(document)?))
 }
 
@@ -222,7 +228,7 @@ pub(crate) async fn enqueue(
     let id = access.workspace.id.clone();
     // Backpressure: every queued upload holds its bytes in memory, so a
     // workspace with a deep line of them turns more away until it drains.
-    let waiting = app.jobs.lane_active(&upload_lane(&id));
+    let waiting = app.jobs.lane_active(&LaneKey::Ingest(id.clone()));
     if waiting.saturating_add(files.len()) > MAX_WAITING_UPLOADS {
         return Err(ApiError::busy(
             format!("{waiting} uploads are already waiting in this workspace; try again shortly"),
@@ -267,8 +273,8 @@ pub(crate) async fn enqueue(
                 access
                     .audit(
                         app,
-                        "ingest",
-                        Some(("document", &existing.id)),
+                        AuditAction::Ingest,
+                        Some(ResourceKind::Document.id(&existing.id)),
                         Outcome::Allowed,
                         Some(serde_json::json!({
                             "filename": filename,
@@ -289,8 +295,8 @@ pub(crate) async fn enqueue(
         access
             .audit(
                 app,
-                "ingest",
-                Some(("document", &document_id)),
+                AuditAction::Ingest,
+                Some(ResourceKind::Document.id(&document_id)),
                 Outcome::Allowed,
                 Some(serde_json::json!({ "filename": filename, "size_bytes": size })),
             )
@@ -341,20 +347,17 @@ pub(crate) async fn set_pinned(
 ) -> ApiResult<DocumentInfo> {
     let db = app.workspace_db(&access.workspace.id).await?;
     let doc_id = doc.to_owned();
-    let updated = with_db(db, move |db| {
-        if db.document(&doc_id)?.is_none() {
-            return Ok(None);
-        }
+    let document = with_db(db, move |db| {
         db.set_document_pinned(&doc_id, pinned)?;
-        db.document(&doc_id)
+        db.document(&doc_id)?
+            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))
     })
     .await?;
-    let document = updated.ok_or_else(|| ApiError::not_found("no such document"))?;
     access
         .audit(
             app,
-            "context",
-            Some(("document", doc)),
+            AuditAction::Context,
+            Some(ResourceKind::Document.id(doc)),
             Outcome::Allowed,
             Some(serde_json::json!({ "pinned": pinned })),
         )
@@ -377,23 +380,22 @@ pub(crate) async fn remove(
 pub(crate) async fn delete_document(app: &App, access: &Access, doc: &str) -> ApiResult<String> {
     let db = app.workspace_db(&access.workspace.id).await?;
     let doc_id = doc.to_owned();
-    let removed = with_db(db, move |db| {
-        let Some(document) = db.document(&doc_id)? else {
-            return Ok(None);
-        };
+    let filename = with_db(db, move |db| {
+        let document = db
+            .document(&doc_id)?
+            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))?;
         let table = ingestion::parser::detect_file_type(&document.filename)
             .is_structured()
             .then(|| ingestion::table_name_for(&document.filename));
         db.delete_document(&doc_id, table.as_deref())?;
-        Ok(Some(document.filename))
+        Ok(document.filename)
     })
     .await?;
-    let filename = removed.ok_or_else(|| ApiError::not_found("no such document"))?;
     access
         .audit(
             app,
-            "delete",
-            Some(("document", doc)),
+            AuditAction::Delete,
+            Some(ResourceKind::Document.id(doc)),
             Outcome::Allowed,
             Some(serde_json::json!({ "filename": filename })),
         )

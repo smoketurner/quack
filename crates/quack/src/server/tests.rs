@@ -20,10 +20,11 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState};
+use quack_core::jobs::LaneKey;
 use quack_core::storage::control::{
     AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope,
 };
-use quack_core::storage::workspace::{NewChunk, NewDocument};
+use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -1318,6 +1319,52 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), format!("/w/{ws}/chat"));
+}
+
+/// A record named by id that does not exist is a 404 wherever it is
+/// named, and a missing ontology version or merge proposal no longer
+/// borrows that status for every other failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_records_answer_404() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("m", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}");
+    for (method, path, body) in [
+        (
+            Method::PATCH,
+            format!("{base}/documents/nope"),
+            serde_json::json!({ "pinned": true }),
+        ),
+        (
+            Method::PATCH,
+            format!("{base}/sessions/nope"),
+            serde_json::json!({ "shared": true }),
+        ),
+        (
+            Method::POST,
+            format!("{base}/ontology/versions/99/restore"),
+            serde_json::json!({}),
+        ),
+        (
+            Method::PUT,
+            format!("{base}/graph/merges/nope"),
+            serde_json::json!({ "action": "reject" }),
+        ),
+        (
+            Method::PUT,
+            format!("{base}/ontology/candidates/nope"),
+            serde_json::json!({ "action": "reject" }),
+        ),
+    ] {
+        let (status, body) = h.call(method, &path, Some(&token), Some(body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        assert!(
+            body.to_string().contains("does not exist"),
+            "{path}: {body}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2829,13 +2876,13 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
             Some(serde_json::json!({ "action": "acept" })),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let (status, _, headers) = h
         .form(&format!("/w/{ws}/graph/merges/nope"), None, "action=acept")
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
-        location(&headers).contains("must"),
+        location(&headers).contains("unknown+merge+decision"),
         "{}",
         location(&headers)
     );
@@ -3476,7 +3523,7 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
         JobSpec::new(JobKind::Chat, "what is our churn?")
             .workspace(ws.clone())
             .owner(Some(member.clone()))
-            .lane(Lane::serial("session:s")),
+            .lane(Lane::serial(&LaneKey::Session(String::from("s")))),
         |ctx| async move {
             ctx.cancel_token().cancelled().await;
             Err(String::from("cancelled"))
@@ -3559,13 +3606,13 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
     let ws = h.workspace("busy", &owner).await;
     let token = h.login("owner").await;
     let release = quack_core::llm::CancellationToken::new();
-    let lane = crate::server::queue::upload_lane(&ws);
+    let lane = LaneKey::Ingest(ws.clone());
     for n in 0..crate::server::queue::MAX_WAITING_UPLOADS {
         let release = release.clone();
         h.app.jobs.submit(
             JobSpec::new(JobKind::Ingest, format!("held {n}"))
                 .workspace(ws.clone())
-                .lane(Lane::new(lane.clone(), 1)),
+                .lane(Lane::new(&lane, 1)),
             move |_| async move {
                 release.cancelled().await;
                 Ok(String::new())
@@ -3723,7 +3770,7 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         .unwrap_or_else(|e| fail(&e.message));
     db.run(|db| {
         db.insert_document(
-            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"),
+            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
         )?;
         db.insert_chunk(&NewChunk {
             id: "c",

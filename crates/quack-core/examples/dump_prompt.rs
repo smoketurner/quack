@@ -9,7 +9,7 @@
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::storage::sessions::ChatMode;
-use quack_core::storage::workspace::{NewDocument, WorkspaceDb};
+use quack_core::storage::workspace::{DocumentStatus, NewDocument, WorkspaceDb};
 
 fn main() {
     let db = WorkspaceDb::open_in_memory(4).unwrap();
@@ -18,7 +18,8 @@ fn main() {
     db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")
         .unwrap();
     db.insert_document(
-        &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+        &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     quack_core::ontology::store::save(

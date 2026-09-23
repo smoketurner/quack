@@ -14,7 +14,7 @@ pub(crate) fn write(out: &mut impl Write, report: &Report, as_json: bool) -> Res
             .iter()
             .map(|c| {
                 json!({
-                    "area": c.area,
+                    "area": c.area.as_str(),
                     "status": c.status.as_str(),
                     "summary": c.summary,
                     "fix": c.fix,
@@ -34,7 +34,7 @@ pub(crate) fn write(out: &mut impl Write, report: &Report, as_json: bool) -> Res
     let width = report
         .checks
         .iter()
-        .map(|c| c.area.len())
+        .map(|c| c.area.as_str().len())
         .max()
         .unwrap_or(0);
     let indent = " ".repeat(width.saturating_add(8));
@@ -44,7 +44,7 @@ pub(crate) fn write(out: &mut impl Write, report: &Report, as_json: bool) -> Res
             out,
             "{:<4}  {:width$}  {}",
             check.status.as_str(),
-            check.area,
+            check.area.as_str(),
             summary.next().unwrap_or_default()
         )?;
         for line in summary {
@@ -74,7 +74,7 @@ pub(crate) fn write(out: &mut impl Write, report: &Report, as_json: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quack_core::doctor::Check;
+    use quack_core::doctor::{Area, Check};
 
     #[test]
     #[expect(
@@ -86,13 +86,13 @@ mod tests {
         let report = Report {
             checks: vec![
                 Check {
-                    area: "config",
+                    area: Area::Config,
                     status: Status::Ok,
                     summary: String::from("loaded"),
                     fix: None,
                 },
                 Check {
-                    area: "chat model",
+                    area: Area::ChatModel,
                     status: Status::Fail,
                     summary: String::from("o/m: cannot reach"),
                     fix: Some(String::from("ollama serve\nsecond line")),

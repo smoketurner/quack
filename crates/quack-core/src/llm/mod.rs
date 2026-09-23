@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex};
 use rig::prelude::*;
 
 use crate::analysis::agent::{self, AgentResponse};
-use crate::analysis::events::{self, AgentEvent, EventSink};
+use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
-use crate::analysis::tools::{ReaderDb, SharedDb};
+use crate::analysis::tools::{ReaderDb, SharedDb, with_db};
 use crate::config::config_file_path;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::embedding::{Embedder, Input, Profile};
-use crate::error::{Error, Result};
+use crate::error::{Error, Record, Result};
 use crate::graph::extract as graph_extract;
 use crate::ontology::{Ontology, documents};
 use crate::priority::{Priority, with_priority};
@@ -282,9 +282,7 @@ pub async fn stream_answer(
     use futures::StreamExt;
     use rig::streaming::StreamedAssistantContent;
     let collect = async {
-        let mut stream = agent
-            .stream_chat(text, Vec::<rig::message::Message>::new())
-            .await;
+        let mut stream = agent.stream_chat(text, Vec::<Message>::new()).await;
         let mut answer = String::new();
         let mut final_text: Option<String> = None;
         while let Some(item) = stream.next().await {
@@ -766,37 +764,19 @@ pub async fn run_turn(
     sink: EventSink,
     cancel: CancellationToken,
 ) -> Result<AgentResponse> {
-    let chat = config.chat_model_ref()?;
-    // Without an embedding provider the agent still runs: document search
-    // is keyword-only and graph entry is exact (issue #58).
-    let embedding_model = optional_embedding_model(config).await?;
-
-    // On the blocking pool, in the writer's interactive line: an async
-    // worker never waits on the connection.
-    let (prompt, history) = {
-        let session_id = session_id.to_owned();
-        let pinned_token_budget = config.retrieval.pinned_token_budget;
-        let context_max_tokens = config.context.max_tokens;
-        let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
-            .then_some(config.analysis.max_context_tokens);
-        let history_budget = config.analysis.history_token_budget;
-        crate::analysis::tools::with_db(&db, move |guard| {
-            let session = sessions::get_session(guard, &session_id)?
-                .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
-            let prompt = PromptOptions {
-                mode: session.mode,
-                write_policy: policy,
-                pinned_token_budget,
-                context: context::combined(guard)?,
-                context_max_tokens,
-                ollama_context_cap,
-            };
-            Ok((
-                prompt,
-                sessions::history_for_model(guard, &session_id, history_budget)?,
-            ))
-        })
-        .await?
+    // A failure before the turn begins is the turn's failure too, so an
+    // interface that only reads the events still sees why.
+    let StartedTurn {
+        chat,
+        embedding_model,
+        prompt,
+        history,
+    } = match start_turn(config, &db, session_id, policy).await {
+        Ok(started) => started,
+        Err(e) => {
+            drop(sink.send(AgentEvent::Failed(TurnFailure::from(&e))));
+            return Err(e);
+        }
     };
 
     tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
@@ -865,11 +845,64 @@ pub async fn run_turn(
     };
 
     let (session, text, recorded) = (session_id.to_owned(), message.to_owned(), response.clone());
-    crate::analysis::tools::with_db(&db, move |guard| {
+    with_db(&db, move |guard| {
         sessions::record_turn(guard, &session, &text, &recorded)
     })
     .await?;
     Ok(response)
+}
+
+/// What a turn needs before the model is called.
+struct StartedTurn<'c> {
+    chat: ModelRef<'c>,
+    /// `None` when no embedding model is configured.
+    embedding_model: Option<Embeddings>,
+    prompt: PromptOptions,
+    /// The session's earlier messages, replayed to the model.
+    history: Vec<Message>,
+}
+
+async fn start_turn<'c>(
+    config: &'c Config,
+    db: &SharedDb,
+    session_id: &str,
+    policy: WritePolicy,
+) -> Result<StartedTurn<'c>> {
+    let chat = config.chat_model_ref()?;
+    // Without an embedding provider the agent still runs: document search
+    // is keyword-only and graph entry is exact (issue #58).
+    let embedding_model = optional_embedding_model(config).await?;
+    // On the blocking pool, in the writer's interactive line: an async
+    // worker never waits on the connection.
+    let session_id = session_id.to_owned();
+    let pinned_token_budget = config.retrieval.pinned_token_budget;
+    let context_max_tokens = config.context.max_tokens;
+    let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
+        .then_some(config.analysis.max_context_tokens);
+    let history_budget = config.analysis.history_token_budget;
+    let (prompt, history) = with_db(db, move |guard| {
+        let session = sessions::get_session(guard, &session_id)?
+            .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
+        let prompt = PromptOptions {
+            mode: session.mode,
+            write_policy: policy,
+            pinned_token_budget,
+            context: context::combined(guard)?,
+            context_max_tokens,
+            ollama_context_cap,
+        };
+        Ok((
+            prompt,
+            sessions::history_for_model(guard, &session_id, history_budget)?,
+        ))
+    })
+    .await?;
+    Ok(StartedTurn {
+        chat,
+        embedding_model,
+        prompt,
+        history,
+    })
 }
 
 /// What a cancelled turn's recorded answer ends with.
@@ -887,7 +920,7 @@ async fn dispatch(
     embedding_model: Option<Embeddings>,
     policy: WritePolicy,
     prompt: PromptOptions,
-    history: Vec<rig::message::Message>,
+    history: Vec<Message>,
     message: &str,
     sink: EventSink,
 ) -> Result<AgentResponse> {

@@ -181,19 +181,47 @@ pub struct Lane {
     limit: u32,
 }
 
+/// What a lane keeps in order: one key per resource whose work must not
+/// overlap or run out of order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LaneKey {
+    /// One chat session's turns, answered in the order asked.
+    Session(String),
+    /// A workspace's uploads.
+    Ingest(String),
+    /// A workspace's graph extraction.
+    Graph(String),
+    /// A workspace's ontology document pass.
+    Ontology(String),
+    /// A workspace's embedding refresh.
+    Embeddings(String),
+}
+
+impl fmt::Display for LaneKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(id) => write!(f, "session:{id}"),
+            Self::Ingest(workspace) => write!(f, "ingest:{workspace}"),
+            Self::Graph(workspace) => write!(f, "graph:{workspace}"),
+            Self::Ontology(workspace) => write!(f, "ontology:{workspace}"),
+            Self::Embeddings(workspace) => write!(f, "embeddings:{workspace}"),
+        }
+    }
+}
+
 impl Lane {
     /// One job at a time: a chat session, a workspace's graph extraction.
     #[must_use]
-    pub fn serial(key: impl Into<String>) -> Self {
+    pub fn serial(key: &LaneKey) -> Self {
         Self::new(key, 1)
     }
 
     /// Up to `limit` at a time (at least one). The first job submitted on
     /// a key fixes its limit while any job holds the lane.
     #[must_use]
-    pub fn new(key: impl Into<String>, limit: u32) -> Self {
+    pub fn new(key: &LaneKey, limit: u32) -> Self {
         Self {
-            key: key.into(),
+            key: key.to_string(),
             limit: limit.max(1),
         }
     }
@@ -545,12 +573,13 @@ impl JobQueue {
     /// Jobs queued or running in lane `key`: a new one there waits behind
     /// them (up to the lane's limit).
     #[must_use]
-    pub fn lane_active(&self, key: &str) -> usize {
+    pub fn lane_active(&self, key: &LaneKey) -> usize {
+        let key = key.to_string();
         self.inner
             .registry()
             .jobs
             .values()
-            .filter(|e| e.info.lane.as_deref() == Some(key) && !e.info.state.is_finished())
+            .filter(|e| e.info.lane.as_deref() == Some(key.as_str()) && !e.info.state.is_finished())
             .count()
     }
 
@@ -801,6 +830,22 @@ mod tests {
         panic!("{msg}")
     }
 
+    /// A job's `lane` shows its key as `kind:id`.
+    #[test]
+    fn lane_keys_read_as_kind_and_id() {
+        let id = || String::from("w1");
+        for (key, text) in [
+            (LaneKey::Session(id()), "session:w1"),
+            (LaneKey::Ingest(id()), "ingest:w1"),
+            (LaneKey::Graph(id()), "graph:w1"),
+            (LaneKey::Ontology(id()), "ontology:w1"),
+            (LaneKey::Embeddings(id()), "embeddings:w1"),
+        ] {
+            assert_eq!(key.to_string(), text);
+            assert_eq!(Lane::serial(&key).key(), text);
+        }
+    }
+
     #[test]
     fn progress_shows_percent_rounded_down() {
         let shown = |done, total| JobProgress { done, total }.to_string();
@@ -887,20 +932,24 @@ mod tests {
         for n in 0..3_u32 {
             let log = Arc::clone(&log);
             let gate = Arc::clone(&gate);
-            ids.push(queue.submit(
-                JobSpec::new(JobKind::Chat, format!("turn {n}")).lane(Lane::serial("session:a")),
-                move |_| async move {
-                    if n == 0 {
-                        gate.notified().await;
-                    }
-                    log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
-                    Ok(String::new())
-                },
-            ));
+            ids.push(
+                queue.submit(
+                    JobSpec::new(JobKind::Chat, format!("turn {n}"))
+                        .lane(Lane::serial(&LaneKey::Session(String::from("a")))),
+                    move |_| async move {
+                        if n == 0 {
+                            gate.notified().await;
+                        }
+                        log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
+                        Ok(String::new())
+                    },
+                ),
+            );
         }
         // Another lane is not held up by the first.
         let other = queue.submit(
-            JobSpec::new(JobKind::Sql, "other").lane(Lane::serial("session:b")),
+            JobSpec::new(JobKind::Sql, "other")
+                .lane(Lane::serial(&LaneKey::Session(String::from("b")))),
             |_| async { Ok(String::from("done")) },
         );
         assert_eq!(finished(&queue, other).await.state, JobState::Succeeded);
@@ -930,13 +979,16 @@ mod tests {
         let mut held = Vec::new();
         for n in 0..3 {
             let gate = Arc::clone(&gate);
-            held.push(wide.submit(
-                JobSpec::new(JobKind::Ingest, format!("{n}")).lane(Lane::new("ingest:w", 2)),
-                move |_| async move {
-                    gate.notified().await;
-                    Ok(String::new())
-                },
-            ));
+            held.push(
+                wide.submit(
+                    JobSpec::new(JobKind::Ingest, format!("{n}"))
+                        .lane(Lane::new(&LaneKey::Ingest(String::from("w")), 2)),
+                    move |_| async move {
+                        gate.notified().await;
+                        Ok(String::new())
+                    },
+                ),
+            );
         }
         let free = wide.submit(JobSpec::new(JobKind::Sql, "select"), |_| async {
             Ok(String::new())
@@ -945,7 +997,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let counts = wide.counts(None);
         assert_eq!((counts.running, counts.queued), (2, 1));
-        assert_eq!(wide.lane_active("ingest:w"), 3);
+        assert_eq!(wide.lane_active(&LaneKey::Ingest(String::from("w"))), 3);
         for _ in 0..3 {
             gate.notify_one();
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -953,7 +1005,7 @@ mod tests {
         for id in held {
             assert_eq!(finished(&wide, id).await.state, JobState::Succeeded);
         }
-        assert_eq!(wide.lane_active("ingest:w"), 0);
+        assert_eq!(wide.lane_active(&LaneKey::Ingest(String::from("w"))), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -963,13 +1015,16 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..50_u32 {
             let log = Arc::clone(&log);
-            ids.push(queue.submit(
-                JobSpec::new(JobKind::Chat, format!("{n}")).lane(Lane::serial("session:x")),
-                move |_| async move {
-                    log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
-                    Ok(String::new())
-                },
-            ));
+            ids.push(
+                queue.submit(
+                    JobSpec::new(JobKind::Chat, format!("{n}"))
+                        .lane(Lane::serial(&LaneKey::Session(String::from("x")))),
+                    move |_| async move {
+                        log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
+                        Ok(String::new())
+                    },
+                ),
+            );
         }
         // One cancelled while queued is skipped, not waited on.
         let skipped = ids.get(10).copied().unwrap_or_else(|| fail("no job 10"));
@@ -989,14 +1044,16 @@ mod tests {
     async fn cancel_stops_queued_and_running_jobs_and_panics_fail() {
         let queue = JobQueue::new(10);
         let running = queue.submit(
-            JobSpec::new(JobKind::Chat, "long").lane(Lane::serial("session:c")),
+            JobSpec::new(JobKind::Chat, "long")
+                .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
             |ctx| async move {
                 ctx.cancel_token().cancelled().await;
                 Err(String::from("stopped"))
             },
         );
         let queued = queue.submit(
-            JobSpec::new(JobKind::Chat, "never").lane(Lane::serial("session:c")),
+            JobSpec::new(JobKind::Chat, "never")
+                .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
             |_| async { Ok(String::from("ran")) },
         );
         tokio::time::sleep(Duration::from_millis(20)).await;

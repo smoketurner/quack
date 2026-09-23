@@ -8,12 +8,14 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::embedding::{Input, Vector};
+use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::{
-    GraphOptions, GraphResult, extract, resolve, store as graph_store, tables, traverse,
+    ExtractSource, GraphOptions, GraphResult, extract, resolve, store as graph_store, tables,
+    traverse,
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
@@ -21,7 +23,7 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::{App, with_db};
 use quack_core::analysis::tools::SharedDb;
-use quack_core::jobs::{JobKind, JobSpec, Lane};
+use quack_core::jobs::{JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::Ontology;
 
 #[derive(Deserialize, Default)]
@@ -92,7 +94,13 @@ pub(crate) async fn search(
         })
         .await?;
     access
-        .audit(&app, "graph", None, Outcome::Allowed, Some(detail))
+        .audit(
+            &app,
+            AuditAction::Graph,
+            None,
+            Outcome::Allowed,
+            Some(detail),
+        )
         .await?;
     Ok(Json(serde_json::to_value(result)?))
 }
@@ -133,7 +141,13 @@ pub(crate) async fn path(
         })
         .await?;
     access
-        .audit(&app, "graph", None, Outcome::Allowed, Some(detail))
+        .audit(
+            &app,
+            AuditAction::Graph,
+            None,
+            Outcome::Allowed,
+            Some(detail),
+        )
         .await?;
     Ok(Json(serde_json::to_value(result)?))
 }
@@ -144,7 +158,9 @@ pub(crate) async fn status(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "graph_status").await?;
+    access
+        .audit_read(&app, AuditAction::List, "graph_status")
+        .await?;
     let status = app.read(&id, graph_store::status).await?;
     Ok(Json(serde_json::to_value(status)?))
 }
@@ -153,7 +169,7 @@ pub(crate) async fn status(
 pub(crate) struct ExtractRequest {
     /// `all` (default), `tables`, or `documents`.
     #[serde(default)]
-    pub source: Option<String>,
+    pub source: ExtractSource,
     /// Chunks to send to the model at most.
     pub sample: Option<u32>,
     #[serde(default)]
@@ -170,19 +186,12 @@ pub(crate) async fn extract(
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
-    let (do_tables, do_documents) = match request.source.as_deref() {
-        None | Some("all") => (true, true),
-        Some("tables") => (true, false),
-        Some("documents") => (false, true),
-        Some(other) => return Err(ApiError::bad_request(format!("unknown source '{other}'"))),
-    };
     let started = start_extraction(
         &app,
         &access,
         &id,
         &ExtractionPlan {
-            tables: do_tables,
-            documents: do_documents,
+            source: request.source,
             sample: request.sample,
             reset: request.reset,
         },
@@ -198,8 +207,7 @@ pub(crate) async fn extract(
 
 /// What to extract.
 pub(crate) struct ExtractionPlan {
-    pub tables: bool,
-    pub documents: bool,
+    pub source: ExtractSource,
     pub sample: Option<u32>,
     pub reset: bool,
 }
@@ -212,8 +220,7 @@ pub(crate) async fn start_extraction(
     id: &str,
     plan: &ExtractionPlan,
 ) -> ApiResult<serde_json::Value> {
-    let (do_tables, do_documents, sample, reset) =
-        (plan.tables, plan.documents, plan.sample, plan.reset);
+    let (sample, reset) = (plan.sample, plan.reset);
     let slot = app.begin_extraction(id).ok_or_else(|| {
         ApiError::new(
             StatusCode::CONFLICT,
@@ -235,12 +242,12 @@ pub(crate) async fn start_extraction(
     if reset {
         with_db(Arc::clone(&db), graph_store::clear).await?;
     }
-    let table_summaries = if do_tables {
+    let table_summaries = if plan.source.includes_tables() {
         extract_tables_in_batches(&db, &ontology, provisional).await?
     } else {
         Vec::new()
     };
-    let chunks = if do_documents {
+    let chunks = if plan.source.includes_documents() {
         app.read(id, move |db| extract::chunks(db, sample)).await?
     } else {
         Vec::new()
@@ -255,7 +262,7 @@ pub(crate) async fn start_extraction(
         access
             .audit(
                 app,
-                "graph_extract",
+                AuditAction::GraphExtract,
                 None,
                 Outcome::Allowed,
                 Some(serde_json::json!({ "tables": table_summaries, "resolution": summary })),
@@ -272,8 +279,8 @@ pub(crate) async fn start_extraction(
     access
         .audit(
             app,
-            "graph_extract",
-            Some(("graph_run", &run)),
+            AuditAction::GraphExtract,
+            Some(ResourceKind::GraphRun.id(&run)),
             Outcome::Allowed,
             Some(serde_json::json!({ "tables": table_summaries, "cost": cost })),
         )
@@ -354,7 +361,7 @@ fn spawn_document_extraction(
     let spec = JobSpec::new(JobKind::Graph, "graph extraction")
         .workspace(access.workspace.id.clone())
         .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(format!("graph:{}", access.workspace.id)));
+        .lane(Lane::serial(&LaneKey::Graph(access.workspace.id.clone())));
     let jobs = app.jobs.clone();
     let (cancel_app, cancel_access, cancel_run) =
         (Arc::clone(&app), access.clone(), run_id.clone());
@@ -418,8 +425,8 @@ fn spawn_document_extraction(
         if let Err(e) = access
             .audit(
                 &app,
-                "graph_extract",
-                Some(("graph_run", &run_id)),
+                AuditAction::GraphExtract,
+                Some(ResourceKind::GraphRun.id(&run_id)),
                 outcome,
                 Some(detail),
             )
@@ -443,8 +450,8 @@ fn spawn_document_extraction(
         audit_cancelled(
             &cancel_app,
             &cancel_access,
-            "graph_extract",
-            "graph_run",
+            AuditAction::GraphExtract,
+            ResourceKind::GraphRun,
             &cancel_run,
         )
         .await;
@@ -456,15 +463,15 @@ fn spawn_document_extraction(
 pub(crate) async fn audit_cancelled(
     app: &App,
     access: &Access,
-    action: &str,
-    resource: &str,
+    action: AuditAction,
+    resource: ResourceKind,
     run_id: &str,
 ) {
     if let Err(e) = access
         .audit(
             app,
             action,
-            Some((resource, run_id)),
+            Some(resource.id(run_id)),
             Outcome::Error,
             Some(serde_json::json!({ "finished": true, "error": "cancelled before it started" })),
         )
@@ -487,7 +494,7 @@ pub(crate) async fn revalidate(
     access
         .audit(
             &app,
-            "graph_revalidate",
+            AuditAction::GraphRevalidate,
             None,
             Outcome::Allowed,
             Some(serde_json::to_value(&outcome)?),
@@ -509,7 +516,7 @@ pub(crate) async fn review(
     })
     .await?;
     access
-        .audit(&app, "graph_review", None, Outcome::Allowed, None)
+        .audit(&app, AuditAction::GraphReview, None, Outcome::Allowed, None)
         .await?;
     Ok(Json(serde_json::to_value(status)?))
 }
@@ -520,76 +527,41 @@ pub(crate) async fn merges(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "list", "graph_merges").await?;
+    access
+        .audit_read(&app, AuditAction::List, "graph_merges")
+        .await?;
     let pending = app.read(&id, resolve::pending).await?;
     Ok(Json(serde_json::json!({ "merges": pending })))
 }
 
 #[derive(Deserialize)]
-pub(crate) struct MergeDecision {
-    /// `accept` or `reject`.
-    pub action: String,
-}
-
-/// A decision on a merge proposal. The API's JSON and the graph page's
-/// form both parse into it, so an unknown action is refused by both rather
-/// than read as a rejection, which cannot be undone.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MergeAction {
-    Accept,
-    Reject,
-}
-
-impl std::str::FromStr for MergeAction {
-    type Err = ApiError;
-
-    fn from_str(action: &str) -> ApiResult<Self> {
-        match action {
-            "accept" => Ok(Self::Accept),
-            "reject" => Ok(Self::Reject),
-            other => Err(ApiError::bad_request(format!(
-                "action must be accept or reject, not '{other}'"
-            ))),
-        }
-    }
-}
-
-impl MergeAction {
-    /// Record the decision on proposal `id`.
-    pub(crate) fn apply(
-        self,
-        db: &quack_core::storage::workspace::WorkspaceDb,
-        id: &str,
-        decided_by: Option<&str>,
-    ) -> quack_core::error::Result<resolve::MergeProposal> {
-        match self {
-            Self::Accept => resolve::accept(db, id, decided_by),
-            Self::Reject => resolve::reject(db, id, decided_by),
-        }
-    }
+pub(crate) struct DecideMerge {
+    /// `accept` or `reject`; anything else is refused while the body is read.
+    pub action: MergeDecision,
 }
 
 pub(crate) async fn decide_merge(
     State(app): State<App>,
     identity: Identity,
     Path((id, mid)): Path<(String, String)>,
-    Json(body): Json<MergeDecision>,
+    Json(body): Json<DecideMerge>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let action: MergeAction = body.action.parse()?;
+    let decision = body.action;
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
     let merge_id = mid.clone();
-    let proposal = with_db(db, move |db| action.apply(db, &merge_id, Some(&author)))
-        .await
-        .map_err(|e| ApiError::not_found(e.message))?;
+    let proposal = with_db(db, move |db| {
+        resolve::decide(db, &merge_id, decision, Some(&author))
+    })
+    .await?;
     access
         .audit(
             &app,
-            "graph_merge",
-            Some(("graph_merge", &mid)),
+            AuditAction::GraphMerge,
+            Some(ResourceKind::GraphMerge.id(&mid)),
             Outcome::Allowed,
-            Some(serde_json::json!({ "accept": action == MergeAction::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
+            Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
         )
         .await?;
     Ok(Json(serde_json::to_value(proposal)?))

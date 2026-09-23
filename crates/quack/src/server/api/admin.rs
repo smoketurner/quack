@@ -3,7 +3,7 @@
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Json, response::IntoResponse};
-use quack_core::storage::control::{AuditFilter, Outcome};
+use quack_core::storage::control::{AuditAction, AuditFilter, Outcome, ResourceKind};
 use serde::Deserialize;
 
 use crate::server::auth::{Identity, require_admin};
@@ -37,9 +37,8 @@ pub(crate) async fn create_user(
         .control
         .create_user(&body.username, &body.password, body.is_admin)
         .await?;
-    let mut entry = identity.audit("admin", Outcome::Allowed);
-    entry.resource_type = Some(String::from("user"));
-    entry.resource_id = Some(user.id.clone());
+    let mut entry = identity.audit(AuditAction::Admin, Outcome::Allowed);
+    entry = entry.on(ResourceKind::User.id(&user.id));
     app.control.record_audit(&entry).await?;
     Ok((StatusCode::CREATED, Json(serde_json::to_value(user)?)))
 }

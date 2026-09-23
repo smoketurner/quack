@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::induction::{Candidate, Proposal, snake_id};
-use super::{Class, Ontology, Property, PropertyType, Relation};
+use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation};
 use crate::error::{Error, Result};
 use crate::llm::{Embeddings, name_similarity};
 use crate::progress::{ChunkDone, Progress};
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
 
 /// What open extraction returns for one chunk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -145,8 +145,8 @@ pub fn estimate(db: &WorkspaceDb, options: &DocumentEvidenceOptions) -> Result<C
     let (documents, chunks): (i64, i64) = db.connection().query_row(
         "SELECT count(DISTINCT c.document_id), count(*) FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = 'ready' AND length(c.content) > 40",
-        [],
+         WHERE d.status = ? AND length(c.content) > 40",
+        [DocumentStatus::Ready],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let documents = u32::try_from(documents).unwrap_or(u32::MAX);
@@ -170,12 +170,14 @@ pub fn sample_chunks(db: &WorkspaceDb, sample: u32) -> Result<Vec<SampledChunk>>
     let mut stmt = db.connection().prepare(
         "SELECT c.id, c.document_id, d.filename FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = 'ready' AND length(c.content) > 40 \
+         WHERE d.status = ? AND length(c.content) > 40 \
          ORDER BY c.document_id, c.chunk_index",
     )?;
     let rows: Vec<(String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .filter_map(std::result::Result::ok)
+        .query_map([DocumentStatus::Ready], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .flatten()
         .collect();
     let mut by_doc: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (id, document_id, filename) in rows {
@@ -593,14 +595,14 @@ fn propose_classes(
     candidates: &mut Vec<Candidate>,
 ) {
     for (class, support) in &evidence.class_support {
-        if class == super::ROOT_CLASS || current.is_some_and(|o| o.class(class).is_some()) {
+        if class == ROOT_CLASS || current.is_some_and(|o| o.class(class).is_some()) {
             continue;
         }
         let parent = evidence
             .parents
             .get(class)
             .cloned()
-            .unwrap_or_else(|| String::from(super::ROOT_CLASS));
+            .unwrap_or_else(|| String::from(ROOT_CLASS));
         candidates.push(Candidate {
             proposal: Proposal::Class(Class {
                 id: class.clone(),
@@ -756,10 +758,10 @@ fn infer_hierarchy(
 fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>) -> String {
     let total: u32 = counts.values().sum();
     let Some((top, n)) = counts.iter().max_by_key(|(_, n)| **n) else {
-        return String::from(super::ROOT_CLASS);
+        return String::from(ROOT_CLASS);
     };
     if total == 0 {
-        return String::from(super::ROOT_CLASS);
+        return String::from(ROOT_CLASS);
     }
     if f64::from(*n) / f64::from(total) >= 0.8 {
         return top.clone();
@@ -783,7 +785,7 @@ fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>
             return ancestor.clone();
         }
     }
-    String::from(super::ROOT_CLASS)
+    String::from(ROOT_CLASS)
 }
 
 #[cfg(test)]
@@ -821,7 +823,7 @@ mod tests {
             assert!(
                 db.insert_document(
                     &NewDocument::new(&doc, &format!("{doc}.md"), "text/markdown", 10)
-                        .with_status("ready")
+                        .with_status(DocumentStatus::Ready)
                 )
                 .is_ok()
             );
@@ -846,7 +848,8 @@ mod tests {
         }
         assert!(
             db.insert_document(
-                &NewDocument::new("pending", "p.md", "text/markdown", 1).with_status("queued")
+                &NewDocument::new("pending", "p.md", "text/markdown", 1)
+                    .with_status(DocumentStatus::Queued)
             )
             .is_ok()
         );
@@ -912,7 +915,7 @@ mod tests {
         let find = |kind: &str, id: &str| {
             candidates
                 .iter()
-                .find(|c| c.proposal.kind() == kind && c.proposal.id() == id)
+                .find(|c| c.proposal.kind().as_str() == kind && c.proposal.id() == id)
         };
         let vendor = find("class", "vendor").unwrap_or_else(|| fail("no vendor"));
         assert!(

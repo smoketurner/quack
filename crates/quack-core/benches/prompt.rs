@@ -21,7 +21,7 @@ use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::sessions::ChatMode;
-use quack_core::storage::workspace::{NewChunk, NewDocument, WorkspaceDb};
+use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
 
 const EMBEDDING_DIM: u32 = 384;
 const DOCUMENTS: usize = 40;
@@ -40,7 +40,7 @@ fn workspace() -> WorkspaceDb {
                 "application/pdf",
                 10_000,
             )
-            .with_status("ready"),
+            .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         for c in 0..CHUNKS_PER_DOC {

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::embedding::{Input, Vector};
-use quack_core::graph::{GraphResult, GraphStatus};
+use quack_core::graph::{ExtractSource, GraphResult, GraphStatus};
 use quack_core::graph::{extract, resolve, store as graph_store, tables, traverse};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
@@ -106,11 +106,11 @@ pub(crate) async fn run(
             yes,
         } => {
             let sources = if tables_only {
-                Sources::Tables
+                ExtractSource::Tables
             } else if documents_only {
-                Sources::Documents
+                ExtractSource::Documents
             } else {
-                Sources::All
+                ExtractSource::All
             };
             run_extract(
                 config,
@@ -178,13 +178,13 @@ fn run_quick(db: &WorkspaceDb, action: GraphAction, out: &mut impl Write) -> Res
         }
         GraphAction::Merge { ids } => {
             for id in &ids {
-                let m = resolve::accept(db, id, None)?;
+                let m = resolve::decide(db, id, resolve::MergeDecision::Accept, None)?;
                 writeln!(out, "Merged {} into {}.", m.drop.label, m.keep.label)?;
             }
         }
         GraphAction::Reject { ids } => {
             for id in &ids {
-                let m = resolve::reject(db, id, None)?;
+                let m = resolve::decide(db, id, resolve::MergeDecision::Reject, None)?;
                 writeln!(out, "Kept {} and {} apart.", m.keep.label, m.drop.label)?;
             }
         }
@@ -192,15 +192,8 @@ fn run_quick(db: &WorkspaceDb, action: GraphAction, out: &mut impl Write) -> Res
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sources {
-    All,
-    Tables,
-    Documents,
-}
-
 struct ExtractArgs {
-    sources: Sources,
+    sources: ExtractSource,
     sample: Option<u32>,
     reset: bool,
     yes: bool,
@@ -313,7 +306,7 @@ async fn run_extract(
         db.run(graph_store::clear).await?;
         writeln!(out, "Cleared the graph.")?;
     }
-    if args.sources != Sources::Documents {
+    if args.sources.includes_tables() {
         if ontology.mappings.is_empty() {
             writeln!(
                 out,
@@ -336,7 +329,7 @@ async fn run_extract(
             }
         }
     }
-    if args.sources != Sources::Tables {
+    if args.sources.includes_documents() {
         let sample = args.sample;
         let chunks = db.run(move |db| extract::chunks(db, sample)).await?;
         if chunks.is_empty() {

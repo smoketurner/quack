@@ -721,14 +721,13 @@ impl Config {
     ///
     /// Returns an error if `chat_model` is unset or names an unknown provider.
     pub fn chat_model_ref(&self) -> Result<ModelRef<'_>> {
-        let spec = self.general.chat_model.as_deref().ok_or_else(|| {
-            Error::Config(format!(
-                "no chat model configured — set [general].chat_model = \"PROVIDER/MODEL\" \
-                 in {} or QUACK_MODEL; `quack doctor` checks the setup and suggests one \
-                 (SQL with `quack -q` needs no model)",
-                config_file_path().display()
-            ))
-        })?;
+        let spec = self
+            .general
+            .chat_model
+            .as_deref()
+            .ok_or_else(|| Error::NoChatModel {
+                config_file: config_file_path(),
+            })?;
         self.resolve_model("chat_model", spec)
     }
 

@@ -5,7 +5,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use quack_core::llm;
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
@@ -80,7 +80,7 @@ pub(crate) async fn run_import(
         Outcome::Error
     };
     access
-        .audit(app, "import", None, audit_outcome, Some(detail))
+        .audit(app, AuditAction::Import, None, audit_outcome, Some(detail))
         .await?;
     outcome.map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
 }

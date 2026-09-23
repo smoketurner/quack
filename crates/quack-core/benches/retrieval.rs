@@ -27,7 +27,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use quack_core::storage::workspace::{ChunkScope, NewChunk, NewDocument, WorkspaceDb};
+use quack_core::storage::workspace::{
+    ChunkScope, DocumentStatus, NewChunk, NewDocument, WorkspaceDb,
+};
 
 const SIZES: [usize; 3] = [10_000, 100_000, 1_000_000];
 const CHUNKS_PER_DOC: usize = 1_000;
@@ -70,7 +72,7 @@ fn fill(db: &WorkspaceDb, from: usize, to: usize, dim: usize) {
         let doc_id = format!("doc-{doc}");
         db.insert_document(
             &NewDocument::new(&doc_id, &format!("doc-{doc}.md"), "text/markdown", 1)
-                .with_status("ready"),
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         for c in 0..CHUNKS_PER_DOC {

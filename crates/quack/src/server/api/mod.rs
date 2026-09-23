@@ -19,9 +19,46 @@ mod tables;
 mod workspaces;
 
 use axum::Router;
+use axum::response::sse::Event;
 use axum::routing::{delete, get, post};
 
 use super::state::App;
+
+/// The event names the query and job streams send. Clients subscribe by
+/// these names, so they are a contract, written once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamEvent {
+    Status,
+    Text,
+    ToolStarted,
+    ToolFinished,
+    WriteRefused,
+    Complete,
+    Error,
+    Jobs,
+    Job,
+}
+
+impl StreamEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Text => "text",
+            Self::ToolStarted => "tool_started",
+            Self::ToolFinished => "tool_finished",
+            Self::WriteRefused => "write_refused",
+            Self::Complete => "complete",
+            Self::Error => "error",
+            Self::Jobs => "jobs",
+            Self::Job => "job",
+        }
+    }
+
+    /// An SSE event carrying this name.
+    pub(crate) fn event(self) -> Event {
+        Event::default().event(self.as_str())
+    }
+}
 
 pub(crate) fn router() -> Router<App> {
     Router::new()

@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{AuthMode, Config, ModelRef, ProviderType};
 use crate::embedding::{PromptSource, ResolvedPrompts};
+use crate::error::Error;
 use crate::llm::{OllamaRunningModels, oauth};
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -38,23 +39,41 @@ pub enum Status {
     Fail,
 }
 
-impl Status {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Fail => "fail",
-        }
-    }
+text_enum!(Status, "check status", {
+    Ok => "ok",
+    Info => "info",
+    Warn => "warn",
+    Fail => "fail",
+});
+
+/// The part of the setup a check looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Area {
+    Config,
+    Crypto,
+    Data,
+    ControlDb,
+    Workspace,
+    ChatModel,
+    Embeddings,
+    Server,
 }
+
+text_enum!(Area, "doctor area", {
+    Config => "config",
+    Crypto => "crypto",
+    Data => "data",
+    ControlDb => "control db",
+    Workspace => "workspace",
+    ChatModel => "chat model",
+    Embeddings => "embeddings",
+    Server => "server",
+});
 
 /// One finding: what was checked, how it came out, and what to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
-    /// The part of the setup: `config`, `data`, `workspace`, `chat model`, ...
-    pub area: &'static str,
+    pub area: Area,
     pub status: Status,
     pub summary: String,
     /// What to run or change, when there is something to do.
@@ -62,7 +81,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn new(area: &'static str, status: Status, summary: impl Into<String>) -> Self {
+    fn new(area: Area, status: Status, summary: impl Into<String>) -> Self {
         Self {
             area,
             status,
@@ -146,16 +165,20 @@ fn check_config(report: &mut Report, inspection: &Inspection) {
     let path = inspection.config_path.display();
     match &inspection.file_state {
         FileState::Missing => report.push(Check::new(
-            "config",
+            Area::Config,
             Status::Ok,
             format!("no file at {path}: built-in defaults are in force"),
         )),
         FileState::Loaded => {
-            report.push(Check::new("config", Status::Ok, format!("{path} loaded")));
+            report.push(Check::new(
+                Area::Config,
+                Status::Ok,
+                format!("{path} loaded"),
+            ));
         }
         FileState::Rejected(error) => report.push(
             Check::new(
-                "config",
+                Area::Config,
                 Status::Fail,
                 format!(
                     "{path} is rejected, so every other command fails: {}; \
@@ -168,7 +191,7 @@ fn check_config(report: &mut Report, inspection: &Inspection) {
     }
     for unknown in &inspection.unknown {
         let check = Check::new(
-            "config",
+            Area::Config,
             Status::Fail,
             format!("unknown key {}", unknown.path),
         );
@@ -182,11 +205,11 @@ fn check_config(report: &mut Report, inspection: &Inspection) {
 fn check_crypto(report: &mut Report) {
     let module = crate::crypto::provider_description();
     if aws_lc_rs::fips_version().is_some() || !cfg!(target_os = "linux") {
-        report.push(Check::new("crypto", Status::Ok, module));
+        report.push(Check::new(Area::Crypto, Status::Ok, module));
     } else {
         report.push(
             Check::new(
-                "crypto",
+                Area::Crypto,
                 Status::Warn,
                 format!("{module}: this Linux build is not using the FIPS module"),
             )
@@ -203,7 +226,7 @@ fn check_data_dir(report: &mut Report, dir: &Path) -> bool {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             report.push(Check::new(
-                "data",
+                Area::Data,
                 Status::Ok,
                 format!("{shown} does not exist yet; the first command creates it, private to you"),
             ));
@@ -211,16 +234,24 @@ fn check_data_dir(report: &mut Report, dir: &Path) -> bool {
         }
         Err(e) => {
             report.push(
-                Check::new("data", Status::Fail, format!("cannot read {shown}: {e}"))
-                    .fix("check the path's permissions, or point QUACK_DATA_DIR elsewhere"),
+                Check::new(
+                    Area::Data,
+                    Status::Fail,
+                    format!("cannot read {shown}: {e}"),
+                )
+                .fix("check the path's permissions, or point QUACK_DATA_DIR elsewhere"),
             );
             return false;
         }
     };
     if !metadata.is_dir() {
         report.push(
-            Check::new("data", Status::Fail, format!("{shown} is not a directory"))
-                .fix("set [general].data_dir or QUACK_DATA_DIR to a directory"),
+            Check::new(
+                Area::Data,
+                Status::Fail,
+                format!("{shown} is not a directory"),
+            )
+            .fix("set [general].data_dir or QUACK_DATA_DIR to a directory"),
         );
         return false;
     }
@@ -232,7 +263,7 @@ fn check_data_dir(report: &mut Report, dir: &Path) -> bool {
         Err(e) => {
             report.push(
                 Check::new(
-                    "data",
+                    Area::Data,
                     Status::Fail,
                     format!("cannot write to {shown}: {e}"),
                 )
@@ -244,7 +275,7 @@ fn check_data_dir(report: &mut Report, dir: &Path) -> bool {
     match exposed_mode(&metadata) {
         Some(mode) => report.push(
             Check::new(
-                "data",
+                Area::Data,
                 Status::Warn,
                 format!(
                     "{shown} is open to other users (mode {mode:o}); it holds every workspace's \
@@ -254,7 +285,7 @@ fn check_data_dir(report: &mut Report, dir: &Path) -> bool {
             .fix(format!("chmod 700 {shown}")),
         ),
         None => report.push(Check::new(
-            "data",
+            Area::Data,
             Status::Ok,
             format!("{shown} is writable and private"),
         )),
@@ -279,7 +310,7 @@ async fn check_control(report: &mut Report, config: &Config) -> Option<ControlPl
     let path = config.control_db_path();
     if !path.exists() {
         report.push(Check::new(
-            "control db",
+            Area::ControlDb,
             Status::Ok,
             format!(
                 "{} does not exist yet; the first command creates it",
@@ -292,7 +323,7 @@ async fn check_control(report: &mut Report, config: &Config) -> Option<ControlPl
         Ok(control) => {
             let workspaces = control.list_workspaces().await.map_or(0, |w| w.len());
             report.push(Check::new(
-                "control db",
+                Area::ControlDb,
                 Status::Ok,
                 format!(
                     "{} opens and is migrated; {}",
@@ -305,7 +336,7 @@ async fn check_control(report: &mut Report, config: &Config) -> Option<ControlPl
         Err(e) => {
             report.push(
                 Check::new(
-                    "control db",
+                    Area::ControlDb,
                     Status::Fail,
                     format!("{} does not open: {e}", path.display()),
                 )
@@ -331,7 +362,7 @@ async fn check_workspace(
             Ok(row) => row,
             Err(e) => {
                 report.push(Check::new(
-                    "workspace",
+                    Area::Workspace,
                     Status::Fail,
                     format!("cannot look up workspace '{name}': {e}"),
                 ));
@@ -342,7 +373,7 @@ async fn check_workspace(
     };
     let Some(row) = row else {
         report.push(Check::new(
-            "workspace",
+            Area::Workspace,
             Status::Ok,
             format!("'{name}' does not exist yet; the first command that uses it creates it"),
         ));
@@ -350,7 +381,7 @@ async fn check_workspace(
     };
     if !config.workspace_db_path(&row.id).exists() {
         report.push(Check::new(
-            "workspace",
+            Area::Workspace,
             Status::Ok,
             format!("'{name}' is registered; its database file is created on first use"),
         ));
@@ -361,7 +392,7 @@ async fn check_workspace(
             let tables = db.list_tables().map_or(0, |t| t.len());
             let documents = db.list_documents().map_or(0, |d| d.len());
             report.push(Check::new(
-                "workspace",
+                Area::Workspace,
                 Status::Ok,
                 format!(
                     "'{name}' opens: {}, {}",
@@ -371,32 +402,30 @@ async fn check_workspace(
             ));
             if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
                 report.push(
-                    Check::new("workspace", Status::Warn, format!("'{name}': {note}"))
+                    Check::new(Area::Workspace, Status::Warn, format!("'{name}': {note}"))
                         .fix(format!("quack embeddings refresh -w {name}")),
                 );
             }
         }
+        Err(Error::WorkspaceLocked { .. }) => {
+            report.push(Check::new(
+                Area::Workspace,
+                Status::Info,
+                format!(
+                    "'{name}' is open in another quack process (a server or a session), \
+                     so it was not checked"
+                ),
+            ));
+        }
         Err(e) => {
-            let message = e.to_string();
-            if message.contains("lock") {
-                report.push(Check::new(
-                    "workspace",
-                    Status::Info,
-                    format!(
-                        "'{name}' is open in another quack process (a server or a session), \
-                         so it was not checked"
-                    ),
-                ));
-            } else {
-                report.push(
-                    Check::new(
-                        "workspace",
-                        Status::Fail,
-                        format!("'{name}' does not open: {message}"),
-                    )
-                    .fix("check the file under the data directory, or restore a backup"),
-                );
-            }
+            report.push(
+                Check::new(
+                    Area::Workspace,
+                    Status::Fail,
+                    format!("'{name}' does not open: {e}"),
+                )
+                .fix("check the file under the data directory, or restore a backup"),
+            );
         }
     }
 }
@@ -406,7 +435,7 @@ async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&re
         let suggestion = suggest_chat_model(http).await;
         report.push(
             Check::new(
-                "chat model",
+                Area::ChatModel,
                 Status::Warn,
                 "none configured: SQL (`quack -q`, typed SQL in `quack`), ingest, and \
                  import work; questions, `ontology propose --documents`, and \
@@ -417,9 +446,9 @@ async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&re
         return;
     };
     match config.chat_model_ref() {
-        Ok(model) => check_model(report, "chat model", config, model, http).await,
+        Ok(model) => check_model(report, Area::ChatModel, config, model, http).await,
         Err(e) => report.push(Check::new(
-            "chat model",
+            Area::ChatModel,
             Status::Fail,
             format!("\"{spec}\": {e}"),
         )),
@@ -434,7 +463,7 @@ async fn check_embedding_model(
     match config.embedding_model_ref() {
         Ok(None) => report.push(
             Check::new(
-                "embeddings",
+                Area::Embeddings,
                 Status::Info,
                 "no embedding model: document search is keyword-only (BM25), and \
                  documents ingested now are stored without vectors",
@@ -445,7 +474,7 @@ async fn check_embedding_model(
             ),
         ),
         Ok(Some(model)) => {
-            check_model(report, "embeddings", config, model, http).await;
+            check_model(report, Area::Embeddings, config, model, http).await;
             report.push(prompts_check(config, model));
             if let (Some(http), ProviderType::Ollama, Some(configured)) = (
                 http,
@@ -463,7 +492,7 @@ async fn check_embedding_model(
                 }
             }
         }
-        Err(e) => report.push(Check::new("embeddings", Status::Fail, e.to_string())),
+        Err(e) => report.push(Check::new(Area::Embeddings, Status::Fail, e.to_string())),
     }
 }
 
@@ -473,7 +502,7 @@ fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
     let ResolvedPrompts { prompts, source } = ResolvedPrompts::for_model(config, model.model);
     match source {
         PromptSource::Family(family) if prompts.is_empty() => Check::new(
-            "embeddings",
+            Area::Embeddings,
             Status::Ok,
             format!(
                 "{model}: {} takes no input prefixes ({})",
@@ -481,7 +510,7 @@ fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
             ),
         ),
         PromptSource::Family(family) => Check::new(
-            "embeddings",
+            Area::Embeddings,
             Status::Ok,
             format!(
                 "{model}: the query, document, and similarity prefixes {} was trained with ({})",
@@ -489,12 +518,12 @@ fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
             ),
         ),
         PromptSource::Config => Check::new(
-            "embeddings",
+            Area::Embeddings,
             Status::Ok,
             format!("{model}: input prefixes from [embedding]"),
         ),
         PromptSource::Unknown => Check::new(
-            "embeddings",
+            Area::Embeddings,
             Status::Info,
             format!("{model}: quack knows no input prefixes for this model, so it gets none"),
         )
@@ -560,13 +589,13 @@ fn width_check(
     let reported = show.ok()?.embedding_length()?;
     Some(if reported == configured {
         Check::new(
-            "embeddings",
+            Area::Embeddings,
             Status::Ok,
             format!("{model}: makes {reported}-dimensional vectors, as embedding_dimension says"),
         )
     } else {
         Check::new(
-            "embeddings",
+            Area::Embeddings,
             Status::Fail,
             format!(
                 "{model}: makes {reported}-dimensional vectors but embedding_dimension is \
@@ -583,7 +612,7 @@ fn width_check(
 /// Credentials, transport, and whether the provider serves the model.
 async fn check_model(
     report: &mut Report,
-    area: &'static str,
+    area: Area,
     config: &Config,
     model: ModelRef<'_>,
     http: Option<&reqwest::Client>,
@@ -629,7 +658,7 @@ async fn check_model(
 /// The credential a model's provider is called with, or the failed check
 /// saying why there is none.
 async fn model_credential(
-    area: &'static str,
+    area: Area,
     config: &Config,
     model: ModelRef<'_>,
 ) -> std::result::Result<Option<String>, Box<Check>> {
@@ -684,7 +713,7 @@ async fn model_credential(
 
 /// What a model-list probe says about one model.
 fn listing_check(
-    area: &'static str,
+    area: Area,
     model: ModelRef<'_>,
     base: &str,
     listing: std::result::Result<Listing, Probe>,
@@ -803,7 +832,7 @@ async fn check_server(report: &mut Report, config: &Config, control: Option<&Con
     match bind.parse::<SocketAddr>() {
         Err(e) => report.push(
             Check::new(
-                "server",
+                Area::Server,
                 Status::Fail,
                 format!("[server].bind = \"{bind}\" is not an address: {e}"),
             )
@@ -811,7 +840,7 @@ async fn check_server(report: &mut Report, config: &Config, control: Option<&Con
         ),
         Ok(addr) if config.server.local && !addr.ip().is_loopback() => report.push(
             Check::new(
-                "server",
+                Area::Server,
                 Status::Fail,
                 format!("[server].local serves without authentication, but bind = {addr} is not loopback"),
             )
@@ -819,7 +848,7 @@ async fn check_server(report: &mut Report, config: &Config, control: Option<&Con
         ),
         Ok(addr) if !addr.ip().is_loopback() => report.push(
             Check::new(
-                "server",
+                Area::Server,
                 Status::Warn,
                 format!(
                     "`quack serve` listens on {addr}, reachable from other machines over plain HTTP"
@@ -833,7 +862,7 @@ async fn check_server(report: &mut Report, config: &Config, control: Option<&Con
                 None => 0,
             };
             let check = Check::new(
-                "server",
+                Area::Server,
                 Status::Ok,
                 format!("`quack serve` binds {addr}, this machine only; {}", plural(users, "user")),
             );
@@ -1074,7 +1103,7 @@ mod tests {
         }
     }
 
-    fn find<'a>(report: &'a Report, area: &str) -> Vec<&'a Check> {
+    fn find(report: &Report, area: Area) -> Vec<&Check> {
         report.checks.iter().filter(|c| c.area == area).collect()
     }
 
@@ -1084,7 +1113,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = run(&inspection(dir.path(), None), &offline()).await;
         assert!(!report.has_failures(), "{report:#?}");
-        let chat = find(&report, "chat model");
+        let chat = find(&report, Area::ChatModel);
         assert_eq!(chat.len(), 1);
         assert_eq!(chat.first().unwrap().status, Status::Warn);
         assert!(chat.first().unwrap().summary.contains("SQL"));
@@ -1097,7 +1126,7 @@ mod tests {
                 .contains("chat_model")
         );
         assert_eq!(
-            find(&report, "embeddings").first().unwrap().status,
+            find(&report, Area::Embeddings).first().unwrap().status,
             Status::Info
         );
         // Nothing was created by looking.
@@ -1113,7 +1142,7 @@ mod tests {
             &offline(),
         )
         .await;
-        let config = find(&report, "config");
+        let config = find(&report, Area::Config);
         assert!(
             config.iter().all(|c| c.status == Status::Fail),
             "{config:#?}"
@@ -1132,7 +1161,7 @@ mod tests {
         let toml = "[general]\nchat_model = \"a/claude\"\n[providers.a]\ntype = \"anthropic\"\n\
                     auth = \"api-key\"\napi_key_env = \"QUACK_DOCTOR_TEST_KEY_UNSET\"\n";
         let report = run(&inspection(dir.path(), Some(toml)), &offline()).await;
-        let chat = find(&report, "chat model");
+        let chat = find(&report, Area::ChatModel);
         let check = chat.first().unwrap();
         assert_eq!(check.status, Status::Fail);
         assert!(check.summary.contains("QUACK_DOCTOR_TEST_KEY_UNSET"));
@@ -1149,7 +1178,7 @@ mod tests {
             ..Options::default()
         };
         let report = run(&inspection(dir.path(), Some(toml)), &options).await;
-        let check = *find(&report, "chat model").first().unwrap();
+        let check = *find(&report, Area::ChatModel).first().unwrap();
         assert_eq!(check.status, Status::Fail, "{check:#?}");
         assert!(check.summary.contains("cannot reach"));
         assert!(check.fix.as_deref().unwrap().contains("ollama serve"));
@@ -1167,11 +1196,14 @@ mod tests {
         let mode = std::fs::metadata(data).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let report = run(&inspection, &offline()).await;
-        assert_eq!(find(&report, "data").first().unwrap().status, Status::Ok);
+        assert_eq!(
+            find(&report, Area::Data).first().unwrap().status,
+            Status::Ok
+        );
 
         std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o755)).unwrap();
         let report = run(&inspection, &offline()).await;
-        let check = *find(&report, "data").first().unwrap();
+        let check = *find(&report, Area::Data).first().unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.fix.as_deref().unwrap().starts_with("chmod 700"));
     }
@@ -1185,7 +1217,10 @@ mod tests {
             &offline(),
         )
         .await;
-        assert_eq!(find(&open, "server").first().unwrap().status, Status::Warn);
+        assert_eq!(
+            find(&open, Area::Server).first().unwrap().status,
+            Status::Warn
+        );
         let local = run(
             &inspection(
                 dir.path(),
@@ -1194,7 +1229,10 @@ mod tests {
             &offline(),
         )
         .await;
-        assert_eq!(find(&local, "server").first().unwrap().status, Status::Fail);
+        assert_eq!(
+            find(&local, Area::Server).first().unwrap().status,
+            Status::Fail
+        );
     }
 
     #[test]

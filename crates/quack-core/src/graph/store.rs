@@ -3,13 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::resolve::MergeStatus;
 use super::{Drift, Edge, GraphStatus, Node, Provenance, normalize_label};
 use crate::error::{Error, Result};
 use crate::ontology::{self, Ontology, store as ontology_store};
-use crate::storage::workspace::{WorkspaceDb, embedding_literal};
-
-const META_BUILT_WITH: &str = "graph_built_with_ontology_version";
-const META_DRIFT: &str = "graph_drift";
+use crate::storage::workspace::{MetaKey, WorkspaceDb, embedding_literal};
 
 /// A node to store: merged into an existing one with the same normalized
 /// label and class, else inserted.
@@ -446,7 +444,7 @@ pub fn provenance_of(db: &WorkspaceDb, subject_ids: &[String]) -> Result<Vec<Pro
 /// Returns an error if the read fails.
 pub fn built_with(db: &WorkspaceDb) -> Result<u32> {
     Ok(db
-        .meta(META_BUILT_WITH)?
+        .meta(MetaKey::GraphBuiltWithOntologyVersion)?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0))
 }
@@ -457,7 +455,7 @@ pub fn built_with(db: &WorkspaceDb) -> Result<u32> {
 ///
 /// Returns an error if the write fails.
 pub fn set_built_with(db: &WorkspaceDb, version: u32) -> Result<()> {
-    db.set_meta_public(META_BUILT_WITH, &version.to_string())
+    db.set_meta(MetaKey::GraphBuiltWithOntologyVersion, &version.to_string())
 }
 
 /// The accumulated drift.
@@ -467,7 +465,7 @@ pub fn set_built_with(db: &WorkspaceDb, version: u32) -> Result<()> {
 /// Returns an error if the read fails.
 pub fn drift(db: &WorkspaceDb) -> Result<Drift> {
     Ok(db
-        .meta(META_DRIFT)?
+        .meta(MetaKey::GraphDrift)?
         .and_then(|v| serde_json::from_str(&v).ok())
         .unwrap_or_default())
 }
@@ -480,7 +478,7 @@ pub fn drift(db: &WorkspaceDb) -> Result<Drift> {
 pub fn record_drift(db: &WorkspaceDb, run: &Drift) -> Result<()> {
     let mut total = drift(db)?;
     total.absorb(run);
-    db.set_meta_public(META_DRIFT, &serde_json::to_string(&total)?)
+    db.set_meta(MetaKey::GraphDrift, &serde_json::to_string(&total)?)
 }
 
 /// Size, provisional and stale flags, pending merges, and drift.
@@ -497,8 +495,8 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     )?;
     let edges: i64 = conn.query_row("SELECT count(*) FROM _quack_graph_edges", [], |r| r.get(0))?;
     let pending_merges: i64 = conn.query_row(
-        "SELECT count(*) FROM _quack_graph_merges WHERE status = 'pending'",
-        [],
+        "SELECT count(*) FROM _quack_graph_merges WHERE status = ?",
+        [MergeStatus::Pending],
         |r| r.get(0),
     )?;
     let built_with_version = built_with(db)?;
@@ -540,8 +538,8 @@ pub fn clear(db: &WorkspaceDb) -> Result<()> {
          DELETE FROM _quack_graph_nodes; DELETE FROM _quack_graph_merges; \
          DELETE FROM _quack_graph_extracted;",
     )?;
-    db.set_meta_public(META_DRIFT, "{}")?;
-    db.set_meta_public(META_BUILT_WITH, "0")
+    db.set_meta(MetaKey::GraphDrift, "{}")?;
+    db.set_meta(MetaKey::GraphBuiltWithOntologyVersion, "0")
 }
 
 /// Note that a chunk was extracted under an ontology version, with what

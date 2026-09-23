@@ -486,7 +486,7 @@ pub fn format_query_result(capped: &CappedResults) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::workspace::{NewChunk, NewDocument};
+    use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
     fn db() -> WorkspaceDb {
         WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
@@ -567,7 +567,8 @@ mod tests {
         db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")
             .unwrap();
         db.insert_document(
-            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         ontology_store::save(
@@ -616,7 +617,8 @@ mod tests {
     fn context_is_placed_after_documents_and_truncated_to_budget() {
         let db = db();
         db.insert_document(
-            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         let mut opts = options(ChatMode::Chat, 100);
@@ -644,7 +646,8 @@ mod tests {
         db.execute_statement("CREATE TABLE claims(id INT, amount INT)")
             .unwrap();
         db.insert_document(
-            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         let chat = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
@@ -679,11 +682,13 @@ mod tests {
     fn pinned_documents_are_injected_within_budget() {
         let db = db();
         db.insert_document(
-            &NewDocument::new("d1", "rules.md", "text/markdown", 1).with_status("ready"),
+            &NewDocument::new("d1", "rules.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_document(
-            &NewDocument::new("d2", "big.md", "text/markdown", 1).with_status("ready"),
+            &NewDocument::new("d2", "big.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         let big = "x".repeat(400);

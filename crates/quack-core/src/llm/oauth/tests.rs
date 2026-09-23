@@ -316,9 +316,13 @@ async fn missing_cache_and_failed_refresh_both_require_a_login() {
     );
     idp.state.refresh_fails.store(true, Ordering::SeqCst);
     let err = m.access_token().await.err();
-    assert!(err.is_some_and(
-        |e| matches!(&e, Error::AuthRequired { reason, .. } if reason.contains("refresh failed"))
-    ));
+    assert!(err.is_some_and(|e| matches!(
+        &e,
+        Error::AuthRequired {
+            reason: AuthReason::RefreshFailed(_),
+            ..
+        }
+    )));
 
     assert!(
         m.cache

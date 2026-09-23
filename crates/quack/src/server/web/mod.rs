@@ -5,6 +5,8 @@
 
 pub(crate) mod markdown;
 
+use std::fmt;
+
 use askama::Template;
 use axum::Form;
 use axum::Router;
@@ -18,13 +20,14 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use axum_extra::extract::cookie::Cookie;
-use quack_core::ontology::induction::{Decision, Proposal, propose_from_tables};
+use quack_core::ontology::candidates::{CandidateAction, Queue};
+use quack_core::ontology::induction::{Decision, ItemKind, Proposal, propose_from_tables};
 use quack_core::ontology::store as ontology_store;
 use quack_core::ontology::{Ontology, OntologyDiff, candidates};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, Role, Scope, TokenRow, UserRow,
-    WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
+    Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
@@ -43,8 +46,11 @@ use super::error::ApiError;
 use super::state::{App, with_db};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store as graph_store;
-use quack_core::graph::{GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse};
+use quack_core::graph::{
+    ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse,
+};
 use quack_core::import::ImportRequest;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -313,7 +319,7 @@ struct ClassRow {
 
 struct CandidateView {
     id: String,
-    kind: String,
+    kind: ItemKind,
     proposal_id: String,
     confidence: String,
     evidence: String,
@@ -331,8 +337,8 @@ struct OntologyPage {
     diff: Option<OntologyDiff>,
     /// The page of the queue being shown.
     queue: Vec<CandidateView>,
-    /// `pending` or `low_support`: which queue `queue` shows.
-    queue_status: String,
+    /// Which queue `queue` shows.
+    queue_status: Queue,
     queue_page: usize,
     queue_pages: usize,
     pending_total: usize,
@@ -349,19 +355,21 @@ const CANDIDATES_PER_PAGE: usize = 50;
 struct OntologyQuery {
     error: Option<String>,
     notice: Option<String>,
-    /// `pending` (default) or `low_support`.
-    status: Option<String>,
+    /// The main queue unless `low_support` is asked for.
+    #[serde(default, deserialize_with = "blank_as_none")]
+    status: Option<Queue>,
     page: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct BulkDecideForm {
     /// `accept` or `reject`.
-    bulk: String,
+    bulk: CandidateAction,
     #[serde(default)]
     ids: Vec<String>,
+    /// The queue to return to.
     #[serde(default)]
-    status: String,
+    status: Queue,
 }
 
 /// One node as the graph page's inspector shows it.
@@ -601,7 +609,7 @@ async fn logout(
         app.close_web_session(token);
     }
     app.control
-        .record_audit(&identity.audit("logout", Outcome::Allowed))
+        .record_audit(&identity.audit(AuditAction::Logout, Outcome::Allowed))
         .await?;
     Ok((
         jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()),
@@ -690,10 +698,9 @@ async fn create_workspace(
             .set_member(&ws.id, &identity.user_id, Role::Owner)
             .await?;
     }
-    let mut entry = identity.audit("workspace", Outcome::Allowed);
+    let mut entry = identity.audit(AuditAction::Workspace, Outcome::Allowed);
     entry.workspace_id = Some(ws.id.clone());
-    entry.resource_type = Some(String::from("workspace"));
-    entry.resource_id = Some(ws.id.clone());
+    entry = entry.on(ResourceKind::Workspace.id(&ws.id));
     app.control.record_audit(&entry).await?;
     Ok(Redirect::to(&format!("/w/{}/chat", ws.id)).into_response())
 }
@@ -825,8 +832,8 @@ async fn chat(
         access
             .audit(
                 &app,
-                "session_read",
-                Some(("session", &current.id)),
+                AuditAction::SessionRead,
+                Some(ResourceKind::Session.id(&current.id)),
                 Outcome::Allowed,
                 None,
             )
@@ -883,9 +890,7 @@ async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
     let documents = app
         .read(&access.workspace.id, WorkspaceDb::list_documents)
         .await?;
-    let pending = documents
-        .iter()
-        .any(|d| d.status == "queued" || d.status == "processing");
+    let pending = documents.iter().any(|d| d.status.is_in_flight());
     Ok(DocumentRows {
         ws_id: access.workspace.id.clone(),
         can_write: access.permits(Need::WRITE),
@@ -930,7 +935,7 @@ async fn jobs_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "jobs").await?;
+    access.audit_read(&app, AuditAction::Page, "jobs").await?;
     let rows = render_jobs(&app, &access)?;
     html(&JobsPage {
         page: page(&app, &access.identity, "Jobs", Some(&access)),
@@ -944,7 +949,9 @@ async fn job_rows(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "job_rows").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "job_rows")
+        .await?;
     Ok(Html(render_jobs(&app, &access)?).into_response())
 }
 
@@ -966,7 +973,9 @@ async fn documents(
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "documents").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "documents")
+        .await?;
     let rows = render_rows(&app, &access).await?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
@@ -1010,7 +1019,9 @@ async fn document_rows(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "document_rows").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "document_rows")
+        .await?;
     Ok(Html(render_rows(&app, &access).await?).into_response())
 }
 
@@ -1146,7 +1157,7 @@ async fn tables(
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "tables").await?;
+    access.audit_read(&app, AuditAction::Page, "tables").await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
         page: page(&app, &access.identity, "Tables", Some(&access)),
@@ -1217,7 +1228,7 @@ async fn table(
     access
         .audit(
             &app,
-            "open",
+            AuditAction::Open,
             None,
             Outcome::Allowed,
             Some(serde_json::json!({ "table": name })),
@@ -1251,7 +1262,7 @@ async fn sql_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "sql").await?;
+    access.audit_read(&app, AuditAction::Page, "sql").await?;
     html(&SqlPage {
         page: page(&app, &access.identity, "SQL", Some(&access)),
         sql: String::new(),
@@ -1382,11 +1393,10 @@ async fn ontology_page(
     Query(q): Query<OntologyQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "ontology").await?;
-    let queue_status = match q.status.as_deref() {
-        Some("low_support") => "low_support",
-        _ => "pending",
-    };
+    access
+        .audit_read(&app, AuditAction::Page, "ontology")
+        .await?;
+    let queue_status = q.status.unwrap_or_default();
     let (ontology, versions, diff, pending, low_support, has_tables) = app
         .read(&id, |db| {
             let current = ontology_store::current(db)?;
@@ -1398,17 +1408,16 @@ async fn ontology_page(
                 }
                 _ => None,
             };
-            let pending = candidates::pending(db)?;
-            let low_support = candidates::low_support(db)?;
+            let pending = candidates::queue(db, Queue::Pending)?;
+            let low_support = candidates::queue(db, Queue::LowSupport)?;
             let has_tables = !db.list_tables()?.is_empty();
             Ok((current, versions, diff, pending, low_support, has_tables))
         })
         .await?;
     let (pending_total, low_support_total) = (pending.len(), low_support.len());
-    let rows = if queue_status == "low_support" {
-        low_support
-    } else {
-        pending
+    let rows = match queue_status {
+        Queue::Pending => pending,
+        Queue::LowSupport => low_support,
     };
     // The queue is paged (issue #55): 221 candidates from one document
     // pass are not one wall of rows.
@@ -1436,7 +1445,7 @@ async fn ontology_page(
         versions,
         diff,
         queue,
-        queue_status: queue_status.to_owned(),
+        queue_status,
         queue_page,
         queue_pages,
         pending_total,
@@ -1455,10 +1464,9 @@ async fn ontology_decide_many(
     MultiForm(form): MultiForm<BulkDecideForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let back = if form.status == "low_support" {
-        format!("/w/{id}/ontology?status=low_support")
-    } else {
-        format!("/w/{id}/ontology")
+    let back = match form.status {
+        Queue::LowSupport => format!("/w/{id}/ontology?status={}", Queue::LowSupport),
+        Queue::Pending => format!("/w/{id}/ontology"),
     };
     if form.ids.is_empty() {
         return Ok(Redirect::to(&format!(
@@ -1467,10 +1475,10 @@ async fn ontology_decide_many(
         ))
         .into_response());
     }
-    let accept = match form.bulk.as_str() {
-        "accept" => true,
-        "reject" => false,
-        _ => {
+    let accept = match form.bulk {
+        CandidateAction::Accept => true,
+        CandidateAction::Reject => false,
+        CandidateAction::Rename | CandidateAction::MergeInto | CandidateAction::Reparent => {
             return Ok(Redirect::to(&format!(
                 "{back}{}error=unknown+bulk+action",
                 if back.contains('?') { "&" } else { "?" }
@@ -1499,7 +1507,7 @@ async fn ontology_decide_many(
             access
                 .audit(
                     &app,
-                    "ontology",
+                    AuditAction::Ontology,
                     None,
                     Outcome::Allowed,
                     Some(serde_json::json!({
@@ -1588,10 +1596,10 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
     let source = e.get("source").and_then(|v| v.as_str());
     let from_documents = source == Some("documents");
     let from_bundle = source == Some("okf");
-    let (evidence, detail) = match c.kind.as_str() {
+    let (evidence, detail) = match c.kind {
         _ if from_bundle => (bundle_evidence(e), proposal_detail(&c.proposal)),
         _ if from_documents => (document_evidence(e), proposal_detail(&c.proposal)),
-        "class" => (
+        ItemKind::Class => (
             format!(
                 "table {} · {} rows · key {}",
                 get("table"),
@@ -1600,7 +1608,7 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
             ),
             String::new(),
         ),
-        "property" => (
+        ItemKind::Property => (
             format!(
                 "{}.{} · {} · {} distinct of {} · e.g. {}",
                 get("table"),
@@ -1622,7 +1630,7 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
                 _ => String::new(),
             },
         ),
-        "relation" => (
+        ItemKind::Relation => (
             format!(
                 "{}.{} matches {}.{} for {} of values",
                 get("table"),
@@ -1636,7 +1644,7 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
                 _ => String::new(),
             },
         ),
-        _ => (
+        ItemKind::Mapping => (
             format!("table {}", get("table")),
             match &c.proposal {
                 Proposal::Mapping(m) => format!(
@@ -1709,8 +1717,8 @@ async fn ontology_propose(
             access
                 .audit(
                     &app,
-                    "propose",
-                    run.as_deref().map(|r| ("induction_run", r)),
+                    AuditAction::Propose,
+                    run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
                     Outcome::Allowed,
                     Some(serde_json::json!({ "candidates": count })),
                 )
@@ -1724,7 +1732,7 @@ async fn ontology_propose(
 
 #[derive(Deserialize)]
 struct DecideForm {
-    action: String,
+    action: CandidateAction,
     #[serde(default)]
     target: String,
 }
@@ -1736,15 +1744,10 @@ async fn ontology_decide(
     Form(form): Form<DecideForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let target = form.target.trim().to_owned();
-    let decision = match form.action.as_str() {
-        "accept" => Some(Decision::Accept),
-        "rename" if !target.is_empty() => Some(Decision::Rename(target)),
-        "merge_into" if !target.is_empty() => Some(Decision::MergeInto(target)),
-        "reparent" if !target.is_empty() => Some(Decision::Reparent(target)),
-        "reject" => None,
-        _ => {
-            let target = format!("/w/{id}/ontology?error=that+action+needs+a+target");
+    let decision = match form.action.decision(Some(&form.target)) {
+        Ok(decision) => decision,
+        Err(e) => {
+            let target = format!("/w/{id}/ontology?error={}", urlencoded(&e.to_string()));
             return Ok(Redirect::to(&target).into_response());
         }
     };
@@ -1765,8 +1768,8 @@ async fn ontology_decide(
             access
                 .audit(
                     &app,
-                    "ontology",
-                    Some(("candidate", &cid)),
+                    AuditAction::Ontology,
+                    Some(ResourceKind::Candidate.id(&cid)),
                     Outcome::Allowed,
                     Some(serde_json::json!({ "action": form.action, "version": version })),
                 )
@@ -1808,8 +1811,8 @@ async fn ontology_import(
             access
                 .audit(
                     &app,
-                    "ontology",
-                    Some(("ontology_version", &stored.version.to_string())),
+                    AuditAction::Ontology,
+                    Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
                     Outcome::Allowed,
                     Some(serde_json::json!({ "version": stored.version })),
                 )
@@ -1849,8 +1852,8 @@ async fn ontology_init(
         access
             .audit(
                 &app,
-                "ontology",
-                Some(("ontology_version", &stored.version.to_string())),
+                AuditAction::Ontology,
+                Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
                 Outcome::Allowed,
                 None,
             )
@@ -1871,14 +1874,12 @@ async fn ontology_restore(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
-    let stored = with_db(db, move |db| ontology_store::restore(db, v, Some(&author)))
-        .await
-        .map_err(|e| ApiError::not_found(e.message))?;
+    let stored = with_db(db, move |db| ontology_store::restore(db, v, Some(&author))).await?;
     access
         .audit(
             &app,
-            "ontology",
-            Some(("ontology_version", &stored.version.to_string())),
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "restored": v })),
         )
@@ -1892,7 +1893,9 @@ async fn context_page(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "context").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "context")
+        .await?;
     let (current, versions) = app
         .read(&id, |db| {
             Ok((context::current(db)?, context::history(db, 20)?))
@@ -1927,8 +1930,8 @@ async fn context_save(
     access
         .audit(
             &app,
-            "context",
-            Some(("context", &stored.version.to_string())),
+            AuditAction::Context,
+            Some(ResourceKind::Context.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version })),
         )
@@ -1989,7 +1992,9 @@ async fn settings(
         ..Need::READ
     };
     let access = access(&app, identity, &id, need).await?;
-    access.audit_read(&app, "page", "settings").await?;
+    access
+        .audit_read(&app, AuditAction::Page, "settings")
+        .await?;
     settings_view(&app, &access, None, q.error).await
 }
 
@@ -2025,8 +2030,8 @@ async fn settings_save(
     access
         .audit(
             &app,
-            "workspace",
-            Some(("workspace", &id)),
+            AuditAction::Workspace,
+            Some(ResourceKind::Workspace.id(&id)),
             Outcome::Allowed,
             None,
         )
@@ -2054,8 +2059,8 @@ async fn member_add(
     access
         .audit(
             &app,
-            "member",
-            Some(("user", &user.id)),
+            AuditAction::Member,
+            Some(ResourceKind::User.id(&user.id)),
             Outcome::Allowed,
             None,
         )
@@ -2073,8 +2078,8 @@ async fn member_remove(
     access
         .audit(
             &app,
-            "member",
-            Some(("user", &user_id)),
+            AuditAction::Member,
+            Some(ResourceKind::User.id(&user_id)),
             Outcome::Allowed,
             None,
         )
@@ -2125,8 +2130,8 @@ async fn token_create(
     access
         .audit(
             &app,
-            "token",
-            Some(("token", &row.token_hash)),
+            AuditAction::Token,
+            Some(ResourceKind::Token.id(&row.token_hash)),
             Outcome::Allowed,
             None,
         )
@@ -2155,8 +2160,8 @@ async fn token_revoke(
     access
         .audit(
             &app,
-            "token",
-            Some(("token", &hash)),
+            AuditAction::Token,
+            Some(ResourceKind::Token.id(&hash)),
             Outcome::Allowed,
             None,
         )
@@ -2200,9 +2205,8 @@ async fn admin_user_add(
         .await
     {
         Ok(user) => {
-            let mut entry = identity.audit("admin", Outcome::Allowed);
-            entry.resource_type = Some(String::from("user"));
-            entry.resource_id = Some(user.id);
+            let mut entry = identity.audit(AuditAction::Admin, Outcome::Allowed);
+            entry = entry.on(ResourceKind::User.id(&user.id));
             app.control.record_audit(&entry).await?;
             Ok(Redirect::to("/admin/users").into_response())
         }
@@ -2228,7 +2232,7 @@ fn blank_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: std::str::FromStr,
-    T::Err: std::fmt::Display,
+    T::Err: fmt::Display,
 {
     match Option::<String>::deserialize(deserializer)?
         .as_deref()
@@ -2318,7 +2322,7 @@ async fn graph_page(
     Query(q): Query<GraphPageQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, "page", "graph").await?;
+    access.audit_read(&app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
     let query = GraphQueryView {
         entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
@@ -2520,8 +2524,8 @@ fn short_id(id: &str) -> String {
 
 #[derive(Deserialize)]
 struct ExtractForm {
-    #[serde(default)]
-    source: String,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    source: Option<ExtractSource>,
     sample: Option<String>,
     #[serde(default)]
     reset: bool,
@@ -2534,11 +2538,6 @@ async fn graph_extract(
     Form(form): Form<ExtractForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let (do_tables, do_documents) = match form.source.as_str() {
-        "tables" => (true, false),
-        "documents" => (false, true),
-        _ => (true, true),
-    };
     let sample = form
         .sample
         .as_deref()
@@ -2548,8 +2547,7 @@ async fn graph_extract(
         &access,
         &id,
         &graph_api::ExtractionPlan {
-            tables: do_tables,
-            documents: do_documents,
+            source: form.source.unwrap_or_default(),
             sample,
             reset: form.reset,
         },
@@ -2581,7 +2579,7 @@ async fn graph_revalidate(
             access
                 .audit(
                     &app,
-                    "graph_revalidate",
+                    AuditAction::GraphRevalidate,
                     None,
                     Outcome::Allowed,
                     Some(serde_json::json!({
@@ -2613,7 +2611,7 @@ async fn graph_review(
     let db = app.workspace_db(&id).await?;
     with_db(db, graph_store::mark_reviewed).await?;
     access
-        .audit(&app, "graph_review", None, Outcome::Allowed, None)
+        .audit(&app, AuditAction::GraphReview, None, Outcome::Allowed, None)
         .await?;
     Ok(Redirect::to(&format!("/w/{id}/graph")).into_response())
 }
@@ -2630,26 +2628,31 @@ async fn graph_merge_decide(
     Form(form): Form<MergeForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let action = match form.action.parse::<graph_api::MergeAction>() {
-        Ok(action) => action,
+    // Parsed rather than extracted, so a bad value comes back as a notice
+    // on the page instead of an error page.
+    let decision = match form.action.parse::<MergeDecision>() {
+        Ok(decision) => decision,
         Err(e) => {
-            let target = format!("/w/{id}/graph?error={}", urlencoded(&e.message));
+            let target = format!("/w/{id}/graph?error={}", urlencoded(&e.to_string()));
             return Ok(Redirect::to(&target).into_response());
         }
     };
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
     let merge_id = mid.clone();
-    let outcome = with_db(db, move |db| action.apply(db, &merge_id, Some(&author))).await;
+    let outcome = with_db(db, move |db| {
+        resolve::decide(db, &merge_id, decision, Some(&author))
+    })
+    .await;
     let target = match outcome {
         Ok(proposal) => {
             access
                 .audit(
                     &app,
-                    "graph_merge",
-                    Some(("graph_merge", &mid)),
+                    AuditAction::GraphMerge,
+                    Some(ResourceKind::GraphMerge.id(&mid)),
                     Outcome::Allowed,
-                    Some(serde_json::json!({ "accept": action == graph_api::MergeAction::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
+                    Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
                 )
                 .await?;
             format!("/w/{id}/graph")

@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Profile, Prompts, StaleVectors, Vector,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Record, Result};
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -24,7 +24,31 @@ const PHRASE_CANDIDATE_CAP: u32 = 500;
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "8";
+const WORKSPACE_SCHEMA_VERSION: &str = "9";
+
+/// The keys of `_quack_meta`, the workspace's own settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaKey {
+    /// [`WORKSPACE_SCHEMA_VERSION`] when the internal tables were last upgraded.
+    SchemaVersion,
+    /// The width of the vector columns.
+    EmbeddingDimension,
+    /// The embedding model before profiles; read once on upgrade and deleted.
+    EmbeddingModel,
+    /// The ontology version the graph was last built or revalidated with.
+    GraphBuiltWithOntologyVersion,
+    /// Extraction's unknown classes and relations, as a JSON count map.
+    GraphDrift,
+}
+
+text_enum!(MetaKey, "meta key", {
+    SchemaVersion => "schema_version",
+    EmbeddingDimension => "embedding_dimension",
+    EmbeddingModel => "embedding_model",
+    GraphBuiltWithOntologyVersion => "graph_built_with_ontology_version",
+    GraphDrift => "graph_drift",
+});
+text_enum_sql!(MetaKey);
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -195,7 +219,7 @@ pub struct WorkspaceDb {
     query_timeout: Duration,
     /// `files/` under the workspace directory, where ingested files are
     /// kept; `None` in memory.
-    files_dir: Option<std::path::PathBuf>,
+    files_dir: Option<PathBuf>,
 }
 
 impl WorkspaceDb {
@@ -253,8 +277,8 @@ impl WorkspaceDb {
         }
         let value: Option<String> = conn
             .query_row(
-                "SELECT value FROM _quack_meta WHERE key = 'embedding_dimension'",
-                [],
+                "SELECT value FROM _quack_meta WHERE key = ?",
+                duckdb::params![MetaKey::EmbeddingDimension],
                 |row| row.get(0),
             )
             .map(Some)
@@ -284,7 +308,18 @@ impl WorkspaceDb {
         std::fs::create_dir_all(&files_dir)?;
 
         let profile = Profile::from_config(config)?;
-        let conn = duckdb::Connection::open(&db_path)?;
+        // DuckDB reports a file held by another process only in its message
+        // text ("Could not set lock on file ..."); it is classified here, once,
+        // so callers match a variant instead.
+        let conn = duckdb::Connection::open(&db_path).map_err(|e| {
+            if e.to_string().contains("Could not set lock") {
+                Error::WorkspaceLocked {
+                    path: db_path.clone(),
+                }
+            } else {
+                Error::from(e)
+            }
+        })?;
         // The columns keep the width they were created with until the
         // reconciliation below decides otherwise.
         let column_dimension = Self::recorded_dimension(&conn)?
@@ -546,7 +581,7 @@ impl WorkspaceDb {
                 sha256 TEXT,
                 source TEXT,
                 ingested_at TIMESTAMP DEFAULT now(),
-                status TEXT DEFAULT 'pending',
+                status TEXT DEFAULT 'queued',
                 error_message TEXT,
                 pinned BOOLEAN NOT NULL DEFAULT false,
                 chunk_count INTEGER,
@@ -624,8 +659,8 @@ impl WorkspaceDb {
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&crate::graph::ddl(dim))?;
         self.upgrade_data(dim)?;
-        self.set_meta("schema_version", WORKSPACE_SCHEMA_VERSION)?;
-        self.set_meta("embedding_dimension", &dim.to_string())?;
+        self.set_meta(MetaKey::SchemaVersion, WORKSPACE_SCHEMA_VERSION)?;
+        self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
         Ok(())
     }
 
@@ -633,7 +668,7 @@ impl WorkspaceDb {
     /// under an older one.
     fn upgrade_data(&self, dim: Dimension) -> Result<()> {
         let recorded = self
-            .meta("schema_version")?
+            .meta(MetaKey::SchemaVersion)?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
         // Version 4 introduced the term index; version 6 changed its tokens
@@ -649,6 +684,17 @@ impl WorkspaceDb {
         if recorded < 8 {
             self.tag_legacy_vectors(dim)?;
         }
+        // Version 9 reads a document's status as one of four values. Rows
+        // written before every insert named its status took the column's
+        // old default, `pending`, and were never processed.
+        if recorded < 9 {
+            self.conn.execute(
+                "UPDATE _quack_documents SET status = ?, \
+                 error_message = 'never finished processing; upload it again' \
+                 WHERE status IS NULL OR status = 'pending'",
+                duckdb::params![DocumentStatus::Error],
+            )?;
+        }
         Ok(())
     }
 
@@ -661,10 +707,12 @@ impl WorkspaceDb {
             [],
             |row| row.get(0),
         )?;
-        let model = self.meta("embedding_model")?;
+        let model = self.meta(MetaKey::EmbeddingModel)?;
         // The profile table replaces this key.
-        self.conn
-            .execute("DELETE FROM _quack_meta WHERE key = 'embedding_model'", [])?;
+        self.conn.execute(
+            "DELETE FROM _quack_meta WHERE key = ?",
+            duckdb::params![MetaKey::EmbeddingModel],
+        )?;
         if untagged == 0 {
             return Ok(());
         }
@@ -738,7 +786,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+    pub fn meta(&self, key: MetaKey) -> Result<Option<String>> {
         if !self.table_exists("_quack_meta")? {
             return Ok(None);
         }
@@ -757,22 +805,18 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the write fails.
-    pub fn set_meta_public(&self, key: &str, value: &str) -> Result<()> {
-        self.set_meta(key, value)
+    pub fn set_meta(&self, key: MetaKey, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _quack_meta (key, value) VALUES (?, ?)",
+            duckdb::params![key, value],
+        )?;
+        Ok(())
     }
 
     /// The `FLOAT[N]` type of this workspace's vectors.
     #[must_use]
     pub fn vector_type_public(&self) -> String {
         self.vector_type()
-    }
-
-    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _quack_meta (key, value) VALUES (?, ?)",
-            duckdb::params![key, value],
-        )?;
-        Ok(())
     }
 
     /// The width of the stored vectors: of the vector columns, which a
@@ -839,7 +883,7 @@ impl WorkspaceDb {
         self.vectors
             .column_dimension
             .store(dimension.get(), Ordering::Release);
-        self.set_meta("embedding_dimension", &dimension.to_string())
+        self.set_meta(MetaKey::EmbeddingDimension, &dimension.to_string())
     }
 
     /// The profile the configured model runs under, `None` without one.
@@ -933,10 +977,10 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn document_by_sha256(&self, sha256: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> 'error' ORDER BY ingested_at, id LIMIT 1"
+            "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> ? ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![sha256])?;
+        let mut rows = stmt.query(duckdb::params![sha256, DocumentStatus::Error])?;
         match rows.next()? {
             Some(row) => Ok(Some(document_from_row(row)?)),
             None => Ok(None),
@@ -951,11 +995,11 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn table_owner(&self, table: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE status <> 'error' AND tables IS NOT NULL \
+            "{DOCUMENT_SELECT} WHERE status <> ? AND tables IS NOT NULL \
              AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![table])?;
+        let mut rows = stmt.query(duckdb::params![DocumentStatus::Error, table])?;
         match rows.next()? {
             Some(row) => Ok(Some(document_from_row(row)?)),
             None => Ok(None),
@@ -970,7 +1014,7 @@ impl WorkspaceDb {
     ///
     /// Returns an error if a query fails.
     pub fn document_intact(&self, doc: &DocumentInfo) -> Result<bool> {
-        if doc.status != "ready" {
+        if doc.status != DocumentStatus::Ready {
             return Ok(true);
         }
         if let Some(tables) = &doc.tables
@@ -1000,10 +1044,14 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn fail_stale_uploads(&self) -> Result<usize> {
         let changed = self.conn.execute(
-            "UPDATE _quack_documents SET status = 'error', \
+            "UPDATE _quack_documents SET status = ?, \
              error_message = 'interrupted by a restart before it was processed; upload it again' \
-             WHERE status IN ('queued', 'processing')",
-            [],
+             WHERE status IN (?, ?)",
+            duckdb::params![
+                DocumentStatus::Error,
+                DocumentStatus::Queued,
+                DocumentStatus::Processing
+            ],
         )?;
         Ok(changed)
     }
@@ -1054,7 +1102,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn update_document_status(&self, id: &str, status: &str) -> Result<()> {
+    pub fn update_document_status(&self, id: &str, status: DocumentStatus) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET status = ?, error_message = NULL WHERE id = ?",
             duckdb::params![status, id],
@@ -1069,8 +1117,8 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn mark_document_error(&self, id: &str, message: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE _quack_documents SET status = 'error', error_message = ? WHERE id = ?",
-            duckdb::params![message, id],
+            "UPDATE _quack_documents SET status = ?, error_message = ? WHERE id = ?",
+            duckdb::params![DocumentStatus::Error, message, id],
         )?;
         Ok(())
     }
@@ -1195,7 +1243,7 @@ impl WorkspaceDb {
         let Some(files_dir) = &self.files_dir else {
             return;
         };
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(name) = Path::new(filename).file_name() {
             candidates.push(files_dir.join(name));
         }
@@ -1358,11 +1406,12 @@ impl WorkspaceDb {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.heading, c.content FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE d.status = 'ready' \
+             WHERE d.status = ? \
                AND (c.embedding IS NULL OR c.embedding_profile IS DISTINCT FROM ?) \
              ORDER BY c.id LIMIT ?",
         )?;
         let mut rows = stmt.query(duckdb::params![
+            DocumentStatus::Ready,
             self.embedding_fingerprint(),
             i64::from(limit)
         ])?;
@@ -1389,8 +1438,8 @@ impl WorkspaceDb {
             "SELECT count(*) FILTER (WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ?), \
                     count(*) FILTER (WHERE c.embedding IS NULL) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE d.status = 'ready'",
-            duckdb::params![current],
+             WHERE d.status = ?",
+            duckdb::params![current, DocumentStatus::Ready],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let mut stale = Vec::new();
@@ -1398,11 +1447,11 @@ impl WorkspaceDb {
             "SELECT CAST(p.profile AS VARCHAR), count(*) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
              LEFT JOIN _quack_embedding_profiles p ON p.fingerprint = c.embedding_profile \
-             WHERE d.status = 'ready' AND c.embedding IS NOT NULL \
+             WHERE d.status = ? AND c.embedding IS NOT NULL \
                AND c.embedding_profile IS DISTINCT FROM ? \
              GROUP BY ALL ORDER BY 2 DESC",
         )?;
-        let mut rows = stmt.query(duckdb::params![current])?;
+        let mut rows = stmt.query(duckdb::params![DocumentStatus::Ready, current])?;
         while let Some(row) = rows.next()? {
             let profile: Option<String> = row.get(0)?;
             stale.push(StaleVectors {
@@ -1498,14 +1547,15 @@ impl WorkspaceDb {
              FROM scored sc \
              JOIN _quack_chunks c ON c.id = sc.chunk_id \
              JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE sc.score > 0 AND d.status = 'ready'{filter} \
+             WHERE sc.score > 0 AND d.status = ?{filter} \
              ORDER BY sc.score DESC, c.chunk_index ASC \
              LIMIT ?"
         );
         let limit = i64::from(fetch_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(2));
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(3));
         params.push(&term_list);
+        params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
@@ -1594,7 +1644,7 @@ impl WorkspaceDb {
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ? \
-               AND d.status = 'ready'{filter} \
+               AND d.status = ?{filter} \
              ORDER BY score DESC \
              LIMIT ?",
             self.vector_type()
@@ -1604,9 +1654,10 @@ impl WorkspaceDb {
         let fingerprint = self.embedding_fingerprint();
         let limit = i64::from(top_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(3));
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(4));
         params.push(&query_literal);
         params.push(&fingerprint);
+        params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
@@ -1652,9 +1703,7 @@ impl WorkspaceDb {
             duckdb::params![pinned, document_id],
         )?;
         if changed == 0 {
-            return Err(Error::Ingestion(format!(
-                "document '{document_id}' does not exist"
-            )));
+            return Err(Record::Document.missing(document_id));
         }
         Ok(())
     }
@@ -1788,7 +1837,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns `f`'s error (an interrupted statement's included), or
-    /// [`Error::Analysis`] when the work was cancelled before it started.
+    /// [`Error::Cancelled`] when the work was cancelled before it started.
     pub fn cancellable<R>(
         &self,
         canceller: &QueryCanceller,
@@ -1797,7 +1846,7 @@ impl WorkspaceDb {
         {
             let mut slot = canceller.slot();
             if slot.cancelled {
-                return Err(Error::Analysis(String::from("cancelled")));
+                return Err(Error::Cancelled);
             }
             slot.running = Some(self.conn.interrupt_handle());
         }
@@ -1979,6 +2028,40 @@ pub struct TableDescription {
     pub sample_rows: QueryResults,
 }
 
+/// Where a document is in ingestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocumentStatus {
+    /// Registered; its bytes wait on the work queue.
+    Queued,
+    /// Being parsed, chunked, and embedded, or loaded as a table.
+    Processing,
+    /// Searchable, or its table loaded.
+    Ready,
+    /// Failed; `error_message` says why.
+    Error,
+}
+
+text_enum!(DocumentStatus, "document status", {
+    Queued => "queued",
+    Processing => "processing",
+    Ready => "ready",
+    Error => "error",
+});
+
+impl DocumentStatus {
+    /// Still on its way to `ready` or `error`.
+    #[must_use]
+    pub fn is_in_flight(self) -> bool {
+        match self {
+            Self::Queued | Self::Processing => true,
+            Self::Ready | Self::Error => false,
+        }
+    }
+}
+
+text_enum_sql!(DocumentStatus);
+
 /// Document metadata row.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DocumentInfo {
@@ -1993,8 +2076,7 @@ pub struct DocumentInfo {
     /// before the column existed.
     pub sha256: Option<String>,
     pub source: DocumentSource,
-    /// `queued`, `processing`, `ready`, or `error`.
-    pub status: String,
+    pub status: DocumentStatus,
     pub error_message: Option<String>,
     pub pinned: bool,
     /// Chunks stored once processed; `None` until then and for tables.
@@ -2061,7 +2143,7 @@ pub struct NewDocument<'a> {
     pub size_bytes: usize,
     pub sha256: &'a str,
     pub source: DocumentSource,
-    pub status: &'a str,
+    pub status: DocumentStatus,
     pub ingested_by: Option<&'a str>,
 }
 
@@ -2078,13 +2160,13 @@ impl<'a> NewDocument<'a> {
             size_bytes,
             sha256: "",
             source: DocumentSource::Upload,
-            status: "queued",
+            status: DocumentStatus::Queued,
             ingested_by: None,
         }
     }
 
     #[must_use]
-    pub fn with_status(mut self, status: &'a str) -> Self {
+    pub fn with_status(mut self, status: DocumentStatus) -> Self {
         self.status = status;
         self
     }
@@ -2945,7 +3027,10 @@ mod tests {
         // Cancelled before the work starts: it never runs.
         let early = QueryCanceller::new();
         early.cancel();
-        assert!(db.cancellable(&early, |_| Ok(())).is_err());
+        assert!(matches!(
+            db.cancellable(&early, |_| Ok(())),
+            Err(Error::Cancelled)
+        ));
 
         // Cancelled while a long statement runs: the statement stops.
         let canceller = QueryCanceller::new();
@@ -3653,8 +3738,10 @@ mod tests {
     }
 
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {
-        db.insert_document(&NewDocument::new(id, "doc.txt", "text/plain", 10).with_status("ready"))
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.insert_document(
+            &NewDocument::new(id, "doc.txt", "text/plain", 10).with_status(DocumentStatus::Ready),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
     }
 
     fn insert_text_chunk(
@@ -3878,14 +3965,14 @@ mod tests {
             // identifier term is missing and the recorded version rolls back.
             db.execute_statement("DELETE FROM _quack_terms WHERE term = 'pol8841'")
                 .unwrap_or_else(|e| fail(&e.to_string()));
-            db.set_meta_public("schema_version", "6")
+            db.set_meta(MetaKey::SchemaVersion, "6")
                 .unwrap_or_else(|e| fail(&e.to_string()));
         }
 
         let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(
             reopened
-                .meta("schema_version")
+                .meta(MetaKey::SchemaVersion)
                 .unwrap_or_else(|e| fail(&e.to_string())),
             Some(String::from(WORKSPACE_SCHEMA_VERSION))
         );

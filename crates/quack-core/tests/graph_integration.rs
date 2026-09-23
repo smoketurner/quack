@@ -8,10 +8,11 @@ use std::collections::BTreeMap;
 
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
 use quack_core::graph::extract::{Extraction, GraphExtractor};
+use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::{GraphOptions, extract, resolve, store as graph_store, tables, traverse};
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
-use quack_core::storage::workspace::{NewChunk, NewDocument, WorkspaceDb};
+use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
@@ -166,7 +167,8 @@ fn workspace() -> WorkspaceDb {
     )
     .unwrap();
     db.insert_document(
-        &NewDocument::new("doc-1", "notes.md", "text/markdown", 10).with_status("ready"),
+        &NewDocument::new("doc-1", "notes.md", "text/markdown", 10)
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -264,7 +266,8 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
 fn extraction_samples_evenly_across_documents() {
     let db = workspace();
     db.insert_document(
-        &NewDocument::new("doc-2", "long.md", "text/markdown", 10).with_status("ready"),
+        &NewDocument::new("doc-2", "long.md", "text/markdown", 10)
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     for i in 0..4 {
@@ -373,7 +376,8 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     // A second document adds one node of its own, one edge of its own,
     // and a second source for a vendor the table already produced.
     db.insert_document(
-        &NewDocument::new("doc-2", "extra.md", "text/markdown", 10).with_status("ready"),
+        &NewDocument::new("doc-2", "extra.md", "text/markdown", 10)
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -424,7 +428,8 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     // The document that loaded the mapped table: the table drops, and
     // with it every node and edge the rows supported.
     db.insert_document(
-        &NewDocument::new("doc-t", "shipments.csv", "text/csv", 10).with_status("ready"),
+        &NewDocument::new("doc-t", "shipments.csv", "text/csv", 10)
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.set_document_tables("doc-t", &[String::from("shipments")])
@@ -585,7 +590,13 @@ fn paths_merges_and_listing(
 
     // Accepting the merge folds Orgenics Ltd into Orgenics: its edge and
     // provenance move, the alias is kept, and the path shortens.
-    let proposal = resolve::accept(db, &pending.first().unwrap().id, Some("tester")).unwrap();
+    let proposal = resolve::decide(
+        db,
+        &pending.first().unwrap().id,
+        MergeDecision::Accept,
+        Some("tester"),
+    )
+    .unwrap();
     let kept = graph_store::node(db, &proposal.keep.id).unwrap().unwrap();
     assert!(
         kept.properties
@@ -602,7 +613,7 @@ fn paths_merges_and_listing(
         "the merged vendor's ships_to edge shortens it"
     );
     assert!(resolve::pending(db).unwrap().is_empty());
-    assert!(resolve::accept(db, &proposal.id, None).is_err());
+    assert!(resolve::decide(db, &proposal.id, MergeDecision::Accept, None).is_err());
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::Cookie;
-use quack_core::storage::control::Outcome;
+use quack_core::storage::control::{AuditAction, Outcome};
 use serde::Deserialize;
 
 use crate::server::auth::{
@@ -54,7 +54,7 @@ pub(crate) async fn logout(
     if let Credential::Session(token) = &identity.credential {
         app.close_web_session(token);
     }
-    let entry = identity.audit("logout", Outcome::Allowed);
+    let entry = identity.audit(AuditAction::Logout, Outcome::Allowed);
     app.control.record_audit(&entry).await?;
     Ok((
         jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()),

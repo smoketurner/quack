@@ -5,6 +5,7 @@
 //! the server forwards them as SSE and the session store persists them.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -14,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
 use crate::embedding::{Input, Vector};
+use crate::error::Error;
 
 /// A turn's embeddings, by input (the role is part of it).
 type EmbeddingCache = HashMap<Input, Vector>;
@@ -104,7 +106,50 @@ pub enum AgentEvent {
     /// chart, and whether any write was refused.
     TurnComplete(AgentResponse),
     /// The turn failed after possibly emitting some of the above.
-    Failed(String),
+    Failed(TurnFailure),
+}
+
+/// Why a turn failed: the message every interface shows, and what kind of
+/// failure it was, so an interface chooses its answer without reading the
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFailure {
+    pub message: String,
+    pub kind: FailureKind,
+}
+
+/// The failures an interface answers differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// A provider needs `quack auth login` first.
+    AuthRequired,
+    /// No chat model is configured.
+    NoChatModel,
+    /// The session (or another named record) does not exist.
+    NotFound,
+    /// A model, tool, or storage failure.
+    Other,
+}
+
+impl From<&Error> for TurnFailure {
+    fn from(error: &Error) -> Self {
+        let kind = match error {
+            Error::AuthRequired { .. } => FailureKind::AuthRequired,
+            Error::NoChatModel { .. } => FailureKind::NoChatModel,
+            Error::NotFound { .. } => FailureKind::NotFound,
+            _ => FailureKind::Other,
+        };
+        Self {
+            message: error.to_string(),
+            kind,
+        }
+    }
+}
+
+impl fmt::Display for TurnFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// Sending half of the event channel.
@@ -278,8 +323,37 @@ impl StepInProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::embedding::Dimension;
+    use crate::error::{AuthReason, Record};
+
+    /// Interfaces choose their answer from the kind, never the text.
+    #[test]
+    fn a_turn_failure_keeps_the_kind_of_error_it_came_from() {
+        let kind = |e: Error| TurnFailure::from(&e).kind;
+        assert_eq!(
+            kind(Error::AuthRequired {
+                provider: String::from("corp"),
+                reason: AuthReason::NoToken,
+            }),
+            FailureKind::AuthRequired
+        );
+        assert_eq!(
+            kind(Error::NoChatModel {
+                config_file: PathBuf::from("config.toml"),
+            }),
+            FailureKind::NoChatModel
+        );
+        assert_eq!(kind(Record::Session.missing("s1")), FailureKind::NotFound);
+        assert_eq!(
+            kind(Error::Llm(String::from("the model went away"))),
+            FailureKind::Other
+        );
+        let failure = TurnFailure::from(&Record::Session.missing("s1"));
+        assert_eq!(failure.to_string(), "session 's1' does not exist");
+    }
 
     #[test]
     fn budget_note_counts_calls_and_warns_near_the_limit() {
