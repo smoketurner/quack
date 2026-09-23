@@ -1,6 +1,8 @@
 use serde::Deserialize;
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -26,7 +28,7 @@ pub const ENV_BIND: &str = "QUACK_BIND";
 pub struct Config {
     pub general: GeneralConfig,
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    pub providers: BTreeMap<ProviderName, ProviderConfig>,
     pub ingestion: IngestionConfig,
     pub embedding: EmbeddingConfig,
     pub retrieval: RetrievalConfig,
@@ -59,6 +61,75 @@ impl Default for GeneralConfig {
             chat_model: None,
             embedding_model: None,
         }
+    }
+}
+
+/// A `[providers.NAME]` key. It names the provider's OAuth cache and key
+/// files, so it is checked when the config is read: ASCII letters, digits,
+/// `_`, `-`, and `.`, not starting with `.`, at most 64 characters. Nothing
+/// it names can leave the tokens directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ProviderName(String);
+
+impl ProviderName {
+    const MAX_LEN: usize = 64;
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ProviderName {
+    type Error = Error;
+
+    fn try_from(name: String) -> Result<Self> {
+        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+        if name.is_empty()
+            || name.len() > Self::MAX_LEN
+            || name.starts_with('.')
+            || !name.chars().all(allowed)
+        {
+            return Err(Error::Config(format!(
+                "provider name '{name}' must be 1 to {} ASCII letters, digits, '_', '-', or '.', \
+                 not starting with '.'",
+                Self::MAX_LEN
+            )));
+        }
+        Ok(Self(name))
+    }
+}
+
+impl FromStr for ProviderName {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        Self::try_from(name.to_owned())
+    }
+}
+
+impl PartialEq<str> for ProviderName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ProviderName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl Borrow<str> for ProviderName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(&self.0)
     }
 }
 
@@ -178,7 +249,7 @@ impl ProviderConfig {
 /// A resolved `PROVIDER/MODEL` reference.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelRef<'a> {
-    pub provider_name: &'a str,
+    pub provider_name: &'a ProviderName,
     pub provider: &'a ProviderConfig,
     pub model: &'a str,
 }
@@ -737,7 +808,7 @@ impl Config {
                 "{setting} = \"{spec}\" is missing the model after the slash"
             )));
         }
-        let provider = self.providers.get(provider_name).ok_or_else(|| {
+        let (provider_name, provider) = self.providers.get_key_value(provider_name).ok_or_else(|| {
             Error::Config(format!(
                 "{setting} = \"{spec}\" names provider '{provider_name}', which is not configured; \
                  add a [providers.{provider_name}] section in {}",
@@ -942,6 +1013,21 @@ rerank = "model"
             ..Overrides::default()
         };
         assert!(Config::from_contents(None, &bad).is_err());
+    }
+
+    #[test]
+    fn provider_names_that_could_leave_the_tokens_directory_are_rejected() {
+        for bad in ["../evil", ".hidden", "a/b", "a\\\\b", "", "sp ace"] {
+            let toml_text = format!("[providers.\"{bad}\"]\ntype = \"ollama\"\n");
+            assert!(err_of(&toml_text).contains("provider name"), "{bad:?}");
+        }
+        let long = "p".repeat(65);
+        assert!(long.parse::<ProviderName>().is_err());
+        for good in ["ollama", "azure.openai", "corp-gw_2", &"p".repeat(64)] {
+            assert!(good.parse::<ProviderName>().is_ok(), "{good}");
+        }
+        let config = Config::parse("[providers.\"azure.openai\"]\ntype = \"openai\"\n");
+        assert!(config.is_ok_and(|c| c.providers.contains_key("azure.openai")));
     }
 
     #[test]

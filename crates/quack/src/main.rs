@@ -1036,7 +1036,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
 }
 
 fn oauth_manager(config: &Config, name: &str) -> Result<Arc<TokenManager>> {
-    let provider = config.providers.get(name).ok_or_else(|| {
+    let (name, provider) = config.providers.get_key_value(name).ok_or_else(|| {
         anyhow::anyhow!(
             "provider '{name}' is not configured; add [providers.{name}] with auth = \"oauth\""
         )

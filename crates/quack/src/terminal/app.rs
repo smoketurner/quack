@@ -3203,7 +3203,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
-        use quack_core::config::{AuthMode, ProviderConfig, ProviderType};
+        use quack_core::config::{AuthMode, ProviderConfig, ProviderName, ProviderType};
         use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
         // Without an embedding model the job says what is missing.
@@ -3224,7 +3224,9 @@ mod tests {
         let mut config = Config::default();
         config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
         config.providers.insert(
-            String::from("ollama"),
+            "ollama"
+                .parse::<ProviderName>()
+                .unwrap_or_else(|e| fail(&e.to_string())),
             ProviderConfig {
                 provider_type: ProviderType::Ollama,
                 auth: AuthMode::None,

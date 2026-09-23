@@ -148,7 +148,7 @@ fn writer_of(db: &WorkspaceDb) -> Writer {
 fn test_config(data_dir: &Path) -> Config {
     let mut providers = BTreeMap::new();
     providers.insert(
-        "mock".into(),
+        "mock".parse().unwrap(),
         ProviderConfig {
             provider_type: ProviderType::Ollama,
             auth: AuthMode::None,

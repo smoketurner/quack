@@ -33,7 +33,7 @@ use rig::http_client::{
 };
 use tokio::sync::oneshot;
 
-use crate::config::ProviderConfig;
+use crate::config::{ProviderConfig, ProviderName};
 
 use crate::priority::{Priority, current_priority};
 
@@ -189,7 +189,7 @@ impl Default for LimitedHttp {
 impl LimitedHttp {
     /// The client for provider `name`, sharing its process-wide gates.
     #[must_use]
-    pub fn for_provider(name: &str, provider: &ProviderConfig) -> Self {
+    pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
             inner: reqwest::Client::default(),
             provider: Some(Arc::from(format!(
@@ -326,6 +326,11 @@ mod tests {
 
     use super::*;
     use crate::config::{AuthMode, ProviderType};
+    use crate::error::Error;
+
+    fn name(text: &str) -> ProviderName {
+        text.parse().unwrap_or_else(|e: Error| fail(&e.to_string()))
+    }
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -402,11 +407,15 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (url, peak) = slow_server(Duration::from_millis(150)).await;
-        let limited =
-            LimitedHttp::for_provider("limit-test", &provider(ProviderType::Openai, Some(2), &url));
+        let limited = LimitedHttp::for_provider(
+            &name("limit-test"),
+            &provider(ProviderType::Openai, Some(2), &url),
+        );
         // Another client for the same provider shares the gate.
-        let again =
-            LimitedHttp::for_provider("limit-test", &provider(ProviderType::Openai, Some(2), &url));
+        let again = LimitedHttp::for_provider(
+            &name("limit-test"),
+            &provider(ProviderType::Openai, Some(2), &url),
+        );
         let mut calls = Vec::new();
         for n in 0..6 {
             let client = if n % 2 == 0 {
@@ -444,8 +453,10 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (url, peak) = slow_server(Duration::from_millis(200)).await;
-        let client =
-            LimitedHttp::for_provider("per-model", &provider(ProviderType::Ollama, None, &url));
+        let client = LimitedHttp::for_provider(
+            &name("per-model"),
+            &provider(ProviderType::Ollama, None, &url),
+        );
         // A chat model and an embedding model: one each at a time, both at
         // once.
         let chat = tokio::spawn(call(client.clone(), url.clone(), r#"{"model":"chat"}"#));

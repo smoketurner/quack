@@ -15,7 +15,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use quack_core::config::{AuthMode, Config, ProviderConfig, ProviderType};
+use quack_core::config::{AuthMode, Config, ProviderConfig, ProviderName, ProviderType};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -2270,7 +2270,9 @@ fn banner_names_the_address_mode_and_models() {
     let mut config = Config::default();
     config.general.chat_model = Some(String::from("ollama/llama3"));
     config.providers.insert(
-        String::from("ollama"),
+        "ollama"
+            .parse::<ProviderName>()
+            .unwrap_or_else(|e| fail(&e.to_string())),
         ProviderConfig {
             provider_type: ProviderType::Ollama,
             auth: AuthMode::None,
@@ -3725,7 +3727,9 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
     let mut config = Config::default();
     config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
     config.providers.insert(
-        String::from("ollama"),
+        "ollama"
+            .parse::<ProviderName>()
+            .unwrap_or_else(|e| fail(&e.to_string())),
         ProviderConfig {
             provider_type: ProviderType::Ollama,
             auth: AuthMode::None,

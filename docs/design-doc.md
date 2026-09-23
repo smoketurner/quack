@@ -1274,7 +1274,10 @@ Lifecycle: acquire via `quack auth login PROVIDER` (browser PKCE, or device code
 `{issuer_url}/.well-known/openid-configuration`; verifier from aws-lc-rs randomness);
 reuse while more than 60 s remain; refresh silently under `refresh_lock`; restart on
 refresh failure; in print, ingest, and server modes, where no flow can run, fail with exit
-4 / HTTP 503 naming the command to run. Cache encrypted (AES-256-GCM, the provider name as
+4 / HTTP 503 naming the command to run. The cache and key files are named after the provider,
+so a `[providers.NAME]` key is checked when the config is read (`config::ProviderName`: ASCII
+letters, digits, `_`, `-`, `.`, not starting with `.`, at most 64) and cannot point outside
+`<data_dir>/tokens/`. Cache encrypted (AES-256-GCM, the provider name as
 associated data) with a key in the OS keychain where available (macOS Keychain, the Linux
 kernel keyring via `keyutils`, which is always present but in-memory, so a reboot needs a
 new login; Windows Credential Manager), else a 0600 key file. `quack auth status` and

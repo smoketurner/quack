@@ -67,7 +67,7 @@ async fn prepare(
     let chat = app.config.chat_model_ref()?;
     if let Some(allowed) = access.workspace.allowed_providers.as_deref() {
         let names: Vec<String> = serde_json::from_str(allowed).unwrap_or_default();
-        if !names.iter().any(|n| n == chat.provider_name) {
+        if !names.iter().any(|n| chat.provider_name == n.as_str()) {
             return Err(ApiError::forbidden(format!(
                 "provider '{}' is not allowed in this workspace",
                 chat.provider_name

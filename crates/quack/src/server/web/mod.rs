@@ -1957,7 +1957,12 @@ async fn settings_view(
         .config
         .providers
         .keys()
-        .map(|name| (name.clone(), allowed.is_empty() || allowed.contains(name)))
+        .map(|name| {
+            (
+                name.to_string(),
+                allowed.is_empty() || allowed.iter().any(|a| a == name.as_str()),
+            )
+        })
         .collect();
     let (members, tokens) = if access.permits(Need::OWN) {
         (

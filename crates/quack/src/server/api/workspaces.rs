@@ -135,7 +135,7 @@ pub(crate) async fn update(
     let access = access(&app, identity, &id, Need::OWN).await?;
     if let Some(names) = &body.allowed_providers {
         for name in names {
-            if !app.config.providers.contains_key(name) {
+            if !app.config.providers.contains_key(name.as_str()) {
                 return Err(ApiError::bad_request(format!(
                     "'{name}' is not a configured provider"
                 )));

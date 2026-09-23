@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::inspect::{FileState, Inspection};
-use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
+use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderName, ProviderType};
 use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::{OllamaRunningModels, oauth};
@@ -776,7 +776,7 @@ fn listing_check(
 
 async fn oauth_token(
     config: &Config,
-    name: &str,
+    name: &ProviderName,
     provider: &ProviderConfig,
 ) -> std::result::Result<String, String> {
     let manager =
