@@ -10,9 +10,9 @@
 //! Ollama server each get their own limit, as Ollama serves each model
 //! separately. A freed permit goes to a waiting [`Priority::Interactive`]
 //! request before any background one: a question is never queued behind a
-//! whole ingest's embedding batches or an extraction's next chunk. A turn
-//! (`run_turn`) and a query embedding run interactive; everything else is
-//! background.
+//! whole ingest's embedding batches or an extraction's next chunk. The
+//! priority is [`crate::priority`]'s task-local: background jobs run
+//! background, and everything else, turns included, interactive.
 //!
 //! A turn waiting on the user's answer to a permission prompt, or running a
 //! tool, holds nothing. rig's streaming loop drains a model response before
@@ -35,30 +35,7 @@ use tokio::sync::oneshot;
 
 use crate::config::ProviderConfig;
 
-/// Who is waiting for a model: a person, or background work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Priority {
-    /// A turn or a lookup someone is watching; served first.
-    Interactive,
-    /// Ingest embeddings, extraction, proposals.
-    Background,
-}
-
-tokio::task_local! {
-    static PRIORITY: Priority;
-}
-
-/// Run `work` with its model requests at `priority` (for everything it
-/// awaits on this task).
-pub async fn with_priority<F: Future>(priority: Priority, work: F) -> F::Output {
-    PRIORITY.scope(priority, work).await
-}
-
-/// The priority of the task making a request: background unless scoped.
-#[must_use]
-pub fn current_priority() -> Priority {
-    PRIORITY.try_with(|p| *p).unwrap_or(Priority::Background)
-}
+pub use crate::priority::{Priority, current_priority, with_priority};
 
 /// Permits of one provider and model, handed to interactive waiters first.
 struct Gate {
@@ -531,8 +508,8 @@ mod tests {
         assert_eq!(gate.available(), 1);
 
         // The priority follows the task that scoped it.
-        assert_eq!(current_priority(), Priority::Background);
-        let inside = with_priority(Priority::Interactive, async { current_priority() }).await;
-        assert_eq!(inside, Priority::Interactive);
+        assert_eq!(current_priority(), Priority::Interactive);
+        let inside = with_priority(Priority::Background, async { current_priority() }).await;
+        assert_eq!(inside, Priority::Background);
     }
 }

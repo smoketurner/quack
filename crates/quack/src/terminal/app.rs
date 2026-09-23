@@ -26,13 +26,14 @@ use crate::terminal::chart::ChartData;
 use crate::terminal::ui;
 use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::citations::Citation;
-use quack_core::error::Error as CoreError;
+use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::jobs::{JobContext, JobId, JobInfo, JobKind, JobQueue, JobSpec, JobState, Lane};
 use quack_core::llm::{self, CancellationToken};
 use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
+use quack_core::priority::Priority;
 use quack_core::storage::context;
 
 use crate::graph_cli::GraphAction;
@@ -162,6 +163,35 @@ enum AppMsg {
     TurnClosed(JobId),
     /// A job that is not a turn finished, with what to show.
     Finished(JobId, BackgroundResult),
+    /// A command's database step answered: apply its result on the loop.
+    Apply(Box<dyn FnOnce(&mut App) + Send>),
+}
+
+/// Where a command's database step runs.
+#[derive(Clone, Copy)]
+enum Side {
+    /// The reader pool, inside a read-only transaction: never waits on
+    /// the writer.
+    Read,
+    /// The writer, in its interactive line.
+    Write,
+}
+
+/// A command's database step, run in order by the session's worker.
+type DbStep = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// A session loaded for the transcript.
+struct Replay {
+    session_id: String,
+    rows: Vec<sessions::MessageRow>,
+}
+
+/// What `/resume PREFIX` found.
+enum Found {
+    Current,
+    One(String, Replay),
+    None(String),
+    Many(String, Vec<String>),
 }
 
 /// A decision the user owes. Prompts are modal, answered in order, while
@@ -214,6 +244,14 @@ pub(crate) struct App {
     pub(crate) active_jobs: Vec<JobInfo>,
     /// Ctrl+C was pressed once while jobs were running; a second quits.
     quit_armed: bool,
+    /// The session's database worker: every command's database step runs
+    /// there, in the order typed, never on the event loop's thread.
+    db_steps: Option<mpsc::UnboundedSender<DbStep>>,
+    /// Database steps sent and not yet applied.
+    pending_db: usize,
+    /// While a session switch (or mode change) is on its way: the lines
+    /// typed meanwhile, submitted once it lands.
+    switching: Option<VecDeque<String>>,
     last_sql: Option<String>,
     input_history: Vec<String>,
     history_cursor: Option<usize>,
@@ -274,6 +312,9 @@ impl App {
             job_events,
             active_jobs: Vec::new(),
             quit_armed: false,
+            db_steps: None,
+            pending_db: 0,
+            switching: None,
             last_sql: None,
             input_history: Vec::new(),
             history_cursor: None,
@@ -300,21 +341,26 @@ impl App {
         Ok(app)
     }
 
-    /// Load a session's stored messages into the transcript.
+    /// Load a session's stored messages into the transcript (at startup,
+    /// before the loop runs; `/resume` loads on the reader instead).
     fn replay_session(&mut self, session_id: &str) -> Result<()> {
         let rows = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("workspace lock poisoned: {e}"))?;
-            sessions::messages(&db, session_id)?
+            let db = self.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            load_session(&db, session_id)?
         };
+        self.apply_replay(rows);
+        Ok(())
+    }
+
+    /// Put a loaded session's messages in the transcript.
+    fn apply_replay(&mut self, replay: Replay) {
+        let Replay { session_id, rows } = replay;
         if rows.is_empty() {
             self.messages.push(Message::new(
                 MessageRole::System,
                 format!("Session {session_id} has no messages yet."),
             ));
-            return Ok(());
+            return;
         }
         self.messages.push(Message::new(
             MessageRole::System,
@@ -378,7 +424,6 @@ impl App {
                 }
             }
         }
-        Ok(())
     }
 
     /// The event loop: one `select!` over the terminal's input stream, the
@@ -436,7 +481,7 @@ impl App {
 
         self.cancel_all_jobs();
         self.wait_for_jobs(QUIT_GRACE).await;
-        self.forget_session_if_empty();
+        self.forget_session_now();
         Ok(())
     }
 
@@ -521,6 +566,10 @@ impl App {
                 self.settle_turns();
             }
             AppMsg::Finished(job, result) => self.handle_background_result(job, result),
+            AppMsg::Apply(apply) => {
+                self.pending_db = self.pending_db.saturating_sub(1);
+                apply(self);
+            }
         }
     }
 
@@ -1196,181 +1245,163 @@ impl App {
     }
 
     fn show_sessions(&mut self) {
-        let listing = {
-            let db = match self.db.lock() {
-                Ok(db) => db,
-                Err(e) => {
-                    self.messages.push(Message::new(
-                        MessageRole::Error,
-                        format!("workspace lock poisoned: {e}"),
-                    ));
-                    return;
-                }
-            };
-            sessions::list_sessions(&db, 20)
-        };
-        match listing {
-            Ok(rows) if rows.is_empty() => self
-                .messages
-                .push(Message::new(MessageRole::System, "No sessions yet.")),
-            Ok(rows) => {
-                let mut text = String::from("Sessions (most recent first):");
-                for row in rows {
-                    let marker = if row.id == self.session_id { "*" } else { " " };
-                    let line = format!(
-                        "\n{marker} {}  {}  {:>3} msgs  {}",
-                        row.id,
-                        row.updated_at,
-                        row.message_count,
-                        row.title.as_deref().unwrap_or("(untitled)")
+        self.on_db(
+            Side::Read,
+            |db| sessions::list_sessions(db, 20),
+            |app, listing| match listing {
+                Ok(rows) if rows.is_empty() => app.note(MessageRole::System, "No sessions yet."),
+                Ok(rows) => {
+                    let mut text = String::from("Sessions (most recent first):");
+                    for row in rows {
+                        let marker = if row.id == app.session_id { "*" } else { " " };
+                        let line = format!(
+                            "\n{marker} {}  {}  {:>3} msgs  {}",
+                            row.id,
+                            row.updated_at,
+                            row.message_count,
+                            row.title.as_deref().unwrap_or("(untitled)")
+                        );
+                        text.push_str(&line);
+                    }
+                    text.push_str(
+                        "\nUse /resume ID to switch (any unique prefix works; ids created close \
+                         together differ only near the end).",
                     );
-                    text.push_str(&line);
+                    app.note(MessageRole::System, text);
                 }
-                text.push_str(
-                    "\nUse /resume ID to switch (any unique prefix works; ids created close \
-                     together differ only near the end).",
-                );
-                self.messages.push(Message::new(MessageRole::System, text));
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
+    /// `/resume PREFIX`: find the session, then load its messages, both on
+    /// the reader; input typed meanwhile waits for the switch.
     fn switch_session(&mut self, prefix: &str) {
         if prefix.is_empty() {
-            self.messages.push(Message::new(
-                MessageRole::System,
-                "Usage: /resume SESSION_ID",
-            ));
+            self.note(MessageRole::System, "Usage: /resume SESSION_ID");
             return;
         }
-        let found = {
-            let db = match self.db.lock() {
-                Ok(db) => db,
-                Err(e) => {
-                    self.messages.push(Message::new(
-                        MessageRole::Error,
-                        format!("workspace lock poisoned: {e}"),
-                    ));
-                    return;
-                }
-            };
-            sessions::list_sessions(&db, 1000).map(|rows| {
-                rows.into_iter()
-                    .filter(|s| s.id.starts_with(prefix))
-                    .collect::<Vec<_>>()
-            })
-        };
-        match found {
-            Ok(matches) if matches.len() == 1 => {
-                let id = matches.into_iter().next().map(|s| s.id).unwrap_or_default();
-                if id == self.session_id {
-                    self.messages.push(Message::new(
-                        MessageRole::System,
-                        "That is the current session.",
-                    ));
-                } else {
-                    self.forget_session_if_empty();
-                    self.clear_transcript();
-                    self.session_id.clone_from(&id);
-                    if let Err(e) = self.replay_session(&id) {
-                        self.messages
-                            .push(Message::new(MessageRole::Error, format!("{e}")));
+        let prefix = prefix.to_owned();
+        let current = self.session_id.clone();
+        self.switching.get_or_insert_with(VecDeque::new);
+        self.on_db(
+            Side::Read,
+            move |db| {
+                let matches: Vec<String> = sessions::list_sessions(db, 1000)?
+                    .into_iter()
+                    .filter(|s| s.id.starts_with(&prefix))
+                    .map(|s| s.id)
+                    .collect();
+                let found = match matches.as_slice() {
+                    [id] if *id == current => Found::Current,
+                    [id] => Found::One(id.clone(), load_session(db, id)?),
+                    [] => Found::None(prefix),
+                    _ => Found::Many(prefix, matches),
+                };
+                Ok(found)
+            },
+            |app, found| {
+                match found {
+                    Ok(Found::Current) => {
+                        app.note(MessageRole::System, "That is the current session.");
                     }
+                    Ok(Found::One(id, replay)) => {
+                        app.forget_session_if_empty();
+                        app.clear_transcript();
+                        app.session_id = id;
+                        app.apply_replay(replay);
+                    }
+                    Ok(Found::None(prefix)) => {
+                        app.note(MessageRole::Error, format!("no session matches '{prefix}'"));
+                    }
+                    Ok(Found::Many(prefix, ids)) => {
+                        let mut text = format!(
+                            "'{prefix}' matches {} sessions; use more of the id:",
+                            ids.len()
+                        );
+                        for id in ids.iter().take(10) {
+                            text.push_str("\n  ");
+                            text.push_str(id);
+                        }
+                        app.note(MessageRole::Error, text);
+                    }
+                    Err(e) => app.note(MessageRole::Error, e.to_string()),
                 }
-            }
-            Ok(matches) if matches.is_empty() => self.messages.push(Message::new(
-                MessageRole::Error,
-                format!("no session matches '{prefix}'"),
-            )),
-            Ok(matches) => {
-                let mut text = format!(
-                    "'{prefix}' matches {} sessions; use more of the id:",
-                    matches.len()
-                );
-                for m in matches.iter().take(10) {
-                    text.push_str("\n  ");
-                    text.push_str(&m.id);
-                }
-                self.messages.push(Message::new(MessageRole::Error, text));
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
-        self.scroll_offset = 0;
+                app.finish_switch();
+            },
+        );
     }
 
     fn new_session(&mut self) {
-        let created = {
-            let db = match self.db.lock() {
-                Ok(db) => db,
-                Err(e) => {
-                    self.messages.push(Message::new(
-                        MessageRole::Error,
-                        format!("workspace lock poisoned: {e}"),
-                    ));
-                    return;
+        let current = self.session_id.clone();
+        let model = self.provider_display.clone();
+        self.switching.get_or_insert_with(VecDeque::new);
+        self.on_db(
+            Side::Write,
+            move |db| {
+                let mode = sessions::get_session(db, &current)
+                    .ok()
+                    .flatten()
+                    .map_or(ChatMode::Chat, |s| s.mode);
+                sessions::create_session(db, &model, mode, None)
+            },
+            |app, created| {
+                match created {
+                    Ok(session) => {
+                        app.forget_session_if_empty();
+                        app.session_id = session.id;
+                        app.clear_transcript();
+                        let text = format!("New session {}", app.session_id);
+                        app.note(MessageRole::System, text);
+                    }
+                    Err(e) => app.note(MessageRole::Error, e.to_string()),
                 }
-            };
-            let mode = sessions::get_session(&db, &self.session_id)
-                .ok()
-                .flatten()
-                .map_or(ChatMode::Chat, |s| s.mode);
-            sessions::create_session(&db, &self.provider_display, mode, None)
-        };
-        match created {
-            Ok(session) => {
-                self.forget_session_if_empty();
-                self.session_id = session.id;
-                self.clear_transcript();
-                self.messages.push(Message::new(
-                    MessageRole::System,
-                    format!("New session {}", self.session_id),
-                ));
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
-        self.scroll_offset = 0;
+                app.finish_switch();
+            },
+        );
     }
 
     fn set_mode(&mut self, args: &str) {
-        let Ok(db) = self.db.lock() else {
-            self.messages
-                .push(Message::new(MessageRole::Error, "workspace lock poisoned"));
-            return;
-        };
+        let session = self.session_id.clone();
         if args.is_empty() {
-            let current = sessions::get_session(&db, &self.session_id)
-                .ok()
-                .flatten()
-                .map_or(ChatMode::Chat, |s| s.mode);
-            self.messages.push(Message::new(
-                MessageRole::System,
-                format!("Mode: {current}. Use /mode chat or /mode query to change it."),
-            ));
+            self.on_db(
+                Side::Read,
+                move |db| {
+                    Ok(sessions::get_session(db, &session)?.map_or(ChatMode::Chat, |s| s.mode))
+                },
+                |app, mode| match mode {
+                    Ok(mode) => app.note(
+                        MessageRole::System,
+                        format!("Mode: {mode}. Use /mode chat or /mode query to change it."),
+                    ),
+                    Err(e) => app.note(MessageRole::Error, e.to_string()),
+                },
+            );
             return;
         }
         let Some(mode) = ChatMode::parse(args) else {
-            self.messages.push(Message::new(
+            self.note(
                 MessageRole::Error,
                 format!("unknown mode '{args}'; use chat or query"),
-            ));
+            );
             return;
         };
-        match sessions::set_session_mode(&db, &self.session_id, mode) {
-            Ok(()) => self.messages.push(Message::new(
-                MessageRole::System,
-                format!("Mode set to {mode} for this session."),
-            )),
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
+        // A question typed right after must start in the new mode.
+        self.switching.get_or_insert_with(VecDeque::new);
+        self.on_db(
+            Side::Write,
+            move |db| sessions::set_session_mode(db, &session, mode),
+            move |app, set| {
+                match set {
+                    Ok(()) => app.note(
+                        MessageRole::System,
+                        format!("Mode set to {mode} for this session."),
+                    ),
+                    Err(e) => app.note(MessageRole::Error, e.to_string()),
+                }
+                app.finish_switch();
+            },
+        );
     }
 
     /// `/ontology ARGS`: the CLI's `quack ontology` verbs, parsed the same
@@ -1429,89 +1460,81 @@ impl App {
         );
     }
     fn show_schema(&mut self, table: &str) {
-        let table = table.trim();
+        let table = table.trim().to_owned();
         if table.is_empty() {
-            self.messages
-                .push(Message::new(MessageRole::System, "Usage: /schema TABLE"));
+            self.note(MessageRole::System, "Usage: /schema TABLE");
             return;
         }
-        let described = match self.db.lock() {
-            Ok(db) => db.list_tables().and_then(|tables| {
-                if tables.iter().any(|t| t == table) {
-                    db.describe_table(table)
+        self.on_db(
+            Side::Read,
+            move |db| {
+                if db.list_tables()?.contains(&table) {
+                    db.describe_table(&table)
                 } else {
                     Err(CoreError::Analysis(format!("no table named '{table}'")))
                 }
-            }),
-            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
-        };
-        match described {
-            Ok(d) => {
-                let mut text = format!("{} ({} rows)\n", d.table_name, d.row_count);
-                for column in &d.columns {
-                    let line = format!("  {} {}\n", column.name, column.column_type);
-                    text.push_str(&line);
+            },
+            |app, described| match described {
+                Ok(d) => {
+                    let mut text = format!("{} ({} rows)\n", d.table_name, d.row_count);
+                    for column in &d.columns {
+                        let line = format!("  {} {}\n", column.name, column.column_type);
+                        text.push_str(&line);
+                    }
+                    let mut buf = Vec::new();
+                    if d.sample_rows.write_table(&mut buf).is_ok() {
+                        text.push_str(&String::from_utf8_lossy(&buf));
+                    }
+                    app.note(MessageRole::Sql, text);
                 }
-                let mut buf = Vec::new();
-                if d.sample_rows.write_table(&mut buf).is_ok() {
-                    text.push_str(&String::from_utf8_lossy(&buf));
-                }
-                self.messages.push(Message::new(MessageRole::Sql, text));
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, e.to_string())),
-        }
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     fn delete_document(&mut self, prefix: &str) {
-        let prefix = prefix.trim();
+        let prefix = prefix.trim().to_owned();
         if prefix.is_empty() {
-            self.messages.push(Message::new(
-                MessageRole::System,
-                "Usage: /delete DOCUMENT_ID",
-            ));
+            self.note(MessageRole::System, "Usage: /delete DOCUMENT_ID");
             return;
         }
-        let outcome = match self.db.lock() {
-            Ok(db) => resolve_document(&db, prefix).and_then(|doc| {
+        self.on_db(
+            Side::Write,
+            move |db| {
+                let doc = resolve_document(db, &prefix)?;
                 let table = ingestion::parser::detect_file_type(&doc.filename)
                     .is_structured()
                     .then(|| ingestion::table_name_for(&doc.filename));
                 db.delete_document(&doc.id, table.as_deref())
                     .map(|_| doc.filename)
-            }),
-            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
-        };
-        match outcome {
-            Ok(filename) => self.messages.push(Message::new(
-                MessageRole::System,
-                format!("Deleted {filename} with its chunks, tables, and graph rows."),
-            )),
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, e.to_string())),
-        }
+            },
+            |app, outcome| match outcome {
+                Ok(filename) => app.note(
+                    MessageRole::System,
+                    format!("Deleted {filename} with its chunks, tables, and graph rows."),
+                ),
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     fn set_shared(&mut self, shared: bool) {
-        let outcome = match self.db.lock() {
-            Ok(db) => sessions::set_session_shared(&db, &self.session_id, shared),
-            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
-        };
-        match outcome {
-            Ok(()) => self.messages.push(Message::new(
-                MessageRole::System,
-                if shared {
-                    "This session is shared with every member of the workspace."
-                } else {
-                    "This session is yours alone again."
-                },
-            )),
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, e.to_string())),
-        }
+        let session = self.session_id.clone();
+        self.on_db(
+            Side::Write,
+            move |db| sessions::set_session_shared(db, &session, shared),
+            move |app, outcome| match outcome {
+                Ok(()) => app.note(
+                    MessageRole::System,
+                    if shared {
+                        "This session is shared with every member of the workspace."
+                    } else {
+                        "This session is yours alone again."
+                    },
+                ),
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     /// `/export [--sql|--markdown] [FILE]`: the session as SQL or
@@ -1526,212 +1549,176 @@ impl App {
                 other => file = Some(other.to_owned()),
             }
         }
-        let text = match self.db.lock() {
-            Ok(db) => sessions::get_session(&db, &self.session_id).and_then(|session| {
-                let rows = sessions::messages(&db, &self.session_id)?;
+        let session = self.session_id.clone();
+        self.on_db(
+            Side::Read,
+            move |db| {
+                let found = sessions::get_session(db, &session)?;
+                let rows = sessions::messages(db, &session)?;
                 if sql {
                     sessions::export_sql(&rows)
                 } else {
-                    let session = session
+                    let found = found
                         .ok_or_else(|| CoreError::Analysis(String::from("session vanished")))?;
-                    sessions::export_markdown(&session, &rows)
+                    sessions::export_markdown(&found, &rows)
                 }
-            }),
-            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
-        };
-        let text = match text {
-            Ok(text) => text,
-            Err(e) => {
-                self.messages
-                    .push(Message::new(MessageRole::Error, e.to_string()));
-                return;
-            }
-        };
-        match file {
-            Some(path) => match std::fs::write(&path, &text) {
-                Ok(()) => self.messages.push(Message::new(
-                    MessageRole::System,
-                    format!("Wrote the session to {path}."),
-                )),
-                Err(e) => self.messages.push(Message::new(
-                    MessageRole::Error,
-                    format!("cannot write {path}: {e}"),
-                )),
             },
-            None => self.messages.push(Message::new(MessageRole::Sql, text)),
-        }
+            move |app, text| match (text, file) {
+                (Err(e), _) => app.note(MessageRole::Error, e.to_string()),
+                (Ok(text), Some(path)) => match std::fs::write(&path, &text) {
+                    Ok(()) => {
+                        app.note(MessageRole::System, format!("Wrote the session to {path}."));
+                    }
+                    Err(e) => app.note(MessageRole::Error, format!("cannot write {path}: {e}")),
+                },
+                (Ok(text), None) => app.note(MessageRole::Sql, text),
+            },
+        );
     }
 
     fn show_context(&mut self) {
-        let result = match self.db.lock() {
-            Ok(db) => context::current(&db),
-            Err(e) => {
-                self.messages.push(Message::new(
-                    MessageRole::Error,
-                    format!("workspace lock poisoned: {e}"),
-                ));
-                return;
-            }
-        };
-        match result {
-            Ok(Some(current)) => self.messages.push(Message::new(
-                MessageRole::System,
-                format!(
-                    "Workspace context (version {}, {}):\n{}",
-                    current.version, current.edited_at, current.content
+        self.on_db(
+            Side::Read,
+            context::current,
+            |app, result| match result {
+                Ok(Some(current)) => app.note(
+                    MessageRole::System,
+                    format!(
+                        "Workspace context (version {}, {}):\n{}",
+                        current.version, current.edited_at, current.content
+                    ),
                 ),
-            )),
-            Ok(None) => self.messages.push(Message::new(
-                MessageRole::System,
-                "No workspace context set. Use `quack context edit` or `quack context import FILE`.",
-            )),
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
+                Ok(None) => app.note(
+                    MessageRole::System,
+                    "No workspace context set. Use `quack context edit` or `quack context import FILE`.",
+                ),
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     /// `/graph ENTITY [HOPS]` or `/graph --class CLASS`: a tree of the
     /// neighbourhood or of the class's entities.
     fn show_graph(&mut self, args: &str) {
         if args.is_empty() {
-            self.messages.push(Message::new(
+            self.note(
                 MessageRole::System,
                 "Usage: /graph ENTITY [HOPS], or /graph --class CLASS",
-            ));
+            );
             return;
         }
         let options = self.config.graph.options();
-        let outcome = match self.db.lock() {
-            Ok(db) => {
+        let args = args.to_owned();
+        self.on_db(
+            Side::Read,
+            move |db| {
                 if let Some(class) = args.strip_prefix("--class ") {
-                    ontology_store::current(&db).and_then(|ontology| {
-                        traverse::by_class(
-                            &db,
-                            ontology.as_ref(),
-                            class.trim(),
-                            options.max_nodes,
-                            &options,
-                        )
-                    })
+                    let ontology = ontology_store::current(db)?;
+                    traverse::by_class(
+                        db,
+                        ontology.as_ref(),
+                        class.trim(),
+                        options.max_nodes,
+                        &options,
+                    )
                 } else {
                     let (entity, hops) = match args.rsplit_once(' ') {
                         Some((entity, hops)) if hops.parse::<u32>().is_ok() => {
                             (entity.trim(), hops.parse::<u32>().unwrap_or(2))
                         }
-                        _ => (args, 2),
+                        _ => (args.as_str(), 2),
                     };
-                    traverse::resolve_entry(&db, entity, None, None).and_then(|roots| {
-                        if roots.is_empty() {
-                            return Err(CoreError::Analysis(format!(
-                                "no entity matches '{entity}'"
-                            )));
-                        }
-                        traverse::neighborhood(&db, &roots, hops, None, &options)
-                    })
+                    let roots = traverse::resolve_entry(db, entity, None, None)?;
+                    if roots.is_empty() {
+                        return Err(CoreError::Analysis(format!("no entity matches '{entity}'")));
+                    }
+                    traverse::neighborhood(db, &roots, hops, None, &options)
                 }
-            }
-            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
-        };
-        match outcome {
-            Ok(result) => self.messages.push(Message::new(
-                MessageRole::System,
-                traverse::render_tree(&result),
-            )),
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
+            },
+            |app, outcome| match outcome {
+                Ok(result) => app.note(MessageRole::System, traverse::render_tree(&result)),
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     /// `/path FROM -> TO`: the shortest relation chain.
     fn show_path(&mut self, args: &str) {
         let Some((from, to)) = args.split_once("->") else {
-            self.messages
-                .push(Message::new(MessageRole::System, "Usage: /path FROM -> TO"));
+            self.note(MessageRole::System, "Usage: /path FROM -> TO");
             return;
         };
-        let (from, to) = (from.trim(), to.trim());
+        let (from, to) = (from.trim().to_owned(), to.trim().to_owned());
         let options = self.config.graph.options();
-        let outcome = match self.db.lock() {
-            Ok(db) => traverse::resolve_entry(&db, from, None, None).and_then(|a| {
-                let b = traverse::resolve_entry(&db, to, None, None)?;
+        let (shown_from, shown_to) = (from.clone(), to.clone());
+        self.on_db(
+            Side::Read,
+            move |db| {
+                let a = traverse::resolve_entry(db, &from, None, None)?;
+                let b = traverse::resolve_entry(db, &to, None, None)?;
                 match (a.first(), b.first()) {
-                    (Some(a), Some(b)) => traverse::path(&db, a, b, 4, &options),
+                    (Some(a), Some(b)) => traverse::path(db, a, b, 4, &options),
                     (None, _) => Err(CoreError::Analysis(format!("no entity matches '{from}'"))),
                     (_, None) => Err(CoreError::Analysis(format!("no entity matches '{to}'"))),
                 }
-            }),
-            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
-        };
-        match outcome {
-            Ok(result) if result.is_empty() => self.messages.push(Message::new(
-                MessageRole::System,
-                format!("No path connects {from} and {to} within 4 hops."),
-            )),
-            Ok(result) => self.messages.push(Message::new(
-                MessageRole::System,
-                traverse::render_tree(&result),
-            )),
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
+            },
+            move |app, outcome| match outcome {
+                Ok(result) if result.is_empty() => app.note(
+                    MessageRole::System,
+                    format!("No path connects {shown_from} and {shown_to} within 4 hops."),
+                ),
+                Ok(result) => app.note(MessageRole::System, traverse::render_tree(&result)),
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     fn show_documents(&mut self) {
-        let listing = match self.db.lock() {
-            Ok(db) => db.list_documents(),
-            Err(e) => {
-                self.messages.push(Message::new(
-                    MessageRole::Error,
-                    format!("workspace lock poisoned: {e}"),
-                ));
-                return;
-            }
-        };
-        match listing {
-            Ok(docs) if docs.is_empty() => self
-                .messages
-                .push(Message::new(MessageRole::System, "No documents yet.")),
-            Ok(docs) => {
-                let mut text = String::from("Documents:");
-                for doc in docs {
-                    let line = format!(
-                        "\n  {}  {:<10}  {}  {}",
-                        short_id(&doc.id),
-                        doc.status,
-                        if doc.pinned { "pinned" } else { "      " },
-                        doc.filename
-                    );
-                    text.push_str(&line);
+        self.on_db(
+            Side::Read,
+            WorkspaceDb::list_documents,
+            |app, listing| match listing {
+                Ok(docs) if docs.is_empty() => app.note(MessageRole::System, "No documents yet."),
+                Ok(docs) => {
+                    let mut text = String::from("Documents:");
+                    for doc in docs {
+                        let line = format!(
+                            "\n  {}  {:<10}  {}  {}",
+                            short_id(&doc.id),
+                            doc.status,
+                            if doc.pinned { "pinned" } else { "      " },
+                            doc.filename
+                        );
+                        text.push_str(&line);
+                    }
+                    text.push_str("\nUse /pin ID or /unpin ID.");
+                    app.note(MessageRole::System, text);
                 }
-                text.push_str("\nUse /pin ID or /unpin ID.");
-                self.messages.push(Message::new(MessageRole::System, text));
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     fn set_pinned(&mut self, prefix: &str, pinned: bool) {
         if prefix.is_empty() {
-            self.messages.push(Message::new(
+            self.note(
                 MessageRole::System,
                 if pinned {
                     "Usage: /pin DOCUMENT_ID"
                 } else {
                     "Usage: /unpin DOCUMENT_ID"
                 },
-            ));
+            );
             return;
         }
-        let outcome = match self.db.lock() {
-            Ok(db) => db.list_documents().and_then(|docs| {
-                let matches: Vec<String> = docs
+        let prefix = prefix.to_owned();
+        self.on_db(
+            Side::Write,
+            move |db| {
+                let matches: Vec<String> = db
+                    .list_documents()?
                     .into_iter()
-                    .filter(|d| d.id.starts_with(prefix))
+                    .filter(|d| d.id.starts_with(&prefix))
                     .map(|d| d.id)
                     .collect();
                 match matches.as_slice() {
@@ -1744,22 +1731,19 @@ impl App {
                         many.len()
                     ))),
                 }
-            }),
-            Err(e) => Err(CoreError::Analysis(format!("workspace lock poisoned: {e}"))),
-        };
-        match outcome {
-            Ok(id) => self.messages.push(Message::new(
-                MessageRole::System,
-                format!(
-                    "{} {}",
-                    if pinned { "Pinned" } else { "Unpinned" },
-                    short_id(&id)
+            },
+            move |app, outcome| match outcome {
+                Ok(id) => app.note(
+                    MessageRole::System,
+                    format!(
+                        "{} {}",
+                        if pinned { "Pinned" } else { "Unpinned" },
+                        short_id(&id)
+                    ),
                 ),
-            )),
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, format!("{e}"))),
-        }
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     /// Drop the current session if nothing was ever recorded in it.
@@ -1805,13 +1789,98 @@ impl App {
     }
 
     /// Drop the session on screen if nothing was ever recorded in it,
-    /// unless a turn of it is still queued or running.
-    fn forget_session_if_empty(&self) {
+    /// unless a turn of it is still queued or running (a database step, in
+    /// order with the rest).
+    fn forget_session_if_empty(&mut self) {
+        if self.turns.iter().any(|t| t.session_id == self.session_id) {
+            return;
+        }
+        let session = self.session_id.clone();
+        self.on_db(
+            Side::Write,
+            move |db| sessions::delete_if_empty(db, &session),
+            |_, _| {},
+        );
+    }
+
+    /// The same when the session ends: after the loop, so it may wait.
+    fn forget_session_now(&self) {
         if self.turns.iter().any(|t| t.session_id == self.session_id) {
             return;
         }
         if let Ok(db) = self.db.lock() {
             drop(sessions::delete_if_empty(&db, &self.session_id));
+        }
+    }
+
+    /// Push a transcript line.
+    fn note(&mut self, role: MessageRole, text: impl Into<String>) {
+        self.messages.push(Message::new(role, text));
+        self.scroll_offset = 0;
+    }
+
+    /// Run `work` against the workspace in the session's database worker,
+    /// on `side`, and `apply` its result on the loop. Steps run one at a
+    /// time in the order they were sent, so `/pin X` then `/docs` shows the
+    /// pin; the loop never waits on the database.
+    fn on_db<T, W, A>(&mut self, side: Side, work: W, apply: A)
+    where
+        T: Send + 'static,
+        W: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
+        A: FnOnce(&mut App, CoreResult<T>) + Send + 'static,
+    {
+        let db = Arc::clone(&self.db);
+        let reader = self.reader_db.clone();
+        let tx = self.msg_tx.clone();
+        let step: DbStep = Box::new(move || {
+            Box::pin(async move {
+                let result = match side {
+                    Side::Read => reader.with_db(work).await,
+                    Side::Write => tokio::task::spawn_blocking(move || {
+                        let guard = db
+                            .lock_at(Priority::Interactive)
+                            .map_err(|e| CoreError::Analysis(e.to_string()))?;
+                        work(&guard)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(CoreError::Analysis(format!(
+                            "the database task failed: {e}"
+                        )))
+                    }),
+                };
+                drop(tx.send(AppMsg::Apply(Box::new(move |app: &mut App| {
+                    apply(app, result);
+                }))));
+            })
+        });
+        self.pending_db = self.pending_db.saturating_add(1);
+        let steps = self.db_steps.get_or_insert_with(|| {
+            let (steps, mut queue) = mpsc::unbounded_channel::<DbStep>();
+            tokio::spawn(async move {
+                while let Some(step) = queue.recv().await {
+                    step().await;
+                }
+            });
+            steps
+        });
+        if steps.send(step).is_err() {
+            self.pending_db = self.pending_db.saturating_sub(1);
+            self.note(MessageRole::Error, "the database worker stopped");
+        }
+    }
+
+    /// A switch landed: submit what was typed meanwhile, in order.
+    fn finish_switch(&mut self) {
+        let mut waiting = self.switching.take().unwrap_or_default();
+        // A line that starts another switch sends the rest back to wait.
+        while self.switching.is_none()
+            && let Some(text) = waiting.pop_front()
+        {
+            self.submit_text(text);
+        }
+        if let Some(after) = self.switching.as_mut() {
+            after.extend(waiting);
         }
     }
 
@@ -1828,6 +1897,23 @@ impl App {
         self.textarea = TextArea::default();
         configure_textarea(&mut self.textarea);
         self.scroll_offset = 0;
+        self.submit_text(trimmed);
+    }
+
+    /// Act on one submitted line. While a session switch is on its way the
+    /// line waits, so it lands in the session the user now expects.
+    fn submit_text(&mut self, trimmed: String) {
+        if let Some(waiting) = self.switching.as_mut() {
+            let first = waiting.is_empty();
+            waiting.push_back(trimmed);
+            if first {
+                self.note(
+                    MessageRole::System,
+                    "Waiting for the session switch; this runs right after it.",
+                );
+            }
+            return;
+        }
 
         if trimmed.starts_with('/') {
             self.handle_slash_command(&trimmed);
@@ -1942,16 +2028,17 @@ impl App {
         self.messages
             .push(Message::new(MessageRole::User, sql.clone()));
         self.last_sql = Some(sql.clone());
-        let kind = match self.db.lock() {
-            Ok(db) => db.classify_user_statement(&sql),
-            Err(e) => {
-                self.messages.push(Message::new(
-                    MessageRole::Error,
-                    format!("workspace lock poisoned: {e}"),
-                ));
-                return;
-            }
-        };
+        // Classifying is a parse: the reader pool does it, off the loop.
+        let statement = sql.clone();
+        self.on_db(
+            Side::Read,
+            move |db| db.classify_user_statement(&statement),
+            move |app, kind| app.gate_direct_sql(sql, kind),
+        );
+    }
+
+    /// Run a classified statement, or ask before a write.
+    fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>) {
         match kind {
             Ok(StatementKind::Read) => self.execute_direct_sql(sql, false),
             Ok(StatementKind::Write) if self.writes_allowed() => self.execute_direct_sql(sql, true),
@@ -1998,32 +2085,22 @@ impl App {
         });
     }
     fn show_tables(&mut self) {
-        let listing = match self.db.lock() {
-            Ok(db) => db.list_tables(),
-            Err(e) => {
-                self.messages.push(Message::new(
-                    MessageRole::Error,
-                    format!("workspace lock poisoned: {e}"),
-                ));
-                return;
-            }
-        };
-        match listing {
-            Ok(tables) if tables.is_empty() => self
-                .messages
-                .push(Message::new(MessageRole::System, "No tables yet.")),
-            Ok(tables) => {
-                let mut text = String::from("Tables:");
-                for table in tables {
-                    text.push_str("\n  ");
-                    text.push_str(&table);
+        self.on_db(
+            Side::Read,
+            WorkspaceDb::list_tables,
+            |app, listing| match listing {
+                Ok(tables) if tables.is_empty() => app.note(MessageRole::System, "No tables yet."),
+                Ok(tables) => {
+                    let mut text = String::from("Tables:");
+                    for table in tables {
+                        text.push_str("\n  ");
+                        text.push_str(&table);
+                    }
+                    app.note(MessageRole::System, text);
                 }
-                self.messages.push(Message::new(MessageRole::System, text));
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, e.to_string())),
-        }
+                Err(e) => app.note(MessageRole::Error, e.to_string()),
+            },
+        );
     }
 
     /// Submit a question as a job in its session's lane: it starts once
@@ -2265,6 +2342,20 @@ impl CliJob {
     }
 }
 
+/// The runtime, seen from a job's own thread, with the job's priority.
+struct Bridge {
+    handle: tokio::runtime::Handle,
+    priority: quack_core::priority::Priority,
+}
+
+impl Bridge {
+    /// Drive `work` to completion at the job's priority.
+    fn block_on<F: Future>(&self, work: F) -> F::Output {
+        self.handle
+            .block_on(quack_core::priority::with_priority(self.priority, work))
+    }
+}
+
 /// Run long blocking work (`DuckDB` steps between model calls, and
 /// ingestion futures that are not `Send`) on a thread of its own, driving
 /// any async part on the runtime, and turn its answer into a transcript
@@ -2272,13 +2363,16 @@ impl CliJob {
 /// waits for its blocking pool when it shuts down, and quitting must not
 /// wait for an ingest that has no checkpoint to stop at.
 async fn on_blocking_thread(
-    work: impl FnOnce(&tokio::runtime::Handle) -> Result<String> + Send + 'static,
+    work: impl FnOnce(&Bridge) -> Result<String> + Send + 'static,
 ) -> BackgroundResult {
     let handle = tokio::runtime::Handle::current();
+    // The thread has no task-local: the job's priority goes with it, and
+    // its `block_on` scopes it again.
+    let priority = quack_core::priority::current_priority();
     let (done, answer) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name(String::from("quack-job"))
-        .spawn(move || drop(done.send(work(&handle))));
+        .spawn(move || drop(done.send(work(&Bridge { handle, priority }))));
     if let Err(e) = spawned {
         return BackgroundResult::Error(format!("could not start the job's thread: {e}"));
     }
@@ -2344,6 +2438,14 @@ async fn run_job_inner(
         }
     }
     Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+}
+
+/// A session's messages, read for the transcript.
+fn load_session(db: &WorkspaceDb, session_id: &str) -> CoreResult<Replay> {
+    Ok(Replay {
+        session_id: session_id.to_owned(),
+        rows: sessions::messages(db, session_id)?,
+    })
 }
 
 /// A finished step as one transcript message: the header line, the
@@ -2601,7 +2703,7 @@ async fn run_ingest_inner(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use quack_core::storage::writer::Writer;
 
     use quack_core::analysis::agent::AgentResponse;
     use quack_core::analysis::events::ToolStep;
@@ -2621,7 +2723,7 @@ mod tests {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Mutex::new(db));
+        let db: SharedDb = Arc::new(Writer::new(db));
         let reader_db = ReaderDb::new(Arc::clone(&db));
         App::new(
             String::from("ws"),
@@ -2650,6 +2752,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         fail("no background result arrived");
+    }
+
+    /// Wait until every database step sent so far has been applied.
+    async fn db_settle(app: &mut App) {
+        pump_until(app, |app| app.pending_db == 0).await;
     }
 
     /// Pump until `done` holds.
@@ -2694,6 +2801,7 @@ mod tests {
 
         // A write asks first; `y` runs it as a job.
         app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a, 'x' AS b");
+        db_settle(&mut app).await;
         assert!(app.awaiting_permission());
         assert!(matches!(app.prompts.front(), Some(Prompt::Sql(_))));
         app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
@@ -2702,8 +2810,10 @@ mod tests {
         assert_eq!(last(&app).role, MessageRole::Sql);
 
         app.handle_slash_command("/tables");
+        db_settle(&mut app).await;
         assert!(last(&app).content.contains('t'), "{}", last(&app).content);
         app.handle_slash_command("/schema t");
+        db_settle(&mut app).await;
         assert_eq!(last(&app).role, MessageRole::Sql);
         assert!(
             last(&app).content.contains("a INTEGER"),
@@ -2711,10 +2821,12 @@ mod tests {
             last(&app).content
         );
         app.handle_slash_command("/schema nope");
+        db_settle(&mut app).await;
         assert_eq!(last(&app).role, MessageRole::Error);
 
         // Internal tables stay refused, a read runs without asking.
         app.handle_slash_command("/sql SELECT * FROM _quack_documents");
+        db_settle(&mut app).await;
         assert_eq!(last(&app).role, MessageRole::Error);
         app.handle_slash_command("/sql SELECT a FROM t");
         settle(&mut app).await;
@@ -2750,8 +2862,10 @@ mod tests {
         );
 
         app.handle_slash_command("/export --markdown");
+        db_settle(&mut app).await;
         assert_eq!(last(&app).role, MessageRole::Sql);
         app.handle_slash_command("/share");
+        db_settle(&mut app).await;
         assert!(last(&app).content.contains("shared"));
         app.handle_slash_command("/model");
         assert!(last(&app).content.contains("keyword search only"));
@@ -2913,7 +3027,11 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(screen.contains("42"), "{screen}");
+        // The result table, not a session id that happens to hold "42".
+        assert!(
+            screen.contains("answer") && screen.contains("(1 rows)"),
+            "{screen}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2936,6 +3054,59 @@ mod tests {
         assert!(sql_sink.send(()).is_ok());
         pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
         assert!(ui::job_strip(&app).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn database_commands_run_in_order_off_the_loop_and_input_waits_for_a_switch() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "# Notes\n\nSomething to pin.")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        app.start_ingest(file);
+        settle(&mut app).await;
+
+        // A write then a read, sent back to back, answer in that order: the
+        // listing sees the pin.
+        let id = {
+            let db = app.db.lock().unwrap_or_else(|e| fail(&e.to_string()));
+            db.list_documents()
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .first()
+                .map_or_else(|| fail("no document"), |d| d.id.clone())
+        };
+        app.handle_slash_command(&format!("/pin {id}"));
+        app.handle_slash_command("/docs");
+        // Neither has answered on the loop yet: nothing blocked here.
+        assert_eq!(app.pending_db, 2);
+        db_settle(&mut app).await;
+        assert!(
+            last(&app).content.contains("pinned"),
+            "{}",
+            last(&app).content
+        );
+
+        // Input typed during a switch waits for it, then lands in the new
+        // session.
+        let old = app.session_id.clone();
+        app.handle_slash_command("/new");
+        app.set_textarea_content("/workspace");
+        app.submit_message();
+        assert!(
+            last(&app)
+                .content
+                .contains("Waiting for the session switch"),
+            "{}",
+            last(&app).content
+        );
+        db_settle(&mut app).await;
+        assert_ne!(app.session_id, old);
+        assert!(
+            last(&app).content.contains(&app.session_id),
+            "the deferred /workspace ran in the new session: {}",
+            last(&app).content
+        );
+        assert!(app.switching.is_none());
     }
 
     #[test]
@@ -3017,7 +3188,10 @@ mod tests {
         pump_until(&mut app, |app| {
             app.turns.is_empty()
                 && app.active_jobs.is_empty()
-                && app.messages.iter().any(|m| m.content.contains("42"))
+                && app
+                    .messages
+                    .iter()
+                    .any(|m| m.role == MessageRole::Sql && m.content.contains("42"))
         })
         .await;
         let jobs = app.jobs.list();
@@ -3056,13 +3230,14 @@ mod tests {
         assert!(last(&app).content.contains("42"), "{}", last(&app).content);
     }
 
-    #[test]
-    fn typed_input_is_kept_across_sessions_and_relative_paths_are_files() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_input_is_kept_across_sessions_and_relative_paths_are_files() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         {
             let mut app = app(dir.path());
             app.set_textarea_content("/tables");
             app.submit_message();
+            db_settle(&mut app).await;
         }
         let again = app(dir.path());
         assert_eq!(again.input_history, vec![String::from("/tables")]);

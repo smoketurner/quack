@@ -1,6 +1,7 @@
 //! What every handler shares: the config, the control plane, one open
 //! `DuckDB` handle per workspace, the browser sessions, and the work queue.
 
+use quack_core::storage::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -179,7 +180,7 @@ impl AppState {
             })
             .await
             .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
-            let writer: SharedDb = Arc::new(Mutex::new(db));
+            let writer: SharedDb = Arc::new(Writer::new(db));
             let reader = open_reader(&writer, pool_size).await;
             Ok(WorkspaceHandle { writer, reader })
         })
@@ -277,10 +278,13 @@ where
     T: Send + 'static,
     F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
 {
+    // The blocking task has no task-local: carry the caller's line over,
+    // so a background job's writes stay behind a person's.
+    let priority = quack_core::priority::current_priority();
     tokio::task::spawn_blocking(move || {
         let guard = db
-            .lock()
-            .map_err(|e| quack_core::error::Error::Analysis(format!("mutex poisoned: {e}")))?;
+            .lock_at(priority)
+            .map_err(|e| quack_core::error::Error::Analysis(e.to_string()))?;
         f(&guard)
     })
     .await

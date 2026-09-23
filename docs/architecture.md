@@ -45,6 +45,8 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |
 | `migrations/*.sql` | `control.db` schema versions | [migrations.md](migrations.md) |
 | `storage::workspace` | the workspace DuckDB file: open with confinement and limits, the `_quack_` tables, statement classification, hybrid retrieval (cosine scan plus BM25 over `_quack_terms`), the document registry, query execution with faithful JSON values | 5.4, 6.1, 7.4 |
+| `storage::writer` | the workspace's one writer connection behind a two-tier line: interactive callers before background ones | 4.1, 7.4 |
+| `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
 | `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit | 5.3, 8 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
 | `import` | rows from Postgres, SQLite, or an HTTP data file as a workspace table | 6.2 |

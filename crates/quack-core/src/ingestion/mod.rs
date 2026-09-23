@@ -4,7 +4,7 @@ pub mod office;
 pub mod parser;
 pub mod xlsx;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rig::embeddings::EmbeddingModel;
@@ -16,6 +16,7 @@ use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
     DocumentInfo, DocumentSource, NewChunk, NewDocument, WorkspaceDb, quote_ident,
 };
+use crate::storage::writer::Writer;
 
 /// Access to a workspace database for ingestion: a bare handle, or a
 /// shared one that is locked only around each database step so embedding
@@ -35,11 +36,9 @@ impl DbHandle for WorkspaceDb {
     }
 }
 
-impl DbHandle for Arc<Mutex<WorkspaceDb>> {
+impl DbHandle for Arc<Writer> {
     fn with<R>(&self, f: impl FnOnce(&WorkspaceDb) -> Result<R>) -> Result<R> {
-        let guard = self
-            .lock()
-            .map_err(|e| Error::Ingestion(format!("workspace mutex poisoned: {e}")))?;
+        let guard = self.lock().map_err(|e| Error::Ingestion(e.to_string()))?;
         f(&guard)
     }
 }

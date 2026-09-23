@@ -130,9 +130,14 @@ The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`,
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
 a strip above the prompt shows active jobs, `/jobs` lists them, `/cancel N` stops one, and
-write prompts from concurrent work queue up. Terminal jobs share the session's one
-`SharedDb`; `graph_cli::run` and `ontology_cli::run` take any `DbHandle` and lock only
-around each database step.
+write prompts from concurrent work queue up. Its commands' database steps run in the order
+typed on one worker task (`App::on_db`: reads on the reader pool, writes in the writer's
+interactive line), never on the loop's thread; input typed during `/new`, `/resume`, or
+`/mode` waits for the switch. `SharedDb` is `Arc<storage::writer::Writer>`: one holder at
+a time, interactive callers before background ones by `quack_core::priority` (a
+task-local, interactive unless the job queue scopes a background job kind);
+`graph_cli::run` and `ontology_cli::run` take any `DbHandle` and lock only around each
+database step.
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes

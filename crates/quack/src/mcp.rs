@@ -892,7 +892,7 @@ pub(crate) async fn serve_stdio(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use quack_core::storage::writer::Writer;
 
     use quack_core::config::Config;
 
@@ -907,7 +907,7 @@ mod tests {
         let mut config = Config::default();
         config.general.data_dir = dir.to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Mutex::new(db));
+        let db: SharedDb = Arc::new(Writer::new(db));
         let reader = ReaderDb::new(Arc::clone(&db));
         McpServer::new(
             config,
@@ -1030,7 +1030,7 @@ mod tests {
         .unwrap_or_else(|e| fail(&e.to_string()));
         config.general.data_dir = dir.path().to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Mutex::new(db));
+        let db: SharedDb = Arc::new(Writer::new(db));
         let reader =
             quack_core::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let server = McpServer::new(

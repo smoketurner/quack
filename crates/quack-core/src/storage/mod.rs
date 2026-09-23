@@ -4,3 +4,4 @@ pub mod control;
 pub mod queries;
 pub mod sessions;
 pub mod workspace;
+pub mod writer;

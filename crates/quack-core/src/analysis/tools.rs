@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::storage::workspace::{
     ChunkScope, ChunkSearchResult, StatementKind, WorkspaceDb, quote_ident,
 };
+use crate::storage::writer::Writer;
 
 use super::chart::{self, ChartSpec};
 use super::events::TurnRecorder;
@@ -21,7 +22,10 @@ use crate::error::Error;
 use crate::ontology::store as ontology_store;
 use crate::ontology::{self, Ontology};
 
-pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
+/// A workspace connection behind its two-tier line of waiters
+/// ([`crate::storage::writer`]): the writer of a workspace, or one reader
+/// of its pool.
+pub type SharedDb = Arc<Writer>;
 
 /// Shared state behind every clone of one workspace handle's `ReaderDb`.
 struct ReaderPool {
@@ -87,7 +91,7 @@ impl ReaderDb {
             let Some(candidate) = self.0.readers.get(i) else {
                 continue;
             };
-            if let Ok(guard) = candidate.try_lock() {
+            if let Some(guard) = candidate.try_lock() {
                 drop(guard);
                 return candidate;
             }
@@ -180,7 +184,7 @@ pub async fn open_reader(shared_db: &SharedDb, pool_size: u32) -> ReaderDb {
     let readers = clones
         .into_iter()
         .map(|clone| match clone {
-            Ok(db) => Arc::new(Mutex::new(db)),
+            Ok(db) => Arc::new(Writer::new(db)),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -240,10 +244,12 @@ where
     T: Send + 'static,
 {
     let db = Arc::clone(db);
+    // The blocking task has no task-local: carry the caller's line over.
+    let priority = crate::priority::current_priority();
     tokio::task::spawn_blocking(move || {
         let guard = db
-            .lock()
-            .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
+            .lock_at(priority)
+            .map_err(|e| Error::Analysis(e.to_string()))?;
         f(&guard)
     })
     .await
@@ -1698,7 +1704,7 @@ mod tests {
     }
 
     fn shared_db() -> SharedDb {
-        Arc::new(Mutex::new(
+        Arc::new(Writer::new(
             WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| unreachable_db(&e.to_string())),
         ))
     }

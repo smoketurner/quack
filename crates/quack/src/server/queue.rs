@@ -59,12 +59,19 @@ pub(crate) fn submit_upload(
     let id = app.jobs.submit(spec, move |ctx| async move {
         let cancel = ctx.cancel_token();
         let handle = tokio::runtime::Handle::current();
+        // The blocking thread has no task-local: keep the job's priority.
+        let priority = quack_core::priority::current_priority();
         let document_id = job.document_id.clone();
         // Parsing and DuckDB writes are blocking work; the embedding calls
         // inside need the runtime, so block on it from a blocking thread.
         let outcome = tokio::task::spawn_blocking({
             let db = Arc::clone(&worker_db);
-            move || handle.block_on(process(&config, &workspace, &db, job, &cancel))
+            move || {
+                handle.block_on(quack_core::priority::with_priority(
+                    priority,
+                    process(&config, &workspace, &db, job, &cancel),
+                ))
+            }
         })
         .await;
         match outcome {

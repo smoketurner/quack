@@ -32,10 +32,11 @@ use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
+use quack_core::storage::writer::Writer;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Exit status for a usage error (bad flags, no terminal for the session).
@@ -641,7 +642,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         cli.resume.as_deref(),
         cli.mode.map(ChatMode::from),
     )?;
-    let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let db: SharedDb = Arc::new(Writer::new(ws_db));
     let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     let outcome = print::run_prompt(
         &config,
@@ -918,7 +919,7 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let db: SharedDb = Arc::new(Writer::new(ws_db));
     let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     let policy = if allow_write {
         WritePolicy::Allow
@@ -1116,7 +1117,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         cli.resume.as_deref(),
         cli.mode.map(ChatMode::from),
     )?;
-    let db: SharedDb = Arc::new(Mutex::new(ws_db));
+    let db: SharedDb = Arc::new(Writer::new(ws_db));
     let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     terminal::run(
         config,
