@@ -892,7 +892,7 @@ pub(crate) async fn serve_stdio(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use quack_core::storage::writer::Writer;
 
     use quack_core::config::Config;
 
@@ -907,7 +907,7 @@ mod tests {
         let mut config = Config::default();
         config.general.data_dir = dir.to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Mutex::new(db));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
         let reader = ReaderDb::new(Arc::clone(&db));
         McpServer::new(
             config,
@@ -1030,7 +1030,7 @@ mod tests {
         .unwrap_or_else(|e| fail(&e.to_string()));
         config.general.data_dir = dir.path().to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Mutex::new(db));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
         let reader =
             quack_core::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let server = McpServer::new(
@@ -1054,9 +1054,9 @@ mod tests {
                 mode: mode.map(str::to_owned),
             })
         };
-        let session_count = || {
-            let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-            sessions::list_sessions(&guard, 10)
+        let session_count = || async {
+            db.run(|db| sessions::list_sessions(db, 10))
+                .await
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .len()
         };
@@ -1069,7 +1069,7 @@ mod tests {
             let text = error_text(&failed);
             assert!(text.contains("the agent turn failed"), "{text}");
             assert!(!text.contains("does not exist"), "{text}");
-            assert_eq!(session_count(), 0);
+            assert_eq!(session_count().await, 0);
         }
 
         let bad_mode = server
@@ -1084,20 +1084,20 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&unknown).contains("does not exist"));
 
-        let existing = {
-            let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-            sessions::create_session(&guard, "o/m", ChatMode::Chat, None)
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .id
-        };
+        let existing = db
+            .run(|db| sessions::create_session(db, "o/m", ChatMode::Chat, None))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .id;
         let failed = server
             .query(ask(Some(&existing), Some("query")))
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&failed).contains("the agent turn failed"));
-        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-        let kept =
-            sessions::get_session(&guard, &existing).unwrap_or_else(|e| fail(&e.to_string()));
+        let kept = db
+            .run(move |db| sessions::get_session(db, &existing))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
         // The mode given with an existing session id does not change it.
         assert_eq!(kept.map(|s| s.mode), Some(ChatMode::Chat));
     }

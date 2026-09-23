@@ -165,18 +165,28 @@ run at most the lane's limit at a time, strictly in submission order (a job's pl
 line is taken when it is submitted, not when its task first runs). A job with no lane
 starts at once.
 
+The priority (`crate::priority`, a Tokio task-local) is interactive unless scoped: the job
+queue runs `ingest`, `import`, `ontology`, `graph`, and `export` jobs as background. Every
+job is a task on the runtime, so the scope covers all the work it awaits; the threads
+outside the runtime (the writer, the blocking pool that parses files) decide nothing by
+it, since a closure takes its writer line when it is sent.
+
 The queue does not count jobs against a pool. What is scarce is the resources jobs use,
 and each is limited where it is used:
 
 | Resource | Limit | Where |
 |----------|-------|-------|
-| Model requests to a provider | `[providers.NAME].max_concurrent_requests` (1 for Ollama, which serves one request per model unless `OLLAMA_NUM_PARALLEL` says more; 8 for hosted APIs), process-wide | `llm::LimitedHttp`: every rig client quack builds sends through it; a permit is held from the request until its body is read or its stream ends |
-| The workspace's writer connection | one statement at a time (the `SharedDb` mutex, section 7.4) | long work takes it per step, never across a model call |
+| Model requests, per provider and model | `[providers.NAME].max_concurrent_requests` for each model (1 for Ollama, which serves one request per model unless `OLLAMA_NUM_PARALLEL` says more; 8 for hosted APIs), process-wide, interactive requests first | `llm::LimitedHttp`: every rig client quack builds sends through it; the model is read from the request body; a permit is held from the request until its body is read or its stream ends |
+| The workspace's writer connection | owned by one thread per workspace (`storage::writer::Writer`, an actor, section 7.4) that runs the closures sent to it one at a time, interactive first | callers send owned closures and await the answer (`Writer::run`), so no async worker ever waits on it; long work sends one step at a time, never across a model call |
 | Reads | the reader pool (`[analysis].reader_pool_size`) | `ReaderDb` |
 | Uploads per workspace (server) | `[server].workers_per_workspace` | the `ingest:{workspace}` lane |
 
 A turn therefore holds nothing while it waits for the user's answer to a write prompt or
-runs a tool, and a quick `SELECT` never waits behind chat. rig's streaming loop drains a
+runs a tool, and a quick `SELECT` never waits behind chat. Requests carry a priority
+(`quack_core::priority`, a Tokio task-local): `run_turn` and `embed_query` run interactive,
+everything else (ingest embeddings, extraction, proposals) background, and a freed permit
+goes to the oldest interactive waiter before any background one, so a question never
+queues behind a whole ingest. rig's streaming loop drains a
 model response before it runs the tool calls in it, so a tool that calls the same
 provider (the query embedding, the model reranker) never waits on a permit its own turn
 still holds. `[analysis].extraction_concurrency` and `[ingestion].embedding_concurrency`
@@ -212,8 +222,8 @@ workspace content (section 5), so it never reaches `control.db`; a restart forge
 the durable record of what a job did is the document, table, session, or audit row it
 wrote. Uploads a previous process left `queued` are marked failed when the workspace is
 next opened. Jobs share the workspace's one writer connection with everything else
-(section 7.4); long work (graph extraction, the document pass, ingestion) takes the writer
-only around each database step, never across a model call, so a question asked meanwhile
+(section 7.4); long work (graph extraction, the document pass, ingestion) sends the writer
+one database step at a time, never spanning a model call, so a question asked meanwhile
 records its turn between those steps.
 
 ---
@@ -481,8 +491,10 @@ Opening a workspace whose recorded `embedding_dimension` differs from the config
 provider's is an error with a clear message, never a silent mismatch — unless no chunk has
 an embedding yet, in which case the workspace adopts the new dimension and retypes the
 `embedding` columns of `_quack_chunks` and `_quack_graph_nodes` through NULL. Session and
-message writes are small and frequent; a workspace is one connection behind a mutex, so
-they serialize with ingestion writes rather than running beside them.
+message writes are small and frequent; a workspace has one writer connection, so they
+serialize with ingestion writes rather than running beside them, though in the writer's
+interactive line, ahead of any waiting background write (section 4.1): the connection
+lives on the workspace's writer thread and every write is a closure sent to it.
 
 ### 5.5 `control.db` (server only, SQLite, sea-query queries, SQL-file migrations)
 
@@ -1743,8 +1755,10 @@ because the system being replaced runs on Postgres.
 
 1. **DuckDB is embedded and single-process.** One `quack serve` process owns every
    workspace file. Vertical scaling only. Concurrency within a process is narrower than
-   DuckDB's MVCC would allow: a workspace is one connection behind a mutex
-   (`Arc<Mutex<WorkspaceDb>>`), so ingestion, session writes, and readers take turns.
+   DuckDB's MVCC would allow: a workspace has one writer connection
+   (`storage::writer::Writer`, owned by a thread of its own that serves interactive
+   work before background work), so ingestion and session writes take turns; reads go
+   to the reader pool.
    Horizontal scaling or an HA pair is not possible without moving storage to a server
    database. For a single-instance deployment this is a simplification, not a limitation.
 2. **Vector search is an exact scan, not an index.** Every query computes the cosine
@@ -1782,7 +1796,7 @@ because the system being replaced runs on Postgres.
 4. **Storage backend seam — not built.** The intent was that retrieval, `graph/`, and
    `ontology/` sit behind small traits so a Postgres + pgvector backend could be added
    without touching the agent or the interfaces. In the code they take `&WorkspaceDb`
-   directly; the only traits are `DbHandle`, `Reranker`, `Extractor`, and `GraphExtractor`,
+   directly; the only traits are `Reranker`, `Extractor`, and `GraphExtractor`,
    none of them a storage seam. Adding another backend today means changing graph and
    ontology code.
 5. **Migration from the current deployment.** Documents are re-uploaded and re-embedded
@@ -1986,13 +2000,20 @@ design to the tracker and is updated as issues close. Ordered by risk.
     means copying the workspace directory while no write is in flight. Sections 15, 19.
 15. **Work queues, first pass** (section 4.1). The terminal, the web chat, REST `query`,
     uploads, graph extraction, and the document pass run on `quack_core::jobs`, and model
-    requests are limited per provider in `llm::LimitedHttp`. Not yet:
-    MCP `query` calls and print mode run their turn directly (one call, one answer, nothing
-    to keep responsive); the web chat page shows its own turn but not a job strip (the Jobs
-    page does); jobs are not persisted across restarts; and an upload queue no longer
-    pushes back on the client when deep (the old 64-deep bound): `upload_max_mb` and the
-    rate limiter bound it instead. Quick terminal commands (`/tables`, `/docs`, `/pin`,
-    ...) still run inline, taking the writer for one short step.
+    requests are limited per provider and model in `llm::LimitedHttp`, interactive first.
+    Ingest and import stop on cancel, mid-embedding included. A workspace with 64 uploads
+    waiting answers the next with 503 and `Retry-After: 30`; the web Jobs page follows
+    `.../jobs/stream` instead of polling; the terminal re-renders only the messages that
+    changed. The writer is an actor: one thread per workspace owns the connection and
+    runs the owned closures sent to it, interactive before background, so no runtime
+    worker ever blocks on the database. Ingestion, import, extraction, and the CLI
+    commands take the `Writer` itself (the CLI spawns one too), parsing runs on the
+    blocking pool, and every job, the terminal's included, is a plain task on the
+    runtime. The terminal's commands run their database step, in the order typed, on a
+    worker task, reads on the reader pool. Not yet: MCP `query` calls and
+    print mode run their turn directly (one call, one answer, nothing to keep
+    responsive); the web chat page shows its own turn but not a job strip (the Jobs page
+    does); jobs are not persisted across restarts.
 
 ---
 

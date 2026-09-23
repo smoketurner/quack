@@ -30,6 +30,10 @@ pub enum Error {
     #[error("ingestion error: {0}")]
     Ingestion(String),
 
+    /// The work was cancelled (a job's cancel token) before it finished.
+    #[error("cancelled")]
+    Cancelled,
+
     /// A structured file would load into a table another document owns
     /// (issue #51): one document per table.
     #[error(

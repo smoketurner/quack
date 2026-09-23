@@ -10,5 +10,6 @@ pub mod jobs;
 pub mod llm;
 pub mod okf;
 pub mod ontology;
+pub mod priority;
 pub mod progress;
 pub mod storage;

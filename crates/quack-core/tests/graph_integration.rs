@@ -11,9 +11,16 @@ use quack_core::graph::store::NewNode;
 use quack_core::graph::{GraphOptions, extract, resolve, store as graph_store, tables, traverse};
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::storage::workspace::{NewChunk, NewDocument, WorkspaceDb};
+use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
 const DIM: usize = 4;
+
+/// A writer over a second connection to `db`'s database, for the steps
+/// that take one, while the test reads and writes through `db`.
+fn writer_of(db: &WorkspaceDb) -> Writer {
+    Writer::spawn(db.try_clone_reader().unwrap()).unwrap()
+}
 
 /// Labels sharing a first letter embed close together; others far apart.
 struct LetterEmbedding;
@@ -271,6 +278,7 @@ fn extraction_samples_evenly_across_documents() {
 #[tokio::test]
 async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes() {
     let db = workspace();
+    let writer = writer_of(&db);
     let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, false).unwrap();
     let node = |label: &str| NewNode {
@@ -300,7 +308,7 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
         auto_merge_threshold: 0.05,
         ..GraphOptions::default()
     };
-    let resolved = resolve::resolve(&db, Some(&LetterEmbedding), &options)
+    let resolved = resolve::resolve(&writer, Some(&LetterEmbedding), &options)
         .await
         .unwrap();
     assert_eq!(resolved.auto_merged, 1, "{resolved:?}");
@@ -424,6 +432,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
 #[tokio::test]
 async fn tables_documents_resolution_and_traversal_end_to_end() {
     let db = workspace();
+    let writer = writer_of(&db);
     let current = store::current(&db).unwrap().unwrap();
 
     // Table mapping: three keyed rows become shipments with edges to
@@ -444,7 +453,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     // failed chunk is skipped, Kenya merges with the table's Kenya.
     let chunks = extract::chunks(&db, None).unwrap();
     assert_eq!(chunks.len(), 2);
-    let summary = extract::run(&db, chunks, &Canned, &current, false, 2, &|_| {})
+    let summary = extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})
         .await
         .unwrap();
     // Both chunks are on record (the failed one is not), so the next run
@@ -475,7 +484,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
         auto_merge_threshold: 0.0,
         ..GraphOptions::default()
     };
-    let resolved = resolve::resolve(&db, Some(&LetterEmbedding), &options)
+    let resolved = resolve::resolve(&writer, Some(&LetterEmbedding), &options)
         .await
         .unwrap();
     assert_eq!(resolved.embedded, 8);
@@ -706,10 +715,11 @@ fn class_listings_report_the_total_they_were_capped_from() {
 #[tokio::test]
 async fn provenance_maps_between_entities_and_chunks() {
     let db = workspace();
+    let writer = writer_of(&db);
     let current = ontology();
     tables::extract(&db, &current, false).unwrap();
     let chunks = extract::chunks(&db, None).unwrap();
-    extract::run(&db, chunks, &Canned, &current, false, 2, &|_| {})
+    extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})
         .await
         .unwrap();
 

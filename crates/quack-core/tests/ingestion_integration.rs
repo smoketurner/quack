@@ -13,6 +13,7 @@ use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
     ChunkScope, DocumentSource, NewChunk, NewDocument, StatementKind, WorkspaceDb,
 };
+use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
 const TEST_DIM: usize = 4;
@@ -111,6 +112,12 @@ impl EmbeddingModel for MockEmbeddingModel {
     }
 }
 
+/// A writer over a second connection to `db`'s database, for ingestion
+/// and import, while the test's own statements and assertions keep `db`.
+fn writer_of(db: &WorkspaceDb) -> Writer {
+    Writer::spawn(db.try_clone_reader().unwrap()).unwrap()
+}
+
 fn test_config(data_dir: &Path) -> Config {
     let mut providers = BTreeMap::new();
     providers.insert(
@@ -185,10 +192,12 @@ async fn ingest_text_without_embeddings() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
+    let writer = writer_of(&db);
+
     let data = b"Hello world. This is a test document for ingestion testing.";
-    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("test.txt", data),
         None,
@@ -217,13 +226,15 @@ async fn ingest_text_with_mock_embeddings() {
     let workspace_id = "ws-text-embed";
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+
+    let writer = writer_of(&db);
     let model = MockEmbeddingModel { dim: TEST_DIM };
 
     let data = b"This is a longer document with enough words to produce at least one chunk. \
                  We need to make sure the embedding pipeline works end to end with our mock.";
     let result = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("embed_test.txt", data),
         Some(&model),
@@ -304,13 +315,14 @@ async fn ingest_six_sections(
     model: &InFlightModel,
 ) -> (WorkspaceDb, ingestion::IngestResult) {
     let db = WorkspaceDb::open(config, workspace_id).unwrap();
+    let writer = writer_of(&db);
     let sections: Vec<String> = (1..=6)
         .map(|i| format!("# Section {i}\n\nA short paragraph about topic number {i}.\n"))
         .collect();
     let data = sections.join("\n");
     let result = ingestion::ingest_file(
         config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("sections.md", data.as_bytes()),
         Some(model),
@@ -376,6 +388,8 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     let workspace_id = "ws-batch";
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+
+    let writer = writer_of(&db);
     let model = BatchRecordingModel::make(&(), "mock", None);
 
     // Five headed sections, each its own chunk at 50 tokens.
@@ -385,7 +399,7 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     let data = sections.join("\n");
     let result = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("batches.md", data.as_bytes()),
         Some(&model),
@@ -421,9 +435,11 @@ async fn ingest_csv_structured() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
+    let writer = writer_of(&db);
+
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("people.csv", csv_content),
         None,
@@ -457,9 +473,11 @@ async fn ingest_json_structured() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
+    let writer = writer_of(&db);
+
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("scores.json", json_content),
         None,
@@ -487,9 +505,11 @@ async fn ingest_unknown_file_type_returns_error() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
+    let writer = writer_of(&db);
+
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("image.png", b"fake image data"),
         None,
@@ -512,9 +532,11 @@ async fn ingest_empty_text_file() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
-    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
+    let writer = writer_of(&db);
+
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("empty.txt", b""),
         None,
@@ -536,10 +558,12 @@ async fn ingest_markdown_as_unstructured() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
+    let writer = writer_of(&db);
+
     let data = b"# Heading\n\nSome paragraph text.\n\n- item 1\n- item 2\n";
-    let result = ingestion::ingest_file::<MockEmbeddingModel, _>(
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new("notes.md", data),
         None,
@@ -1195,6 +1219,7 @@ async fn ingest_csv_with_quote_in_filename() {
     let config = test_config_no_provider(dir.path());
     let workspace_id = "ws-quote";
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
 
     let filename = "it's a file.csv";
     let files_dir = config.workspace_files_dir(workspace_id);
@@ -1203,7 +1228,7 @@ async fn ingest_csv_with_quote_in_filename() {
 
     let result = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         workspace_id,
         &ingestion::NewFile::new(filename, b"a,b\n1,2\n3,4\n"),
         None::<&MockEmbeddingModel>,
@@ -1496,10 +1521,11 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-md-meta").unwrap();
+    let writer = writer_of(&db);
     let md = b"# Exclusions\n\nFlood is excluded.\n\n# Claims\n\nClose in thirty days.\n";
     let result = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-md-meta",
         &ingestion::NewFile::new("rules.md", md),
         None::<&MockEmbeddingModel>,
@@ -1539,10 +1565,11 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-dedup").unwrap();
+    let writer = writer_of(&db);
     let md = b"# Renewal terms\n\nRenewals close in thirty days.\n";
     let first = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-dedup",
         &ingestion::NewFile::new("terms.md", md).source(DocumentSource::Stdin),
         None::<&MockEmbeddingModel>,
@@ -1562,7 +1589,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
     // Same bytes under another name: skipped, naming the existing document.
     let again = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-dedup",
         &ingestion::NewFile::new("copy.md", md).title(Some("Copy")),
         None::<&MockEmbeddingModel>,
@@ -1579,7 +1606,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
     // An explicit title wins over the parsed heading.
     let titled = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-dedup",
         &ingestion::NewFile::new("other.md", b"# Heading\n\nBody.\n").title(Some(" Given ")),
         None::<&MockEmbeddingModel>,
@@ -1596,7 +1623,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
     let bad = b"%PDF-1.4 not really a pdf";
     let failed = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-dedup",
         &ingestion::NewFile::new("scan.pdf", bad),
         None::<&MockEmbeddingModel>,
@@ -1620,6 +1647,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-long-pdf").unwrap();
+    let writer = writer_of(&db);
 
     let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Long Report");
     for page in 1..=60 {
@@ -1632,7 +1660,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
 
     let result = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-long-pdf",
         &ingestion::NewFile::new("report.pdf", &bytes),
         None::<&MockEmbeddingModel>,
@@ -1764,10 +1792,11 @@ async fn workbook_loads_one_table_per_sheet_and_delete_drops_them() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-xlsx").unwrap();
+    let writer = writer_of(&db);
     let bytes = tiny_xlsx();
     let result = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-xlsx",
         &ingestion::NewFile::new("Region Sales.xlsx", &bytes),
         None::<&MockEmbeddingModel>,
@@ -1824,10 +1853,11 @@ async fn office_and_html_documents_are_chunked_with_titles() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-office").unwrap();
+    let writer = writer_of(&db);
     let page = b"<html><head><title>Renewal Guide</title></head><body><h1>Terms</h1><p>Thirty days.</p></body></html>";
     let result = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-office",
         &ingestion::NewFile::new("guide.html", page),
         None::<&MockEmbeddingModel>,
@@ -1853,7 +1883,7 @@ async fn office_and_html_documents_are_chunked_with_titles() {
 
     let failed = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-office",
         &ingestion::NewFile::new("deck.pptx", b"not a package"),
         None::<&MockEmbeddingModel>,
@@ -1878,6 +1908,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-import").unwrap();
+    let writer = writer_of(&db);
     // Beside the data directory, not inside it: quack's own files are
     // refused as a source (issue #69).
     let source_dir = tempfile::tempdir().unwrap();
@@ -1906,11 +1937,12 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     };
     let summary = quack_core::import::import(
         &config,
-        &db,
+        &writer,
         "ws-import",
         &request,
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await
     .unwrap();
@@ -1961,11 +1993,12 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     };
     let summary = quack_core::import::import(
         &config,
-        &db,
+        &writer,
         "ws-import",
         &request,
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await
     .unwrap();
@@ -2011,6 +2044,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-failed").unwrap();
+    let writer = writer_of(&db);
     db.insert_document(&NewDocument::new("d", "a.md", "text/markdown", 1).with_status("error"))
         .unwrap();
     db.insert_chunk(&NewChunk {
@@ -2051,7 +2085,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
     // and nothing of it stays searchable or counted.
     let failed = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-failed",
         &ingestion::NewFile::new("notes.md", b"# Notes\n\nA giraffe walked by.\n"),
         Some(&FailingEmbeddingModel),
@@ -2095,6 +2129,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-owner").unwrap();
+    let writer = writer_of(&db);
     let first_bytes = b"region,total\nnorth,1\n";
     let ingested = |outcome: ingestion::IngestOutcome| match outcome {
         ingestion::IngestOutcome::Ingested(r) => Some(r),
@@ -2103,7 +2138,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     let first = ingested(
         ingestion::ingest_file(
             &config,
-            &db,
+            &writer,
             "ws-owner",
             &ingestion::NewFile::new("sales.csv", first_bytes),
             None::<&MockEmbeddingModel>,
@@ -2116,7 +2151,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
 
     let changed = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-owner",
         &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,2\n"),
         None::<&MockEmbeddingModel>,
@@ -2141,7 +2176,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     db.execute_statement("DROP TABLE sales").unwrap();
     let again = ingestion::ingest_file(
         &config,
-        &db,
+        &writer,
         "ws-owner",
         &ingestion::NewFile::new("sales.csv", first_bytes),
         None::<&MockEmbeddingModel>,
@@ -2181,12 +2216,13 @@ async fn server_policy_refuses_local_sqlite_files() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-import-policy").unwrap();
+    let writer = writer_of(&db);
     let server_policy = quack_core::import::ImportPolicy::server(&config);
     assert!(!server_policy.local_files);
     assert!(!server_policy.private_hosts);
     let local_file = quack_core::import::import(
         &config,
-        &db,
+        &writer,
         "ws-import-policy",
         &quack_core::import::ImportRequest {
             url: format!("sqlite://{}", dir.path().join("control.db").display()),
@@ -2197,6 +2233,7 @@ async fn server_policy_refuses_local_sqlite_files() {
         },
         server_policy,
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(local_file.is_err_and(|e| e.to_string().contains("allow_local_files")));
@@ -2208,6 +2245,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-import-errors").unwrap();
+    let writer = writer_of(&db);
     let source_dir = tempfile::tempdir().unwrap();
     let source_path = source_dir.path().join("source.db");
     {
@@ -2232,11 +2270,12 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     };
     let summary = quack_core::import::import(
         &config,
-        &db,
+        &writer,
         "ws-import-errors",
         &first,
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await
     .unwrap();
@@ -2244,7 +2283,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     // The same rows again are a duplicate; a bad query and a bad URL are errors.
     let again = quack_core::import::import(
         &config,
-        &db,
+        &writer,
         "ws-import-errors",
         &quack_core::import::ImportRequest {
             url: url.clone(),
@@ -2255,12 +2294,13 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(again.is_err_and(|e| e.to_string().contains("identical")));
     let bad = quack_core::import::import(
         &config,
-        &db,
+        &writer,
         "ws-import-errors",
         &quack_core::import::ImportRequest {
             url,
@@ -2271,12 +2311,13 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(bad.is_err_and(|e| e.to_string().contains("rejected the query")));
     let unsupported = quack_core::import::import(
         &config,
-        &db,
+        &writer,
         "ws-import-errors",
         &quack_core::import::ImportRequest {
             url: String::from("mysql://h/db"),
@@ -2287,6 +2328,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         quack_core::import::ImportPolicy::owner(),
         None::<&MockEmbeddingModel>,
+        None,
     )
     .await;
     assert!(unsupported.is_err());
@@ -2297,4 +2339,102 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             .unwrap()
             .contains(&String::from("Orders_Import"))
     );
+}
+
+/// Answers every batch only after `delay`, so a cancel can land while a
+/// request is in flight.
+struct SlowModel {
+    delay: std::time::Duration,
+}
+
+impl EmbeddingModel for SlowModel {
+    const MAX_DOCUMENTS: usize = 1024;
+    type Client = ();
+
+    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+        Self {
+            delay: std::time::Duration::from_secs(60),
+        }
+    }
+
+    fn ndims(&self) -> usize {
+        TEST_DIM
+    }
+
+    fn embed_texts(
+        &self,
+        texts: impl IntoIterator<Item = String> + Send,
+    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        let texts: Vec<String> = texts.into_iter().collect();
+        let delay = self.delay;
+        async move {
+            tokio::time::sleep(delay).await;
+            Ok(texts
+                .into_iter()
+                .map(|document| Embedding {
+                    document,
+                    vec: vec![0.1_f64; TEST_DIM],
+                })
+                .collect())
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-cancel";
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
+    let model = SlowModel {
+        delay: std::time::Duration::from_secs(60),
+    };
+    let cancel = quack_core::llm::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        trigger.cancel();
+    });
+    let started = std::time::Instant::now();
+    let outcome = ingestion::ingest_file(
+        &config,
+        &writer,
+        workspace_id,
+        &ingestion::NewFile::new("long.md", b"# Long\n\nSome text to embed.").cancel(Some(&cancel)),
+        Some(&model),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(quack_core::error::Error::Cancelled)),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the request in flight was abandoned, not waited out"
+    );
+    let documents = db.list_documents().unwrap();
+    let document = documents.first().unwrap();
+    assert_eq!(document.status, "error");
+    assert_eq!(document.error_message.as_deref(), Some("cancelled"));
+    let qr = db
+        .execute_query("SELECT COUNT(*) AS cnt FROM _quack_chunks")
+        .unwrap();
+    assert_eq!(
+        qr.rows.first().unwrap().first().unwrap(),
+        &serde_json::Value::Number(0.into())
+    );
+
+    // Cancelled before it starts: nothing is parsed or stored.
+    let early = quack_core::llm::CancellationToken::new();
+    early.cancel();
+    let outcome = ingestion::ingest_file(
+        &config,
+        &writer,
+        workspace_id,
+        &ingestion::NewFile::new("other.md", b"# Other").cancel(Some(&early)),
+        Some(&model),
+    )
+    .await;
+    assert!(matches!(outcome, Err(quack_core::error::Error::Cancelled)));
 }

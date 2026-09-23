@@ -20,8 +20,10 @@ use sqlx::{
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::ingestion::{self, DbHandle, IngestOutcome, NewFile};
+use crate::ingestion::{self, IngestOutcome, NewFile};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
+use crate::storage::writer::Writer;
+use tokio_util::sync::CancellationToken;
 
 /// What to import and where to put it.
 #[derive(Debug, Clone)]
@@ -172,14 +174,16 @@ fn table_name(raw: &str) -> Result<String> {
 /// # Errors
 ///
 /// Returns an error when the URL is unsupported, the source cannot be
-/// reached or queried, or the load fails.
-pub async fn import<M: EmbeddingModel, D: DbHandle>(
+/// reached or queried, or the load fails; [`Error::Cancelled`] when
+/// `cancel` fires first (a download or query in flight is abandoned).
+pub async fn import<M: EmbeddingModel>(
     config: &Config,
-    db: &D,
+    db: &Writer,
     workspace_id: &str,
     request: &ImportRequest,
     policy: ImportPolicy,
     embedding_model: Option<&M>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<ImportSummary> {
     let table = table_name(&request.table)?;
     let limit = request
@@ -197,7 +201,9 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
                 private_hosts: policy.private_hosts,
                 redirects: policy.private_hosts,
             };
-            let (filename, bytes) = fetch_http(&request.url, &table, &download).await?;
+            let (filename, bytes) =
+                ingestion::or_cancelled(cancel, fetch_http(&request.url, &table, &download))
+                    .await?;
             (filename, bytes, Vec::new(), None)
         }
         SourceKind::Sqlite if !policy.local_files => {
@@ -214,14 +220,17 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         }
         SourceKind::Postgres | SourceKind::Sqlite => {
             let sql = source_query(request)?;
-            let fetched = tokio::time::timeout(timeout, fetch_rows(&request.url, &sql, limit))
-                .await
-                .map_err(|_| {
-                    Error::Ingestion(format!(
-                        "the source did not answer within {} s",
-                        timeout.as_secs()
-                    ))
-                })??;
+            let fetch = async {
+                tokio::time::timeout(timeout, fetch_rows(&request.url, &sql, limit))
+                    .await
+                    .map_err(|_| {
+                        Error::Ingestion(format!(
+                            "the source did not answer within {} s",
+                            timeout.as_secs()
+                        ))
+                    })?
+            };
+            let fetched = ingestion::or_cancelled(cancel, fetch).await?;
             (
                 format!("{table}.csv"),
                 fetched.csv.into_bytes(),
@@ -236,7 +245,8 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         workspace_id,
         &NewFile::new(&filename, &bytes)
             .source(DocumentSource::Import)
-            .title(Some(&source)),
+            .title(Some(&source))
+            .cancel(cancel),
         embedding_model,
     )
     .await?;
@@ -254,9 +264,12 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         .first()
         .cloned()
         .ok_or_else(|| Error::Ingestion(String::from("the import produced no table")))?;
-    let (columns, rows) = match rows {
-        Some(rows) => (columns, rows),
-        None => db.with(|db| cap_loaded_table(db, &loaded, limit))?,
+    let (columns, rows) = if let Some(rows) = rows {
+        (columns, rows)
+    } else {
+        let table = loaded.clone();
+        db.run(move |db| cap_loaded_table(db, &table, limit))
+            .await?
     };
     tracing::info!(table = %loaded, rows, source = %source, "imported external data");
     Ok(ImportSummary {
@@ -770,7 +783,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
         let mut config = Config::default();
         config.general.data_dir = dir.path().to_path_buf();
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| no_workspace(&e.to_string()));
+        let db = open_writer(&config);
         let url = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nn,s\n1,a\n2,b\n3,c\n",
         )
@@ -789,6 +802,7 @@ mod tests {
             &request,
             ImportPolicy::owner(),
             None::<&crate::llm::EmbedModel>,
+            None,
         )
         .await
         .unwrap_or_else(|e| no_import(&e.to_string()));
@@ -796,7 +810,8 @@ mod tests {
         assert_eq!(summary.rows, 2);
         assert_eq!(summary.columns, vec![String::from("n"), String::from("s")]);
         let kept = db
-            .execute_query("SELECT n FROM rows ORDER BY n")
+            .run(|db| db.execute_query("SELECT n FROM rows ORDER BY n"))
+            .await
             .map(|r| r.rows.len())
             .unwrap_or_default();
         assert_eq!(kept, 2);
@@ -813,8 +828,10 @@ mod tests {
     }
 
     #[expect(clippy::panic, reason = "test helper: the workspace must open")]
-    fn no_workspace(msg: &str) -> WorkspaceDb {
-        panic!("cannot open the workspace: {msg}")
+    fn open_writer(config: &Config) -> Writer {
+        WorkspaceDb::open(config, "ws")
+            .and_then(Writer::spawn)
+            .unwrap_or_else(|e| panic!("cannot open the workspace: {e}"))
     }
 
     #[expect(clippy::panic, reason = "test asserts Ok")]
@@ -837,7 +854,7 @@ mod tests {
         let link = dir.path().join("elsewhere.db");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&control, &link).unwrap_or_else(|e| no_file(&e.to_string()));
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| no_workspace(&e.to_string()));
+        let db = open_writer(&config);
         let control = control.display();
         let mut urls = vec![
             format!("sqlite:{control}"),
@@ -862,6 +879,7 @@ mod tests {
                 &request,
                 ImportPolicy::owner(),
                 None::<&crate::llm::EmbedModel>,
+                None,
             )
             .await
             .err()

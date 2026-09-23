@@ -247,10 +247,58 @@ fn jobs_indicator(app: &App) -> String {
     }
 }
 
-pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+/// A message's rendered lines and the fingerprint they were rendered from.
+pub(crate) type WrappedMessage = (u64, Vec<Line<'static>>);
 
-    for msg in &app.messages {
+/// Every message's lines, wrapped to `width`. Each message's lines are
+/// cached on the app by a fingerprint of what it shows, so a redraw
+/// re-renders only the messages that changed (the one streaming, as a
+/// rule), not the Markdown and wrapping of the whole transcript.
+pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut cache = app.wrap_cache.borrow_mut();
+    // Messages are appended, edited in place, or cleared; never removed
+    // from the middle, so the cache stays aligned by index.
+    cache.truncate(app.messages.len());
+    cache.resize(app.messages.len(), None);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (msg, slot) in app.messages.iter().zip(cache.iter_mut()) {
+        let key = fingerprint(msg, width, app.expand_steps);
+        match slot {
+            Some((cached, rendered)) if *cached == key => lines.extend(rendered.iter().cloned()),
+            _ => {
+                let rendered = message_lines(msg, width, app.expand_steps);
+                lines.extend(rendered.iter().cloned());
+                *slot = Some((key, rendered));
+            }
+        }
+    }
+    lines
+}
+
+/// What decides a message's rendering.
+fn fingerprint(msg: &crate::terminal::app::Message, width: usize, expand: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    msg.role.hash(&mut hasher);
+    msg.content.hash(&mut hasher);
+    msg.detail.hash(&mut hasher);
+    msg.chart
+        .as_ref()
+        .map(|c| c.title.as_str())
+        .hash(&mut hasher);
+    width.hash(&mut hasher);
+    (expand && msg.role == MessageRole::Step).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// One message's lines, wrapped to `width`, with the blank line after it.
+fn message_lines(
+    msg: &crate::terminal::app::Message,
+    width: usize,
+    expand_steps: bool,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    {
         let (prefix, style) = match msg.role {
             MessageRole::User => (" > ", Style::default().fg(Color::Cyan)),
             MessageRole::Assistant => ("   ", Style::default()),
@@ -268,7 +316,7 @@ pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
         };
         let body: Vec<Vec<Span<'static>>> = match msg.role {
             MessageRole::Assistant => markdown::render(&msg.content),
-            MessageRole::Step => step_body(msg, app.expand_steps, style),
+            MessageRole::Step => step_body(msg, expand_steps, style),
             _ => msg
                 .content
                 .lines()

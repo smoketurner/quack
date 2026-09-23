@@ -23,6 +23,7 @@ use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
 use crate::graph::extract as graph_extract;
 use crate::ontology::{Ontology, documents};
+use crate::priority::{Priority, with_priority};
 use crate::storage::{context, sessions};
 pub use tokio_util::sync::CancellationToken;
 
@@ -469,8 +470,8 @@ fn cosine(a: &[f64], b: &[f64]) -> f64 {
 ///
 /// Returns an error when the provider call fails.
 pub async fn embed_query(model: &EmbedModel, text: &str) -> Result<Vec<f32>> {
-    let embedding = model
-        .embed_text(text)
+    // A query embedding is a lookup someone is waiting on.
+    let embedding = with_priority(Priority::Interactive, model.embed_text(text))
         .await
         .map_err(|e| Error::Embedding(e.to_string()))?;
     #[expect(clippy::cast_possible_truncation, reason = "stored vectors are f32")]
@@ -768,25 +769,32 @@ pub async fn run_turn(
     // is keyword-only and graph entry is exact (issue #58).
     let embedding_model = optional_embedding_model(config).await?;
 
+    // On the blocking pool, in the writer's interactive line: an async
+    // worker never waits on the connection.
     let (prompt, history) = {
-        let guard = db
-            .lock()
-            .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
-        let session = sessions::get_session(&guard, session_id)?
-            .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
-        let prompt = PromptOptions {
-            mode: session.mode,
-            write_policy: policy,
-            pinned_token_budget: config.retrieval.pinned_token_budget,
-            context: context::combined(&guard)?,
-            context_max_tokens: config.context.max_tokens,
-            ollama_context_cap: (chat.provider.provider_type == ProviderType::Ollama)
-                .then_some(config.analysis.max_context_tokens),
-        };
-        (
-            prompt,
-            sessions::history_for_model(&guard, session_id, config.analysis.history_token_budget)?,
-        )
+        let session_id = session_id.to_owned();
+        let pinned_token_budget = config.retrieval.pinned_token_budget;
+        let context_max_tokens = config.context.max_tokens;
+        let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
+            .then_some(config.analysis.max_context_tokens);
+        let history_budget = config.analysis.history_token_budget;
+        crate::analysis::tools::with_db(&db, move |guard| {
+            let session = sessions::get_session(guard, &session_id)?
+                .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
+            let prompt = PromptOptions {
+                mode: session.mode,
+                write_policy: policy,
+                pinned_token_budget,
+                context: context::combined(guard)?,
+                context_max_tokens,
+                ollama_context_cap,
+            };
+            Ok((
+                prompt,
+                sessions::history_for_model(guard, &session_id, history_budget)?,
+            ))
+        })
+        .await?
     };
 
     tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
@@ -811,17 +819,22 @@ pub async fn run_turn(
             }
         }
     });
-    let turn = dispatch(
-        config,
-        Arc::clone(&db),
-        reader_db,
-        chat,
-        embedding_model,
-        policy,
-        prompt,
-        history,
-        message,
-        inner_sink,
+    // Someone is watching this turn: its model calls, and the tools' calls
+    // inside it, go ahead of background work at the provider (design 4.1).
+    let turn = with_priority(
+        Priority::Interactive,
+        dispatch(
+            config,
+            Arc::clone(&db),
+            reader_db,
+            chat,
+            embedding_model,
+            policy,
+            prompt,
+            history,
+            message,
+            inner_sink,
+        ),
     );
     let outcome = tokio::select! {
         biased;
@@ -849,10 +862,11 @@ pub async fn run_turn(
         response
     };
 
-    let guard = db
-        .lock()
-        .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
-    sessions::record_turn(&guard, session_id, message, &response)?;
+    let (session, text, recorded) = (session_id.to_owned(), message.to_owned(), response.clone());
+    crate::analysis::tools::with_db(&db, move |guard| {
+        sessions::record_turn(guard, &session, &text, &recorded)
+    })
+    .await?;
     Ok(response)
 }
 
@@ -1082,7 +1096,9 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "o/m", sessions::ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Mutex::new(db));
+        let db: SharedDb = Arc::new(
+            crate::storage::writer::Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())),
+        );
         let reader_db =
             crate::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let (sink, mut events) = events::channel();
@@ -1107,9 +1123,11 @@ mod tests {
             matches!(&last, Some(AgentEvent::TurnComplete(r)) if r.cancelled),
             "{last:?}"
         );
-        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-        let messages =
-            sessions::messages(&guard, &session.id).unwrap_or_else(|e| fail(&e.to_string()));
+        let id = session.id.clone();
+        let messages = db
+            .run(move |guard| sessions::messages(guard, &id))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
         let roles: Vec<sessions::MessageRole> = messages.iter().map(|m| m.role).collect();
         assert_eq!(
             roles,

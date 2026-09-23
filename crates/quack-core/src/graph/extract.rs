@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use super::Drift;
 use super::store::{self, NewNode, Source};
 use crate::error::{Error, Result};
-use crate::ingestion::DbHandle;
 use crate::ontology::{self, Ontology};
 use crate::progress::{ChunkDone, Progress};
 use crate::storage::workspace::WorkspaceDb;
+use crate::storage::writer::Writer;
 
 /// What the model returns for one chunk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -301,7 +301,7 @@ const MODEL_CONFIDENCE: f64 = 0.8;
 ///
 /// Returns an error when every chunk fails or a write fails.
 pub async fn run(
-    db: &impl DbHandle,
+    db: &Writer,
     chunks: Vec<ChunkText>,
     extractor: &dyn GraphExtractor,
     ontology: &Ontology,
@@ -352,18 +352,25 @@ pub async fn run(
             .invalid_edges
             .saturating_add(validated.invalid_edges);
         summary.drift.absorb(&validated.drift);
-        let (nodes, edges) = db.with(|db| {
-            db.under_timeout(|db| {
-                let counts = store_validated(
-                    db,
-                    &validated,
-                    &Source::chunk(&chunk.document_id, &chunk.chunk_id, MODEL_CONFIDENCE),
-                    provisional,
-                )?;
-                store::record_extracted(db, &chunk.chunk_id, ontology.version, counts)?;
-                Ok(counts)
+        let (document_id, chunk_id, version) = (
+            chunk.document_id.clone(),
+            chunk.chunk_id.clone(),
+            ontology.version,
+        );
+        let (nodes, edges) = db
+            .run(move |db| {
+                db.under_timeout(|db| {
+                    let counts = store_validated(
+                        db,
+                        &validated,
+                        &Source::chunk(&document_id, &chunk_id, MODEL_CONFIDENCE),
+                        provisional,
+                    )?;
+                    store::record_extracted(db, &chunk_id, version, counts)?;
+                    Ok(counts)
+                })
             })
-        })?;
+            .await?;
         if nodes == 0 && edges == 0 {
             tracing::debug!(chunk = %chunk.chunk_id, "graph extraction kept nothing from this chunk");
         }
@@ -377,7 +384,9 @@ pub async fn run(
             "every chunk failed extraction; check the model and provider",
         )));
     }
-    db.with(|db| store::record_drift(db, &summary.drift, false))?;
+    let drift = summary.drift.clone();
+    db.run(move |db| store::record_drift(db, &drift, false))
+        .await?;
     Ok(summary)
 }
 

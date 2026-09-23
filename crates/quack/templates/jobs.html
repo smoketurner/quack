@@ -3,7 +3,7 @@
 {% if let Some(ws) = page.workspace %}
 <h1 class="text-xl font-semibold">Jobs</h1>
 <p class="mt-2 text-sm text-slate-600">Uploads, graph extraction, ontology proposals, and questions run in the background. Questions in one session are answered in order, and each model provider serves as many requests at once as its configuration allows. This list follows them as they run.</p>
-<div id="rows" class="mt-6" hx-get="/w/{{ ws.id }}/jobs/rows" hx-trigger="every 2s [document.querySelector('#rows [data-pending]')]" hx-swap="innerHTML">
+<div id="rows" class="mt-6" hx-get="/w/{{ ws.id }}/jobs/rows" hx-trigger="jobs-changed from:body" hx-swap="innerHTML" data-jobs-stream="/api/v1/workspaces/{{ ws.id }}/jobs/stream">
 {{ rows|safe }}
 </div>
 {% endif %}

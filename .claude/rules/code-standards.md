@@ -69,7 +69,9 @@ and code — this file is the gate, the doc is the detail.
       confinement sequence, and produce two independent `DatabaseInstance`s that cannot
       see each other's commits and silently overwrite each other's writes. In-process
       single-open is therefore ours to enforce — in the server, the per-workspace
-      `OnceCell` in `AppState::workspace_handle`. A reader clone never calls `confine_to`
+      `OnceCell` in `AppState::workspace_handle`. The opened connection then moves onto
+      its workspace's writer thread (`storage::writer::Writer::spawn`) and is reached only
+      by closures sent there; reader clones are made on that thread. A reader clone never calls `confine_to`
       or `apply_resource_limits`
       again (both `SET`s fail once configuration is locked), and every statement it runs
       goes through `WorkspaceDb::read_only`, scoped to that one piece of work.

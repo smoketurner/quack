@@ -16,6 +16,19 @@ use quack_core::llm;
 
 use super::state::App;
 
+/// Uploads a workspace may have queued or processing before another is
+/// turned away with 503 and `Retry-After` (each holds its file's bytes in
+/// memory until it runs).
+pub(crate) const MAX_WAITING_UPLOADS: usize = 64;
+
+/// How long a turned-away uploader is told to wait.
+pub(crate) const UPLOAD_RETRY_SECONDS: u32 = 30;
+
+/// The workspace's upload lane key.
+pub(crate) fn upload_lane(workspace_id: &str) -> String {
+    format!("ingest:{workspace_id}")
+}
+
 pub(crate) struct UploadJob {
     pub document_id: String,
     pub filename: String,
@@ -36,37 +49,34 @@ pub(crate) fn submit_upload(
         .workspace(workspace_id)
         .owner(owner)
         .lane(Lane::new(
-            format!("ingest:{workspace_id}"),
+            upload_lane(workspace_id),
             app.config.server.workers_per_workspace,
         ));
     let config = app.config.clone();
     let workspace = workspace_id.to_owned();
     let document_id = job.document_id.clone();
     let worker_db = Arc::clone(&db);
-    let id = app.jobs.submit(spec, move |_| async move {
-        let handle = tokio::runtime::Handle::current();
-        let document_id = job.document_id.clone();
-        // Parsing and DuckDB writes are blocking work; the embedding calls
-        // inside need the runtime, so block on it from a blocking thread.
-        let outcome = tokio::task::spawn_blocking({
-            let db = Arc::clone(&worker_db);
-            move || handle.block_on(process(&config, &workspace, &db, job))
-        })
-        .await;
-        match outcome {
-            Ok(result) => result,
-            Err(e) => {
-                // The task died before `process` could record an outcome;
-                // the document must not stay `processing` forever.
-                tracing::error!(error = %e, document = %document_id, "upload worker task failed");
-                let message = "the ingestion worker failed before finishing this file";
-                mark_error(&worker_db, &document_id, message);
-                Err(String::from(message))
-            }
-        }
+    let id = app.jobs.submit(spec, move |ctx| async move {
+        let cancel = ctx.cancel_token();
+        process(&config, &workspace, &worker_db, job, &cancel).await
     });
-    when_cancelled_unstarted(&app.jobs, id, move || async move {
-        mark_error(&db, &document_id, "cancelled before processing started");
+    // The work records its own outcome; a job that ends without running it
+    // (cancelled while queued) or that died mid-way (a panic) must not
+    // leave the document `queued` or `processing` forever.
+    let jobs = app.jobs.clone();
+    tokio::spawn(async move {
+        let Some(ended) = jobs.wait(id).await else {
+            return;
+        };
+        let message = match ended.state {
+            JobState::Cancelled if ended.started_at.is_none() => {
+                "cancelled before processing started"
+            }
+            JobState::Cancelled => "cancelled",
+            JobState::Failed => "the ingestion worker failed before finishing this file",
+            _ => return,
+        };
+        mark_unfinished(&db, &document_id, message).await;
     });
     id
 }
@@ -90,12 +100,20 @@ where
     });
 }
 
-async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: UploadJob) -> JobResult {
+/// Process the upload; a cancel stops it between steps or mid-embedding and
+/// leaves the document `error: cancelled`.
+async fn process(
+    config: &Config,
+    workspace_id: &str,
+    db: &SharedDb,
+    job: UploadJob,
+    cancel: &llm::CancellationToken,
+) -> JobResult {
     let model = match llm::optional_embedding_model(config).await {
         Ok(model) => model,
         Err(e) => {
             tracing::warn!(error = %e, document = %job.document_id, "upload fails: no embedding model");
-            mark_error(db, &job.document_id, &e.to_string());
+            mark_error(db, &job.document_id, &e.to_string()).await;
             return Err(e.to_string());
         }
     };
@@ -107,6 +125,7 @@ async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: Upload
         &job.filename,
         &job.data,
         model.as_ref(),
+        Some(cancel),
     )
     .await;
     match result {
@@ -126,15 +145,35 @@ async fn process(config: &Config, workspace_id: &str, db: &SharedDb, job: Upload
 
 /// Record `message` as the document's error, so a client polling it sees
 /// `error` rather than `processing` without end.
-fn mark_error(db: &SharedDb, document_id: &str, message: &str) {
-    match db.lock() {
-        Ok(guard) => {
-            if let Err(mark) = guard.mark_document_error(document_id, message) {
-                tracing::error!(error = %mark, document = %document_id, "could not record the upload failure");
+async fn mark_error(db: &SharedDb, document_id: &str, message: &str) {
+    let (id, text) = (document_id.to_owned(), message.to_owned());
+    if let Err(mark) = db.run(move |db| db.mark_document_error(&id, &text)).await {
+        tracing::error!(error = %mark, document = %document_id, "could not record the upload failure");
+    }
+}
+
+/// [`mark_error`] for a document the work left `queued` or `processing`;
+/// one it finished (ready, or failed with its own message) is left alone.
+async fn mark_unfinished(db: &SharedDb, document_id: &str, message: &str) {
+    let (id, text) = (document_id.to_owned(), message.to_owned());
+    let marked = db
+        .run(move |db| {
+            let unfinished = db
+                .document(&id)?
+                .is_some_and(|doc| matches!(doc.status.as_str(), "queued" | "processing"));
+            if unfinished {
+                db.mark_document_error(&id, &text)?;
             }
+            Ok(unfinished)
+        })
+        .await;
+    match marked {
+        Ok(true) => {
+            tracing::warn!(document = %document_id, reason = message, "upload ended unfinished");
         }
-        Err(poisoned) => {
-            tracing::error!(error = %poisoned, document = %document_id, "workspace lock poisoned; upload failure not recorded");
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = %e, document = %document_id, "could not record the upload failure");
         }
     }
 }

@@ -33,6 +33,8 @@ use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::priority::{Priority, with_priority};
+
 /// Snapshots the broadcast channel holds for a slow subscriber before it
 /// lags; a lagged subscriber resynchronizes from [`JobQueue::list`].
 const EVENT_CAPACITY: usize = 256;
@@ -97,6 +99,21 @@ impl JobKind {
             Self::Ontology => "ontology",
             Self::Graph => "graph",
             Self::Export => "export",
+        }
+    }
+}
+
+impl JobKind {
+    /// The priority its model requests and workspace writes run at: work
+    /// someone is watching (a turn, a statement) is interactive, the rest
+    /// background (design doc 4.1).
+    #[must_use]
+    pub const fn priority(self) -> Priority {
+        match self {
+            Self::Chat | Self::Sql => Priority::Interactive,
+            Self::Ingest | Self::Import | Self::Ontology | Self::Graph | Self::Export => {
+                Priority::Background
+            }
         }
     }
 }
@@ -517,6 +534,7 @@ impl JobQueue {
         Fut: Future<Output = JobResult> + Send + 'static,
     {
         let id = JobId::new();
+        let kind = spec.kind;
         let cancel = CancellationToken::new();
         let snapshot = {
             let mut registry = self.inner.registry();
@@ -559,7 +577,7 @@ impl JobQueue {
                 cancel: cancel.clone(),
                 inner: Arc::clone(&inner),
             };
-            run(&inner, ticket, ctx, work).await;
+            run(&inner, ticket, ctx, kind, work).await;
         });
         id
     }
@@ -664,14 +682,19 @@ impl JobQueue {
 /// Wait for the lane, run the work, and record its end. The end is recorded
 /// while the lane slot is still held, so the next job in the lane never
 /// starts before its predecessor reads as finished.
-async fn run<F, Fut>(inner: &Arc<Inner>, lane: Option<LaneTicket>, ctx: JobContext, work: F)
-where
+async fn run<F, Fut>(
+    inner: &Arc<Inner>,
+    lane: Option<LaneTicket>,
+    ctx: JobContext,
+    kind: JobKind,
+    work: F,
+) where
     F: FnOnce(JobContext) -> Fut + Send + 'static,
     Fut: Future<Output = JobResult> + Send + 'static,
 {
     let id = ctx.id;
     // The lane slot lives in `_held` until the end is recorded.
-    let (state, outcome, _held) = run_held(inner, lane, ctx, work).await;
+    let (state, outcome, _held) = run_held(inner, lane, ctx, kind, work).await;
     inner.finish(id, state, outcome);
 }
 
@@ -682,6 +705,7 @@ async fn run_held<F, Fut>(
     inner: &Arc<Inner>,
     lane: Option<LaneTicket>,
     ctx: JobContext,
+    kind: JobKind,
     work: F,
 ) -> (JobState, Option<String>, Held)
 where
@@ -715,8 +739,9 @@ where
         info.state = JobState::Running;
         info.started_at = Some(Timestamp::now());
     });
-    // Its own task, so a panic in the work surfaces as a join error here.
-    let outcome = tokio::spawn(work(ctx)).await;
+    // Its own task, so a panic in the work surfaces as a join error here,
+    // at its kind's priority.
+    let outcome = tokio::spawn(with_priority(kind.priority(), work(ctx))).await;
     let (state, text) = match outcome {
         Ok(Ok(summary)) => (JobState::Succeeded, Some(summary)),
         Ok(Err(_)) if cancel.is_cancelled() => {

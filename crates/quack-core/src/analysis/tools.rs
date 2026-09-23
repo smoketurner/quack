@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::storage::workspace::{
     ChunkScope, ChunkSearchResult, StatementKind, WorkspaceDb, quote_ident,
 };
+use crate::storage::writer::Writer;
 
 use super::chart::{self, ChartSpec};
 use super::events::TurnRecorder;
@@ -21,14 +22,27 @@ use crate::error::Error;
 use crate::ontology::store as ontology_store;
 use crate::ontology::{self, Ontology};
 
-pub type SharedDb = Arc<Mutex<WorkspaceDb>>;
+/// A workspace's writer: its one write connection, on a thread of its own
+/// with a two-tier line of work ([`crate::storage::writer`]).
+pub type SharedDb = Arc<Writer>;
+
+/// One reader connection of a pool: a `try_clone_reader` clone of the
+/// writer, used by one read at a time.
+type ReaderConn = Arc<Mutex<WorkspaceDb>>;
+
+/// Where one read runs.
+enum Slot<'a> {
+    Reader(&'a ReaderConn),
+    /// The writer, when the pool is degraded or has no readers.
+    Writer(&'a SharedDb),
+}
 
 /// Shared state behind every clone of one workspace handle's `ReaderDb`.
 struct ReaderPool {
     /// A small fixed pool of reader clones, round-robined so concurrent
     /// reads run in parallel instead of queuing behind each other on one
     /// shared connection.
-    readers: Vec<SharedDb>,
+    readers: Vec<ReaderConn>,
     next: AtomicUsize,
     writer: SharedDb,
     /// Set once a write is observed to have created a temp object on the
@@ -55,10 +69,10 @@ impl ReaderDb {
     /// [`open_reader`] returns when a clone would not serve.
     #[must_use]
     pub fn new(db: SharedDb) -> Self {
-        Self::from_pool(vec![Arc::clone(&db)], db)
+        Self::from_pool(Vec::new(), db)
     }
 
-    fn from_pool(readers: Vec<SharedDb>, writer: SharedDb) -> Self {
+    fn from_pool(readers: Vec<ReaderConn>, writer: SharedDb) -> Self {
         Self(Arc::new(ReaderPool {
             readers,
             next: AtomicUsize::new(0),
@@ -76,11 +90,11 @@ impl ReaderDb {
     /// probe is best-effort: another task can take the chosen slot before
     /// the caller actually locks it, which only costs that caller the
     /// same wait a busy slot would have anyway.
-    fn pick(&self) -> &SharedDb {
-        if self.0.degraded.load(Ordering::Relaxed) {
-            return &self.0.writer;
-        }
+    fn pick(&self) -> Slot<'_> {
         let len = self.0.readers.len();
+        if self.0.degraded.load(Ordering::Relaxed) || len == 0 {
+            return Slot::Writer(&self.0.writer);
+        }
         let start = self.0.next.fetch_add(1, Ordering::Relaxed);
         for offset in 0..len {
             let i = start.wrapping_add(offset).checked_rem(len).unwrap_or(0);
@@ -89,19 +103,14 @@ impl ReaderDb {
             };
             if let Ok(guard) = candidate.try_lock() {
                 drop(guard);
-                return candidate;
+                return Slot::Reader(candidate);
             }
         }
         let i = start.checked_rem(len).unwrap_or(0);
-        self.0.readers.get(i).unwrap_or(&self.0.writer)
-    }
-
-    /// A handle to classify a statement against (`gate_statement`) rather
-    /// than execute it: classification is a pure parse, so any connection
-    /// works, and picking a pool slot instead of the writer avoids taking
-    /// the writer's mutex for a read-only tool's classification.
-    pub(crate) fn classify_on(&self) -> &SharedDb {
-        self.pick()
+        self.0
+            .readers
+            .get(i)
+            .map_or(Slot::Writer(&self.0.writer), Slot::Reader)
     }
 
     /// Run `f` against the locked workspace handle on the blocking pool,
@@ -118,7 +127,20 @@ impl ReaderDb {
     where
         T: Send + 'static,
     {
-        with_db(self.pick(), move |db| db.read_only(f)).await
+        match self.pick() {
+            Slot::Writer(writer) => writer.run(move |db| db.read_only(f)).await,
+            Slot::Reader(conn) => {
+                let conn = Arc::clone(conn);
+                tokio::task::spawn_blocking(move || {
+                    let guard = conn
+                        .lock()
+                        .map_err(|e| Error::Analysis(format!("reader lock poisoned: {e}")))?;
+                    guard.read_only(f)
+                })
+                .await
+                .map_err(|e| Error::Analysis(format!("database task failed: {e}")))?
+            }
+        }
     }
 
     /// Check the writer for a temp object created since this handle was
@@ -177,16 +199,16 @@ pub async fn open_reader(shared_db: &SharedDb, pool_size: u32) -> ReaderDb {
     if has_temp_tables {
         return ReaderDb::new(Arc::clone(shared_db));
     }
-    let readers = clones
+    let readers: Vec<ReaderConn> = clones
         .into_iter()
-        .map(|clone| match clone {
-            Ok(db) => Arc::new(Mutex::new(db)),
+        .filter_map(|clone| match clone {
+            Ok(db) => Some(Arc::new(Mutex::new(db))),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "failed to clone a reader connection; this slot will share the writer"
+                    "failed to clone a reader connection; the pool is one smaller"
                 );
-                Arc::clone(shared_db)
+                None
             }
         })
         .collect();
@@ -223,15 +245,14 @@ fn tool_error(e: crate::error::Error) -> ToolError {
     }
 }
 
-/// Run `f` against the locked workspace handle on the blocking pool, so a
-/// `DuckDB` call never blocks an async worker. Every tool that queries the
-/// writer directly (`run_sql`, and `gate_statement`'s classification) calls
-/// this; every tool that only reads goes through [`ReaderDb::with_db`]
-/// instead, which wraps this same helper in [`WorkspaceDb::read_only`].
+/// Run `f` on the workspace's writer and await it (at the calling task's
+/// priority); no async worker waits on the connection. `run_sql` writes
+/// through this; every tool that only reads goes through
+/// [`ReaderDb::with_db`] instead.
 ///
 /// # Errors
 ///
-/// Returns `f`'s error, or an error if the blocking task itself panics.
+/// Returns `f`'s error, or the writer's (a panic in `f`, a stopped writer).
 pub(crate) async fn with_db<T>(
     db: &SharedDb,
     f: impl FnOnce(&WorkspaceDb) -> crate::error::Result<T> + Send + 'static,
@@ -239,15 +260,7 @@ pub(crate) async fn with_db<T>(
 where
     T: Send + 'static,
 {
-    let db = Arc::clone(db);
-    tokio::task::spawn_blocking(move || {
-        let guard = db
-            .lock()
-            .map_err(|e| Error::Analysis(format!("mutex poisoned: {e}")))?;
-        f(&guard)
-    })
-    .await
-    .map_err(|e| Error::Analysis(format!("database task failed: {e}")))?
+    db.run(f).await
 }
 
 /// Prefix of a `run_sql` or `describe_table` result that carries a `DuckDB`
@@ -307,21 +320,23 @@ pub fn creates_temp_object(sql: &str) -> bool {
 /// Classify a statement and apply the write policy. Takes and releases the
 /// database lock itself so a permission prompt never holds it.
 async fn gate_statement(
-    db: &SharedDb,
+    db: &ReaderDb,
     sql: &str,
     policy: WritePolicy,
     refused: &RefusalFlag,
     recorder: &TurnRecorder,
 ) -> Result<Gate, ToolError> {
+    // Classification is a parse: a reader serves, never the writer's line.
     let sql_owned = sql.to_owned();
-    let kind = with_db(db, move |db| {
-        if db.references_internal_table(&sql_owned)? {
-            return Ok(None);
-        }
-        db.classify_statement(&sql_owned).map(Some)
-    })
-    .await
-    .map_err(tool_error)?;
+    let kind = db
+        .with_db(move |db| {
+            if db.references_internal_table(&sql_owned)? {
+                return Ok(None);
+            }
+            db.classify_statement(&sql_owned).map(Some)
+        })
+        .await
+        .map_err(tool_error)?;
     let Some(kind) = kind else {
         return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
     };
@@ -373,6 +388,7 @@ pub struct RunSqlTool {
 }
 
 impl RunSqlTool {
+    #[must_use]
     pub fn new(
         db: SharedDb,
         reader_db: ReaderDb,
@@ -457,7 +473,7 @@ impl Tool for RunSqlTool {
     ) -> Result<Self::Output, Self::Error> {
         let step = self.recorder.start(Self::NAME, args.query.trim());
         match gate_statement(
-            &self.db,
+            &self.reader_db,
             &args.query,
             self.policy,
             &self.refused,
@@ -1172,7 +1188,7 @@ impl Tool for CreateChartTool {
         let step = self.recorder.start(Self::NAME, args.sql.trim());
         // Charts are read-only: never prompt, never write.
         if let Gate::Reject(message) = gate_statement(
-            self.db.classify_on(),
+            &self.db,
             &args.sql,
             WritePolicy::Deny,
             &RefusalFlag::default(),
@@ -1338,23 +1354,20 @@ mod tests {
     }
 
     /// Two chunks about hail, the denser one second, for the search tests.
-    fn seed_hail_chunks(db: &SharedDb) {
+    async fn seed_hail_chunks(db: &SharedDb) {
         use crate::storage::workspace::{NewChunk, NewDocument};
-        let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
-        guard
-            .insert_document(
+        db.run(|guard| {
+            guard.insert_document(
                 &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
-            )
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        for (i, text) in [
-            "Hail fell on Denver.",
-            "Hail and hail again in Denver county.",
-        ]
-        .iter()
-        .enumerate()
-        {
-            guard
-                .insert_chunk(&NewChunk {
+            )?;
+            for (i, text) in [
+                "Hail fell on Denver.",
+                "Hail and hail again in Denver county.",
+            ]
+            .iter()
+            .enumerate()
+            {
+                guard.insert_chunk(&NewChunk {
                     id: &format!("c{i}"),
                     document_id: "d",
                     chunk_index: u32::try_from(i).unwrap_or(0),
@@ -1362,9 +1375,12 @@ mod tests {
                     heading: None,
                     page: None,
                     embedding: None,
-                })
-                .unwrap_or_else(|e| fail_test(&e.to_string()));
-        }
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
     }
 
     #[test]
@@ -1698,9 +1714,12 @@ mod tests {
     }
 
     fn shared_db() -> SharedDb {
-        Arc::new(Mutex::new(
-            WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| unreachable_db(&e.to_string())),
-        ))
+        Arc::new(
+            Writer::spawn(
+                WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| unreachable_db(&e.to_string())),
+            )
+            .unwrap_or_else(|e| fail_test(&e.to_string())),
+        )
     }
 
     #[expect(clippy::panic, reason = "test helper: in-memory DuckDB must open")]
@@ -1715,15 +1734,22 @@ mod tests {
         let db = shared_db();
         let refused = RefusalFlag::default();
         assert!(matches!(
-            gate_statement(&db, "SELECT 1", WritePolicy::Deny, &refused, &recorder).await,
+            gate_statement(
+                &ReaderDb::new(Arc::clone(&db)),
+                "SELECT 1",
+                WritePolicy::Deny,
+                &refused,
+                &recorder
+            )
+            .await,
             Ok(Gate::Run(StatementKind::Read))
         ));
         assert!(matches!(
-            gate_statement(&db, "SELECT * FROM _quack_chunks", WritePolicy::Allow, &refused, &recorder).await,
+            gate_statement(&ReaderDb::new(Arc::clone(&db)), "SELECT * FROM _quack_chunks", WritePolicy::Allow, &refused, &recorder).await,
             Ok(Gate::Reject(m)) if m == INTERNAL_TABLE_REFUSED
         ));
         assert!(matches!(
-            gate_statement(&db, "SELEC 1", WritePolicy::Allow, &refused, &recorder).await,
+            gate_statement(&ReaderDb::new(Arc::clone(&db)), "SELEC 1", WritePolicy::Allow, &refused, &recorder).await,
             Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
         ));
         assert!(!refused.was_refused());
@@ -1865,7 +1891,7 @@ mod tests {
         let refused = RefusalFlag::default();
         assert!(matches!(
             gate_statement(
-                &db,
+                &ReaderDb::new(Arc::clone(&db)),
                 "CREATE TEMP TABLE t AS SELECT 1",
                 WritePolicy::Allow,
                 &refused,
@@ -1896,7 +1922,7 @@ mod tests {
             }
         }
         let db = shared_db();
-        seed_hail_chunks(&db);
+        seed_hail_chunks(&db).await;
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
@@ -1985,27 +2011,25 @@ mod tests {
     #[tokio::test]
     async fn search_documents_top_k_is_capped_regardless_of_what_the_model_asks_for() {
         let db = shared_db();
-        {
-            let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
-            guard
-                .insert_document(
-                    &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
-                )
-                .unwrap_or_else(|e| fail_test(&e.to_string()));
+        db.run(|guard| {
+            guard.insert_document(
+                &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
+            )?;
             for i in 0..(MAX_SEARCH_TOP_K * 2) {
-                guard
-                    .insert_chunk(&crate::storage::workspace::NewChunk {
-                        id: &format!("c{i}"),
-                        document_id: "d",
-                        chunk_index: i,
-                        content: &format!("Hail fell in county {i}."),
-                        heading: None,
-                        page: None,
-                        embedding: None,
-                    })
-                    .unwrap_or_else(|e| fail_test(&e.to_string()));
+                guard.insert_chunk(&crate::storage::workspace::NewChunk {
+                    id: &format!("c{i}"),
+                    document_id: "d",
+                    chunk_index: i,
+                    content: &format!("Hail fell in county {i}."),
+                    heading: None,
+                    page: None,
+                    embedding: None,
+                })?;
             }
-        }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
@@ -2131,14 +2155,11 @@ mod tests {
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
-        {
-            let guard = db.lock().unwrap_or_else(|e| fail_test(&e.to_string()));
-            assert!(
-                guard
-                    .execute_statement("CREATE TABLE trips(trip_distance DOUBLE)")
-                    .is_ok()
-            );
-        }
+        assert!(
+            db.run(|guard| guard.execute_statement("CREATE TABLE trips(trip_distance DOUBLE)"))
+                .await
+                .is_ok()
+        );
         let tool = RunSqlTool::new(
             Arc::clone(&db),
             ReaderDb::new(Arc::clone(&db)),
@@ -2205,7 +2226,7 @@ mod tests {
         let refused = RefusalFlag::default();
         assert!(matches!(
             gate_statement(
-                &db,
+                &ReaderDb::new(Arc::clone(&db)),
                 "CREATE TABLE t(a INT)",
                 WritePolicy::Allow,
                 &refused,
@@ -2216,7 +2237,7 @@ mod tests {
         ));
         assert!(!refused.was_refused());
         assert!(matches!(
-            gate_statement(&db, "DROP TABLE t", WritePolicy::Deny, &refused, &recorder).await,
+            gate_statement(&ReaderDb::new(Arc::clone(&db)), "DROP TABLE t", WritePolicy::Deny, &refused, &recorder).await,
             Ok(Gate::Reject(m)) if m == WRITE_REFUSED
         ));
         assert!(refused.was_refused());
@@ -2237,8 +2258,14 @@ mod tests {
             let refused = refused.clone();
             async move {
                 matches!(
-                    gate_statement(&db, "DELETE FROM t", WritePolicy::Ask, &refused, &recorder)
-                        .await,
+                    gate_statement(
+                        &ReaderDb::new(Arc::clone(&db)),
+                        "DELETE FROM t",
+                        WritePolicy::Ask,
+                        &refused,
+                        &recorder
+                    )
+                    .await,
                     Ok(Gate::Run(StatementKind::Write))
                 )
             }

@@ -1,6 +1,7 @@
 //! What every handler shares: the config, the control plane, one open
 //! `DuckDB` handle per workspace, the browser sessions, and the work queue.
 
+use quack_core::storage::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -179,7 +180,9 @@ impl AppState {
             })
             .await
             .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
-            let writer: SharedDb = Arc::new(Mutex::new(db));
+            let writer: SharedDb = Arc::new(
+                Writer::spawn(db).map_err(|e| ApiError::internal(e.to_string()))?,
+            );
             let reader = open_reader(&writer, pool_size).await;
             Ok(WorkspaceHandle { writer, reader })
         })
@@ -270,20 +273,12 @@ fn aws_lc_rs_fill(bytes: &mut [u8]) -> ApiResult<()> {
     random_bytes(bytes).map_err(|e| ApiError::internal(e.to_string()))
 }
 
-/// Run a closure against the workspace handle on the blocking pool, so a
-/// slow query never stalls the runtime.
+/// Run a closure on the workspace's writer, at the calling task's priority,
+/// and await it: no runtime worker ever waits on the connection.
 pub(crate) async fn with_db<T, F>(db: SharedDb, f: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        let guard = db
-            .lock()
-            .map_err(|e| quack_core::error::Error::Analysis(format!("mutex poisoned: {e}")))?;
-        f(&guard)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("database task failed: {e}")))?
-    .map_err(ApiError::from)
+    db.run(f).await.map_err(ApiError::from)
 }

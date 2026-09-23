@@ -1041,12 +1041,14 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         .await
         .unwrap_or_else(|e| fail(&e.message));
     let (mine, theirs) = {
-        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-        let mine = create_session(&guard, "m", ChatMode::Chat, Some(&viewer))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let theirs = create_session(&guard, "m", ChatMode::Chat, Some(&other))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        (mine.id, theirs.id)
+        let (viewer, other) = (viewer.clone(), other.clone());
+        db.run(move |db| {
+            let mine = create_session(db, "m", ChatMode::Chat, Some(&viewer))?;
+            let theirs = create_session(db, "m", ChatMode::Chat, Some(&other))?;
+            Ok((mine.id, theirs.id))
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
     };
     let viewer_token = h.login("viewer").await;
     let owner_token = h.login("owner").await;
@@ -1229,8 +1231,9 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let fresh = {
-        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-        create_session(&guard, "m", ChatMode::Chat, Some(&owner))
+        let owner = owner.clone();
+        db.run(move |db| create_session(db, "m", ChatMode::Chat, Some(&owner)))
+            .await
             .unwrap_or_else(|e| fail(&e.to_string()))
             .id
     };
@@ -3323,4 +3326,105 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("a question in a private session"), "{html}");
     assert!(!html.contains("Cancel</button>"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
+    use quack_core::jobs::{JobKind, JobSpec, Lane};
+
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("busy", &owner).await;
+    let token = h.login("owner").await;
+    let release = quack_core::llm::CancellationToken::new();
+    let lane = crate::server::queue::upload_lane(&ws);
+    for n in 0..crate::server::queue::MAX_WAITING_UPLOADS {
+        let release = release.clone();
+        h.app.jobs.submit(
+            JobSpec::new(JobKind::Ingest, format!("held {n}"))
+                .workspace(ws.clone())
+                .lane(Lane::new(lane.clone(), 1)),
+            move |_| async move {
+                release.cancelled().await;
+                Ok(String::new())
+            },
+        );
+    }
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws}/documents"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "text": "one more", "title": "late" }).to_string(),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, headers) = h.send(request).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        headers
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+        Some("30")
+    );
+    // Nothing was registered for the refused upload.
+    let (_, listed) = h
+        .get(&format!("/api/v1/workspaces/{ws}/documents"), &token)
+        .await;
+    assert_eq!(listed["documents"].as_array().map(Vec::len), Some(0));
+
+    // Once the line drains, uploads are taken again.
+    release.cancel();
+    for _ in 0..100 {
+        if h.app.jobs.lane_active(&lane) == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/documents"),
+            &token,
+            serde_json::json!({ "text": "one more", "title": "late" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_jobs_page_follows_the_job_stream_with_the_session_cookie() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("live", &owner).await;
+    let cookie = h.login("owner").await;
+    let (status, html, _) = h.page(&format!("/w/{ws}/jobs"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(&format!(
+            "data-jobs-stream=\"/api/v1/workspaces/{ws}/jobs/stream\""
+        )) && html.contains("jobs-changed from:body")
+            && !html.contains("every 2s"),
+        "{html}"
+    );
+    // The stream answers the browser's cookie; only the head is read, since
+    // the body never ends.
+    let request = Request::builder()
+        .uri(format!("/api/v1/workspaces/{ws}/jobs/stream"))
+        .header(header::COOKIE, format!("quack_session={cookie}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|t| t.starts_with("text/event-stream"))
+    );
 }
