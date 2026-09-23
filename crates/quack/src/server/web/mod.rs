@@ -440,7 +440,8 @@ struct AdminAuditPage {
     page: Page,
     rows: Vec<AuditRow>,
     action: String,
-    outcome: String,
+    outcome: Option<Outcome>,
+    outcomes: &'static [Outcome],
     workspace_id: String,
 }
 
@@ -2036,7 +2037,7 @@ async fn settings_save(
 #[derive(Deserialize)]
 struct MemberForm {
     username: String,
-    role: String,
+    role: Role,
 }
 
 async fn member_add(
@@ -2049,8 +2050,7 @@ async fn member_add(
     let Some(user) = app.control.find_user_by_username(&form.username).await? else {
         return Ok(Redirect::to(&format!("/w/{id}/settings?error=no+such+user")).into_response());
     };
-    let role = Role::parse(&form.role)?;
-    app.control.set_member(&id, &user.id, role).await?;
+    app.control.set_member(&id, &user.id, form.role).await?;
     access
         .audit(
             &app,
@@ -2086,7 +2086,7 @@ async fn member_remove(
 struct TokenForm {
     name: String,
     #[serde(default)]
-    scopes: Vec<String>,
+    scopes: Vec<Scope>,
     expires_days: Option<u32>,
 }
 
@@ -2103,11 +2103,7 @@ async fn token_create(
                 .into_response(),
         );
     }
-    let scopes = form
-        .scopes
-        .iter()
-        .map(|s| Scope::parse(s))
-        .collect::<CoreResult<Vec<_>>>()?;
+    let scopes = form.scopes;
     let expires_at = form.expires_days.filter(|d| *d > 0).and_then(|days| {
         jiff::Timestamp::now()
             .checked_add(jiff::SignedDuration::from_hours(
@@ -2221,8 +2217,26 @@ async fn admin_user_add(
 #[derive(Deserialize)]
 struct AuditQuery {
     action: Option<String>,
-    outcome: Option<String>,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    outcome: Option<Outcome>,
     workspace_id: Option<String>,
+}
+
+/// A query or form value where blank means "not given", as the filter's
+/// "any" option sends it; anything else must parse.
+fn blank_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => Ok(None),
+        Some(text) => text.parse().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 async fn admin_audit(
@@ -2232,13 +2246,12 @@ async fn admin_audit(
 ) -> WebResult<Response> {
     require_admin(&identity)?;
     let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-    let (action, outcome, workspace_id) =
-        (clean(q.action), clean(q.outcome), clean(q.workspace_id));
+    let (action, outcome, workspace_id) = (clean(q.action), q.outcome, clean(q.workspace_id));
     let rows = app
         .control
         .query_audit(&AuditFilter {
             action: action.clone(),
-            outcome: outcome.clone(),
+            outcome,
             workspace_id: workspace_id.clone(),
             limit: 200,
             ..AuditFilter::default()
@@ -2248,7 +2261,8 @@ async fn admin_audit(
         page: page(&app, &identity, "Audit", None),
         rows,
         action: action.unwrap_or_default(),
-        outcome: outcome.unwrap_or_default(),
+        outcome,
+        outcomes: Outcome::ALL,
         workspace_id: workspace_id.unwrap_or_default(),
     })
 }

@@ -20,7 +20,9 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState};
-use quack_core::storage::control::{AuditFilter, AuditRow, ControlPlane, Role, Scope};
+use quack_core::storage::control::{
+    AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope,
+};
 use quack_core::storage::workspace::{NewChunk, NewDocument};
 
 struct Harness {
@@ -310,14 +312,14 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
     let denied = h
         .audit(AuditFilter {
             user_id: Some(bob.clone()),
-            outcome: Some(String::from("denied")),
+            outcome: Some(Outcome::Denied),
             ..AuditFilter::default()
         })
         .await;
     assert!(
         denied
             .iter()
-            .any(|r| r.workspace_id.as_deref() == Some(ws.as_str()) && r.channel == "web")
+            .any(|r| r.workspace_id.as_deref() == Some(ws.as_str()) && r.channel == Channel::Web)
     );
     let (status, _) = h.get("/api/v1/workspaces/nope", &bob_token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -439,7 +441,7 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
     let denied = h
         .audit(AuditFilter {
             user_id: Some(dave_root),
-            outcome: Some(String::from("denied")),
+            outcome: Some(Outcome::Denied),
             ..AuditFilter::default()
         })
         .await;
@@ -581,9 +583,9 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert!(
         access_rows
             .iter()
-            .any(|r| r.outcome == "denied" && r.user_id.as_deref() == Some(viewer.as_str()))
+            .any(|r| r.outcome == Outcome::Denied && r.user_id.as_deref() == Some(viewer.as_str()))
     );
-    assert!(access_rows.iter().any(|r| r.outcome == "error"));
+    assert!(access_rows.iter().any(|r| r.outcome == Outcome::Error));
     assert!(access_rows.iter().all(|r| r.request_id.is_some()));
 }
 
@@ -937,7 +939,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     assert!(
         api_rows
             .iter()
-            .all(|r| r.channel == "api" && r.token_hash.is_some())
+            .all(|r| r.channel == Channel::Api && r.token_hash.is_some())
     );
 
     let (expired, _) = h
@@ -959,7 +961,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     let denied = h
         .audit(AuditFilter {
             action: Some(String::from("token")),
-            outcome: Some(String::from("denied")),
+            outcome: Some(Outcome::Denied),
             ..AuditFilter::default()
         })
         .await;
@@ -1013,7 +1015,13 @@ async fn query_endpoints_fail_cleanly_without_a_chat_model() {
             serde_json::json!({ "prompt": "hi", "mode": "sideways" }),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // An unknown mode is refused while the body is read, with the modes it
+    // accepts.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.to_string().contains("expected `chat` or `query`"),
+        "{body}"
+    );
     let (status, body) = h
         .get(&format!("/api/v1/workspaces/{ws}/sessions"), &owner_token)
         .await;
@@ -1200,7 +1208,7 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
             Some(serde_json::json!({ "mode": "loud" })),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let (status, _) = h
         .call(
             Method::PATCH,
@@ -1272,7 +1280,13 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         })
         .await;
     assert_eq!(deletes.len(), 3, "two allowed and the viewer's denied one");
-    assert_eq!(deletes.iter().filter(|r| r.outcome == "denied").count(), 1);
+    assert_eq!(
+        deletes
+            .iter()
+            .filter(|r| r.outcome == Outcome::Denied)
+            .count(),
+        1
+    );
     assert!(
         deletes
             .iter()
@@ -2121,6 +2135,16 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     let (status, html, _) = h.page("/admin/audit?outcome=denied", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Access audit"), "{html}");
+    assert!(
+        html.contains(r#"<option value="denied" selected>"#),
+        "the filter keeps its choice: {html}"
+    );
+    // The filter's "any outcome" choice sends a blank value.
+    let (status, html, _) = h
+        .page("/admin/audit?action=&outcome=&workspace_id=", Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Access audit"), "{html}");
 
     // Static assets and the error page.
     let (status, css, headers) = h.page("/static/css/output.css", None).await;
@@ -2507,8 +2531,17 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
         3,
         "denied write, allowed write, allowed read"
     );
-    assert!(sql_rows.iter().all(|r| r.channel == "mcp"), "{sql_rows:?}");
-    assert_eq!(sql_rows.iter().filter(|r| r.outcome == "denied").count(), 1);
+    assert!(
+        sql_rows.iter().all(|r| r.channel == Channel::Mcp),
+        "{sql_rows:?}"
+    );
+    assert_eq!(
+        sql_rows
+            .iter()
+            .filter(|r| r.outcome == Outcome::Denied)
+            .count(),
+        1
+    );
 }
 
 /// Every allowed workspace read writes its access row and its detail row
@@ -2558,7 +2591,7 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
     let rows = h
         .audit(AuditFilter {
             workspace_id: Some(ws.clone()),
-            outcome: Some(String::from("allowed")),
+            outcome: Some(Outcome::Allowed),
             ..AuditFilter::default()
         })
         .await;
@@ -3202,7 +3235,13 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         4,
         "two allowed, the refused control.db, and the failed query; the bad URL never reaches the audit"
     );
-    assert_eq!(imports.iter().filter(|r| r.outcome == "error").count(), 2);
+    assert_eq!(
+        imports
+            .iter()
+            .filter(|r| r.outcome == Outcome::Error)
+            .count(),
+        2
+    );
 }
 
 fn urlencode(text: &str) -> String {
@@ -3764,7 +3803,10 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
         .collect();
     assert_eq!(for_run.len(), 2, "{rows:?}");
-    assert!(for_run.iter().any(|r| r.outcome == "error"), "{rows:?}");
+    assert!(
+        for_run.iter().any(|r| r.outcome == Outcome::Error),
+        "{rows:?}"
+    );
     // The vector is still stale.
     let (_, body) = h.get(&base, &viewer_token).await;
     assert_eq!(body["stale_chunks"], 1, "{body}");

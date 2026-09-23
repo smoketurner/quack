@@ -7,7 +7,9 @@ use crate::storage::workspace::QueryResults;
 /// Most points per series; beyond this the query should aggregate.
 pub const MAX_POINTS: usize = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ChartKind {
     Bar,
@@ -16,34 +18,12 @@ pub enum ChartKind {
     Pie,
 }
 
-impl ChartKind {
-    /// Parse `bar`, `line`, `scatter`, or `pie`, case-insensitively.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error naming the accepted kinds otherwise.
-    pub fn parse(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "bar" => Ok(Self::Bar),
-            "line" => Ok(Self::Line),
-            "scatter" => Ok(Self::Scatter),
-            "pie" => Ok(Self::Pie),
-            other => Err(Error::Analysis(format!(
-                "unsupported chart kind '{other}'; use bar, line, scatter, or pie"
-            ))),
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bar => "bar",
-            Self::Line => "line",
-            Self::Scatter => "scatter",
-            Self::Pie => "pie",
-        }
-    }
-}
+text_enum!(ChartKind, "chart kind", {
+    Bar => "bar",
+    Line => "line",
+    Scatter => "scatter",
+    Pie => "pie",
+});
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Axis {
@@ -92,7 +72,7 @@ pub fn generate_chart_spec(
     y_column: &str,
     title: &str,
 ) -> Result<ChartSpec> {
-    let kind = ChartKind::parse(kind)?;
+    let kind: ChartKind = kind.parse()?;
     let column = |name: &str| {
         results
             .columns
@@ -214,10 +194,10 @@ mod tests {
             (" scatter ", ChartKind::Scatter),
             ("pie", ChartKind::Pie),
         ] {
-            assert!(ChartKind::parse(text).is_ok_and(|k| k == kind));
+            assert!(text.parse::<ChartKind>().is_ok_and(|k| k == kind));
         }
-        let err = ChartKind::parse("area").err();
-        assert!(err.is_some_and(|e| e.to_string().contains("bar, line, scatter, or pie")));
+        let err = "area".parse::<ChartKind>().err();
+        assert!(err.is_some_and(|e| e.to_string().contains("bar, line, scatter, pie")));
     }
 
     #[test]

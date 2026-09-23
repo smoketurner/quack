@@ -126,6 +126,7 @@ pub(crate) struct QueryArgs {
     /// `chat` (general knowledge allowed, the default) or `query` (every
     /// claim from the workspace), for a new session; an existing session
     /// keeps the mode it was created with.
+    #[schemars(with = "Option<ChatMode>")]
     pub mode: Option<String>,
 }
 
@@ -259,9 +260,9 @@ impl McpServer {
         }
         let mode = match args.mode.as_deref().map(str::trim) {
             None | Some("") => None,
-            Some(text) => match ChatMode::parse(text) {
-                Some(mode) => Some(mode),
-                None => return Ok(failure("mode must be chat or query")),
+            Some(text) => match text.parse::<ChatMode>() {
+                Ok(mode) => Some(mode),
+                Err(e) => return Ok(failure(e.to_string())),
             },
         };
         let session = match self.resolve_session(args.session_id, mode).await? {
@@ -1078,7 +1079,11 @@ mod tests {
             .query(ask(None, Some("loud")))
             .await
             .unwrap_or_else(|e| fail(&e.message));
-        assert!(error_text(&bad_mode).contains("chat or query"));
+        assert!(
+            error_text(&bad_mode).contains("unknown mode 'loud'; use one of: chat, query"),
+            "{}",
+            error_text(&bad_mode)
+        );
 
         let unknown = server
             .query(ask(Some("nope"), None))

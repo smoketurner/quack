@@ -89,7 +89,7 @@ pub(crate) async fn show(
 pub(crate) struct UpdateSession {
     pub shared: Option<bool>,
     /// `chat` or `query`: the explicit way to change a session's mode.
-    pub mode: Option<String>,
+    pub mode: Option<ChatMode>,
 }
 
 /// Share a session with every member or take it back, or change its
@@ -108,9 +108,7 @@ pub(crate) async fn update(
     if let Some(shared) = body.shared {
         session = Some(set_shared(&app, &access, &sid, shared).await?);
     }
-    if let Some(mode) = body.mode.as_deref() {
-        let mode = ChatMode::parse(mode)
-            .ok_or_else(|| ApiError::bad_request("mode must be chat or query"))?;
+    if let Some(mode) = body.mode {
         session = Some(set_mode(&app, &access, &sid, mode).await?);
     }
     let session = session.ok_or_else(|| ApiError::not_found("no such session"))?;

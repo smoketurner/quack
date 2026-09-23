@@ -29,7 +29,7 @@ use crate::server::web::markdown::to_html;
 pub(crate) struct QueryRequest {
     pub prompt: String,
     pub session_id: Option<String>,
-    pub mode: Option<String>,
+    pub mode: Option<ChatMode>,
     #[serde(default)]
     pub allow_write: bool,
 }
@@ -69,13 +69,7 @@ async fn prepare(
             )));
         }
     }
-    let mode = match body.mode.as_deref() {
-        None => None,
-        Some(m) => Some(
-            ChatMode::parse(m)
-                .ok_or_else(|| ApiError::bad_request("mode must be chat or query"))?,
-        ),
-    };
+    let mode = body.mode;
     let db = app.workspace_db(workspace_id).await?;
     let reader_db = app.reader_db(workspace_id).await?;
     let requested = body.session_id.clone();

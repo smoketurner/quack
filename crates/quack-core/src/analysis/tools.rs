@@ -1156,7 +1156,10 @@ impl CreateChartTool {
 pub struct CreateChartArgs {
     /// SQL query to get chart data (at most 200 rows; aggregate first)
     pub sql: String,
-    /// Kind of chart: bar, line, scatter, or pie
+    /// Kind of chart: bar, line, scatter, or pie. The schema lists the kinds;
+    /// the text is parsed leniently so a near miss comes back as a message
+    /// the model can act on rather than a rejected call.
+    #[schemars(with = "crate::analysis::chart::ChartKind")]
     pub kind: String,
     /// Column for the x axis (category labels; slice names for pie)
     pub x: String,
@@ -2291,6 +2294,18 @@ mod tests {
         req.allow();
         assert!(gate.await.is_ok_and(|ran| ran));
         assert!(!refused.was_refused());
+    }
+
+    /// The model sees the chart kinds in the tool's schema, not only in
+    /// prose.
+    #[test]
+    fn the_chart_schema_lists_every_kind() {
+        let schema = serde_json::to_value(schemars::schema_for!(CreateChartArgs))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        for kind in crate::analysis::chart::ChartKind::ALL {
+            assert!(schema.contains(&format!("\"{kind}\"")), "{kind}: {schema}");
+        }
     }
 }
 

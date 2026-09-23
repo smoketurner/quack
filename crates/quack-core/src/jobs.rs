@@ -47,11 +47,14 @@ impl JobId {
     fn new() -> Self {
         Self(Uuid::now_v7())
     }
+}
 
-    /// Parse an id as [`fmt::Display`] writes it.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
-        Uuid::parse_str(text).ok().map(Self)
+/// Reads an id as [`fmt::Display`] writes it.
+impl std::str::FromStr for JobId {
+    type Err = uuid::Error;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(text.trim()).map(Self)
     }
 }
 
@@ -1038,7 +1041,12 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed.last().map(|j| j.id), last);
         assert_eq!(
-            JobId::parse(&listed.first().map(|j| j.id.to_string()).unwrap_or_default()),
+            listed
+                .first()
+                .map(|j| j.id.to_string())
+                .unwrap_or_default()
+                .parse::<JobId>()
+                .ok(),
             listed.first().map(|j| j.id)
         );
     }

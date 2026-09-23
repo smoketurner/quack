@@ -71,34 +71,13 @@ pub enum PropertyType {
     Boolean,
 }
 
-impl PropertyType {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::String => "string",
-            Self::Number => "number",
-            Self::Date => "date",
-            Self::Enum => "enum",
-            Self::Boolean => "boolean",
-        }
-    }
-
-    /// Parse the stored form.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for any other text.
-    pub fn parse(text: &str) -> Result<Self> {
-        match text {
-            "string" => Ok(Self::String),
-            "number" => Ok(Self::Number),
-            "date" => Ok(Self::Date),
-            "enum" => Ok(Self::Enum),
-            "boolean" => Ok(Self::Boolean),
-            other => Err(Error::Ontology(format!("unknown property type '{other}'"))),
-        }
-    }
-}
+text_enum!(PropertyType, "property type", {
+    String => "string",
+    Number => "number",
+    Date => "date",
+    Enum => "enum",
+    Boolean => "boolean",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

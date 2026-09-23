@@ -48,6 +48,14 @@ pub enum Error {
     #[error("ontology error: {0}")]
     Ontology(String),
 
+    /// Text that names none of an enum's values: a role, a scope, a mode.
+    #[error("unknown {what} '{value}'; use one of: {allowed}")]
+    UnknownValue {
+        what: &'static str,
+        value: String,
+        allowed: String,
+    },
+
     #[error("unsupported file type: {0}")]
     UnsupportedFileType(String),
 

@@ -1,3 +1,6 @@
+#[macro_use]
+mod text_enum;
+
 pub mod analysis;
 pub mod config;
 pub mod crypto;

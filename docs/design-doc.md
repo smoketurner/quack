@@ -1412,7 +1412,10 @@ GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal
 
 Uploads, extraction, and proposals return `202` with a `job` id and run on the work queue
 (section 4.1); clients poll the resource or the job. Agent turns run there too, in their
-session's lane. Rate limiting per token via `tower_governor`.
+session's lane. Rate limiting per token via `tower_governor`. A field that names one of a
+fixed set (`mode`, `role`, `scopes`, an audit `outcome`) is read as that value: an unknown
+one is refused while the request is read, 422 for a JSON body and 400 for a query string,
+with the accepted values in the message.
 
 ```
 GET    /api/v1/workspaces/{id}/jobs               queued, running, and recent jobs, newest first,
