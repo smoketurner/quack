@@ -696,7 +696,7 @@ impl App {
             AgentEvent::Failed(err) => {
                 turn.ended = true;
                 let text = if visible {
-                    err
+                    err.message
                 } else {
                     format!(
                         "Job #{} in session {} failed: {err}",

@@ -1320,6 +1320,47 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
     assert_eq!(location(&headers), format!("/w/{ws}/chat"));
 }
 
+/// A record named by id that does not exist is a 404 wherever it is
+/// named, and a missing ontology version or merge proposal no longer
+/// borrows that status for every other failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_records_answer_404() {
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("m", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}");
+    for (method, path, body) in [
+        (
+            Method::PATCH,
+            format!("{base}/documents/nope"),
+            serde_json::json!({ "pinned": true }),
+        ),
+        (
+            Method::PATCH,
+            format!("{base}/sessions/nope"),
+            serde_json::json!({ "shared": true }),
+        ),
+        (
+            Method::POST,
+            format!("{base}/ontology/versions/99/restore"),
+            serde_json::json!({}),
+        ),
+        (
+            Method::PUT,
+            format!("{base}/graph/merges/nope"),
+            serde_json::json!({ "action": "reject" }),
+        ),
+    ] {
+        let (status, body) = h.call(method, &path, Some(&token), Some(body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        assert!(
+            body.to_string().contains("does not exist"),
+            "{path}: {body}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ontology_is_versioned_over_the_api_and_the_web_page() {
     let h = harness(false).await;

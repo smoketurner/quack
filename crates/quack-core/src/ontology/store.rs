@@ -392,7 +392,7 @@ fn check_mappings(db: &WorkspaceDb, ontology: &Ontology) -> Result<()> {
 /// Returns an error when the version does not exist or the save fails.
 pub fn restore(db: &WorkspaceDb, target: u32, author: Option<&str>) -> Result<Ontology> {
     let snapshot = version(db, target)?
-        .ok_or_else(|| Error::Ontology(format!("ontology version {target} does not exist")))?;
+        .ok_or_else(|| crate::error::Record::OntologyVersion.missing(target.to_string()))?;
     save(
         db,
         &snapshot,

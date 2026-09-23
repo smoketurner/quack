@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 
 use super::chart::ChartSpec;
 use super::citations::{self, Citation};
-use super::events::{AgentEvent, EventSink, ToolStep, TurnRecorder};
+use super::events::{AgentEvent, EventSink, ToolStep, TurnFailure, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::ModelReranker;
 use super::text_to_sql::{self, PromptOptions};
@@ -221,7 +221,7 @@ where
             Ok(response)
         }
         Err(e) => {
-            recorder.emit(AgentEvent::Failed(e.to_string()));
+            recorder.emit(AgentEvent::Failed(TurnFailure::from(&e)));
             Err(e)
         }
     }

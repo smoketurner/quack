@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 
 use crate::analysis::agent::AgentResponse;
-use crate::error::{Error, Result};
+use crate::error::{Error, Record, Result};
 
 use super::workspace::WorkspaceDb;
 
@@ -131,9 +131,7 @@ pub fn set_session_mode(db: &WorkspaceDb, session_id: &str, mode: ChatMode) -> R
         duckdb::params![mode.as_str(), session_id],
     )?;
     if changed == 0 {
-        return Err(Error::Analysis(format!(
-            "session '{session_id}' does not exist"
-        )));
+        return Err(Record::Session.missing(session_id));
     }
     Ok(())
 }
@@ -227,7 +225,7 @@ pub fn set_session_shared(db: &WorkspaceDb, session_id: &str, shared: bool) -> R
         duckdb::params![shared, session_id],
     )?;
     if changed == 0 {
-        return Err(Error::Analysis(format!("no session {session_id}")));
+        return Err(Record::Session.missing(session_id));
     }
     Ok(())
 }
@@ -245,9 +243,7 @@ pub fn append_message(
     metadata: Option<&serde_json::Value>,
 ) -> Result<i64> {
     if get_session(db, session_id)?.is_none() {
-        return Err(Error::Analysis(format!(
-            "session '{session_id}' does not exist"
-        )));
+        return Err(Record::Session.missing(session_id));
     }
     let conn = db.connection();
     let seq: i64 = conn.query_row(
@@ -317,8 +313,8 @@ pub fn record_turn(
     user_message: &str,
     response: &AgentResponse,
 ) -> Result<()> {
-    let session = get_session(db, session_id)?
-        .ok_or_else(|| Error::Analysis(format!("session '{session_id}' does not exist")))?;
+    let session =
+        get_session(db, session_id)?.ok_or_else(|| Record::Session.missing(session_id))?;
 
     append_message(db, session_id, MessageRole::User, user_message, None)?;
 
@@ -768,7 +764,13 @@ mod tests {
     fn append_to_missing_session_is_an_error() {
         let db = db();
         let err = append_message(&db, "nope", MessageRole::User, "x", None).err();
-        assert!(err.is_some_and(|e| e.to_string().contains("does not exist")));
+        assert!(err.is_some_and(|e| matches!(
+            e,
+            Error::NotFound {
+                record: Record::Session,
+                ..
+            }
+        )));
     }
 
     #[test]

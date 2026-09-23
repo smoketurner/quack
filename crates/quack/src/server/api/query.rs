@@ -13,6 +13,7 @@ use quack_core::analysis::events::{self, AgentEvent};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
+use quack_core::error::Record;
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane};
 use quack_core::llm;
 use quack_core::storage::control::Outcome;
@@ -78,14 +79,10 @@ async fn prepare(
     let sees_all = access.sees_all_sessions();
     let session_id = with_db(Arc::clone(&db), move |db| {
         if let Some(id) = requested {
-            let session = sessions::get_session(db, &id)?.ok_or_else(|| {
-                quack_core::error::Error::Analysis(format!("session '{id}' does not exist"))
-            })?;
-            if !sessions::visible_to(&session, &user, sees_all) {
-                return Err(quack_core::error::Error::Analysis(format!(
-                    "session '{id}' does not exist"
-                )));
-            }
+            // A session the caller may not see reads as missing, not forbidden.
+            sessions::get_session(db, &id)?
+                .filter(|s| sessions::visible_to(s, &user, sees_all))
+                .ok_or_else(|| Record::Session.missing(id.as_str()))?;
             // A session's mode is set when it is created; `mode` on a
             // later turn is ignored, and PATCH .../sessions/{sid} changes
             // it explicitly (issue #57).
@@ -94,8 +91,7 @@ async fn prepare(
             Ok(sessions::create_session(db, &model, mode.unwrap_or_default(), Some(&user))?.id)
         }
     })
-    .await
-    .map_err(|e| ApiError::not_found(e.message))?;
+    .await?;
     let policy = if body.allow_write {
         WritePolicy::Allow
     } else {
@@ -258,20 +254,11 @@ pub(crate) async fn query(
                 None,
             )
             .await;
-            let message =
-                failure.unwrap_or_else(|| String::from("the turn ended without an answer"));
-            Err(turn_error(&message))
+            Err(failure.map_or_else(
+                || ApiError::internal("the turn ended without an answer"),
+                ApiError::from,
+            ))
         }
-    }
-}
-
-fn turn_error(message: &str) -> ApiError {
-    if message.contains("quack auth login") {
-        ApiError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
-    } else if message.contains("no chat model configured") {
-        ApiError::bad_request(message)
-    } else {
-        ApiError::internal(message)
     }
 }
 
@@ -339,9 +326,9 @@ pub(crate) async fn stream(
                         .json_data(payload)
                         .unwrap_or_default()
                 }
-                AgentEvent::Failed(message) => {
+                AgentEvent::Failed(failure) => {
                     record_turn(&app, &access, &session_id, &prompt, Outcome::Error, None).await;
-                    Event::default().event("error").data(message)
+                    Event::default().event("error").data(failure.message)
                 }
             };
             Some((Ok(out), (events, app, access, session_id, prompt, guard)))

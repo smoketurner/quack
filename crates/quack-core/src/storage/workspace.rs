@@ -284,7 +284,18 @@ impl WorkspaceDb {
         std::fs::create_dir_all(&files_dir)?;
 
         let profile = Profile::from_config(config)?;
-        let conn = duckdb::Connection::open(&db_path)?;
+        // DuckDB reports a file held by another process only in its message
+        // text ("Could not set lock on file ..."); it is classified here, once,
+        // so callers match a variant instead.
+        let conn = duckdb::Connection::open(&db_path).map_err(|e| {
+            if e.to_string().contains("Could not set lock") {
+                Error::WorkspaceLocked {
+                    path: db_path.clone(),
+                }
+            } else {
+                Error::from(e)
+            }
+        })?;
         // The columns keep the width they were created with until the
         // reconciliation below decides otherwise.
         let column_dimension = Self::recorded_dimension(&conn)?
@@ -1652,9 +1663,7 @@ impl WorkspaceDb {
             duckdb::params![pinned, document_id],
         )?;
         if changed == 0 {
-            return Err(Error::Ingestion(format!(
-                "document '{document_id}' does not exist"
-            )));
+            return Err(crate::error::Record::Document.missing(document_id));
         }
         Ok(())
     }
@@ -1788,7 +1797,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns `f`'s error (an interrupted statement's included), or
-    /// [`Error::Analysis`] when the work was cancelled before it started.
+    /// [`Error::Cancelled`] when the work was cancelled before it started.
     pub fn cancellable<R>(
         &self,
         canceller: &QueryCanceller,
@@ -1797,7 +1806,7 @@ impl WorkspaceDb {
         {
             let mut slot = canceller.slot();
             if slot.cancelled {
-                return Err(Error::Analysis(String::from("cancelled")));
+                return Err(Error::Cancelled);
             }
             slot.running = Some(self.conn.interrupt_handle());
         }
@@ -2945,7 +2954,10 @@ mod tests {
         // Cancelled before the work starts: it never runs.
         let early = QueryCanceller::new();
         early.cancel();
-        assert!(db.cancellable(&early, |_| Ok(())).is_err());
+        assert!(matches!(
+            db.cancellable(&early, |_| Ok(())),
+            Err(Error::Cancelled)
+        ));
 
         // Cancelled while a long statement runs: the statement stops.
         let canceller = QueryCanceller::new();

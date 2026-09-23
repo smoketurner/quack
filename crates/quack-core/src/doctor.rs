@@ -376,27 +376,25 @@ async fn check_workspace(
                 );
             }
         }
+        Err(crate::error::Error::WorkspaceLocked { .. }) => {
+            report.push(Check::new(
+                "workspace",
+                Status::Info,
+                format!(
+                    "'{name}' is open in another quack process (a server or a session), \
+                     so it was not checked"
+                ),
+            ));
+        }
         Err(e) => {
-            let message = e.to_string();
-            if message.contains("lock") {
-                report.push(Check::new(
+            report.push(
+                Check::new(
                     "workspace",
-                    Status::Info,
-                    format!(
-                        "'{name}' is open in another quack process (a server or a session), \
-                         so it was not checked"
-                    ),
-                ));
-            } else {
-                report.push(
-                    Check::new(
-                        "workspace",
-                        Status::Fail,
-                        format!("'{name}' does not open: {message}"),
-                    )
-                    .fix("check the file under the data directory, or restore a backup"),
-                );
-            }
+                    Status::Fail,
+                    format!("'{name}' does not open: {e}"),
+                )
+                .fix("check the file under the data directory, or restore a backup"),
+            );
         }
     }
 }

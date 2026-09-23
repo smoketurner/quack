@@ -5,6 +5,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use quack_core::error::Record;
 use quack_core::storage::control::Outcome;
 use quack_core::storage::sessions::{self, ChatMode};
 use serde::Deserialize;
@@ -57,7 +58,7 @@ async fn visible_session(
                 .filter(|s| sessions::visible_to(s, &user, sees_all)))
         })
         .await?;
-    found.ok_or_else(|| ApiError::not_found("no such session"))
+    found.ok_or_else(|| Record::Session.missing(session_id).into())
 }
 
 pub(crate) async fn show(
@@ -111,7 +112,7 @@ pub(crate) async fn update(
     if let Some(mode) = body.mode {
         session = Some(set_mode(&app, &access, &sid, mode).await?);
     }
-    let session = session.ok_or_else(|| ApiError::not_found("no such session"))?;
+    let session = session.ok_or_else(|| ApiError::from(Record::Session.missing(sid.as_str())))?;
     Ok(Json(serde_json::to_value(session)?))
 }
 
@@ -136,10 +137,10 @@ pub(crate) async fn set_mode(
     let session_id = session.id.clone();
     let updated = with_db(db, move |db| {
         sessions::set_session_mode(db, &session_id, mode)?;
-        sessions::get_session(db, &session_id)
+        sessions::get_session(db, &session_id)?
+            .ok_or_else(|| Record::Session.missing(session_id.as_str()))
     })
-    .await?
-    .ok_or_else(|| ApiError::not_found("no such session"))?;
+    .await?;
     access
         .audit(
             app,
@@ -173,10 +174,10 @@ pub(crate) async fn set_shared(
     let session_id = session.id.clone();
     let updated = with_db(db, move |db| {
         sessions::set_session_shared(db, &session_id, shared)?;
-        sessions::get_session(db, &session_id)
+        sessions::get_session(db, &session_id)?
+            .ok_or_else(|| Record::Session.missing(session_id.as_str()))
     })
-    .await?
-    .ok_or_else(|| ApiError::not_found("no such session"))?;
+    .await?;
     access
         .audit(
             app,

@@ -456,9 +456,7 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<MergeProposal> {
         .filter(|m| m.id.starts_with(prefix))
         .collect();
     match matches.len() {
-        0 => Err(Error::Analysis(format!(
-            "no pending merge matches '{prefix}'"
-        ))),
+        0 => Err(crate::error::Record::MergeProposal.missing(prefix)),
         1 => matches
             .into_iter()
             .next()

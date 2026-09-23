@@ -580,9 +580,7 @@ pub(crate) async fn decide_merge(
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
     let merge_id = mid.clone();
-    let proposal = with_db(db, move |db| action.apply(db, &merge_id, Some(&author)))
-        .await
-        .map_err(|e| ApiError::not_found(e.message))?;
+    let proposal = with_db(db, move |db| action.apply(db, &merge_id, Some(&author))).await?;
     access
         .audit(
             &app,

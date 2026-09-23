@@ -1871,9 +1871,7 @@ async fn ontology_restore(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
-    let stored = with_db(db, move |db| ontology_store::restore(db, v, Some(&author)))
-        .await
-        .map_err(|e| ApiError::not_found(e.message))?;
+    let stored = with_db(db, move |db| ontology_store::restore(db, v, Some(&author))).await?;
     access
         .audit(
             &app,

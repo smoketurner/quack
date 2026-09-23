@@ -1806,7 +1806,7 @@ mod tests {
     fn auth_required_is_recognised_through_context_only_while_typed() {
         let auth = || quack_core::error::Error::AuthRequired {
             provider: String::from("corp"),
-            reason: String::from("no cached token"),
+            reason: quack_core::error::AuthReason::NoToken,
         };
         assert!(auth_exit_code(&anyhow::Error::from(auth())).is_some());
         assert!(auth_exit_code(&anyhow::Error::from(auth()).context("import failed")).is_some());

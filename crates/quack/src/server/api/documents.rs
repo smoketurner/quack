@@ -6,6 +6,7 @@ use std::sync::Arc;
 use axum::extract::{Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::{Json, response::IntoResponse};
+use quack_core::error::Record;
 use quack_core::ingestion;
 use quack_core::storage::control::Outcome;
 use serde::Deserialize;
@@ -47,8 +48,12 @@ pub(crate) async fn show(
             None,
         )
         .await?;
-    let found = app.read(&id, move |db| db.document(&doc)).await?;
-    let document = found.ok_or_else(|| ApiError::not_found("no such document"))?;
+    let document = app
+        .read(&id, move |db| {
+            db.document(&doc)?
+                .ok_or_else(|| Record::Document.missing(doc.as_str()))
+        })
+        .await?;
     Ok(Json(serde_json::to_value(document)?))
 }
 
@@ -341,15 +346,12 @@ pub(crate) async fn set_pinned(
 ) -> ApiResult<DocumentInfo> {
     let db = app.workspace_db(&access.workspace.id).await?;
     let doc_id = doc.to_owned();
-    let updated = with_db(db, move |db| {
-        if db.document(&doc_id)?.is_none() {
-            return Ok(None);
-        }
+    let document = with_db(db, move |db| {
         db.set_document_pinned(&doc_id, pinned)?;
-        db.document(&doc_id)
+        db.document(&doc_id)?
+            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))
     })
     .await?;
-    let document = updated.ok_or_else(|| ApiError::not_found("no such document"))?;
     access
         .audit(
             app,
@@ -377,18 +379,17 @@ pub(crate) async fn remove(
 pub(crate) async fn delete_document(app: &App, access: &Access, doc: &str) -> ApiResult<String> {
     let db = app.workspace_db(&access.workspace.id).await?;
     let doc_id = doc.to_owned();
-    let removed = with_db(db, move |db| {
-        let Some(document) = db.document(&doc_id)? else {
-            return Ok(None);
-        };
+    let filename = with_db(db, move |db| {
+        let document = db
+            .document(&doc_id)?
+            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))?;
         let table = ingestion::parser::detect_file_type(&document.filename)
             .is_structured()
             .then(|| ingestion::table_name_for(&document.filename));
         db.delete_document(&doc_id, table.as_deref())?;
-        Ok(Some(document.filename))
+        Ok(document.filename)
     })
     .await?;
-    let filename = removed.ok_or_else(|| ApiError::not_found("no such document"))?;
     access
         .audit(
             app,

@@ -38,7 +38,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 pub use cache::{CachedToken, KeySource, TokenCache};
 
 use crate::config::{OAuthConfig, ProviderConfig};
-use crate::error::{Error, Result};
+use crate::error::{AuthReason, Error, Result};
 
 /// Tokens with less than this left are refreshed before use.
 const REUSE_MARGIN: SignedDuration = SignedDuration::from_secs(60);
@@ -202,7 +202,7 @@ impl TokenManager {
             None => self.current.read().await.clone(),
         };
         let Some(cached) = cached else {
-            return Err(self.auth_required("no token is cached"));
+            return Err(self.auth_required(AuthReason::NoToken));
         };
         if cached.is_fresh(Timestamp::now(), REUSE_MARGIN) {
             let access = cached.access_token.clone();
@@ -210,9 +210,7 @@ impl TokenManager {
             return Ok(access);
         }
         let Some(refresh) = cached.refresh_token.as_ref() else {
-            return Err(
-                self.auth_required("the token expired and the issuer gave no refresh token")
-            );
+            return Err(self.auth_required(AuthReason::ExpiredNoRefresh));
         };
         let refreshed = self.refresh(refresh).await?;
         let access = refreshed.access_token.clone();
@@ -229,10 +227,10 @@ impl TokenManager {
             .map(|t| t.access_token.clone())
     }
 
-    fn auth_required(&self, reason: &str) -> Error {
+    fn auth_required(&self, reason: AuthReason) -> Error {
         Error::AuthRequired {
             provider: self.provider.clone(),
-            reason: reason.to_owned(),
+            reason,
         }
     }
 
@@ -244,7 +242,7 @@ impl TokenManager {
             .exchange_refresh_token(&RefreshToken::new(refresh.expose_secret().to_owned()))
             .request_async(&http)
             .await
-            .map_err(|e| self.auth_required(&format!("refresh failed: {e}")))?;
+            .map_err(|e| self.auth_required(AuthReason::RefreshFailed(e.to_string())))?;
         let mut token = cached_from_response(&response);
         if token.refresh_token.is_none() {
             token.refresh_token = Some(refresh.clone());
