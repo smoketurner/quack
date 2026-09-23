@@ -1302,7 +1302,9 @@ fn run_docs(
             .then(|| ingestion::table_name_for(&filename));
         db.delete_document(&id, table.as_deref())?;
     }
-    list_documents(db, json)
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    list_documents(db, json, &mut out)
 }
 
 /// Resolve a full document id or a unique prefix.
@@ -1320,28 +1322,11 @@ fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<String> {
     }
 }
 
-fn list_documents(db: &WorkspaceDb, json: bool) -> Result<()> {
+fn list_documents(db: &WorkspaceDb, json: bool, out: &mut impl Write) -> Result<()> {
     let docs = db.list_documents()?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
     if json {
         for doc in &docs {
-            serde_json::to_writer(
-                &mut out,
-                &serde_json::json!({
-                    "id": doc.id,
-                    "filename": doc.filename,
-                    "title": doc.title,
-                    "mime_type": doc.mime_type,
-                    "size_bytes": doc.size_bytes,
-                    "sha256": doc.sha256,
-                    "source": doc.source,
-                    "status": doc.status,
-                    "pinned": doc.pinned,
-                    "chunk_count": doc.chunk_count,
-                    "ingested_at": doc.ingested_at,
-                }),
-            )?;
+            serde_json::to_writer(&mut *out, doc)?;
             writeln!(out)?;
         }
     } else if docs.is_empty() {
@@ -1788,6 +1773,30 @@ mod tests {
             std::io::ErrorKind::NotFound
         ))));
         assert!(!is_broken_pipe(&anyhow::anyhow!("something else")));
+    }
+
+    /// `docs --json` prints every recorded field, so a script can tell why a
+    /// document failed.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn docs_json_carries_every_document_field() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap();
+        db.insert_document(&quack_core::storage::workspace::NewDocument::new(
+            "d1",
+            "broken.pdf",
+            "application/pdf",
+            3,
+        ))
+        .unwrap();
+        db.mark_document_error("d1", "no text layer").unwrap();
+        let mut out = Vec::new();
+        list_documents(&db, true, &mut out).unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(row.get("status").unwrap(), "error", "{row}");
+        assert_eq!(row.get("error_message").unwrap(), "no text layer", "{row}");
+        for key in ["ingested_by", "tables", "filename", "sha256", "source"] {
+            assert!(row.get(key).is_some(), "{key} missing: {row}");
+        }
     }
 
     /// A missing login is recognised through the context a command adds
