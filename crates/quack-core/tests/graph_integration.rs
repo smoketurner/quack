@@ -589,7 +589,13 @@ fn paths_merges_and_listing(
 
     // Accepting the merge folds Orgenics Ltd into Orgenics: its edge and
     // provenance move, the alias is kept, and the path shortens.
-    let proposal = resolve::accept(db, &pending.first().unwrap().id, Some("tester")).unwrap();
+    let proposal = resolve::decide(
+        db,
+        &pending.first().unwrap().id,
+        resolve::MergeDecision::Accept,
+        Some("tester"),
+    )
+    .unwrap();
     let kept = graph_store::node(db, &proposal.keep.id).unwrap().unwrap();
     assert!(
         kept.properties
@@ -606,7 +612,7 @@ fn paths_merges_and_listing(
         "the merged vendor's ships_to edge shortens it"
     );
     assert!(resolve::pending(db).unwrap().is_empty());
-    assert!(resolve::accept(db, &proposal.id, None).is_err());
+    assert!(resolve::decide(db, &proposal.id, resolve::MergeDecision::Accept, None).is_err());
 }
 
 #[tokio::test]

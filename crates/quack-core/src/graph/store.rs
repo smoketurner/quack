@@ -497,8 +497,8 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     )?;
     let edges: i64 = conn.query_row("SELECT count(*) FROM _quack_graph_edges", [], |r| r.get(0))?;
     let pending_merges: i64 = conn.query_row(
-        "SELECT count(*) FROM _quack_graph_merges WHERE status = 'pending'",
-        [],
+        "SELECT count(*) FROM _quack_graph_merges WHERE status = ?",
+        [super::resolve::MergeStatus::Pending],
         |r| r.get(0),
     )?;
     let built_with_version = built_with(db)?;

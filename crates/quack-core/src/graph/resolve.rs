@@ -23,7 +23,54 @@ pub struct MergeProposal {
     pub keep: Node,
     pub drop: Node,
     pub distance: f64,
-    pub status: String,
+    pub status: MergeStatus,
+}
+
+/// Where a merge proposal stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeStatus {
+    /// Waiting for review.
+    Pending,
+    /// Merged.
+    Accepted,
+    /// Kept apart; not proposed again.
+    Rejected,
+    /// One of its nodes merged into something else first.
+    Superseded,
+}
+
+text_enum!(MergeStatus, "merge status", {
+    Pending => "pending",
+    Accepted => "accepted",
+    Rejected => "rejected",
+    Superseded => "superseded",
+});
+text_enum_sql!(MergeStatus);
+
+/// A reviewer's answer to a merge proposal, from the CLI, the API, or the
+/// graph page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeDecision {
+    Accept,
+    Reject,
+}
+
+text_enum!(MergeDecision, "merge decision", {
+    Accept => "accept",
+    Reject => "reject",
+});
+
+impl MergeDecision {
+    /// The status a proposal takes when this is the answer.
+    #[must_use]
+    pub fn status(self) -> MergeStatus {
+        match self {
+            Self::Accept => MergeStatus::Accepted,
+            Self::Reject => MergeStatus::Rejected,
+        }
+    }
 }
 
 /// What a resolution pass did.
@@ -395,8 +442,8 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
         duckdb::params![drop],
     )?;
     conn.execute(
-        "UPDATE _quack_graph_merges SET status = 'superseded' WHERE status = 'pending' AND (keep_node_id = ? OR drop_node_id = ?)",
-        duckdb::params![drop, drop],
+        "UPDATE _quack_graph_merges SET status = ? WHERE status = ? AND (keep_node_id = ? OR drop_node_id = ?)",
+        duckdb::params![MergeStatus::Superseded, MergeStatus::Pending, drop, drop],
     )?;
     conn.execute(
         "DELETE FROM _quack_graph_nodes WHERE id = ?",
@@ -413,10 +460,10 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
 pub fn pending(db: &WorkspaceDb) -> Result<Vec<MergeProposal>> {
     let mut stmt = db.connection().prepare(
         "SELECT id, keep_node_id, drop_node_id, distance, status FROM _quack_graph_merges \
-         WHERE status = 'pending' ORDER BY distance, id",
+         WHERE status = ? ORDER BY distance, id",
     )?;
-    let mut rows = stmt.query([])?;
-    let mut raw: Vec<(String, String, String, f64, String)> = Vec::new();
+    let mut rows = stmt.query([MergeStatus::Pending])?;
+    let mut raw: Vec<(String, String, String, f64, MergeStatus)> = Vec::new();
     while let Some(row) = rows.next()? {
         raw.push((
             row.get(0)?,
@@ -467,31 +514,26 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<MergeProposal> {
     }
 }
 
-/// Apply a proposed merge.
+/// Record a reviewer's answer to a pending proposal (full id or unique
+/// prefix): an accepted one merges its nodes; a rejected one is not
+/// proposed again.
 ///
 /// # Errors
 ///
 /// Returns an error when the proposal is not pending or the merge fails.
-pub fn accept(db: &WorkspaceDb, id: &str, decided_by: Option<&str>) -> Result<MergeProposal> {
+pub fn decide(
+    db: &WorkspaceDb,
+    id: &str,
+    decision: MergeDecision,
+    decided_by: Option<&str>,
+) -> Result<MergeProposal> {
     let proposal = find(db, id)?;
-    merge_nodes(db, &proposal.keep.id, &proposal.drop.id)?;
+    if decision == MergeDecision::Accept {
+        merge_nodes(db, &proposal.keep.id, &proposal.drop.id)?;
+    }
     db.connection().execute(
-        "UPDATE _quack_graph_merges SET status = 'accepted', decided_by = ?, decided_at = now() WHERE id = ?",
-        duckdb::params![decided_by, proposal.id],
-    )?;
-    Ok(proposal)
-}
-
-/// Decline a proposed merge; it is not proposed again.
-///
-/// # Errors
-///
-/// Returns an error when the proposal is not pending.
-pub fn reject(db: &WorkspaceDb, id: &str, decided_by: Option<&str>) -> Result<MergeProposal> {
-    let proposal = find(db, id)?;
-    db.connection().execute(
-        "UPDATE _quack_graph_merges SET status = 'rejected', decided_by = ?, decided_at = now() WHERE id = ?",
-        duckdb::params![decided_by, proposal.id],
+        "UPDATE _quack_graph_merges SET status = ?, decided_by = ?, decided_at = now() WHERE id = ?",
+        duckdb::params![decision.status(), decided_by, proposal.id],
     )?;
     Ok(proposal)
 }

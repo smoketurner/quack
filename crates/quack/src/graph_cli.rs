@@ -178,13 +178,13 @@ fn run_quick(db: &WorkspaceDb, action: GraphAction, out: &mut impl Write) -> Res
         }
         GraphAction::Merge { ids } => {
             for id in &ids {
-                let m = resolve::accept(db, id, None)?;
+                let m = resolve::decide(db, id, resolve::MergeDecision::Accept, None)?;
                 writeln!(out, "Merged {} into {}.", m.drop.label, m.keep.label)?;
             }
         }
         GraphAction::Reject { ids } => {
             for id in &ids {
-                let m = resolve::reject(db, id, None)?;
+                let m = resolve::decide(db, id, resolve::MergeDecision::Reject, None)?;
                 writeln!(out, "Kept {} and {} apart.", m.keep.label, m.drop.label)?;
             }
         }

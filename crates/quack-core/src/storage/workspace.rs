@@ -2038,20 +2038,7 @@ impl DocumentStatus {
     }
 }
 
-impl duckdb::ToSql for DocumentStatus {
-    fn to_sql(&self) -> duckdb::Result<duckdb::types::ToSqlOutput<'_>> {
-        Ok(duckdb::types::ToSqlOutput::from(self.as_str()))
-    }
-}
-
-impl duckdb::types::FromSql for DocumentStatus {
-    fn column_result(value: duckdb::types::ValueRef<'_>) -> duckdb::types::FromSqlResult<Self> {
-        value
-            .as_str()?
-            .parse()
-            .map_err(|e: Error| duckdb::types::FromSqlError::Other(Box::new(e)))
-    }
-}
+text_enum_sql!(DocumentStatus);
 
 /// Document metadata row.
 #[derive(Debug, Clone, serde::Serialize)]

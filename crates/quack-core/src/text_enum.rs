@@ -2,6 +2,29 @@
 //! typed at a prompt, or sent over the API: `as_str`, `Display`, `FromStr`,
 //! and `ALL`, generated from a single list so the four cannot disagree.
 
+/// Store a [`text_enum!`] enum in a `DuckDB` column as its text form: bound
+/// as a parameter, and read back through `FromStr`, so an unknown stored
+/// value is a conversion error rather than a guess.
+macro_rules! text_enum_sql {
+    ($name:ident) => {
+        impl ::duckdb::ToSql for $name {
+            fn to_sql(&self) -> ::duckdb::Result<::duckdb::types::ToSqlOutput<'_>> {
+                Ok(::duckdb::types::ToSqlOutput::from(self.as_str()))
+            }
+        }
+
+        impl ::duckdb::types::FromSql for $name {
+            fn column_result(
+                value: ::duckdb::types::ValueRef<'_>,
+            ) -> ::duckdb::types::FromSqlResult<Self> {
+                value.as_str()?.parse().map_err(|e: $crate::error::Error| {
+                    ::duckdb::types::FromSqlError::Other(Box::new(e))
+                })
+            }
+        }
+    };
+}
+
 /// Implement `as_str`, `ALL`, `Display`, and `FromStr` for a fieldless,
 /// `Copy` enum from its variants' text forms, which must be the names its
 /// serde attributes give. Parsing trims and ignores ASCII case; anything
@@ -61,6 +84,7 @@ mod tests {
 
     use crate::analysis::chart::ChartKind;
     use crate::error::Error;
+    use crate::graph::resolve::{MergeDecision, MergeStatus};
     use crate::ontology::PropertyType;
     use crate::storage::control::{Channel, Outcome, Role, Scope};
     use crate::storage::sessions::{ChatMode, MessageRole};
@@ -101,6 +125,8 @@ mod tests {
         round_trips(PropertyType::ALL);
         round_trips(DocumentSource::ALL);
         round_trips(DocumentStatus::ALL);
+        round_trips(MergeStatus::ALL);
+        round_trips(MergeDecision::ALL);
     }
 
     #[test]

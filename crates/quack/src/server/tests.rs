@@ -2870,13 +2870,13 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
             Some(serde_json::json!({ "action": "acept" })),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let (status, _, headers) = h
         .form(&format!("/w/{ws}/graph/merges/nope"), None, "action=acept")
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
-        location(&headers).contains("must"),
+        location(&headers).contains("unknown+merge+decision"),
         "{}",
         location(&headers)
     );

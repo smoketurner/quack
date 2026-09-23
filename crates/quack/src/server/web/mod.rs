@@ -2626,17 +2626,22 @@ async fn graph_merge_decide(
     Form(form): Form<MergeForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let action = match form.action.parse::<graph_api::MergeAction>() {
-        Ok(action) => action,
+    // Parsed rather than extracted, so a bad value comes back as a notice
+    // on the page instead of an error page.
+    let decision = match form.action.parse::<resolve::MergeDecision>() {
+        Ok(decision) => decision,
         Err(e) => {
-            let target = format!("/w/{id}/graph?error={}", urlencoded(&e.message));
+            let target = format!("/w/{id}/graph?error={}", urlencoded(&e.to_string()));
             return Ok(Redirect::to(&target).into_response());
         }
     };
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
     let merge_id = mid.clone();
-    let outcome = with_db(db, move |db| action.apply(db, &merge_id, Some(&author))).await;
+    let outcome = with_db(db, move |db| {
+        resolve::decide(db, &merge_id, decision, Some(&author))
+    })
+    .await;
     let target = match outcome {
         Ok(proposal) => {
             access
@@ -2645,7 +2650,7 @@ async fn graph_merge_decide(
                     "graph_merge",
                     Some(("graph_merge", &mid)),
                     Outcome::Allowed,
-                    Some(serde_json::json!({ "accept": action == graph_api::MergeAction::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
+                    Some(serde_json::json!({ "accept": decision == resolve::MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
                 )
                 .await?;
             format!("/w/{id}/graph")
