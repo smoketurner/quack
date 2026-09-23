@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 
 use toml::{Table, Value as TomlValue};
 
+use crate::embedding::ResolvedPrompts;
+use crate::embedding::presets::Family;
+
 use super::{
     AuthMode, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, config_file_path,
     default_redirect_uri,
@@ -267,6 +270,10 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "embedding",
+        &["query_prefix", "document_prefix", "similarity_prefix"],
+    ),
+    (
         "retrieval",
         &[
             "top_k",
@@ -371,6 +378,7 @@ fn collect(config: &Config, file: Option<&Table>, in_force: bool) -> Vec<Setting
     general(&mut inventory, config, &defaults);
     providers(&mut inventory, config);
     ingestion(&mut inventory, config, &defaults);
+    embedding(&mut inventory, config);
     retrieval(&mut inventory, config, &defaults);
     context(&mut inventory, config, &defaults);
     analysis(&mut inventory, config, &defaults);
@@ -481,6 +489,39 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         ingestion.upload_max_mb,
         default.upload_max_mb,
     );
+}
+
+/// The prefix in force for each role: the file's, else the built-in one
+/// for the configured model's family, which is also the default shown.
+fn embedding(inventory: &mut Inventory<'_>, config: &Config) {
+    let model = config
+        .general
+        .embedding_model
+        .as_deref()
+        .and_then(|spec| spec.split_once('/'))
+        .map_or("", |(_, model)| model);
+    let prompts = ResolvedPrompts::for_model(config, model).prompts;
+    let builtin = Family::of(model).map(Family::prompts);
+    let mut s = inventory.section("embedding");
+    for (key, value, default) in [
+        (
+            "query_prefix",
+            prompts.query,
+            builtin.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "document_prefix",
+            prompts.document,
+            builtin.as_ref().map(|p| p.document.clone()),
+        ),
+        (
+            "similarity_prefix",
+            prompts.similarity,
+            builtin.as_ref().map(|p| p.similarity.clone()),
+        ),
+    ] {
+        s.optional(key, Some(quoted(&value)), default.as_deref().map(quoted));
+    }
 }
 
 fn retrieval(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {

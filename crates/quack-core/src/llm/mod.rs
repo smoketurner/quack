@@ -20,6 +20,7 @@ use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::config_file_path;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
+use crate::embedding::{Embedder, Input, Profile};
 use crate::error::{Error, Result};
 use crate::graph::extract as graph_extract;
 use crate::ontology::{Ontology, documents};
@@ -151,6 +152,10 @@ impl EmbeddingModel for OllamaEmbedder {
     }
 }
 
+/// The configured embedding model under the configured profile: what every
+/// interface embeds with.
+pub type Embeddings = Embedder<EmbedModel>;
+
 /// Embedding model over every provider that supports embeddings.
 #[derive(Clone)]
 pub enum EmbedModel {
@@ -212,6 +217,10 @@ impl EmbeddingModel for EmbedModel {
         &self,
         texts: impl IntoIterator<Item = String> + Send,
     ) -> std::result::Result<Vec<Embedding>, EmbeddingError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "dispatch to the provider's model; callers reach this through an Embedder role"
+        )]
         match self {
             Self::Ollama(m) => m.embed_texts(texts).await,
             Self::OpenAi(m) => m.embed_texts(texts).await,
@@ -426,7 +435,7 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn documents::Extrac
 ///
 /// Returns an error when embedding fails.
 pub async fn name_similarity(
-    model: &EmbedModel,
+    embedder: &Embeddings,
     names: &[String],
     threshold: f64,
 ) -> Result<std::collections::HashMap<(String, String), bool>> {
@@ -434,11 +443,11 @@ pub async fn name_similarity(
     if names.len() < 2 {
         return Ok(out);
     }
-    let embeddings = model
-        .embed_texts(names.iter().map(|n| n.replace('_', " ")))
-        .await
-        .map_err(|e| Error::Embedding(e.to_string()))?;
-    let vectors: Vec<Vec<f64>> = embeddings.into_iter().map(|e| e.vec).collect();
+    let inputs: Vec<Input> = names
+        .iter()
+        .map(|n| Input::Similarity(n.replace('_', " ")))
+        .collect();
+    let vectors = embedder.embed(&inputs).await?;
     for (i, a) in names.iter().enumerate() {
         for (j, b) in names.iter().enumerate() {
             if i == j {
@@ -453,29 +462,19 @@ pub async fn name_similarity(
     Ok(out)
 }
 
-fn cosine(a: &[f64], b: &[f64]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     if na == 0.0 || nb == 0.0 {
         0.0
     } else {
         dot / (na * nb)
     }
-}
-
-/// Embed one query string as `f32`s, the width stored in the workspace.
-///
-/// # Errors
-///
-/// Returns an error when the provider call fails.
-pub async fn embed_query(model: &EmbedModel, text: &str) -> Result<Vec<f32>> {
-    // A query embedding is a lookup someone is waiting on.
-    let embedding = with_priority(Priority::Interactive, model.embed_text(text))
-        .await
-        .map_err(|e| Error::Embedding(e.to_string()))?;
-    #[expect(clippy::cast_possible_truncation, reason = "stored vectors are f32")]
-    Ok(embedding.vec.into_iter().map(|v| v as f32).collect())
 }
 
 /// The bearer credential for a provider, according to its `auth` mode: none,
@@ -703,13 +702,18 @@ async fn build_embed_model(config: &Config, model: ModelRef<'_>) -> Result<Embed
 /// # Errors
 ///
 /// Returns an error if the reference or provider is invalid.
-pub async fn optional_embedding_model(config: &Config) -> Result<Option<EmbedModel>> {
-    let Some(model) = config.embedding_model_ref()? else {
+pub async fn optional_embedding_model(config: &Config) -> Result<Option<Embeddings>> {
+    let (Some(model), Some(profile)) =
+        (config.embedding_model_ref()?, Profile::from_config(config)?)
+    else {
         tracing::info!("no embedding model configured");
         return Ok(None);
     };
     tracing::info!(model = %model, "using embedding model");
-    build_embed_model(config, model).await.map(Some)
+    Ok(Some(Embedder::new(
+        build_embed_model(config, model).await?,
+        profile,
+    )))
 }
 
 /// The configured embedding model, required.
@@ -717,15 +721,13 @@ pub async fn optional_embedding_model(config: &Config) -> Result<Option<EmbedMod
 /// # Errors
 ///
 /// Returns an error if `[general].embedding_model` is unset or invalid.
-pub async fn required_embedding_model(config: &Config) -> Result<EmbedModel> {
-    let model = config.embedding_model_ref()?.ok_or_else(|| {
+pub async fn required_embedding_model(config: &Config) -> Result<Embeddings> {
+    optional_embedding_model(config).await?.ok_or_else(|| {
         Error::Config(format!(
             "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
             config_file_path().display()
         ))
-    })?;
-    tracing::info!(model = %model, "using embedding model");
-    build_embed_model(config, model).await
+    })
 }
 
 /// `provider/model` for status lines, or a placeholder.
@@ -882,7 +884,7 @@ async fn dispatch(
     db: SharedDb,
     reader_db: ReaderDb,
     chat: ModelRef<'_>,
-    embedding_model: Option<EmbedModel>,
+    embedding_model: Option<Embeddings>,
     policy: WritePolicy,
     prompt: PromptOptions,
     history: Vec<rig::message::Message>,
@@ -957,6 +959,7 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
 
     fn parse(toml_text: &str) -> Config {
         match Config::parse(toml_text) {
@@ -1012,7 +1015,7 @@ mod tests {
             "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n",
         );
         let model = required_embedding_model(&config).await;
-        assert!(model.is_ok_and(|m| m.ndims() == 4));
+        assert!(model.is_ok_and(|m| m.profile().dimension == Dimension::new(4)));
     }
 
     #[tokio::test]
@@ -1021,7 +1024,7 @@ mod tests {
             "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n[ingestion]\nchunk_size_tokens = 3000\n",
         );
         let model = required_embedding_model(&config).await;
-        let Ok(EmbedModel::Ollama(embedder)) = model else {
+        let Some(EmbedModel::Ollama(embedder)) = model.as_ref().ok().map(Embedder::model) else {
             fail("expected the Ollama embedder")
         };
         let body = embedder.request_body(&[String::from("a chunk")]);

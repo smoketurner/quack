@@ -7,6 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::embedding::{Input, Vector};
 use quack_core::graph::{GraphResult, GraphStatus};
 use quack_core::graph::{extract, resolve, store as graph_store, tables, traverse};
 use quack_core::llm;
@@ -227,7 +228,7 @@ async fn run_search(
     let result = match (entity, class) {
         (None, None) => anyhow::bail!("give an entity, --class CLASS, or both"),
         (Some(entity), class) => {
-            let embedding = query_embedding(config, entity).await?;
+            let embedding = entity_embedding(config, entity).await?;
             let (name, class_id) = (entity.to_owned(), class.map(str::to_owned));
             let roots = db
                 .run(move |db| {
@@ -270,8 +271,8 @@ async fn run_path(
         return Ok(());
     };
     let options = config.graph.options();
-    let a = query_embedding(config, &from).await?;
-    let b = query_embedding(config, &to).await?;
+    let a = entity_embedding(config, &from).await?;
+    let b = entity_embedding(config, &to).await?;
     let (from_name, to_name) = (from.clone(), to.clone());
     let from_nodes = db
         .run(move |db| traverse::resolve_entry(db, &from_name, None, a.as_deref()))
@@ -411,7 +412,7 @@ pub(crate) fn rendered(
     Ok(buf)
 }
 
-fn confirm(out: &mut impl Write) -> Result<bool> {
+pub(crate) fn confirm(out: &mut impl Write) -> Result<bool> {
     write!(out, "Proceed? [y/N] ")?;
     out.flush()?;
     let mut answer = String::new();
@@ -421,11 +422,12 @@ fn confirm(out: &mut impl Write) -> Result<bool> {
 
 /// `None` without an embedding model; a failing model is an error, not a
 /// silent fall-back to exact matches.
-async fn query_embedding(config: &Config, text: &str) -> Result<Option<Vec<f32>>> {
+async fn entity_embedding(config: &Config, text: &str) -> Result<Option<Vector>> {
     let Some(model) = llm::optional_embedding_model(config).await? else {
         return Ok(None);
     };
-    Ok(Some(llm::embed_query(&model, text).await?))
+    let input = Input::Similarity(text.to_owned());
+    Ok(Some(model.embed_interactive(&input).await?))
 }
 
 fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Result<()> {

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{AuthMode, Config, ModelRef, ProviderType};
+use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::llm::{OllamaRunningModels, oauth};
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -368,6 +369,12 @@ async fn check_workspace(
                     plural(documents, "document")
                 ),
             ));
+            if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
+                report.push(
+                    Check::new("workspace", Status::Warn, format!("'{name}': {note}"))
+                        .fix(format!("quack embeddings refresh -w {name}")),
+                );
+            }
         }
         Err(e) => {
             let message = e.to_string();
@@ -387,11 +394,7 @@ async fn check_workspace(
                         Status::Fail,
                         format!("'{name}' does not open: {message}"),
                     )
-                    .fix(if message.contains("dimension") {
-                        "the workspace's vectors were made by another embedding model; set the one it was built with, or re-ingest into a new workspace"
-                    } else {
-                        "check the file under the data directory, or restore a backup"
-                    }),
+                    .fix("check the file under the data directory, or restore a backup"),
                 );
             }
         }
@@ -441,9 +444,140 @@ async fn check_embedding_model(
                  \"ollama/nomic-embed-text\" with embedding_dimension = 768 on the provider",
             ),
         ),
-        Ok(Some(model)) => check_model(report, "embeddings", config, model, http).await,
+        Ok(Some(model)) => {
+            check_model(report, "embeddings", config, model, http).await;
+            report.push(prompts_check(config, model));
+            if let (Some(http), ProviderType::Ollama, Some(configured)) = (
+                http,
+                model.provider.provider_type,
+                model.provider.embedding_dimension,
+            ) {
+                let base = model
+                    .provider
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| OLLAMA_DEFAULT_URL.to_owned());
+                let show = OllamaShow::fetch(http, &base, model.model).await;
+                if let Some(check) = width_check(model, configured, show) {
+                    report.push(check);
+                }
+            }
+        }
         Err(e) => report.push(Check::new("embeddings", Status::Fail, e.to_string())),
     }
+}
+
+/// Which input prefixes the embedding model gets, and where they come
+/// from.
+fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
+    let ResolvedPrompts { prompts, source } = ResolvedPrompts::for_model(config, model.model);
+    match source {
+        PromptSource::Family(family) if prompts.is_empty() => Check::new(
+            "embeddings",
+            Status::Ok,
+            format!(
+                "{model}: {} takes no input prefixes ({})",
+                family.name, family.source
+            ),
+        ),
+        PromptSource::Family(family) => Check::new(
+            "embeddings",
+            Status::Ok,
+            format!(
+                "{model}: the query, document, and similarity prefixes {} was trained with ({})",
+                family.name, family.source
+            ),
+        ),
+        PromptSource::Config => Check::new(
+            "embeddings",
+            Status::Ok,
+            format!("{model}: input prefixes from [embedding]"),
+        ),
+        PromptSource::Unknown => Check::new(
+            "embeddings",
+            Status::Info,
+            format!("{model}: quack knows no input prefixes for this model, so it gets none"),
+        )
+        .fix(
+            "if its model card names query or document prefixes, set query_prefix, \
+             document_prefix, and similarity_prefix under [embedding]",
+        ),
+    }
+}
+
+/// What Ollama's `/api/show` says about a model, read from its metadata
+/// without loading it.
+#[derive(serde::Deserialize)]
+struct OllamaShow {
+    #[serde(default)]
+    model_info: serde_json::Map<String, serde_json::Value>,
+}
+
+impl OllamaShow {
+    async fn fetch(
+        http: &reqwest::Client,
+        base: &str,
+        model: &str,
+    ) -> std::result::Result<Self, Probe> {
+        let url = format!(
+            "{}/api/show",
+            base.trim_end_matches('/').trim_end_matches("/v1")
+        );
+        let response = http
+            .post(url)
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .map_err(|e| Probe::Unreachable(error_chain(&e)))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| Probe::Unexpected(error_chain(&e)))
+    }
+
+    /// The model's vector width: `<architecture>.embedding_length`.
+    fn embedding_length(&self) -> Option<u32> {
+        self.model_info
+            .iter()
+            .find(|(key, _)| key.ends_with(".embedding_length"))
+            .and_then(|(_, value)| value.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    }
+}
+
+/// Whether the configured width is the one the model makes. `None` when
+/// the probe could not tell; `check_model` already reported an
+/// unreachable provider or a missing model.
+fn width_check(
+    model: ModelRef<'_>,
+    configured: u32,
+    show: std::result::Result<OllamaShow, Probe>,
+) -> Option<Check> {
+    let reported = show.ok()?.embedding_length()?;
+    Some(if reported == configured {
+        Check::new(
+            "embeddings",
+            Status::Ok,
+            format!("{model}: makes {reported}-dimensional vectors, as embedding_dimension says"),
+        )
+    } else {
+        Check::new(
+            "embeddings",
+            Status::Fail,
+            format!(
+                "{model}: makes {reported}-dimensional vectors but embedding_dimension is \
+                 {configured}; every embedding call fails until they agree"
+            ),
+        )
+        .fix(format!(
+            "set embedding_dimension = {reported} under [providers.{}]",
+            model.provider_name
+        ))
+    })
 }
 
 /// Credentials, transport, and whether the provider serves the model.
@@ -857,6 +991,75 @@ fn plural(n: usize, noun: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn embedding_config(model: &str, extra: &str) -> Config {
+        let config: Config = toml::from_str(&format!(
+            "[general]\nembedding_model = \"o/{model}\"\n[providers.o]\ntype = \"ollama\"\n\
+             embedding_dimension = 1024\n{extra}"
+        ))
+        .unwrap();
+        config
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn the_width_probe_names_the_fix_when_the_model_disagrees() {
+        let config = embedding_config("embeddinggemma", "");
+        let model = config.embedding_model_ref().unwrap().unwrap();
+        let show =
+            |json: serde_json::Value| -> OllamaShow { serde_json::from_value(json).unwrap() };
+        let gemma = || {
+            show(serde_json::json!({
+                "model_info": { "general.architecture": "gemma3", "gemma3.embedding_length": 768 }
+            }))
+        };
+        assert_eq!(gemma().embedding_length(), Some(768));
+
+        let wrong = width_check(model, 1024, Ok(gemma())).unwrap();
+        assert_eq!(wrong.status, Status::Fail);
+        assert!(
+            wrong.summary.contains("768-dimensional"),
+            "{}",
+            wrong.summary
+        );
+        assert_eq!(
+            wrong.fix.as_deref(),
+            Some("set embedding_dimension = 768 under [providers.o]")
+        );
+        assert_eq!(
+            width_check(model, 768, Ok(gemma())).unwrap().status,
+            Status::Ok
+        );
+        assert!(width_check(model, 768, Ok(show(serde_json::json!({})))).is_none());
+        assert!(width_check(model, 768, Err(Probe::Rejected(401))).is_none());
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn the_prompts_check_says_where_the_prefixes_come_from() {
+        for (model, extra, status, words) in [
+            (
+                "embeddinggemma",
+                "",
+                Status::Ok,
+                "EmbeddingGemma was trained with",
+            ),
+            ("all-minilm", "", Status::Ok, "takes no input prefixes"),
+            (
+                "embeddinggemma",
+                "[embedding]\nquery_prefix = \"q: \"\n",
+                Status::Ok,
+                "from [embedding]",
+            ),
+            ("my-embedder", "", Status::Info, "knows no input prefixes"),
+        ] {
+            let config = embedding_config(model, extra);
+            let check = prompts_check(&config, config.embedding_model_ref().unwrap().unwrap());
+            assert_eq!(check.status, status, "{model}");
+            assert!(check.summary.contains(words), "{}", check.summary);
+        }
+    }
 
     fn inspection(dir: &Path, toml: Option<&str>) -> Inspection {
         let mut inspection = Inspection::of(dir.join("config.toml"), toml);

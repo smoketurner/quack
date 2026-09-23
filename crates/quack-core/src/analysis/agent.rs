@@ -5,6 +5,7 @@ use rig::prelude::*;
 use rig::streaming::StreamedAssistantContent;
 
 use crate::config::{AnalysisConfig, RerankMode, RetrievalConfig};
+use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 
 use super::chart::ChartSpec;
@@ -183,7 +184,7 @@ pub async fn run_analysis<M>(
     db: SharedDb,
     reader_db: ReaderDb,
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: Option<M>,
+    embedding_model: Option<Embedder<M>>,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     graph_options: GraphOptions,
@@ -231,7 +232,7 @@ where
 fn search_tool<M>(
     reader_db: ReaderDb,
     completion_model: &(impl rig::completion::CompletionModel + Clone + 'static),
-    embedding_model: Option<M>,
+    embedding_model: Option<Embedder<M>>,
     retrieval_config: &RetrievalConfig,
     recorder: &TurnRecorder,
 ) -> SearchDocumentsTool<M> {
@@ -283,7 +284,7 @@ async fn run_inner<M>(
     shared_db: SharedDb,
     reader_db: ReaderDb,
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: Option<M>,
+    embedding_model: Option<Embedder<M>>,
     analysis_config: &AnalysisConfig,
     retrieval_config: &RetrievalConfig,
     graph_options: GraphOptions,
@@ -529,7 +530,7 @@ struct BuildContext<'a> {
 /// The rig agent with every tool this workspace and mode register.
 fn build_agent<M>(
     completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: Option<M>,
+    embedding_model: Option<Embedder<M>>,
     system_prompt: &str,
     ctx: &BuildContext<'_>,
 ) -> Result<rig::agent::Agent>

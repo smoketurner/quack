@@ -4,6 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod admin;
 mod config_cli;
 mod doctor_cli;
+mod embeddings_cli;
 mod graph_cli;
 mod mcp;
 mod ontology_cli;
@@ -28,6 +29,7 @@ use quack_core::llm::oauth::{LoginOptions, LoginPrompt};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store as ontology_store;
 use quack_core::ontology::{Ontology, candidates};
+use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
@@ -313,6 +315,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// The workspace's vectors: refresh the ones made with another
+    /// embedding model, width, or input prefixes
+    Embeddings {
+        #[command(subcommand)]
+        action: embeddings_cli::EmbeddingsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -515,6 +524,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Ontology { action } => run_ontology(cli, action).await,
         Commands::Graph { action } => run_graph(cli, action).await,
+        Commands::Embeddings { action } => run_embeddings(cli, action).await,
         Commands::Okf {
             action: OkfAction::Export { dir },
         } => run_okf_export(cli, &dir).await,
@@ -625,7 +635,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
             return Ok(ExitCode::from(EXIT_USAGE));
         }
     };
-    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, workspace_name) = resolve_workspace(cli.workspace.as_deref()).await?;
     // Checked before the workspace opens, so a missing model is one line
     // on stderr rather than a failed turn, and leaves no session behind.
     if let Err(e) = config.chat_model_ref() {
@@ -635,6 +645,9 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     load_piped_stdin(&config, &ws_db, &workspace.id, cli.stdin).await?;
+    if let Some(note) = ws_db.embedding_status()?.note() {
+        tracing::warn!("{note} Run `quack embeddings refresh -w {workspace_name}` to update them.");
+    }
     let session_id = resolve_session(
         &config,
         &ws_db,
@@ -789,6 +802,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Mcp { .. }
         | Commands::Config { .. }
         | Commands::Doctor { .. }
+        | Commands::Embeddings { .. }
         | Commands::Docs { .. } => Ok(()),
     }
 }
@@ -820,6 +834,26 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
             action,
             &mut out,
             &ontology_cli::chunk_progress,
+        )
+        .await,
+    )
+}
+
+async fn run_embeddings(cli: &Cli, action: embeddings_cli::EmbeddingsAction) -> Result<ExitCode> {
+    let ws_db = open_writer(cli).await?;
+    let config = Config::load().context("failed to load configuration")?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    exit_after(
+        embeddings_cli::run(
+            &config,
+            &ws_db,
+            action,
+            &mut out,
+            RunControl {
+                progress: &embeddings_cli::print_progress,
+                cancel: None,
+            },
         )
         .await,
     )

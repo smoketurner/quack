@@ -42,6 +42,7 @@ pub(crate) async fn run(
         allow_write,
     );
     tui_app.load_current_session().await?;
+    tui_app.note_embedding_status().await?;
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     // Mouse capture for wheel scrolling; ratatui's restore does not undo

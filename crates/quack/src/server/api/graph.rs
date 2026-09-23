@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use quack_core::embedding::{Input, Vector};
 use quack_core::graph::{
     GraphOptions, GraphResult, extract, resolve, store as graph_store, tables, traverse,
 };
@@ -34,11 +35,12 @@ pub(crate) struct SearchQuery {
 /// A label's embedding for fuzzy entity resolution, when a model exists.
 /// The text's embedding for fuzzy entry: `None` when no embedding model
 /// is configured, an error when the model fails.
-pub(crate) async fn query_embedding_for(app: &App, text: &str) -> ApiResult<Option<Vec<f32>>> {
+pub(crate) async fn entity_embedding(app: &App, text: &str) -> ApiResult<Option<Vector>> {
     let Some(model) = llm::optional_embedding_model(&app.config).await? else {
         return Ok(None);
     };
-    Ok(Some(llm::embed_query(&model, text).await?))
+    let input = Input::Similarity(text.to_owned());
+    Ok(Some(model.embed_interactive(&input).await?))
 }
 
 pub(crate) async fn search(
@@ -64,7 +66,7 @@ pub(crate) async fn search(
         return Err(ApiError::bad_request("give entity, class, or both"));
     }
     let embedding = match &entity {
-        Some(e) => query_embedding_for(&app, e).await?,
+        Some(e) => entity_embedding(&app, e).await?,
         None => None,
     };
     let hops = q.hops.unwrap_or(2).max(1);
@@ -114,8 +116,8 @@ pub(crate) async fn path(
     if from.is_empty() || to.is_empty() {
         return Err(ApiError::bad_request("from and to are both needed"));
     }
-    let a = query_embedding_for(&app, &from).await?;
-    let b = query_embedding_for(&app, &to).await?;
+    let a = entity_embedding(&app, &from).await?;
+    let b = entity_embedding(&app, &to).await?;
     let max_hops = q.max_hops.unwrap_or(4).max(1);
     let options = app.config.graph.options();
     let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
@@ -334,7 +336,7 @@ struct DocumentJob {
     extractor: Box<dyn extract::GraphExtractor>,
     ontology: Ontology,
     provisional: bool,
-    embeddings: Option<llm::EmbedModel>,
+    embeddings: Option<llm::Embeddings>,
     /// Freed when the pass ends.
     slot: crate::server::state::ExtractionSlot,
     options: GraphOptions,

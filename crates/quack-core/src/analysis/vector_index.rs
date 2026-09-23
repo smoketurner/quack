@@ -4,19 +4,29 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::tools::ReaderDb;
+use crate::embedding::{Embedder, Input, Vector};
 use crate::storage::workspace::ChunkScope;
 
 pub struct DuckDbVectorIndex<M> {
     db: ReaderDb,
-    embedding_model: M,
+    embedder: Embedder<M>,
 }
 
 impl<M> DuckDbVectorIndex<M> {
-    pub fn new(db: ReaderDb, embedding_model: M) -> Self {
-        Self {
-            db,
-            embedding_model,
-        }
+    pub fn new(db: ReaderDb, embedder: Embedder<M>) -> Self {
+        Self { db, embedder }
+    }
+}
+
+impl<M> DuckDbVectorIndex<M>
+where
+    M: rig::embeddings::EmbeddingModel + Send + Sync,
+{
+    async fn query_vector(&self, query: &str) -> Result<Vector, VectorStoreError> {
+        self.embedder
+            .embed_one(&Input::Query(query.to_owned()))
+            .await
+            .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))
     }
 }
 
@@ -30,13 +40,7 @@ where
         &self,
         req: VectorSearchRequest<Self::Filter>,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let embedding = self.embedding_model.embed_text(req.query()).await?;
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
-        )]
-        let query_vec: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
+        let query_vec = self.query_vector(req.query()).await?;
 
         let samples = u32::try_from(req.samples()).unwrap_or(5);
 
@@ -65,13 +69,7 @@ where
         &self,
         req: VectorSearchRequest<Self::Filter>,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        let embedding = self.embedding_model.embed_text(req.query()).await?;
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
-        )]
-        let query_vec: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
+        let query_vec = self.query_vector(req.query()).await?;
 
         let samples = u32::try_from(req.samples()).unwrap_or(5);
 

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::induction::{Candidate, Proposal, snake_id};
 use super::{Class, Ontology, Property, PropertyType, Relation};
 use crate::error::{Error, Result};
-use crate::llm::{EmbedModel, name_similarity};
+use crate::llm::{Embeddings, name_similarity};
 use crate::progress::{ChunkDone, Progress};
 use crate::storage::workspace::WorkspaceDb;
 
@@ -242,7 +242,7 @@ pub async fn run(
     extractor: &dyn Extractor,
     current: Option<&Ontology>,
     options: &DocumentEvidenceOptions,
-    embeddings: Option<&EmbedModel>,
+    embeddings: Option<&Embeddings>,
     concurrency: u32,
     progress: Progress<'_>,
 ) -> Result<(Vec<Candidate>, RunSummary)> {

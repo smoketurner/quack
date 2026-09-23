@@ -28,6 +28,7 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     pub ingestion: IngestionConfig,
+    pub embedding: EmbeddingConfig,
     pub retrieval: RetrievalConfig,
     pub context: ContextConfig,
     pub analysis: AnalysisConfig,
@@ -412,6 +413,27 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self { max_tokens: 4000 }
     }
+}
+
+/// Overrides for the input prefixes the embedding model gets for each role
+/// (`quack_core::embedding`). Unset keeps the built-in prefix for the
+/// model's family; an empty string sends that role unprefixed. Changing
+/// one changes the embedding profile: stored vectors stop being searched
+/// until `quack embeddings refresh` brings them up to date.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the config keys, which read as `query_prefix = ...`"
+)]
+pub struct EmbeddingConfig {
+    /// Before a search query.
+    pub query_prefix: Option<String>,
+    /// Before a document chunk; `{title}` is replaced by the chunk's
+    /// heading, or `none` without one.
+    pub document_prefix: Option<String>,
+    /// Before texts compared with each other: entity labels and names.
+    pub similarity_prefix: Option<String>,
 }
 
 /// Document retrieval settings.

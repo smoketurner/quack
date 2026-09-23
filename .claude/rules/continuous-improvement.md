@@ -72,7 +72,9 @@ Features prone to silent breakage — live-test before any PR that touches them:
   pinned text, workspace context, permission rules; context truncated at
   `[context].max_tokens` with a visible note
 - Citation validation (every `[n]` maps to a chunk retrieved in that turn)
-- Embedding dimension recorded per workspace and checked on open
+- Embedding profile (model, width, role prefixes) recorded on every stored vector; vector
+  search, label matching, and merges use only the current profile's vectors; a width change
+  never drops vectors on open, only `quack embeddings refresh` does
 - DuckDB workspace isolation (each workspace gets its own database file)
 - aws-lc-rs default crypto provider installed exactly once at startup
 

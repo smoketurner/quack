@@ -15,12 +15,13 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use quack_core::config::Config;
+use quack_core::config::{AuthMode, Config, ProviderConfig, ProviderType};
 use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState};
 use quack_core::storage::control::{AuditFilter, AuditRow, ControlPlane, Role, Scope};
+use quack_core::storage::workspace::{NewChunk, NewDocument};
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -3487,5 +3488,178 @@ async fn the_jobs_page_follows_the_job_stream_with_the_session_cookie() {
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|t| t.starts_with("text/event-stream"))
+    );
+}
+
+/// Poll a job until it reaches a final state.
+async fn wait_for_job(h: &Harness, ws: &str, job: &str, token: &str) -> serde_json::Value {
+    for _ in 0..200 {
+        let (_, body) = h
+            .get(&format!("/api/v1/workspaces/{ws}/jobs/{job}"), token)
+            .await;
+        if matches!(
+            body["state"].as_str(),
+            Some("succeeded" | "failed" | "cancelled")
+        ) {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    fail("the job never finished")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
+    // An embedding model the job cannot reach: the refresh starts, then
+    // fails in the background with the provider's error.
+    let mut config = Config::default();
+    config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
+    config.providers.insert(
+        String::from("ollama"),
+        ProviderConfig {
+            provider_type: ProviderType::Ollama,
+            auth: AuthMode::None,
+            base_url: Some(String::from("http://127.0.0.1:9")),
+            api_key_env: None,
+            embedding_dimension: Some(4),
+            max_concurrent_requests: None,
+            oauth: None,
+        },
+    );
+    let h = harness_with(false, config).await;
+    let owner = h.user("owner", false).await;
+    let viewer = h.user("viewer", false).await;
+    let ws = h.workspace("vectors", &owner).await;
+    h.app
+        .control
+        .set_member(&ws, &viewer, Role::Viewer)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let owner_token = h.login("owner").await;
+    let viewer_token = h.login("viewer").await;
+    let base = format!("/api/v1/workspaces/{ws}/embeddings");
+
+    // Nothing stored yet: current, nothing to do.
+    let (status, body) = h.get(&base, &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["note"], serde_json::Value::Null, "{body}");
+    assert_eq!(body["status"]["profile"]["model"], "embeddinggemma");
+    let (status, body) = h
+        .post(
+            &format!("{base}/refresh"),
+            &owner_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "current", "{body}");
+
+    // One chunk whose vector was made under a profile the workspace never
+    // recorded.
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| {
+        db.insert_document(
+            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"),
+        )?;
+        db.insert_chunk(&NewChunk {
+            id: "c",
+            document_id: "d",
+            chunk_index: 0,
+            content: "levee report",
+            heading: None,
+            page: None,
+            embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+        })?;
+        db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+
+    let (status, body) = h.get(&base, &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stale_chunks"], 1, "{body}");
+    assert_eq!(body["plan"]["chunks"], 1, "{body}");
+    let note = body["note"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        note.contains("1 chunks were embedded with an unrecorded profile"),
+        "{note}"
+    );
+
+    // The page says so, with the button for someone who may write.
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents"), Some(&owner_token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("an unrecorded profile") && html.contains("/embeddings/refresh"),
+        "{html}"
+    );
+    let (_, html, _) = h
+        .page(&format!("/w/{ws}/documents"), Some(&viewer_token))
+        .await;
+    assert!(
+        html.contains("an unrecorded profile") && !html.contains("/embeddings/refresh"),
+        "{html}"
+    );
+
+    // A viewer may not start it.
+    let (status, _) = h
+        .post(
+            &format!("{base}/refresh"),
+            &viewer_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = h
+        .post(
+            &format!("{base}/refresh"),
+            &owner_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["plan"]["chunks"], 1, "{body}");
+    let job = body["job"].as_str().unwrap_or_default().to_owned();
+    let run = body["run"].as_str().unwrap_or_default().to_owned();
+    let last = wait_for_job(&h, &ws, &job, &owner_token).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert_eq!(last["kind"], "embeddings", "{last}");
+
+    // Both ends of the run are in the access audit, under its run id.
+    let rows = h
+        .audit(AuditFilter {
+            action: Some(String::from("embeddings_refresh")),
+            ..AuditFilter::default()
+        })
+        .await;
+    let for_run: Vec<&AuditRow> = rows
+        .iter()
+        .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
+        .collect();
+    assert_eq!(for_run.len(), 2, "{rows:?}");
+    assert!(for_run.iter().any(|r| r.outcome == "error"), "{rows:?}");
+    // The vector is still stale.
+    let (_, body) = h.get(&base, &viewer_token).await;
+    assert_eq!(body["stale_chunks"], 1, "{body}");
+
+    // The page's button starts another run and comes back with a notice.
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/embeddings/refresh"),
+            Some(&owner_token),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        location(&headers).contains("background"),
+        "{}",
+        location(&headers)
     );
 }

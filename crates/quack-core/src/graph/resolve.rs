@@ -4,10 +4,15 @@
 //! the rest wait in `_quack_graph_merges` for review.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
+
+use rig::embeddings::EmbeddingModel;
 
 use super::store::{self, id_list};
 use super::{GraphOptions, Node};
+use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
+use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{WorkspaceDb, tokenize};
 use crate::storage::writer::Writer;
 
@@ -36,40 +41,16 @@ pub struct ResolutionSummary {
 /// # Errors
 ///
 /// Returns an error when embedding or a write fails.
-pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
+pub async fn resolve<M: EmbeddingModel>(
     db: &Writer,
-    model: Option<&M>,
+    embedder: Option<&Embedder<M>>,
     options: &GraphOptions,
 ) -> Result<ResolutionSummary> {
     let mut summary = ResolutionSummary::default();
-    let Some(model) = model else {
+    let Some(embedder) = embedder else {
         return Ok(summary);
     };
-    loop {
-        let pending = db.run(|db| store::nodes_without_embedding(db, 64)).await?;
-        if pending.is_empty() {
-            break;
-        }
-        let inputs: Vec<String> = pending.iter().map(store::embedding_input).collect();
-        let embeddings = model
-            .embed_texts(inputs)
-            .await
-            .map_err(|e| Error::Embedding(e.to_string()))?;
-        let embedded = u32::try_from(pending.len()).unwrap_or(u32::MAX);
-        db.run(move |db| {
-            for (node, embedding) in pending.iter().zip(embeddings) {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "f64 -> f32 is acceptable for stored embeddings"
-                )]
-                let vector: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
-                store::set_node_embedding(db, &node.id, &vector)?;
-            }
-            Ok(())
-        })
-        .await?;
-        summary.embedded = summary.embedded.saturating_add(embedded);
-    }
+    summary.embedded = embed_nodes(db, embedder, RunControl::unobserved()).await?;
     let options = *options;
     let (auto_merged, proposed) = db
         .run(move |db| {
@@ -80,6 +61,74 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
     summary.auto_merged = auto_merged;
     summary.proposed = proposed;
     Ok(summary)
+}
+
+/// Label vectors embedded per model call.
+const NODE_BATCH: u32 = 64;
+
+/// Give every node whose label vector is missing or stale one made under
+/// the current profile, `NODE_BATCH` at a time; returns how many. Nothing
+/// is embedded while the workspace's vectors are another width (`refresh`
+/// retypes them first). Progress is reported after each batch; a cancel
+/// stops between batches.
+///
+/// # Errors
+///
+/// Returns an error when embedding or a write fails, or
+/// [`Error::Cancelled`](crate::error::Error::Cancelled).
+pub async fn embed_nodes<M: EmbeddingModel>(
+    db: &Writer,
+    embedder: &Embedder<M>,
+    control: RunControl<'_>,
+) -> Result<u32> {
+    let dimension = embedder.profile().dimension;
+    let total = db
+        .run(move |db| {
+            if db.embedding_dimension() == dimension {
+                store::count_nodes_needing_embedding(db).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+    let Some(total) = total else {
+        tracing::warn!(
+            "node label vectors not embedded: run `quack embeddings refresh` after the width change"
+        );
+        return Ok(0);
+    };
+    let started = Instant::now();
+    let mut embedded: u32 = 0;
+    loop {
+        control.check()?;
+        let batch_started = Instant::now();
+        let pending = db
+            .run(|db| store::nodes_needing_embedding(db, NODE_BATCH))
+            .await?;
+        if pending.is_empty() {
+            return Ok(embedded);
+        }
+        let inputs: Vec<Input> = pending.iter().map(Node::embedding_input).collect();
+        let vectors = embedder.embed(&inputs).await?;
+        let count = u32::try_from(pending.len()).unwrap_or(u32::MAX);
+        db.run(move |db| {
+            db.write_transaction(|db| {
+                for (node, vector) in pending.iter().zip(&vectors) {
+                    db.set_node_embedding(&node.id, vector)?;
+                }
+                Ok(())
+            })
+        })
+        .await?;
+        embedded = embedded.saturating_add(count);
+        (control.progress)(ChunkDone {
+            done: embedded,
+            total: total.max(embedded),
+            failed: 0,
+            took: batch_started.elapsed(),
+            elapsed: started.elapsed(),
+        });
+    }
 }
 
 /// Nearest same-class neighbours considered per node; bounds the work
@@ -116,7 +165,8 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
            SELECT id, label, class_id, embedding, \
                   EXISTS (SELECT 1 FROM _quack_provenance p \
                           WHERE p.subject_id = _quack_graph_nodes.id AND p.table_name <> '') AS keyed \
-           FROM _quack_graph_nodes WHERE embedding IS NOT NULL) \
+           FROM _quack_graph_nodes \
+           WHERE embedding IS NOT NULL AND embedding_profile IS NOT DISTINCT FROM ?) \
          SELECT a.id, a.label, b.id, b.label, \
                 array_cosine_distance(a.embedding, b.embedding) AS d, a.keyed, b.keyed \
          FROM n a JOIN n b ON a.class_id = b.class_id AND a.id < b.id \
@@ -124,7 +174,10 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
            AND array_cosine_distance(a.embedding, b.embedding) <= ? \
          ORDER BY d, a.id, b.id",
     )?;
-    let mut rows = stmt.query(duckdb::params![options.merge_threshold])?;
+    let mut rows = stmt.query(duckdb::params![
+        db.embedding_fingerprint(),
+        options.merge_threshold
+    ])?;
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen: BTreeMap<String, u32> = BTreeMap::new();
     while let Some(row) = rows.next()? {

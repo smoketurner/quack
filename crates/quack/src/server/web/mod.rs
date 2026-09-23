@@ -32,6 +32,7 @@ use rust_embed::Embed;
 use serde::Deserialize;
 
 use super::api::documents as docs_api;
+use super::api::embeddings as embeddings_api;
 use super::api::graph as graph_api;
 use super::api::query as query_api;
 use super::auth::{
@@ -40,6 +41,7 @@ use super::auth::{
 };
 use super::error::ApiError;
 use super::state::{App, with_db};
+use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::store as graph_store;
 use quack_core::graph::{GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse};
@@ -215,6 +217,8 @@ struct DocumentsPage {
     rows: String,
     error: Option<String>,
     notice: Option<String>,
+    /// Chunks found by keyword only until a refresh, when there are any.
+    embeddings_note: Option<String>,
 }
 
 #[derive(Template)]
@@ -462,6 +466,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
+        .route("/w/{id}/embeddings/refresh", post(refresh_embeddings))
         .route("/w/{id}/jobs", get(jobs_page))
         .route("/w/{id}/jobs/rows", get(job_rows))
         .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
@@ -965,12 +970,40 @@ async fn documents(
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "documents").await?;
     let rows = render_rows(&app, &access).await?;
+    let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
         page: page(&app, &access.identity, "Documents", Some(&access)),
         rows,
         error: q.error,
         notice: q.notice,
+        embeddings_note,
     })
+}
+
+/// The Documents page's refresh button: the API's refresh, then back
+/// to the page with what it started.
+async fn refresh_embeddings(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<String>,
+) -> WebResult<Response> {
+    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let target = match embeddings_api::start(&app, &access, &id).await {
+        Ok((_, body)) if body.get("status").and_then(|s| s.as_str()) == Some("running") => {
+            format!(
+                "/w/{id}/documents?notice={}",
+                urlencoded(
+                    "refreshing embeddings in the background; the Jobs page shows its progress"
+                )
+            )
+        }
+        Ok(_) => format!(
+            "/w/{id}/documents?notice={}",
+            urlencoded("every vector is already current")
+        ),
+        Err(e) => format!("/w/{id}/documents?error={}", urlencoded(&e.message)),
+    };
+    Ok(Redirect::to(&target).into_response())
 }
 
 async fn document_rows(
@@ -2297,14 +2330,14 @@ async fn graph_page(
     let embedding = if query.entity.is_empty() {
         None
     } else {
-        graph_api::query_embedding_for(&app, &query.entity).await?
+        graph_api::entity_embedding(&app, &query.entity).await?
     };
     let path_embeddings: Option<EndEmbeddings> = if query.from.is_empty() || query.to.is_empty() {
         None
     } else {
         Some((
-            graph_api::query_embedding_for(&app, &query.from).await?,
-            graph_api::query_embedding_for(&app, &query.to).await?,
+            graph_api::entity_embedding(&app, &query.from).await?,
+            graph_api::entity_embedding(&app, &query.to).await?,
         ))
     };
     let wanted = GraphQueryView {
@@ -2370,7 +2403,7 @@ type PageData = (
 /// Status, ontology presence, chunk count, merge queue, and the result of
 /// whatever the query asked for.
 /// The embeddings of a path query's two ends, when a model exists.
-type EndEmbeddings = (Option<Vec<f32>>, Option<Vec<f32>>);
+type EndEmbeddings = (Option<Vector>, Option<Vector>);
 
 fn graph_page_data(
     db: &WorkspaceDb,

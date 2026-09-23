@@ -91,6 +91,7 @@ cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore 
 cargo run --bin quack -- ontology propose [--extend] [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
 cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate | review | merges | merge ID..
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
+cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- config [--changed] [--json]                            # every recognized setting, its value and origin, the file's unknown keys, the env vars read
@@ -124,7 +125,7 @@ resources are limited where they are used. Every rig client is built over
 `llm::LimitedHttp`, which holds one permit of the process-wide gate for the provider and
 the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
-requests (`run_turn`, `embed_query`, via the `quack_core::priority` task-local) before
+requests (`run_turn`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
 background ones. The registry is in memory only (labels can be workspace content).
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
@@ -213,6 +214,20 @@ total it was capped from (`GraphResult::total_nodes`, `truncated`). Provenance t
 table renders as a predicate `run_sql` can run, since the mapping knows the key column. The
 tool guidance in the system prompt gains a numbered graph procedure whenever those tools
 are registered.
+
+Every embedding goes through `quack_core::embedding::Embedder` as an `Input`, which names
+its role: `Query` (search), `Document { title, text }` (a chunk under its heading), or
+`Similarity` (entity labels and names, ontology type names). It adds the input prefixes the
+model family was trained with (`presets::Family::of`, from each model card; `[embedding]`
+overrides any role, `ResolvedPrompts::for_model`) and returns `Vector`s checked against the
+profile's `Dimension`; `.clippy.toml` disallows rig's raw `embed_text`/`embed_texts`.
+Long runs take a `progress::RunControl` (progress plus cancel). The model, width, and
+prefixes are the `Profile`; every stored
+chunk and node vector carries its fingerprint (`embedding_profile`, profiles in
+`_quack_embedding_profiles`), and vector search, label matching, and merge proposals use
+only the current profile's vectors. Stale or missing vectors are found by keyword until
+`embedding::refresh::run` (`quack embeddings refresh`, `/embeddings refresh`, `POST .../embeddings/refresh`,
+the Documents page) embeds them again; a width change keeps the old vectors until then.
 
 Retrieval and the graph meet through `_quack_provenance`: `search_documents(entity)`
 resolves the name (the same entry-point resolution `search_graph` uses), narrows the search
