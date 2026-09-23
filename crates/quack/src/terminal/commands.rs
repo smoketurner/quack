@@ -558,13 +558,7 @@ mod tests {
         assert_eq!(words("/embeddings "), ["refresh"]);
         assert_eq!(
             words("/ontology propose --"),
-            [
-                "--extend",
-                "--auto-accept",
-                "--documents",
-                "--sample",
-                "--from"
-            ],
+            ["--auto-accept", "--documents", "--sample", "--from"],
             "--yes is implied in the terminal"
         );
         assert!(words("/ontology propose --documents --d").is_empty());
@@ -682,6 +676,11 @@ mod tests {
         assert!(!parses("/graph"));
         assert!(!parses("/mode fast"));
         assert!(!parses("/nothing"));
+        assert!(parses("/ontology propose --documents"));
+        assert!(
+            !parses("/ontology propose --extend"),
+            "propose has one behavior: what the ontology lacks"
+        );
         assert!(matches!(
             SlashLine::try_parse_from(["/graph", "merges"]).map(|l| l.command),
             Ok(SlashCommand::Graph {

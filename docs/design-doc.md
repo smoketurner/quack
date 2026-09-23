@@ -939,20 +939,22 @@ rename, merge into an existing class or relation, reparent, reject. Accepting wr
 ontology version. `PUT .../ontology/candidates/{id}` and `quack ontology accept ID...`
 apply the same actions from scripts; `POST .../ontology/candidates` with `{accept: [ids],
 reject: [ids]}` decides many at once, as the page's tick boxes do. The page shows fifty
-candidates at a time, pending or low-support (a filter link, never hidden). Extend mode
+candidates at a time, pending or low-support (a filter link, never hidden). A proposal
 treats a mapped table as covered: its rows belong to the class the mapping names, so no
 class or mapping is proposed for it, and a column its mapping already relates proposes no
 relation; new columns still propose properties.
 
 **Modes.**
 
-- `propose` (default): from an empty workspace, produce a full draft.
-- `propose --extend`: start from the current ontology and propose only additions and
-  reparents. This is also what the drift report triggers: constrained extraction counts
-  every type or relation the corpus tried to express that the ontology has no place for,
-  and once a count crosses a threshold the interfaces show "the corpus wants N things the
-  ontology lacks; propose extensions?".
-- `propose --from PACK`: seed from an imported domain pack, then extend from evidence.
+- `propose`: propose what the current ontology lacks. With no ontology that is a full
+  draft; afterwards it is only additions and reparents, so running it again never
+  re-queues what was already accepted. There is deliberately no mode that ignores the
+  current ontology: starting over is done with the version verbs (`init`, `import`,
+  `restore`), which keep every earlier version. This is also what the drift report
+  triggers: constrained extraction counts every type or relation the corpus tried to
+  express that the ontology has no place for, and once a count crosses a threshold the
+  interfaces show "the corpus wants N things the ontology lacks; propose extensions?".
+- `propose --from PACK`: seed from an imported domain pack, then propose what it lacks.
 - `--auto-accept`: accept the proposal and build the graph without review, for a first
   look. Everything built this way is marked `provisional` in the graph tables and the
   interfaces keep a banner up until someone reviews. Provisional graphs are excluded from
@@ -960,7 +962,7 @@ relation; new columns still propose properties.
 
 **Graph proposal follows the same loop.** After an ontology is accepted, constrained
 extraction over the full corpus builds the graph, entity resolution proposes merges for
-review, and drift feeds the next `propose --extend`. The loop is: propose from evidence,
+review, and drift feeds the next `propose`. The loop is: propose from evidence,
 review, extract, observe drift, propose again.
 
 ---
@@ -1390,7 +1392,7 @@ PUT    /api/v1/workspaces/{id}/ontology            import: validate, write a new
 POST   /api/v1/workspaces/{id}/ontology/init       the built-in default as version 1
 GET    /api/v1/workspaces/{id}/ontology/versions[?limit=20] | /{v}[?against=N] for a diff
 POST   /api/v1/workspaces/{id}/ontology/versions/{v}/restore
-POST   /api/v1/workspaces/{id}/ontology/propose    {mode: full|extend, sample?, auto_accept?, documents?} -> 202 with documents
+POST   /api/v1/workspaces/{id}/ontology/propose    {sample?, auto_accept?, documents?} -> 202 with documents
 GET    /api/v1/workspaces/{id}/ontology/candidates[?status=low_support]
 POST   /api/v1/workspaces/{id}/ontology/candidates {accept: [ids], reject: [ids]}
 PUT    /api/v1/workspaces/{id}/ontology/candidates/{cid}   {action: accept|rename|merge_into|reparent|reject, ...}
@@ -1512,7 +1514,7 @@ quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--tables-only|--documents-only]
             [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | reject ID..
-quack ontology show | init | propose [--extend] [--documents] [--from FILE] [--sample N]
+quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
               [--auto-accept] [-y] | review [--low-support]
               | accept ID... [--rename N|--merge-into ID|--reparent C] | reject ID...
               | export FILE | import FILE | versions | diff [FROM] [TO] | restore V
@@ -1979,8 +1981,10 @@ design to the tracker and is updated as issues close. Ordered by risk.
 4. ~~No ontology or induction~~ (#27, closed): the model, validation, versions with
    diff and restore, the built-in default, JSON import and export, table and document
    evidence into the review queue (accept, rename, merge, reparent, reject, auto-accept,
-   extend mode, `--from` seeding, low-support candidates), and the CLI, API, and web
-   page. Two deviations from 6.5: cluster names are chosen by frequency rather than a
+   proposals limited to what the current ontology lacks, `--from` seeding, low-support
+   candidates), and the CLI, API, and web page. The separate "full" and "extend" modes
+   were merged (#123): a full mode that ignored the current ontology only re-queued what
+   had been accepted, and it had never taken effect. Two deviations from 6.5: cluster names are chosen by frequency rather than a
    model naming pass, and drift counting arrives with constrained extraction in #28.
    YAML was dropped: JSON is the only interchange form. ~~No graph~~ (#28, closed):
    `quack_core::graph` with deterministic extraction from mapped tables, constrained
@@ -2096,7 +2100,7 @@ design to the tracker and is updated as issues close. Ordered by risk.
   and stale detection; JSON import and export
 - Ontology induction: deterministic proposals from tables, sampled open extraction from
   documents with vocabulary normalization and structure inference, evidence-backed
-  candidates with a review queue, extend mode driven by drift, domain-pack seeding,
+  candidates with a review queue, repeat proposals driven by drift, domain-pack seeding,
   auto-accept with provisional marking
 - Graph: ontology-guided extraction from documents, deterministic extraction from mapped
   tables, entity resolution with review queue, provenance, neighborhood / path / by-class
@@ -2158,7 +2162,7 @@ deployment for document chat is the end of step 8.
 9. ~~Ontology: tables, model, validation, default, versioning, JSON interchange, prompt
    rendering, editor page, API.~~ Done (#27; YAML was dropped for JSON).
 10. ~~Ontology induction: table evidence, document evidence, candidates, review queue,
-    extend mode and drift counting, auto-accept with provisional marking; CLI, API, and
+    repeat proposals and drift counting, auto-accept with provisional marking; CLI, API, and
     web hooks.~~ Done (#27), with the deviations in section 17 item 4.
 11. ~~Graph: extraction from documents and mapped tables, resolution, provenance, traversal,
     tools, TUI tree, web graph page, stale and provisional handling.~~ Done.

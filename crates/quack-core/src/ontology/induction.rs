@@ -279,8 +279,8 @@ fn overlap(db: &WorkspaceDb, table: &str, column: &str, other: &str, key: &str) 
 }
 
 /// Propose classes, properties, keys, relations, and mappings from every
-/// user table. With `current`, only what the ontology lacks is proposed
-/// (`propose --extend`).
+/// user table. With `current`, only what the ontology lacks is proposed;
+/// without one, a full draft.
 ///
 /// # Errors
 ///
@@ -302,7 +302,7 @@ pub fn propose_from_tables(
     Ok(candidates)
 }
 
-/// What the current ontology already has, so extend mode skips it.
+/// What the current ontology already has, so a proposal skips it.
 struct Known<'a>(Option<&'a Ontology>);
 
 impl Known<'_> {

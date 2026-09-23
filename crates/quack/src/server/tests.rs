@@ -1599,12 +1599,28 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["candidates"], serde_json::json!([]));
+    // Propose has one behavior: what the current ontology lacks. A caller
+    // asking for the old "full" mode is told so rather than silently served.
     let (status, body) = h
         .call(
             Method::POST,
             &format!("{base}/propose"),
             None,
-            Some(serde_json::json!({ "mode": "extend" })),
+            Some(serde_json::json!({ "mode": "full" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string()
+            .contains("only what the current ontology lacks"),
+        "{body}"
+    );
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({})),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");

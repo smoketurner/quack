@@ -178,7 +178,10 @@ pub(crate) async fn restore(
 
 #[derive(Deserialize, Default)]
 pub(crate) struct ProposeRequest {
-    /// `full` (default) or `extend`.
+    /// Propose always adds only what the current ontology lacks (a full draft
+    /// when there is none). `"extend"` names that and is accepted; any other
+    /// value, `"full"` included, is refused, so a caller that relied on
+    /// proposing over an existing ontology from scratch finds out.
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -203,13 +206,15 @@ pub(crate) async fn propose(
 ) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
-    let extend = match request.mode.as_deref() {
-        None | Some("full") => false,
-        Some("extend") => true,
-        Some(other) => return Err(ApiError::bad_request(format!("unknown mode '{other}'"))),
-    };
+    if let Some(mode) = request.mode.as_deref()
+        && mode != "extend"
+    {
+        return Err(ApiError::bad_request(format!(
+            "mode '{mode}' is not supported: propose always adds only what the current ontology lacks"
+        )));
+    }
     if request.documents {
-        let started = start_document_run(&app, &access, &id, extend, request.sample).await?;
+        let started = start_document_run(&app, &access, &id, request.sample).await?;
         return Ok((axum::http::StatusCode::ACCEPTED, started));
     }
     let options = app.config.ontology.table_evidence();
@@ -217,8 +222,7 @@ pub(crate) async fn propose(
     let author = access.identity.username.clone();
     let outcome = with_db(db, move |db| {
         let current = store::current(db)?;
-        let base = if extend { current.as_ref() } else { None };
-        let proposals = propose_from_tables(db, base.or(current.as_ref()), &options)?;
+        let proposals = propose_from_tables(db, current.as_ref(), &options)?;
         if proposals.is_empty() {
             return Ok((0, None, None));
         }
@@ -404,7 +408,6 @@ pub(crate) async fn start_document_run(
     app: &App,
     access: &Access,
     id: &str,
-    extend: bool,
     sample: Option<u32>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let mut options = app.config.ontology.document_evidence();
@@ -446,7 +449,6 @@ pub(crate) async fn start_document_run(
     let access = access.clone();
     let run_id = run.clone();
     let job = jobs.submit(spec, move |ctx| async move {
-        let base = if extend { current.as_ref() } else { None };
         let progress = |done: quack_core::progress::ChunkDone| {
             ctx.progress(done.done, done.total);
             tracing::info!(
@@ -460,7 +462,7 @@ pub(crate) async fn start_document_run(
         let outcome = documents::run(
             chunks,
             extractor.as_ref(),
-            base.or(current.as_ref()),
+            current.as_ref(),
             &options,
             embeddings.as_ref(),
             app.config.analysis.extraction_concurrency,

@@ -566,7 +566,7 @@ fn gather(observations: &[Observation], similarity: Similarity<'_>) -> Evidence 
 /// Turn observations into candidates: classes with an inferred hierarchy,
 /// relations with domain and range, recurring attributes as properties.
 /// Candidates below `min_support_documents` are marked low support. With
-/// `current`, ids the ontology already has are skipped (extend mode).
+/// `current`, ids the ontology already has are skipped.
 #[must_use]
 pub fn propose(
     observations: &[Observation],

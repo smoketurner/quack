@@ -1662,8 +1662,6 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
 #[derive(Deserialize)]
 struct ProposeForm {
     #[serde(default)]
-    extend: bool,
-    #[serde(default)]
     auto_accept: bool,
     #[serde(default)]
     documents: bool,
@@ -1677,14 +1675,7 @@ async fn ontology_propose(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     if form.documents {
-        let target = match super::api::ontology::start_document_run(
-            &app,
-            &access,
-            &id,
-            form.extend,
-            None,
-        )
-        .await
+        let target = match super::api::ontology::start_document_run(&app, &access, &id, None).await
         {
             Ok(_) => format!(
                 "/w/{id}/ontology?notice=document+pass+started%3B+candidates+appear+here+when+it+finishes"
@@ -1698,8 +1689,7 @@ async fn ontology_propose(
     let author = access.identity.username.clone();
     let outcome = with_db(db, move |db| {
         let current = ontology_store::current(db)?;
-        let base = if form.extend { current.as_ref() } else { None };
-        let proposals = propose_from_tables(db, base.or(current.as_ref()), &options)?;
+        let proposals = propose_from_tables(db, current.as_ref(), &options)?;
         if proposals.is_empty() {
             return Ok((0, None));
         }
