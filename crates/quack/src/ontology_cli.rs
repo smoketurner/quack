@@ -76,7 +76,7 @@ pub(crate) enum OntologyAction {
         #[arg(long, conflicts_with_all = ["merge_into", "reparent"])]
         rename: Option<String>,
         /// Treat the candidate as this existing class, relation, or property
-        #[arg(long)]
+        #[arg(long, conflicts_with = "reparent")]
         merge_into: Option<String>,
         /// Accept a class under this parent
         #[arg(long)]
@@ -687,5 +687,30 @@ mod tests {
         );
         assert!(text.contains("  - works_at: person -> organization"));
         assert!(text.contains("  - date: date"));
+    }
+
+    /// `accept` takes at most one change: two would leave one silently
+    /// unapplied.
+    #[test]
+    fn accept_takes_one_change_at_a_time() {
+        #[derive(clap::Parser)]
+        #[command(no_binary_name = true)]
+        struct Line {
+            #[command(subcommand)]
+            action: OntologyAction,
+        }
+        let parses = |args: &[&str]| <Line as clap::Parser>::try_parse_from(args).is_ok();
+        assert!(parses(&["accept", "c1"]));
+        assert!(parses(&["accept", "c1", "--reparent", "p"]));
+        assert!(parses(&["accept", "c1", "--merge-into", "m"]));
+        for pair in [
+            ["--merge-into", "m", "--reparent", "p"],
+            ["--rename", "r", "--reparent", "p"],
+            ["--rename", "r", "--merge-into", "m"],
+        ] {
+            let mut args = vec!["accept", "c1"];
+            args.extend(pair);
+            assert!(!parses(&args), "{args:?}");
+        }
     }
 }
