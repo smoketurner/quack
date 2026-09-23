@@ -71,7 +71,10 @@ and code — this file is the gate, the doc is the detail.
       single-open is therefore ours to enforce — in the server, the per-workspace
       `OnceCell` in `AppState::workspace_handle`. The opened connection then moves onto
       its workspace's writer thread (`storage::writer::Writer::spawn`) and is reached only
-      by closures sent there; reader clones are made on that thread. A reader clone never calls `confine_to`
+      by closures sent there; reader clones are made on that thread. The one other writing
+      connection is the server's `storage::audit::AuditLog`, a clone that only ever
+      `INSERT`s new `_quack_audit` rows (new ids never conflict, so `DuckDB` commits them
+      beside a write in progress); nothing else may write through it. A reader clone never calls `confine_to`
       or `apply_resource_limits`
       again (both `SET`s fail once configuration is locked), and every statement it runs
       goes through `WorkspaceDb::read_only`, scoped to that one piece of work.

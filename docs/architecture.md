@@ -47,7 +47,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `storage::workspace` | the workspace DuckDB file: open with confinement and limits, the `_quack_` tables, statement classification, hybrid retrieval (cosine scan plus BM25 over `_quack_terms`), the document registry, query execution with faithful JSON values | 5.4, 6.1, 7.4 |
 | `storage::writer` | the workspace's one writer connection as an actor: a thread of its own runs the closures sent to it, interactive before background; callers await `run` / `run_at` | 4.1, 7.4 |
 | `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
-| `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit | 5.3, 8 |
+| `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the server's insert-only audit connection) | 5.3, 8 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
 | `import` | rows from Postgres, SQLite, or an HTTP data file as a workspace table | 6.2 |
 | `analysis` | the agent loop as an event stream (`agent`, `events`), the tools (`tools`), the system prompt (`text_to_sql`), write policy, citations, the chart spec, the reranking hook (`rerank`) | 7, 9 |

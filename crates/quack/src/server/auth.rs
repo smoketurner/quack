@@ -22,7 +22,6 @@ use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
 use super::state::{App, SessionLookup};
-use quack_core::storage::audit;
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -388,14 +387,17 @@ impl Access {
         }
         app.control.record_audit(&entry).await?;
         let detail = detail.unwrap_or_else(|| serde_json::json!({}));
-        let db = app.workspace_db(&self.workspace.id).await?;
-        let id = entry.id.clone();
-        let user = self.identity.user_id.clone();
-        let action = action.to_owned();
-        super::state::with_db(db, move |db| {
-            audit::record(db, &id, Some(&user), &action, &detail)
-        })
-        .await?;
+        // Its own connection: a request never waits for a write in
+        // progress on the writer just to record that it happened.
+        app.audit_log(&self.workspace.id)
+            .await?
+            .record(
+                entry.id.clone(),
+                Some(self.identity.user_id.clone()),
+                action.to_owned(),
+                detail,
+            )
+            .await?;
         Ok(entry.id)
     }
 

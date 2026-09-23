@@ -20,8 +20,7 @@ pub(crate) async fn show(
 ) -> ApiResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "context").await?;
-    let db = app.workspace_db(&id).await?;
-    let current = with_db(db, context::current).await?;
+    let current = app.read(&id, context::current).await?;
     let wants_markdown = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -82,8 +81,7 @@ pub(crate) async fn versions(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "context_versions").await?;
-    let db = app.workspace_db(&id).await?;
     let limit = q.limit;
-    let history = with_db(db, move |db| context::history(db, limit)).await?;
+    let history = app.read(&id, move |db| context::history(db, limit)).await?;
     Ok(Json(serde_json::json!({ "versions": history })))
 }

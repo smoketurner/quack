@@ -10,7 +10,7 @@ use quack_core::storage::control::Outcome;
 
 use crate::server::auth::{Identity, Need, access};
 use crate::server::error::ApiResult;
-use crate::server::state::{App, with_db};
+use crate::server::state::App;
 use quack_core::okf;
 
 pub(crate) async fn export(
@@ -19,13 +19,13 @@ pub(crate) async fn export(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let db = app.workspace_db(&id).await?;
     let name = access.workspace.name.clone();
-    let (bytes, files) = with_db(db, move |db| {
-        let bundle = okf::export(db, &name)?;
-        Ok((bundle.to_tar()?, bundle.files.len()))
-    })
-    .await?;
+    let (bytes, files) = app
+        .read(&id, move |db| {
+            let bundle = okf::export(db, &name)?;
+            Ok((bundle.to_tar()?, bundle.files.len()))
+        })
+        .await?;
     access
         .audit(
             &app,

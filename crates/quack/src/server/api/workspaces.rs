@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::server::auth::{Credential, Identity, Need, access, require_admin};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::state::{App, with_db};
+use crate::server::state::App;
 
 fn workspace_json(ws: &WorkspaceRow, role: Option<Role>) -> serde_json::Value {
     let allowed: Option<serde_json::Value> = ws
@@ -181,9 +181,8 @@ pub(crate) async fn audit_detail(
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let db = app.workspace_db(&id).await?;
     let limit = q.limit;
-    let rows = with_db(db, move |db| audit::list(db, limit)).await?;
+    let rows = app.read(&id, move |db| audit::list(db, limit)).await?;
     access
         .audit(
             &app,

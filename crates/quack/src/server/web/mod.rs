@@ -797,25 +797,24 @@ async fn chat(
     Query(q): Query<ChatQuery>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let db = app.workspace_db(&id).await?;
     let user = access.identity.user_id.clone();
     let sees_all = access.sees_all_sessions();
     let wanted = q.session.clone();
-    let (sessions_list, current, messages) = with_db(db, move |db| {
-        let list = sessions::list_sessions_for(db, 50, &user, sees_all)?;
-        let current = match wanted {
-            Some(id) => {
-                sessions::get_session(db, &id)?.filter(|s| sessions::visible_to(s, &user, sees_all))
-            }
-            None => None,
-        };
-        let messages = match &current {
-            Some(s) => sessions::messages(db, &s.id)?,
-            None => Vec::new(),
-        };
-        Ok((list, current, messages))
-    })
-    .await?;
+    let (sessions_list, current, messages) = app
+        .read(&id, move |db| {
+            let list = sessions::list_sessions_for(db, 50, &user, sees_all)?;
+            let current = match wanted {
+                Some(id) => sessions::get_session(db, &id)?
+                    .filter(|s| sessions::visible_to(s, &user, sees_all)),
+                None => None,
+            };
+            let messages = match &current {
+                Some(s) => sessions::messages(db, &s.id)?,
+                None => Vec::new(),
+            };
+            Ok((list, current, messages))
+        })
+        .await?;
     if let Some(current) = &current {
         access
             .audit(
@@ -829,8 +828,7 @@ async fn chat(
     }
     // The empty state says what there is to ask about.
     let (tables, documents) = if messages.is_empty() {
-        let db = app.reader_db(&id).await?;
-        db.with_db(|db| Ok((db.list_tables()?, db.list_documents()?)))
+        app.read(&id, |db| Ok((db.list_tables()?, db.list_documents()?)))
             .await?
     } else {
         (Vec::new(), Vec::new())
@@ -876,8 +874,9 @@ async fn unshare_session(
 }
 
 async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
-    let db = app.reader_db(&access.workspace.id).await?;
-    let documents = db.with_db(WorkspaceDb::list_documents).await?;
+    let documents = app
+        .read(&access.workspace.id, WorkspaceDb::list_documents)
+        .await?;
     let pending = documents
         .iter()
         .any(|d| d.status == "queued" || d.status == "processing");
@@ -1117,8 +1116,7 @@ async fn tables(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "tables").await?;
-    let db = app.reader_db(&id).await?;
-    let list = db.with_db(WorkspaceDb::list_tables).await?;
+    let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
         page: page(&app, &access.identity, "Tables", Some(&access)),
         tables: list,
@@ -1172,10 +1170,9 @@ async fn table(
     Path((id, name)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let db = app.reader_db(&id).await?;
     let wanted = name.clone();
-    let (list, described) = db
-        .with_db(move |db| {
+    let (list, described) = app
+        .read(&id, move |db| {
             let list = db.list_tables()?;
             let described = if list.contains(&wanted) && !wanted.starts_with("_quack_") {
                 Some(db.describe_table(&wanted)?)
@@ -1355,13 +1352,12 @@ async fn ontology_page(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "ontology").await?;
-    let db = app.reader_db(&id).await?;
     let queue_status = match q.status.as_deref() {
         Some("low_support") => "low_support",
         _ => "pending",
     };
-    let (ontology, versions, diff, pending, low_support, has_tables) = db
-        .with_db(|db| {
+    let (ontology, versions, diff, pending, low_support, has_tables) = app
+        .read(&id, |db| {
             let current = ontology_store::current(db)?;
             let versions = ontology_store::versions(db, 20)?;
             let diff = match &current {
@@ -1876,11 +1872,11 @@ async fn context_page(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "context").await?;
-    let db = app.workspace_db(&id).await?;
-    let (current, versions) = with_db(db, |db| {
-        Ok((context::current(db)?, context::history(db, 20)?))
-    })
-    .await?;
+    let (current, versions) = app
+        .read(&id, |db| {
+            Ok((context::current(db)?, context::history(db, 20)?))
+        })
+        .await?;
     html(&ContextPage {
         page: page(&app, &access.identity, "Context", Some(&access)),
         content: current
@@ -2288,7 +2284,6 @@ async fn graph_page(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "graph").await?;
-    let db = app.reader_db(&id).await?;
     let options = app.config.graph.options();
     let query = GraphQueryView {
         entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
@@ -2321,8 +2316,8 @@ async fn graph_page(
         to: query.to.clone(),
         max_hops: query.max_hops,
     };
-    let (status, has_ontology, chunk_count, merges, result) = db
-        .with_db(move |db| {
+    let (status, has_ontology, chunk_count, merges, result) = app
+        .read(&id, move |db| {
             graph_page_data(
                 db,
                 &wanted,

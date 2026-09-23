@@ -31,14 +31,14 @@ pub(crate) async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "sessions").await?;
-    let db = app.workspace_db(&id).await?;
     let user = access.identity.user_id.clone();
     let sees_all = access.sees_all_sessions();
     let limit = q.limit;
-    let rows = with_db(db, move |db| {
-        sessions::list_sessions_for(db, limit, &user, sees_all)
-    })
-    .await?;
+    let rows = app
+        .read(&id, move |db| {
+            sessions::list_sessions_for(db, limit, &user, sees_all)
+        })
+        .await?;
     Ok(Json(serde_json::json!({ "sessions": rows })))
 }
 
@@ -48,14 +48,15 @@ async fn visible_session(
     workspace_id: &str,
     session_id: &str,
 ) -> ApiResult<sessions::SessionRow> {
-    let db = app.workspace_db(workspace_id).await?;
     let sid = session_id.to_owned();
     let user = access.identity.user_id.clone();
     let sees_all = access.sees_all_sessions();
-    let found = with_db(db, move |db| {
-        Ok(sessions::get_session(db, &sid)?.filter(|s| sessions::visible_to(s, &user, sees_all)))
-    })
-    .await?;
+    let found = app
+        .read(workspace_id, move |db| {
+            Ok(sessions::get_session(db, &sid)?
+                .filter(|s| sessions::visible_to(s, &user, sees_all)))
+        })
+        .await?;
     found.ok_or_else(|| ApiError::not_found("no such session"))
 }
 
@@ -66,9 +67,10 @@ pub(crate) async fn show(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     let session = visible_session(&app, &access, &id, &sid).await?;
-    let db = app.workspace_db(&id).await?;
     let session_id = session.id.clone();
-    let messages = with_db(db, move |db| sessions::messages(db, &session_id)).await?;
+    let messages = app
+        .read(&id, move |db| sessions::messages(db, &session_id))
+        .await?;
     access
         .audit(
             &app,
@@ -250,16 +252,16 @@ pub(crate) async fn export(
         "markdown" => false,
         _ => return Err(ApiError::bad_request("format must be sql or markdown")),
     };
-    let db = app.workspace_db(&id).await?;
-    let text = with_db(db, move |db| {
-        let rows = sessions::messages(db, &session.id)?;
-        if as_sql {
-            sessions::export_sql(&rows)
-        } else {
-            sessions::export_markdown(&session, &rows)
-        }
-    })
-    .await?;
+    let text = app
+        .read(&id, move |db| {
+            let rows = sessions::messages(db, &session.id)?;
+            if as_sql {
+                sessions::export_sql(&rows)
+            } else {
+                sessions::export_markdown(&session, &rows)
+            }
+        })
+        .await?;
     access
         .audit(
             &app,

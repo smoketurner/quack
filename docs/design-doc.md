@@ -178,7 +178,8 @@ and each is limited where it is used:
 |----------|-------|-------|
 | Model requests, per provider and model | `[providers.NAME].max_concurrent_requests` for each model (1 for Ollama, which serves one request per model unless `OLLAMA_NUM_PARALLEL` says more; 8 for hosted APIs), process-wide, interactive requests first | `llm::LimitedHttp`: every rig client quack builds sends through it; the model is read from the request body; a permit is held from the request until its body is read or its stream ends |
 | The workspace's writer connection | owned by one thread per workspace (`storage::writer::Writer`, an actor, section 7.4) that runs the closures sent to it one at a time, interactive first | callers send owned closures and await the answer (`Writer::run`), so no async worker ever waits on it; long work sends one step at a time, never across a model call |
-| Reads | the reader pool (`[analysis].reader_pool_size`) | `ReaderDb` |
+| Audit detail rows (server) | one insert-only connection per workspace (`storage::audit::AuditLog`, a clone of the writer's on its own thread) | `Access::audit`: `DuckDB` commits separate connections' writes together unless they change the same rows, and a detail row is always a new row, so a request records its audit detail (fail-closed, issue #54) without waiting for a write in progress |
+| Reads | the reader pool (`[analysis].reader_pool_size`) | `ReaderDb`: the agent's SQL and search tools, the terminal's reads, MCP, and every server handler's reads (`App::read`); each read runs in a read-only transaction |
 | Uploads per workspace (server) | `[server].workers_per_workspace` | the `ingest:{workspace}` lane |
 
 A turn therefore holds nothing while it waits for the user's answer to a write prompt or

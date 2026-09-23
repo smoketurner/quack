@@ -9,6 +9,7 @@ use std::time::Instant;
 use quack_core::analysis::tools::{ReaderDb, SharedDb, open_reader};
 use quack_core::config::Config;
 use quack_core::jobs::JobQueue;
+use quack_core::storage::audit::AuditLog;
 use quack_core::storage::workspace::WorkspaceDb;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -16,14 +17,15 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use super::error::{ApiError, ApiResult};
 use quack_core::storage::control::{ControlPlane, random_bytes};
 
-/// A workspace's writer connection plus its reader, opened together so a
-/// reader is built once per workspace handle rather than once per turn (a
-/// turn acquiring one must never wait on the writer mutex a slow write
-/// elsewhere is holding).
+/// A workspace's writer connection plus its reader pool and its audit
+/// connection, opened together so each is built once per workspace handle
+/// rather than once per request (a request must never wait behind a slow
+/// write on the writer to read or to record its audit detail).
 #[derive(Clone)]
 struct WorkspaceHandle {
     writer: SharedDb,
     reader: ReaderDb,
+    audit: Arc<AuditLog>,
 }
 
 pub(crate) struct AppState {
@@ -168,7 +170,7 @@ impl AppState {
         let id = workspace_id.to_owned();
         let pool_size = self.config.analysis.reader_pool_size;
         cell.get_or_try_init(|| async move {
-            let db = tokio::task::spawn_blocking(move || {
+            let (db, audit) = tokio::task::spawn_blocking(move || {
                 let db = WorkspaceDb::open(&config, &id)?;
                 // Uploads a previous process took but never finished cannot
                 // be resumed: their bytes are gone with it.
@@ -176,7 +178,8 @@ impl AppState {
                 if stale > 0 {
                     tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
                 }
-                Ok::<_, quack_core::error::Error>(db)
+                let audit = AuditLog::open(&db)?;
+                Ok::<_, quack_core::error::Error>((db, audit))
             })
             .await
             .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
@@ -184,7 +187,11 @@ impl AppState {
                 Writer::spawn(db).map_err(|e| ApiError::internal(e.to_string()))?,
             );
             let reader = open_reader(&writer, pool_size).await;
-            Ok(WorkspaceHandle { writer, reader })
+            Ok(WorkspaceHandle {
+                writer,
+                reader,
+                audit: Arc::new(audit),
+            })
         })
         .await
         .cloned()
@@ -200,6 +207,27 @@ impl AppState {
     /// over [`Self::workspace_db`] so it never queues behind a write.
     pub(crate) async fn reader_db(&self, workspace_id: &str) -> ApiResult<ReaderDb> {
         Ok(self.workspace_handle(workspace_id).await?.reader)
+    }
+
+    /// The workspace's insert-only audit connection, opened with its writer.
+    pub(crate) async fn audit_log(&self, workspace_id: &str) -> ApiResult<Arc<AuditLog>> {
+        Ok(self.workspace_handle(workspace_id).await?.audit)
+    }
+
+    /// Run a read on one of the workspace's reader connections, inside a
+    /// read-only transaction: it never waits for a write in progress, and
+    /// anything that would write is refused. Every read-only handler reads
+    /// through this; writes go to the writer through [`with_db`].
+    pub(crate) async fn read<T, F>(&self, workspace_id: &str, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
+    {
+        self.reader_db(workspace_id)
+            .await?
+            .with_db(f)
+            .await
+            .map_err(ApiError::from)
     }
 
     /// Start a browser session for the user and return its token.

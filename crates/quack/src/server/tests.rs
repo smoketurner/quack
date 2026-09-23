@@ -638,6 +638,67 @@ async fn sql_bypass_temp_tables_are_still_visible_after_the_reader_degrades() {
     assert_eq!(body["rows"][0][0], 1);
 }
 
+/// A read handler's database work runs on a reader connection and its
+/// audit detail on the audit connection: the request answers while the
+/// writer is held by a long write, and a write through a read is refused
+/// by the read-only transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_requests_never_wait_for_the_writer() {
+    use quack_core::storage::workspace::WorkspaceDb;
+
+    let h = harness(false).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("data", &owner).await;
+    let writer = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    writer
+        .run(|db| db.execute_statement("CREATE TABLE t AS SELECT 1 AS a"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    // Hold the writer busy, as a large load would.
+    let (release, hold) = std::sync::mpsc::channel::<()>();
+    let busy = tokio::spawn(async move {
+        writer
+            .run(move |_| {
+                hold.recv().ok();
+                Ok(())
+            })
+            .await
+    });
+    let tables = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.app.read(&ws, WorkspaceDb::list_tables),
+    )
+    .await;
+    assert!(
+        tables.is_ok_and(|r| r.is_ok_and(|t| t == vec![String::from("t")])),
+        "a read waited for the writer"
+    );
+    // The whole request too: its audit detail goes to the audit
+    // connection, not the busy writer.
+    let token = h.login("owner").await;
+    let listed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.get(&format!("/api/v1/workspaces/{ws}/tables"), &token),
+    )
+    .await;
+    assert!(
+        listed.is_ok_and(|(status, body)| status == StatusCode::OK && body["tables"][0] == "t"),
+        "the request waited for the writer"
+    );
+    let refused = h
+        .app
+        .read(&ws, |db| db.execute_statement("CREATE TABLE u (a INTEGER)"))
+        .await;
+    assert!(refused.is_err(), "a write ran inside a read");
+    assert!(release.send(()).is_ok());
+    assert!(busy.await.is_ok_and(|r| r.is_ok()));
+}
+
 fn multipart(filename: &str, content_type: &str, data: &str) -> (String, Vec<u8>) {
     let boundary = "quackboundary";
     let body = format!(
