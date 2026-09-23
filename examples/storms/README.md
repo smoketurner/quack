@@ -104,7 +104,7 @@ The loader stops where model calls begin. With a chat model configured, three mo
 steps finish the picture:
 
 ```bash
-quack -w storms ontology propose --documents --extend --sample 40    # what the documents mention that the ontology lacks; review and accept
+quack -w storms ontology propose --documents --sample 40    # what the documents mention that the ontology lacks; review and accept
 quack -w storms graph extract --documents-only --sample 100          # named entities and relations from the narratives and the NWS instruction, with chunk provenance
 quack -w storms graph merges                                         # near-duplicate labels the extractor proposed to merge
 ```

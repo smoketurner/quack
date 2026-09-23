@@ -376,7 +376,7 @@ async fn run_extract(
                 if summary.drift.total() > 0 {
                     writeln!(
                         out,
-                        "The documents expressed {} things the ontology lacks; `quack graph status` lists them and `quack ontology propose --extend --documents` proposes them.",
+                        "The documents expressed {} things the ontology lacks; `quack graph status` lists them and `quack ontology propose --documents` proposes them.",
                         summary.drift.total()
                     )?;
                 }

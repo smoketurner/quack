@@ -39,13 +39,11 @@ pub(crate) enum OntologyAction {
     Diff { from: Option<u32>, to: Option<u32> },
     /// Store an earlier version as the newest one
     Restore { version: u32 },
-    /// Propose classes, properties, keys, relations, and mappings from the
+    /// Propose the classes, properties, keys, relations, and mappings the
+    /// current ontology lacks (a full draft when there is none) from the
     /// tables (no model calls) and, with --documents, from a sample of the
     /// documents (one model call per chunk) into the review queue
     Propose {
-        /// Propose only what the current ontology lacks
-        #[arg(long)]
-        extend: bool,
         /// Accept every proposal at once and write the version
         #[arg(long)]
         auto_accept: bool,
@@ -224,7 +222,6 @@ async fn run_propose(
     progress: Progress<'_>,
 ) -> Result<()> {
     let OntologyAction::Propose {
-        extend,
         auto_accept,
         documents,
         sample,
@@ -234,17 +231,9 @@ async fn run_propose(
     else {
         return Ok(());
     };
-    let seeding = db
-        .run(move |db| {
-            let mut seeded = false;
-            let text = rendered(|buf| {
-                seeded = seed(db, from.as_deref(), buf)?;
-                Ok(())
-            });
-            Ok((seeded, text))
-        })
+    let text = db
+        .run(move |db| Ok(rendered(|buf| seed(db, from.as_deref(), buf))))
         .await?;
-    let (seeded, text) = seeding;
     out.write_all(&text.map_err(anyhow::Error::msg)?)?;
     let pass = documents.then_some(DocumentPass {
         sample,
@@ -254,7 +243,6 @@ async fn run_propose(
         config,
         db,
         ProposeArgs {
-            extend: extend || seeded,
             auto_accept,
             documents: pass,
         },
@@ -356,22 +344,21 @@ struct DocumentPass {
 }
 
 struct ProposeArgs {
-    extend: bool,
     auto_accept: bool,
     documents: Option<DocumentPass>,
 }
 
 /// `--from FILE`: store the file as a new version so the proposal only
-/// adds what it lacks. Returns whether a seed was applied.
-fn seed(db: &WorkspaceDb, from: Option<&str>, out: &mut impl Write) -> Result<bool> {
+/// adds what it lacks.
+fn seed(db: &WorkspaceDb, from: Option<&str>, out: &mut impl Write) -> Result<()> {
     let Some(file) = from else {
-        return Ok(false);
+        return Ok(());
     };
     let text = std::fs::read_to_string(file).with_context(|| format!("failed to read {file}"))?;
     let ontology = Ontology::from_json(&text)?;
     let stored = store::save(db, &ontology, None, Some(&format!("seeded from {file}")))?;
     writeln!(out, "seeded version {} from {file}", stored.version)?;
-    Ok(true)
+    Ok(())
 }
 
 /// `quack ontology propose`: table evidence, plus document evidence when
@@ -384,11 +371,7 @@ async fn propose(
     progress: Progress<'_>,
 ) -> Result<()> {
     let current = db.run(store::current).await?;
-    let base = if args.extend { current.as_ref() } else { None };
-    let (known, evidence) = (
-        base.or(current.as_ref()).cloned(),
-        config.ontology.table_evidence(),
-    );
+    let (known, evidence) = (current.clone(), config.ontology.table_evidence());
     let mut proposals = db
         .run(move |db| propose_from_tables(db, known.as_ref(), &evidence))
         .await?;

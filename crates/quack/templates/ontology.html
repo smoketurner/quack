@@ -8,8 +8,7 @@
 {% if ws.can_write && has_tables %}
 <form method="post" action="/w/{{ ws.id }}/ontology/propose" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-200 bg-white p-3 text-sm">
   <span class="font-medium">Propose from the tables</span>
-  <span class="text-slate-500">classes, typed properties, keys, relations, and mappings; no model calls</span>
-  {% if ontology.is_some() %}<label class="inline-flex items-center gap-1"><input type="checkbox" name="extend" value="true" checked> only what is missing</label>{% endif %}
+  <span class="text-slate-500">classes, typed properties, keys, relations, and mappings{% if ontology.is_some() %} the current ontology lacks{% endif %}; no model calls</span>
   <label class="inline-flex items-center gap-1"><input type="checkbox" name="auto_accept" value="true"> accept everything at once</label>
   <label class="inline-flex items-center gap-1"><input type="checkbox" name="documents" value="true"> also from the documents (one model call per sampled chunk; runs in the background)</label>
   <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Propose</button>
