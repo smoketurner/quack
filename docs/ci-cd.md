@@ -141,9 +141,19 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
 4. **publish** (tag only, `contents: write`, no checkout) — downloads the build artifacts,
    verifies each archive against the `.sha256` file written on the machine that built it,
    consolidates them into `SHA256SUMS`, and runs `gh release create --generate-notes
-   --verify-tag` over the archives, SBOMs, image tarballs, and `SHA256SUMS`. Because there
+   --verify-tag` over the archives, SBOMs, packages, image tarballs, and `SHA256SUMS`.
+   Because there
    is no checkout, that step sets `GH_REPO`: with no git remote to infer the repository
    from, `gh` fails with "not a git repository" before it reaches the API.
+5. **publish-packages** (tag only, after publish, no `GITHUB_TOKEN` permissions) — checks
+   out `smoketurner/packages` with `PACKAGES_REPO_TOKEN` (a fine-grained token with
+   contents: write on that repository alone), copies the `.deb` files into
+   `apt/pool/main/` and each `.rpm` into `rpm/x86_64/` or `rpm/aarch64/`, regenerates the
+   APT indices (`dpkg-scanpackages`, `apt-ftparchive release`) and the RPM `repodata/`
+   (`createrepo_c --update`), signs `Release` (as `InRelease` and `Release.gpg`) and each
+   `repomd.xml` with the packages key, and pushes `quack <version>`. A token push, unlike
+   a `GITHUB_TOKEN` one, triggers that repository's `publish-to-s3.yml`, which serves it
+   as packages.smoketurner.com.
 
 `reusable-build.yml`:
 
@@ -170,12 +180,22 @@ provenance SLSA Build Level 3: the Sigstore certificate on every attestation nam
    aws-lc-sys links its shipped objects instead. Each job then signs (see below), archives
    (`.tar.gz`, or `.zip` built with 7-Zip on Windows), writes a `.sha256`, attests build
    provenance for the archive, and attests the SBOM where there is one.
-2. **image** — one job per architecture on its own native runner (`ubuntu-latest`,
+2. **linux-packages** — one job per architecture, both on `ubuntu-latest` since nfpm
+   only archives the prebuilt binary: it unpacks that architecture's musl archive and
+   builds `quack_<version>_<arch>.deb` and `quack-<version>-1.<arch>.rpm` from
+   `packaging/nfpm.yaml` with nfpm (downloaded from its GitHub release, checksum pinned).
+   The RPM is signed with the packages.smoketurner.com key (`GPG_PRIVATE_KEY`,
+   `GPG_PASSPHRASE`, set by smoketurner-infra's `environments/github` root) and its
+   signature checked with `rpmkeys --checksig`; each package gets a `.sha256` and a build
+   provenance attestation. The key is optional on a dry run, which leaves the RPM
+   unsigned with a warning, and required on a tag, because the repository sets
+   `gpgcheck=1`. The `.deb` itself is unsigned: APT checks the signed `Release` instead.
+3. **image** — one job per architecture on its own native runner (`ubuntu-latest`,
    `ubuntu-24.04-arm`), so nothing is emulated: it unpacks that architecture's musl
    archive, builds `Dockerfile.release` (distroless static, nonroot, `/quack` and `/data`),
    pushes by digest on a tag, and exports a `docker load` tarball for air-gapped hosts,
    attested like the binaries.
-3. **image-index** (tag only) — `docker buildx imagetools create` joins the per-architecture
+4. **image-index** (tag only) — `docker buildx imagetools create` joins the per-architecture
    digests into `ghcr.io/smoketurner/quack:<version>` and `:latest`, then attests the index
    digest to the registry. Pushing the attestation also writes an artifact metadata storage
    record, which is why this job alone carries `artifact-metadata: write`.
