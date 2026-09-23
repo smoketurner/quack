@@ -261,8 +261,10 @@ none on `/healthz` (design doc 12). Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
 through `Access::audit`. A handler's reads go through `App::read` (a reader-pool
 connection in a read-only transaction, so a read never occupies the writer and a write
-slipped into one is refused); its writes, and the audit detail row, go to the writer
-through `state::with_db`. `query/stream` forwards the agent event stream as SSE (`text`,
+slipped into one is refused); its writes go to the writer through `state::with_db`; and
+its `_quack_audit` detail row goes to the workspace's insert-only audit connection
+(`storage::audit::AuditLog`, a writer clone on its own thread), so no request waits for a
+write in progress just to record itself. `query/stream` forwards the agent event stream as SSE (`text`,
 `status`, `tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 with a `job` id
 and run on the work queue in a lane of `[server].workers_per_workspace` per workspace
 (`queue.rs`), which locks the workspace only around each database step; `api/jobs.rs`

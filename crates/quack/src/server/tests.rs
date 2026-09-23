@@ -638,11 +638,12 @@ async fn sql_bypass_temp_tables_are_still_visible_after_the_reader_degrades() {
     assert_eq!(body["rows"][0][0], 1);
 }
 
-/// A read handler's database work runs on a reader connection: it answers
-/// while the writer is held by a long write, and a write through it is
-/// refused by the read-only transaction.
+/// A read handler's database work runs on a reader connection and its
+/// audit detail on the audit connection: the request answers while the
+/// writer is held by a long write, and a write through a read is refused
+/// by the read-only transaction.
 #[tokio::test(flavor = "multi_thread")]
-async fn reads_run_on_the_reader_pool_not_behind_the_writer() {
+async fn read_requests_never_wait_for_the_writer() {
     use quack_core::storage::workspace::WorkspaceDb;
 
     let h = harness(false).await;
@@ -676,6 +677,18 @@ async fn reads_run_on_the_reader_pool_not_behind_the_writer() {
     assert!(
         tables.is_ok_and(|r| r.is_ok_and(|t| t == vec![String::from("t")])),
         "a read waited for the writer"
+    );
+    // The whole request too: its audit detail goes to the audit
+    // connection, not the busy writer.
+    let token = h.login("owner").await;
+    let listed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.get(&format!("/api/v1/workspaces/{ws}/tables"), &token),
+    )
+    .await;
+    assert!(
+        listed.is_ok_and(|(status, body)| status == StatusCode::OK && body["tables"][0] == "t"),
+        "the request waited for the writer"
     );
     let refused = h
         .app
