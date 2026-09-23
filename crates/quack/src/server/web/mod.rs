@@ -1947,7 +1947,6 @@ async fn context_save(
 
 #[derive(Deserialize)]
 struct SettingsQuery {
-    token: Option<String>,
     error: Option<String>,
 }
 
@@ -2000,7 +1999,7 @@ async fn settings(
     };
     let access = access(&app, identity, &id, need).await?;
     access.audit_read(&app, "page", "settings").await?;
-    settings_view(&app, &access, q.token, q.error).await
+    settings_view(&app, &access, None, q.error).await
 }
 
 #[derive(Deserialize)]
@@ -2146,7 +2145,14 @@ async fn token_create(
             None,
         )
         .await?;
-    Ok(Redirect::to(&format!("/w/{id}/settings?token={token}")).into_response())
+    // The secret is shown once in this response body, never in a URL where
+    // browser history, proxy logs, or a Referer would keep it.
+    let mut response = settings_view(&app, &access, Some(token), None).await?;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 async fn token_revoke(

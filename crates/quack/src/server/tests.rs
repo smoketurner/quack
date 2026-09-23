@@ -1998,18 +1998,40 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         html.contains("API tokens") && html.contains("Members"),
         "{html}"
     );
-    let (status, _, headers) = h
+    // A new token is shown once in the response body, never in a URL.
+    let (status, html, headers) = h
         .form(
             &format!("/w/{ws}/tokens"),
             Some(&cookie),
             "name=ci&scopes=read&scopes=write",
         )
         .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get(header::LOCATION).is_none(), "{headers:?}");
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert!(html.contains("New token, shown once"), "{html}");
+    let Some((_, rest)) = html.split_once("qk_") else {
+        fail(&html)
+    };
+    let secret: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let token = format!("qk_{secret}");
+    let (status, _) = h.get(&format!("/api/v1/workspaces/{ws}"), &token).await;
+    assert_eq!(status, StatusCode::OK, "the shown token authenticates");
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/settings?token={token}"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
-        location(&headers).contains("?token=qk_"),
-        "{}",
-        location(&headers)
+        !html.contains("shown once") && !html.contains(&token),
+        "the settings page never echoes a token from the URL"
     );
     let (status, html, _) = h.page(&format!("/w/{ws}/tables"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
