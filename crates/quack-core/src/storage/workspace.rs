@@ -814,12 +814,6 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// The `FLOAT[N]` type of this workspace's vectors.
-    #[must_use]
-    pub fn vector_type_public(&self) -> String {
-        self.vector_type()
-    }
-
     /// The width of the stored vectors: of the vector columns, which a
     /// refresh can change.
     #[must_use]
@@ -1482,7 +1476,8 @@ impl WorkspaceDb {
 
     /// The `FLOAT[N]` type of this workspace's embedding column. `N` is a
     /// validated integer, the only value ever interpolated into vector SQL.
-    fn vector_type(&self) -> String {
+    #[must_use]
+    pub fn vector_type(&self) -> String {
         format!("FLOAT[{}]", self.embedding_dimension())
     }
 
