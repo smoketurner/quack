@@ -26,6 +26,30 @@ pub const INTERNAL_PREFIX: &str = "_quack_";
 /// Schema version of the internal tables, recorded in `_quack_meta`.
 const WORKSPACE_SCHEMA_VERSION: &str = "9";
 
+/// The keys of `_quack_meta`, the workspace's own settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaKey {
+    /// [`WORKSPACE_SCHEMA_VERSION`] when the internal tables were last upgraded.
+    SchemaVersion,
+    /// The width of the vector columns.
+    EmbeddingDimension,
+    /// The embedding model before profiles; read once on upgrade and deleted.
+    EmbeddingModel,
+    /// The ontology version the graph was last built or revalidated with.
+    GraphBuiltWithOntologyVersion,
+    /// Extraction's unknown classes and relations, as a JSON count map.
+    GraphDrift,
+}
+
+text_enum!(MetaKey, "meta key", {
+    SchemaVersion => "schema_version",
+    EmbeddingDimension => "embedding_dimension",
+    EmbeddingModel => "embedding_model",
+    GraphBuiltWithOntologyVersion => "graph_built_with_ontology_version",
+    GraphDrift => "graph_drift",
+});
+text_enum_sql!(MetaKey);
+
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
 const DEFAULT_EMBEDDING_DIMENSION: Dimension = Dimension::new(1024);
@@ -253,8 +277,8 @@ impl WorkspaceDb {
         }
         let value: Option<String> = conn
             .query_row(
-                "SELECT value FROM _quack_meta WHERE key = 'embedding_dimension'",
-                [],
+                "SELECT value FROM _quack_meta WHERE key = ?",
+                duckdb::params![MetaKey::EmbeddingDimension],
                 |row| row.get(0),
             )
             .map(Some)
@@ -635,8 +659,8 @@ impl WorkspaceDb {
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&crate::graph::ddl(dim))?;
         self.upgrade_data(dim)?;
-        self.set_meta("schema_version", WORKSPACE_SCHEMA_VERSION)?;
-        self.set_meta("embedding_dimension", &dim.to_string())?;
+        self.set_meta(MetaKey::SchemaVersion, WORKSPACE_SCHEMA_VERSION)?;
+        self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
         Ok(())
     }
 
@@ -644,7 +668,7 @@ impl WorkspaceDb {
     /// under an older one.
     fn upgrade_data(&self, dim: Dimension) -> Result<()> {
         let recorded = self
-            .meta("schema_version")?
+            .meta(MetaKey::SchemaVersion)?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
         // Version 4 introduced the term index; version 6 changed its tokens
@@ -683,10 +707,12 @@ impl WorkspaceDb {
             [],
             |row| row.get(0),
         )?;
-        let model = self.meta("embedding_model")?;
+        let model = self.meta(MetaKey::EmbeddingModel)?;
         // The profile table replaces this key.
-        self.conn
-            .execute("DELETE FROM _quack_meta WHERE key = 'embedding_model'", [])?;
+        self.conn.execute(
+            "DELETE FROM _quack_meta WHERE key = ?",
+            duckdb::params![MetaKey::EmbeddingModel],
+        )?;
         if untagged == 0 {
             return Ok(());
         }
@@ -760,7 +786,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+    pub fn meta(&self, key: MetaKey) -> Result<Option<String>> {
         if !self.table_exists("_quack_meta")? {
             return Ok(None);
         }
@@ -779,22 +805,18 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the write fails.
-    pub fn set_meta_public(&self, key: &str, value: &str) -> Result<()> {
-        self.set_meta(key, value)
+    pub fn set_meta(&self, key: MetaKey, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _quack_meta (key, value) VALUES (?, ?)",
+            duckdb::params![key, value],
+        )?;
+        Ok(())
     }
 
     /// The `FLOAT[N]` type of this workspace's vectors.
     #[must_use]
     pub fn vector_type_public(&self) -> String {
         self.vector_type()
-    }
-
-    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _quack_meta (key, value) VALUES (?, ?)",
-            duckdb::params![key, value],
-        )?;
-        Ok(())
     }
 
     /// The width of the stored vectors: of the vector columns, which a
@@ -861,7 +883,7 @@ impl WorkspaceDb {
         self.vectors
             .column_dimension
             .store(dimension.get(), Ordering::Release);
-        self.set_meta("embedding_dimension", &dimension.to_string())
+        self.set_meta(MetaKey::EmbeddingDimension, &dimension.to_string())
     }
 
     /// The profile the configured model runs under, `None` without one.
@@ -3944,14 +3966,14 @@ mod tests {
             // identifier term is missing and the recorded version rolls back.
             db.execute_statement("DELETE FROM _quack_terms WHERE term = 'pol8841'")
                 .unwrap_or_else(|e| fail(&e.to_string()));
-            db.set_meta_public("schema_version", "6")
+            db.set_meta(MetaKey::SchemaVersion, "6")
                 .unwrap_or_else(|e| fail(&e.to_string()));
         }
 
         let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(
             reopened
-                .meta("schema_version")
+                .meta(MetaKey::SchemaVersion)
                 .unwrap_or_else(|e| fail(&e.to_string())),
             Some(String::from(WORKSPACE_SCHEMA_VERSION))
         );

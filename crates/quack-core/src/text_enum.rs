@@ -92,7 +92,7 @@ mod tests {
     use crate::ontology::induction::ItemKind;
     use crate::storage::control::{AuditAction, Channel, Outcome, ResourceKind, Role, Scope};
     use crate::storage::sessions::{ChatMode, MessageRole};
-    use crate::storage::workspace::{DocumentSource, DocumentStatus};
+    use crate::storage::workspace::{DocumentSource, DocumentStatus, MetaKey};
 
     /// Every value's text form is its serde name, and reads back.
     fn round_trips<T>(all: &[T])
@@ -152,6 +152,7 @@ mod tests {
         text_round_trips(Record::ALL);
         text_round_trips(doctor::Status::ALL);
         text_round_trips(doctor::Area::ALL);
+        text_round_trips(MetaKey::ALL);
     }
 
     #[test]

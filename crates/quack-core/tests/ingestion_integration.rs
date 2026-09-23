@@ -16,7 +16,7 @@ use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentSource, NewChunk, NewDocument, StatementKind, WorkspaceDb,
+    ChunkScope, DocumentSource, MetaKey, NewChunk, NewDocument, StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -1065,13 +1065,16 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("9"));
     assert_eq!(
-        db.meta("embedding_dimension").unwrap().as_deref(),
+        db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
+        Some("9")
+    );
+    assert_eq!(
+        db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
         Some("4")
     );
     // The profile table replaces the model key.
-    assert_eq!(db.meta("embedding_model").unwrap(), None);
+    assert_eq!(db.meta(MetaKey::EmbeddingModel).unwrap(), None);
     let profile = Profile::new(
         "mock-model",
         Dimension::new(TEST_DIM_U32),
@@ -1233,7 +1236,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     let node_id = unembedded.first().map(|n| n.id.clone()).unwrap();
     db.set_node_embedding(&node_id, &vector(&[0.5; 8])).unwrap();
     assert_eq!(
-        db.meta("embedding_dimension").unwrap().as_deref(),
+        db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
         Some("8")
     );
     // The chunk ingested without an embedding survives, term index and
@@ -1584,7 +1587,10 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
         );
     }
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("9"));
+    assert_eq!(
+        db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
+        Some("9")
+    );
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())
         .unwrap();
