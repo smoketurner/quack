@@ -5,6 +5,7 @@
 
 pub(crate) mod markdown;
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use askama::Template;
@@ -35,6 +36,7 @@ use serde::Deserialize;
 use super::api::{
     documents as docs_api, embeddings as embeddings_api, graph as graph_api, import as import_api,
     jobs as jobs_api, ontology as ontology_api, query as query_api, sessions as sessions_api,
+    workspaces as workspaces_api,
 };
 use super::auth::{
     Access, Credential, Identity, Need, Peer, SESSION_COOKIE, access, password_login, request_id,
@@ -1947,22 +1949,12 @@ async fn settings_view(
     new_token: Option<String>,
     error: Option<String>,
 ) -> WebResult<Response> {
-    let allowed: Vec<String> = access
-        .workspace
-        .allowed_providers
-        .as_deref()
-        .and_then(|p| serde_json::from_str(p).ok())
-        .unwrap_or_default();
+    let allowed = &access.workspace.allowed_providers;
     let providers = app
         .config
         .providers
         .keys()
-        .map(|name| {
-            (
-                name.to_string(),
-                allowed.is_empty() || allowed.iter().any(|a| a == name.as_str()),
-            )
-        })
+        .map(|name| (name.to_string(), allowed.permits(name.as_str())))
         .collect();
     let (members, tokens) = if access.permits(Need::OWN) {
         (
@@ -2004,7 +1996,7 @@ async fn settings(
 struct SettingsForm {
     classification: String,
     #[serde(default)]
-    providers: Vec<String>,
+    providers: BTreeSet<String>,
 }
 
 async fn settings_save(
@@ -2014,30 +2006,27 @@ async fn settings_save(
     MultiForm(form): MultiForm<SettingsForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::OWN).await?;
-    let all = app.config.providers.len();
-    let allowed_providers = if form.providers.is_empty() || form.providers.len() == all {
+    // The form is one checkbox per configured provider, so it cannot say
+    // "every provider, including ones added later" other than by ticking
+    // all of them or none.
+    let configured = &app.config.providers;
+    let every = form.providers.len() == configured.len()
+        && configured
+            .keys()
+            .all(|name| form.providers.contains(name.as_str()));
+    let allowed_providers = if form.providers.is_empty() || every {
         ProviderAllowList::All
     } else {
         ProviderAllowList::Only(form.providers)
     };
-    app.control
-        .update_workspace(
-            &id,
-            &WorkspaceChanges {
-                classification: Some(form.classification.trim().to_owned()),
-                allowed_providers,
-            },
-        )
-        .await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Workspace,
-            Some(ResourceKind::Workspace.id(&id)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
+    let changes = WorkspaceChanges {
+        classification: Some(form.classification),
+        allowed_providers,
+    };
+    if let Err(e) = workspaces_api::update_settings(&app, &access, changes).await {
+        let error = urlencoded(&e.message);
+        return Ok(Redirect::to(&format!("/w/{id}/settings?error={error}")).into_response());
+    }
     Ok(Redirect::to(&format!("/w/{id}/settings")).into_response())
 }
 

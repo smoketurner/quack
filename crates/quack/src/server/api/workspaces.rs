@@ -1,6 +1,8 @@
 //! Workspaces: listing by membership, creation by admins, settings by
 //! owners, and the content half of the audit for members.
 
+use std::collections::BTreeSet;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -11,20 +13,16 @@ use quack_core::storage::control::{
 };
 use serde::Deserialize;
 
-use crate::server::auth::{Credential, Identity, Need, access, require_admin};
+use crate::server::auth::{Access, Credential, Identity, Need, access, require_admin};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
 fn workspace_json(ws: &WorkspaceRow, role: Option<Role>) -> serde_json::Value {
-    let allowed: Option<serde_json::Value> = ws
-        .allowed_providers
-        .as_deref()
-        .and_then(|p| serde_json::from_str(p).ok());
     serde_json::json!({
         "id": ws.id,
         "name": ws.name,
         "classification": ws.classification,
-        "allowed_providers": allowed,
+        "allowed_providers": ws.allowed_providers,
         "role": role,
     })
 }
@@ -123,7 +121,7 @@ pub(crate) async fn show(
 pub(crate) struct UpdateWorkspace {
     pub classification: Option<String>,
     /// Absent keeps the list; an empty list allows every provider.
-    pub allowed_providers: Option<Vec<String>>,
+    pub allowed_providers: Option<BTreeSet<String>>,
 }
 
 pub(crate) async fn update(
@@ -133,34 +131,53 @@ pub(crate) async fn update(
     Json(body): Json<UpdateWorkspace>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::OWN).await?;
-    if let Some(names) = &body.allowed_providers {
-        for name in names {
-            if !app.config.providers.contains_key(name.as_str()) {
-                return Err(ApiError::bad_request(format!(
-                    "'{name}' is not a configured provider"
-                )));
-            }
-        }
-    }
     let changes = WorkspaceChanges {
-        classification: body.classification.map(|c| c.trim().to_owned()),
+        classification: body.classification,
         allowed_providers: match body.allowed_providers {
             None => ProviderAllowList::Keep,
             Some(names) if names.is_empty() => ProviderAllowList::All,
             Some(names) => ProviderAllowList::Only(names),
         },
     };
-    let ws = app.control.update_workspace(&id, &changes).await?;
+    let ws = update_settings(&app, &access, changes).await?;
+    Ok(Json(workspace_json(&ws, access.role)))
+}
+
+/// Change a workspace's settings for its owner, from the API or the web
+/// console: every allowed provider must be configured, the classification
+/// is trimmed, and the change is audited.
+pub(crate) async fn update_settings(
+    app: &App,
+    access: &Access,
+    changes: WorkspaceChanges,
+) -> ApiResult<WorkspaceRow> {
+    if let ProviderAllowList::Only(names) = &changes.allowed_providers
+        && let Some(unknown) = names
+            .iter()
+            .find(|name| !app.config.providers.contains_key(name.as_str()))
+    {
+        return Err(ApiError::bad_request(format!(
+            "'{unknown}' is not a configured provider"
+        )));
+    }
+    let changes = WorkspaceChanges {
+        classification: changes.classification.map(|c| c.trim().to_owned()),
+        ..changes
+    };
+    let ws = app
+        .control
+        .update_workspace(&access.workspace.id, &changes)
+        .await?;
     access
         .audit(
-            &app,
+            app,
             AuditAction::Workspace,
             Some(ResourceKind::Workspace.id(&ws.id)),
             Outcome::Allowed,
             None,
         )
         .await?;
-    Ok(Json(workspace_json(&ws, access.role)))
+    Ok(ws)
 }
 
 #[derive(Deserialize)]

@@ -16,7 +16,7 @@ pub(crate) mod ontology;
 pub(crate) mod query;
 pub(crate) mod sessions;
 mod tables;
-mod workspaces;
+pub(crate) mod workspaces;
 
 use axum::Router;
 use axum::response::sse::Event;

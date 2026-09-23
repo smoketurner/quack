@@ -952,6 +952,7 @@ mod tests {
     use quack_core::config::Config;
 
     use super::*;
+    use quack_core::storage::control::AllowedProviders;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -972,7 +973,7 @@ mod tests {
                 id: String::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
-                allowed_providers: None,
+                allowed_providers: AllowedProviders::All,
             },
             policy,
             None,
@@ -1095,7 +1096,7 @@ mod tests {
                 id: String::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
-                allowed_providers: None,
+                allowed_providers: AllowedProviders::All,
             },
             WritePolicy::Deny,
             None,
