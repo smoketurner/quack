@@ -133,11 +133,16 @@ a strip above the prompt shows active jobs, `/jobs` lists them, `/cancel N` stop
 write prompts from concurrent work queue up. Its commands' database steps run in the order
 typed on one worker task (`App::on_db`: reads on the reader pool, writes in the writer's
 interactive line), never on the loop's thread; input typed during `/new`, `/resume`, or
-`/mode` waits for the switch. `SharedDb` is `Arc<storage::writer::Writer>`: one holder at
-a time, interactive callers before background ones by `quack_core::priority` (a
-task-local, interactive unless the job queue scopes a background job kind);
-`graph_cli::run` and `ontology_cli::run` take any `DbHandle` and lock only around each
-database step.
+`/mode` waits for the switch. `SharedDb` is `Arc<storage::writer::Writer>`, an actor: one
+thread per workspace owns the writer connection and runs the owned (`Send + 'static`)
+closures sent to it one at a time, interactive before background by
+`quack_core::priority` (a task-local, interactive unless the job queue scopes a
+background job kind). Async code awaits `Writer::run` (or the server's `with_db`); sync
+code off the runtime uses `Writer::call`; nothing locks the writer. `DbHandle` is async
+and takes owned closures (`Arc<Writer>` sends them to the actor, the CLI's own
+`WorkspaceDb` runs them in place), so `graph_cli`, `ontology_cli`, ingestion, import,
+and extraction send one step at a time and render command output into a buffer on the
+writer's thread (`graph_cli::rendered`).
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes

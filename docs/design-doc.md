@@ -175,7 +175,7 @@ and each is limited where it is used:
 | Resource | Limit | Where |
 |----------|-------|-------|
 | Model requests, per provider and model | `[providers.NAME].max_concurrent_requests` for each model (1 for Ollama, which serves one request per model unless `OLLAMA_NUM_PARALLEL` says more; 8 for hosted APIs), process-wide, interactive requests first | `llm::LimitedHttp`: every rig client quack builds sends through it; the model is read from the request body; a permit is held from the request until its body is read or its stream ends |
-| The workspace's writer connection | one holder at a time, interactive callers first (`storage::writer::Writer`, section 7.4) | long work takes it per step, never across a model call; the terminal and async code reach it only from the blocking pool |
+| The workspace's writer connection | owned by one thread per workspace (`storage::writer::Writer`, an actor, section 7.4) that runs the closures sent to it one at a time, interactive first | callers send owned closures and await the answer (`Writer::run`), so no async worker ever waits on it; long work sends one step at a time, never across a model call |
 | Reads | the reader pool (`[analysis].reader_pool_size`) | `ReaderDb` |
 | Uploads per workspace (server) | `[server].workers_per_workspace` | the `ingest:{workspace}` lane |
 
@@ -491,7 +491,8 @@ an embedding yet, in which case the workspace adopts the new dimension and retyp
 `embedding` columns of `_quack_chunks` and `_quack_graph_nodes` through NULL. Session and
 message writes are small and frequent; a workspace has one writer connection, so they
 serialize with ingestion writes rather than running beside them, though in the writer's
-interactive line, ahead of any waiting background write (section 4.1).
+interactive line, ahead of any waiting background write (section 4.1): the connection
+lives on the workspace's writer thread and every write is a closure sent to it.
 
 ### 5.5 `control.db` (server only, SQLite, sea-query queries, SQL-file migrations)
 
@@ -1753,8 +1754,9 @@ because the system being replaced runs on Postgres.
 1. **DuckDB is embedded and single-process.** One `quack serve` process owns every
    workspace file. Vertical scaling only. Concurrency within a process is narrower than
    DuckDB's MVCC would allow: a workspace has one writer connection
-   (`storage::writer::Writer`, a two-tier line: interactive callers before background
-   ones), so ingestion and session writes take turns; reads go to the reader pool.
+   (`storage::writer::Writer`, owned by a thread of its own that serves interactive
+   work before background work), so ingestion and session writes take turns; reads go
+   to the reader pool.
    Horizontal scaling or an HA pair is not possible without moving storage to a server
    database. For a single-instance deployment this is a simplification, not a limitation.
 2. **Vector search is an exact scan, not an index.** Every query computes the cosine
@@ -2000,9 +2002,11 @@ design to the tracker and is updated as issues close. Ordered by risk.
     Ingest and import stop on cancel, mid-embedding included. A workspace with 64 uploads
     waiting answers the next with 503 and `Retry-After: 30`; the web Jobs page follows
     `.../jobs/stream` instead of polling; the terminal re-renders only the messages that
-    changed. The writer is a two-tier line (interactive first) and the terminal never
-    touches it from its event loop: every command's database step runs, in the order
-    typed, on a worker task, reads on the reader pool. Not yet: MCP `query` calls and
+    changed. The writer is an actor: one thread per workspace owns the connection and
+    runs the owned closures sent to it, interactive before background; `DbHandle` is
+    async, so no runtime worker ever blocks on the database, and the terminal's
+    commands run their database step, in the order typed, on a worker task, reads on
+    the reader pool. Not yet: MCP `query` calls and
     print mode run their turn directly (one call, one answer, nothing to keep
     responsive); the web chat page shows its own turn but not a job strip (the Jobs page
     does); jobs are not persisted across restarts.

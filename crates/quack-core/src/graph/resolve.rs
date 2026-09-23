@@ -46,7 +46,7 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
         return Ok(summary);
     };
     loop {
-        let pending = db.with(|db| store::nodes_without_embedding(db, 64))?;
+        let pending = db.with(|db| store::nodes_without_embedding(db, 64)).await?;
         if pending.is_empty() {
             break;
         }
@@ -55,7 +55,8 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
             .embed_texts(inputs)
             .await
             .map_err(|e| Error::Embedding(e.to_string()))?;
-        db.with(|db| {
+        let embedded = u32::try_from(pending.len()).unwrap_or(u32::MAX);
+        db.with(move |db| {
             for (node, embedding) in pending.iter().zip(embeddings) {
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -65,15 +66,17 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
                 store::set_node_embedding(db, &node.id, &vector)?;
             }
             Ok(())
-        })?;
-        summary.embedded = summary
-            .embedded
-            .saturating_add(u32::try_from(pending.len()).unwrap_or(u32::MAX));
+        })
+        .await?;
+        summary.embedded = summary.embedded.saturating_add(embedded);
     }
-    let (auto_merged, proposed) = db.with(|db| {
-        log_memory(db, "before merge proposals");
-        propose_merges(db, options)
-    })?;
+    let options = *options;
+    let (auto_merged, proposed) = db
+        .with(move |db| {
+            log_memory(db, "before merge proposals");
+            propose_merges(db, &options)
+        })
+        .await?;
     summary.auto_merged = auto_merged;
     summary.proposed = proposed;
     Ok(summary)

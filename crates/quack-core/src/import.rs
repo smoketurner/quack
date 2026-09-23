@@ -263,9 +263,12 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         .first()
         .cloned()
         .ok_or_else(|| Error::Ingestion(String::from("the import produced no table")))?;
-    let (columns, rows) = match rows {
-        Some(rows) => (columns, rows),
-        None => db.with(|db| cap_loaded_table(db, &loaded, limit))?,
+    let (columns, rows) = if let Some(rows) = rows {
+        (columns, rows)
+    } else {
+        let table = loaded.clone();
+        db.with(move |db| cap_loaded_table(db, &table, limit))
+            .await?
     };
     tracing::info!(table = %loaded, rows, source = %source, "imported external data");
     Ok(ImportSummary {

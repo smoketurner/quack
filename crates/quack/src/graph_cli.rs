@@ -125,7 +125,14 @@ pub(crate) async fn run(
             )
             .await?;
         }
-        quick => db.with(|db| Ok(run_quick(db, quick, out)))??,
+        quick => {
+            // One step on the workspace: rendered into a buffer there, then
+            // written here (the output cannot cross to the writer's thread).
+            let rendered = db
+                .with(move |db| Ok(rendered(|buf| run_quick(db, quick, buf))))
+                .await?;
+            out.write_all(&rendered.map_err(anyhow::Error::msg)?)?;
+        }
     }
     out.flush()?;
     Ok(())
@@ -221,17 +228,28 @@ async fn run_search(
         (None, None) => anyhow::bail!("give an entity, --class CLASS, or both"),
         (Some(entity), class) => {
             let embedding = query_embedding(config, entity).await?;
-            let roots =
-                db.with(|db| traverse::resolve_entry(db, entity, class, embedding.as_deref()))?;
+            let (name, class_id) = (entity.to_owned(), class.map(str::to_owned));
+            let roots = db
+                .with(move |db| {
+                    traverse::resolve_entry(db, &name, class_id.as_deref(), embedding.as_deref())
+                })
+                .await?;
             if roots.is_empty() {
                 anyhow::bail!("no entity matches '{entity}'");
             }
-            db.with(|db| traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options))?
+            db.with(move |db| {
+                traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options)
+            })
+            .await?
         }
-        (None, Some(class)) => db.with(|db| {
-            let ontology = ontology_store::current(db)?;
-            traverse::by_class(db, ontology.as_ref(), class, options.max_nodes, &options)
-        })?,
+        (None, Some(class)) => {
+            let class = class.to_owned();
+            db.with(move |db| {
+                let ontology = ontology_store::current(db)?;
+                traverse::by_class(db, ontology.as_ref(), &class, options.max_nodes, &options)
+            })
+            .await?
+        }
     };
     print_result(out, &result, json)
 }
@@ -254,15 +272,23 @@ async fn run_path(
     let options = config.graph.options();
     let a = query_embedding(config, &from).await?;
     let b = query_embedding(config, &to).await?;
-    let from_nodes = db.with(|db| traverse::resolve_entry(db, &from, None, a.as_deref()))?;
-    let to_nodes = db.with(|db| traverse::resolve_entry(db, &to, None, b.as_deref()))?;
+    let (from_name, to_name) = (from.clone(), to.clone());
+    let from_nodes = db
+        .with(move |db| traverse::resolve_entry(db, &from_name, None, a.as_deref()))
+        .await?;
+    let to_nodes = db
+        .with(move |db| traverse::resolve_entry(db, &to_name, None, b.as_deref()))
+        .await?;
     let (Some(a), Some(b)) = (from_nodes.first(), to_nodes.first()) else {
         anyhow::bail!(
             "no entity matches '{}'",
             if from_nodes.is_empty() { &from } else { &to }
         );
     };
-    let result = db.with(|db| traverse::path(db, a, b, max_hops, &options))?;
+    let (a, b) = (a.clone(), b.clone());
+    let result = db
+        .with(move |db| traverse::path(db, &a, &b, max_hops, &options))
+        .await?;
     if result.is_empty() && !json {
         writeln!(out, "No path within {max_hops} hops.")?;
         return Ok(());
@@ -278,11 +304,12 @@ async fn run_extract(
     progress: Progress<'_>,
 ) -> Result<()> {
     let ontology = db
-        .with(ontology_store::current)?
+        .with(ontology_store::current)
+        .await?
         .context("no ontology yet: run `quack ontology init` or `quack ontology propose` first")?;
-    let provisional = db.with(ontology_store::current_is_auto_accepted)?;
+    let provisional = db.with(ontology_store::current_is_auto_accepted).await?;
     if args.reset {
-        db.with(graph_store::clear)?;
+        db.with(graph_store::clear).await?;
         writeln!(out, "Cleared the graph.")?;
     }
     if args.sources != Sources::Documents {
@@ -292,7 +319,11 @@ async fn run_extract(
                 "No mapped tables in the ontology; skipping table extraction."
             )?;
         } else {
-            for summary in db.with(|db| tables::extract(db, &ontology, provisional))? {
+            let mapped = ontology.clone();
+            let summaries = db
+                .with(move |db| tables::extract(db, &mapped, provisional))
+                .await?;
+            for summary in summaries {
                 match &summary.skipped {
                     Some(reason) => writeln!(out, "Table {}: skipped, {reason}", summary.table)?,
                     None => writeln!(
@@ -305,7 +336,8 @@ async fn run_extract(
         }
     }
     if args.sources != Sources::Tables {
-        let chunks = db.with(|db| extract::chunks(db, args.sample))?;
+        let sample = args.sample;
+        let chunks = db.with(move |db| extract::chunks(db, sample)).await?;
         if chunks.is_empty() {
             writeln!(
                 out,
@@ -361,9 +393,22 @@ async fn run_extract(
             resolved.auto_merged, resolved.proposed
         )?;
     }
-    db.with(|db| graph_store::set_built_with(db, ontology.version))?;
-    write!(out, "{}", status_text(&db.with(graph_store::status)?))?;
+    let version = ontology.version;
+    db.with(move |db| graph_store::set_built_with(db, version))
+        .await?;
+    write!(out, "{}", status_text(&db.with(graph_store::status).await?))?;
     Ok(())
+}
+
+/// What `write` printed, or its error's text as the CLI shows it: a
+/// command step that runs on the workspace writer's thread renders there
+/// and hands the bytes back.
+pub(crate) fn rendered(
+    write: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    write(&mut buf).map_err(|e| format!("{e:#}"))?;
+    Ok(buf)
 }
 
 fn confirm(out: &mut impl Write) -> Result<bool> {

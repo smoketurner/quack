@@ -288,7 +288,7 @@ impl App {
         reader_db: ReaderDb,
         session_id: String,
         allow_write: bool,
-    ) -> Result<Self> {
+    ) -> Self {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let mut textarea = TextArea::default();
         configure_textarea(&mut textarea);
@@ -336,18 +336,14 @@ impl App {
             app.messages
                 .push(Message::new(MessageRole::System, NO_CHAT_MODEL_TEXT));
         }
-        let current = app.session_id.clone();
-        app.replay_session(&current)?;
-        Ok(app)
+        app
     }
 
-    /// Load a session's stored messages into the transcript (at startup,
-    /// before the loop runs; `/resume` loads on the reader instead).
-    fn replay_session(&mut self, session_id: &str) -> Result<()> {
-        let rows = {
-            let db = self.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-            load_session(&db, session_id)?
-        };
+    /// Load the session's stored messages into the transcript at startup,
+    /// before the loop runs (`/resume` loads through the database worker).
+    pub(crate) async fn load_current_session(&mut self) -> Result<()> {
+        let id = self.session_id.clone();
+        let rows = self.db.run(move |db| load_session(db, &id)).await?;
         self.apply_replay(rows);
         Ok(())
     }
@@ -481,7 +477,12 @@ impl App {
 
         self.cancel_all_jobs();
         self.wait_for_jobs(QUIT_GRACE).await;
-        self.forget_session_now();
+        if let Some((db, session)) = self.session_to_forget() {
+            drop(
+                db.run(move |db| sessions::delete_if_empty(db, &session))
+                    .await,
+            );
+        }
         Ok(())
     }
 
@@ -1803,14 +1804,14 @@ impl App {
         );
     }
 
-    /// The same when the session ends: after the loop, so it may wait.
-    fn forget_session_now(&self) {
+    /// The same when the session ends, after the loop: the writer and the
+    /// session to drop, taken out first so no borrow of the app is held
+    /// across the await.
+    fn session_to_forget(&self) -> Option<(SharedDb, String)> {
         if self.turns.iter().any(|t| t.session_id == self.session_id) {
-            return;
+            return None;
         }
-        if let Ok(db) = self.db.lock() {
-            drop(sessions::delete_if_empty(&db, &self.session_id));
-        }
+        Some((Arc::clone(&self.db), self.session_id.clone()))
     }
 
     /// Push a transcript line.
@@ -1836,18 +1837,7 @@ impl App {
             Box::pin(async move {
                 let result = match side {
                     Side::Read => reader.with_db(work).await,
-                    Side::Write => tokio::task::spawn_blocking(move || {
-                        let guard = db
-                            .lock_at(Priority::Interactive)
-                            .map_err(|e| CoreError::Analysis(e.to_string()))?;
-                        work(&guard)
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        Err(CoreError::Analysis(format!(
-                            "the database task failed: {e}"
-                        )))
-                    }),
+                    Side::Write => db.run_at(Priority::Interactive, work).await,
                 };
                 drop(tx.send(AppMsg::Apply(Box::new(move |app: &mut App| {
                     apply(app, result);
@@ -2394,10 +2384,6 @@ async fn run_job_inner(
 ) -> Result<String> {
     let progress = |done: quack_core::progress::ChunkDone| ctx.progress(done.done, done.total);
     let mut out: Vec<u8> = Vec::new();
-    let lock = || {
-        db.lock()
-            .map_err(|e| anyhow::anyhow!("workspace lock poisoned: {e}"))
-    };
     match job {
         CliJob::Ontology(action) => {
             crate::ontology_cli::run(config, db, action, &mut out, &progress).await?;
@@ -2410,7 +2396,8 @@ async fn run_job_inner(
             if dir.is_empty() {
                 anyhow::bail!("Usage: /okf DIR");
             }
-            let bundle = okf::export(&*lock()?, workspace_name)?;
+            let name = workspace_name.to_owned();
+            let bundle = db.run(move |db| okf::export(db, &name)).await?;
             bundle.write_to(std::path::Path::new(dir))?;
             std::io::Write::write_all(
                 &mut out,
@@ -2420,14 +2407,18 @@ async fn run_job_inner(
         CliJob::ContextImport(file) => {
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-            let stored = context::set(&*lock()?, text.trim(), None)?;
+            let stored = db
+                .run(move |db| context::set(db, text.trim(), None))
+                .await?;
             std::io::Write::write_all(
                 &mut out,
                 format!("Context is now version {}.", stored.version).as_bytes(),
             )?;
         }
         CliJob::ContextExport(file) => {
-            let current = context::current(&*lock()?)?
+            let current = db
+                .run(context::current)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("no workspace context to export"))?;
             std::fs::write(&file, &current.content)
                 .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
@@ -2516,15 +2507,9 @@ async fn run_sql_task(
 ) -> BackgroundResult {
     let started = std::time::Instant::now();
     let outcome = if write {
-        let result = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| CoreError::Analysis(format!("workspace lock poisoned: {e}")))?;
-            db.cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows))
-        })
-        .await
-        .map_err(|e| CoreError::Analysis(format!("the query task failed: {e}")))
-        .and_then(|r| r);
+        let result = db
+            .run(move |db| db.cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows)))
+            .await;
         reader.observe_write().await;
         result
     } else {
@@ -2723,7 +2708,7 @@ mod tests {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Writer::new(db));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
         let reader_db = ReaderDb::new(Arc::clone(&db));
         App::new(
             String::from("ws"),
@@ -2735,7 +2720,6 @@ mod tests {
             session.id,
             false,
         )
-        .unwrap_or_else(|e| fail(&e.to_string()))
     }
 
     /// Wait for the background result a command posted and apply it.
@@ -3068,13 +3052,13 @@ mod tests {
 
         // A write then a read, sent back to back, answer in that order: the
         // listing sees the pin.
-        let id = {
-            let db = app.db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-            db.list_documents()
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .first()
-                .map_or_else(|| fail("no document"), |d| d.id.clone())
-        };
+        let id = app
+            .db
+            .run(WorkspaceDb::list_documents)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .first()
+            .map_or_else(|| fail("no document"), |d| d.id.clone());
         app.handle_slash_command(&format!("/pin {id}"));
         app.handle_slash_command("/docs");
         // Neither has answered on the loop yet: nothing blocked here.
@@ -3107,6 +3091,41 @@ mod tests {
             last(&app).content
         );
         assert!(app.switching.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_replays_at_startup_through_the_writer() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let session = app.session_id.clone();
+        app.db
+            .run(move |db| {
+                sessions::record_turn(
+                    db,
+                    &session,
+                    "how many storms?",
+                    &AgentResponse {
+                        content: String::from("Twelve storms."),
+                        ..AgentResponse::default()
+                    },
+                )
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        app.load_current_session()
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.role == MessageRole::Assistant && m.content == "Twelve storms."),
+            "the recorded answer is back in the transcript"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Resumed session"))
+        );
     }
 
     #[test]

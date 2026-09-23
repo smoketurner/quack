@@ -31,7 +31,7 @@ pub(crate) async fn run(
     let provider_display = quack_core::llm::chat_model_display(&config);
     let config = Arc::new(config);
 
-    let tui_app = app::App::new(
+    let mut tui_app = app::App::new(
         workspace_name,
         workspace_id,
         provider_display,
@@ -40,7 +40,8 @@ pub(crate) async fn run(
         reader_db,
         session_id,
         allow_write,
-    )?;
+    );
+    tui_app.load_current_session().await?;
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     // Mouse capture for wheel scrolling; ratatui's restore does not undo

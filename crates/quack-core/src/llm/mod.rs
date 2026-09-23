@@ -1095,7 +1095,9 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "o/m", sessions::ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(crate::storage::writer::Writer::new(db));
+        let db: SharedDb = Arc::new(
+            crate::storage::writer::Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())),
+        );
         let reader_db =
             crate::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let (sink, mut events) = events::channel();
@@ -1120,9 +1122,11 @@ mod tests {
             matches!(&last, Some(AgentEvent::TurnComplete(r)) if r.cancelled),
             "{last:?}"
         );
-        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-        let messages =
-            sessions::messages(&guard, &session.id).unwrap_or_else(|e| fail(&e.to_string()));
+        let id = session.id.clone();
+        let messages = db
+            .run(move |guard| sessions::messages(guard, &id))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
         let roles: Vec<sessions::MessageRole> = messages.iter().map(|m| m.role).collect();
         assert_eq!(
             roles,

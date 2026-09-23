@@ -81,13 +81,13 @@ pub(crate) fn submit_upload(
                 // the document must not stay `processing` forever.
                 tracing::error!(error = %e, document = %document_id, "upload worker task failed");
                 let message = "the ingestion worker failed before finishing this file";
-                mark_error(&worker_db, &document_id, message);
+                mark_error(&worker_db, &document_id, message).await;
                 Err(String::from(message))
             }
         }
     });
     when_cancelled_unstarted(&app.jobs, id, move || async move {
-        mark_error(&db, &document_id, "cancelled before processing started");
+        mark_error(&db, &document_id, "cancelled before processing started").await;
     });
     id
 }
@@ -124,7 +124,7 @@ async fn process(
         Ok(model) => model,
         Err(e) => {
             tracing::warn!(error = %e, document = %job.document_id, "upload fails: no embedding model");
-            mark_error(db, &job.document_id, &e.to_string());
+            mark_error(db, &job.document_id, &e.to_string()).await;
             return Err(e.to_string());
         }
     };
@@ -156,15 +156,9 @@ async fn process(
 
 /// Record `message` as the document's error, so a client polling it sees
 /// `error` rather than `processing` without end.
-fn mark_error(db: &SharedDb, document_id: &str, message: &str) {
-    match db.lock() {
-        Ok(guard) => {
-            if let Err(mark) = guard.mark_document_error(document_id, message) {
-                tracing::error!(error = %mark, document = %document_id, "could not record the upload failure");
-            }
-        }
-        Err(poisoned) => {
-            tracing::error!(error = %poisoned, document = %document_id, "workspace lock poisoned; upload failure not recorded");
-        }
+async fn mark_error(db: &SharedDb, document_id: &str, message: &str) {
+    let (id, text) = (document_id.to_owned(), message.to_owned());
+    if let Err(mark) = db.run(move |db| db.mark_document_error(&id, &text)).await {
+        tracing::error!(error = %mark, document = %document_id, "could not record the upload failure");
     }
 }

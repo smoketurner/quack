@@ -642,7 +642,8 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         cli.resume.as_deref(),
         cli.mode.map(ChatMode::from),
     )?;
-    let db: SharedDb = Arc::new(Writer::new(ws_db));
+    let db: SharedDb =
+        Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
     let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     let outcome = print::run_prompt(
         &config,
@@ -655,10 +656,9 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         cli.verbose,
     )
     .await;
-    if outcome.is_err()
-        && let Ok(guard) = db.lock()
-    {
-        drop(sessions::delete_if_empty(&guard, &session_id));
+    if outcome.is_err() {
+        let id = session_id.clone();
+        drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
     if let Err(e) = &outcome
         && let Some(code) = auth_exit_code(e)
@@ -919,7 +919,8 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    let db: SharedDb = Arc::new(Writer::new(ws_db));
+    let db: SharedDb =
+        Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
     let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     let policy = if allow_write {
         WritePolicy::Allow
@@ -1117,7 +1118,8 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         cli.resume.as_deref(),
         cli.mode.map(ChatMode::from),
     )?;
-    let db: SharedDb = Arc::new(Writer::new(ws_db));
+    let db: SharedDb =
+        Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
     let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
     terminal::run(
         config,

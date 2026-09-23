@@ -1041,12 +1041,14 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         .await
         .unwrap_or_else(|e| fail(&e.message));
     let (mine, theirs) = {
-        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-        let mine = create_session(&guard, "m", ChatMode::Chat, Some(&viewer))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let theirs = create_session(&guard, "m", ChatMode::Chat, Some(&other))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        (mine.id, theirs.id)
+        let (viewer, other) = (viewer.clone(), other.clone());
+        db.run(move |db| {
+            let mine = create_session(db, "m", ChatMode::Chat, Some(&viewer))?;
+            let theirs = create_session(db, "m", ChatMode::Chat, Some(&other))?;
+            Ok((mine.id, theirs.id))
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
     };
     let viewer_token = h.login("viewer").await;
     let owner_token = h.login("owner").await;
@@ -1229,8 +1231,9 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let fresh = {
-        let guard = db.lock().unwrap_or_else(|e| fail(&e.to_string()));
-        create_session(&guard, "m", ChatMode::Chat, Some(&owner))
+        let owner = owner.clone();
+        db.run(move |db| create_session(db, "m", ChatMode::Chat, Some(&owner)))
+            .await
             .unwrap_or_else(|e| fail(&e.to_string()))
             .id
     };

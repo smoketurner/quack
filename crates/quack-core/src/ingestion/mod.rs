@@ -18,28 +18,40 @@ use crate::storage::workspace::{
 };
 use crate::storage::writer::Writer;
 
-/// Access to a workspace database for ingestion: a bare handle, or a
-/// shared one that is locked only around each database step so embedding
-/// calls run with the workspace free for other requests.
+/// Access to a workspace database for long work (ingestion, extraction,
+/// proposals): the CLI's own connection, or a workspace's shared writer,
+/// which takes each step as an owned closure on its own thread so the work
+/// between steps (parsing, model calls) holds nothing and no async worker
+/// ever waits on the connection.
 pub trait DbHandle {
-    /// Run `f` against the database.
+    /// Run `f` against the database and await its answer.
     ///
     /// # Errors
     ///
-    /// Returns `f`'s error, or an error when a shared handle is poisoned.
-    fn with<R>(&self, f: impl FnOnce(&WorkspaceDb) -> Result<R>) -> Result<R>;
+    /// Returns `f`'s error, or the writer's (a panic in `f`, a stopped
+    /// writer).
+    fn with<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&WorkspaceDb) -> Result<R> + Send + 'static,
+    ) -> impl std::future::Future<Output = Result<R>>;
 }
 
 impl DbHandle for WorkspaceDb {
-    fn with<R>(&self, f: impl FnOnce(&WorkspaceDb) -> Result<R>) -> Result<R> {
-        f(self)
+    /// The CLI's own connection: nothing to wait for, `f` runs here.
+    fn with<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&WorkspaceDb) -> Result<R> + Send + 'static,
+    ) -> impl std::future::Future<Output = Result<R>> {
+        std::future::ready(f(self))
     }
 }
 
 impl DbHandle for Arc<Writer> {
-    fn with<R>(&self, f: impl FnOnce(&WorkspaceDb) -> Result<R>) -> Result<R> {
-        let guard = self.lock().map_err(|e| Error::Ingestion(e.to_string()))?;
-        f(&guard)
+    fn with<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&WorkspaceDb) -> Result<R> + Send + 'static,
+    ) -> impl std::future::Future<Output = Result<R>> {
+        self.run(f)
     }
 }
 
@@ -185,7 +197,8 @@ pub async fn ingest_file<M: EmbeddingModel, D: DbHandle>(
     file: &NewFile<'_>,
     embedding_model: Option<&M>,
 ) -> Result<IngestOutcome> {
-    let doc_id = match db.with(|db| register_document(db, file))? {
+    let pending = Pending::of(file)?;
+    let doc_id = match db.with(move |db| pending.register(db)).await? {
         Registration::New(id) => id,
         Registration::Duplicate(existing) => return Ok(IngestOutcome::Duplicate(existing)),
     };
@@ -211,12 +224,81 @@ pub async fn ingest_file<M: EmbeddingModel, D: DbHandle>(
 ///
 /// Returns `UnsupportedFileType` or a storage error.
 pub fn register_document(db: &WorkspaceDb, file: &NewFile<'_>) -> Result<Registration> {
-    let file_type = parser::detect_file_type(file.filename);
-    if matches!(file_type, parser::FileType::Unknown) {
-        return Err(Error::UnsupportedFileType(file.filename.to_owned()));
+    Pending::of(file)?.register(db)
+}
+
+/// What registering a file writes, owned and without its bytes, so the
+/// write can be handed to the workspace writer while the bytes stay here.
+struct Pending {
+    filename: String,
+    title: Option<String>,
+    ingested_by: Option<String>,
+    source: DocumentSource,
+    size_bytes: usize,
+    sha256: String,
+    file_type: parser::FileType,
+}
+
+impl Pending {
+    /// Hash the bytes and refuse a type nothing can parse, before any write.
+    fn of(file: &NewFile<'_>) -> Result<Self> {
+        let file_type = parser::detect_file_type(file.filename);
+        if matches!(file_type, parser::FileType::Unknown) {
+            return Err(Error::UnsupportedFileType(file.filename.to_owned()));
+        }
+        Ok(Self {
+            filename: file.filename.to_owned(),
+            title: file
+                .title
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned),
+            ingested_by: file.ingested_by.map(str::to_owned),
+            source: file.source,
+            size_bytes: file.data.len(),
+            sha256: sha256_hex(file.data),
+            file_type,
+        })
     }
-    let sha256 = sha256_hex(file.data);
-    if let Some(existing) = db.document_by_sha256(&sha256)? {
+
+    fn register(&self, db: &WorkspaceDb) -> Result<Registration> {
+        let Self {
+            filename,
+            title,
+            ingested_by,
+            source,
+            size_bytes,
+            sha256,
+            file_type,
+        } = self;
+        register_pending(
+            db,
+            filename,
+            title.as_deref(),
+            ingested_by.as_deref(),
+            *source,
+            *size_bytes,
+            sha256,
+            file_type,
+        )
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the document row's fields, destructured from Pending"
+)]
+fn register_pending(
+    db: &WorkspaceDb,
+    filename: &str,
+    title: Option<&str>,
+    ingested_by: Option<&str>,
+    source: DocumentSource,
+    size_bytes: usize,
+    sha256: &str,
+    file_type: &parser::FileType,
+) -> Result<Registration> {
+    if let Some(existing) = db.document_by_sha256(sha256)? {
         if db.document_intact(&existing)? {
             return Ok(Registration::Duplicate(Box::new(existing)));
         }
@@ -233,20 +315,19 @@ pub fn register_document(db: &WorkspaceDb, file: &NewFile<'_>) -> Result<Registr
         file_type,
         parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json
     ) {
-        check_table_free(db, &sanitize_table_name(file.filename), None)?;
+        check_table_free(db, &sanitize_table_name(filename), None)?;
     }
     let doc_id = uuid::Uuid::now_v7().to_string();
-    let title = file.title.map(str::trim).filter(|t| !t.is_empty());
     db.insert_document(&NewDocument {
         id: &doc_id,
-        filename: file.filename,
+        filename,
         title,
         mime_type: file_type.mime_type(),
-        size_bytes: file.data.len(),
-        sha256: &sha256,
-        source: file.source,
+        size_bytes,
+        sha256,
+        source,
         status: "queued",
-        ingested_by: file.ingested_by,
+        ingested_by,
     })?;
     Ok(Registration::New(doc_id))
 }
@@ -273,7 +354,9 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     embedding_model: Option<&M>,
     cancel: Option<&CancellationToken>,
 ) -> Result<IngestResult> {
-    db.with(|db| db.update_document_status(doc_id, "processing"))?;
+    let id = doc_id.to_owned();
+    db.with(move |db| db.update_document_status(&id, "processing"))
+        .await?;
     let outcome = match check_cancel(cancel) {
         Ok(()) => {
             process_inner(
@@ -290,16 +373,25 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
         }
         Err(e) => Err(e),
     };
+    let id = doc_id.to_owned();
     match &outcome {
-        Ok(result) => db.with(|db| {
-            db.set_document_chunk_count(doc_id, result.chunks_stored)?;
-            db.set_document_tables(doc_id, &result.tables)?;
-            db.update_document_status(doc_id, "ready")
-        })?,
-        Err(e) => db.with(|db| {
-            db.discard_chunks(doc_id)?;
-            db.mark_document_error(doc_id, &e.to_string())
-        })?,
+        Ok(result) => {
+            let (chunks, tables) = (result.chunks_stored, result.tables.clone());
+            db.with(move |db| {
+                db.set_document_chunk_count(&id, chunks)?;
+                db.set_document_tables(&id, &tables)?;
+                db.update_document_status(&id, "ready")
+            })
+            .await?;
+        }
+        Err(e) => {
+            let message = e.to_string();
+            db.with(move |db| {
+                db.discard_chunks(&id)?;
+                db.mark_document_error(&id, &message)
+            })
+            .await?;
+        }
     }
     outcome
 }
@@ -321,9 +413,17 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
     let file_type = parser::detect_file_type(filename);
     match file_type {
         parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json => {
-            let table_name = db.with(|db| {
-                ingest_structured(config, db, workspace_id, doc_id, filename, data, &file_type)
-            })?;
+            // One step on the writer: check the table is free, write the
+            // bytes under `files/`, load them.
+            let step = StructuredLoad {
+                config: config.clone(),
+                workspace_id: workspace_id.to_owned(),
+                doc_id: doc_id.to_owned(),
+                filename: filename.to_owned(),
+                data: data.to_vec(),
+                file_type: file_type.clone(),
+            };
+            let table_name = db.with(move |db| step.load(db)).await?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
@@ -335,8 +435,13 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
             })
         }
         parser::FileType::Xlsx => {
-            let tables =
-                db.with(|db| ingest_workbook(config, db, workspace_id, doc_id, filename, data))?;
+            // Parsing the workbook is the slow part: here, not on the writer.
+            let sheets = xlsx::sheets(data)?;
+            let files_dir = config.workspace_files_dir(workspace_id);
+            let (id, name) = (doc_id.to_owned(), filename.to_owned());
+            let tables = db
+                .with(move |db| ingest_workbook(db, &files_dir, &id, &name, sheets))
+                .await?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
@@ -355,7 +460,9 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
         | parser::FileType::Pptx => {
             let extracted = parser::extract(&file_type, data)?;
             if let Some(title) = extracted.title() {
-                db.with(|db| db.set_document_title_if_empty(doc_id, title))?;
+                let (id, title) = (doc_id.to_owned(), title.to_owned());
+                db.with(move |db| db.set_document_title_if_empty(&id, &title))
+                    .await?;
             }
             let pages_skipped = extracted.pages_skipped;
             if pages_skipped > 0 {
@@ -475,6 +582,30 @@ pub fn table_name_for(filename: &str) -> String {
     sanitize_table_name(filename)
 }
 
+/// A structured file's load, owned, for the workspace writer's thread.
+struct StructuredLoad {
+    config: Config,
+    workspace_id: String,
+    doc_id: String,
+    filename: String,
+    data: Vec<u8>,
+    file_type: parser::FileType,
+}
+
+impl StructuredLoad {
+    fn load(&self, db: &WorkspaceDb) -> Result<String> {
+        ingest_structured(
+            &self.config,
+            db,
+            &self.workspace_id,
+            &self.doc_id,
+            &self.filename,
+            &self.data,
+            &self.file_type,
+        )
+    }
+}
+
 /// Write the bytes under `files/` and load them as a table with `DuckDB`'s
 /// reader for the type. The path is bound, never interpolated.
 fn ingest_structured(
@@ -530,16 +661,13 @@ fn ingest_structured(
 /// CSV for `DuckDB`'s reader (the `excel` extension is not in the static
 /// binary).
 fn ingest_workbook(
-    config: &Config,
     db: &WorkspaceDb,
-    workspace_id: &str,
+    files_dir: &std::path::Path,
     doc_id: &str,
     filename: &str,
-    data: &[u8],
+    sheets: Vec<xlsx::SheetCsv>,
 ) -> Result<Vec<String>> {
-    let sheets = xlsx::sheets(data)?;
-    let files_dir = config.workspace_files_dir(workspace_id);
-    std::fs::create_dir_all(&files_dir)?;
+    std::fs::create_dir_all(files_dir)?;
     let stem = sanitize_table_name(filename);
     let single = sheets.len() == 1;
     let names: Vec<String> = sheets
@@ -599,29 +727,32 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
         cancel,
     } = plan;
 
-    let stored = db.with(|db| {
-        db.write_transaction(|db| {
-            let mut stored: u32 = 0;
-            for (i, chunk) in chunks.iter().enumerate() {
-                let chunk_id = uuid::Uuid::now_v7().to_string();
-                let idx = u32::try_from(i)
-                    .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
-                db.insert_chunk(&NewChunk {
-                    id: &chunk_id,
-                    document_id,
-                    chunk_index: idx,
-                    content: &chunk.content,
-                    heading: chunk.heading.as_deref(),
-                    page: chunk.page,
-                    embedding: None,
-                })?;
-                stored = stored
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
-            }
-            Ok(stored)
+    let (owned, id) = (chunks.to_vec(), document_id.to_owned());
+    let stored = db
+        .with(move |db| {
+            db.write_transaction(|db| {
+                let mut stored: u32 = 0;
+                for (i, chunk) in owned.iter().enumerate() {
+                    let chunk_id = uuid::Uuid::now_v7().to_string();
+                    let idx = u32::try_from(i)
+                        .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
+                    db.insert_chunk(&NewChunk {
+                        id: &chunk_id,
+                        document_id: &id,
+                        chunk_index: idx,
+                        content: &chunk.content,
+                        heading: chunk.heading.as_deref(),
+                        page: chunk.page,
+                        embedding: None,
+                    })?;
+                    stored = stored
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
+                }
+                Ok(stored)
+            })
         })
-    })?;
+        .await?;
 
     let Some(model) = embedding_model else {
         return Ok((stored, None));
@@ -657,7 +788,8 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
     while let Some(next) = or_cancelled(cancel, async { Ok(stream.next().await) }).await? {
         let (offset, embeddings) = next?;
         batches = batches.saturating_add(1);
-        db.with(|db| {
+        let id = document_id.to_owned();
+        db.with(move |db| {
             db.write_transaction(|db| {
                 for (j, embedding) in embeddings.into_iter().enumerate() {
                     let chunk_idx = u32::try_from(offset.saturating_add(j))
@@ -669,11 +801,12 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
                     )]
                     let vec_f32: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
 
-                    db.update_chunk_embedding(document_id, chunk_idx, &vec_f32)?;
+                    db.update_chunk_embedding(&id, chunk_idx, &vec_f32)?;
                 }
                 Ok(())
             })
-        })?;
+        })
+        .await?;
     }
 
     let elapsed = started.elapsed();
