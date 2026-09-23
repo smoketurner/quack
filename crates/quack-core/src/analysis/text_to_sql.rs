@@ -1,11 +1,9 @@
 use crate::analysis::policy::WritePolicy;
-use crate::error::Error;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::graph::store as graph_store;
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
-use crate::storage::workspace::WorkspaceDb;
-use crate::storage::workspace::{CappedResults, QueryResults};
+use crate::storage::workspace::{CappedResults, QueryResults, WorkspaceDb};
 use std::fmt::Write;
 
 /// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to

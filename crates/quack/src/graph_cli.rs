@@ -8,8 +8,10 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::embedding::{Input, Vector};
-use quack_core::graph::{ExtractSource, GraphResult, GraphStatus};
-use quack_core::graph::{extract, resolve, store as graph_store, tables, traverse};
+use quack_core::graph::{
+    ExtractSource, GraphResult, GraphStatus, extract, resolve, store as graph_store, tables,
+    traverse,
+};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
 use quack_core::progress::Progress;

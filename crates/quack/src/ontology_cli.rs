@@ -10,13 +10,10 @@ use quack_core::config::Config;
 
 use crate::graph_cli::rendered;
 use quack_core::llm;
-use quack_core::ontology::Ontology;
-use quack_core::ontology::ROOT_CLASS;
 use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
-use quack_core::ontology::{candidates, documents, store};
-use quack_core::progress::ChunkDone;
-use quack_core::progress::Progress;
+use quack_core::ontology::{Ontology, ROOT_CLASS, candidates, documents, store};
+use quack_core::progress::{ChunkDone, Progress};
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 

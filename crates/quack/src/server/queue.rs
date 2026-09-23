@@ -10,9 +10,8 @@ use std::sync::Arc;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
-use quack_core::ingestion;
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobResult, JobSpec, JobState, Lane, LaneKey};
-use quack_core::llm;
+use quack_core::{ingestion, llm};
 
 use super::state::App;
 

@@ -27,7 +27,6 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{ChunkScope, StatementKind, WorkspaceDb};
-use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, ListResourceTemplatesResult, ListResourcesResult,
@@ -35,7 +34,7 @@ use rmcp::model::{
     Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
-use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 

@@ -42,10 +42,9 @@ use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 
 use crate::embeddings_cli::{self, EmbeddingsAction};
-use crate::graph_cli;
 use crate::graph_cli::GraphAction;
-use crate::ontology_cli;
 use crate::ontology_cli::OntologyAction;
+use crate::{graph_cli, ontology_cli};
 use quack_core::storage::workspace::DocumentInfo;
 
 /// The spinner's frame interval; it ticks only while a job is active.

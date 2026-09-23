@@ -3,21 +3,16 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use quack_core::config::JobsConfig;
 use quack_core::config::{
     AnalysisConfig, AuthMode, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
-    ImportConfig, IngestionConfig, OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig,
-    ServerConfig,
+    ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
+    RetrievalConfig, ServerConfig,
 };
-use quack_core::embedding::refresh::Plan;
-use quack_core::embedding::refresh::Retype;
+use quack_core::embedding::refresh::{Plan, Retype};
 use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::store as graph_store;
-use quack_core::import;
-use quack_core::import::ImportPolicy;
-use quack_core::import::ImportRequest;
-use quack_core::ingestion;
+use quack_core::import::{ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
 use quack_core::llm::CancellationToken;
 use quack_core::storage::control::ControlPlane;
@@ -26,6 +21,7 @@ use quack_core::storage::workspace::{
     WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
+use quack_core::{import, ingestion};
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
 const TEST_DIM: usize = 4;
@@ -2026,8 +2022,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     let source_dir = tempfile::tempdir().unwrap();
     let source_path = source_dir.path().join("source.db");
     {
-        use sqlx::Connection as _;
-        use sqlx::Executor as _;
+        use sqlx::{Connection as _, Executor as _};
         let url = format!("sqlite://{}?mode=rwc", source_path.display());
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
         conn.execute("CREATE TABLE orders (id INTEGER, region TEXT, total REAL, placed TEXT)")
@@ -2366,8 +2361,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     let source_dir = tempfile::tempdir().unwrap();
     let source_path = source_dir.path().join("source.db");
     {
-        use sqlx::Connection as _;
-        use sqlx::Executor as _;
+        use sqlx::{Connection as _, Executor as _};
         let url = format!("sqlite://{}?mode=rwc", source_path.display());
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
         conn.execute("CREATE TABLE orders (id INTEGER, region TEXT)")

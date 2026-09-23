@@ -1,9 +1,8 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols;
 use ratatui::text::Line;
 use ratatui::widgets::{Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType};
+use ratatui::{Frame, symbols};
 
 use quack_core::analysis::chart::{ChartKind as SpecKind, ChartSpec};
 

@@ -20,8 +20,7 @@ use super::rerank::{self, Reranker};
 use super::text_to_sql;
 use crate::embedding::{Embedder, Input, Vector};
 use crate::error::Error;
-use crate::ontology::store as ontology_store;
-use crate::ontology::{self, Ontology};
+use crate::ontology::{self, Ontology, store as ontology_store};
 
 /// A workspace's writer: its one write connection, on a thread of its own
 /// with a two-tier line of work ([`crate::storage::writer`]).
@@ -1268,8 +1267,7 @@ mod tests {
     use crate::graph::store::NewNode;
     use crate::llm::EmbedModel;
     use crate::ontology::Mapping;
-    use crate::storage::workspace::NewChunk;
-    use crate::storage::workspace::{DocumentStatus, NewDocument};
+    use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail_test(msg: &str) -> ! {

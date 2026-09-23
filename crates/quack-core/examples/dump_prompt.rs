@@ -10,8 +10,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::graph::store as graph_store;
 use quack_core::graph::store::NewNode;
-use quack_core::ontology::Ontology;
-use quack_core::ontology::store as ontology_store;
+use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
 use quack_core::storage::workspace::{DocumentStatus, NewDocument, WorkspaceDb};
 
