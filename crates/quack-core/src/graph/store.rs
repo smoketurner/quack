@@ -807,7 +807,7 @@ pub fn nearest_nodes(
          FROM _quack_graph_nodes \
          WHERE embedding IS NOT NULL AND embedding_profile IS NOT DISTINCT FROM ? \
            AND (? IS NULL OR class_id = ?) ORDER BY d LIMIT ?",
-        vt = db.vector_type_public()
+        vt = db.vector_type()
     );
     let literal = embedding_literal(query);
     let mut stmt = db.connection().prepare(&sql)?;
