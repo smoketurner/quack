@@ -11,7 +11,7 @@ use std::sync::Arc;
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ingestion;
-use quack_core::jobs::{JobId, JobKind, JobQueue, JobResult, JobSpec, JobState, Lane};
+use quack_core::jobs::{JobId, JobKind, JobQueue, JobResult, JobSpec, JobState, Lane, LaneKey};
 use quack_core::llm;
 
 use super::state::App;
@@ -23,11 +23,6 @@ pub(crate) const MAX_WAITING_UPLOADS: usize = 64;
 
 /// How long a turned-away uploader is told to wait.
 pub(crate) const UPLOAD_RETRY_SECONDS: u32 = 30;
-
-/// The workspace's upload lane key.
-pub(crate) fn upload_lane(workspace_id: &str) -> String {
-    format!("ingest:{workspace_id}")
-}
 
 pub(crate) struct UploadJob {
     pub document_id: String,
@@ -49,7 +44,7 @@ pub(crate) fn submit_upload(
         .workspace(workspace_id)
         .owner(owner)
         .lane(Lane::new(
-            upload_lane(workspace_id),
+            &LaneKey::Ingest(workspace_id.to_owned()),
             app.config.server.workers_per_workspace,
         ));
     let config = app.config.clone();

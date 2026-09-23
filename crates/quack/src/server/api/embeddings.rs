@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::embedding::refresh::{self, Plan};
-use quack_core::jobs::{JobId, JobKind, JobSpec, Lane};
+use quack_core::jobs::{JobId, JobKind, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::Outcome;
@@ -101,7 +101,7 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
     let spec = JobSpec::new(JobKind::Embeddings, "embeddings refresh")
         .workspace(workspace_id.clone())
         .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(format!("embeddings:{workspace_id}")));
+        .lane(Lane::serial(&LaneKey::Embeddings(workspace_id.clone())));
     let jobs = app.jobs.clone();
     let (cancel_app, cancel_access, cancel_run) =
         (Arc::clone(&app), access.clone(), run_id.clone());

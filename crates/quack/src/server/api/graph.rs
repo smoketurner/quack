@@ -9,7 +9,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::embedding::{Input, Vector};
 use quack_core::graph::{
-    GraphOptions, GraphResult, extract, resolve, store as graph_store, tables, traverse,
+    ExtractSource, GraphOptions, GraphResult, extract, resolve, store as graph_store, tables,
+    traverse,
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
@@ -21,7 +22,7 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::{App, with_db};
 use quack_core::analysis::tools::SharedDb;
-use quack_core::jobs::{JobKind, JobSpec, Lane};
+use quack_core::jobs::{JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::Ontology;
 
 #[derive(Deserialize, Default)]
@@ -153,7 +154,7 @@ pub(crate) async fn status(
 pub(crate) struct ExtractRequest {
     /// `all` (default), `tables`, or `documents`.
     #[serde(default)]
-    pub source: Option<String>,
+    pub source: ExtractSource,
     /// Chunks to send to the model at most.
     pub sample: Option<u32>,
     #[serde(default)]
@@ -170,19 +171,12 @@ pub(crate) async fn extract(
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
-    let (do_tables, do_documents) = match request.source.as_deref() {
-        None | Some("all") => (true, true),
-        Some("tables") => (true, false),
-        Some("documents") => (false, true),
-        Some(other) => return Err(ApiError::bad_request(format!("unknown source '{other}'"))),
-    };
     let started = start_extraction(
         &app,
         &access,
         &id,
         &ExtractionPlan {
-            tables: do_tables,
-            documents: do_documents,
+            source: request.source,
             sample: request.sample,
             reset: request.reset,
         },
@@ -198,8 +192,7 @@ pub(crate) async fn extract(
 
 /// What to extract.
 pub(crate) struct ExtractionPlan {
-    pub tables: bool,
-    pub documents: bool,
+    pub source: ExtractSource,
     pub sample: Option<u32>,
     pub reset: bool,
 }
@@ -212,8 +205,7 @@ pub(crate) async fn start_extraction(
     id: &str,
     plan: &ExtractionPlan,
 ) -> ApiResult<serde_json::Value> {
-    let (do_tables, do_documents, sample, reset) =
-        (plan.tables, plan.documents, plan.sample, plan.reset);
+    let (sample, reset) = (plan.sample, plan.reset);
     let slot = app.begin_extraction(id).ok_or_else(|| {
         ApiError::new(
             StatusCode::CONFLICT,
@@ -235,12 +227,12 @@ pub(crate) async fn start_extraction(
     if reset {
         with_db(Arc::clone(&db), graph_store::clear).await?;
     }
-    let table_summaries = if do_tables {
+    let table_summaries = if plan.source.includes_tables() {
         extract_tables_in_batches(&db, &ontology, provisional).await?
     } else {
         Vec::new()
     };
-    let chunks = if do_documents {
+    let chunks = if plan.source.includes_documents() {
         app.read(id, move |db| extract::chunks(db, sample)).await?
     } else {
         Vec::new()
@@ -354,7 +346,7 @@ fn spawn_document_extraction(
     let spec = JobSpec::new(JobKind::Graph, "graph extraction")
         .workspace(access.workspace.id.clone())
         .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(format!("graph:{}", access.workspace.id)));
+        .lane(Lane::serial(&LaneKey::Graph(access.workspace.id.clone())));
     let jobs = app.jobs.clone();
     let (cancel_app, cancel_access, cancel_run) =
         (Arc::clone(&app), access.clone(), run_id.clone());

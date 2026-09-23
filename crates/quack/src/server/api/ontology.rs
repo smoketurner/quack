@@ -12,7 +12,7 @@ use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::{App, with_db};
-use quack_core::jobs::{JobKind, JobSpec, Lane};
+use quack_core::jobs::{JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::{Ontology, candidates, documents, store};
 
 pub(crate) async fn show(
@@ -65,9 +65,7 @@ pub(crate) async fn init(
     let author = access.identity.username.clone();
     let stored = with_db(db, move |db| {
         if store::latest_version(db)? > 0 {
-            return Err(quack_core::error::Error::Ontology(String::from(
-                "an ontology already exists",
-            )));
+            return Ok(None);
         }
         store::save(
             db,
@@ -75,9 +73,15 @@ pub(crate) async fn init(
             Some(&author),
             Some("built-in default"),
         )
+        .map(Some)
     })
-    .await
-    .map_err(|e| ApiError::new(axum::http::StatusCode::CONFLICT, e.message))?;
+    .await?
+    .ok_or_else(|| {
+        ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "an ontology already exists",
+        )
+    })?;
     access
         .audit(
             &app,
@@ -421,7 +425,7 @@ pub(crate) async fn start_document_run(
     let spec = JobSpec::new(JobKind::Ontology, "ontology document pass")
         .workspace(id)
         .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(format!("ontology:{id}")));
+        .lane(Lane::serial(&LaneKey::Ontology(id.to_owned())));
     let (cancel_app, cancel_access, cancel_run) =
         (std::sync::Arc::clone(app), access.clone(), run.clone());
     let jobs = app.jobs.clone();

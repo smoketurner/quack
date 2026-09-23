@@ -45,7 +45,9 @@ use super::state::{App, with_db};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::store as graph_store;
-use quack_core::graph::{GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse};
+use quack_core::graph::{
+    ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse,
+};
 use quack_core::import::ImportRequest;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -2509,8 +2511,8 @@ fn short_id(id: &str) -> String {
 
 #[derive(Deserialize)]
 struct ExtractForm {
-    #[serde(default)]
-    source: String,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    source: Option<ExtractSource>,
     sample: Option<String>,
     #[serde(default)]
     reset: bool,
@@ -2523,11 +2525,6 @@ async fn graph_extract(
     Form(form): Form<ExtractForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let (do_tables, do_documents) = match form.source.as_str() {
-        "tables" => (true, false),
-        "documents" => (false, true),
-        _ => (true, true),
-    };
     let sample = form
         .sample
         .as_deref()
@@ -2537,8 +2534,7 @@ async fn graph_extract(
         &access,
         &id,
         &graph_api::ExtractionPlan {
-            tables: do_tables,
-            documents: do_documents,
+            source: form.source.unwrap_or_default(),
             sample,
             reset: form.reset,
         },

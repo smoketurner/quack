@@ -136,8 +136,8 @@ pub(crate) async fn stream(
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "stream", "jobs").await?;
     let receiver = app.jobs.subscribe();
-    let first = Event::default()
-        .event("jobs")
+    let first = super::StreamEvent::Jobs
+        .event()
         .json_data(visible_jobs(&app, &access))
         .unwrap_or_default();
     let state = (receiver, app, access, Some(first));
@@ -148,16 +148,16 @@ pub(crate) async fn stream(
         loop {
             match receiver.recv().await {
                 Ok(job) if job.workspace_id.as_deref() == Some(&access.workspace.id) => {
-                    let event = Event::default()
-                        .event("job")
+                    let event = super::StreamEvent::Job
+                        .event()
                         .json_data(redact(&access, job))
                         .unwrap_or_default();
                     return Some((Ok(event), (receiver, app, access, None)));
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let event = Event::default()
-                        .event("jobs")
+                    let event = super::StreamEvent::Jobs
+                        .event()
                         .json_data(visible_jobs(&app, &access))
                         .unwrap_or_default();
                     return Some((Ok(event), (receiver, app, access, None)));

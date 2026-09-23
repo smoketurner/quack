@@ -14,7 +14,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
 use quack_core::error::Record;
-use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane};
+use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm;
 use quack_core::storage::control::Outcome;
 use quack_core::storage::sessions::{self, ChatMode};
@@ -124,7 +124,9 @@ fn start_turn(
     prompt: &str,
 ) -> (events::EventStream, CancelOnDrop) {
     let (sink, stream) = events::channel();
-    let ahead = app.jobs.lane_active(&format!("session:{session_id}"));
+    let ahead = app
+        .jobs
+        .lane_active(&LaneKey::Session(session_id.to_owned()));
     if ahead > 0 {
         drop(sink.send(AgentEvent::Status(String::from(
             "Queued: this runs when the session's previous question has been answered.",
@@ -136,7 +138,7 @@ fn start_turn(
     let spec = JobSpec::new(JobKind::Chat, prompt.chars().take(80).collect::<String>())
         .workspace(access.workspace.id.clone())
         .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(format!("session:{session_id}")));
+        .lane(Lane::serial(&LaneKey::Session(session_id.to_owned())));
     let job = app.jobs.submit(spec, move |ctx| async move {
         // run_turn emits TurnComplete or Failed itself.
         match llm::run_turn(
@@ -287,20 +289,20 @@ pub(crate) async fn stream(
         |(mut events, app, access, session_id, prompt, guard)| async move {
             let event = events.recv().await?;
             let out = match event {
-                AgentEvent::Status(status) => Event::default().event("status").data(status),
-                AgentEvent::TextDelta(text) => Event::default().event("text").data(text),
-                AgentEvent::ToolStarted { tool, detail } => Event::default()
-                    .event("tool_started")
+                AgentEvent::Status(status) => super::StreamEvent::Status.event().data(status),
+                AgentEvent::TextDelta(text) => super::StreamEvent::Text.event().data(text),
+                AgentEvent::ToolStarted { tool, detail } => super::StreamEvent::ToolStarted
+                    .event()
                     .json_data(serde_json::json!({ "tool": tool, "detail": detail }))
                     .unwrap_or_default(),
-                AgentEvent::ToolFinished(step) => Event::default()
-                    .event("tool_finished")
+                AgentEvent::ToolFinished(step) => super::StreamEvent::ToolFinished
+                    .event()
                     .json_data(&step)
                     .unwrap_or_default(),
                 AgentEvent::PermissionRequired(request) => {
                     request.deny();
-                    Event::default()
-                        .event("write_refused")
+                    super::StreamEvent::WriteRefused
+                        .event()
                         .data("writes are off for this request")
                 }
                 AgentEvent::TurnComplete(response) => {
@@ -321,14 +323,14 @@ pub(crate) async fn stream(
                             serde_json::Value::String(to_html(&response.content)),
                         );
                     }
-                    Event::default()
-                        .event("complete")
+                    super::StreamEvent::Complete
+                        .event()
                         .json_data(payload)
                         .unwrap_or_default()
                 }
                 AgentEvent::Failed(failure) => {
                     record_turn(&app, &access, &session_id, &prompt, Outcome::Error, None).await;
-                    Event::default().event("error").data(failure.message)
+                    super::StreamEvent::Error.event().data(failure.message)
                 }
             };
             Some((Ok(out), (events, app, access, session_id, prompt, guard)))

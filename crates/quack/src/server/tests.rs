@@ -3522,7 +3522,9 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
         JobSpec::new(JobKind::Chat, "what is our churn?")
             .workspace(ws.clone())
             .owner(Some(member.clone()))
-            .lane(Lane::serial("session:s")),
+            .lane(Lane::serial(&quack_core::jobs::LaneKey::Session(
+                String::from("s"),
+            ))),
         |ctx| async move {
             ctx.cancel_token().cancelled().await;
             Err(String::from("cancelled"))
@@ -3605,13 +3607,13 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
     let ws = h.workspace("busy", &owner).await;
     let token = h.login("owner").await;
     let release = quack_core::llm::CancellationToken::new();
-    let lane = crate::server::queue::upload_lane(&ws);
+    let lane = quack_core::jobs::LaneKey::Ingest(ws.clone());
     for n in 0..crate::server::queue::MAX_WAITING_UPLOADS {
         let release = release.clone();
         h.app.jobs.submit(
             JobSpec::new(JobKind::Ingest, format!("held {n}"))
                 .workspace(ws.clone())
-                .lane(Lane::new(lane.clone(), 1)),
+                .lane(Lane::new(&lane, 1)),
             move |_| async move {
                 release.cancelled().await;
                 Ok(String::new())

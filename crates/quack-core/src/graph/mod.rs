@@ -207,6 +207,43 @@ pub fn normalize_label(label: &str) -> String {
         .to_lowercase()
 }
 
+/// What a graph extraction reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtractSource {
+    /// Mapped tables, then document chunks.
+    #[default]
+    All,
+    /// Only the mapped tables: no model calls.
+    Tables,
+    /// Only the document chunks.
+    Documents,
+}
+
+text_enum!(ExtractSource, "extract source", {
+    All => "all",
+    Tables => "tables",
+    Documents => "documents",
+});
+
+impl ExtractSource {
+    #[must_use]
+    pub fn includes_tables(self) -> bool {
+        match self {
+            Self::All | Self::Tables => true,
+            Self::Documents => false,
+        }
+    }
+
+    #[must_use]
+    pub fn includes_documents(self) -> bool {
+        match self {
+            Self::All | Self::Documents => true,
+            Self::Tables => false,
+        }
+    }
+}
+
 /// Tuning for traversal and resolution, from `[graph]`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GraphOptions {

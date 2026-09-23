@@ -84,6 +84,7 @@ mod tests {
 
     use crate::analysis::chart::ChartKind;
     use crate::error::Error;
+    use crate::graph::ExtractSource;
     use crate::graph::resolve::{MergeDecision, MergeStatus};
     use crate::ontology::PropertyType;
     use crate::ontology::candidates::{CandidateAction, CandidateStatus, Queue};
@@ -133,6 +134,7 @@ mod tests {
         round_trips(Queue::ALL);
         round_trips(CandidateAction::ALL);
         round_trips(ItemKind::ALL);
+        round_trips(ExtractSource::ALL);
     }
 
     #[test]
