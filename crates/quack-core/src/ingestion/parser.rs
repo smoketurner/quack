@@ -196,39 +196,15 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
     }
 }
 
-/// The sections of an unstructured file; see [`extract`].
-///
-/// # Errors
-///
-/// As [`extract`].
-pub fn extract_sections(file_type: &FileType, data: &[u8]) -> Result<Vec<Section>> {
-    extract(file_type, data).map(|e| e.sections)
-}
-
 /// The document title a parse yields: the first section's heading when
 /// the source has headings (Markdown's first `#` line, an HTML `<title>`),
 /// else nothing.
-#[must_use]
-pub fn title_of(sections: &[Section]) -> Option<&str> {
+fn title_of(sections: &[Section]) -> Option<&str> {
     sections
         .first()
         .and_then(|s| s.heading.as_deref())
         .map(str::trim)
         .filter(|h| !h.is_empty())
-}
-
-/// The whole text of an unstructured file, sections joined.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be parsed.
-pub fn extract_text(file_type: &FileType, data: &[u8]) -> Result<String> {
-    let sections = extract_sections(file_type, data)?;
-    Ok(sections
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n"))
 }
 
 fn utf8(data: &[u8]) -> Result<String> {
@@ -454,14 +430,16 @@ mod tests {
     #[test]
     fn extracts_plain_text() {
         let data = b"Hello, world!";
-        let text = extract_text(&FileType::Text, data);
-        assert!(text.is_ok());
-        assert_eq!(text.ok(), Some(String::from("Hello, world!")));
+        let text = extract(&FileType::Text, data)
+            .ok()
+            .and_then(|e| e.sections.into_iter().next())
+            .map(|s| s.text);
+        assert_eq!(text, Some(String::from("Hello, world!")));
     }
 
     #[test]
     fn rejects_structured_extraction() {
-        let result = extract_text(&FileType::Csv, b"a,b,c");
+        let result = extract(&FileType::Csv, b"a,b,c");
         assert!(result.is_err());
     }
 
@@ -501,7 +479,7 @@ mod tests {
 
     #[test]
     fn pdf_without_text_layer_is_an_error() {
-        let err = extract_sections(&FileType::Pdf, b"%PDF-1.4\n%%EOF").err();
+        let err = extract(&FileType::Pdf, b"%PDF-1.4\n%%EOF").err();
         assert!(err.is_some());
     }
 

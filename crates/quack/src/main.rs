@@ -432,6 +432,15 @@ async fn main() -> Result<ExitCode> {
         // The reader closed the pipe (`quack ... | head -1`): the command
         // did its job, so stop quietly like `git` and `ls` do (issue #68).
         Err(e) if is_broken_pipe(&e) => Ok(ExitCode::SUCCESS),
+        // Any command that reached a provider without a usable token exits
+        // 4, so scripts can tell "run `quack auth login`" from a failure.
+        Err(e) => match auth_exit_code(&e) {
+            Some(code) => {
+                tracing::error!("{e:#}");
+                Ok(code)
+            }
+            None => Err(e),
+        },
         outcome => outcome,
     }
 }
@@ -504,7 +513,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             pin,
         } => {
             init_logging();
-            let outcome = run_ingest(
+            run_ingest(
                 &file,
                 cli.workspace.as_deref(),
                 filename.as_deref(),
@@ -512,14 +521,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
                 no_embed,
                 pin,
             )
-            .await;
-            if let Err(e) = &outcome
-                && let Some(code) = auth_exit_code(e)
-            {
-                tracing::error!("{e:#}");
-                return Ok(code);
-            }
-            outcome?;
+            .await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Ontology { action } => run_ontology(cli, action).await,
@@ -673,12 +675,6 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         let id = session_id.clone();
         drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
-    if let Err(e) = &outcome
-        && let Some(code) = auth_exit_code(e)
-    {
-        tracing::error!("{e:#}");
-        return Ok(code);
-    }
     let refused = outcome?;
     Ok(if refused {
         ExitCode::from(EXIT_WRITE_REFUSED)
@@ -827,16 +823,15 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
     let config = Config::load().context("failed to load configuration")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    exit_after(
-        graph_cli::run(
-            &config,
-            &ws_db,
-            action,
-            &mut out,
-            &ontology_cli::chunk_progress,
-        )
-        .await,
+    graph_cli::run(
+        &config,
+        &ws_db,
+        action,
+        &mut out,
+        &ontology_cli::chunk_progress,
     )
+    .await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_embeddings(cli: &Cli, action: embeddings_cli::EmbeddingsAction) -> Result<ExitCode> {
@@ -844,19 +839,18 @@ async fn run_embeddings(cli: &Cli, action: embeddings_cli::EmbeddingsAction) -> 
     let config = Config::load().context("failed to load configuration")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    exit_after(
-        embeddings_cli::run(
-            &config,
-            &ws_db,
-            action,
-            &mut out,
-            RunControl {
-                progress: &embeddings_cli::print_progress,
-                cancel: None,
-            },
-        )
-        .await,
+    embeddings_cli::run(
+        &config,
+        &ws_db,
+        action,
+        &mut out,
+        RunControl {
+            progress: &embeddings_cli::print_progress,
+            cancel: None,
+        },
     )
+    .await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_ontology(cli: &Cli, action: ontology_cli::OntologyAction) -> Result<ExitCode> {
@@ -864,28 +858,14 @@ async fn run_ontology(cli: &Cli, action: ontology_cli::OntologyAction) -> Result
     let config = Config::load().context("failed to load configuration")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    exit_after(
-        ontology_cli::run(
-            &config,
-            &ws_db,
-            action,
-            &mut out,
-            &ontology_cli::chunk_progress,
-        )
-        .await,
+    ontology_cli::run(
+        &config,
+        &ws_db,
+        action,
+        &mut out,
+        &ontology_cli::chunk_progress,
     )
-}
-
-/// The exit code for a command that may have needed a provider login:
-/// 4 for `AuthRequired` (as `-p` and `ingest`), else the error or success.
-fn exit_after(outcome: Result<()>) -> Result<ExitCode> {
-    if let Err(e) = &outcome
-        && let Some(code) = auth_exit_code(e)
-    {
-        tracing::error!("{e:#}");
-        return Ok(code);
-    }
-    outcome?;
+    .await?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -919,13 +899,8 @@ async fn run_import(
         embedding_model.as_ref(),
         None,
     )
-    .await;
-    if let Err(e) = &summary
-        && let Some(code) = auth_exit_code(&anyhow::anyhow!(e.to_string()))
-    {
-        return Ok(code);
-    }
-    let summary = summary.context("import failed")?;
+    .await
+    .context("import failed")?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     writeln!(
@@ -979,9 +954,10 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Exit 4 when the failure is an OAuth provider without a usable token:
-/// print and ingest cannot run a login flow, so the message names the
-/// command that can.
+/// Exit 4 when the failure is an OAuth provider without a usable token,
+/// found anywhere in the error's chain: no command but `quack auth login`
+/// can run a login flow, so the message names it. `main` applies this to
+/// every command's error, so no command maps it itself.
 fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
     err.chain()
         .any(|cause| {
@@ -1326,7 +1302,9 @@ fn run_docs(
             .then(|| ingestion::table_name_for(&filename));
         db.delete_document(&id, table.as_deref())?;
     }
-    list_documents(db, json)
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    list_documents(db, json, &mut out)
 }
 
 /// Resolve a full document id or a unique prefix.
@@ -1344,28 +1322,11 @@ fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<String> {
     }
 }
 
-fn list_documents(db: &WorkspaceDb, json: bool) -> Result<()> {
+fn list_documents(db: &WorkspaceDb, json: bool, out: &mut impl Write) -> Result<()> {
     let docs = db.list_documents()?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
     if json {
         for doc in &docs {
-            serde_json::to_writer(
-                &mut out,
-                &serde_json::json!({
-                    "id": doc.id,
-                    "filename": doc.filename,
-                    "title": doc.title,
-                    "mime_type": doc.mime_type,
-                    "size_bytes": doc.size_bytes,
-                    "sha256": doc.sha256,
-                    "source": doc.source,
-                    "status": doc.status,
-                    "pinned": doc.pinned,
-                    "chunk_count": doc.chunk_count,
-                    "ingested_at": doc.ingested_at,
-                }),
-            )?;
+            serde_json::to_writer(&mut *out, doc)?;
             writeln!(out)?;
         }
     } else if docs.is_empty() {
@@ -1812,5 +1773,44 @@ mod tests {
             std::io::ErrorKind::NotFound
         ))));
         assert!(!is_broken_pipe(&anyhow::anyhow!("something else")));
+    }
+
+    /// `docs --json` prints every recorded field, so a script can tell why a
+    /// document failed.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn docs_json_carries_every_document_field() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap();
+        db.insert_document(&quack_core::storage::workspace::NewDocument::new(
+            "d1",
+            "broken.pdf",
+            "application/pdf",
+            3,
+        ))
+        .unwrap();
+        db.mark_document_error("d1", "no text layer").unwrap();
+        let mut out = Vec::new();
+        list_documents(&db, true, &mut out).unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(row.get("status").unwrap(), "error", "{row}");
+        assert_eq!(row.get("error_message").unwrap(), "no text layer", "{row}");
+        for key in ["ingested_by", "tables", "filename", "sha256", "source"] {
+            assert!(row.get(key).is_some(), "{key} missing: {row}");
+        }
+    }
+
+    /// A missing login is recognised through the context a command adds
+    /// (`import failed`), but not once the error has been turned into text,
+    /// which is how `quack import` lost its exit 4.
+    #[test]
+    fn auth_required_is_recognised_through_context_only_while_typed() {
+        let auth = || quack_core::error::Error::AuthRequired {
+            provider: String::from("corp"),
+            reason: String::from("no cached token"),
+        };
+        assert!(auth_exit_code(&anyhow::Error::from(auth())).is_some());
+        assert!(auth_exit_code(&anyhow::Error::from(auth()).context("import failed")).is_some());
+        assert!(auth_exit_code(&anyhow::anyhow!(auth().to_string())).is_none());
+        assert!(auth_exit_code(&anyhow::anyhow!("something else")).is_none());
     }
 }

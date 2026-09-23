@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use rig::embeddings::EmbeddingModel;
 
-use super::store::{self, id_list};
+use super::store;
 use super::{GraphOptions, Node};
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
@@ -496,27 +496,6 @@ pub fn reject(db: &WorkspaceDb, id: &str, decided_by: Option<&str>) -> Result<Me
         duckdb::params![decided_by, proposal.id],
     )?;
     Ok(proposal)
-}
-
-/// Nodes by id list, for the review views.
-///
-/// # Errors
-///
-/// Returns an error if the query fails.
-pub fn nodes_by_ids(db: &WorkspaceDb, ids: &[String]) -> Result<Vec<Node>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut stmt = db.connection().prepare(
-        "SELECT id, label, class_id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes \
-         WHERE list_contains(?::VARCHAR[], id) ORDER BY label",
-    )?;
-    let mut rows = stmt.query(duckdb::params![id_list(ids)])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(store::node_from_row(row)?);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

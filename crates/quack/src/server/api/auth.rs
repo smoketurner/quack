@@ -54,8 +54,7 @@ pub(crate) async fn logout(
     if let Credential::Session(token) = &identity.credential {
         app.close_web_session(token);
     }
-    let mut entry = identity.audit("logout", Outcome::Allowed);
-    entry.workspace_id = None;
+    let entry = identity.audit("logout", Outcome::Allowed);
     app.control.record_audit(&entry).await?;
     Ok((
         jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()),

@@ -218,19 +218,6 @@ impl Inspection {
             .iter()
             .filter(|s| !s.is_default() || s.file_value.is_some())
     }
-
-    /// The sections in order, each with its settings.
-    #[must_use]
-    pub fn sections(&self) -> Vec<(&str, Vec<&Setting>)> {
-        let mut sections: Vec<(&str, Vec<&Setting>)> = Vec::new();
-        for setting in &self.settings {
-            match sections.last_mut() {
-                Some((name, group)) if *name == setting.section => group.push(setting),
-                _ => sections.push((&setting.section, vec![setting])),
-            }
-        }
-        sections
-    }
 }
 
 /// `Config::load` without the file lookup: parse, apply the environment,
@@ -1214,19 +1201,6 @@ top_k = 3
         assert!(changed.contains("retrieval.top_k"));
         assert!(changed.contains("general.chat_model"));
         assert!(!changed.contains("retrieval.rrf_k"));
-    }
-
-    #[test]
-    fn sections_group_settings_in_order() {
-        let inspection = inspect(SAMPLE);
-        let sections: Vec<&str> = inspection
-            .sections()
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        assert_eq!(sections.first(), Some(&"general"));
-        assert!(sections.contains(&"providers.ollama"));
-        assert_eq!(sections.last(), Some(&"jobs"));
     }
 
     #[test]
