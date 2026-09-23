@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
 
+use crate::confirm::Confirm;
 use crate::graph_cli::rendered;
 use quack_core::llm;
 use quack_core::ontology::candidates::{CandidateStatus, Queue};
@@ -399,7 +400,7 @@ async fn propose(
         out.flush()?;
         if cost.chunks == 0 {
             writeln!(out, "No ready documents to sample.")?;
-        } else if !pass.assume_yes && !confirm(out)? {
+        } else if !Confirm::from_yes(pass.assume_yes).ask(out, "Proceed?", Some("--yes"))? {
             writeln!(out, "Skipped the document pass.")?;
         } else {
             let from_documents =
@@ -498,22 +499,6 @@ async fn run_documents(
 }
 
 /// Ask on the terminal; a non-terminal stdin means no.
-fn confirm(out: &mut impl Write) -> Result<bool> {
-    use std::io::{BufRead, IsTerminal};
-    if !std::io::stdin().is_terminal() {
-        writeln!(
-            out,
-            "Pass --yes to run the document pass without a terminal."
-        )?;
-        return Ok(false);
-    }
-    write!(out, "Proceed? [y/N] ")?;
-    out.flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
-}
-
 /// One line of evidence for the review listing.
 fn evidence_line(c: &candidates::CandidateRow) -> String {
     let e = &c.evidence;

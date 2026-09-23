@@ -4,6 +4,7 @@ mod text_enum;
 pub mod analysis;
 pub mod config;
 pub mod crypto;
+pub mod csv;
 pub mod doctor;
 pub mod embedding;
 pub mod error;

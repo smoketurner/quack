@@ -18,7 +18,9 @@ use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb, with_db};
-use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType, config_file_path};
+use crate::config::{
+    AuthMode, Config, ModelRef, ProviderConfig, ProviderName, ProviderType, config_file_path,
+};
 use crate::embedding::{Embedder, Input, Profile};
 use crate::error::{Error, Record, Result};
 use crate::graph::extract as graph_extract;
@@ -478,7 +480,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 /// the static key from the environment, or the current OAuth access token.
 async fn credential(
     config: &Config,
-    name: &str,
+    name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<Option<String>> {
     match provider.auth {
@@ -562,7 +564,7 @@ async fn ollama_model_resident(client: &OllamaClient, model: &str) -> bool {
 
 async fn build_ollama_client(
     config: &Config,
-    name: &str,
+    name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<OllamaClient> {
     let key = credential(config, name, provider)
@@ -586,7 +588,7 @@ async fn build_ollama_client(
 
 async fn build_openai_client(
     config: &Config,
-    name: &str,
+    name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<OpenAiClient> {
     let key = credential(config, name, provider).await?.ok_or_else(|| {
@@ -603,7 +605,7 @@ async fn build_openai_client(
 }
 
 fn openai_client_with_key(
-    name: &str,
+    name: &ProviderName,
     base_url: Option<&str>,
     key: &str,
     http: LimitedHttp,
@@ -623,7 +625,7 @@ fn openai_client_with_key(
 
 async fn build_anthropic_client(
     config: &Config,
-    name: &str,
+    name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<AnthropicClient> {
     let key = credential(config, name, provider).await?.ok_or_else(|| {

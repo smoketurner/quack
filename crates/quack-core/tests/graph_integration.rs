@@ -11,6 +11,7 @@ use quack_core::error::Error;
 use quack_core::graph::extract::{Extraction, GraphExtractor};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
+use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     GraphOptions, GraphResult, Node, extract, resolve, store as graph_store, tables, traverse,
 };
@@ -259,7 +260,7 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
         ..GraphOptions::default()
     };
     let hub = traverse::resolve_entry(&db, "V0", Some("vendor"), None).unwrap();
-    let found = traverse::neighborhood(&db, &hub, 3, None, &options).unwrap();
+    let found = traverse::neighborhood(&db, &hub, Hops::new(3), None, &options).unwrap();
     assert_eq!(found.nodes.len(), 7, "{}", found.nodes.len());
 }
 
@@ -416,7 +417,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     graph_store::add_provenance(&db, &edge, &source).unwrap();
     assert_eq!(graph_store::status(&db).unwrap().nodes, 8);
 
-    assert!(db.delete_document("doc-2", None).unwrap());
+    assert!(db.delete_document("doc-2").unwrap());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (7, 6));
     assert!(graph_store::node(&db, &nowhere).unwrap().is_none());
@@ -437,7 +438,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     .unwrap();
     db.set_document_tables("doc-t", &[String::from("shipments")])
         .unwrap();
-    assert!(db.delete_document("doc-t", None).unwrap());
+    assert!(db.delete_document("doc-t").unwrap());
     assert!(db.list_tables().unwrap().is_empty());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (0, 0));
@@ -527,7 +528,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     // vendors through the shipments and the direct ships_to edge.
     let roots = traverse::resolve_entry(&db, "kenya", None, None).unwrap();
     assert_eq!(roots.len(), 1);
-    let hood = traverse::neighborhood(&db, &roots, 2, None, &options).unwrap();
+    let hood = traverse::neighborhood(&db, &roots, Hops::new(2), None, &options).unwrap();
     let labels: Vec<&str> = hood.nodes.iter().map(|n| n.label.as_str()).collect();
     assert!(
         labels.contains(&"PO-1")
@@ -546,7 +547,8 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
             .iter()
             .any(|p| p.table_name.as_deref() == Some("shipments"))
     );
-    let only = traverse::neighborhood(&db, &roots, 2, Some("delivered_to"), &options).unwrap();
+    let only =
+        traverse::neighborhood(&db, &roots, Hops::new(2), Some("delivered_to"), &options).unwrap();
     assert!(only.edges.iter().all(|e| e.relation_id == "delivered_to"));
 
     // Fuzzy entry: an unknown spelling resolves through the embedding.
@@ -575,11 +577,11 @@ fn paths_merges_and_listing(
     // long for 4; Uganda to Kenya is 4 hops.
     let uganda = traverse::resolve_entry(db, "Uganda", None, None).unwrap();
     let kenya = roots.first().unwrap();
-    let path = traverse::path(db, uganda.first().unwrap(), kenya, 4, options).unwrap();
+    let path = traverse::path(db, uganda.first().unwrap(), kenya, Hops::new(4), options).unwrap();
     assert_eq!(path.edges.len(), 4, "{path:?}");
     assert_eq!(path.nodes.first().map(|n| n.label.as_str()), Some("Uganda"));
     assert_eq!(path.nodes.last().map(|n| n.label.as_str()), Some("Kenya"));
-    let none = traverse::path(db, uganda.first().unwrap(), kenya, 2, options).unwrap();
+    let none = traverse::path(db, uganda.first().unwrap(), kenya, Hops::new(2), options).unwrap();
     assert!(none.is_empty());
 
     // By class with subclass expansion: organizations include vendors.
@@ -609,7 +611,7 @@ fn paths_merges_and_listing(
     );
     assert!(graph_store::node(db, &proposal.drop.id).unwrap().is_none());
     assert_eq!(graph_store::status(db).unwrap().nodes, 7);
-    let path = traverse::path(db, uganda.first().unwrap(), kenya, 4, options).unwrap();
+    let path = traverse::path(db, uganda.first().unwrap(), kenya, Hops::new(4), options).unwrap();
     assert_eq!(
         path.edges.len(),
         3,
@@ -630,7 +632,8 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
 
     // Query mode drops provisional results entirely.
     let roots = traverse::resolve_entry(&db, "Kenya", None, None).unwrap();
-    let hood = traverse::neighborhood(&db, &roots, 1, None, &GraphOptions::default()).unwrap();
+    let hood =
+        traverse::neighborhood(&db, &roots, Hops::new(1), None, &GraphOptions::default()).unwrap();
     assert!(!hood.is_empty());
     assert!(hood.without_provisional().is_empty());
     graph_store::mark_reviewed(&db).unwrap();

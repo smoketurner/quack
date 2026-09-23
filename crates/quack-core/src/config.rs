@@ -1,6 +1,8 @@
 use serde::Deserialize;
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -26,7 +28,7 @@ pub const ENV_BIND: &str = "QUACK_BIND";
 pub struct Config {
     pub general: GeneralConfig,
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    pub providers: BTreeMap<ProviderName, ProviderConfig>,
     pub ingestion: IngestionConfig,
     pub embedding: EmbeddingConfig,
     pub retrieval: RetrievalConfig,
@@ -59,6 +61,75 @@ impl Default for GeneralConfig {
             chat_model: None,
             embedding_model: None,
         }
+    }
+}
+
+/// A `[providers.NAME]` key. It names the provider's OAuth cache and key
+/// files, so it is checked when the config is read: ASCII letters, digits,
+/// `_`, `-`, and `.`, not starting with `.`, at most 64 characters. Nothing
+/// it names can leave the tokens directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ProviderName(String);
+
+impl ProviderName {
+    const MAX_LEN: usize = 64;
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ProviderName {
+    type Error = Error;
+
+    fn try_from(name: String) -> Result<Self> {
+        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+        if name.is_empty()
+            || name.len() > Self::MAX_LEN
+            || name.starts_with('.')
+            || !name.chars().all(allowed)
+        {
+            return Err(Error::Config(format!(
+                "provider name '{name}' must be 1 to {} ASCII letters, digits, '_', '-', or '.', \
+                 not starting with '.'",
+                Self::MAX_LEN
+            )));
+        }
+        Ok(Self(name))
+    }
+}
+
+impl FromStr for ProviderName {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        Self::try_from(name.to_owned())
+    }
+}
+
+impl PartialEq<str> for ProviderName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ProviderName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl Borrow<str> for ProviderName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(&self.0)
     }
 }
 
@@ -178,7 +249,7 @@ impl ProviderConfig {
 /// A resolved `PROVIDER/MODEL` reference.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelRef<'a> {
-    pub provider_name: &'a str,
+    pub provider_name: &'a ProviderName,
     pub provider: &'a ProviderConfig,
     pub model: &'a str,
 }
@@ -557,6 +628,42 @@ fn default_data_dir() -> PathBuf {
     )
 }
 
+/// The values the environment puts in force over the config file:
+/// `QUACK_DATA_DIR`, `QUACK_MODEL`, and `QUACK_BIND`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub data_dir: Option<PathBuf>,
+    pub chat_model: Option<String>,
+    pub bind: Option<String>,
+}
+
+impl Overrides {
+    /// The overrides this process's environment sets.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            data_dir: std::env::var_os(ENV_DATA_DIR).map(PathBuf::from),
+            chat_model: std::env::var(ENV_MODEL).ok(),
+            bind: std::env::var(ENV_BIND).ok(),
+        }
+    }
+
+    /// Put each set value in force over `config`, after the file and before
+    /// validation. `quack config` replays this to report which values the
+    /// environment, rather than the file, put in force.
+    pub fn apply(&self, config: &mut Config) {
+        if let Some(data_dir) = &self.data_dir {
+            config.general.data_dir.clone_from(data_dir);
+        }
+        if let Some(model) = &self.chat_model {
+            config.general.chat_model = Some(model.clone());
+        }
+        if let Some(bind) = &self.bind {
+            config.server.bind.clone_from(bind);
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from the XDG config directory, falling back to defaults.
     ///
@@ -573,35 +680,35 @@ impl Config {
     /// parsed, contains unknown keys, or fails validation.
     pub fn load() -> Result<Self> {
         let config_path = config_file_path();
-
-        let mut config = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            Self::parse(&content)?
+        let contents = if config_path.exists() {
+            Some(std::fs::read_to_string(&config_path)?)
         } else {
-            Self::default()
+            None
         };
+        Self::from_contents(contents.as_deref(), &Overrides::from_env())
+    }
 
-        config.apply_env();
+    /// The configuration in force for a config file's text (`None` when there
+    /// is no file): parsed, with `overrides` applied, then validated once.
+    /// Validating before the overrides would reject a file whose bad value
+    /// the environment replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on syntax errors, unknown keys, or a configuration
+    /// that fails validation.
+    pub fn from_contents(contents: Option<&str>, overrides: &Overrides) -> Result<Self> {
+        let mut config = match contents {
+            Some(text) => toml::from_str(text)?,
+            None => Self::default(),
+        };
+        overrides.apply(&mut config);
         config.validate()?;
         Ok(config)
     }
 
-    /// Apply the environment overrides, after the file and before
-    /// validation. `quack config` replays this to report which values the
-    /// environment, rather than the file, put in force.
-    pub fn apply_env(&mut self) {
-        if let Ok(data_dir) = std::env::var(ENV_DATA_DIR) {
-            self.general.data_dir = PathBuf::from(data_dir);
-        }
-        if let Ok(model) = std::env::var(ENV_MODEL) {
-            self.general.chat_model = Some(model);
-        }
-        if let Ok(bind) = std::env::var(ENV_BIND) {
-            self.server.bind = bind;
-        }
-    }
-
-    /// Parse and validate TOML text.
+    /// Parse and validate TOML text alone, without the environment
+    /// overrides [`Self::from_contents`] applies.
     ///
     /// # Errors
     ///
@@ -701,7 +808,7 @@ impl Config {
                 "{setting} = \"{spec}\" is missing the model after the slash"
             )));
         }
-        let provider = self.providers.get(provider_name).ok_or_else(|| {
+        let (provider_name, provider) = self.providers.get_key_value(provider_name).ok_or_else(|| {
             Error::Config(format!(
                 "{setting} = \"{spec}\" names provider '{provider_name}', which is not configured; \
                  add a [providers.{provider_name}] section in {}",
@@ -883,6 +990,59 @@ rerank = "model"
         assert!(anthropic.is_some_and(|p| {
             p.provider_type == ProviderType::Anthropic && p.auth == AuthMode::ApiKey
         }));
+    }
+
+    #[test]
+    fn an_override_rescues_the_file_value_it_replaces() {
+        let file = "[general]\nchat_model = \"missing/model\"\n\n\
+                    [providers.ollama]\ntype = \"ollama\"\n";
+        let none = Overrides::default();
+        let rejected = Config::from_contents(Some(file), &none).err();
+        assert!(rejected.is_some_and(|e| e.to_string().contains("missing")));
+        let rescued = Overrides {
+            chat_model: Some(String::from("ollama/gpt-oss:20b")),
+            ..Overrides::default()
+        };
+        let config = Config::from_contents(Some(file), &rescued);
+        assert!(
+            config.is_ok_and(|c| c.general.chat_model.as_deref() == Some("ollama/gpt-oss:20b"))
+        );
+        // An override is still validated: it cannot name a missing provider.
+        let bad = Overrides {
+            chat_model: Some(String::from("nowhere/x")),
+            ..Overrides::default()
+        };
+        assert!(Config::from_contents(None, &bad).is_err());
+    }
+
+    #[test]
+    fn provider_names_that_could_leave_the_tokens_directory_are_rejected() {
+        for bad in ["../evil", ".hidden", "a/b", "a\\\\b", "", "sp ace"] {
+            let toml_text = format!("[providers.\"{bad}\"]\ntype = \"ollama\"\n");
+            assert!(err_of(&toml_text).contains("provider name"), "{bad:?}");
+        }
+        let long = "p".repeat(65);
+        assert!(long.parse::<ProviderName>().is_err());
+        for good in ["ollama", "azure.openai", "corp-gw_2", &"p".repeat(64)] {
+            assert!(good.parse::<ProviderName>().is_ok(), "{good}");
+        }
+        let config = Config::parse("[providers.\"azure.openai\"]\ntype = \"openai\"\n");
+        assert!(config.is_ok_and(|c| c.providers.contains_key("azure.openai")));
+    }
+
+    #[test]
+    fn overrides_replace_only_what_they_set() {
+        let overrides = Overrides {
+            data_dir: Some(PathBuf::from("/srv/quack")),
+            bind: Some(String::from("0.0.0.0:9000")),
+            ..Overrides::default()
+        };
+        let config = Config::from_contents(Some("[general]\n"), &overrides);
+        assert!(
+            config.is_ok_and(|c| c.general.data_dir == Path::new("/srv/quack")
+                && c.server.bind == "0.0.0.0:9000"
+                && c.general.chat_model.is_none())
+        );
     }
 
     fn err_of(toml_text: &str) -> String {

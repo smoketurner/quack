@@ -384,10 +384,7 @@ pub(crate) async fn delete_document(app: &App, access: &Access, doc: &str) -> Ap
         let document = db
             .document(&doc_id)?
             .ok_or_else(|| Record::Document.missing(doc_id.as_str()))?;
-        let table = ingestion::parser::detect_file_type(&document.filename)
-            .is_structured()
-            .then(|| ingestion::table_name_for(&document.filename));
-        db.delete_document(&doc_id, table.as_deref())?;
+        db.delete_document(&doc_id)?;
         Ok(document.filename)
     })
     .await?;

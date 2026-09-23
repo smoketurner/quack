@@ -46,9 +46,17 @@ impl FileType {
     /// Loaded as tables rather than chunked.
     #[must_use]
     pub fn is_structured(&self) -> bool {
+        self.is_single_table() || *self == Self::Xlsx
+    }
+
+    /// Loaded as one table named after the file; a workbook makes one per
+    /// sheet instead.
+    #[must_use]
+    pub fn is_single_table(&self) -> bool {
         match self {
-            Self::Csv | Self::Parquet | Self::Json | Self::Xlsx => true,
-            Self::Pdf
+            Self::Csv | Self::Parquet | Self::Json => true,
+            Self::Xlsx
+            | Self::Pdf
             | Self::Text
             | Self::Markdown
             | Self::Html
@@ -127,6 +135,32 @@ pub struct Section {
     pub text: String,
 }
 
+/// Every extension quack reads, lowercase, and the type it is read as.
+const EXTENSIONS: &[(&str, FileType)] = &[
+    ("csv", FileType::Csv),
+    ("tsv", FileType::Csv),
+    ("parquet", FileType::Parquet),
+    ("pq", FileType::Parquet),
+    ("json", FileType::Json),
+    ("jsonl", FileType::Json),
+    ("ndjson", FileType::Json),
+    ("xlsx", FileType::Xlsx),
+    ("xlsm", FileType::Xlsx),
+    ("xls", FileType::Xlsx),
+    ("ods", FileType::Xlsx),
+    ("pdf", FileType::Pdf),
+    ("md", FileType::Markdown),
+    ("markdown", FileType::Markdown),
+    ("txt", FileType::Text),
+    ("text", FileType::Text),
+    ("log", FileType::Text),
+    ("html", FileType::Html),
+    ("htm", FileType::Html),
+    ("xhtml", FileType::Html),
+    ("docx", FileType::Docx),
+    ("pptx", FileType::Pptx),
+];
+
 /// Detect file type from the filename extension.
 #[must_use]
 pub fn detect_file_type(filename: &str) -> FileType {
@@ -135,20 +169,18 @@ pub fn detect_file_type(filename: &str) -> FileType {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    EXTENSIONS
+        .iter()
+        .find(|(known, _)| *known == ext)
+        .map_or(FileType::Unknown, |(_, file_type)| file_type.clone())
+}
 
-    match ext.as_str() {
-        "csv" | "tsv" => FileType::Csv,
-        "parquet" | "pq" => FileType::Parquet,
-        "json" | "jsonl" | "ndjson" => FileType::Json,
-        "xlsx" | "xlsm" | "xls" | "ods" => FileType::Xlsx,
-        "pdf" => FileType::Pdf,
-        "md" | "markdown" => FileType::Markdown,
-        "txt" | "text" | "log" => FileType::Text,
-        "html" | "htm" | "xhtml" => FileType::Html,
-        "docx" => FileType::Docx,
-        "pptx" => FileType::Pptx,
-        _ => FileType::Unknown,
-    }
+/// The extensions of the files that load as tables, in table order.
+pub fn table_extensions() -> impl Iterator<Item = &'static str> {
+    EXTENSIONS
+        .iter()
+        .filter(|(_, file_type)| file_type.is_structured())
+        .map(|(ext, _)| *ext)
 }
 
 /// Extract an unstructured file: PDFs one section per page, Markdown one

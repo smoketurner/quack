@@ -37,7 +37,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub use cache::{CachedToken, KeySource, TokenCache};
 
-use crate::config::{OAuthConfig, ProviderConfig};
+use crate::config::{OAuthConfig, ProviderConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
 
 /// Tokens with less than this left are refreshed before use.
@@ -128,7 +128,7 @@ pub struct AuthStatus {
 
 /// One provider's OAuth state: the config, the cache, and the in-memory token.
 pub struct TokenManager {
-    provider: String,
+    provider: ProviderName,
     config: OAuthConfig,
     cache: TokenCache,
     http: reqwest::Client,
@@ -155,7 +155,7 @@ impl TokenManager {
     /// Returns an error when the HTTP client cannot be built.
     pub fn new(
         tokens_dir: &Path,
-        provider: &str,
+        provider: &ProviderName,
         config: OAuthConfig,
         key_source: KeySource,
     ) -> Result<Self> {
@@ -165,7 +165,7 @@ impl TokenManager {
             .build()
             .map_err(|e| Error::Llm(format!("failed to build the OAuth HTTP client: {e}")))?;
         Ok(Self {
-            provider: provider.to_owned(),
+            provider: provider.clone(),
             config,
             cache: TokenCache::new(tokens_dir, provider, key_source),
             http,
@@ -176,7 +176,7 @@ impl TokenManager {
     }
 
     #[must_use]
-    pub fn provider(&self) -> &str {
+    pub fn provider(&self) -> &ProviderName {
         &self.provider
     }
 
@@ -229,7 +229,7 @@ impl TokenManager {
 
     fn auth_required(&self, reason: AuthReason) -> Error {
         Error::AuthRequired {
-            provider: self.provider.clone(),
+            provider: self.provider.to_string(),
             reason,
         }
     }
@@ -367,7 +367,7 @@ impl TokenManager {
     pub async fn status(&self) -> Result<AuthStatus> {
         let cached = self.cache.load().await?;
         Ok(AuthStatus {
-            provider: self.provider.clone(),
+            provider: self.provider.to_string(),
             logged_in: cached.is_some(),
             expires_at: cached.as_ref().map(|t| t.expires_at),
             has_refresh_token: cached.is_some_and(|t| t.refresh_token.is_some()),
@@ -586,7 +586,7 @@ async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
 /// manager cannot be built.
 pub fn shared_manager(
     tokens_dir: &Path,
-    name: &str,
+    name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<Arc<TokenManager>> {
     static MANAGERS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokenManager>>>> = OnceLock::new();
@@ -595,7 +595,7 @@ pub fn shared_manager(
             "provider '{name}' has auth = \"oauth\" but no [providers.{name}.oauth] section"
         ))
     })?;
-    let key = tokens_dir.join(name);
+    let key = tokens_dir.join(name.as_str());
     let mut managers = MANAGERS
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()

@@ -30,6 +30,7 @@ use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::citations::Citation;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::traverse;
+use quack_core::graph::traverse::Hops;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::jobs::{
     JobContext, JobId, JobInfo, JobKind, JobQueue, JobSpec, JobState, Lane, LaneKey,
@@ -1595,11 +1596,7 @@ impl App {
             Side::Write,
             move |db| {
                 let doc = resolve_document(db, &prefix)?;
-                let table = ingestion::parser::detect_file_type(&doc.filename)
-                    .is_structured()
-                    .then(|| ingestion::table_name_for(&doc.filename));
-                db.delete_document(&doc.id, table.as_deref())
-                    .map(|_| doc.filename)
+                db.delete_document(&doc.id).map(|_| doc.filename)
             },
             |app, outcome| match outcome {
                 Ok(filename) => app.note(
@@ -1715,11 +1712,12 @@ impl App {
                         &options,
                     )
                 } else {
-                    let (entity, hops) = match args.rsplit_once(' ') {
-                        Some((entity, hops)) if hops.parse::<u32>().is_ok() => {
-                            (entity.trim(), hops.parse::<u32>().unwrap_or(2))
-                        }
-                        _ => (args.as_str(), 2),
+                    let (entity, hops) = match args
+                        .rsplit_once(' ')
+                        .and_then(|(entity, hops)| Some((entity, hops.parse::<u32>().ok()?)))
+                    {
+                        Some((entity, hops)) => (entity.trim(), Hops::new(hops)),
+                        None => (args.as_str(), Hops::NEIGHBORHOOD),
                     };
                     let roots = traverse::resolve_entry(db, entity, None, None)?;
                     if roots.is_empty() {
@@ -1750,7 +1748,7 @@ impl App {
                 let a = traverse::resolve_entry(db, &from, None, None)?;
                 let b = traverse::resolve_entry(db, &to, None, None)?;
                 match (a.first(), b.first()) {
-                    (Some(a), Some(b)) => traverse::path(db, a, b, 4, &options),
+                    (Some(a), Some(b)) => traverse::path(db, a, b, Hops::PATH, &options),
                     (None, _) => Err(CoreError::Analysis(format!("no entity matches '{from}'"))),
                     (_, None) => Err(CoreError::Analysis(format!("no entity matches '{to}'"))),
                 }
@@ -1758,7 +1756,10 @@ impl App {
             move |app, outcome| match outcome {
                 Ok(result) if result.is_empty() => app.note(
                     MessageRole::System,
-                    format!("No path connects {shown_from} and {shown_to} within 4 hops."),
+                    format!(
+                        "No path connects {shown_from} and {shown_to} within {} hops.",
+                        Hops::PATH
+                    ),
                 ),
                 Ok(result) => app.note(MessageRole::System, traverse::render_tree(&result)),
                 Err(e) => app.note(MessageRole::Error, e.to_string()),
@@ -3203,7 +3204,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
-        use quack_core::config::{AuthMode, ProviderConfig, ProviderType};
+        use quack_core::config::{AuthMode, ProviderConfig, ProviderName, ProviderType};
         use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
         // Without an embedding model the job says what is missing.
@@ -3224,7 +3225,9 @@ mod tests {
         let mut config = Config::default();
         config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
         config.providers.insert(
-            String::from("ollama"),
+            "ollama"
+                .parse::<ProviderName>()
+                .unwrap_or_else(|e| fail(&e.to_string())),
             ProviderConfig {
                 provider_type: ProviderType::Ollama,
                 auth: AuthMode::None,

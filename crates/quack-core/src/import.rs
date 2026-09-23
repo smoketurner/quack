@@ -19,9 +19,10 @@ use sqlx::{
 };
 
 use crate::config::Config;
+use crate::csv::CsvField;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
-use crate::ingestion::{self, IngestOutcome, NewFile};
+use crate::ingestion::{self, IngestOutcome, NewFile, parser};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
 use tokio_util::sync::CancellationToken;
@@ -421,13 +422,7 @@ impl Csv {
             let Some(value) = cell else {
                 continue;
             };
-            if value.contains([',', '"', '\n', '\r']) {
-                self.text.push('"');
-                self.text.push_str(&value.replace('"', "\"\""));
-                self.text.push('"');
-            } else {
-                self.text.push_str(value);
-            }
+            self.text.push_str(&CsvField(value).to_string());
         }
         self.text.push('\n');
     }
@@ -450,23 +445,21 @@ struct Download {
 /// is checked, and the connection is pinned to those addresses so a
 /// second lookup cannot answer differently.
 async fn fetch_http(url: &str, table: &str, download: &Download) -> Result<(String, Vec<u8>)> {
+    // The same extensions `quack ingest` loads as tables.
     let extension = url
-        .split('?')
+        .split(['?', '#'])
         .next()
         .and_then(|path| path.rsplit('/').next())
-        .and_then(|name| {
-            name.rsplit_once('.')
-                .map(|(_, ext)| ext.to_ascii_lowercase())
-        })
-        .filter(|ext| {
-            matches!(
-                ext.as_str(),
-                "csv" | "tsv" | "parquet" | "json" | "jsonl" | "ndjson" | "xlsx"
-            )
-        })
+        .filter(|name| parser::detect_file_type(name).is_structured())
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase())
         .ok_or_else(|| {
-            Error::Ingestion(String::from(
-                "the URL must end in .csv, .tsv, .parquet, .json, .jsonl, or .xlsx",
+            let accepted: Vec<String> = parser::table_extensions()
+                .map(|e| format!(".{e}"))
+                .collect();
+            Error::Ingestion(format!(
+                "the URL must name a table file ending in {}",
+                accepted.join(", ")
             ))
         })?;
     let parsed = reqwest::Url::parse(url).map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
@@ -698,6 +691,43 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("private address"), "{err}");
+    }
+
+    /// A URL names a file `quack ingest` loads as a table, or it is
+    /// refused before any network use; a type the URL passes goes on to
+    /// the host check, which refuses loopback here.
+    #[tokio::test]
+    async fn urls_take_every_extension_ingest_loads_as_a_table() {
+        let download = Download {
+            timeout: Duration::from_secs(5),
+            max_mb: 1,
+            private_hosts: false,
+            redirects: false,
+        };
+        for accepted in [
+            "http://127.0.0.1:9/book.ods",
+            "http://127.0.0.1:9/old.XLS?download=1",
+            "http://127.0.0.1:9/data.pq#part",
+            "http://127.0.0.1:9/rows.ndjson",
+        ] {
+            let err = fetch_http(accepted, "t", &download)
+                .await
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains("private address"), "{accepted}: {err}");
+        }
+        for refused in ["http://127.0.0.1:9/notes.pdf", "http://127.0.0.1:9/data"] {
+            let err = fetch_http(refused, "t", &download)
+                .await
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                err.contains("must name a table file") && err.contains(".ods"),
+                "{refused}: {err}"
+            );
+        }
     }
 
     /// One HTTP exchange on a loopback port: answer `response` to the

@@ -43,6 +43,7 @@ use crate::server::state::{App, with_db};
 use quack_core::analysis::tools;
 use quack_core::analysis::tools::TEMP_OBJECT_REFUSED;
 use quack_core::error::Result as CoreResult;
+use quack_core::graph::traverse::Hops;
 use quack_core::graph::{GraphResult, traverse};
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
@@ -623,7 +624,7 @@ impl McpServer {
             Some(e) => self.embed(e).await?,
             None => None,
         };
-        let hops = args.hops.unwrap_or(2).max(1);
+        let hops = Hops::neighborhood(args.hops);
         let relation = args.relation.clone();
         let options = self.inner.config.graph.options();
         let detail = serde_json::json!({ "entity": entity, "class": class, "relation": relation, "hops": hops });
@@ -672,7 +673,7 @@ impl McpServer {
         }
         let a = self.embed(&from).await?;
         let b = self.embed(&to).await?;
-        let max_hops = args.max_hops.unwrap_or(4).max(1);
+        let max_hops = Hops::path(args.max_hops);
         let options = self.inner.config.graph.options();
         let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
         let (from_label, to_label) = (from.clone(), to.clone());
@@ -952,6 +953,7 @@ mod tests {
     use quack_core::config::Config;
 
     use super::*;
+    use quack_core::storage::control::AllowedProviders;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -972,7 +974,7 @@ mod tests {
                 id: String::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
-                allowed_providers: None,
+                allowed_providers: AllowedProviders::All,
             },
             policy,
             None,
@@ -1095,7 +1097,7 @@ mod tests {
                 id: String::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
-                allowed_providers: None,
+                allowed_providers: AllowedProviders::All,
             },
             WritePolicy::Deny,
             None,

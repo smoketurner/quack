@@ -148,7 +148,7 @@ fn writer_of(db: &WorkspaceDb) -> Writer {
 fn test_config(data_dir: &Path) -> Config {
     let mut providers = BTreeMap::new();
     providers.insert(
-        "mock".into(),
+        "mock".parse().unwrap(),
         ProviderConfig {
             provider_type: ProviderType::Ollama,
             auth: AuthMode::None,
@@ -1949,7 +1949,7 @@ async fn workbook_loads_one_table_per_sheet_and_delete_drops_them() {
         2,
         "one CSV per sheet"
     );
-    assert!(db.delete_document(&result.document_id, None).unwrap());
+    assert!(db.delete_document(&result.document_id).unwrap());
     assert!(db.list_tables().unwrap().is_empty());
     assert!(db.document(&result.document_id).unwrap().is_none());
     // The workbook and its per-sheet CSVs are gone from files/ too.
@@ -2444,7 +2444,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     .await;
     assert!(unsupported.is_err());
     // Delete through the document row drops the imported table.
-    assert!(db.delete_document(&summary.document_id, None).unwrap());
+    assert!(db.delete_document(&summary.document_id).unwrap());
     assert!(
         !db.list_tables()
             .unwrap()

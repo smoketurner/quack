@@ -3,6 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
 mod config_cli;
+mod confirm;
 mod doctor_cli;
 mod embeddings_cli;
 mod graph_cli;
@@ -36,6 +37,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::confirm::Confirm;
 
 /// Exit status for a usage error (bad flags, no terminal for the session).
 const EXIT_USAGE: u8 = 2;
@@ -1036,7 +1039,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
 }
 
 fn oauth_manager(config: &Config, name: &str) -> Result<Arc<TokenManager>> {
-    let provider = config.providers.get(name).ok_or_else(|| {
+    let (name, provider) = config.providers.get_key_value(name).ok_or_else(|| {
         anyhow::anyhow!(
             "provider '{name}' is not configured; add [providers.{name}] with auth = \"oauth\""
         )
@@ -1289,14 +1292,7 @@ fn run_docs(
     }
     if let Some(prefix) = delete {
         let id = find_document(db, prefix)?;
-        let filename = db
-            .document(&id)?
-            .map(|d| d.filename)
-            .context("document vanished")?;
-        let table = ingestion::parser::detect_file_type(&filename)
-            .is_structured()
-            .then(|| ingestion::table_name_for(&filename));
-        db.delete_document(&id, table.as_deref())?;
+        db.delete_document(&id)?;
     }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -1640,19 +1636,15 @@ async fn ingest_bundle(
         if existing.as_deref() == Some(body.as_str()) {
             writeln!(out, "index.md already is the workspace context.")?;
         } else {
-            write!(
-                out,
-                "index.md can become the workspace context{}. Apply it? [y/N] ",
+            let question = format!(
+                "index.md can become the workspace context{}. Apply it?",
                 if existing.is_some() {
                     " (replacing the current one)"
                 } else {
                     ""
                 }
-            )?;
-            out.flush()?;
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            if matches!(answer.trim(), "y" | "Y" | "yes") {
+            );
+            if Confirm::Ask.ask(&mut out, &question, None)? {
                 let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
                 writeln!(out, "context is now version {}", stored.version)?;
             } else {

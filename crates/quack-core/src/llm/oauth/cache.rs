@@ -16,6 +16,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 use super::keychain;
+use crate::config::ProviderName;
 use crate::error::{Error, Result};
 
 const KEY_LEN: usize = 32;
@@ -81,7 +82,7 @@ impl std::fmt::Display for KeySource {
 /// One provider's cache file and its key.
 #[derive(Debug, Clone)]
 pub struct TokenCache {
-    provider: String,
+    provider: ProviderName,
     path: PathBuf,
     key_path: PathBuf,
     key_source: KeySource,
@@ -89,9 +90,9 @@ pub struct TokenCache {
 
 impl TokenCache {
     #[must_use]
-    pub fn new(tokens_dir: &Path, provider: &str, key_source: KeySource) -> Self {
+    pub fn new(tokens_dir: &Path, provider: &ProviderName, key_source: KeySource) -> Self {
         Self {
-            provider: provider.to_owned(),
+            provider: provider.clone(),
             path: tokens_dir.join(format!("{provider}.json")),
             key_path: tokens_dir.join(format!("{provider}.key")),
             key_source,
@@ -150,7 +151,7 @@ impl TokenCache {
         let plaintext = aead
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
-                Aad::from(self.provider.as_bytes()),
+                Aad::from(self.provider.as_str().as_bytes()),
                 &mut ciphertext,
             )
             .map_err(|_| {
@@ -191,7 +192,7 @@ impl TokenCache {
         let aead = RandomizedNonceKey::new(&AES_256_GCM, &key)
             .map_err(|_| Error::Llm(String::from("token cache key is unusable")))?;
         let nonce = aead
-            .seal_in_place_append_tag(Aad::from(self.provider.as_bytes()), &mut in_out)
+            .seal_in_place_append_tag(Aad::from(self.provider.as_str().as_bytes()), &mut in_out)
             .map_err(|_| Error::Llm(String::from("token cache encryption failed")))?;
         let envelope = Envelope {
             version: FORMAT_VERSION,
@@ -213,7 +214,7 @@ impl TokenCache {
         remove_if_present(&self.path)?;
         remove_if_present(&self.key_path)?;
         if self.key_source == KeySource::Keychain
-            && let Err(e) = keychain::delete(&self.provider).await
+            && let Err(e) = keychain::delete(self.provider.as_str()).await
         {
             tracing::warn!(provider = %self.provider, error = %e, "keychain entry not removed");
         }
@@ -235,14 +236,14 @@ impl TokenCache {
     }
 
     async fn keychain_key(&self, create: bool) -> Result<Option<[u8; KEY_LEN]>> {
-        if let Some(encoded) = keychain::get(&self.provider).await? {
+        if let Some(encoded) = keychain::get(self.provider.as_str()).await? {
             return decode_key(&encoded).map(Some);
         }
         if !create {
             return Ok(None);
         }
         let key = generate_key()?;
-        keychain::set(&self.provider, &BASE64.encode(key)).await?;
+        keychain::set(self.provider.as_str(), &BASE64.encode(key)).await?;
         Ok(Some(key))
     }
 
@@ -331,6 +332,10 @@ mod tests {
         tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()))
     }
 
+    fn name(text: &str) -> ProviderName {
+        text.parse().unwrap_or_else(|e: Error| fail(&e.to_string()))
+    }
+
     /// Fail the test with a message; `!` lets it sit in a `let ... else`.
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -340,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn round_trip_with_a_file_key() {
         let dir = temp();
-        let cache = TokenCache::new(dir.path(), "azure", KeySource::File);
+        let cache = TokenCache::new(dir.path(), &name("azure"), KeySource::File);
         assert!(cache.load().await.is_ok_and(|t| t.is_none()));
         assert!(cache.store(&token("at", Some("rt"))).await.is_ok());
         let loaded = cache.load().await;
@@ -369,13 +374,13 @@ mod tests {
     #[tokio::test]
     async fn tampered_ciphertext_and_wrong_provider_are_rejected() {
         let dir = temp();
-        let cache = TokenCache::new(dir.path(), "a", KeySource::File);
+        let cache = TokenCache::new(dir.path(), &name("a"), KeySource::File);
         assert!(cache.store(&token("at", None)).await.is_ok());
         // Same key file, different associated data.
         let renamed = dir.path().join("b.json");
         assert!(std::fs::copy(cache.path(), &renamed).is_ok());
         assert!(std::fs::copy(dir.path().join("a.key"), dir.path().join("b.key")).is_ok());
-        let other = TokenCache::new(dir.path(), "b", KeySource::File);
+        let other = TokenCache::new(dir.path(), &name("b"), KeySource::File);
         let err = other.load().await.err();
         assert!(err.is_some_and(|e| e.to_string().contains("does not decrypt")));
         // Flipped ciphertext byte.
@@ -399,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn missing_key_means_no_token_and_clear_removes_everything() {
         let dir = temp();
-        let cache = TokenCache::new(dir.path(), "p", KeySource::File);
+        let cache = TokenCache::new(dir.path(), &name("p"), KeySource::File);
         assert!(cache.store(&token("at", None)).await.is_ok());
         assert!(std::fs::remove_file(dir.path().join("p.key")).is_ok());
         assert!(cache.load().await.is_ok_and(|t| t.is_none()));

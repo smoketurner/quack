@@ -6,6 +6,7 @@ use std::io::{Cursor, Write};
 
 use calamine::{Data, Reader};
 
+use crate::csv::CsvField;
 use crate::error::{Error, Result};
 
 /// One sheet of a workbook as CSV bytes, with its name.
@@ -44,7 +45,7 @@ pub fn sheets(data: &[u8]) -> Result<Vec<SheetCsv>> {
             let fields: Vec<String> = row.iter().map(cell_text).collect();
             let line = fields
                 .iter()
-                .map(|f| csv_field(f))
+                .map(|f| CsvField(f).to_string())
                 .collect::<Vec<_>>()
                 .join(",");
             csv.write_all(line.as_bytes())?;
@@ -126,14 +127,6 @@ fn excel_serial_to_iso(serial: f64) -> Option<String> {
     Some(datetime.strftime("%Y-%m-%d %H:%M:%S").to_string())
 }
 
-fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,9 +139,6 @@ mod tests {
         assert_eq!(cell_text(&Data::Bool(true)), "true");
         assert_eq!(cell_text(&Data::Empty), "");
         assert_eq!(cell_text(&Data::String(String::from("a,b"))), "a,b");
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
-        assert_eq!(csv_field("plain"), "plain");
     }
 
     #[test]

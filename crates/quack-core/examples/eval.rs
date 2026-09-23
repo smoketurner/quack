@@ -82,7 +82,7 @@ fn print_error(message: &str) {
 async fn run() -> Result<Report> {
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval");
     let data_dir = tempfile::tempdir()?;
-    let config = eval_config(data_dir.path());
+    let config = eval_config(data_dir.path())?;
     let workspace_id = "eval";
     let db = WorkspaceDb::open(&config, workspace_id)?;
     // No prefixes: the hashing embedder counts tokens, and a prefix would
@@ -130,10 +130,10 @@ async fn run() -> Result<Report> {
     })
 }
 
-fn eval_config(data_dir: &Path) -> Config {
+fn eval_config(data_dir: &Path) -> Result<Config> {
     let mut providers = BTreeMap::new();
     providers.insert(
-        String::from("eval"),
+        "eval".parse()?,
         ProviderConfig {
             provider_type: ProviderType::Ollama,
             auth: AuthMode::None,
@@ -144,7 +144,7 @@ fn eval_config(data_dir: &Path) -> Config {
             oauth: None,
         },
     );
-    Config {
+    Ok(Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
             default_workspace: String::from("eval"),
@@ -162,7 +162,7 @@ fn eval_config(data_dir: &Path) -> Config {
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
         jobs: JobsConfig::default(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -9,8 +9,10 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use sea_query::{Expr, ExprTrait, Order, Query, SqliteQueryBuilder};
+use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use super::queries::{ApiTokens, AuditLog, Members, Users, Workspaces};
@@ -33,8 +35,56 @@ pub struct WorkspaceRow {
     pub id: String,
     pub name: String,
     pub classification: String,
-    /// JSON array of provider names, or `None` for all.
-    pub allowed_providers: Option<String>,
+    pub allowed_providers: AllowedProviders,
+}
+
+/// Which configured providers a workspace's questions may use. Stored as a
+/// JSON array of names, or NULL for all; decoded once, when the row is read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AllowedProviders {
+    #[default]
+    All,
+    Only(BTreeSet<String>),
+}
+
+impl AllowedProviders {
+    /// Decode the stored column. A value that does not parse allows no
+    /// provider rather than every one, and says so in the log.
+    fn from_column(stored: Option<&str>) -> Self {
+        let Some(text) = stored else {
+            return Self::All;
+        };
+        match serde_json::from_str(text) {
+            Ok(names) => Self::Only(names),
+            Err(e) => {
+                tracing::warn!(error = %e, "unreadable allowed_providers; allowing none");
+                Self::Only(BTreeSet::new())
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn permits(&self, provider: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(names) => names.contains(provider),
+        }
+    }
+
+    /// The names, or `None` when every provider is allowed.
+    #[must_use]
+    pub fn names(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::All => None,
+            Self::Only(names) => Some(names),
+        }
+    }
+}
+
+impl Serialize for AllowedProviders {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.names().serialize(serializer)
+    }
 }
 
 /// Settings a workspace owner may change.
@@ -53,7 +103,7 @@ pub enum ProviderAllowList {
     /// Clear it: every configured provider is allowed.
     All,
     /// Only these provider names.
-    Only(Vec<String>),
+    Only(BTreeSet<String>),
 }
 
 /// A server user. The password hash never leaves this module.
@@ -541,7 +591,10 @@ impl ControlPlane {
             id: r.try_get("id")?,
             name: r.try_get("name")?,
             classification: r.try_get("classification")?,
-            allowed_providers: r.try_get("allowed_providers")?,
+            allowed_providers: AllowedProviders::from_column(
+                r.try_get::<Option<String>, _>("allowed_providers")?
+                    .as_deref(),
+            ),
         })
     }
 
@@ -599,7 +652,7 @@ impl ControlPlane {
             id,
             name: name.to_owned(),
             classification: String::from("internal"),
-            allowed_providers: None,
+            allowed_providers: AllowedProviders::All,
         })
     }
 
@@ -1364,6 +1417,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stored_allow_lists_decode_and_fail_closed() {
+        assert_eq!(AllowedProviders::from_column(None), AllowedProviders::All);
+        let only = AllowedProviders::from_column(Some("[\"ollama\"]"));
+        assert!(only.permits("ollama") && !only.permits("openai"));
+        let unreadable = AllowedProviders::from_column(Some("not json"));
+        assert!(!unreadable.permits("ollama"));
+        assert_eq!(
+            serde_json::to_value(&only).ok(),
+            Some(serde_json::json!(["ollama"]))
+        );
+        assert_eq!(
+            serde_json::to_value(AllowedProviders::All).ok(),
+            Some(serde_json::Value::Null)
+        );
+    }
+
     #[tokio::test]
     async fn migrations_reach_v3_and_rerun_idempotently() {
         let (dir, cp) = open().await;
@@ -1387,17 +1457,23 @@ mod tests {
                 &ws.id,
                 &WorkspaceChanges {
                     classification: Some(String::from("secret")),
-                    allowed_providers: ProviderAllowList::Only(vec![String::from("ollama")]),
+                    allowed_providers: ProviderAllowList::Only(BTreeSet::from([String::from(
+                        "ollama",
+                    )])),
                 },
             )
             .await;
         assert!(changed.is_ok_and(|w| {
-            w.classification == "secret" && w.allowed_providers.as_deref() == Some("[\"ollama\"]")
+            w.classification == "secret"
+                && w.allowed_providers.permits("ollama")
+                && !w.allowed_providers.permits("openai")
         }));
         let kept = cp
             .update_workspace(&ws.id, &WorkspaceChanges::default())
             .await;
-        assert!(kept.is_ok_and(|w| w.classification == "secret" && w.allowed_providers.is_some()));
+        assert!(kept.is_ok_and(
+            |w| w.classification == "secret" && w.allowed_providers != AllowedProviders::All
+        ));
         let cleared = cp
             .update_workspace(
                 &ws.id,
@@ -1407,7 +1483,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(cleared.is_ok_and(|w| w.allowed_providers.is_none()));
+        assert!(cleared.is_ok_and(|w| w.allowed_providers == AllowedProviders::All));
         assert!(
             cp.update_workspace("missing", &WorkspaceChanges::default())
                 .await

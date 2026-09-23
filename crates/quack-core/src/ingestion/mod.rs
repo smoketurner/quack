@@ -274,10 +274,7 @@ fn register_pending(
             "its table or chunks were dropped; the file was ingested again",
         )?;
     }
-    if matches!(
-        file_type,
-        parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json
-    ) {
+    if file_type.is_single_table() {
         check_table_free(db, &sanitize_table_name(filename), None)?;
     }
     let doc_id = uuid::Uuid::now_v7().to_string();

@@ -206,6 +206,10 @@ fn temp() -> tempfile::TempDir {
 }
 
 /// Fail the test with a message; `!` lets it sit in a `let ... else`.
+fn name(text: &str) -> ProviderName {
+    text.parse().unwrap_or_else(|e: Error| fail(&e.to_string()))
+}
+
 #[expect(clippy::panic, reason = "test failure path")]
 fn fail(msg: &str) -> ! {
     panic!("{msg}")
@@ -214,7 +218,7 @@ fn fail(msg: &str) -> ! {
 fn manager(dir: &Path, idp: &MockIdp, device_code: bool) -> TokenManager {
     match TokenManager::new(
         dir,
-        "p",
+        &name("p"),
         oauth_config(&idp.issuer, device_code),
         KeySource::File,
     ) {
@@ -462,7 +466,7 @@ async fn browser_login_reports_the_issuer_error() {
 async fn device_login_without_a_device_endpoint_is_an_error() {
     let dir = temp();
     let config = oauth_config("http://127.0.0.1:9", true);
-    let Ok(m) = TokenManager::new(dir.path(), "p", config, KeySource::File) else {
+    let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
         fail("manager build failed");
     };
     let endpoints = Endpoints {
@@ -479,7 +483,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
 async fn discovery_failure_is_reported_with_the_url() {
     let dir = temp();
     let config = oauth_config("http://127.0.0.1:9", false);
-    let Ok(m) = TokenManager::new(dir.path(), "p", config, KeySource::File) else {
+    let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
         fail("manager build failed");
     };
     assert!(
@@ -504,14 +508,14 @@ fn shared_manager_is_one_per_provider_and_needs_the_oauth_section() {
         max_concurrent_requests: None,
         oauth: Some(oauth_config("http://127.0.0.1:9", false)),
     };
-    let a = shared_manager(dir.path(), "shared", &provider);
-    let b = shared_manager(dir.path(), "shared", &provider);
+    let a = shared_manager(dir.path(), &name("shared"), &provider);
+    let b = shared_manager(dir.path(), &name("shared"), &provider);
     assert!(matches!((&a, &b), (Ok(a), Ok(b)) if Arc::ptr_eq(a, b)));
     let none = ProviderConfig {
         oauth: None,
         ..provider
     };
-    assert!(shared_manager(dir.path(), "other", &none).is_err());
+    assert!(shared_manager(dir.path(), &name("other"), &none).is_err());
 }
 
 #[test]

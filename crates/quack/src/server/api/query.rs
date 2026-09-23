@@ -65,14 +65,15 @@ async fn prepare(
         return Err(ApiError::bad_request("prompt must not be empty"));
     }
     let chat = app.config.chat_model_ref()?;
-    if let Some(allowed) = access.workspace.allowed_providers.as_deref() {
-        let names: Vec<String> = serde_json::from_str(allowed).unwrap_or_default();
-        if !names.iter().any(|n| n == chat.provider_name) {
-            return Err(ApiError::forbidden(format!(
-                "provider '{}' is not allowed in this workspace",
-                chat.provider_name
-            )));
-        }
+    if !access
+        .workspace
+        .allowed_providers
+        .permits(chat.provider_name.as_str())
+    {
+        return Err(ApiError::forbidden(format!(
+            "provider '{}' is not allowed in this workspace",
+            chat.provider_name
+        )));
     }
     let mode = body.mode;
     let db = app.workspace_db(workspace_id).await?;

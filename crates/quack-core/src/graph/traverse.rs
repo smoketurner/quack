@@ -11,6 +11,49 @@ use crate::error::Result;
 use crate::ontology::Ontology;
 use crate::storage::workspace::WorkspaceDb;
 
+/// How many relations a walk follows from its entry point: at least one,
+/// whatever was asked, and capped again by `[graph].max_traversal_depth`
+/// when it runs. Every interface reads the caller's number through this, so
+/// `--hops 0` and `hops: 0` mean the same everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct Hops(u32);
+
+impl Hops {
+    /// How far a neighborhood reaches when the caller does not say.
+    pub const NEIGHBORHOOD: Self = Self(2);
+    /// How long a path may be when the caller does not say.
+    pub const PATH: Self = Self(4);
+
+    #[must_use]
+    pub const fn new(hops: u32) -> Self {
+        if hops == 0 { Self(1) } else { Self(hops) }
+    }
+
+    /// The caller's number, or [`Self::NEIGHBORHOOD`].
+    #[must_use]
+    pub fn neighborhood(hops: Option<u32>) -> Self {
+        hops.map_or(Self::NEIGHBORHOOD, Self::new)
+    }
+
+    /// The caller's number, or [`Self::PATH`].
+    #[must_use]
+    pub fn path(hops: Option<u32>) -> Self {
+        hops.map_or(Self::PATH, Self::new)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Hops {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// How far an embedding match may be from the query to count as the entity.
 const ENTRY_MAX_DISTANCE: f64 = 0.25;
 
@@ -164,14 +207,14 @@ pub fn suggest_entities(
 pub fn neighborhood(
     db: &WorkspaceDb,
     roots: &[Node],
-    hops: u32,
+    hops: Hops,
     relation: Option<&str>,
     options: &GraphOptions,
 ) -> Result<GraphResult> {
     if roots.is_empty() {
         return Ok(GraphResult::default());
     }
-    let depth = hops.min(options.max_traversal_depth);
+    let depth = hops.get().min(options.max_traversal_depth);
     let root_ids: Vec<String> = roots.iter().map(|n| n.id.clone()).collect();
     // Breadth-first, one query per frontier, never more than `max_nodes`
     // visited: a recursive CTE would enumerate every simple path out of a
@@ -233,7 +276,7 @@ pub fn path(
     db: &WorkspaceDb,
     from: &Node,
     to: &Node,
-    max_hops: u32,
+    max_hops: Hops,
     options: &GraphOptions,
 ) -> Result<GraphResult> {
     if from.id == to.id {
@@ -243,6 +286,7 @@ pub fn path(
     }
     // A path spans two neighbourhoods, so it may run twice as deep.
     let limit = max_hops
+        .get()
         .min(options.max_traversal_depth.saturating_mul(2))
         .max(1);
     // node id -> (previous node id, edge id)
@@ -539,6 +583,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn hops_are_at_least_one_with_named_defaults() {
+        assert_eq!(Hops::new(0).get(), 1);
+        assert_eq!(Hops::new(5).get(), 5);
+        assert_eq!(Hops::neighborhood(None), Hops::NEIGHBORHOOD);
+        assert_eq!(Hops::neighborhood(Some(0)).get(), 1);
+        assert_eq!(Hops::path(None), Hops::PATH);
+        assert_eq!(Hops::path(Some(0)).get(), 1);
+        assert_eq!((Hops::NEIGHBORHOOD.get(), Hops::PATH.get()), (2, 4));
+    }
     use crate::graph::Edge;
 
     fn node(id: &str, label: &str, properties: serde_json::Value) -> Node {

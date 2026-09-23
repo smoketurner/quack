@@ -2320,6 +2320,7 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 use crate::error;
+use crate::graph::traverse::Hops;
 use crate::graph::{self, GraphResult};
 use crate::ontology::Relation;
 
@@ -2382,7 +2383,7 @@ struct GraphQuery {
     entity: Option<String>,
     class: Option<String>,
     relation: Option<String>,
-    hops: u32,
+    hops: Hops,
     embedding: Option<Vector>,
 }
 
@@ -2591,7 +2592,7 @@ where
                 .map(str::trim)
                 .filter(|r| !r.is_empty())
                 .map(str::to_owned),
-            hops: args.hops.unwrap_or(2).max(1),
+            hops: Hops::neighborhood(args.hops),
             embedding,
         };
         let options = self.options;
@@ -2718,7 +2719,7 @@ where
             label_embedding(self.embedding_model.as_ref(), &self.recorder, from).await?;
         let to_embedding =
             label_embedding(self.embedding_model.as_ref(), &self.recorder, to).await?;
-        let max_hops = args.max_hops.unwrap_or(4).max(1);
+        let max_hops = Hops::path(args.max_hops);
         let from_owned = from.to_owned();
         let to_owned = to.to_owned();
         let options = self.options;

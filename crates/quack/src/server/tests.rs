@@ -15,7 +15,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use quack_core::config::{AuthMode, Config, ProviderConfig, ProviderType};
+use quack_core::config::{AuthMode, Config, ProviderConfig, ProviderName, ProviderType};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -2142,6 +2142,30 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         html.contains("API tokens") && html.contains("Members"),
         "{html}"
     );
+    // The settings form validates providers as the API does: an unknown one
+    // is refused with the reason, and nothing is saved.
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/settings"),
+            Some(&cookie),
+            "classification=secret&providers=nope",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let refused = location(&headers);
+    assert!(
+        refused.starts_with(&format!("/w/{ws}/settings?error=")),
+        "{refused}"
+    );
+    let (status, html, _) = h.page(&refused, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("not a configured provider"), "{html}");
+    let unchanged = h.app.control.get_workspace(&ws).await;
+    assert!(
+        unchanged.is_ok_and(|w| w
+            .is_some_and(|w| w.classification != "secret" && w.allowed_providers.permits("any"))),
+        "a refused form saves nothing"
+    );
     // A new token is shown once in the response body, never in a URL.
     let (status, html, headers) = h
         .form(
@@ -2270,7 +2294,9 @@ fn banner_names_the_address_mode_and_models() {
     let mut config = Config::default();
     config.general.chat_model = Some(String::from("ollama/llama3"));
     config.providers.insert(
-        String::from("ollama"),
+        "ollama"
+            .parse::<ProviderName>()
+            .unwrap_or_else(|e| fail(&e.to_string())),
         ProviderConfig {
             provider_type: ProviderType::Ollama,
             auth: AuthMode::None,
@@ -3725,7 +3751,9 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
     let mut config = Config::default();
     config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
     config.providers.insert(
-        String::from("ollama"),
+        "ollama"
+            .parse::<ProviderName>()
+            .unwrap_or_else(|e| fail(&e.to_string())),
         ProviderConfig {
             provider_type: ProviderType::Ollama,
             auth: AuthMode::None,

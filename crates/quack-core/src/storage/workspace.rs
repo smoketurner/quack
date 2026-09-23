@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::csv::CsvField;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Profile, Prompts, StaleVectors, Vector,
 };
 use crate::error::{Error, Record, Result};
 use crate::graph;
+use crate::ingestion::{self, parser};
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -1135,7 +1137,7 @@ impl WorkspaceDb {
 
     /// Remove a document with its chunks and term index. The tables it
     /// loaded into are dropped too: those recorded on the row, or for rows
-    /// from before that was recorded, `fallback_table`. Graph nodes and
+    /// from before that was recorded, [`DocumentInfo::fallback_tables`]. Graph nodes and
     /// edges whose only provenance was the document or its tables go with
     /// it (issue #43), as do its files under `files/`. Returns whether the
     /// document existed.
@@ -1143,13 +1145,25 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if any delete fails.
-    pub fn delete_document(&self, id: &str, fallback_table: Option<&str>) -> Result<bool> {
+    pub fn delete_document(&self, id: &str) -> Result<bool> {
         let Some(doc) = self.document(id)? else {
             return Ok(false);
         };
-        let tables: Vec<String> = match doc.tables {
-            Some(tables) => tables,
-            None => fallback_table.map(str::to_owned).into_iter().collect(),
+        let tables = if let Some(tables) = doc.tables.clone() {
+            tables
+        } else {
+            // Never a table another document loaded: a row still queued, or
+            // one that failed before loading, has no tables of its own yet.
+            let mut unowned = Vec::new();
+            for table in doc.fallback_tables() {
+                if self
+                    .table_owner(&table)?
+                    .is_none_or(|owner| owner.id == doc.id)
+                {
+                    unowned.push(table);
+                }
+            }
+            unowned
         };
         self.forget_graph_provenance(id, &tables)?;
         self.conn.execute(
@@ -2091,6 +2105,18 @@ impl DocumentInfo {
     pub fn display_name(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.filename)
     }
+
+    /// The tables a row from before `tables` was recorded loaded into: the
+    /// one named after the file, for a CSV, Parquet, or JSON file. Workbooks
+    /// arrived with the `tables` column, so their rows always carry it.
+    #[must_use]
+    pub fn fallback_tables(&self) -> Vec<String> {
+        if parser::detect_file_type(&self.filename).is_single_table() {
+            vec![ingestion::table_name_for(&self.filename)]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// How a document reached the workspace.
@@ -2886,21 +2912,18 @@ impl QueryResults {
     ///
     /// Returns an error if writing fails.
     pub fn write_csv(&self, out: &mut impl Write) -> Result<()> {
-        fn field(value: &str) -> String {
-            if value.contains([',', '"', '\n', '\r']) {
-                format!("\"{}\"", value.replace('"', "\"\""))
-            } else {
-                value.to_owned()
-            }
-        }
-        let header: Vec<String> = self.columns.iter().map(|c| field(c)).collect();
+        let header: Vec<String> = self
+            .columns
+            .iter()
+            .map(|c| CsvField(c).to_string())
+            .collect();
         writeln!(out, "{}", header.join(","))?;
         for row in &self.rows {
             let cells: Vec<String> = row
                 .iter()
                 .map(|v| match v {
                     serde_json::Value::Null => String::new(),
-                    other => field(&display_json_value(other)),
+                    other => CsvField(&display_json_value(other)).to_string(),
                 })
                 .collect();
             writeln!(out, "{}", cells.join(","))?;
@@ -2982,6 +3005,49 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// A row from before `tables` was recorded drops the one table named
+    /// after its file, and nothing else; a chunked document has none.
+    #[test]
+    fn deleting_a_row_without_recorded_tables_drops_its_file_table() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        for sql in [
+            "CREATE TABLE sales AS SELECT 1 AS n",
+            "CREATE TABLE sales_notes AS SELECT 2 AS n",
+        ] {
+            db.execute_statement(sql)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        db.insert_document(&NewDocument::new("d1", "sales.csv", "text/csv", 1))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let doc = db.document("d1").unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(doc.as_ref().is_some_and(|d| d.tables.is_none()));
+        assert_eq!(
+            doc.map(|d| d.fallback_tables()),
+            Some(vec![String::from("sales")])
+        );
+        assert!(db.delete_document("d1").is_ok_and(|existed| existed));
+        assert!(db.table_exists("sales").is_ok_and(|exists| !exists));
+        assert!(db.table_exists("sales_notes").is_ok_and(|exists| exists));
+
+        // A queued row with the same file name has no tables yet: deleting
+        // it leaves the table another document loaded.
+        db.execute_statement("CREATE TABLE sales AS SELECT 3 AS n")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.insert_document(&NewDocument::new("owner", "sales.csv", "text/csv", 1))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.set_document_tables("owner", &[String::from("sales")])
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.insert_document(&NewDocument::new("queued", "sales.csv", "text/csv", 1))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(db.delete_document("queued").is_ok_and(|existed| existed));
+        assert!(db.table_exists("sales").is_ok_and(|exists| exists));
+
+        db.insert_document(&NewDocument::new("d2", "notes.md", "text/markdown", 1))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let notes = db.document("d2").unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(notes.is_some_and(|d| d.fallback_tables().is_empty()));
     }
 
     /// A stored source reads back as written; a NULL (rows from before the

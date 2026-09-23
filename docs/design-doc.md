@@ -742,7 +742,7 @@ each turn rather than retrieved, bounded by its own `[retrieval].pinned_token_bu
 | Excel `.xlsx`, `.xls`, `.ods` | `calamine` (pure Rust) writes each sheet as CSV under `files/` for `read_csv_auto` | One table per data sheet: `<stem>` for one sheet, `<stem>_<sheet>` otherwise; recorded on the document row so deleting it drops them |
 | stdin (print mode) | sniffed | Temporary table `stdin` |
 | Postgres, SQLite | `quack import URL --table T (--from SOURCE_TABLE \| --query SQL) [--limit N]`, `POST .../import`, the Tables page form, `/import` in the terminal: sqlx runs the query on the source with every column cast to text, the rows pass through `files/<table>.csv` and `read_csv_auto`, so `DuckDB` sniffs the types and the table is a document (source `import`, title the redacted URL) that can be deleted like any other. The password in the URL is used once and never stored; audit rows carry the redacted URL. Capped by `[import].max_rows` (a file is cut to it after the load), `max_download_mb`, and `timeout_seconds`. `sqlite:` paths inside `[general].data_dir` (`control.db`, the workspace files) are refused for every caller. The CLI, the terminal, and `quack serve --local` run as the owner and reach any other source; `quack serve` with logins refuses `sqlite:` paths unless `[import].allow_local_files` is on and, unless `allow_private_hosts` is on, resolves the host first, refuses loopback, private, link-local, and metadata addresses, pins the connection to the checked addresses, and does not follow redirects. | Table in `data.duckdb`, a snapshot of the source at import time |
-| CSV, Parquet, JSON, XLSX over HTTP(S) | The same command with an `http(s)://` URL: reqwest fetches the file and it goes through the usual reader under the requested table name | Table in `data.duckdb` |
+| CSV, Parquet, JSON, workbooks over HTTP(S) | The same command with an `http(s)://` URL naming any file `quack ingest` loads as a table (`parser::table_extensions`: CSV, TSV, Parquet, JSON, JSONL, and XLSX, XLSM, XLS, ODS workbooks): reqwest fetches the file and it goes through the usual reader under the requested table name | Table in `data.duckdb` |
 | MySQL, S3 | Not yet: MySQL needs the sqlx driver enabled and its identifier quoting; S3 needs request signing (the `object_store` crate is the candidate). The scanner and httpfs extensions stay out (section 15). | — |
 
 Table naming: sanitized file stem; on collision the web UI and TUI ask (replace, rename,
@@ -884,7 +884,9 @@ three nearest node embeddings within a distance of 0.25, and nothing if none qua
 Operations: `neighborhood(entity, hops, relation?)`, `path(a, b, max_hops)` (single-source
 BFS with a parent map, bounded by `max_traversal_depth * 2`), `by_class(class, limit)` with
 subclass expansion. Limits: `max_traversal_depth` (3) and `max_nodes` (200), the cap on
-nodes visited.
+nodes visited. Every interface reads a caller's hop count through `traverse::Hops`: at
+least 1, 2 for a neighborhood and 4 for a path when unset, so `--hops 0`, `hops: 0`, and
+`/graph X 0` mean the same thing.
 
 **Rendering.** TUI and `quack graph` print a depth-first tree; the web UI renders an
 ECharts `graph` series with class-colored nodes and an inspector showing properties and
@@ -1274,7 +1276,10 @@ Lifecycle: acquire via `quack auth login PROVIDER` (browser PKCE, or device code
 `{issuer_url}/.well-known/openid-configuration`; verifier from aws-lc-rs randomness);
 reuse while more than 60 s remain; refresh silently under `refresh_lock`; restart on
 refresh failure; in print, ingest, and server modes, where no flow can run, fail with exit
-4 / HTTP 503 naming the command to run. Cache encrypted (AES-256-GCM, the provider name as
+4 / HTTP 503 naming the command to run. The cache and key files are named after the provider,
+so a `[providers.NAME]` key is checked when the config is read (`config::ProviderName`: ASCII
+letters, digits, `_`, `-`, `.`, not starting with `.`, at most 64) and cannot point outside
+`<data_dir>/tokens/`. Cache encrypted (AES-256-GCM, the provider name as
 associated data) with a key in the OS keychain where available (macOS Keychain, the Linux
 kernel keyring via `keyutils`, which is always present but in-memory, so a reboot needs a
 new login; Windows Credential Manager), else a 0600 key file. `quack auth status` and
@@ -1525,6 +1530,8 @@ quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
               | accept ID... [--rename N|--merge-into ID|--reparent C] | reject ID...
               | export FILE | import FILE | versions | diff [FROM] [TO] | restore V
 quack context show | edit | history | export FILE | import FILE
+# Commands that spend model calls ask first ([y/N]) on a terminal; with no
+# terminal the answer is no, and -y / --yes goes ahead.
 quack sessions [--json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-

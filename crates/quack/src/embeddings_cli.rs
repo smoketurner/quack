@@ -14,7 +14,7 @@ use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
-use crate::graph_cli::confirm;
+use crate::confirm::Confirm;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum EmbeddingsAction {
@@ -26,15 +26,6 @@ pub(crate) enum EmbeddingsAction {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-}
-
-/// Whether to ask before spending the model calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Confirm {
-    /// Show the plan and read the answer from stdin.
-    Ask,
-    /// Go ahead: `-y`, or a terminal job, which may not read stdin.
-    Assume,
 }
 
 /// Run `action` against the workspace behind `db`.
@@ -52,8 +43,7 @@ pub(crate) async fn run(
 ) -> Result<()> {
     match action {
         EmbeddingsAction::Refresh { yes } => {
-            let confirm_first = if yes { Confirm::Assume } else { Confirm::Ask };
-            refresh(config, db, confirm_first, out, control).await
+            refresh(config, db, Confirm::from_yes(yes), out, control).await
         }
     }
 }
@@ -78,7 +68,7 @@ async fn refresh(
         return Ok(());
     }
     writeln!(out, "{plan}")?;
-    if confirm_first == Confirm::Ask && !confirm(out)? {
+    if !confirm_first.ask(out, "Proceed?", Some("--yes"))? {
         writeln!(out, "Nothing changed.")?;
         return Ok(());
     }
