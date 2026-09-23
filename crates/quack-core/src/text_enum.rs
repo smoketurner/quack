@@ -47,7 +47,7 @@ macro_rules! text_enum {
 
         impl ::std::fmt::Display for $name {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                f.write_str(self.as_str())
+                f.pad(self.as_str())
             }
         }
 
@@ -83,7 +83,8 @@ mod tests {
     use serde::Serialize;
 
     use crate::analysis::chart::ChartKind;
-    use crate::error::Error;
+    use crate::doctor;
+    use crate::error::{Error, Record};
     use crate::graph::ExtractSource;
     use crate::graph::resolve::{MergeDecision, MergeStatus};
     use crate::ontology::PropertyType;
@@ -93,19 +94,30 @@ mod tests {
     use crate::storage::sessions::{ChatMode, MessageRole};
     use crate::storage::workspace::{DocumentSource, DocumentStatus};
 
-    /// Every value's text form is its serde name, and reads back, trimmed
-    /// and in any case.
+    /// Every value's text form is its serde name, and reads back.
     fn round_trips<T>(all: &[T])
     where
         T: Copy + PartialEq + std::fmt::Debug + Display + FromStr<Err = Error> + Serialize,
     {
         for &value in all {
-            let text = value.to_string();
             assert_eq!(
                 serde_json::to_value(value).ok(),
-                Some(serde_json::Value::String(text.clone())),
+                Some(serde_json::Value::String(value.to_string())),
                 "{value:?}"
             );
+        }
+        text_round_trips(all);
+    }
+
+    /// Every value's text form reads back, trimmed and in any case, and
+    /// `Display` honors width.
+    fn text_round_trips<T>(all: &[T])
+    where
+        T: Copy + PartialEq + std::fmt::Debug + Display + FromStr<Err = Error>,
+    {
+        for &value in all {
+            let text = value.to_string();
+            assert_eq!(format!("{value:>30}"), format!("{text:>30}"));
             assert_eq!(text.parse::<T>().ok(), Some(value));
             assert_eq!(
                 format!("  {}  ", text.to_ascii_uppercase())
@@ -137,6 +149,9 @@ mod tests {
         round_trips(ExtractSource::ALL);
         round_trips(AuditAction::ALL);
         round_trips(ResourceKind::ALL);
+        text_round_trips(Record::ALL);
+        text_round_trips(doctor::Status::ALL);
+        text_round_trips(doctor::Area::ALL);
     }
 
     #[test]
