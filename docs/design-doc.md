@@ -1413,9 +1413,12 @@ GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal
 Uploads, extraction, and proposals return `202` with a `job` id and run on the work queue
 (section 4.1); clients poll the resource or the job. Agent turns run there too, in their
 session's lane. Rate limiting per token via `tower_governor`. A field that names one of a
-fixed set (`mode`, `role`, `scopes`, an audit `outcome`) is read as that value: an unknown
-one is refused while the request is read, 422 for a JSON body and 400 for a query string,
-with the accepted values in the message.
+fixed set (`mode`, `role`, `scopes`, an audit `outcome`, a merge or candidate `action`, an
+extraction `source`) is read as that value: an unknown one is refused while the request is
+read, 422 for a JSON body and 400 for a query string, with the accepted values in the
+message. A session, document, ontology version, merge proposal, or candidate that does not
+exist is 404; a provider that needs `quack auth login` or a workspace another process holds
+is 503; a question with no chat model configured is 400.
 
 ```
 GET    /api/v1/workspaces/{id}/jobs               queued, running, and recent jobs, newest first,
