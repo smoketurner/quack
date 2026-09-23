@@ -582,6 +582,7 @@ fn is_private_address(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Embeddings;
 
     #[test]
     fn urls_classify_and_redact() {
@@ -802,7 +803,7 @@ mod tests {
             "ws",
             &request,
             ImportPolicy::owner(),
-            None::<&crate::llm::Embeddings>,
+            None::<&Embeddings>,
             None,
         )
         .await
@@ -879,7 +880,7 @@ mod tests {
                 "ws",
                 &request,
                 ImportPolicy::owner(),
-                None::<&crate::llm::Embeddings>,
+                None::<&Embeddings>,
                 None,
             )
             .await

@@ -486,6 +486,8 @@ pub fn format_query_result(capped: &CappedResults) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::store::NewNode;
+    use crate::ontology::Ontology;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
     fn db() -> WorkspaceDb {
@@ -513,13 +515,7 @@ mod tests {
     fn the_graph_procedure_appears_only_once_the_graph_has_nodes() {
         const PROCEDURE: &str = "When answering questions about how entities relate";
         let db = db();
-        ontology_store::save(
-            &db,
-            &crate::ontology::Ontology::builtin_default(),
-            Some("tester"),
-            None,
-        )
-        .unwrap();
+        ontology_store::save(&db, &Ontology::builtin_default(), Some("tester"), None).unwrap();
 
         // An ontology alone registers no graph tools, so it gets no procedure.
         let without = build_system_prompt(&db, &options(ChatMode::Chat, 0)).unwrap();
@@ -528,7 +524,7 @@ mod tests {
 
         graph_store::upsert_node(
             &db,
-            &crate::graph::store::NewNode {
+            &NewNode {
                 label: String::from("Acme"),
                 class_id: String::from("organization"),
                 properties: serde_json::json!({}),
@@ -571,16 +567,10 @@ mod tests {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        ontology_store::save(
-            &db,
-            &crate::ontology::Ontology::builtin_default(),
-            Some("tester"),
-            None,
-        )
-        .unwrap();
+        ontology_store::save(&db, &Ontology::builtin_default(), Some("tester"), None).unwrap();
         graph_store::upsert_node(
             &db,
-            &crate::graph::store::NewNode {
+            &NewNode {
                 label: String::from("Acme"),
                 class_id: String::from("organization"),
                 properties: serde_json::json!({}),

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use quack_core::config::JobsConfig;
 use quack_core::config::{
     AnalysisConfig, AuthMode, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
     ImportConfig, IngestionConfig, OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig,
@@ -11,9 +12,14 @@ use quack_core::config::{
 use quack_core::embedding::refresh::Plan;
 use quack_core::embedding::refresh::Retype;
 use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
+use quack_core::error::Error;
 use quack_core::graph::store as graph_store;
+use quack_core::import;
+use quack_core::import::ImportPolicy;
+use quack_core::import::ImportRequest;
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
+use quack_core::llm::CancellationToken;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
     ChunkScope, DocumentSource, DocumentStatus, MetaKey, NewChunk, NewDocument, StatementKind,
@@ -181,7 +187,7 @@ fn test_config(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
-        jobs: quack_core::config::JobsConfig::default(),
+        jobs: JobsConfig::default(),
     }
 }
 
@@ -203,7 +209,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
-        jobs: quack_core::config::JobsConfig::default(),
+        jobs: JobsConfig::default(),
     }
 }
 
@@ -546,7 +552,7 @@ async fn ingest_unknown_file_type_returns_error() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, quack_core::error::Error::UnsupportedFileType(_)),
+        matches!(err, Error::UnsupportedFileType(_)),
         "expected UnsupportedFileType, got: {err}"
     );
 }
@@ -2034,19 +2040,19 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         .unwrap();
     }
     let url = format!("sqlite://{}", source_path.display());
-    let request = quack_core::import::ImportRequest {
+    let request = ImportRequest {
         url: url.clone(),
         table: String::from("Orders Import"),
         query: None,
         source_table: Some(String::from("orders")),
         limit: None,
     };
-    let summary = quack_core::import::import(
+    let summary = import::import(
         &config,
         &writer,
         "ws-import",
         &request,
-        quack_core::import::ImportPolicy::owner(),
+        ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
@@ -2088,7 +2094,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     );
 
     // A query with a limit, into another table.
-    let request = quack_core::import::ImportRequest {
+    let request = ImportRequest {
         url: url.clone(),
         table: String::from("big"),
         query: Some(String::from(
@@ -2097,12 +2103,12 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         source_table: None,
         limit: Some(2),
     };
-    let summary = quack_core::import::import(
+    let summary = import::import(
         &config,
         &writer,
         "ws-import",
         &request,
-        quack_core::import::ImportPolicy::owner(),
+        ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
@@ -2328,14 +2334,14 @@ async fn server_policy_refuses_local_sqlite_files() {
     let config = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&config, "ws-import-policy").unwrap();
     let writer = writer_of(&db);
-    let server_policy = quack_core::import::ImportPolicy::server(&config);
+    let server_policy = ImportPolicy::server(&config);
     assert!(!server_policy.local_files);
     assert!(!server_policy.private_hosts);
-    let local_file = quack_core::import::import(
+    let local_file = import::import(
         &config,
         &writer,
         "ws-import-policy",
-        &quack_core::import::ImportRequest {
+        &ImportRequest {
             url: format!("sqlite://{}", dir.path().join("control.db").display()),
             table: String::from("x"),
             query: None,
@@ -2372,19 +2378,19 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             .unwrap();
     }
     let url = format!("sqlite://{}", source_path.display());
-    let first = quack_core::import::ImportRequest {
+    let first = ImportRequest {
         url: url.clone(),
         table: String::from("Orders Import"),
         query: None,
         source_table: Some(String::from("orders")),
         limit: None,
     };
-    let summary = quack_core::import::import(
+    let summary = import::import(
         &config,
         &writer,
         "ws-import-errors",
         &first,
-        quack_core::import::ImportPolicy::owner(),
+        ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
@@ -2392,52 +2398,52 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     .unwrap();
     assert_eq!(summary.rows, 1);
     // The same rows again are a duplicate; a bad query and a bad URL are errors.
-    let again = quack_core::import::import(
+    let again = import::import(
         &config,
         &writer,
         "ws-import-errors",
-        &quack_core::import::ImportRequest {
+        &ImportRequest {
             url: url.clone(),
             table: String::from("Orders Import"),
             query: None,
             source_table: Some(String::from("orders")),
             limit: None,
         },
-        quack_core::import::ImportPolicy::owner(),
+        ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await;
     assert!(again.is_err_and(|e| e.to_string().contains("identical")));
-    let bad = quack_core::import::import(
+    let bad = import::import(
         &config,
         &writer,
         "ws-import-errors",
-        &quack_core::import::ImportRequest {
+        &ImportRequest {
             url,
             table: String::from("x"),
             query: Some(String::from("SELECT * FROM nope")),
             source_table: None,
             limit: None,
         },
-        quack_core::import::ImportPolicy::owner(),
+        ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await;
     assert!(bad.is_err_and(|e| e.to_string().contains("rejected the query")));
-    let unsupported = quack_core::import::import(
+    let unsupported = import::import(
         &config,
         &writer,
         "ws-import-errors",
-        &quack_core::import::ImportRequest {
+        &ImportRequest {
             url: String::from("mysql://h/db"),
             table: String::from("x"),
             query: None,
             source_table: Some(String::from("t")),
             limit: None,
         },
-        quack_core::import::ImportPolicy::owner(),
+        ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
@@ -2501,7 +2507,7 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     let model = embedder(SlowModel {
         delay: std::time::Duration::from_secs(60),
     });
-    let cancel = quack_core::llm::CancellationToken::new();
+    let cancel = CancellationToken::new();
     let trigger = cancel.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2516,10 +2522,7 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
         Some(&model),
     )
     .await;
-    assert!(
-        matches!(outcome, Err(quack_core::error::Error::Cancelled)),
-        "{outcome:?}"
-    );
+    assert!(matches!(outcome, Err(Error::Cancelled)), "{outcome:?}");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
         "the request in flight was abandoned, not waited out"
@@ -2537,7 +2540,7 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     );
 
     // Cancelled before it starts: nothing is parsed or stored.
-    let early = quack_core::llm::CancellationToken::new();
+    let early = CancellationToken::new();
     early.cancel();
     let outcome = ingestion::ingest_file(
         &config,
@@ -2547,5 +2550,5 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
         Some(&model),
     )
     .await;
-    assert!(matches!(outcome, Err(quack_core::error::Error::Cancelled)));
+    assert!(matches!(outcome, Err(Error::Cancelled)));
 }

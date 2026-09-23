@@ -13,8 +13,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::config;
+use crate::config::ProviderConfig;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{AuthMode, Config, ModelRef, ProviderType};
+use crate::crypto;
 use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::{OllamaRunningModels, oauth};
@@ -203,7 +206,7 @@ fn check_config(report: &mut Report, inspection: &Inspection) {
 }
 
 fn check_crypto(report: &mut Report) {
-    let module = crate::crypto::provider_description();
+    let module = crypto::provider_description();
     if aws_lc_rs::fips_version().is_some() || !cfg!(target_os = "linux") {
         report.push(Check::new(Area::Crypto, Status::Ok, module));
     } else {
@@ -776,7 +779,7 @@ fn listing_check(
 async fn oauth_token(
     config: &Config,
     name: &str,
-    provider: &crate::config::ProviderConfig,
+    provider: &ProviderConfig,
 ) -> std::result::Result<String, String> {
     let manager =
         oauth::shared_manager(&config.tokens_dir(), name, provider).map_err(|e| e.to_string())?;
@@ -809,7 +812,7 @@ async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
     let snippet = |model: &str| {
         format!(
             "add to {}:\n[general]\nchat_model = \"ollama/{model}\"\n\n[providers.ollama]\ntype = \"ollama\"",
-            crate::config::config_file_path().display()
+            config::config_file_path().display()
         )
     };
     match pulled.first() {

@@ -20,6 +20,8 @@ use quack_core::config;
 use quack_core::config::AuthMode;
 use quack_core::config::Config;
 use quack_core::crypto;
+use quack_core::doctor;
+use quack_core::doctor::Options;
 use quack_core::error::Error as CoreError;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
@@ -59,7 +61,7 @@ static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "{}\n{}",
         env!("CARGO_PKG_VERSION"),
-        quack_core::crypto::provider_description()
+        crypto::provider_description()
     )
 });
 
@@ -609,12 +611,12 @@ fn run_config(changed: bool, json: bool) -> Result<ExitCode> {
 async fn run_doctor(cli: &Cli, offline: bool, json: bool) -> Result<ExitCode> {
     init_logging();
     let inspection = config::inspect::Inspection::load();
-    let options = quack_core::doctor::Options {
+    let options = Options {
         workspace: cli.workspace.clone(),
         offline,
-        ..quack_core::doctor::Options::default()
+        ..Options::default()
     };
-    let report = quack_core::doctor::run(&inspection, &options).await;
+    let report = doctor::run(&inspection, &options).await;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     doctor_cli::write(&mut out, &report, json)?;
@@ -1753,6 +1755,7 @@ fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, S
 mod tests {
     use super::*;
     use quack_core::error::AuthReason;
+    use quack_core::storage::workspace::NewDocument;
 
     /// A closed reader surfaces as an `io::Error`, a `serde_json` error, or
     /// core's transparent `Io` and `Json` variants; each one ends the
@@ -1780,13 +1783,8 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test")]
     fn docs_json_carries_every_document_field() {
         let db = WorkspaceDb::open_in_memory(4).unwrap();
-        db.insert_document(&quack_core::storage::workspace::NewDocument::new(
-            "d1",
-            "broken.pdf",
-            "application/pdf",
-            3,
-        ))
-        .unwrap();
+        db.insert_document(&NewDocument::new("d1", "broken.pdf", "application/pdf", 3))
+            .unwrap();
         db.mark_document_error("d1", "no text layer").unwrap();
         let mut out = Vec::new();
         list_documents(&db, true, &mut out).unwrap();

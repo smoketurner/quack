@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use super::candidates::AUTO_ACCEPT_NOTE;
 use super::{
     Class, Mapping, MappingRelation, Ontology, Property, PropertyType, ROOT_CLASS, Relation,
 };
@@ -48,7 +49,7 @@ pub fn current_is_auto_accepted(db: &WorkspaceDb) -> Result<bool> {
     Ok(versions(db, 1)?.first().is_some_and(|v| {
         v.note
             .as_deref()
-            .is_some_and(|n| n.starts_with(super::candidates::AUTO_ACCEPT_NOTE))
+            .is_some_and(|n| n.starts_with(AUTO_ACCEPT_NOTE))
     }))
 }
 

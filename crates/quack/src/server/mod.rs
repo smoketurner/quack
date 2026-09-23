@@ -31,6 +31,7 @@ use tower_http::request_id::{
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
+use quack_core::config::AuthMode;
 use quack_core::storage::control::{ControlPlane, sha256_hex};
 use state::{App, AppState};
 
@@ -227,9 +228,9 @@ fn banner(
         .iter()
         .map(|(name, p)| {
             let auth = match p.auth {
-                quack_core::config::AuthMode::None => "no auth",
-                quack_core::config::AuthMode::ApiKey => "api key",
-                quack_core::config::AuthMode::Oauth => "oauth",
+                AuthMode::None => "no auth",
+                AuthMode::ApiKey => "api key",
+                AuthMode::Oauth => "oauth",
             };
             format!("{name} ({}, {auth})", p.provider_type)
         })

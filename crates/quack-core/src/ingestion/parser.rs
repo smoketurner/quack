@@ -3,6 +3,7 @@ use std::path::Path;
 use pdf_oxide::PdfDocument;
 use pdf_oxide::editor::DocumentInfo;
 
+use super::{html, office};
 use crate::error::{Error, Result};
 use crate::okf::parse_front_matter;
 
@@ -185,9 +186,9 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
             flow: Flow::Sectioned,
             pages_skipped: 0,
         }),
-        FileType::Html => super::html::html(&utf8(data)?),
-        FileType::Docx => super::office::docx(data),
-        FileType::Pptx => super::office::pptx(data),
+        FileType::Html => html::html(&utf8(data)?),
+        FileType::Docx => office::docx(data),
+        FileType::Pptx => office::pptx(data),
         FileType::Csv | FileType::Parquet | FileType::Json | FileType::Xlsx | FileType::Unknown => {
             Err(Error::Ingestion(format!(
                 "cannot extract text from {file_type} files"

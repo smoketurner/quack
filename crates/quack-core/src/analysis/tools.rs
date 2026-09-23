@@ -14,7 +14,7 @@ use crate::storage::workspace::{
 use crate::storage::writer::Writer;
 
 use super::chart::{self, ChartSpec};
-use super::events::TurnRecorder;
+use super::events::{self, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, Reranker};
 use super::text_to_sql;
@@ -124,8 +124,8 @@ impl ReaderDb {
     /// or the transaction itself.
     pub async fn with_db<T>(
         &self,
-        f: impl FnOnce(&WorkspaceDb) -> crate::error::Result<T> + Send + 'static,
-    ) -> crate::error::Result<T>
+        f: impl FnOnce(&WorkspaceDb) -> error::Result<T> + Send + 'static,
+    ) -> error::Result<T>
     where
         T: Send + 'static,
     {
@@ -257,8 +257,8 @@ fn tool_error(e: Error) -> ToolError {
 /// Returns `f`'s error, or the writer's (a panic in `f`, a stopped writer).
 pub(crate) async fn with_db<T>(
     db: &SharedDb,
-    f: impl FnOnce(&WorkspaceDb) -> crate::error::Result<T> + Send + 'static,
-) -> crate::error::Result<T>
+    f: impl FnOnce(&WorkspaceDb) -> error::Result<T> + Send + 'static,
+) -> error::Result<T>
 where
     T: Send + 'static,
 {
@@ -432,7 +432,7 @@ impl RunSqlTool {
 /// The note under a result whose statement repeats `earlier` with other
 /// literals.
 fn per_group_note(earlier: &str) -> String {
-    let (preview, _) = super::events::preview_detail(earlier);
+    let (preview, _) = events::preview_detail(earlier);
     format!(
         "Note: this statement repeats an earlier one with different literal values ({}). \
          Do not run it once per value: one statement covers every group at once with \
@@ -632,7 +632,7 @@ pub struct SearchDocumentsArgs {
 /// document ids. Anything that matches nothing is an error naming the
 /// documents that exist, so the model retries instead of getting an empty
 /// result it reads as "the workspace has nothing on this".
-fn resolve_document_ids(db: &WorkspaceDb, wanted: &[String]) -> crate::error::Result<Vec<String>> {
+fn resolve_document_ids(db: &WorkspaceDb, wanted: &[String]) -> error::Result<Vec<String>> {
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
@@ -821,7 +821,7 @@ fn entity_chunks(
     db: &WorkspaceDb,
     entity: &str,
     embedding: Option<&[f32]>,
-) -> crate::error::Result<Vec<String>> {
+) -> error::Result<Vec<String>> {
     let nodes = graph::traverse::resolve_entry(db, entity, None, embedding)?;
     if nodes.is_empty() {
         let suggestions = graph::traverse::suggest_entities(db, entity, None, embedding)?;
@@ -1262,8 +1262,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::analysis::chart::ChartKind;
     use crate::analysis::events::{self, AgentEvent};
     use crate::embedding::{Dimension, Profile, Prompts};
+    use crate::graph::store::NewNode;
+    use crate::llm::EmbedModel;
+    use crate::ontology::Mapping;
+    use crate::storage::workspace::NewChunk;
     use crate::storage::workspace::{DocumentStatus, NewDocument};
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -1319,7 +1324,7 @@ mod tests {
             },
             Profile::new("m", Dimension::new(4), Prompts::default()),
         );
-        let (sink, _rx) = crate::analysis::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let name = |text: &str| Input::Similarity(text.to_owned());
 
@@ -1411,7 +1416,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            db.insert_chunk(&crate::storage::workspace::NewChunk {
+            db.insert_chunk(&NewChunk {
                 id: "c1",
                 document_id: "doc-1",
                 chunk_index: 0,
@@ -1422,7 +1427,7 @@ mod tests {
             })
             .is_ok()
         );
-        let node = |label: &str| crate::graph::store::NewNode {
+        let node = |label: &str| NewNode {
             label: String::from(label),
             class_id: String::from("organization"),
             properties: json!({}),
@@ -1488,7 +1493,7 @@ mod tests {
     #[test]
     fn row_provenance_becomes_a_predicate_when_the_class_is_mapped() {
         let mut ontology = Ontology::builtin_default();
-        ontology.mappings.push(crate::ontology::Mapping {
+        ontology.mappings.push(Mapping {
             table: String::from("orders"),
             class: String::from("organization"),
             key: String::from("order id"),
@@ -1943,7 +1948,7 @@ mod tests {
         seed_hail_chunks(&db).await;
         let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
-        let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+        let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
             5,
@@ -1970,7 +1975,7 @@ mod tests {
             "BM25 puts the denser chunk first: {text}"
         );
 
-        let reranked = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+        let reranked = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
             5,
@@ -2006,14 +2011,14 @@ mod tests {
     #[test]
     fn search_documents_offers_the_entity_argument_only_with_a_graph() {
         let (sink, _rx) = events::channel();
-        let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+        let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(shared_db()),
             None,
             5,
             60,
             TurnRecorder::new(sink),
         );
-        let has_entity = |tool: &SearchDocumentsTool<crate::llm::EmbedModel>| {
+        let has_entity = |tool: &SearchDocumentsTool<EmbedModel>| {
             tool.parameters().pointer("/properties/entity").is_some()
         };
 
@@ -2035,7 +2040,7 @@ mod tests {
                     .with_status(DocumentStatus::Ready),
             )?;
             for i in 0..(MAX_SEARCH_TOP_K * 2) {
-                guard.insert_chunk(&crate::storage::workspace::NewChunk {
+                guard.insert_chunk(&NewChunk {
                     id: &format!("c{i}"),
                     document_id: "d",
                     chunk_index: i,
@@ -2051,7 +2056,7 @@ mod tests {
         .unwrap_or_else(|e| fail_test(&e.to_string()));
         let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
-        let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
+        let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
             5,
@@ -2306,7 +2311,7 @@ mod tests {
         let schema = serde_json::to_value(schemars::schema_for!(CreateChartArgs))
             .map(|s| s.to_string())
             .unwrap_or_default();
-        for kind in crate::analysis::chart::ChartKind::ALL {
+        for kind in ChartKind::ALL {
             assert!(schema.contains(&format!("\"{kind}\"")), "{kind}: {schema}");
         }
     }
@@ -2316,7 +2321,9 @@ mod tests {
 // search_graph and find_path
 // ---------------------------------------------------------------------------
 
+use crate::error;
 use crate::graph::{self, GraphResult};
+use crate::ontology::Relation;
 
 /// The graph results a turn produced, kept for the response.
 pub type GraphResults = Arc<Mutex<Vec<GraphResult>>>;
@@ -2388,7 +2395,7 @@ fn lookup_graph(
     db: &WorkspaceDb,
     query: &GraphQuery,
     options: &graph::GraphOptions,
-) -> crate::error::Result<GraphLookup> {
+) -> error::Result<GraphLookup> {
     let ontology = ontology_store::current(db)?;
     let class = query.class.as_deref();
     let relation = query.relation.as_deref();
@@ -2446,7 +2453,7 @@ fn listed(ids: &[&str]) -> String {
 /// `resolve_document_ids` sets the contract for `search_documents`: an id
 /// that matches nothing is an error the model can correct, never an empty
 /// result it reads as "the workspace has nothing on this".
-fn check_class(ontology: Option<&Ontology>, class_id: &str) -> crate::error::Result<()> {
+fn check_class(ontology: Option<&Ontology>, class_id: &str) -> error::Result<()> {
     let Some(ontology) = ontology else {
         return Err(Error::Analysis(String::from(
             "this workspace has no ontology, so it has no classes to search by",
@@ -2464,7 +2471,7 @@ fn check_class(ontology: Option<&Ontology>, class_id: &str) -> crate::error::Res
 }
 
 /// Refuse a relation the ontology does not define, naming the ones it does.
-fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> crate::error::Result<()> {
+fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> error::Result<()> {
     let Some(ontology) = ontology else {
         return Err(Error::Analysis(String::from(
             "this workspace has no ontology, so it has no relations to follow",
@@ -2495,7 +2502,7 @@ async fn cached_embed<M: EmbeddingModel>(
     embedder: &Embedder<M>,
     recorder: &TurnRecorder,
     input: Input,
-) -> crate::error::Result<Vector> {
+) -> error::Result<Vector> {
     if let Some(cached) = recorder.cached_embedding(&input) {
         return Ok(cached);
     }
@@ -3112,8 +3119,8 @@ fn describe_class(ontology: &Ontology, class_id: &str, census: &(u64, Vec<String
 /// relation in that direction.
 fn relation_line(
     label: &str,
-    relations: &[&crate::ontology::Relation],
-    render: impl Fn(&crate::ontology::Relation) -> String,
+    relations: &[&Relation],
+    render: impl Fn(&Relation) -> String,
 ) -> String {
     if relations.is_empty() {
         return format!("{label}: none");

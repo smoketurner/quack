@@ -21,10 +21,13 @@ use serde::Deserialize;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::when_cancelled_unstarted;
+use crate::server::state::ExtractionSlot;
 use crate::server::state::{App, with_db};
 use quack_core::analysis::tools::SharedDb;
+use quack_core::jobs::JobId;
 use quack_core::jobs::{JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::Ontology;
+use quack_core::progress::ChunkDone;
 
 #[derive(Deserialize, Default)]
 pub(crate) struct SearchQuery {
@@ -345,19 +348,14 @@ struct DocumentJob {
     provisional: bool,
     embeddings: Option<llm::Embeddings>,
     /// Freed when the pass ends.
-    slot: crate::server::state::ExtractionSlot,
+    slot: ExtractionSlot,
     options: GraphOptions,
 }
 
 /// Run the model over the chunks, resolve, record the version, and audit
 /// the run's end under `run_id`, as a job in the workspace's graph lane
 /// with a chunk count for its progress.
-fn spawn_document_extraction(
-    app: App,
-    access: Access,
-    run_id: String,
-    job: DocumentJob,
-) -> quack_core::jobs::JobId {
+fn spawn_document_extraction(app: App, access: Access, run_id: String, job: DocumentJob) -> JobId {
     let spec = JobSpec::new(JobKind::Graph, "graph extraction")
         .workspace(access.workspace.id.clone())
         .owner(Some(access.identity.user_id.clone()))
@@ -376,7 +374,7 @@ fn spawn_document_extraction(
             options,
             slot,
         } = job;
-        let progress = |done: quack_core::progress::ChunkDone| {
+        let progress = |done: ChunkDone| {
             ctx.progress(done.done, done.total);
             tracing::info!(
                 run = %run_id,

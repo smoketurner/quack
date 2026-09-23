@@ -41,6 +41,9 @@ use serde::Deserialize;
 
 use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
+use quack_core::analysis::tools;
+use quack_core::analysis::tools::TEMP_OBJECT_REFUSED;
+use quack_core::error::Result as CoreResult;
 use quack_core::graph::{GraphResult, traverse};
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
@@ -305,7 +308,7 @@ impl McpServer {
     async fn db<T, F>(&self, f: F) -> Result<T, McpError>
     where
         T: Send + 'static,
-        F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
+        F: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
     {
         with_db(Arc::clone(&self.inner.db), f)
             .await
@@ -318,7 +321,7 @@ impl McpServer {
     async fn reader_db<T, F>(&self, f: F) -> Result<T, McpError>
     where
         T: Send + 'static,
-        F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
+        F: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
     {
         self.inner.reader.with_db(f).await.map_err(internal)
     }
@@ -490,12 +493,12 @@ impl McpServer {
             StatementKind::Write => true,
             StatementKind::Invalid(message) => return Ok(failure(message)),
         };
-        if is_write && quack_core::analysis::tools::creates_temp_object(&statement) {
+        if is_write && tools::creates_temp_object(&statement) {
             self.inner
                 .auditor
                 .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
-            return Ok(failure(quack_core::analysis::tools::TEMP_OBJECT_REFUSED));
+            return Ok(failure(TEMP_OBJECT_REFUSED));
         }
         if is_write && self.inner.policy != WritePolicy::Allow {
             self.inner
@@ -1084,8 +1087,7 @@ mod tests {
         config.general.data_dir = dir.path().to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-        let reader =
-            quack_core::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
+        let reader = tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let server = McpServer::new(
             config,
             Arc::clone(&db),

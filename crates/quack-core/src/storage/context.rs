@@ -6,6 +6,8 @@
 use crate::error::Result;
 
 use super::workspace::WorkspaceDb;
+use crate::config;
+use crate::error::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ContextVersion {
@@ -69,14 +71,13 @@ pub fn set(db: &WorkspaceDb, content: &str, edited_by: Option<&str>) -> Result<C
         "INSERT INTO _quack_context (version, content, edited_by) VALUES (?, ?, ?)",
         duckdb::params![next, normalized, edited_by],
     )?;
-    current(db)?
-        .ok_or_else(|| crate::error::Error::Analysis(String::from("context vanished after insert")))
+    current(db)?.ok_or_else(|| Error::Analysis(String::from("context vanished after insert")))
 }
 
 /// Path of the global context prefix, next to `config.toml`.
 #[must_use]
 pub fn global_context_path() -> std::path::PathBuf {
-    crate::config::config_file_path().with_file_name("context.md")
+    config::config_file_path().with_file_name("context.md")
 }
 
 /// The global prefix, if the file exists and is not blank.

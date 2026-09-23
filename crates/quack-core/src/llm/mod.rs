@@ -992,7 +992,10 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::tools;
     use crate::embedding::Dimension;
+    use crate::storage::workspace::WorkspaceDb;
+    use crate::storage::writer::Writer;
 
     fn parse(toml_text: &str) -> Config {
         match Config::parse(toml_text) {
@@ -1128,15 +1131,11 @@ mod tests {
             "[general]\nchat_model = \"o/m\"\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 4\n",
         );
         config.general.data_dir = dir.path().to_path_buf();
-        let db = crate::storage::workspace::WorkspaceDb::open(&config, "ws")
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "o/m", sessions::ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(
-            crate::storage::writer::Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())),
-        );
-        let reader_db =
-            crate::analysis::tools::open_reader(&db, config.analysis.reader_pool_size).await;
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+        let reader_db = tools::open_reader(&db, config.analysis.reader_pool_size).await;
         let (sink, mut events) = events::channel();
         let cancel = CancellationToken::new();
         cancel.cancel();

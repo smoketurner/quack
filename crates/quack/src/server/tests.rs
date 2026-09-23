@@ -19,8 +19,13 @@ use quack_core::config::{AuthMode, Config, ProviderConfig, ProviderType};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use super::state::{App, AppState};
+use super::state::{App, AppState, with_db};
+use crate::server::queue::MAX_WAITING_UPLOADS;
 use quack_core::jobs::LaneKey;
+use quack_core::llm::CancellationToken;
+use quack_core::okf::Bundle;
+use quack_core::okf::BundleFile;
+use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope,
 };
@@ -2267,9 +2272,9 @@ fn banner_names_the_address_mode_and_models() {
     config.general.chat_model = Some(String::from("ollama/llama3"));
     config.providers.insert(
         String::from("ollama"),
-        quack_core::config::ProviderConfig {
-            provider_type: quack_core::config::ProviderType::Ollama,
-            auth: quack_core::config::AuthMode::None,
+        ProviderConfig {
+            provider_type: ProviderType::Ollama,
+            auth: AuthMode::None,
             base_url: None,
             api_key_env: None,
             embedding_dimension: None,
@@ -2663,7 +2668,7 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
         .workspace_db(&ws)
         .await
         .unwrap_or_else(|e| fail(&e.message));
-    let details = super::state::with_db(db, |db| quack_core::storage::audit::list(db, 100))
+    let details = with_db(db, |db| audit::list(db, 100))
         .await
         .unwrap_or_else(|e| fail(&e.message));
     let ids: std::collections::BTreeSet<&str> = details.iter().map(|d| d.id.as_str()).collect();
@@ -2988,7 +2993,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let bundle = quack_core::okf::Bundle::from_tar(&bytes).unwrap_or_else(|e| fail(&e.to_string()));
+    let bundle = Bundle::from_tar(&bytes).unwrap_or_else(|e| fail(&e.to_string()));
     let paths: Vec<&str> = bundle.files.iter().map(|f| f.path.as_str()).collect();
     assert!(
         paths.contains(&"index.md")
@@ -3090,18 +3095,18 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         )
         .await;
     let ws2 = body["id"].as_str().unwrap_or_default().to_owned();
-    let mut incoming = quack_core::okf::Bundle::default();
-    incoming.files.push(quack_core::okf::BundleFile {
+    let mut incoming = Bundle::default();
+    incoming.files.push(BundleFile {
         path: String::from("index.md"),
         content: String::from("---\ntype: index\n---\n# Shipping\n\nAll weights in kg.\n"),
     });
-    incoming.files.push(quack_core::okf::BundleFile {
+    incoming.files.push(BundleFile {
         path: String::from("vendors/orgenics.md"),
         content: String::from(
             "---\ntype: Vendor\ntitle: Orgenics\n---\nShips to [Kenya](../countries/kenya.md).\n",
         ),
     });
-    incoming.files.push(quack_core::okf::BundleFile {
+    incoming.files.push(BundleFile {
         path: String::from("countries/kenya.md"),
         content: String::from("---\ntype: Country\ntitle: Kenya\n---\nEast Africa.\n"),
     });
@@ -3605,9 +3610,9 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
     let owner = h.user("owner", false).await;
     let ws = h.workspace("busy", &owner).await;
     let token = h.login("owner").await;
-    let release = quack_core::llm::CancellationToken::new();
+    let release = CancellationToken::new();
     let lane = LaneKey::Ingest(ws.clone());
-    for n in 0..crate::server::queue::MAX_WAITING_UPLOADS {
+    for n in 0..MAX_WAITING_UPLOADS {
         let release = release.clone();
         h.app.jobs.submit(
             JobSpec::new(JobKind::Ingest, format!("held {n}"))

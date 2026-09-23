@@ -8,6 +8,7 @@ use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
@@ -162,11 +163,7 @@ pub(crate) async fn run_prompt(
 /// nothing streamed, what the turn appended when the stream stands, the
 /// validated content again when validation changed what streamed, then
 /// the chart note and the sources.
-fn write_text_answer(
-    out: &mut impl Write,
-    streamed: &str,
-    response: &quack_core::analysis::agent::AgentResponse,
-) -> Result<()> {
+fn write_text_answer(out: &mut impl Write, streamed: &str, response: &AgentResponse) -> Result<()> {
     if streamed.is_empty() {
         write!(out, "{}", response.content)?;
     } else if let Some(rest) = response.content.strip_prefix(streamed) {

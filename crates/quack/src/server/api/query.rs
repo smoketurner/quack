@@ -27,6 +27,8 @@ use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 use crate::server::web::markdown::to_html;
+use quack_core::analysis::tools;
+use quack_core::analysis::tools::TEMP_OBJECT_REFUSED;
 
 #[derive(Deserialize)]
 pub(crate) struct QueryRequest {
@@ -394,13 +396,11 @@ pub(crate) async fn execute_sql(
         StatementKind::Invalid(message) => return Err(ApiError::bad_request(message)),
     };
     let detail = serde_json::json!({ "sql": statement });
-    if is_write && quack_core::analysis::tools::creates_temp_object(statement) {
+    if is_write && tools::creates_temp_object(statement) {
         access
             .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
             .await?;
-        return Err(ApiError::bad_request(
-            quack_core::analysis::tools::TEMP_OBJECT_REFUSED,
-        ));
+        return Err(ApiError::bad_request(TEMP_OBJECT_REFUSED));
     }
     if is_write && !access.permits(Need::WRITE) {
         access

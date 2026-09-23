@@ -7,6 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
+use crate::config::AuthMode;
+use crate::config::ProviderType;
 
 /// What the mock issuer does and what it saw.
 #[derive(Default)]
@@ -495,8 +497,8 @@ async fn discovery_failure_is_reported_with_the_url() {
 fn shared_manager_is_one_per_provider_and_needs_the_oauth_section() {
     let dir = temp();
     let provider = ProviderConfig {
-        provider_type: crate::config::ProviderType::Openai,
-        auth: crate::config::AuthMode::Oauth,
+        provider_type: ProviderType::Openai,
+        auth: AuthMode::Oauth,
         base_url: None,
         api_key_env: None,
         embedding_dimension: None,

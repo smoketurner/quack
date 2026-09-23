@@ -9,12 +9,16 @@ use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
+use super::graph::audit_cancelled;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::{App, with_db};
+use quack_core::jobs::JobResult;
 use quack_core::jobs::{JobKind, JobSpec, Lane, LaneKey};
+use quack_core::llm;
 use quack_core::ontology::{Ontology, candidates, documents, store};
+use quack_core::progress::ChunkDone;
 
 pub(crate) async fn show(
     State(app): State<App>,
@@ -399,8 +403,8 @@ pub(crate) async fn start_document_run(
         options.sample_chunks = n;
     }
     // Fail now, not in the background, when no model can be built.
-    let extractor = quack_core::llm::chat_extractor(&app.config).await?;
-    let embeddings = quack_core::llm::optional_embedding_model(&app.config).await?;
+    let extractor = llm::chat_extractor(&app.config).await?;
+    let embeddings = llm::optional_embedding_model(&app.config).await?;
     let (cost, chunks, current) = app
         .read(id, move |db| {
             let cost = documents::estimate(db, &options)?;
@@ -433,7 +437,7 @@ pub(crate) async fn start_document_run(
     let access = access.clone();
     let run_id = run.clone();
     let job = jobs.submit(spec, move |ctx| async move {
-        let progress = |done: quack_core::progress::ChunkDone| {
+        let progress = |done: ChunkDone| {
             ctx.progress(done.done, done.total);
             tracing::info!(
                 run = %run_id,
@@ -465,7 +469,7 @@ pub(crate) async fn start_document_run(
         finish_document_run(&app, &access, &run_id, result).await
     });
     when_cancelled_unstarted(&jobs, job, move || async move {
-        super::graph::audit_cancelled(
+        audit_cancelled(
             &cancel_app,
             &cancel_access,
             AuditAction::Propose,
@@ -486,7 +490,7 @@ async fn finish_document_run(
     access: &Access,
     run_id: &str,
     result: Result<documents::RunSummary, String>,
-) -> quack_core::jobs::JobResult {
+) -> JobResult {
     let (outcome, detail) = match &result {
         Ok(summary) => (
             Outcome::Allowed,
