@@ -12,3 +12,12 @@ too-many-lines-threshold       = 100
 allowed-idents-below-min-chars = ["x", "y", "z", "i", "j", "k", "n", "s", "e", "id", "db", "tx", "rx", "ok"]
 
 # MSRV is read automatically from the workspace `rust-version` field.
+
+# Embedding goes through `quack_core::embedding::Embedder`, which names the
+# role each text is embedded in and checks the width of what comes back.
+# A direct call would skip the role's prefix and the check.
+disallowed-methods = [
+  { path = "rig::embeddings::embedding::EmbeddingModel::embed_texts", reason = "embed through quack_core::embedding::Embedder, which applies the role's prefix" },
+  { path = "rig::embeddings::embedding::EmbeddingModel::embed_text", reason = "embed through quack_core::embedding::Embedder, which applies the role's prefix" },
+  { path = "rig::embeddings::embedding::EmbeddingModel::embed_texts_with_usage", reason = "embed through quack_core::embedding::Embedder, which applies the role's prefix" },
+]

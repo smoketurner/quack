@@ -19,6 +19,7 @@ use sqlx::{
 };
 
 use crate::config::Config;
+use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ingestion::{self, IngestOutcome, NewFile};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
@@ -182,7 +183,7 @@ pub async fn import<M: EmbeddingModel>(
     workspace_id: &str,
     request: &ImportRequest,
     policy: ImportPolicy,
-    embedding_model: Option<&M>,
+    embedder: Option<&Embedder<M>>,
     cancel: Option<&CancellationToken>,
 ) -> Result<ImportSummary> {
     let table = table_name(&request.table)?;
@@ -247,7 +248,7 @@ pub async fn import<M: EmbeddingModel>(
             .source(DocumentSource::Import)
             .title(Some(&source))
             .cancel(cancel),
-        embedding_model,
+        embedder,
     )
     .await?;
     let result = match outcome {
@@ -801,7 +802,7 @@ mod tests {
             "ws",
             &request,
             ImportPolicy::owner(),
-            None::<&crate::llm::EmbedModel>,
+            None::<&crate::llm::Embeddings>,
             None,
         )
         .await
@@ -878,7 +879,7 @@ mod tests {
                 "ws",
                 &request,
                 ImportPolicy::owner(),
-                None::<&crate::llm::EmbedModel>,
+                None::<&crate::llm::Embeddings>,
                 None,
             )
             .await

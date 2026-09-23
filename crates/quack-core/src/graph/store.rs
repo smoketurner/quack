@@ -755,29 +755,26 @@ fn class_fits(ontology: &Ontology, class: &str, wanted: &str) -> bool {
     wanted == ontology::ROOT_CLASS || class == wanted || ontology.is_subclass_of(class, wanted)
 }
 
-/// Nodes with no embedding yet, for `embed_missing`.
+/// Nodes whose label vector is missing or was made under another profile.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn nodes_without_embedding(db: &WorkspaceDb, limit: u32) -> Result<Vec<Node>> {
-    let sql = format!("SELECT {NODE_COLUMNS} WHERE embedding IS NULL ORDER BY id LIMIT ?");
+pub fn nodes_needing_embedding(db: &WorkspaceDb, limit: u32) -> Result<Vec<Node>> {
+    let sql = format!(
+        "SELECT {NODE_COLUMNS} WHERE embedding IS NULL OR embedding_profile IS DISTINCT FROM ? \
+         ORDER BY id LIMIT ?"
+    );
     let mut stmt = db.connection().prepare(&sql)?;
-    let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
+    let mut rows = stmt.query(duckdb::params![
+        db.embedding_fingerprint(),
+        i64::from(limit)
+    ])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         out.push(node_from_row(row)?);
     }
     Ok(out)
-}
-
-/// Store a node's label embedding.
-///
-/// # Errors
-///
-/// Returns an error if the update fails.
-pub fn set_node_embedding(db: &WorkspaceDb, id: &str, embedding: &[f32]) -> Result<()> {
-    db.set_vector("_quack_graph_nodes", "embedding", id, embedding)
 }
 
 /// The text a node's embedding is computed from: its label and class.
@@ -798,17 +795,22 @@ pub fn nearest_nodes(
     class_id: Option<&str>,
     limit: u32,
 ) -> Result<Vec<(Node, f64)>> {
+    if !db.accepts_vector_width(query.len()) {
+        return Ok(Vec::new());
+    }
     let sql = format!(
         "SELECT id, label, class_id, CAST(properties AS VARCHAR), provisional, \
                 array_cosine_distance(embedding, ?::{vt}) AS d \
          FROM _quack_graph_nodes \
-         WHERE embedding IS NOT NULL AND (? IS NULL OR class_id = ?) ORDER BY d LIMIT ?",
+         WHERE embedding IS NOT NULL AND embedding_profile IS NOT DISTINCT FROM ? \
+           AND (? IS NULL OR class_id = ?) ORDER BY d LIMIT ?",
         vt = db.vector_type_public()
     );
     let literal = embedding_literal(query);
     let mut stmt = db.connection().prepare(&sql)?;
     let mut rows = stmt.query(duckdb::params![
         literal,
+        db.embedding_fingerprint(),
         class_id,
         class_id,
         i64::from(limit)

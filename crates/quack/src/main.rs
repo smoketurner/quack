@@ -8,6 +8,7 @@ mod graph_cli;
 mod mcp;
 mod ontology_cli;
 mod print;
+mod reembed_cli;
 mod server;
 mod terminal;
 
@@ -313,6 +314,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Re-embed the chunks and graph labels whose vectors were made with
+    /// another embedding model, width, or input prefixes, or have none;
+    /// until then they are found by keyword search only
+    Reembed {
+        /// Do not ask before spending the model calls
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -515,6 +525,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Ontology { action } => run_ontology(cli, action).await,
         Commands::Graph { action } => run_graph(cli, action).await,
+        Commands::Reembed { yes } => run_reembed(cli, yes).await,
         Commands::Okf {
             action: OkfAction::Export { dir },
         } => run_okf_export(cli, &dir).await,
@@ -625,7 +636,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
             return Ok(ExitCode::from(EXIT_USAGE));
         }
     };
-    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, workspace_name) = resolve_workspace(cli.workspace.as_deref()).await?;
     // Checked before the workspace opens, so a missing model is one line
     // on stderr rather than a failed turn, and leaves no session behind.
     if let Err(e) = config.chat_model_ref() {
@@ -635,6 +646,9 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     load_piped_stdin(&config, &ws_db, &workspace.id, cli.stdin).await?;
+    if let Some(note) = ws_db.embedding_status()?.note() {
+        tracing::warn!("{note} Run `quack reembed -w {workspace_name}` to re-embed them.");
+    }
     let session_id = resolve_session(
         &config,
         &ws_db,
@@ -789,6 +803,7 @@ async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) 
         | Commands::Mcp { .. }
         | Commands::Config { .. }
         | Commands::Doctor { .. }
+        | Commands::Reembed { .. }
         | Commands::Docs { .. } => Ok(()),
     }
 }
@@ -820,6 +835,24 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
             action,
             &mut out,
             &ontology_cli::chunk_progress,
+        )
+        .await,
+    )
+}
+
+async fn run_reembed(cli: &Cli, yes: bool) -> Result<ExitCode> {
+    let ws_db = open_writer(cli).await?;
+    let config = Config::load().context("failed to load configuration")?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    exit_after(
+        reembed_cli::run(
+            &config,
+            &ws_db,
+            yes,
+            &mut out,
+            &reembed_cli::print_progress,
+            None,
         )
         .await,
     )

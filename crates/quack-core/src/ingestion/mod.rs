@@ -10,6 +10,7 @@ use rig::embeddings::EmbeddingModel;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::embedding::{DocumentInput, Embedder};
 use crate::error::{Error, Result};
 use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
@@ -157,7 +158,7 @@ pub async fn ingest_file<M: EmbeddingModel>(
     db: &Writer,
     workspace_id: &str,
     file: &NewFile<'_>,
-    embedding_model: Option<&M>,
+    embedder: Option<&Embedder<M>>,
 ) -> Result<IngestOutcome> {
     let pending = Pending::of(file)?;
     let doc_id = match db.run(move |db| pending.register(db)).await? {
@@ -171,7 +172,7 @@ pub async fn ingest_file<M: EmbeddingModel>(
         &doc_id,
         file.filename,
         file.data,
-        embedding_model,
+        embedder,
         file.cancel,
     )
     .await?;
@@ -313,7 +314,7 @@ pub async fn process_document<M: EmbeddingModel>(
     doc_id: &str,
     filename: &str,
     data: &[u8],
-    embedding_model: Option<&M>,
+    embedder: Option<&Embedder<M>>,
     cancel: Option<&CancellationToken>,
 ) -> Result<IngestResult> {
     let id = doc_id.to_owned();
@@ -328,7 +329,7 @@ pub async fn process_document<M: EmbeddingModel>(
                 doc_id,
                 filename,
                 data,
-                embedding_model,
+                embedder,
                 cancel,
             )
             .await
@@ -369,7 +370,7 @@ async fn process_inner<M: EmbeddingModel>(
     doc_id: &str,
     filename: &str,
     data: &[u8],
-    embedding_model: Option<&M>,
+    embedder: Option<&Embedder<M>>,
     cancel: Option<&CancellationToken>,
 ) -> Result<IngestResult> {
     let file_type = parser::detect_file_type(filename);
@@ -448,7 +449,7 @@ async fn process_inner<M: EmbeddingModel>(
                 db,
                 doc_id,
                 &chunks,
-                embedding_model,
+                embedder,
                 EmbedPlan {
                     batch_size: config.ingestion.embedding_batch_size,
                     concurrency: config.ingestion.embedding_concurrency,
@@ -736,7 +737,7 @@ async fn embed_and_store<M: EmbeddingModel>(
     db: &Writer,
     document_id: &str,
     chunks: &[chunker::Chunk],
-    embedding_model: Option<&M>,
+    embedder: Option<&Embedder<M>>,
     plan: EmbedPlan<'_>,
 ) -> Result<(u32, Option<Duration>)> {
     use futures::StreamExt as _;
@@ -748,10 +749,10 @@ async fn embed_and_store<M: EmbeddingModel>(
     } = plan;
 
     let (owned, id) = (chunks.to_vec(), document_id.to_owned());
-    let stored = db
+    let chunk_ids = db
         .run(move |db| {
             db.write_transaction(|db| {
-                let mut stored: u32 = 0;
+                let mut ids = Vec::with_capacity(owned.len());
                 for (i, chunk) in owned.iter().enumerate() {
                     let chunk_id = uuid::Uuid::now_v7().to_string();
                     let idx = u32::try_from(i)
@@ -765,20 +766,31 @@ async fn embed_and_store<M: EmbeddingModel>(
                         page: chunk.page,
                         embedding: None,
                     })?;
-                    stored = stored
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Ingestion("chunk count overflow".into()))?;
+                    ids.push(chunk_id);
                 }
-                Ok(stored)
+                Ok(ids)
             })
         })
         .await?;
+    let stored = u32::try_from(chunk_ids.len())
+        .map_err(|_| Error::Ingestion("chunk count overflow".into()))?;
 
-    let Some(model) = embedding_model else {
+    let Some(embedder) = embedder else {
         return Ok((stored, None));
     };
     if chunks.is_empty() {
         return Ok((stored, Some(Duration::ZERO)));
+    }
+    let width = usize::try_from(embedder.profile().dimension).unwrap_or(usize::MAX);
+    if !db.run(move |db| Ok(db.accepts_vector_width(width))).await? {
+        // The configured width changed and the workspace still holds
+        // vectors of the old one: the chunks are found by keyword until
+        // `reembed` retypes the columns and embeds them.
+        tracing::warn!(
+            document_id = %document_id,
+            "chunks stored without vectors: run `quack reembed` after the embedding width change"
+        );
+        return Ok((stored, None));
     }
 
     let started = Instant::now();
@@ -788,40 +800,29 @@ async fn embed_and_store<M: EmbeddingModel>(
     // Batches are collected before the futures are built: a closure that
     // takes the slice by reference would tie each future's type to that
     // borrow and fail the `Send` check the server's handlers need.
-    let batches_input: Vec<(usize, Vec<String>)> = chunks
+    let batches_input: Vec<(Vec<String>, Vec<DocumentInput>)> = chunk_ids
         .chunks(batch_size)
-        .enumerate()
-        .map(|(batch, slice)| {
-            let texts = slice.iter().map(chunker::Chunk::embedding_input).collect();
-            (batch.saturating_mul(batch_size), texts)
+        .zip(chunks.chunks(batch_size))
+        .map(|(ids, slice)| {
+            (
+                ids.to_vec(),
+                slice.iter().map(chunker::Chunk::embedding_input).collect(),
+            )
         })
         .collect();
-    let calls = batches_input.into_iter().map(|(offset, texts)| async move {
-        let embeddings = model
-            .embed_texts(texts)
-            .await
-            .map_err(|e| Error::Embedding(e.to_string()))?;
-        Ok::<_, Error>((offset, embeddings))
+    let calls = batches_input.into_iter().map(|(ids, inputs)| async move {
+        let vectors = embedder.documents(&inputs).await?;
+        Ok::<_, Error>((ids, vectors))
     });
     let mut batches: u32 = 0;
     let mut stream = futures::stream::iter(calls).buffered(concurrency);
     while let Some(next) = or_cancelled(cancel, async { Ok(stream.next().await) }).await? {
-        let (offset, embeddings) = next?;
+        let (ids, vectors) = next?;
         batches = batches.saturating_add(1);
-        let id = document_id.to_owned();
         db.run(move |db| {
             db.write_transaction(|db| {
-                for (j, embedding) in embeddings.into_iter().enumerate() {
-                    let chunk_idx = u32::try_from(offset.saturating_add(j))
-                        .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
-
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
-                    )]
-                    let vec_f32: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
-
-                    db.update_chunk_embedding(&id, chunk_idx, &vec_f32)?;
+                for (chunk_id, vector) in ids.iter().zip(&vectors) {
+                    db.set_chunk_embedding(chunk_id, vector)?;
                 }
                 Ok(())
             })

@@ -23,9 +23,11 @@ use std::process::ExitCode;
 
 use quack_core::analysis::citations::{self, CitationRegistry};
 use quack_core::config::{
-    AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, GraphConfig, ImportConfig,
-    IngestionConfig, OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
+    AnalysisConfig, AuthMode, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
+    ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
+    RetrievalConfig, ServerConfig,
 };
+use quack_core::embedding::{Embedder, Profile, Prompts};
 use quack_core::error::{Error, Result};
 use quack_core::graph::extract::{ChunkText, ExtractFuture, Extraction, GraphExtractor};
 use quack_core::graph::{self, store};
@@ -83,7 +85,12 @@ async fn run() -> Result<Report> {
     let config = eval_config(data_dir.path());
     let workspace_id = "eval";
     let db = WorkspaceDb::open(&config, workspace_id)?;
-    let embedder = HashEmbedder;
+    // No prefixes: the hashing embedder counts tokens, and a prefix would
+    // add the same tokens to every input.
+    let embedder = Embedder::new(
+        HashEmbedder,
+        Profile::new("hash-embedder", HASH_DIM_U32, Prompts::default()),
+    );
 
     ingest_documents(
         &config,
@@ -142,6 +149,7 @@ fn eval_config(data_dir: &Path) -> Config {
         },
         providers,
         ingestion: IngestionConfig::default(),
+        embedding: EmbeddingConfig::default(),
         retrieval: RetrievalConfig::default(),
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
@@ -149,7 +157,7 @@ fn eval_config(data_dir: &Path) -> Config {
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
         import: ImportConfig::default(),
-        jobs: quack_core::config::JobsConfig::default(),
+        jobs: JobsConfig::default(),
     }
 }
 
@@ -234,14 +242,6 @@ fn hash_embed(text: &str) -> Vec<f64> {
     buckets
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the hashing embedder's precision is not meaningful past f32"
-)]
-fn to_f32(embedding: &[f64]) -> Vec<f32> {
-    embedding.iter().map(|v| *v as f32).collect()
-}
-
 // ---------------------------------------------------------------------------
 // Ingestion
 // ---------------------------------------------------------------------------
@@ -257,7 +257,7 @@ async fn ingest_documents(
     db: &WorkspaceDb,
     workspace_id: &str,
     dir: &Path,
-    embedder: &HashEmbedder,
+    embedder: &Embedder<HashEmbedder>,
 ) -> Result<()> {
     let writer = writer_of(db)?;
     for path in list_files(dir, "md")? {
@@ -481,7 +481,7 @@ async fn evaluate_retrieval(
     db: &WorkspaceDb,
     gold_path: &Path,
     chunks: &[ChunkRow],
-    embedder: &HashEmbedder,
+    embedder: &Embedder<HashEmbedder>,
     top_k: u32,
     rrf_k: u32,
 ) -> Result<RetrievalReport> {
@@ -516,11 +516,7 @@ async fn evaluate_retrieval(
 
         let keyword_ids =
             ids_of(db.search_keyword_chunks(&q.question, top_k, &ChunkScope::all())?);
-        let query_embedding = embedder
-            .embed_text(&q.question)
-            .await
-            .map_err(|e| Error::Embedding(e.to_string()))?;
-        let query_vec = to_f32(&query_embedding.vec);
+        let query_vec = embedder.query(&q.question).await?;
         let similar_ids =
             ids_of(db.search_similar_chunks(&query_vec, top_k, &ChunkScope::all())?);
         let hybrid_ids = ids_of(db.search_hybrid_chunks(

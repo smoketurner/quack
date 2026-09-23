@@ -83,6 +83,8 @@ pub enum JobKind {
     Ontology,
     /// A graph command or extraction run.
     Graph,
+    /// Vectors brought up to the current embedding profile.
+    Reembed,
     /// A bundle, context, or session written out.
     Export,
 }
@@ -98,6 +100,7 @@ impl JobKind {
             Self::Import => "import",
             Self::Ontology => "ontology",
             Self::Graph => "graph",
+            Self::Reembed => "reembed",
             Self::Export => "export",
         }
     }
@@ -111,9 +114,12 @@ impl JobKind {
     pub const fn priority(self) -> Priority {
         match self {
             Self::Chat | Self::Sql => Priority::Interactive,
-            Self::Ingest | Self::Import | Self::Ontology | Self::Graph | Self::Export => {
-                Priority::Background
-            }
+            Self::Ingest
+            | Self::Import
+            | Self::Ontology
+            | Self::Graph
+            | Self::Reembed
+            | Self::Export => Priority::Background,
         }
     }
 }

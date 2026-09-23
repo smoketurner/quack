@@ -229,6 +229,7 @@ pub fn ddl(dimension: u32) -> String {
             provisional BOOLEAN NOT NULL DEFAULT false,
             UNIQUE (normalized_label, class_id)
         );
+        ALTER TABLE _quack_graph_nodes ADD COLUMN IF NOT EXISTS embedding_profile TEXT;
         CREATE TABLE IF NOT EXISTS _quack_graph_edges (
             id TEXT PRIMARY KEY,
             source_node_id TEXT NOT NULL,

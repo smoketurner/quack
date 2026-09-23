@@ -13,6 +13,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
+use crate::embedding::Role;
+
+/// A turn's embeddings, by role and text.
+type EmbeddingCache = HashMap<(Role, String), Vec<f32>>;
 
 /// One tool invocation, recorded for the transcript and the final response.
 /// Lines of a step's detail every interface shows before folding the
@@ -128,7 +132,7 @@ pub struct TurnRecorder {
     /// and `search_graph` on the same name, `find_path` reusing an entity
     /// a prior call already resolved), and this keeps a turn from paying
     /// for the same embedding call twice.
-    embedding_cache: Arc<Mutex<HashMap<String, Vec<f32>>>>,
+    embedding_cache: Arc<Mutex<EmbeddingCache>>,
     /// `[analysis].max_turns`, so a tool result can tell the model how
     /// much of the turn is left; `None` when the limit is not known.
     turn_limit: Option<usize>,
@@ -179,17 +183,22 @@ impl TurnRecorder {
         }
     }
 
-    /// This turn's cached embedding for `text`, if some earlier call this
-    /// turn already computed it.
+    /// This turn's cached embedding of `text` in `role`, if some earlier
+    /// call this turn already computed it. The role is part of the key: a
+    /// query and an entity name with the same text are different inputs.
     #[must_use]
-    pub fn cached_embedding(&self, text: &str) -> Option<Vec<f32>> {
-        self.embedding_cache.lock().ok()?.get(text).cloned()
+    pub fn cached_embedding(&self, role: Role, text: &str) -> Option<Vec<f32>> {
+        self.embedding_cache
+            .lock()
+            .ok()?
+            .get(&(role, text.to_owned()))
+            .cloned()
     }
 
-    /// Remember `text`'s embedding for the rest of this turn.
-    pub fn cache_embedding(&self, text: &str, embedding: Vec<f32>) {
+    /// Remember `text`'s embedding in `role` for the rest of this turn.
+    pub fn cache_embedding(&self, role: Role, text: &str, embedding: Vec<f32>) {
         if let Ok(mut cache) = self.embedding_cache.lock() {
-            cache.insert(text.to_owned(), embedding);
+            cache.insert((role, text.to_owned()), embedding);
         }
     }
 
@@ -331,14 +340,22 @@ mod tests {
     fn embedding_cache_returns_what_it_was_given_and_nothing_else() {
         let (sink, _rx) = channel();
         let recorder = TurnRecorder::new(sink);
-        assert_eq!(recorder.cached_embedding("Acme"), None);
+        assert_eq!(recorder.cached_embedding(Role::Similarity, "Acme"), None);
 
-        recorder.cache_embedding("Acme", vec![1.0, 2.0, 3.0]);
-        assert_eq!(recorder.cached_embedding("Acme"), Some(vec![1.0, 2.0, 3.0]));
+        recorder.cache_embedding(Role::Similarity, "Acme", vec![1.0, 2.0, 3.0]);
+        assert_eq!(
+            recorder.cached_embedding(Role::Similarity, "Acme"),
+            Some(vec![1.0, 2.0, 3.0])
+        );
         // A different tool resolving the same label this turn gets the
         // same vector back rather than embedding it again.
-        assert_eq!(recorder.cached_embedding("Acme"), Some(vec![1.0, 2.0, 3.0]));
-        assert_eq!(recorder.cached_embedding("Beta"), None);
+        assert_eq!(
+            recorder.cached_embedding(Role::Similarity, "Acme"),
+            Some(vec![1.0, 2.0, 3.0])
+        );
+        // The same text as a search query is a different input.
+        assert_eq!(recorder.cached_embedding(Role::Query, "Acme"), None);
+        assert_eq!(recorder.cached_embedding(Role::Similarity, "Beta"), None);
     }
 
     fn permission_request(event: Option<AgentEvent>) -> Option<PermissionRequest> {

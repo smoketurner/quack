@@ -6,6 +6,7 @@ mod admin;
 mod auth;
 mod context;
 pub(crate) mod documents;
+pub(crate) mod embeddings;
 pub(crate) mod graph;
 pub(crate) mod import;
 pub(crate) mod jobs;
@@ -49,6 +50,11 @@ pub(crate) fn router() -> Router<App> {
             get(documents::show)
                 .patch(documents::update)
                 .delete(documents::remove),
+        )
+        .route("/workspaces/{id}/embeddings", get(embeddings::show))
+        .route(
+            "/workspaces/{id}/embeddings/reembed",
+            post(embeddings::reembed),
         )
         .route("/workspaces/{id}/tables", get(tables::list))
         .route("/workspaces/{id}/tables/{name}", get(tables::describe))

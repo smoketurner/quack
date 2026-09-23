@@ -1,8 +1,11 @@
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::embedding::{Profile, Prompts};
 use crate::error::{Error, Result};
 
 /// Tables quack manages inside a workspace database. Hidden from the agent's
@@ -31,7 +34,7 @@ const PHRASE_CANDIDATE_CAP: u32 = 500;
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "7";
+const WORKSPACE_SCHEMA_VERSION: &str = "8";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -171,10 +174,34 @@ const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontolo
                 decided_at TIMESTAMP
             );";
 
+/// The embedding side of a workspace, shared by every connection to it:
+/// the width of its vector columns, which a re-embed can change, and the
+/// profile the configured model runs under.
+#[derive(Debug)]
+struct Vectors {
+    /// Width of `_quack_chunks.embedding` and `_quack_graph_nodes.embedding`.
+    column_dimension: AtomicU32,
+    /// `None` without an embedding model.
+    profile: Option<Profile>,
+    /// `profile`'s fingerprint, stored beside each vector made under it.
+    fingerprint: Option<String>,
+}
+
+impl Vectors {
+    fn new(column_dimension: u32, profile: Option<Profile>) -> Arc<Self> {
+        let fingerprint = profile.as_ref().map(Profile::fingerprint);
+        Arc::new(Self {
+            column_dimension: AtomicU32::new(column_dimension),
+            profile,
+            fingerprint,
+        })
+    }
+}
+
 /// Wraps a `DuckDB` connection for a single workspace.
 pub struct WorkspaceDb {
     conn: duckdb::Connection,
-    embedding_dimension: u32,
+    vectors: Arc<Vectors>,
     query_timeout: Duration,
     /// `files/` under the workspace directory, where ingested files are
     /// kept; `None` in memory.
@@ -188,10 +215,26 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the database cannot be created.
     pub fn open_in_memory(embedding_dimension: u32) -> Result<Self> {
+        Self::in_memory(Vectors::new(embedding_dimension, None))
+    }
+
+    /// An in-memory database whose vectors are made under `profile` (for
+    /// tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be created.
+    pub fn open_in_memory_with_profile(profile: Profile) -> Result<Self> {
+        let db = Self::in_memory(Vectors::new(profile.dimension, Some(profile)))?;
+        db.record_profile()?;
+        Ok(db)
+    }
+
+    fn in_memory(vectors: Arc<Vectors>) -> Result<Self> {
         let conn = duckdb::Connection::open_in_memory()?;
         let db = Self {
             conn,
-            embedding_dimension,
+            vectors,
             query_timeout: Duration::from_secs(30),
             files_dir: None,
         };
@@ -209,9 +252,9 @@ impl WorkspaceDb {
 
     /// Open (or create) the `DuckDB` database for a workspace.
     ///
-    /// Creates the `_quack_` internal tables if they
-    /// do not exist, and reconciles the embedding dimension recorded in
-    /// `_quack_meta` with the configured provider.
+    /// Creates the `_quack_` internal tables if they do not exist, and
+    /// reconciles the vector width recorded in `_quack_meta` with the
+    /// configured embedding profile.
     ///
     /// # Errors
     ///
@@ -225,32 +268,26 @@ impl WorkspaceDb {
         let files_dir = config.workspace_files_dir(workspace_id);
         std::fs::create_dir_all(&files_dir)?;
 
-        let embedding = config.embedding_model_ref()?;
-        let configured_dimension = embedding.and_then(|m| m.provider.embedding_dimension);
-        let configured_model = embedding.map(|m| m.model);
-
+        let profile = Profile::from_config(config)?;
         let conn = duckdb::Connection::open(&db_path)?;
+        // The columns keep the width they were created with until the
+        // reconciliation below decides otherwise.
+        let column_dimension = recorded_dimension(&conn)?
+            .or(profile.as_ref().map(|p| p.dimension))
+            .unwrap_or(DEFAULT_EMBEDDING_DIMENSION);
 
-        let mut db = Self {
+        let db = Self {
             conn,
-            embedding_dimension: configured_dimension.unwrap_or(DEFAULT_EMBEDDING_DIMENSION),
+            vectors: Vectors::new(column_dimension, profile),
             query_timeout: Duration::from_secs(u64::from(config.analysis.query_timeout_seconds)),
             files_dir: Some(files_dir),
         };
         db.apply_resource_limits(config)?;
         let workspace_dir = std::fs::canonicalize(config.workspace_dir(workspace_id))?;
         db.confine_to(Some(&workspace_dir))?;
-        db.rename_legacy_tables()?;
-        db.reconcile_embedding_dimension(configured_dimension, configured_model)
-            .or_else(|e| match e {
-                // A brand-new workspace has no meta table yet; create it first.
-                Error::DuckDb(_) => {
-                    db.create_internal_tables()?;
-                    db.reconcile_embedding_dimension(configured_dimension, configured_model)
-                }
-                other => Err(other),
-            })?;
         db.create_internal_tables()?;
+        db.reconcile_dimension()?;
+        db.record_profile()?;
         Ok(db)
     }
 
@@ -274,7 +311,7 @@ impl WorkspaceDb {
     pub fn try_clone_reader(&self) -> Result<Self> {
         Ok(Self {
             conn: self.conn.try_clone()?,
-            embedding_dimension: self.embedding_dimension,
+            vectors: Arc::clone(&self.vectors),
             query_timeout: self.query_timeout,
             files_dir: self.files_dir.clone(),
         })
@@ -479,7 +516,7 @@ impl WorkspaceDb {
 
     fn create_internal_tables(&self) -> Result<()> {
         self.rename_legacy_tables()?;
-        let dim = self.embedding_dimension;
+        let dim = self.column_dimension();
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS _quack_meta (
                 key TEXT PRIMARY KEY,
@@ -520,6 +557,12 @@ impl WorkspaceDb {
             ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
+            ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS embedding_profile TEXT;
+            CREATE TABLE IF NOT EXISTS _quack_embedding_profiles (
+                fingerprint TEXT PRIMARY KEY,
+                profile JSON NOT NULL,
+                first_used TIMESTAMP DEFAULT now()
+            );
             CREATE TABLE IF NOT EXISTS _quack_terms (
                 chunk_id TEXT NOT NULL,
                 term TEXT NOT NULL,
@@ -565,6 +608,15 @@ impl WorkspaceDb {
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&crate::graph::ddl(dim))?;
+        self.upgrade_data(dim)?;
+        self.set_meta("schema_version", WORKSPACE_SCHEMA_VERSION)?;
+        self.set_meta("embedding_dimension", &dim.to_string())?;
+        Ok(())
+    }
+
+    /// The data rebuilds a schema version asks of a workspace recorded
+    /// under an older one.
+    fn upgrade_data(&self, dim: u32) -> Result<()> {
         let recorded = self
             .meta("schema_version")?
             .and_then(|v| v.parse::<u32>().ok())
@@ -576,9 +628,68 @@ impl WorkspaceDb {
             tracing::info!("indexing existing chunks for keyword search");
             self.reindex_terms()?;
         }
-        self.set_meta("schema_version", WORKSPACE_SCHEMA_VERSION)?;
-        self.set_meta("embedding_dimension", &dim.to_string())?;
+        // Version 8 records the profile of every stored vector. Those made
+        // before it went to the model unprefixed, under the model the
+        // workspace last recorded.
+        if recorded < 8 {
+            self.tag_legacy_vectors(dim)?;
+        }
         Ok(())
+    }
+
+    /// Record the profile vectors made before profiles existed were made
+    /// under, and tag them with it.
+    fn tag_legacy_vectors(&self, dim: u32) -> Result<()> {
+        let untagged: i64 = self.conn.query_row(
+            "SELECT (SELECT count(*) FROM _quack_chunks WHERE embedding IS NOT NULL AND embedding_profile IS NULL) \
+                  + (SELECT count(*) FROM _quack_graph_nodes WHERE embedding IS NOT NULL AND embedding_profile IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        let model = self.meta("embedding_model")?;
+        // The profile table replaces this key.
+        self.conn
+            .execute("DELETE FROM _quack_meta WHERE key = 'embedding_model'", [])?;
+        if untagged == 0 {
+            return Ok(());
+        }
+        let model = model.unwrap_or_else(|| String::from("unknown"));
+        let legacy = Profile::new(&model, dim, Prompts::default());
+        self.insert_profile(&legacy)?;
+        let fingerprint = legacy.fingerprint();
+        for table in ["_quack_chunks", "_quack_graph_nodes"] {
+            self.conn.execute(
+                &format!(
+                    "UPDATE {table} SET embedding_profile = ? \
+                     WHERE embedding IS NOT NULL AND embedding_profile IS NULL"
+                ),
+                duckdb::params![fingerprint],
+            )?;
+        }
+        tracing::info!(
+            profile = %legacy.describe(),
+            vectors = untagged,
+            "recorded the profile of existing vectors"
+        );
+        Ok(())
+    }
+
+    fn insert_profile(&self, profile: &Profile) -> Result<()> {
+        let json = serde_json::to_string(profile)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO _quack_embedding_profiles (fingerprint, profile) VALUES (?, ?)",
+            duckdb::params![profile.fingerprint(), json],
+        )?;
+        Ok(())
+    }
+
+    /// Record the current profile, so every stored fingerprint can be
+    /// described.
+    fn record_profile(&self) -> Result<()> {
+        match &self.vectors.profile {
+            Some(profile) => self.insert_profile(profile),
+            None => Ok(()),
+        }
     }
 
     /// Workspaces created before the `_quack_` prefix keep their data.
@@ -635,24 +746,6 @@ impl WorkspaceDb {
         self.set_meta(key, value)
     }
 
-    /// Store a vector in `column` of the row of `table` whose `id` matches.
-    /// `table` and `column` are quack's own identifiers, never user input.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the update fails.
-    pub fn set_vector(&self, table: &str, column: &str, id: &str, embedding: &[f32]) -> Result<()> {
-        let sql = format!(
-            "UPDATE {} SET {} = ?::{} WHERE id = ?",
-            quote_ident(table),
-            quote_ident(column),
-            self.vector_type()
-        );
-        self.conn
-            .execute(&sql, duckdb::params![format_embedding(embedding), id])?;
-        Ok(())
-    }
-
     /// The `FLOAT[N]` type of this workspace's vectors.
     #[must_use]
     pub fn vector_type_public(&self) -> String {
@@ -670,70 +763,106 @@ impl WorkspaceDb {
     /// The embedding width this workspace stores.
     #[must_use]
     pub fn embedding_dimension(&self) -> u32 {
-        self.embedding_dimension
+        self.column_dimension()
     }
 
-    /// Reconcile the configured embedding dimension with what the workspace
-    /// recorded. A fresh or empty workspace adopts the configured value; a
-    /// workspace that already holds embeddings of a different width is an
-    /// error, never a silent mismatch.
-    fn reconcile_embedding_dimension(
-        &mut self,
-        configured: Option<u32>,
-        configured_model: Option<&str>,
-    ) -> Result<()> {
-        let recorded = self
-            .meta("embedding_dimension")?
-            .and_then(|v| v.parse::<u32>().ok());
-        let recorded_model = self.meta("embedding_model")?;
+    /// The width of the vector columns.
+    fn column_dimension(&self) -> u32 {
+        self.vectors.column_dimension.load(Ordering::Acquire)
+    }
 
-        match (recorded, configured) {
-            (Some(rec), Some(conf)) if rec != conf => {
-                let stored_chunks: i64 = self.conn.query_row(
-                    "SELECT count(*) FROM _quack_chunks WHERE embedding IS NOT NULL",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if stored_chunks > 0 {
-                    return Err(Error::Config(format!(
-                        "workspace embeddings are {rec}-dimensional ({}) but the configured \
-                         provider produces {conf}-dimensional ({}) vectors; re-ingest the \
-                         documents or switch back to the original embedding model",
-                        recorded_model.as_deref().unwrap_or("unknown model"),
-                        configured_model.unwrap_or("unknown model"),
-                    )));
-                }
-                tracing::info!(
-                    from = rec,
-                    to = conf,
-                    "no chunk embeddings stored; adopting the configured embedding dimension"
-                );
-                // Chunks ingested without an embedding provider (and their
-                // term index) stay; only the vector column changes width.
-                // Node label embeddings are recomputed by the next
-                // resolution pass, so they are cleared and resized.
-                // No stored vector survives the change, so the column is
-                // retyped through NULL: DuckDB cannot cast even a NULL
-                // FLOAT[4] to FLOAT[8] on its own.
-                self.conn.execute_batch(&format!(
-                    "ALTER TABLE _quack_chunks ALTER embedding SET DATA TYPE FLOAT[{conf}] USING NULL::FLOAT[{conf}];"
-                ))?;
-                if self.table_exists("_quack_graph_nodes")? {
-                    self.conn.execute_batch(&format!(
-                        "ALTER TABLE _quack_graph_nodes ALTER embedding SET DATA TYPE FLOAT[{conf}] USING NULL::FLOAT[{conf}];"
-                    ))?;
-                }
-                self.embedding_dimension = conf;
-            }
-            (Some(rec), None) => self.embedding_dimension = rec,
-            (None, Some(conf)) => self.embedding_dimension = conf,
-            (Some(_), Some(_)) | (None, None) => {}
+    /// Bring the vector columns to the configured profile's width when no
+    /// chunk vector would be lost doing it. When chunk vectors of another
+    /// width exist they stay as they are, unsearched, until `reembed`
+    /// retypes the columns: a mistyped `embedding_dimension` must not
+    /// discard a workspace's embeddings.
+    fn reconcile_dimension(&self) -> Result<()> {
+        let Some(profile) = &self.vectors.profile else {
+            return Ok(());
+        };
+        let column = self.column_dimension();
+        if profile.dimension == column {
+            return Ok(());
         }
-        self.set_meta("embedding_dimension", &self.embedding_dimension.to_string())?;
-        if let Some(model) = configured_model {
-            self.set_meta("embedding_model", model)?;
+        let stored: i64 = self.conn.query_row(
+            "SELECT count(*) FROM _quack_chunks WHERE embedding IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if stored > 0 {
+            tracing::warn!(
+                stored = column,
+                configured = profile.dimension,
+                "the workspace's vectors are a different width from the configured model's; \
+                 vector search is off until `quack reembed` re-embeds them"
+            );
+            return Ok(());
         }
-        Ok(())
+        tracing::info!(
+            from = column,
+            to = profile.dimension,
+            "no chunk embeddings stored; adopting the configured embedding dimension"
+        );
+        self.retype_vectors(profile.dimension)
+    }
+
+    /// Change the vector columns' width. Every stored vector is dropped:
+    /// `DuckDB` cannot cast a vector to another width, not even a NULL one,
+    /// so the columns are retyped through NULL. Chunks and their term
+    /// index stay; node label vectors are recomputed by the next pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a statement fails.
+    pub fn retype_vectors(&self, dimension: u32) -> Result<()> {
+        self.conn.execute_batch(&format!(
+            "ALTER TABLE _quack_chunks ALTER embedding SET DATA TYPE FLOAT[{dimension}] USING NULL::FLOAT[{dimension}];
+             UPDATE _quack_chunks SET embedding_profile = NULL;"
+        ))?;
+        if self.table_exists("_quack_graph_nodes")? {
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE _quack_graph_nodes ALTER embedding SET DATA TYPE FLOAT[{dimension}] USING NULL::FLOAT[{dimension}];
+                 UPDATE _quack_graph_nodes SET embedding_profile = NULL;"
+            ))?;
+        }
+        self.vectors
+            .column_dimension
+            .store(dimension, Ordering::Release);
+        self.set_meta("embedding_dimension", &dimension.to_string())
+    }
+
+    /// The profile the configured model runs under, `None` without one.
+    #[must_use]
+    pub fn embedding_profile(&self) -> Option<&Profile> {
+        self.vectors.profile.as_ref()
+    }
+
+    /// The fingerprint a vector made now is stored under, and the only one
+    /// vector search matches. `None` without a model: vectors stored then
+    /// (only tests store any) are unprofiled and match each other.
+    #[must_use]
+    pub fn embedding_fingerprint(&self) -> Option<&str> {
+        self.vectors.fingerprint.as_deref()
+    }
+
+    /// Whether a vector of `width` fits the columns. It does not when the
+    /// configured model's width changed and `reembed` has not run yet;
+    /// such a vector is neither stored nor searched with.
+    #[must_use]
+    pub fn accepts_vector_width(&self, width: usize) -> bool {
+        usize::try_from(self.column_dimension()).is_ok_and(|column| column == width)
+    }
+
+    /// The error for storing a vector the columns cannot hold.
+    fn check_vector_width(&self, width: usize) -> Result<()> {
+        if self.accepts_vector_width(width) {
+            return Ok(());
+        }
+        Err(Error::Embedding(format!(
+            "the workspace stores {}-dimensional vectors and this one has {width}; \
+             run `quack reembed` to re-embed the workspace at the new width",
+            self.column_dimension()
+        )))
     }
 
     /// Drop a document's chunks and their term index, and clear its chunk
@@ -1092,9 +1221,10 @@ impl WorkspaceDb {
         let length = term_count(&terms);
         match chunk.embedding {
             Some(emb) => {
+                self.check_vector_width(emb.len())?;
                 let sql = format!(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{})",
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding, embedding_profile) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{}, ?)",
                     self.vector_type()
                 );
                 self.conn.execute(
@@ -1107,7 +1237,8 @@ impl WorkspaceDb {
                         chunk.heading,
                         page,
                         length,
-                        format_embedding(emb)
+                        format_embedding(emb),
+                        self.embedding_fingerprint()
                     ],
                 )?;
             }
@@ -1175,33 +1306,131 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Update a chunk's embedding vector by document ID and chunk index.
+    /// Store a chunk's vector, made under the current profile.
     ///
     /// # Errors
     ///
-    /// Returns an error if the update fails.
-    pub fn update_chunk_embedding(
-        &self,
-        document_id: &str,
-        chunk_index: u32,
-        embedding: &[f32],
-    ) -> Result<()> {
+    /// Returns an error if the vector does not fit the columns or the
+    /// update fails.
+    pub fn set_chunk_embedding(&self, chunk_id: &str, embedding: &[f32]) -> Result<()> {
+        self.set_vector("_quack_chunks", chunk_id, embedding)
+    }
+
+    /// Store a graph node's label vector, made under the current profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vector does not fit the columns or the
+    /// update fails.
+    pub fn set_node_embedding(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        self.set_vector("_quack_graph_nodes", node_id, embedding)
+    }
+
+    fn set_vector(&self, table: &str, id: &str, embedding: &[f32]) -> Result<()> {
+        self.check_vector_width(embedding.len())?;
         let sql = format!(
-            "UPDATE _quack_chunks SET embedding = ?::{} \
-             WHERE document_id = ? AND chunk_index = ?",
+            "UPDATE {} SET embedding = ?::{}, embedding_profile = ? WHERE id = ?",
+            quote_ident(table),
             self.vector_type()
         );
         self.conn.execute(
             &sql,
-            duckdb::params![format_embedding(embedding), document_id, chunk_index],
+            duckdb::params![
+                format_embedding(embedding),
+                self.embedding_fingerprint(),
+                id
+            ],
         )?;
         Ok(())
+    }
+
+    /// Chunks of ready documents whose vector is missing or was made under
+    /// another profile, oldest first: what `reembed` works through.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn chunks_needing_embedding(&self, limit: u32) -> Result<Vec<PendingChunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.heading, c.content FROM _quack_chunks c \
+             JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE d.status = 'ready' \
+               AND (c.embedding IS NULL OR c.embedding_profile IS DISTINCT FROM ?) \
+             ORDER BY c.id LIMIT ?",
+        )?;
+        let mut rows = stmt.query(duckdb::params![
+            self.embedding_fingerprint(),
+            i64::from(limit)
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(PendingChunk {
+                id: row.get(0)?,
+                heading: row.get(1)?,
+                content: row.get(2)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// How this workspace's stored vectors stand against the current
+    /// profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query fails.
+    pub fn embedding_status(&self) -> Result<EmbeddingStatus> {
+        let current = self.embedding_fingerprint();
+        let (current_chunks, missing_chunks): (i64, i64) = self.conn.query_row(
+            "SELECT count(*) FILTER (WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ?), \
+                    count(*) FILTER (WHERE c.embedding IS NULL) \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE d.status = 'ready'",
+            duckdb::params![current],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut stale = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT CAST(p.profile AS VARCHAR), count(*) \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             LEFT JOIN _quack_embedding_profiles p ON p.fingerprint = c.embedding_profile \
+             WHERE d.status = 'ready' AND c.embedding IS NOT NULL \
+               AND c.embedding_profile IS DISTINCT FROM ? \
+             GROUP BY ALL ORDER BY 2 DESC",
+        )?;
+        let mut rows = stmt.query(duckdb::params![current])?;
+        while let Some(row) = rows.next()? {
+            let profile: Option<String> = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            stale.push(StaleVectors {
+                profile: profile.and_then(|json| serde_json::from_str(&json).ok()),
+                chunks: count_u64(count),
+            });
+        }
+        let stale_nodes: i64 = if self.table_exists("_quack_graph_nodes")? {
+            self.conn.query_row(
+                "SELECT count(*) FROM _quack_graph_nodes \
+                 WHERE embedding IS NOT NULL AND embedding_profile IS DISTINCT FROM ?",
+                duckdb::params![current],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        Ok(EmbeddingStatus {
+            profile: self.vectors.profile.clone(),
+            column_dimension: self.column_dimension(),
+            current_chunks: count_u64(current_chunks),
+            missing_chunks: count_u64(missing_chunks),
+            stale,
+            stale_nodes: count_u64(stale_nodes),
+        })
     }
 
     /// The `FLOAT[N]` type of this workspace's embedding column. `N` is a
     /// validated integer, the only value ever interpolated into vector SQL.
     fn vector_type(&self) -> String {
-        format!("FLOAT[{}]", self.embedding_dimension)
+        format!("FLOAT[{}]", self.column_dimension())
     }
 
     /// Keyword search: BM25 over the terms quack indexed at ingest, scored in
@@ -1347,23 +1576,34 @@ impl WorkspaceDb {
         if scope.is_empty() {
             return Ok(Vec::new());
         }
+        if !self.accepts_vector_width(query_embedding.len()) {
+            tracing::warn!(
+                query = query_embedding.len(),
+                stored = self.column_dimension(),
+                "vector search skipped: the workspace's vectors are another width until `quack reembed` runs"
+            );
+            return Ok(Vec::new());
+        }
         let filter = scope.sql();
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
                     1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE c.embedding IS NOT NULL AND d.status = 'ready'{filter} \
+             WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ? \
+               AND d.status = 'ready'{filter} \
              ORDER BY score DESC \
              LIMIT ?",
             self.vector_type()
         );
 
         let query_literal = format_embedding(query_embedding);
+        let fingerprint = self.embedding_fingerprint();
         let limit = i64::from(top_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(2));
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(3));
         params.push(&query_literal);
+        params.push(&fingerprint);
         scope.bind(&mut params);
         params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
@@ -1879,6 +2119,121 @@ fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
             .get::<_, Option<String>>(13)?
             .and_then(|json| serde_json::from_str(&json).ok()),
     })
+}
+
+/// A chunk whose vector is missing or stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChunk {
+    pub id: String,
+    pub heading: Option<String>,
+    pub content: String,
+}
+
+/// Stored chunk vectors made under a profile other than the current one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StaleVectors {
+    /// `None` when the fingerprint was never recorded.
+    pub profile: Option<Profile>,
+    pub chunks: u64,
+}
+
+/// How a workspace's vectors stand against the current embedding profile.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EmbeddingStatus {
+    /// `None` without an embedding model.
+    pub profile: Option<Profile>,
+    /// Width of the stored vectors, which differs from the profile's
+    /// until `reembed` runs after an `embedding_dimension` change.
+    pub column_dimension: u32,
+    /// Chunks searchable by vector now.
+    pub current_chunks: u64,
+    /// Chunks with no vector: ingested without a model, or while the width
+    /// was changing.
+    pub missing_chunks: u64,
+    /// Chunks with a vector from another profile, by profile: searched by
+    /// keyword only.
+    pub stale: Vec<StaleVectors>,
+    /// Graph nodes whose label vector is from another profile.
+    pub stale_nodes: u64,
+}
+
+impl EmbeddingStatus {
+    /// Chunks with a vector from another profile.
+    #[must_use]
+    pub fn stale_chunks(&self) -> u64 {
+        self.stale
+            .iter()
+            .map(|s| s.chunks)
+            .fold(0, u64::saturating_add)
+    }
+
+    /// Whether `reembed` has anything to do: a model is configured and
+    /// some chunk or node vector is missing or stale.
+    #[must_use]
+    pub fn needs_reembed(&self) -> bool {
+        self.profile.is_some()
+            && (self.stale_chunks() > 0 || self.missing_chunks > 0 || self.stale_nodes > 0)
+    }
+
+    /// A note for the operator when chunk vectors are out of date, `None`
+    /// when every one is current or there is no model to re-embed with.
+    /// The caller adds how to re-embed from where the operator is.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        let profile = self.profile.as_ref()?;
+        let stale = self.stale_chunks();
+        if stale == 0 && self.missing_chunks == 0 {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for group in &self.stale {
+            let made_with = group
+                .profile
+                .as_ref()
+                .map_or_else(|| String::from("an unrecorded profile"), Profile::describe);
+            parts.push(format!(
+                "{} chunks were embedded with {made_with}",
+                group.chunks
+            ));
+        }
+        if self.missing_chunks > 0 {
+            parts.push(format!("{} chunks have no vector", self.missing_chunks));
+        }
+        Some(format!(
+            "{}; the configured model is {}, so they are found by keyword search only.",
+            parts.join(", "),
+            profile.describe()
+        ))
+    }
+}
+
+fn count_u64(count: i64) -> u64 {
+    u64::try_from(count).unwrap_or(0)
+}
+
+/// The vector width a workspace file recorded, before anything else runs
+/// on it: `None` for a new file.
+fn recorded_dimension(conn: &duckdb::Connection) -> Result<Option<u32>> {
+    let has_meta: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = '_quack_meta' AND NOT temporary",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_meta {
+        return Ok(None);
+    }
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM _quack_meta WHERE key = 'embedding_dimension'",
+            [],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    Ok(value.and_then(|v| v.parse().ok()))
 }
 
 /// A chunk to store.

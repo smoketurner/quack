@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use quack_core::embedding::{Embedder, Profile, Prompts, Role};
 use quack_core::graph::extract::{Extraction, GraphExtractor};
 use quack_core::graph::store::NewNode;
 use quack_core::graph::{GraphOptions, extract, resolve, store as graph_store, tables, traverse};
@@ -24,6 +25,14 @@ fn writer_of(db: &WorkspaceDb) -> Writer {
 
 /// Labels sharing a first letter embed close together; others far apart.
 struct LetterEmbedding;
+
+/// `LetterEmbedding` with no prefixes, so a label reaches it unchanged.
+fn letters() -> Embedder<LetterEmbedding> {
+    Embedder::new(
+        LetterEmbedding,
+        Profile::new("letters", 4, Prompts::default()),
+    )
+}
 
 impl EmbeddingModel for LetterEmbedding {
     const MAX_DOCUMENTS: usize = 1024;
@@ -308,7 +317,7 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
         auto_merge_threshold: 0.05,
         ..GraphOptions::default()
     };
-    let resolved = resolve::resolve(&writer, Some(&LetterEmbedding), &options)
+    let resolved = resolve::resolve(&writer, Some(&letters()), &options)
         .await
         .unwrap();
     assert_eq!(resolved.auto_merged, 1, "{resolved:?}");
@@ -484,7 +493,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
         auto_merge_threshold: 0.0,
         ..GraphOptions::default()
     };
-    let resolved = resolve::resolve(&writer, Some(&LetterEmbedding), &options)
+    let resolved = resolve::resolve(&writer, Some(&letters()), &options)
         .await
         .unwrap();
     assert_eq!(resolved.embedded, 8);
@@ -525,21 +534,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     assert!(only.edges.iter().all(|e| e.relation_id == "delivered_to"));
 
     // Fuzzy entry: an unknown spelling resolves through the embedding.
-    let embedding = LetterEmbedding.embed_text("Kenia").await.unwrap();
-    // The fixture embeds 0, 1, or a hundredth: exact in f32.
-    let vector: Vec<f32> = embedding
-        .vec
-        .iter()
-        .map(|v| {
-            if *v >= 1.0 {
-                1.0
-            } else if *v > 0.0 {
-                0.01
-            } else {
-                0.0
-            }
-        })
-        .collect();
+    let vector = letters().one(Role::Similarity, "Kenia").await.unwrap();
     let fuzzy = traverse::resolve_entry(&db, "Kenia", Some("country"), Some(&vector)).unwrap();
     assert_eq!(fuzzy.first().map(|n| n.label.as_str()), Some("Kenya"));
     assert!(
@@ -825,32 +820,14 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
 
     // With an embedding, a label sharing no text still comes back: these
     // are the matches `resolve_entry` rejected as too far to be the entity.
-    for node in graph_store::nodes_without_embedding(&db, 10).unwrap() {
-        let label = LetterEmbedding.embed_text(&node.label).await.unwrap();
-        graph_store::set_node_embedding(&db, &node.id, &letter_vector(&label.vec)).unwrap();
+    for node in graph_store::nodes_needing_embedding(&db, 10).unwrap() {
+        let label = letters().one(Role::Similarity, &node.label).await.unwrap();
+        db.set_node_embedding(&node.id, &label).unwrap();
     }
-    let query = LetterEmbedding.embed_text("Kampala").await.unwrap();
-    let suggestions =
-        traverse::suggest_entities(&db, "Kampala", None, Some(&letter_vector(&query.vec))).unwrap();
+    let query = letters().one(Role::Similarity, "Kampala").await.unwrap();
+    let suggestions = traverse::suggest_entities(&db, "Kampala", None, Some(&query)).unwrap();
     assert!(
         suggestions.contains(&String::from("Kenya (country)")),
         "{suggestions:?}"
     );
-}
-
-/// A `LetterEmbedding` vector as `f32`: the fixture embeds 0, 1, or a
-/// hundredth, all exact in `f32`.
-fn letter_vector(embedding: &[f64]) -> Vec<f32> {
-    embedding
-        .iter()
-        .map(|v| {
-            if *v >= 1.0 {
-                1.0
-            } else if *v > 0.0 {
-                0.01
-            } else {
-                0.0
-            }
-        })
-        .collect()
 }

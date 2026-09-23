@@ -302,8 +302,15 @@ are not accessible" and there is no opt-in flag. IDs are UUID v7 via
 ```sql
 -- workspace metadata
 CREATE TABLE _quack_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  -- schema_version, embedding_model, embedding_dimension,
+  -- schema_version, embedding_dimension (the width of the vector columns),
   -- graph_built_with_ontology_version, graph_drift
+
+-- every embedding profile a stored vector was made under (section 6.1)
+CREATE TABLE _quack_embedding_profiles (
+    fingerprint TEXT PRIMARY KEY,          -- SHA-256 of the profile JSON
+    profile     JSON NOT NULL,             -- {model, dimension, prompts: {query, document, similarity}}
+    first_used  TIMESTAMP DEFAULT now()
+);
 
 CREATE TABLE _quack_context (
     version    INTEGER PRIMARY KEY,
@@ -340,7 +347,8 @@ CREATE TABLE _quack_chunks (
     heading     TEXT,                       -- nearest preceding heading, if any
     page        INTEGER,                    -- for paginated sources
     token_count INTEGER,
-    embedding   FLOAT[N]                    -- N fixed per workspace, recorded in _quack_meta
+    embedding   FLOAT[N],                   -- N fixed per workspace, recorded in _quack_meta
+    embedding_profile TEXT                  -- fingerprint of the profile it was made under
 );
 -- No vector index: search is an exact cosine scan with the core
 -- array_cosine_distance function (see section 15).
@@ -415,6 +423,7 @@ CREATE TABLE _quack_graph_nodes (
     class_id           TEXT NOT NULL,
     properties         JSON,                -- validated against the class's properties
     embedding          FLOAT[N],            -- label + class, for fuzzy resolution
+    embedding_profile  TEXT,                -- fingerprint of the profile it was made under
     provisional        BOOLEAN NOT NULL DEFAULT false,   -- built from an unreviewed ontology
     UNIQUE (normalized_label, class_id)
 );
@@ -488,10 +497,20 @@ CREATE TABLE _quack_audit (
 );
 ```
 
-Opening a workspace whose recorded `embedding_dimension` differs from the configured
-provider's is an error with a clear message, never a silent mismatch — unless no chunk has
-an embedding yet, in which case the workspace adopts the new dimension and retypes the
-`embedding` columns of `_quack_chunks` and `_quack_graph_nodes` through NULL. Session and
+Every stored vector carries the fingerprint of the embedding profile it was made under
+(section 6.1), and vector search, label matching, and merge proposals compare only vectors
+of the current profile, so a changed model, width, or prefix never mixes two vector spaces.
+Vectors of another profile stay where they are; their chunks are found by keyword search
+until `quack reembed` (terminal `/reembed`, `POST .../embeddings/reembed`, the Documents
+page's button) re-embeds them, and the terminal, print mode, `quack doctor`, and the
+Documents page say how many there are. When the configured width differs from the stored
+one, the workspace keeps the old columns and vectors rather than discarding them on open
+(a mistyped `embedding_dimension` must not cost a workspace its embeddings): new chunks are
+stored without vectors, and the re-embed retypes the `embedding` columns of `_quack_chunks`
+and `_quack_graph_nodes` through NULL before embedding everything. With no chunk vector
+stored, open adopts the new width at once. Schema version 8 tags vectors made before
+profiles existed with the profile they were made under: the model the workspace recorded,
+no prefixes. Session and
 message writes are small and frequent; a workspace has one writer connection, so they
 serialize with ingestion writes rather than running beside them, though in the writer's
 interactive line, ahead of any waiting background write (section 4.1): the connection
@@ -642,12 +661,27 @@ OCR is deferred.
 difference. A sectioned source (Markdown, HTML, DOCX headings, PPTX slides, plain text) is
 split at its section boundaries first, so a chunk never spans two sections, but within a
 section the window ignores paragraph and sentence boundaries. The nearest preceding heading
-is stored on the chunk and prepended to its embedding input. A PDF is one continuous text:
+is stored on the chunk and given to the embedding model as the chunk's title. A PDF is one continuous text:
 its pages are joined by a blank line and windowed as a whole, so a paragraph split by a page
 break stays in one chunk; each chunk records the page its first token lies on, and carries
 the document's Info title (else the filename stem) as its heading, since a PDF has no
 heading of its own to give the embedding context. Token counts via `tiktoken`
 (`cl100k_base`).
+
+**Embedding roles and profiles.** Every text is embedded in a role: a search query, a
+document chunk, or a text compared with its own kind (entity labels, a name looked up among
+them, ontology type names). Most embedding models were trained with a different input
+prefix per role and lose retrieval quality without it, and Ollama adds none, so
+`quack_core::embedding` does: built-in prefixes per model family, taken from each family's
+model card (EmbeddingGemma's `task: search result | query: ` and `title: {title} | text: `,
+Qwen3-Embedding's query instruction, nomic's `search_query: ` and `search_document: `,
+E5, BGE, mxbai, Snowflake Arctic; none for all-MiniLM, BGE-M3, granite, or OpenAI's), each
+role overridable under `[embedding]` (section 13). A document prefix with a `{title}` slot
+gets the chunk's heading there (`none` without one); otherwise the heading leads the text.
+Every call goes through `Embedder`, which names the role and checks the width of each
+vector that comes back against `embedding_dimension`, so a mismatched model fails with the
+fix rather than a cast error; clippy's `disallowed_methods` keeps raw embedding calls out.
+The model, its width, and its prefixes are the embedding profile.
 
 **Embedding.** Batches of `[ingestion].embedding_batch_size` (64 by default, at least one)
 through the configured embedding provider, with `[ingestion].embedding_concurrency` (2)
@@ -1193,8 +1227,10 @@ rendering.
 
 `[general].chat_model` and `[general].embedding_model` name `PROVIDER/MODEL` each; a
 workspace's `allowed_providers` filters the choice; the session records the model it used.
-Changing the embedding model for a workspace requires re-embedding and is a guided
-operation, not a config edit.
+Changing the embedding model, its width, or its prefixes leaves a workspace's vectors
+stale rather than wrong: they are not searched, their chunks are found by keyword, and
+`quack reembed` shows what it will re-embed, asks, and brings them up to date in place
+(section 5.4).
 
 ### 10.2 Authentication
 
@@ -1345,6 +1381,8 @@ POST   /api/v1/workspaces/{id}/graph/revalidate
 POST   /api/v1/workspaces/{id}/graph/review        mark a provisional graph reviewed
 GET    /api/v1/workspaces/{id}/graph/merges        PUT .../graph/merges/{mid} {action: accept|reject}
 POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?}
+GET    /api/v1/workspaces/{id}/embeddings          current, stale, and missing vectors against the configured profile, and the plan
+POST   /api/v1/workspaces/{id}/embeddings/reembed  200 when current, else 202 with the plan and the job
 GET    /api/v1/workspaces/{id}/okf                 the bundle as a tar (import is POST .../documents with a tar)
 GET    /api/v1/workspaces/{id}/ontology            current version, JSON
 PUT    /api/v1/workspaces/{id}/ontology            import: validate, write a new version
@@ -1460,6 +1498,7 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
 quack docs [--json] [--pin ID | --unpin ID | --delete ID]
+quack reembed [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--tables-only|--documents-only]
             [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | reject ID..
@@ -1634,6 +1673,11 @@ scopes = ["https://cognitiveservices.azure.com/.default", "offline_access"]
 redirect_uri = "http://127.0.0.1:19876/callback"
 # client_secret_env = "AZURE_CLIENT_SECRET"   # server as confidential client
 # device_code = false
+
+[embedding]              # input prefixes per role; unset keeps the model family's built-in one
+# query_prefix = "task: search result | query: "
+# document_prefix = "title: {title} | text: "    # {title}: the chunk's heading, or "none"
+# similarity_prefix = "task: sentence similarity | query: "
 
 [retrieval]
 top_k = 8

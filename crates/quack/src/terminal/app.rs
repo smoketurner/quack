@@ -16,6 +16,7 @@ use quack_core::analysis::events::{self, AgentEvent, PermissionRequest};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::embedding::reembed::Progress;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::storage::sessions::{self, ChatMode, MessageRole as StoredRole};
 use quack_core::storage::workspace::{
@@ -38,6 +39,7 @@ use quack_core::storage::context;
 
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
+use crate::reembed_cli;
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -77,6 +79,7 @@ Commands:
   /path FROM -> TO  Shortest relation chain between two entities
   /context [import FILE | export FILE]  Show, replace, or save the workspace context
   /okf DIR          Export the workspace as an Open Knowledge Format bundle
+  /reembed          Re-embed what the embedding model, width, or prefixes left stale
   /sessions         List recent sessions
   /resume ID        Switch to a session (id prefix accepted) and replay it
   /new              Start a fresh session
@@ -345,6 +348,20 @@ impl App {
         let id = self.session_id.clone();
         let rows = self.db.run(move |db| load_session(db, &id)).await?;
         self.apply_replay(rows);
+        Ok(())
+    }
+
+    /// Say so at startup when some vectors were made under another
+    /// embedding profile or are missing: those chunks are found by keyword
+    /// only until `/reembed` runs.
+    pub(crate) async fn note_embedding_status(&mut self) -> Result<()> {
+        let status = self.db.run(WorkspaceDb::embedding_status).await?;
+        if let Some(note) = status.note() {
+            self.messages.push(Message::new(
+                MessageRole::System,
+                format!("{note} /reembed re-embeds them in the background."),
+            ));
+        }
         Ok(())
     }
 
@@ -1208,6 +1225,7 @@ impl App {
             "/unshare" => self.set_shared(false),
             "/export" => self.export_session(args),
             "/okf" => self.run_job(CliJob::Okf(args.to_owned()), "Exporting the bundle"),
+            "/reembed" => self.run_job(CliJob::Reembed, "Re-embedding"),
             "/chart" => self.show_chart(args),
             "/steps" => {
                 self.expand_steps = !self.expand_steps;
@@ -2294,6 +2312,7 @@ fn resolve_document(
 enum CliJob {
     Ontology(OntologyAction),
     Graph(GraphAction),
+    Reembed,
     Okf(String),
     ContextImport(String),
     ContextExport(String),
@@ -2304,6 +2323,7 @@ impl CliJob {
         match self {
             Self::Ontology(_) => JobKind::Ontology,
             Self::Graph(_) => JobKind::Graph,
+            Self::Reembed => JobKind::Reembed,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
             Self::ContextImport(_) => JobKind::Import,
         }
@@ -2333,6 +2353,13 @@ async fn run_job_inner(
         }
         CliJob::Graph(action) => {
             crate::graph_cli::run(config, db, action, &mut out, &progress).await?;
+        }
+        CliJob::Reembed => {
+            // The terminal owns stdin, so the job never asks; `/cancel`
+            // stops it between batches.
+            let progress = |p: Progress| ctx.progress(p.done, p.total);
+            let cancel = ctx.cancel_token();
+            reembed_cli::run(config, db, true, &mut out, &progress, Some(&cancel)).await?;
         }
         CliJob::Okf(dir) => {
             let dir = dir.trim();
@@ -2648,7 +2675,11 @@ mod tests {
     /// An app over a real workspace file (the background jobs open it
     /// again by id), driven without a terminal.
     fn app(dir: &std::path::Path) -> App {
-        let mut config = Config::default();
+        app_with(dir, Config::default())
+    }
+
+    /// `app` under `config`, its data directory moved to `dir`.
+    fn app_with(dir: &std::path::Path, mut config: Config) -> App {
         config.general.data_dir = dir.to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
@@ -3036,6 +3067,74 @@ mod tests {
             last(&app).content
         );
         assert!(app.switching.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reembed_is_a_job_and_stale_vectors_are_noted_at_startup() {
+        use quack_core::config::{AuthMode, ProviderConfig, ProviderType};
+        use quack_core::storage::workspace::{NewChunk, NewDocument};
+
+        // Without an embedding model the job says what is missing.
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.handle_slash_command("/reembed");
+        settle(&mut app).await;
+        assert_eq!(last(&app).role, MessageRole::Error);
+        assert!(
+            last(&app).content.contains("no embedding model configured"),
+            "{}",
+            last(&app).content
+        );
+
+        // With one, a vector from another profile is noted when the
+        // session opens.
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = Config::default();
+        config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
+        config.providers.insert(
+            String::from("ollama"),
+            ProviderConfig {
+                provider_type: ProviderType::Ollama,
+                auth: AuthMode::None,
+                base_url: Some(String::from("http://127.0.0.1:9")),
+                api_key_env: None,
+                embedding_dimension: Some(4),
+                max_concurrent_requests: None,
+                oauth: None,
+            },
+        );
+        let mut app = app_with(dir.path(), config);
+        app.note_embedding_status()
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let before = app.messages.len();
+        app.db
+            .run(|db| {
+                db.insert_document(
+                    &NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"),
+                )?;
+                db.insert_chunk(&NewChunk {
+                    id: "c",
+                    document_id: "d",
+                    chunk_index: 0,
+                    content: "levee report",
+                    heading: None,
+                    page: None,
+                    embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+                })?;
+                db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(app.messages.len(), before, "nothing to note while current");
+        app.note_embedding_status()
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let note = &last(&app).content;
+        assert!(
+            note.contains("keyword search only") && note.contains("/reembed"),
+            "{note}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

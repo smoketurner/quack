@@ -648,7 +648,7 @@ impl McpServer {
         else {
             return Ok(None);
         };
-        llm::embed_query(&model, text)
+        llm::embed_entity_name(&model, text)
             .await
             .map(Some)
             .map_err(internal)

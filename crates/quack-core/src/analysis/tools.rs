@@ -18,6 +18,7 @@ use super::events::TurnRecorder;
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, Reranker};
 use super::text_to_sql;
+use crate::embedding::{Embedder, Role};
 use crate::error::Error;
 use crate::ontology::store as ontology_store;
 use crate::ontology::{self, Ontology};
@@ -562,7 +563,7 @@ pub struct SearchDocumentsTool<M> {
     db: ReaderDb,
     /// `None` runs keyword search alone: a workspace without an embedding
     /// provider still answers from its documents.
-    embedding_model: Option<M>,
+    embedding_model: Option<Embedder<M>>,
     default_top_k: u32,
     rrf_k: u32,
     reranker: Option<Arc<dyn Reranker>>,
@@ -578,7 +579,7 @@ pub struct SearchDocumentsTool<M> {
 impl<M> SearchDocumentsTool<M> {
     pub fn new(
         db: ReaderDb,
-        embedding_model: Option<M>,
+        embedding_model: Option<Embedder<M>>,
         default_top_k: u32,
         rrf_k: u32,
         recorder: TurnRecorder,
@@ -724,13 +725,15 @@ where
         let step = self.recorder.start(Self::NAME, &detail);
         let query_vec: Option<Vec<f32>> = match &self.embedding_model {
             None => None,
-            Some(model) => match cached_embed(model, &self.recorder, &args.query).await {
-                Ok(vector) => Some(vector),
-                Err(e) => {
-                    step.finish(format!("error: {e}"));
-                    return Err(ToolError::Embedding(e.to_string()));
+            Some(model) => {
+                match cached_embed(model, &self.recorder, Role::Query, &args.query).await {
+                    Ok(vector) => Some(vector),
+                    Err(e) => {
+                        step.finish(format!("error: {e}"));
+                        return Err(ToolError::Embedding(e.to_string()));
+                    }
                 }
-            },
+            }
         };
 
         let top_k = args
@@ -1305,23 +1308,29 @@ mod tests {
     #[tokio::test]
     async fn cached_embed_asks_the_model_only_once_per_text() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model = CountingEmbeddingModel {
-            calls: Arc::clone(&calls),
-        };
+        let model = Embedder::new(
+            CountingEmbeddingModel {
+                calls: Arc::clone(&calls),
+            },
+            crate::embedding::Profile::new("m", 4, crate::embedding::Prompts::default()),
+        );
         let (sink, _rx) = crate::analysis::events::channel();
         let recorder = TurnRecorder::new(sink);
 
-        let first = cached_embed(&model, &recorder, "Acme").await;
-        let second = cached_embed(&model, &recorder, "Acme").await;
-        let other = cached_embed(&model, &recorder, "Beta").await;
+        let first = cached_embed(&model, &recorder, Role::Similarity, "Acme").await;
+        let second = cached_embed(&model, &recorder, Role::Similarity, "Acme").await;
+        let other = cached_embed(&model, &recorder, Role::Similarity, "Beta").await;
+        let as_query = cached_embed(&model, &recorder, Role::Query, "Acme").await;
 
         assert!(first.is_ok());
         assert_eq!(first.as_ref().ok(), second.as_ref().ok());
         assert!(other.is_ok());
+        assert!(as_query.is_ok());
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "one call for \"Acme\", one for the different text \"Beta\", none for the repeat"
+            3,
+            "one call for \"Acme\", one for the different text \"Beta\", one for \"Acme\" \
+             as a query rather than a name, none for the repeat"
         );
     }
 
@@ -2294,7 +2303,7 @@ pub type GraphResults = Arc<Mutex<Vec<GraphResult>>>;
 
 pub struct SearchGraphTool<M> {
     db: ReaderDb,
-    embedding_model: Option<M>,
+    embedding_model: Option<Embedder<M>>,
     options: graph::GraphOptions,
     exclude_provisional: bool,
     results: GraphResults,
@@ -2304,7 +2313,7 @@ pub struct SearchGraphTool<M> {
 impl<M> SearchGraphTool<M> {
     pub fn new(
         db: ReaderDb,
-        embedding_model: Option<M>,
+        embedding_model: Option<Embedder<M>>,
         options: graph::GraphOptions,
         exclude_provisional: bool,
         results: GraphResults,
@@ -2463,20 +2472,16 @@ fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> crate::erro
 /// Returns the model's error, unwrapped so a caller keeps its usual
 /// message formatting.
 async fn cached_embed<M: EmbeddingModel>(
-    model: &M,
+    embedder: &Embedder<M>,
     recorder: &TurnRecorder,
+    role: Role,
     text: &str,
-) -> std::result::Result<Vec<f32>, rig::embeddings::EmbeddingError> {
-    if let Some(cached) = recorder.cached_embedding(text) {
+) -> crate::error::Result<Vec<f32>> {
+    if let Some(cached) = recorder.cached_embedding(role, text) {
         return Ok(cached);
     }
-    let embedding = model.embed_text(text).await?;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "f64 -> f32 is acceptable for embedding vectors stored in DuckDB"
-    )]
-    let vector: Vec<f32> = embedding.vec.into_iter().map(|v| v as f32).collect();
-    recorder.cache_embedding(text, vector.clone());
+    let vector = embedder.one(role, text).await?;
+    recorder.cache_embedding(role, text, vector.clone());
     Ok(vector)
 }
 
@@ -2485,14 +2490,14 @@ async fn cached_embed<M: EmbeddingModel>(
 /// error when the model fails (issue #62: a silent `None` degraded the
 /// search to exact matches without saying so).
 async fn label_embedding<M: EmbeddingModel>(
-    model: Option<&M>,
+    embedder: Option<&Embedder<M>>,
     recorder: &TurnRecorder,
     label: &str,
 ) -> Result<Option<Vec<f32>>, ToolError> {
-    let Some(model) = model else {
+    let Some(embedder) = embedder else {
         return Ok(None);
     };
-    let vector = cached_embed(model, recorder, label)
+    let vector = cached_embed(embedder, recorder, Role::Similarity, label)
         .await
         .map_err(|e| ToolError::Analysis(format!("embedding failed: {e}")))?;
     Ok(Some(vector))
@@ -2615,7 +2620,7 @@ where
 
 pub struct FindPathTool<M> {
     db: ReaderDb,
-    embedding_model: Option<M>,
+    embedding_model: Option<Embedder<M>>,
     options: graph::GraphOptions,
     exclude_provisional: bool,
     results: GraphResults,
@@ -2625,7 +2630,7 @@ pub struct FindPathTool<M> {
 impl<M> FindPathTool<M> {
     pub fn new(
         db: ReaderDb,
-        embedding_model: Option<M>,
+        embedding_model: Option<Embedder<M>>,
         options: graph::GraphOptions,
         exclude_provisional: bool,
         results: GraphResults,

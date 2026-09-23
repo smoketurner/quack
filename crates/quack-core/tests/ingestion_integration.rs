@@ -4,9 +4,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use quack_core::config::{
-    AnalysisConfig, AuthMode, Config, ContextConfig, GeneralConfig, GraphConfig, ImportConfig,
-    IngestionConfig, OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig, ServerConfig,
+    AnalysisConfig, AuthMode, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
+    ImportConfig, IngestionConfig, OntologyConfig, ProviderConfig, ProviderType, RetrievalConfig,
+    ServerConfig,
 };
+use quack_core::embedding::reembed::Plan;
+use quack_core::embedding::{Embedder, Profile, Prompts};
+use quack_core::graph::store as graph_store;
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
 use quack_core::storage::control::ControlPlane;
@@ -21,6 +25,15 @@ const TEST_DIM_U32: u32 = 4;
 
 struct MockEmbeddingModel {
     dim: usize,
+}
+
+/// `model` under the profile `test_config` configures: `mock-model`,
+/// `TEST_DIM` wide, no prefixes.
+fn embedder<M: EmbeddingModel>(model: M) -> Embedder<M> {
+    Embedder::new(
+        model,
+        Profile::new("mock-model", TEST_DIM_U32, Prompts::default()),
+    )
 }
 
 /// Records the size of every batch it is asked to embed.
@@ -148,6 +161,7 @@ fn test_config(data_dir: &Path) -> Config {
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
         },
+        embedding: EmbeddingConfig::default(),
         retrieval: RetrievalConfig::default(),
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
@@ -169,6 +183,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         },
         providers: BTreeMap::new(),
         ingestion: IngestionConfig::default(),
+        embedding: EmbeddingConfig::default(),
         retrieval: RetrievalConfig::default(),
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
@@ -228,7 +243,7 @@ async fn ingest_text_with_mock_embeddings() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let writer = writer_of(&db);
-    let model = MockEmbeddingModel { dim: TEST_DIM };
+    let model = embedder(MockEmbeddingModel { dim: TEST_DIM });
 
     let data = b"This is a longer document with enough words to produce at least one chunk. \
                  We need to make sure the embedding pipeline works end to end with our mock.";
@@ -312,7 +327,7 @@ impl EmbeddingModel for InFlightModel {
 async fn ingest_six_sections(
     config: &Config,
     workspace_id: &str,
-    model: &InFlightModel,
+    model: &Embedder<InFlightModel>,
 ) -> (WorkspaceDb, ingestion::IngestResult) {
     let db = WorkspaceDb::open(config, workspace_id).unwrap();
     let writer = writer_of(&db);
@@ -353,14 +368,14 @@ async fn embedding_concurrency_overlaps_requests_and_keeps_vectors_with_their_ch
     let mut config = test_config(dir.path());
     config.ingestion.embedding_batch_size = 1;
     config.ingestion.embedding_concurrency = 3;
-    let model = InFlightModel::make(&(), "mock", None);
+    let model = embedder(InFlightModel::make(&(), "mock", None));
 
     let (db, result) = ingest_six_sections(&config, "ws-concurrent", &model).await;
 
     assert_eq!(result.chunks_stored, 6);
     assert!(result.embedding_time.is_some());
-    assert_eq!(model.calls.load(Ordering::SeqCst), 6);
-    let peak = model.peak.load(Ordering::SeqCst);
+    assert_eq!(model.model().calls.load(Ordering::SeqCst), 6);
+    let peak = model.model().peak.load(Ordering::SeqCst);
     assert!((2..=3).contains(&peak), "peak in-flight requests: {peak}");
     assert_eq!(mismatched_vectors(&db), serde_json::Value::Number(0.into()));
 }
@@ -372,11 +387,11 @@ async fn embedding_concurrency_of_one_stays_serial() {
     let mut config = test_config(dir.path());
     config.ingestion.embedding_batch_size = 1;
     config.ingestion.embedding_concurrency = 1;
-    let model = InFlightModel::make(&(), "mock", None);
+    let model = embedder(InFlightModel::make(&(), "mock", None));
 
     let (db, _) = ingest_six_sections(&config, "ws-serial", &model).await;
 
-    assert_eq!(model.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(model.model().peak.load(Ordering::SeqCst), 1);
     assert_eq!(mismatched_vectors(&db), serde_json::Value::Number(0.into()));
 }
 
@@ -390,7 +405,7 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let writer = writer_of(&db);
-    let model = BatchRecordingModel::make(&(), "mock", None);
+    let model = embedder(BatchRecordingModel::make(&(), "mock", None));
 
     // Five headed sections, each its own chunk at 50 tokens.
     let sections: Vec<String> = (1..=5)
@@ -409,7 +424,7 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     .ingested()
     .unwrap();
 
-    let batches = model.batches.lock().unwrap().clone();
+    let batches = model.model().batches.lock().unwrap().clone();
     let total: usize = batches.iter().sum();
     assert_eq!(total, result.chunks_stored as usize);
     assert!(
@@ -670,7 +685,7 @@ fn workspace_db_chunk_with_embedding() {
 }
 
 #[test]
-fn workspace_db_update_chunk_embedding() {
+fn workspace_db_set_chunk_embedding() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let workspace_id = "ws-update-emb";
@@ -703,7 +718,7 @@ fn workspace_db_update_chunk_embedding() {
 
     // Update with an embedding
     let embedding = [1.0_f32, 0.0, 0.0, 0.0];
-    db.update_chunk_embedding("doc-1", 0, &embedding).unwrap();
+    db.set_chunk_embedding("c1", &embedding).unwrap();
 
     // Embedding should now be non-NULL
     let qr = db
@@ -1028,14 +1043,21 @@ fn open_records_schema_version_and_embedding_meta() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("7"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("8"));
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("4")
     );
+    // The profile table replaces the model key.
+    assert_eq!(db.meta("embedding_model").unwrap(), None);
+    let profile = Profile::new("mock-model", TEST_DIM_U32, Prompts::default());
+    assert_eq!(db.embedding_profile(), Some(&profile));
+    let recorded = db
+        .execute_query("SELECT fingerprint FROM _quack_embedding_profiles")
+        .unwrap();
     assert_eq!(
-        db.meta("embedding_model").unwrap().as_deref(),
-        Some("mock-model")
+        recorded.rows.first().and_then(|r| r.first()),
+        Some(&serde_json::Value::String(profile.fingerprint()))
     );
     assert_eq!(db.embedding_dimension(), TEST_DIM_U32);
     assert!(db.list_tables().unwrap().is_empty());
@@ -1053,7 +1075,7 @@ fn reopen_without_provider_keeps_recorded_dimension() {
 }
 
 #[test]
-fn dimension_change_with_stored_embeddings_is_an_error() {
+fn dimension_change_with_stored_embeddings_keeps_them_until_reembed() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     {
@@ -1076,16 +1098,43 @@ fn dimension_change_with_stored_embeddings_is_an_error() {
         p.embedding_dimension = Some(8);
     }
     changed.general.embedding_model = Some("mock/other-model".into());
-    let err = WorkspaceDb::open(&changed, "ws-mismatch").err().unwrap();
-    let msg = err.to_string();
+    // Opening still works: the old vectors stay, at their width, unsearched.
+    let db = WorkspaceDb::open(&changed, "ws-mismatch").unwrap();
+    assert_eq!(db.embedding_dimension(), 4);
+    assert!(!db.accepts_vector_width(8));
     assert!(
-        msg.contains("4-dimensional") && msg.contains("8-dimensional"),
-        "{msg}"
+        db.search_similar_chunks(&[0.5; 8], 5, &ChunkScope::all())
+            .unwrap()
+            .is_empty()
     );
+    assert_eq!(
+        db.search_keyword_chunks("x", 5, &ChunkScope::all())
+            .unwrap()
+            .len(),
+        1
+    );
+    let err = db
+        .set_chunk_embedding("c", &[0.5; 8])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("quack reembed"), "{err}");
+    let status = db.embedding_status().unwrap();
+    assert_eq!(status.column_dimension, 4);
+    assert_eq!(status.stale_chunks(), 1);
+    let made_with = status.stale.first().and_then(|s| s.profile.clone());
+    assert_eq!(
+        made_with,
+        Some(Profile::new("mock-model", 4, Prompts::default()))
+    );
+    let note = status.note().unwrap();
     assert!(
-        msg.contains("mock-model") && msg.contains("other-model"),
-        "{msg}"
+        note.contains("1 chunks were embedded with mock-model (4 dimensions, no prefixes)")
+            && note.contains("other-model (8 dimensions, no prefixes)"),
+        "{note}"
     );
+    let plan = Plan::from_status(&status);
+    assert_eq!(plan.retype, Some((4, 8)));
+    assert_eq!(plan.chunks, 1);
 }
 
 #[test]
@@ -1111,9 +1160,9 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         // A node label embedding of the old width: cleared on reopen and
         // recomputed by the next resolution pass.
         let db = WorkspaceDb::open(&config, "ws-adopt").unwrap();
-        let node = quack_core::graph::store::upsert_node(
+        let node = graph_store::upsert_node(
             &db,
-            &quack_core::graph::store::NewNode {
+            &graph_store::NewNode {
                 label: String::from("Kenya"),
                 class_id: String::from("country"),
                 properties: serde_json::json!({}),
@@ -1121,9 +1170,9 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             },
         )
         .unwrap();
-        quack_core::graph::store::set_node_embedding(&db, &node, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        db.set_node_embedding(&node, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         assert!(
-            quack_core::graph::store::nodes_without_embedding(&db, 10)
+            graph_store::nodes_needing_embedding(&db, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1134,10 +1183,10 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     }
     let db = WorkspaceDb::open(&changed, "ws-adopt").unwrap();
     assert_eq!(db.embedding_dimension(), 8);
-    let unembedded = quack_core::graph::store::nodes_without_embedding(&db, 10).unwrap();
+    let unembedded = graph_store::nodes_needing_embedding(&db, 10).unwrap();
     assert_eq!(unembedded.len(), 1);
     let node_id = unembedded.first().map(|n| n.id.clone()).unwrap();
-    quack_core::graph::store::set_node_embedding(&db, &node_id, &[0.5; 8]).unwrap();
+    db.set_node_embedding(&node_id, &[0.5; 8]).unwrap();
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("8")
@@ -1231,7 +1280,7 @@ async fn ingest_csv_with_quote_in_filename() {
         &writer,
         workspace_id,
         &ingestion::NewFile::new(filename, b"a,b\n1,2\n3,4\n"),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap()
@@ -1474,7 +1523,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
         );
     }
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
-    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("7"));
+    assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("8"));
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())
         .unwrap();
@@ -1528,7 +1577,7 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
         &writer,
         "ws-md-meta",
         &ingestion::NewFile::new("rules.md", md),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap()
@@ -1572,7 +1621,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         &writer,
         "ws-dedup",
         &ingestion::NewFile::new("terms.md", md).source(DocumentSource::Stdin),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap()
@@ -1592,7 +1641,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         &writer,
         "ws-dedup",
         &ingestion::NewFile::new("copy.md", md).title(Some("Copy")),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap();
@@ -1609,7 +1658,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         &writer,
         "ws-dedup",
         &ingestion::NewFile::new("other.md", b"# Heading\n\nBody.\n").title(Some(" Given ")),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap()
@@ -1626,7 +1675,7 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         &writer,
         "ws-dedup",
         &ingestion::NewFile::new("scan.pdf", bad),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await;
     assert!(failed.is_err());
@@ -1663,7 +1712,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
         &writer,
         "ws-long-pdf",
         &ingestion::NewFile::new("report.pdf", &bytes),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap()
@@ -1799,7 +1848,7 @@ async fn workbook_loads_one_table_per_sheet_and_delete_drops_them() {
         &writer,
         "ws-xlsx",
         &ingestion::NewFile::new("Region Sales.xlsx", &bytes),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap()
@@ -1860,7 +1909,7 @@ async fn office_and_html_documents_are_chunked_with_titles() {
         &writer,
         "ws-office",
         &ingestion::NewFile::new("guide.html", page),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap()
@@ -1886,7 +1935,7 @@ async fn office_and_html_documents_are_chunked_with_titles() {
         &writer,
         "ws-office",
         &ingestion::NewFile::new("deck.pptx", b"not a package"),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await;
     assert!(failed.is_err());
@@ -1941,7 +1990,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         "ws-import",
         &request,
         quack_core::import::ImportPolicy::owner(),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await
@@ -1997,7 +2046,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         "ws-import",
         &request,
         quack_core::import::ImportPolicy::owner(),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await
@@ -2088,7 +2137,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
         &writer,
         "ws-failed",
         &ingestion::NewFile::new("notes.md", b"# Notes\n\nA giraffe walked by.\n"),
-        Some(&FailingEmbeddingModel),
+        Some(&embedder(FailingEmbeddingModel)),
     )
     .await;
     assert!(failed.is_err());
@@ -2141,7 +2190,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
             &writer,
             "ws-owner",
             &ingestion::NewFile::new("sales.csv", first_bytes),
-            None::<&MockEmbeddingModel>,
+            None::<&Embedder<MockEmbeddingModel>>,
         )
         .await
         .unwrap(),
@@ -2154,7 +2203,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
         &writer,
         "ws-owner",
         &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,2\n"),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await;
     let err = changed.err().map(|e| e.to_string()).unwrap_or_default();
@@ -2179,7 +2228,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
         &writer,
         "ws-owner",
         &ingestion::NewFile::new("sales.csv", first_bytes),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
     )
     .await
     .unwrap();
@@ -2232,7 +2281,7 @@ async fn server_policy_refuses_local_sqlite_files() {
             limit: None,
         },
         server_policy,
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await;
@@ -2274,7 +2323,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         "ws-import-errors",
         &first,
         quack_core::import::ImportPolicy::owner(),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await
@@ -2293,7 +2342,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             limit: None,
         },
         quack_core::import::ImportPolicy::owner(),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await;
@@ -2310,7 +2359,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             limit: None,
         },
         quack_core::import::ImportPolicy::owner(),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await;
@@ -2327,7 +2376,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             limit: None,
         },
         quack_core::import::ImportPolicy::owner(),
-        None::<&MockEmbeddingModel>,
+        None::<&Embedder<MockEmbeddingModel>>,
         None,
     )
     .await;
@@ -2387,9 +2436,9 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     let workspace_id = "ws-cancel";
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     let writer = writer_of(&db);
-    let model = SlowModel {
+    let model = embedder(SlowModel {
         delay: std::time::Duration::from_secs(60),
-    };
+    });
     let cancel = quack_core::llm::CancellationToken::new();
     let trigger = cancel.clone();
     tokio::spawn(async move {

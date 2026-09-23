@@ -91,6 +91,7 @@ cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore 
 cargo run --bin quack -- ontology propose [--extend] [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
 cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate | review | merges | merge ID..
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
+cargo run --bin quack -- reembed [-y]                                           # re-embed vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER                      # OAuth token for an auth = "oauth" provider
 cargo run --bin quack -- config [--changed] [--json]                            # every recognized setting, its value and origin, the file's unknown keys, the env vars read
@@ -213,6 +214,18 @@ total it was capped from (`GraphResult::total_nodes`, `truncated`). Provenance t
 table renders as a predicate `run_sql` can run, since the mapping knows the key column. The
 tool guidance in the system prompt gains a numbered graph procedure whenever those tools
 are registered.
+
+Every embedding goes through `quack_core::embedding::Embedder` in a role: `query` (search),
+`documents` (chunks, with their heading as title), or `similar` (entity labels and names,
+ontology type names). It adds the input prefixes the model family was trained with
+(`embedding::presets`, from each model card; `[embedding]` overrides any role) and checks
+each vector's width against `embedding_dimension`; `.clippy.toml` disallows rig's raw
+`embed_text`/`embed_texts`. The model, width, and prefixes are the `Profile`; every stored
+chunk and node vector carries its fingerprint (`embedding_profile`, profiles in
+`_quack_embedding_profiles`), and vector search, label matching, and merge proposals use
+only the current profile's vectors. Stale or missing vectors are found by keyword until
+`embedding::reembed::run` (`quack reembed`, `/reembed`, `POST .../embeddings/reembed`,
+the Documents page) re-embeds them; a width change keeps the old vectors until then.
 
 Retrieval and the graph meet through `_quack_provenance`: `search_documents(entity)`
 resolves the name (the same entry-point resolution `search_graph` uses), narrows the search

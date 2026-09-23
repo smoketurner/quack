@@ -43,8 +43,10 @@ Each workspace's `data.duckdb` carries the `_quack_` tables (documents, chunks, 
 ontology, graph, provenance, merges, sessions, messages, context, audit detail; design doc
 section 5.4) beside the user's tables and views. `WorkspaceDb::open()` creates what is
 missing and records `_quack_meta.schema_version`; a bump can trigger a rebuild, as version
-6 rebuilt the term index when stemming arrived and version 7 rebuilt it again to add the
-joined identifier term (`pol8841` alongside `pol` and `8841` for `POL-8841`; issue #77).
+6 rebuilt the term index when stemming arrived, version 7 rebuilt it again to add the
+joined identifier term (`pol8841` alongside `pol` and `8841` for `POL-8841`; issue #77),
+and version 8 tagged every stored vector with the embedding profile it was made under (the
+model the workspace had recorded, no prefixes).
 Phrase search (`"..."` in a keyword query) needed no version bump: it post-filters
 candidates by substring rather than adding term positions to `_quack_terms`.
 
@@ -61,7 +63,9 @@ every open.
 - Every internal table is prefixed `_quack_` so it is hidden from the agent's table listing
   and refused in user and agent SQL.
 - The embedding dimension is fixed per workspace and recorded in `_quack_meta`; a schema
-  version never changes it. Changing the embedding model is a re-embed.
+  version never changes it. Changing the embedding model, its width, or its input
+  prefixes leaves vectors stale, never dropped on open; `quack reembed` brings them up to
+  date, retyping the vector columns first when the width changed.
 - The ontology and the workspace context are versioned as data
   (`_quack_ontology_versions`, `_quack_context`), not by schema versions.
 - A workspace directory is portable: every version must open a file created by an older
