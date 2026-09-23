@@ -272,7 +272,9 @@ go through one `auth::password_login`, and a browser session expires at
 (`state::SessionLookup`); its cookie is `HttpOnly`, `SameSite=Lax`, `Max-Age`d to the
 absolute lifetime, and `Secure` unless the request came from loopback. One `tower_governor`
 limiter covers the web UI, the API, and MCP, with a tighter one on the two login routes and
-none on `/healthz` (design doc 12). Every
+none on `/healthz` (design doc 12). The same routes carry `no-store` cache headers
+(`server::no_store`) unless the handler set `Cache-Control` itself, as the static assets
+do. Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
 through `Access::audit`. A handler's reads go through `App::read` (a reader-pool
 connection in a read-only transaction, so a read never occupies the writer and a write
