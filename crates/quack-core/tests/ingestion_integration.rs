@@ -1784,9 +1784,7 @@ fn piped_bytes_load_as_a_temporary_stdin_table() {
 
     let csv = b"region\ttotal\nnorth\t10\nsouth\t20\n";
     assert_eq!(
-        ingestion::load_stdin_table(&config, &db, "ws-stdin", csv)
-            .unwrap()
-            .as_deref(),
+        ingestion::load_stdin_table(&config, &db, "ws-stdin", csv).unwrap(),
         Some("stdin")
     );
     let rows = db

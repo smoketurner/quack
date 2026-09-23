@@ -202,16 +202,13 @@ pub fn relation_id_for_column(column: &str) -> String {
     format!("has_{stem}")
 }
 
-fn property_type(
-    profile: &ColumnProfile,
-    options: &TableEvidenceOptions,
-) -> (PropertyType, Vec<String>) {
+fn property_type(profile: &ColumnProfile, options: &TableEvidenceOptions) -> PropertyType {
     let t = profile.duckdb_type.as_str();
     if t == "BOOLEAN" {
-        return (PropertyType::Boolean, Vec::new());
+        return PropertyType::Boolean;
     }
     if t.starts_with("DATE") || t.starts_with("TIMESTAMP") {
-        return (PropertyType::Date, Vec::new());
+        return PropertyType::Date;
     }
     if [
         "TINYINT",
@@ -229,18 +226,18 @@ fn property_type(
     .contains(&t)
         || t.starts_with("DECIMAL")
     {
-        return (PropertyType::Number, Vec::new());
+        return PropertyType::Number;
     }
     if profile.non_null > 0 && profile.date_share >= 0.9 {
-        return (PropertyType::Date, Vec::new());
+        return PropertyType::Date;
     }
     if profile.rows >= options.enum_min_rows
         && profile.distinct > 1
         && profile.distinct <= u64::from(options.enum_max_values)
     {
-        return (PropertyType::Enum, Vec::new());
+        return PropertyType::Enum;
     }
-    (PropertyType::String, Vec::new())
+    PropertyType::String
 }
 
 fn enum_values(db: &WorkspaceDb, table: &str, column: &str) -> Result<Vec<String>> {
@@ -367,7 +364,7 @@ fn propose_table(
 
     for column in &profile.columns {
         let property_id = snake_id(&column.name);
-        let (kind, _) = property_type(column, options);
+        let kind = property_type(column, options);
         let values = if kind == PropertyType::Enum {
             enum_values(db, &profile.name, &column.name)?
         } else {

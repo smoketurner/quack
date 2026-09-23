@@ -385,8 +385,7 @@ pub async fn run(
         )));
     }
     let drift = summary.drift.clone();
-    db.run(move |db| store::record_drift(db, &drift, false))
-        .await?;
+    db.run(move |db| store::record_drift(db, &drift)).await?;
     Ok(summary)
 }
 

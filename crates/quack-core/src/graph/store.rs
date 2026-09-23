@@ -472,17 +472,13 @@ pub fn drift(db: &WorkspaceDb) -> Result<Drift> {
         .unwrap_or_default())
 }
 
-/// Add a run's drift to the stored total, or replace it.
+/// Add a run's drift to the stored total.
 ///
 /// # Errors
 ///
 /// Returns an error if the write fails.
-pub fn record_drift(db: &WorkspaceDb, run: &Drift, replace: bool) -> Result<()> {
-    let mut total = if replace {
-        Drift::default()
-    } else {
-        drift(db)?
-    };
+pub fn record_drift(db: &WorkspaceDb, run: &Drift) -> Result<()> {
+    let mut total = drift(db)?;
     total.absorb(run);
     db.set_meta_public(META_DRIFT, &serde_json::to_string(&total)?)
 }

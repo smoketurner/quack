@@ -1039,8 +1039,7 @@ const STRUCTURAL_TYPES: &[&str] = &[
 
 /// An OKF `type` as an ontology id: lowercase, words joined by `_`,
 /// a trailing `s` dropped from the last word.
-#[must_use]
-pub fn type_id(raw: &str) -> String {
+fn type_id(raw: &str) -> String {
     let mut words: Vec<String> = raw
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())

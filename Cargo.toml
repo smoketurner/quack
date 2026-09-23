@@ -81,7 +81,6 @@ rustls               = { version = "=0.23.45", default-features = false }
 schemars             = { version = "=1.2.2", default-features = false }
 scraper              = { version = "=0.27.0", default-features = false }
 sea-query            = { version = "=1.0.2", default-features = false }
-sea-query-sqlx       = { version = "=0.9.1", default-features = false }
 secrecy              = { version = "=0.10.3", default-features = false }
 serde                = { version = "=1.0.229", default-features = false }
 serde_json           = { version = "=1.0.151", default-features = false }

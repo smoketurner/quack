@@ -561,7 +561,7 @@ pub fn load_stdin_table(
     db: &WorkspaceDb,
     workspace_id: &str,
     data: &[u8],
-) -> Result<Option<String>> {
+) -> Result<Option<&'static str>> {
     if data.iter().all(u8::is_ascii_whitespace) {
         return Ok(None);
     }
@@ -593,7 +593,7 @@ pub fn load_stdin_table(
         bytes = data.len(),
         "loaded piped data"
     );
-    Ok(Some(STDIN_TABLE.to_owned()))
+    Ok(Some(STDIN_TABLE))
 }
 
 /// The table a structured file loads into: its stem with anything outside

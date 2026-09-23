@@ -50,6 +50,8 @@ struct Walker {
 }
 
 const SKIPPED: &[&str] = &["script", "style", "noscript", "head", "template", "svg"];
+/// Every heading level starts a section; the level itself is not kept.
+const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
 const BLOCKS: &[&str] = &[
     "p",
     "div",
@@ -88,11 +90,10 @@ impl Walker {
                 if SKIPPED.contains(&name) {
                     return;
                 }
-                if let Some(level) = heading_level(name) {
+                if HEADINGS.contains(&name) {
                     let title = collapse(&subtree_text(node));
                     self.flush();
                     self.heading = (!title.is_empty()).then_some(title);
-                    let _ = level;
                     return;
                 }
                 let block = BLOCKS.contains(&name);
@@ -137,18 +138,6 @@ impl Walker {
                 text,
             });
         }
-    }
-}
-
-fn heading_level(name: &str) -> Option<u8> {
-    match name {
-        "h1" => Some(1),
-        "h2" => Some(2),
-        "h3" => Some(3),
-        "h4" => Some(4),
-        "h5" => Some(5),
-        "h6" => Some(6),
-        _ => None,
     }
 }
 

@@ -10,18 +10,6 @@ use crate::embedding::{
 };
 use crate::error::{Error, Result};
 
-/// Tables quack manages inside a workspace database. Hidden from the agent's
-/// table listing and refused in agent SQL.
-pub const INTERNAL_TABLES: &[&str] = &[
-    "_quack_meta",
-    "_quack_documents",
-    "_quack_chunks",
-    "_quack_sessions",
-    "_quack_messages",
-    "_quack_terms",
-    "_quack_context",
-];
-
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
@@ -1523,7 +1511,7 @@ impl WorkspaceDb {
         let mut rows = stmt.query(params.as_slice())?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
-            results.push(chunk_from_row(row, 7)?);
+            results.push(chunk_from_row(row)?);
         }
         if phrases.is_empty() {
             return Ok(results);
@@ -1625,7 +1613,7 @@ impl WorkspaceDb {
         let mut results = Vec::new();
 
         while let Some(row) = rows.next()? {
-            results.push(chunk_from_row(row, 7)?);
+            results.push(chunk_from_row(row)?);
         }
 
         Ok(results)
@@ -1646,7 +1634,7 @@ impl WorkspaceDb {
         for id in ids {
             let mut rows = stmt.query(duckdb::params![id])?;
             if let Some(row) = rows.next()? {
-                out.push(chunk_from_row(row, 7)?);
+                out.push(chunk_from_row(row)?);
             }
         }
         Ok(out)
@@ -2171,7 +2159,7 @@ pub struct ChunkSearchResult {
     pub score: f64,
 }
 
-fn chunk_from_row(row: &duckdb::Row<'_>, score_idx: usize) -> duckdb::Result<ChunkSearchResult> {
+fn chunk_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<ChunkSearchResult> {
     let page: Option<i64> = row.get(6)?;
     Ok(ChunkSearchResult {
         id: row.get(0)?,
@@ -2181,7 +2169,7 @@ fn chunk_from_row(row: &duckdb::Row<'_>, score_idx: usize) -> duckdb::Result<Chu
         filename: row.get(4)?,
         heading: row.get(5)?,
         page: page.and_then(|p| u32::try_from(p).ok()),
-        score: row.get(score_idx)?,
+        score: row.get(7)?,
     })
 }
 
