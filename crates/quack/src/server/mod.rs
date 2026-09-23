@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderValue, Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::routing::get;
 use quack_core::config::Config;
 use tower_governor::governor::GovernorConfigBuilder;
@@ -154,6 +154,7 @@ pub(crate) fn router(app: App) -> Router {
         spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
         limited = limited.layer(GovernorLayer::new(config));
     }
+    let limited = limited.layer(axum::middleware::map_response(no_store));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(limited)
@@ -185,6 +186,24 @@ pub(crate) fn router(app: App) -> Router {
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(RequestIdV7))
         .with_state(app)
+}
+
+/// Pages, API answers, downloads, and streams carry workspace content, so no
+/// browser or proxy may keep a copy (a page must not come back from the Back
+/// button after logout). A response that already chose a policy keeps it: the
+/// static assets are public and revalidate by `ETag`. `Expires` and `Pragma`
+/// cover HTTP/1.0 caches that ignore `Cache-Control`.
+async fn no_store(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    }
+    response
 }
 
 /// The startup banner: what this server is and how it is configured.

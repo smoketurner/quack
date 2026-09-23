@@ -1770,6 +1770,69 @@ async fn local_mode_needs_no_login_and_owns_everything() {
     assert!(rows.iter().all(|r| r.user_id.as_deref() == Some("local")));
 }
 
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn responses_are_not_cached_unless_the_handler_sets_a_policy() {
+    fn assert_no_store(what: &str, headers: &axum::http::HeaderMap) {
+        let get = |name| headers.get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(
+            get(header::CACHE_CONTROL),
+            Some("no-cache, no-store, must-revalidate"),
+            "{what}"
+        );
+        assert_eq!(get(header::EXPIRES), Some("0"), "{what}");
+        assert_eq!(get(header::PRAGMA), Some("no-cache"), "{what}");
+    }
+    let h = harness(false).await;
+    let alice = h.user("alice", false).await;
+    let ws = h.workspace("docs", &alice).await;
+
+    // Login sets the session cookie; its response is not kept either.
+    let login = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"username":"alice","password":"pw"}"#))
+        .unwrap();
+    let (status, body, headers) = h.send(login).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_store("login", &headers);
+    let token = body["token"].as_str().unwrap_or_default().to_owned();
+
+    for (what, path, bearer) in [
+        (
+            "api answer",
+            format!("/api/v1/workspaces/{ws}"),
+            Some(&token),
+        ),
+        ("api denial", format!("/api/v1/workspaces/{ws}"), None),
+        ("web page", format!("/w/{ws}/settings"), None),
+        ("mcp", format!("/mcp/v1/{ws}"), Some(&token)),
+    ] {
+        let mut request = Request::builder().uri(path);
+        if let Some(token) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let (_, _, headers) = h.send(request.body(Body::empty()).unwrap()).await;
+        assert_no_store(what, &headers);
+    }
+
+    // Public assets keep their own revalidate-by-ETag policy, and the health
+    // check sits outside the layer.
+    let (status, _, headers) = h.page("/static/css/output.css", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "no-cache",
+        "{headers:?}"
+    );
+    assert!(headers.get(header::EXPIRES).is_none());
+    assert!(headers.get(header::PRAGMA).is_none());
+    let (status, _, headers) = h.page("/healthz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get(header::CACHE_CONTROL).is_none());
+}
+
 // --- web UI ------------------------------------------------------------------
 
 impl Harness {
@@ -2012,7 +2075,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         headers
             .get(header::CACHE_CONTROL)
             .and_then(|v| v.to_str().ok()),
-        Some("no-store")
+        Some("no-cache, no-store, must-revalidate")
     );
     assert!(html.contains("New token, shown once"), "{html}");
     let Some((_, rest)) = html.split_once("qk_") else {

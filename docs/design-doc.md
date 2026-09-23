@@ -1621,6 +1621,14 @@ roadmap and may never be built.
   a dead server to whatever is watching it. Each limiter's per-key state is swept once a
   minute: governor holds one entry per caller until something drops it, so an unswept
   limiter grows by one entry for every address that ever connected.
+- **Nothing a caller receives is cached.** Pages, API answers, downloads, and event
+  streams carry workspace content, so every response under the web UI, the REST API, and
+  MCP carries `Cache-Control: no-cache, no-store, must-revalidate`, `Expires: 0`, and
+  `Pragma: no-cache` unless its handler chose a policy itself; a page then cannot come
+  back from the Back button after logout. The static assets are the exception: they are
+  public and keep `no-cache` with an `ETag`. A new API token is shown once in the body of
+  the response that created it, never in a URL, where history and access logs would keep
+  it.
 - Roles: `viewer` asks questions and searches; `member` also uploads, pins, deletes own
   uploads, grants write, edits the context and ontology, runs proposals and extraction;
   `owner` manages members and tokens and sees all sessions. `is_admin` manages users and
