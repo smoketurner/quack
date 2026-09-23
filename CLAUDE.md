@@ -259,7 +259,10 @@ absolute lifetime, and `Secure` unless the request came from loopback. One `towe
 limiter covers the web UI, the API, and MCP, with a tighter one on the two login routes and
 none on `/healthz` (design doc 12). Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
-through `Access::audit`. `query/stream` forwards the agent event stream as SSE (`text`,
+through `Access::audit`. A handler's reads go through `App::read` (a reader-pool
+connection in a read-only transaction, so a read never occupies the writer and a write
+slipped into one is refused); its writes, and the audit detail row, go to the writer
+through `state::with_db`. `query/stream` forwards the agent event stream as SSE (`text`,
 `status`, `tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 with a `job` id
 and run on the work queue in a lane of `[server].workers_per_workspace` per workspace
 (`queue.rs`), which locks the workspace only around each database step; `api/jobs.rs`

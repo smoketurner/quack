@@ -113,8 +113,9 @@ impl ReaderDb {
             .map_or(Slot::Writer(&self.0.writer), Slot::Reader)
     }
 
-    /// Run `f` against the locked workspace handle on the blocking pool,
-    /// inside a read-only transaction.
+    /// Run `f` inside a read-only transaction on a reader connection (on
+    /// the blocking pool), or on the writer when the pool is empty or
+    /// degraded.
     ///
     /// # Errors
     ///
@@ -167,8 +168,8 @@ impl ReaderDb {
 }
 
 /// Build a reader pool for a workspace handle's whole lifetime — once, not
-/// once per turn, so acquiring one never waits on the writer mutex a slow
-/// write elsewhere is holding. `pool_size` genuine
+/// once per turn, so acquiring one never waits behind a slow write on the
+/// writer. `pool_size` genuine
 /// [`WorkspaceDb::try_clone_reader`] clones, unless the writer already has
 /// a temp table (the CLI's piped `stdin`) a clone could not see, in which
 /// case every reader-routed tool shares the writer from the start. A clone
@@ -177,8 +178,8 @@ impl ReaderDb {
 /// aborting.
 pub async fn open_reader(shared_db: &SharedDb, pool_size: u32) -> ReaderDb {
     let pool_size = pool_size.max(1);
-    // One lock acquisition and one blocking-pool round trip for the temp
-    // check and every clone, instead of `pool_size + 1` separate ones:
+    // One step on the writer for the temp check and every clone, instead
+    // of `pool_size + 1` separate ones:
     // shortens how long a concurrent first-time open of this workspace
     // can overlap another one, and is simply less work.
     let outcome = with_db(shared_db, move |db| {

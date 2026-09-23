@@ -21,8 +21,7 @@ pub(crate) async fn show(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "ontology").await?;
-    let db = app.workspace_db(&id).await?;
-    let current = with_db(db, store::current).await?;
+    let current = app.read(&id, store::current).await?;
     let ontology = current.ok_or_else(|| ApiError::not_found("no ontology yet"))?;
     Ok(Json(serde_json::to_value(ontology)?))
 }
@@ -108,9 +107,8 @@ pub(crate) async fn versions(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "ontology_versions").await?;
-    let db = app.workspace_db(&id).await?;
     let limit = q.limit;
-    let rows = with_db(db, move |db| store::versions(db, limit)).await?;
+    let rows = app.read(&id, move |db| store::versions(db, limit)).await?;
     Ok(Json(serde_json::json!({ "versions": rows })))
 }
 
@@ -136,18 +134,18 @@ pub(crate) async fn version(
             None,
         )
         .await?;
-    let db = app.workspace_db(&id).await?;
     let against = q.against.unwrap_or(v.saturating_sub(1));
-    let (snapshot, older) = with_db(db, move |db| {
-        let snapshot = store::version(db, v)?;
-        let older = if against == 0 {
-            None
-        } else {
-            store::version(db, against)?
-        };
-        Ok((snapshot, older))
-    })
-    .await?;
+    let (snapshot, older) = app
+        .read(&id, move |db| {
+            let snapshot = store::version(db, v)?;
+            let older = if against == 0 {
+                None
+            } else {
+                store::version(db, against)?
+            };
+            Ok((snapshot, older))
+        })
+        .await?;
     let snapshot = snapshot.ok_or_else(|| ApiError::not_found("no such version"))?;
     let diff = older.map(|older| snapshot.diff(&older));
     Ok(Json(
@@ -265,10 +263,9 @@ pub(crate) async fn list_candidates(
     access
         .audit_read(&app, "list", "ontology_candidates")
         .await?;
-    let db = app.workspace_db(&id).await?;
     let rows = match q.status.as_deref() {
-        None | Some("pending") => with_db(db, candidates::pending).await?,
-        Some("low_support") => with_db(db, candidates::low_support).await?,
+        None | Some("pending") => app.read(&id, candidates::pending).await?,
+        Some("low_support") => app.read(&id, candidates::low_support).await?,
         Some(other) => {
             return Err(ApiError::bad_request(format!(
                 "status must be pending or low_support, not '{other}'"
@@ -417,13 +414,13 @@ pub(crate) async fn start_document_run(
     // Fail now, not in the background, when no model can be built.
     let extractor = quack_core::llm::chat_extractor(&app.config).await?;
     let embeddings = quack_core::llm::optional_embedding_model(&app.config).await?;
-    let db = app.workspace_db(id).await?;
-    let (cost, chunks, current) = with_db(std::sync::Arc::clone(&db), move |db| {
-        let cost = documents::estimate(db, &options)?;
-        let chunks = documents::sample_chunks(db, options.sample_chunks)?;
-        Ok((cost, chunks, store::current(db)?))
-    })
-    .await?;
+    let (cost, chunks, current) = app
+        .read(id, move |db| {
+            let cost = documents::estimate(db, &options)?;
+            let chunks = documents::sample_chunks(db, options.sample_chunks)?;
+            Ok((cost, chunks, store::current(db)?))
+        })
+        .await?;
     if chunks.is_empty() {
         return Err(ApiError::bad_request("no ready documents to sample"));
     }
@@ -437,6 +434,7 @@ pub(crate) async fn start_document_run(
             Some(serde_json::json!({ "documents": true, "cost": cost })),
         )
         .await?;
+    let db = app.workspace_db(id).await?;
     let spec = JobSpec::new(JobKind::Ontology, "ontology document pass")
         .workspace(id)
         .owner(Some(access.identity.user_id.clone()))

@@ -6,7 +6,7 @@ use quack_core::storage::control::Outcome;
 
 use crate::server::auth::{Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::state::{App, with_db};
+use crate::server::state::App;
 use quack_core::storage::workspace::WorkspaceDb;
 
 pub(crate) async fn list(
@@ -16,8 +16,7 @@ pub(crate) async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "tables").await?;
-    let db = app.workspace_db(&id).await?;
-    let tables = with_db(db, WorkspaceDb::list_tables).await?;
+    let tables = app.read(&id, WorkspaceDb::list_tables).await?;
     Ok(Json(serde_json::json!({ "tables": tables })))
 }
 
@@ -30,15 +29,15 @@ pub(crate) async fn describe(
     if name.starts_with("_quack_") {
         return Err(ApiError::not_found("no such table"));
     }
-    let db = app.workspace_db(&id).await?;
     let table = name.clone();
-    let described = with_db(db, move |db| {
-        if !db.list_tables()?.contains(&table) {
-            return Ok(None);
-        }
-        db.describe_table(&table).map(Some)
-    })
-    .await?;
+    let described = app
+        .read(&id, move |db| {
+            if !db.list_tables()?.contains(&table) {
+                return Ok(None);
+            }
+            db.describe_table(&table).map(Some)
+        })
+        .await?;
     let described = described.ok_or_else(|| ApiError::not_found("no such table"))?;
     // The table name is user content: it goes in the workspace detail,
     // not in control.db.

@@ -394,9 +394,12 @@ pub(crate) async fn execute_sql(
     access: &Access,
     statement: &str,
 ) -> ApiResult<SqlOutcome> {
-    let db = app.workspace_db(&access.workspace.id).await?;
     let sql = statement.to_owned();
-    let kind = with_db(Arc::clone(&db), move |db| db.classify_user_statement(&sql))
+    // Classifying parses the statement: a read, never in the writer's line.
+    let kind = app
+        .read(&access.workspace.id, move |db| {
+            db.classify_user_statement(&sql)
+        })
         .await
         .map_err(|e| ApiError::forbidden(e.message))?;
     let is_write = match kind {
@@ -425,6 +428,7 @@ pub(crate) async fn execute_sql(
     let sql = statement.to_owned();
     let max_rows = app.config.analysis.max_query_rows;
     let result = if is_write {
+        let db = app.workspace_db(&access.workspace.id).await?;
         let result = with_db(db, move |db| db.execute_query_capped(&sql, max_rows)).await;
         // Whatever ran might have created a temp object the check above
         // did not catch (a leading comment, a multi-statement batch);

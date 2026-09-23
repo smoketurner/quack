@@ -28,8 +28,7 @@ pub(crate) async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "documents").await?;
-    let db = app.workspace_db(&id).await?;
-    let docs = with_db(db, WorkspaceDb::list_documents).await?;
+    let docs = app.read(&id, WorkspaceDb::list_documents).await?;
     Ok(Json(serde_json::json!({ "documents": docs })))
 }
 
@@ -48,8 +47,7 @@ pub(crate) async fn show(
             None,
         )
         .await?;
-    let db = app.workspace_db(&id).await?;
-    let found = with_db(db, move |db| db.document(&doc)).await?;
+    let found = app.read(&id, move |db| db.document(&doc)).await?;
     let document = found.ok_or_else(|| ApiError::not_found("no such document"))?;
     Ok(Json(serde_json::to_value(document)?))
 }

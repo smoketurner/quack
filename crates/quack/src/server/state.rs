@@ -18,8 +18,7 @@ use quack_core::storage::control::{ControlPlane, random_bytes};
 
 /// A workspace's writer connection plus its reader, opened together so a
 /// reader is built once per workspace handle rather than once per turn (a
-/// turn acquiring one must never wait on the writer mutex a slow write
-/// elsewhere is holding).
+/// turn acquiring one must never wait behind a slow write on the writer).
 #[derive(Clone)]
 struct WorkspaceHandle {
     writer: SharedDb,
@@ -200,6 +199,22 @@ impl AppState {
     /// over [`Self::workspace_db`] so it never queues behind a write.
     pub(crate) async fn reader_db(&self, workspace_id: &str) -> ApiResult<ReaderDb> {
         Ok(self.workspace_handle(workspace_id).await?.reader)
+    }
+
+    /// Run a read on one of the workspace's reader connections, inside a
+    /// read-only transaction: it never waits for a write in progress, and
+    /// anything that would write is refused. Every read-only handler reads
+    /// through this; writes go to the writer through [`with_db`].
+    pub(crate) async fn read<T, F>(&self, workspace_id: &str, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&WorkspaceDb) -> quack_core::error::Result<T> + Send + 'static,
+    {
+        self.reader_db(workspace_id)
+            .await?
+            .with_db(f)
+            .await
+            .map_err(ApiError::from)
     }
 
     /// Start a browser session for the user and return its token.

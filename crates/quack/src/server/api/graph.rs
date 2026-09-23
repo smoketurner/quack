@@ -70,25 +70,25 @@ pub(crate) async fn search(
     let hops = q.hops.unwrap_or(2).max(1);
     let relation = q.relation.clone();
     let options = app.config.graph.options();
-    let db = app.workspace_db(&id).await?;
     let detail =
         serde_json::json!({ "entity": entity, "class": class, "relation": relation, "hops": hops });
-    let result = with_db(db, move |db| {
-        if let Some(entity) = entity {
-            let roots =
-                traverse::resolve_entry(db, &entity, class.as_deref(), embedding.as_deref())?;
-            return traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options);
-        }
-        let ontology = ontology_store::current(db)?;
-        traverse::by_class(
-            db,
-            ontology.as_ref(),
-            class.as_deref().unwrap_or_default(),
-            options.max_nodes,
-            &options,
-        )
-    })
-    .await?;
+    let result = app
+        .read(&id, move |db| {
+            if let Some(entity) = entity {
+                let roots =
+                    traverse::resolve_entry(db, &entity, class.as_deref(), embedding.as_deref())?;
+                return traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options);
+            }
+            let ontology = ontology_store::current(db)?;
+            traverse::by_class(
+                db,
+                ontology.as_ref(),
+                class.as_deref().unwrap_or_default(),
+                options.max_nodes,
+                &options,
+            )
+        })
+        .await?;
     access
         .audit(&app, "graph", None, Outcome::Allowed, Some(detail))
         .await?;
@@ -118,18 +118,18 @@ pub(crate) async fn path(
     let b = query_embedding_for(&app, &to).await?;
     let max_hops = q.max_hops.unwrap_or(4).max(1);
     let options = app.config.graph.options();
-    let db = app.workspace_db(&id).await?;
     let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
     let (from_label, to_label) = (from.clone(), to.clone());
-    let result = with_db(db, move |db| {
-        let from_nodes = traverse::resolve_entry(db, &from_label, None, a.as_deref())?;
-        let to_nodes = traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
-        match (from_nodes.first(), to_nodes.first()) {
-            (Some(a), Some(b)) => traverse::path(db, a, b, max_hops, &options),
-            _ => Ok(GraphResult::default()),
-        }
-    })
-    .await?;
+    let result = app
+        .read(&id, move |db| {
+            let from_nodes = traverse::resolve_entry(db, &from_label, None, a.as_deref())?;
+            let to_nodes = traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
+            match (from_nodes.first(), to_nodes.first()) {
+                (Some(a), Some(b)) => traverse::path(db, a, b, max_hops, &options),
+                _ => Ok(GraphResult::default()),
+            }
+        })
+        .await?;
     access
         .audit(&app, "graph", None, Outcome::Allowed, Some(detail))
         .await?;
@@ -143,8 +143,7 @@ pub(crate) async fn status(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "graph_status").await?;
-    let db = app.workspace_db(&id).await?;
-    let status = with_db(db, graph_store::status).await?;
+    let status = app.read(&id, graph_store::status).await?;
     Ok(Json(serde_json::to_value(status)?))
 }
 
@@ -220,13 +219,14 @@ pub(crate) async fn start_extraction(
         )
     })?;
     let db = app.workspace_db(id).await?;
-    let (ontology, provisional) = with_db(Arc::clone(&db), |db| {
-        Ok((
-            ontology_store::current(db)?,
-            ontology_store::current_is_auto_accepted(db)?,
-        ))
-    })
-    .await?;
+    let (ontology, provisional) = app
+        .read(id, |db| {
+            Ok((
+                ontology_store::current(db)?,
+                ontology_store::current_is_auto_accepted(db)?,
+            ))
+        })
+        .await?;
     let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
     let options = app.config.graph.options();
     let embeddings = llm::optional_embedding_model(&app.config).await?;
@@ -239,7 +239,7 @@ pub(crate) async fn start_extraction(
         Vec::new()
     };
     let chunks = if do_documents {
-        with_db(Arc::clone(&db), move |db| extract::chunks(db, sample)).await?
+        app.read(id, move |db| extract::chunks(db, sample)).await?
     } else {
         Vec::new()
     };
@@ -519,8 +519,7 @@ pub(crate) async fn merges(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "list", "graph_merges").await?;
-    let db = app.workspace_db(&id).await?;
-    let pending = with_db(db, resolve::pending).await?;
+    let pending = app.read(&id, resolve::pending).await?;
     Ok(Json(serde_json::json!({ "merges": pending })))
 }
 
