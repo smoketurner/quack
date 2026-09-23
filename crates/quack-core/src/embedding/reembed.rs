@@ -9,44 +9,42 @@
 //! retyped first, which drops every stored vector: the operator asked for
 //! exactly that by running it.
 
-use rig::embeddings::EmbeddingModel;
-use tokio_util::sync::CancellationToken;
+use std::fmt;
+use std::time::Instant;
 
-use super::{DocumentInput, Embedder};
+use rig::embeddings::EmbeddingModel;
+
+use super::{Dimension, Embedder, EmbeddingStatus, Input, Profile, StaleVectors};
 use crate::error::{Error, Result};
-use crate::graph::resolve;
-use crate::storage::workspace::EmbeddingStatus;
+use crate::graph::{resolve, store as graph_store};
+use crate::progress::{ChunkDone, RunControl};
 use crate::storage::writer::Writer;
 
-/// Which vectors a run is working on.
+/// A change of vector width: the columns hold `stored`-wide vectors and the
+/// configured model makes `configured`-wide ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Stage {
-    Chunks,
-    Nodes,
-}
-
-/// Where a run is, after each batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Progress {
-    pub stage: Stage,
-    pub done: u32,
-    /// The stage's count when the run started; chunks ingested meanwhile
-    /// are embedded by their own ingest.
-    pub total: u32,
+pub struct Retype {
+    pub stored: Dimension,
+    pub configured: Dimension,
 }
 
 /// What a run will do, for the caller to show before starting it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Plan {
-    /// Chunks with a missing or stale vector.
+    /// The profile the vectors will be made under; `None` without a model.
+    pub profile: Option<Profile>,
+    /// The stale chunk vectors, by the profile they were made under.
+    pub stale: Vec<StaleVectors>,
+    /// Chunks with no vector.
+    pub missing_chunks: u64,
+    /// Chunks with a missing or stale vector (every chunk when the width
+    /// changes).
     pub chunks: u64,
     /// Graph nodes with a stale label vector. Nodes never embedded get
     /// one too, as graph resolution would give them.
     pub nodes: u64,
-    /// `(stored, configured)` widths when the columns must be retyped,
-    /// dropping every stored vector.
-    pub retype: Option<(u32, u32)>,
+    /// When the columns must be retyped, dropping every stored vector.
+    pub retype: Option<Retype>,
 }
 
 impl Plan {
@@ -57,16 +55,23 @@ impl Plan {
             .profile
             .as_ref()
             .filter(|p| p.dimension != status.column_dimension)
-            .map(|p| (status.column_dimension, p.dimension));
+            .map(|p| Retype {
+                stored: status.column_dimension,
+                configured: p.dimension,
+            });
+        let rewritten = if retype.is_some() {
+            status.current_chunks
+        } else {
+            0
+        };
         Self {
+            profile: status.profile.clone(),
+            stale: status.stale.clone(),
+            missing_chunks: status.missing_chunks,
             chunks: status
                 .stale_chunks()
                 .saturating_add(status.missing_chunks)
-                .saturating_add(if retype.is_some() {
-                    status.current_chunks
-                } else {
-                    0
-                }),
+                .saturating_add(rewritten),
             nodes: status.stale_nodes,
             retype,
         }
@@ -79,18 +84,109 @@ impl Plan {
     }
 }
 
+/// The plan as the operator reads it before agreeing to it.
+impl fmt::Display for Plan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(Retype { stored, configured }) = self.retype {
+            writeln!(
+                f,
+                "The workspace stores {stored}-dimensional vectors and the configured model \
+                 makes {configured}-dimensional ones: every stored vector is dropped first, and \
+                 chunks are found by keyword search until they are re-embedded."
+            )?;
+        }
+        for group in &self.stale {
+            writeln!(
+                f,
+                "{} chunks were embedded with {}.",
+                group.chunks,
+                group.made_with()
+            )?;
+        }
+        if self.missing_chunks > 0 {
+            writeln!(f, "{} chunks have no vector.", self.missing_chunks)?;
+        }
+        write!(
+            f,
+            "Re-embed {} chunks and {} graph node labels",
+            self.chunks, self.nodes
+        )?;
+        match &self.profile {
+            Some(profile) => write!(f, " with {}.", profile.describe()),
+            None => f.write_str("."),
+        }
+    }
+}
+
 /// What a run did.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Summary {
+    /// The profile the vectors were made under.
+    pub profile: Profile,
     /// The width the columns had, when they were retyped.
-    pub retyped_from: Option<u32>,
+    pub retyped_from: Option<Dimension>,
     pub chunks: u32,
     pub nodes: u32,
 }
 
+impl fmt::Display for Summary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(from) = self.retyped_from {
+            writeln!(f, "Dropped the {from}-dimensional vectors.")?;
+        }
+        write!(
+            f,
+            "Re-embedded {} chunks and {} graph node labels with {}.",
+            self.chunks,
+            self.nodes,
+            self.profile.describe()
+        )
+    }
+}
+
+/// The workspace once it is ready to take vectors of the embedder's width.
+struct Prepared {
+    status: EmbeddingStatus,
+    retyped_from: Option<Dimension>,
+    nodes: u32,
+}
+
+impl Prepared {
+    /// Check the workspace runs under `embedder`'s profile, retype its
+    /// vector columns when the width changed, and count what there is to
+    /// do.
+    async fn load<M: EmbeddingModel>(db: &Writer, embedder: &Embedder<M>) -> Result<Self> {
+        let fingerprint = embedder.profile().fingerprint();
+        let dimension = embedder.profile().dimension;
+        db.run(move |db| {
+            if db.embedding_fingerprint() != Some(&fingerprint) {
+                return Err(Error::Config(
+                    "the workspace was opened under a different embedding profile than the \
+                     model re-embedding it; reopen it with the current configuration"
+                        .into(),
+                ));
+            }
+            let column = db.embedding_dimension();
+            let retyped_from = if column == dimension {
+                None
+            } else {
+                tracing::info!(from = %column, to = %dimension, "retyping the vector columns");
+                db.retype_vectors(dimension)?;
+                Some(column)
+            };
+            Ok(Self {
+                status: db.embedding_status()?,
+                retyped_from,
+                nodes: graph_store::count_nodes_needing_embedding(db)?,
+            })
+        })
+        .await
+    }
+}
+
 /// Re-embed every chunk and node whose vector is missing or stale, in
-/// batches of `batch_size`. `progress` hears after every batch; `cancel`
-/// stops between batches with [`Error::Cancelled`], keeping what was done.
+/// batches of `batch_size`. Progress counts chunks and node labels
+/// together; a cancel stops between batches, keeping what was done.
 ///
 /// # Errors
 ///
@@ -101,59 +197,39 @@ pub async fn run<M: EmbeddingModel>(
     db: &Writer,
     embedder: &Embedder<M>,
     batch_size: u32,
-    progress: &(dyn Fn(Progress) + Sync),
-    cancel: Option<&CancellationToken>,
+    control: RunControl<'_>,
 ) -> Result<Summary> {
-    let fingerprint = embedder.profile().fingerprint();
-    let dimension = embedder.profile().dimension;
-    let (status, retyped_from) = db
-        .run(move |db| {
-            if db.embedding_fingerprint() != Some(fingerprint.as_str()) {
-                return Err(Error::Config(
-                    "the workspace was opened under a different embedding profile than the \
-                     model re-embedding it; reopen it with the current configuration"
-                        .into(),
-                ));
-            }
-            let status = db.embedding_status()?;
-            let column = status.column_dimension;
-            if column == dimension {
-                return Ok((status, None));
-            }
-            tracing::info!(from = column, to = dimension, "retyping the vector columns");
-            db.retype_vectors(dimension)?;
-            Ok((db.embedding_status()?, Some(column)))
-        })
-        .await?;
-    let mut summary = Summary {
+    let started = Instant::now();
+    let Prepared {
+        status,
         retyped_from,
-        ..Summary::default()
-    };
-
-    let total = u32::try_from(status.stale_chunks().saturating_add(status.missing_chunks))
+        nodes,
+    } = Prepared::load(db, embedder).await?;
+    let chunk_total = u32::try_from(status.stale_chunks().saturating_add(status.missing_chunks))
         .unwrap_or(u32::MAX);
+    let total = chunk_total.saturating_add(nodes);
     let batch = batch_size.max(1);
-    progress(Progress {
-        stage: Stage::Chunks,
-        done: 0,
-        total,
-    });
+    let mut summary = Summary {
+        profile: embedder.profile().clone(),
+        retyped_from,
+        chunks: 0,
+        nodes: 0,
+    };
     loop {
-        if cancel.is_some_and(CancellationToken::is_cancelled) {
-            return Err(Error::Cancelled);
-        }
+        control.check()?;
+        let batch_started = Instant::now();
         let pending = db.run(move |db| db.chunks_needing_embedding(batch)).await?;
         if pending.is_empty() {
             break;
         }
-        let inputs: Vec<DocumentInput> = pending
+        let inputs: Vec<Input> = pending
             .iter()
-            .map(|chunk| DocumentInput {
+            .map(|chunk| Input::Document {
                 title: chunk.heading.clone(),
                 text: chunk.content.clone(),
             })
             .collect();
-        let vectors = embedder.documents(&inputs).await?;
+        let vectors = embedder.embed(&inputs).await?;
         let count = u32::try_from(pending.len()).unwrap_or(u32::MAX);
         db.run(move |db| {
             db.write_transaction(|db| {
@@ -165,34 +241,42 @@ pub async fn run<M: EmbeddingModel>(
         })
         .await?;
         summary.chunks = summary.chunks.saturating_add(count);
-        progress(Progress {
-            stage: Stage::Chunks,
+        (control.progress)(ChunkDone {
             done: summary.chunks,
             total: total.max(summary.chunks),
+            failed: 0,
+            took: batch_started.elapsed(),
+            elapsed: started.elapsed(),
         });
     }
 
-    let nodes_total = u32::try_from(status.stale_nodes).unwrap_or(u32::MAX);
-    progress(Progress {
-        stage: Stage::Nodes,
-        done: 0,
-        total: nodes_total,
-    });
-    let on_nodes = |done: u32| {
-        progress(Progress {
-            stage: Stage::Nodes,
-            done,
-            total: nodes_total.max(done),
+    // Node batches report on the same scale, after the chunks.
+    let chunks_done = summary.chunks;
+    let on_nodes = |done: ChunkDone| {
+        let done_total = chunks_done.saturating_add(done.done);
+        (control.progress)(ChunkDone {
+            done: done_total,
+            total: total.max(done_total),
+            elapsed: started.elapsed(),
+            ..done
         });
     };
-    summary.nodes = resolve::embed_nodes(db, embedder, &on_nodes, cancel).await?;
+    summary.nodes = resolve::embed_nodes(
+        db,
+        embedder,
+        RunControl {
+            progress: &on_nodes,
+            cancel: control.cancel,
+        },
+    )
+    .await?;
     Ok(summary)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embedding::{Profile, Prompts};
+    use crate::embedding::Prompts;
 
     fn status(
         profile_dim: Option<u32>,
@@ -202,14 +286,14 @@ mod tests {
         stale: u64,
     ) -> EmbeddingStatus {
         EmbeddingStatus {
-            profile: profile_dim.map(|d| Profile::new("m", d, Prompts::default())),
-            column_dimension: column,
+            profile: profile_dim.map(|d| Profile::new("m", Dimension::new(d), Prompts::default())),
+            column_dimension: Dimension::new(column),
             current_chunks: current,
             missing_chunks: missing,
             stale: if stale == 0 {
                 Vec::new()
             } else {
-                vec![crate::storage::workspace::StaleVectors {
+                vec![StaleVectors {
                     profile: None,
                     chunks: stale,
                 }]
@@ -224,8 +308,48 @@ mod tests {
         assert_eq!(same.chunks, 5);
         assert_eq!(same.retype, None);
         let wider = Plan::from_status(&status(Some(8), 4, 0, 2, 3));
-        assert_eq!(wider.retype, Some((4, 8)));
+        assert_eq!(
+            wider.retype,
+            Some(Retype {
+                stored: Dimension::new(4),
+                configured: Dimension::new(8)
+            })
+        );
         assert_eq!(wider.chunks, 5);
         assert!(Plan::from_status(&status(Some(4), 4, 10, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn the_plan_reads_as_the_old_profile_the_missing_and_a_width_change() {
+        let text = Plan::from_status(&EmbeddingStatus {
+            profile: Some(Profile::new(
+                "embeddinggemma",
+                Dimension::new(1024),
+                Prompts::default(),
+            )),
+            column_dimension: Dimension::new(768),
+            current_chunks: 0,
+            missing_chunks: 2,
+            stale: vec![StaleVectors {
+                profile: Some(Profile::new(
+                    "nomic-embed-text",
+                    Dimension::new(768),
+                    Prompts::default(),
+                )),
+                chunks: 40,
+            }],
+            stale_nodes: 3,
+        })
+        .to_string();
+        assert_eq!(
+            text,
+            "The workspace stores 768-dimensional vectors and the configured model makes \
+             1024-dimensional ones: every stored vector is dropped first, and chunks are found \
+             by keyword search until they are re-embedded.\n\
+             40 chunks were embedded with nomic-embed-text (768 dimensions, no prefixes).\n\
+             2 chunks have no vector.\n\
+             Re-embed 42 chunks and 3 graph node labels with embeddinggemma (1024 dimensions, \
+             no prefixes)."
+        );
     }
 }

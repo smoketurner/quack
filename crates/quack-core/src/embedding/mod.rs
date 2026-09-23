@@ -1,11 +1,11 @@
 //! What quack embeds, and how.
 //!
-//! Every embedding call names its role: a search [`Embedder::query`], the
-//! [`Embedder::documents`] a query retrieves, or text compared with text of
-//! its own kind ([`Embedder::similar`]: entity labels, ontology names). Most
-//! embedding models were trained with a different input prefix for each
-//! role and lose quality without it; [`presets`] carries the prefixes each
-//! family's authors specify, and `[embedding]` in the config overrides them.
+//! Every text is embedded as an [`Input`], which names its role: a search
+//! query, a document chunk a query retrieves, or text compared with text of
+//! its own kind (entity labels, ontology names). Most embedding models were
+//! trained with a different input prefix for each role and lose quality
+//! without it; [`presets`] carries the prefixes each family's authors
+//! specify, and `[embedding]` in the config overrides them.
 //!
 //! The model, its vector width, and those prefixes together are a
 //! [`Profile`]. Vectors made under one profile are not comparable with
@@ -15,14 +15,21 @@
 
 pub mod presets;
 pub mod reembed;
+mod status;
+mod vector;
 
+use std::slice;
 use std::sync::Arc;
 
 use rig::embeddings::EmbeddingModel;
 use serde::{Deserialize, Serialize};
 
+pub use status::{EmbeddingStatus, StaleVectors};
+pub use vector::{Dimension, Fingerprint, Vector, WidthMismatch};
+
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::priority::{Priority, with_priority};
 use crate::storage::control::sha256_hex;
 
 /// The placeholder a document prefix may carry for the chunk's title.
@@ -31,6 +38,18 @@ pub const TITLE_PLACEHOLDER: &str = "{title}";
 /// What fills [`TITLE_PLACEHOLDER`] when a chunk has no heading, as
 /// `EmbeddingGemma`'s card specifies.
 const NO_TITLE: &str = "none";
+
+/// A text to embed, in the role it is embedded for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Input {
+    /// A search query, retrieving documents.
+    Query(String),
+    /// A document chunk a query retrieves, under its heading.
+    Document { title: Option<String>, text: String },
+    /// Text compared with text of its own kind: entity labels, a name
+    /// looked up among them, ontology names.
+    Similarity(String),
+}
 
 /// The prefix put before each role's input. Empty means none.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,55 +67,28 @@ impl Prompts {
         self.query.is_empty() && self.document.is_empty() && self.similarity.is_empty()
     }
 
-    fn query_input(&self, text: &str) -> String {
-        format!("{}{text}", self.query)
-    }
-
-    fn similarity_input(&self, text: &str) -> String {
-        format!("{}{text}", self.similarity)
-    }
-
-    /// A document's input. A prefix with a title slot gets the title
-    /// there; otherwise the title leads the text, so retrieval still sees
-    /// which section a chunk came from.
-    fn document_input(&self, document: &DocumentInput) -> String {
-        if self.document.contains(TITLE_PLACEHOLDER) {
-            let title = document
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .unwrap_or(NO_TITLE);
-            format!(
-                "{}{}",
-                self.document.replace(TITLE_PLACEHOLDER, title),
-                document.text
-            )
-        } else {
-            match &document.title {
-                Some(title) => format!("{}{title}\n\n{}", self.document, document.text),
-                None => format!("{}{}", self.document, document.text),
+    /// The text the model receives for `input`. A document prefix with a
+    /// title slot gets the title there; otherwise the title leads the text,
+    /// so retrieval still sees which section a chunk came from.
+    fn render(&self, input: &Input) -> String {
+        match input {
+            Input::Query(text) => format!("{}{text}", self.query),
+            Input::Similarity(text) => format!("{}{text}", self.similarity),
+            Input::Document { title, text } if self.document.contains(TITLE_PLACEHOLDER) => {
+                let title = title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(NO_TITLE);
+                format!("{}{text}", self.document.replace(TITLE_PLACEHOLDER, title))
             }
+            Input::Document {
+                title: Some(title),
+                text,
+            } => format!("{}{title}\n\n{text}", self.document),
+            Input::Document { title: None, text } => format!("{}{text}", self.document),
         }
     }
-}
-
-/// What a text is embedded as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Role {
-    /// A search query, retrieving documents.
-    Query,
-    /// A document a query retrieves.
-    Document,
-    /// Text compared with text of its own kind: labels, names.
-    Similarity,
-}
-
-/// A document chunk to embed: its text and the heading it sits under.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentInput {
-    pub title: Option<String>,
-    pub text: String,
 }
 
 /// Where a profile's prompts came from.
@@ -110,20 +102,55 @@ pub enum PromptSource {
     Unknown,
 }
 
+/// The prompts a model runs with, and where they came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPrompts {
+    pub prompts: Prompts,
+    pub source: PromptSource,
+}
+
+impl ResolvedPrompts {
+    /// The prompts `model` runs with: its family's, with each role set in
+    /// `[embedding]` taking precedence.
+    #[must_use]
+    pub fn for_model(config: &Config, model: &str) -> Self {
+        let family = presets::Family::of(model);
+        let mut prompts = family.map(presets::Family::prompts).unwrap_or_default();
+        let overrides = &config.embedding;
+        let mut overridden = false;
+        for (value, slot) in [
+            (&overrides.query_prefix, &mut prompts.query),
+            (&overrides.document_prefix, &mut prompts.document),
+            (&overrides.similarity_prefix, &mut prompts.similarity),
+        ] {
+            if let Some(value) = value {
+                value.clone_into(slot);
+                overridden = true;
+            }
+        }
+        let source = match (overridden, family) {
+            (true, _) => PromptSource::Config,
+            (false, Some(family)) => PromptSource::Family(family),
+            (false, None) => PromptSource::Unknown,
+        };
+        Self { prompts, source }
+    }
+}
+
 /// Everything that decides what vector a text becomes. Two vectors are
 /// comparable only when their profiles are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     /// The model as configured, with Ollama's implicit `:latest` removed.
     pub model: String,
-    pub dimension: u32,
+    pub dimension: Dimension,
     pub prompts: Prompts,
 }
 
 impl Profile {
     /// A profile over `model`, its name normalized.
     #[must_use]
-    pub fn new(model: &str, dimension: u32, prompts: Prompts) -> Self {
+    pub fn new(model: &str, dimension: Dimension, prompts: Prompts) -> Self {
         Self {
             model: model.strip_suffix(":latest").unwrap_or(model).to_owned(),
             dimension,
@@ -147,16 +174,20 @@ impl Profile {
                 model.provider_name
             )));
         };
-        let (prompts, _) = prompts_for(config, model.model);
-        Ok(Some(Self::new(model.model, dimension, prompts)))
+        let resolved = ResolvedPrompts::for_model(config, model.model);
+        Ok(Some(Self::new(
+            model.model,
+            Dimension::new(dimension),
+            resolved.prompts,
+        )))
     }
 
     /// The identity recorded beside each stored vector: the SHA-256 of
     /// the profile's JSON, whose field order is fixed.
     #[must_use]
-    pub fn fingerprint(&self) -> String {
+    pub fn fingerprint(&self) -> Fingerprint {
         let json = serde_json::to_vec(self).unwrap_or_default();
-        sha256_hex(&json)
+        Fingerprint::new(sha256_hex(&json))
     }
 
     /// One line for notes: `embeddinggemma (768 dimensions, with prefixes)`.
@@ -171,33 +202,7 @@ impl Profile {
     }
 }
 
-/// The prompts `model` runs with, and where they came from: its family's,
-/// with each role set in `[embedding]` taking precedence.
-#[must_use]
-pub fn prompts_for(config: &Config, model: &str) -> (Prompts, PromptSource) {
-    let family = presets::family(model);
-    let mut prompts = family.map(presets::Family::prompts).unwrap_or_default();
-    let overrides = &config.embedding;
-    let mut overridden = false;
-    for (value, slot) in [
-        (&overrides.query_prefix, &mut prompts.query),
-        (&overrides.document_prefix, &mut prompts.document),
-        (&overrides.similarity_prefix, &mut prompts.similarity),
-    ] {
-        if let Some(value) = value {
-            value.clone_into(slot);
-            overridden = true;
-        }
-    }
-    let source = match (overridden, family) {
-        (true, _) => PromptSource::Config,
-        (false, Some(family)) => PromptSource::Family(family),
-        (false, None) => PromptSource::Unknown,
-    };
-    (prompts, source)
-}
-
-/// An embedding model under a [`Profile`]: every call names its role, and
+/// An embedding model under a [`Profile`]: every input names its role, and
 /// every vector that comes back is checked against the profile's width.
 #[derive(Clone)]
 pub struct Embedder<M> {
@@ -225,113 +230,71 @@ impl<M: EmbeddingModel> Embedder<M> {
         &self.model
     }
 
-    /// One text's vector in `role` (a document without a title).
+    /// One input's vector for a lookup someone is waiting on (a search, an
+    /// entity name): its model request goes ahead of background work.
     ///
     /// # Errors
     ///
     /// Returns an error when the model fails or answers with the wrong
     /// width.
-    pub async fn one(&self, role: Role, text: &str) -> Result<Vec<f32>> {
-        let prompts = &self.profile.prompts;
-        let input = match role {
-            Role::Query => prompts.query_input(text),
-            Role::Document => prompts.document_input(&DocumentInput {
-                title: None,
-                text: text.to_owned(),
-            }),
-            Role::Similarity => prompts.similarity_input(text),
-        };
-        let mut vectors = self.embed(vec![input]).await?;
+    pub async fn embed_interactive(&self, input: &Input) -> Result<Vector> {
+        with_priority(Priority::Interactive, self.embed_one(input)).await
+    }
+
+    /// One input's vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model fails or answers with the wrong
+    /// width.
+    pub async fn embed_one(&self, input: &Input) -> Result<Vector> {
+        let mut vectors = self.embed(slice::from_ref(input)).await?;
         vectors
             .pop()
             .ok_or_else(|| Error::Embedding("the model returned no embedding".into()))
     }
 
-    /// A search query's vector.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the model fails or answers with the wrong
-    /// width.
-    pub async fn query(&self, text: &str) -> Result<Vec<f32>> {
-        self.one(Role::Query, text).await
-    }
-
-    /// Document chunks' vectors, in order.
+    /// The inputs' vectors, in order.
     ///
     /// # Errors
     ///
     /// Returns an error when the model fails or answers with the wrong
     /// width or count.
-    pub async fn documents(&self, documents: &[DocumentInput]) -> Result<Vec<Vec<f32>>> {
-        let inputs = documents
-            .iter()
-            .map(|d| self.profile.prompts.document_input(d))
-            .collect();
-        self.embed(inputs).await
-    }
-
-    /// Vectors for texts compared with each other rather than retrieved:
-    /// entity labels, a name looked up among them, ontology names.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the model fails or answers with the wrong
-    /// width or count.
-    pub async fn similar(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let inputs = texts
-            .iter()
-            .map(|t| self.profile.prompts.similarity_input(t))
-            .collect();
-        self.embed(inputs).await
-    }
-
-    async fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    pub async fn embed(&self, inputs: &[Input]) -> Result<Vec<Vector>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let expected = inputs.len();
+        let texts: Vec<String> = inputs
+            .iter()
+            .map(|input| self.profile.prompts.render(input))
+            .collect();
         #[expect(
             clippy::disallowed_methods,
-            reason = "the one place a raw embedding call is made: every caller goes through a role"
+            reason = "the one place a raw embedding call is made: every caller goes through an Input"
         )]
         let embeddings = self
             .model
-            .embed_texts(inputs)
+            .embed_texts(texts)
             .await
             .map_err(|e| Error::Embedding(e.to_string()))?;
-        if embeddings.len() != expected {
+        if embeddings.len() != inputs.len() {
             return Err(Error::Embedding(format!(
-                "{} returned {} embeddings for {expected} inputs",
+                "{} returned {} embeddings for {} inputs",
                 self.profile.model,
-                embeddings.len()
+                embeddings.len(),
+                inputs.len()
             )));
         }
-        let width = usize::try_from(self.profile.dimension).unwrap_or(usize::MAX);
         embeddings
             .into_iter()
             .map(|embedding| {
-                if embedding.vec.len() != width {
-                    return Err(width_mismatch(
-                        &self.profile.model,
-                        embedding.vec.len(),
-                        self.profile.dimension,
-                    ));
-                }
                 #[expect(clippy::cast_possible_truncation, reason = "vectors are stored as f32")]
-                Ok(embedding.vec.into_iter().map(|v| v as f32).collect())
+                let values = embedding.vec.into_iter().map(|v| v as f32).collect();
+                Vector::new(values, self.profile.dimension)
+                    .map_err(|mismatch| mismatch.for_model(&self.profile.model))
             })
             .collect()
     }
-}
-
-/// The error for a model whose vectors are not the configured width.
-#[must_use]
-pub fn width_mismatch(model: &str, returned: usize, configured: u32) -> Error {
-    Error::Config(format!(
-        "{model} returned {returned}-dimensional vectors but its provider's \
-         embedding_dimension is {configured}; set embedding_dimension = {returned}"
-    ))
 }
 
 #[cfg(test)]
@@ -391,37 +354,35 @@ mod tests {
             inputs: Arc::clone(&inputs),
         };
         (
-            Embedder::new(model, Profile::new("m", dimension, prompts)),
+            Embedder::new(model, Profile::new("m", Dimension::new(dimension), prompts)),
             inputs,
         )
     }
 
     fn gemma() -> Prompts {
-        presets::family("embeddinggemma").unwrap().prompts()
+        presets::Family::of("embeddinggemma").unwrap().prompts()
+    }
+
+    fn document(title: Option<&str>, text: &str) -> Input {
+        Input::Document {
+            title: title.map(str::to_owned),
+            text: text.to_owned(),
+        }
     }
 
     #[tokio::test]
     async fn each_role_gets_its_prefix() {
         let (embedder, inputs) = recording(4, 4, gemma());
-        embedder.query("storm damage").await.unwrap();
         embedder
-            .documents(&[
-                DocumentInput {
-                    title: Some("Scales".into()),
-                    text: "EF0 to EF5".into(),
-                },
-                DocumentInput {
-                    title: None,
-                    text: "untitled".into(),
-                },
-                DocumentInput {
-                    title: Some("  ".into()),
-                    text: "blank heading".into(),
-                },
+            .embed(&[
+                Input::Query("storm damage".into()),
+                document(Some("Scales"), "EF0 to EF5"),
+                document(None, "untitled"),
+                document(Some("  "), "blank heading"),
+                Input::Similarity("Acme (company)".into()),
             ])
             .await
             .unwrap();
-        embedder.similar(&["Acme (company)".into()]).await.unwrap();
         assert_eq!(
             *inputs.lock().unwrap(),
             [
@@ -436,24 +397,17 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_title_slot_the_heading_leads_the_text() {
-        let prompts = presets::family("nomic-embed-text").unwrap().prompts();
+        let prompts = presets::Family::of("nomic-embed-text").unwrap().prompts();
         let (embedder, inputs) = recording(4, 4, prompts);
         embedder
-            .documents(&[DocumentInput {
-                title: Some("Scales".into()),
-                text: "EF0".into(),
-            }])
+            .embed_one(&document(Some("Scales"), "EF0"))
             .await
             .unwrap();
         let (plain, plain_inputs) = recording(4, 4, Prompts::default());
         plain
-            .documents(&[DocumentInput {
-                title: Some("Scales".into()),
-                text: "EF0".into(),
-            }])
+            .embed(&[document(Some("Scales"), "EF0"), Input::Query("q".into())])
             .await
             .unwrap();
-        plain.query("q").await.unwrap();
         assert_eq!(*inputs.lock().unwrap(), ["search_document: Scales\n\nEF0"]);
         assert_eq!(*plain_inputs.lock().unwrap(), ["Scales\n\nEF0", "q"]);
     }
@@ -461,45 +415,56 @@ mod tests {
     #[tokio::test]
     async fn a_vector_of_the_wrong_width_is_a_config_error_naming_both() {
         let (embedder, _) = recording(768, 1024, Prompts::default());
-        let err = embedder.query("q").await.unwrap_err().to_string();
+        let err = embedder
+            .embed_one(&Input::Query("q".into()))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("768-dimensional"), "{err}");
         assert!(err.contains("embedding_dimension is 1024"), "{err}");
         assert!(err.contains("embedding_dimension = 768"), "{err}");
     }
 
     #[tokio::test]
-    async fn no_inputs_make_no_call() {
+    async fn vectors_come_back_at_the_profile_width() {
         let (embedder, inputs) = recording(4, 4, Prompts::default());
-        assert!(embedder.similar(&[]).await.unwrap().is_empty());
-        assert!(inputs.lock().unwrap().is_empty());
+        assert!(embedder.embed(&[]).await.unwrap().is_empty());
+        assert!(inputs.lock().unwrap().is_empty(), "no inputs, no call");
+        let vector = embedder
+            .embed_one(&Input::Similarity("a".into()))
+            .await
+            .unwrap();
+        assert_eq!(vector.dimension(), Dimension::new(4));
     }
 
     #[test]
     fn profiles_differ_by_any_part_and_ignore_latest() {
-        let base = Profile::new("embeddinggemma:latest", 768, gemma());
+        let d768 = Dimension::new(768);
+        let base = Profile::new("embeddinggemma:latest", d768, gemma());
         assert_eq!(base.model, "embeddinggemma");
         assert_eq!(
             base.fingerprint(),
-            Profile::new("embeddinggemma", 768, gemma()).fingerprint()
+            Profile::new("embeddinggemma", d768, gemma()).fingerprint()
         );
         for other in [
-            Profile::new("embeddinggemma", 768, Prompts::default()),
-            Profile::new("embeddinggemma", 512, gemma()),
-            Profile::new("embeddinggemma:300m-qat-q4_0", 768, gemma()),
+            Profile::new("embeddinggemma", d768, Prompts::default()),
+            Profile::new("embeddinggemma", Dimension::new(512), gemma()),
+            Profile::new("embeddinggemma:300m-qat-q4_0", d768, gemma()),
         ] {
             assert_ne!(base.fingerprint(), other.fingerprint(), "{other:?}");
         }
-        assert_eq!(base.fingerprint().len(), 64);
+        assert_eq!(base.fingerprint().as_str().len(), 64);
     }
 
     #[test]
     fn describe_says_whether_prefixes_apply() {
+        let four = Dimension::new(4);
         assert_eq!(
-            Profile::new("m", 4, Prompts::default()).describe(),
+            Profile::new("m", four, Prompts::default()).describe(),
             "m (4 dimensions, no prefixes)"
         );
         assert_eq!(
-            Profile::new("m", 4, gemma()).describe(),
+            Profile::new("m", four, gemma()).describe(),
             "m (4 dimensions, with prefixes)"
         );
     }
@@ -511,26 +476,29 @@ mod tests {
     #[test]
     fn config_overrides_one_role_and_keeps_the_family_for_the_rest() {
         let base = "[general]\nembedding_model = \"o/embeddinggemma\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 768\n";
-        let (prompts, source) = prompts_for(&config(base), "embeddinggemma");
-        assert_eq!(prompts, gemma());
-        assert!(matches!(source, PromptSource::Family(f) if f.name == "EmbeddingGemma"));
+        let resolved = ResolvedPrompts::for_model(&config(base), "embeddinggemma");
+        assert_eq!(resolved.prompts, gemma());
+        assert!(matches!(resolved.source, PromptSource::Family(f) if f.name == "EmbeddingGemma"));
 
         let with =
             format!("{base}[embedding]\nquery_prefix = \"task: question answering | query: \"\n");
-        let (prompts, source) = prompts_for(&config(&with), "embeddinggemma");
-        assert_eq!(prompts.query, "task: question answering | query: ");
-        assert_eq!(prompts.document, gemma().document);
-        assert_eq!(source, PromptSource::Config);
+        let resolved = ResolvedPrompts::for_model(&config(&with), "embeddinggemma");
+        assert_eq!(resolved.prompts.query, "task: question answering | query: ");
+        assert_eq!(resolved.prompts.document, gemma().document);
+        assert_eq!(resolved.source, PromptSource::Config);
 
         let off = format!(
             "{base}[embedding]\nquery_prefix = \"\"\ndocument_prefix = \"\"\nsimilarity_prefix = \"\"\n"
         );
-        let (prompts, _) = prompts_for(&config(&off), "embeddinggemma");
-        assert!(prompts.is_empty());
+        assert!(
+            ResolvedPrompts::for_model(&config(&off), "embeddinggemma")
+                .prompts
+                .is_empty()
+        );
 
-        let (prompts, source) = prompts_for(&config(base), "my-embedder");
-        assert!(prompts.is_empty());
-        assert_eq!(source, PromptSource::Unknown);
+        let resolved = ResolvedPrompts::for_model(&config(base), "my-embedder");
+        assert!(resolved.prompts.is_empty());
+        assert_eq!(resolved.source, PromptSource::Unknown);
     }
 
     #[test]
@@ -539,7 +507,10 @@ mod tests {
             "[general]\nembedding_model = \"o/embeddinggemma:latest\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 768\n",
         );
         let profile = Profile::from_config(&c).unwrap().unwrap();
-        assert_eq!(profile, Profile::new("embeddinggemma", 768, gemma()));
+        assert_eq!(
+            profile,
+            Profile::new("embeddinggemma", Dimension::new(768), gemma())
+        );
         assert!(Profile::from_config(&Config::default()).unwrap().is_none());
     }
 }

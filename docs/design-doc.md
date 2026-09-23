@@ -184,7 +184,7 @@ and each is limited where it is used:
 
 A turn therefore holds nothing while it waits for the user's answer to a write prompt or
 runs a tool, and a quick `SELECT` never waits behind chat. Requests carry a priority
-(`quack_core::priority`, a Tokio task-local): `run_turn` and `embed_query` run interactive,
+(`quack_core::priority`, a Tokio task-local): `run_turn` and `Embedder::embed_interactive` run interactive,
 everything else (ingest embeddings, extraction, proposals) background, and a freed permit
 goes to the oldest interactive waiter before any background one, so a question never
 queues behind a whole ingest. rig's streaming loop drains a
@@ -678,9 +678,10 @@ Qwen3-Embedding's query instruction, nomic's `search_query: ` and `search_docume
 E5, BGE, mxbai, Snowflake Arctic; none for all-MiniLM, BGE-M3, granite, or OpenAI's), each
 role overridable under `[embedding]` (section 13). A document prefix with a `{title}` slot
 gets the chunk's heading there (`none` without one); otherwise the heading leads the text.
-Every call goes through `Embedder`, which names the role and checks the width of each
-vector that comes back against `embedding_dimension`, so a mismatched model fails with the
-fix rather than a cast error; clippy's `disallowed_methods` keeps raw embedding calls out.
+Every call goes through `Embedder`, whose `Input` names the role, and every vector that
+comes back is a `Vector` checked against the profile's `Dimension` (`embedding_dimension`),
+so a mismatched model fails with the fix rather than a cast error; clippy's
+`disallowed_methods` keeps raw embedding calls out.
 The model, its width, and its prefixes are the embedding profile.
 
 **Embedding.** Batches of `[ingestion].embedding_batch_size` (64 by default, at least one)

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{AuthMode, Config, ModelRef, ProviderType};
-use crate::embedding::{PromptSource, prompts_for};
+use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::llm::{OllamaRunningModels, oauth};
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -457,8 +457,8 @@ async fn check_embedding_model(
                     .base_url
                     .clone()
                     .unwrap_or_else(|| OLLAMA_DEFAULT_URL.to_owned());
-                let reported = ollama_embedding_length(http, &base, model.model).await;
-                if let Some(check) = width_check(model, configured, reported) {
+                let show = OllamaShow::fetch(http, &base, model.model).await;
+                if let Some(check) = width_check(model, configured, show) {
                     report.push(check);
                 }
             }
@@ -470,7 +470,7 @@ async fn check_embedding_model(
 /// Which input prefixes the embedding model gets, and where they come
 /// from.
 fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
-    let (prompts, source) = prompts_for(config, model.model);
+    let ResolvedPrompts { prompts, source } = ResolvedPrompts::for_model(config, model.model);
     match source {
         PromptSource::Family(family) if prompts.is_empty() => Check::new(
             "embeddings",
@@ -505,42 +505,48 @@ fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
     }
 }
 
-/// The vector width Ollama reports for `model` (`/api/show`, which reads
-/// the model's metadata without loading it), `None` when it reports none.
-async fn ollama_embedding_length(
-    http: &reqwest::Client,
-    base: &str,
-    model: &str,
-) -> std::result::Result<Option<u32>, Probe> {
-    let url = format!(
-        "{}/api/show",
-        base.trim_end_matches('/').trim_end_matches("/v1")
-    );
-    let response = http
-        .post(url)
-        .json(&serde_json::json!({ "model": model }))
-        .send()
-        .await
-        .map_err(|e| Probe::Unreachable(error_chain(&e)))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
-    }
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| Probe::Unexpected(error_chain(&e)))?;
-    Ok(embedding_length(&body))
+/// What Ollama's `/api/show` says about a model, read from its metadata
+/// without loading it.
+#[derive(serde::Deserialize)]
+struct OllamaShow {
+    #[serde(default)]
+    model_info: serde_json::Map<String, serde_json::Value>,
 }
 
-/// `<architecture>.embedding_length` from an `/api/show` answer.
-fn embedding_length(show: &serde_json::Value) -> Option<u32> {
-    show.get("model_info")?
-        .as_object()?
-        .iter()
-        .find(|(key, _)| key.ends_with(".embedding_length"))
-        .and_then(|(_, value)| value.as_u64())
-        .and_then(|n| u32::try_from(n).ok())
+impl OllamaShow {
+    async fn fetch(
+        http: &reqwest::Client,
+        base: &str,
+        model: &str,
+    ) -> std::result::Result<Self, Probe> {
+        let url = format!(
+            "{}/api/show",
+            base.trim_end_matches('/').trim_end_matches("/v1")
+        );
+        let response = http
+            .post(url)
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .map_err(|e| Probe::Unreachable(error_chain(&e)))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| Probe::Unexpected(error_chain(&e)))
+    }
+
+    /// The model's vector width: `<architecture>.embedding_length`.
+    fn embedding_length(&self) -> Option<u32> {
+        self.model_info
+            .iter()
+            .find(|(key, _)| key.ends_with(".embedding_length"))
+            .and_then(|(_, value)| value.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    }
 }
 
 /// Whether the configured width is the one the model makes. `None` when
@@ -549,9 +555,9 @@ fn embedding_length(show: &serde_json::Value) -> Option<u32> {
 fn width_check(
     model: ModelRef<'_>,
     configured: u32,
-    reported: std::result::Result<Option<u32>, Probe>,
+    show: std::result::Result<OllamaShow, Probe>,
 ) -> Option<Check> {
-    let reported = reported.ok().flatten()?;
+    let reported = show.ok()?.embedding_length()?;
     Some(if reported == configured {
         Check::new(
             "embeddings",
@@ -1001,13 +1007,16 @@ mod tests {
     fn the_width_probe_names_the_fix_when_the_model_disagrees() {
         let config = embedding_config("embeddinggemma", "");
         let model = config.embedding_model_ref().unwrap().unwrap();
-        let show = serde_json::json!({
-            "model_info": { "general.architecture": "gemma3", "gemma3.embedding_length": 768 }
-        });
-        assert_eq!(embedding_length(&show), Some(768));
-        assert_eq!(embedding_length(&serde_json::json!({})), None);
+        let show =
+            |json: serde_json::Value| -> OllamaShow { serde_json::from_value(json).unwrap() };
+        let gemma = || {
+            show(serde_json::json!({
+                "model_info": { "general.architecture": "gemma3", "gemma3.embedding_length": 768 }
+            }))
+        };
+        assert_eq!(gemma().embedding_length(), Some(768));
 
-        let wrong = width_check(model, 1024, Ok(Some(768))).unwrap();
+        let wrong = width_check(model, 1024, Ok(gemma())).unwrap();
         assert_eq!(wrong.status, Status::Fail);
         assert!(
             wrong.summary.contains("768-dimensional"),
@@ -1019,10 +1028,10 @@ mod tests {
             Some("set embedding_dimension = 768 under [providers.o]")
         );
         assert_eq!(
-            width_check(model, 768, Ok(Some(768))).unwrap().status,
+            width_check(model, 768, Ok(gemma())).unwrap().status,
             Status::Ok
         );
-        assert!(width_check(model, 768, Ok(None)).is_none());
+        assert!(width_check(model, 768, Ok(show(serde_json::json!({})))).is_none());
         assert!(width_check(model, 768, Err(Probe::Rejected(401))).is_none());
     }
 

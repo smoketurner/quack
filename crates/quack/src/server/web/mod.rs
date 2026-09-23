@@ -41,6 +41,7 @@ use super::auth::{
 };
 use super::error::ApiError;
 use super::state::{App, with_db};
+use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::store as graph_store;
 use quack_core::graph::{GraphOptions, GraphResult, GraphStatus, extract, resolve, traverse};
@@ -2400,7 +2401,7 @@ type PageData = (
 /// Status, ontology presence, chunk count, merge queue, and the result of
 /// whatever the query asked for.
 /// The embeddings of a path query's two ends, when a model exists.
-type EndEmbeddings = (Option<Vec<f32>>, Option<Vec<f32>>);
+type EndEmbeddings = (Option<Vector>, Option<Vector>);
 
 fn graph_page_data(
     db: &WorkspaceDb,

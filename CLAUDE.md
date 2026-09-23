@@ -125,7 +125,7 @@ resources are limited where they are used. Every rig client is built over
 `llm::LimitedHttp`, which holds one permit of the process-wide gate for the provider and
 the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
-requests (`run_turn`, `embed_query`, via the `quack_core::priority` task-local) before
+requests (`run_turn`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
 background ones. The registry is in memory only (labels can be workspace content).
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
@@ -215,12 +215,14 @@ table renders as a predicate `run_sql` can run, since the mapping knows the key 
 tool guidance in the system prompt gains a numbered graph procedure whenever those tools
 are registered.
 
-Every embedding goes through `quack_core::embedding::Embedder` in a role: `query` (search),
-`documents` (chunks, with their heading as title), or `similar` (entity labels and names,
-ontology type names). It adds the input prefixes the model family was trained with
-(`embedding::presets`, from each model card; `[embedding]` overrides any role) and checks
-each vector's width against `embedding_dimension`; `.clippy.toml` disallows rig's raw
-`embed_text`/`embed_texts`. The model, width, and prefixes are the `Profile`; every stored
+Every embedding goes through `quack_core::embedding::Embedder` as an `Input`, which names
+its role: `Query` (search), `Document { title, text }` (a chunk under its heading), or
+`Similarity` (entity labels and names, ontology type names). It adds the input prefixes the
+model family was trained with (`presets::Family::of`, from each model card; `[embedding]`
+overrides any role, `ResolvedPrompts::for_model`) and returns `Vector`s checked against the
+profile's `Dimension`; `.clippy.toml` disallows rig's raw `embed_text`/`embed_texts`.
+Long runs take a `progress::RunControl` (progress plus cancel). The model, width, and
+prefixes are the `Profile`; every stored
 chunk and node vector carries its fingerprint (`embedding_profile`, profiles in
 `_quack_embedding_profiles`), and vector search, label matching, and merge proposals use
 only the current profile's vectors. Stale or missing vectors are found by keyword until

@@ -10,7 +10,7 @@ use rig::embeddings::EmbeddingModel;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::embedding::{DocumentInput, Embedder};
+use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
@@ -781,8 +781,8 @@ async fn embed_and_store<M: EmbeddingModel>(
     if chunks.is_empty() {
         return Ok((stored, Some(Duration::ZERO)));
     }
-    let width = usize::try_from(embedder.profile().dimension).unwrap_or(usize::MAX);
-    if !db.run(move |db| Ok(db.accepts_vector_width(width))).await? {
+    let dimension = embedder.profile().dimension;
+    if db.run(move |db| Ok(db.embedding_dimension())).await? != dimension {
         // The configured width changed and the workspace still holds
         // vectors of the old one: the chunks are found by keyword until
         // `reembed` retypes the columns and embeds them.
@@ -800,7 +800,7 @@ async fn embed_and_store<M: EmbeddingModel>(
     // Batches are collected before the futures are built: a closure that
     // takes the slice by reference would tie each future's type to that
     // borrow and fail the `Send` check the server's handlers need.
-    let batches_input: Vec<(Vec<String>, Vec<DocumentInput>)> = chunk_ids
+    let batches_input: Vec<(Vec<String>, Vec<Input>)> = chunk_ids
         .chunks(batch_size)
         .zip(chunks.chunks(batch_size))
         .map(|(ids, slice)| {
@@ -811,7 +811,7 @@ async fn embed_and_store<M: EmbeddingModel>(
         })
         .collect();
     let calls = batches_input.into_iter().map(|(ids, inputs)| async move {
-        let vectors = embedder.documents(&inputs).await?;
+        let vectors = embedder.embed(&inputs).await?;
         Ok::<_, Error>((ids, vectors))
     });
     let mut batches: u32 = 0;

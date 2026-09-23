@@ -20,7 +20,7 @@ use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::config_file_path;
 use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
-use crate::embedding::{Embedder, Profile, Role};
+use crate::embedding::{Embedder, Input, Profile};
 use crate::error::{Error, Result};
 use crate::graph::extract as graph_extract;
 use crate::ontology::{Ontology, documents};
@@ -443,8 +443,11 @@ pub async fn name_similarity(
     if names.len() < 2 {
         return Ok(out);
     }
-    let spaced: Vec<String> = names.iter().map(|n| n.replace('_', " ")).collect();
-    let vectors = embedder.similar(&spaced).await?;
+    let inputs: Vec<Input> = names
+        .iter()
+        .map(|n| Input::Similarity(n.replace('_', " ")))
+        .collect();
+    let vectors = embedder.embed(&inputs).await?;
     for (i, a) in names.iter().enumerate() {
         for (j, b) in names.iter().enumerate() {
             if i == j {
@@ -472,25 +475,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
     } else {
         dot / (na * nb)
     }
-}
-
-/// A search query's vector, for document retrieval.
-///
-/// # Errors
-///
-/// Returns an error when the provider call fails.
-pub async fn embed_query(embedder: &Embeddings, text: &str) -> Result<Vec<f32>> {
-    // A query embedding is a lookup someone is waiting on.
-    with_priority(Priority::Interactive, embedder.query(text)).await
-}
-
-/// An entity name's vector, for finding it among the graph's labels.
-///
-/// # Errors
-///
-/// Returns an error when the provider call fails.
-pub async fn embed_entity_name(embedder: &Embeddings, name: &str) -> Result<Vec<f32>> {
-    with_priority(Priority::Interactive, embedder.one(Role::Similarity, name)).await
 }
 
 /// The bearer credential for a provider, according to its `auth` mode: none,
@@ -719,21 +703,17 @@ async fn build_embed_model(config: &Config, model: ModelRef<'_>) -> Result<Embed
 ///
 /// Returns an error if the reference or provider is invalid.
 pub async fn optional_embedding_model(config: &Config) -> Result<Option<Embeddings>> {
-    let Some(model) = config.embedding_model_ref()? else {
+    let (Some(model), Some(profile)) =
+        (config.embedding_model_ref()?, Profile::from_config(config)?)
+    else {
         tracing::info!("no embedding model configured");
         return Ok(None);
     };
     tracing::info!(model = %model, "using embedding model");
-    embeddings(config, model).await.map(Some)
-}
-
-async fn embeddings(config: &Config, model: ModelRef<'_>) -> Result<Embeddings> {
-    let profile = Profile::from_config(config)?
-        .ok_or_else(|| Error::Config("no embedding model configured".into()))?;
-    Ok(Embedder::new(
+    Ok(Some(Embedder::new(
         build_embed_model(config, model).await?,
         profile,
-    ))
+    )))
 }
 
 /// The configured embedding model, required.
@@ -742,14 +722,12 @@ async fn embeddings(config: &Config, model: ModelRef<'_>) -> Result<Embeddings> 
 ///
 /// Returns an error if `[general].embedding_model` is unset or invalid.
 pub async fn required_embedding_model(config: &Config) -> Result<Embeddings> {
-    let model = config.embedding_model_ref()?.ok_or_else(|| {
+    optional_embedding_model(config).await?.ok_or_else(|| {
         Error::Config(format!(
             "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
             config_file_path().display()
         ))
-    })?;
-    tracing::info!(model = %model, "using embedding model");
-    embeddings(config, model).await
+    })
 }
 
 /// `provider/model` for status lines, or a placeholder.
@@ -981,6 +959,7 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
 
     fn parse(toml_text: &str) -> Config {
         match Config::parse(toml_text) {
@@ -1036,7 +1015,7 @@ mod tests {
             "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n",
         );
         let model = required_embedding_model(&config).await;
-        assert!(model.is_ok_and(|m| m.profile().dimension == 4));
+        assert!(model.is_ok_and(|m| m.profile().dimension == Dimension::new(4)));
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::embedding::{Input, Vector};
 use quack_core::graph::{GraphResult, GraphStatus};
 use quack_core::graph::{extract, resolve, store as graph_store, tables, traverse};
 use quack_core::llm;
@@ -421,11 +422,12 @@ pub(crate) fn confirm(out: &mut impl Write) -> Result<bool> {
 
 /// `None` without an embedding model; a failing model is an error, not a
 /// silent fall-back to exact matches.
-async fn entity_embedding(config: &Config, text: &str) -> Result<Option<Vec<f32>>> {
+async fn entity_embedding(config: &Config, text: &str) -> Result<Option<Vector>> {
     let Some(model) = llm::optional_embedding_model(config).await? else {
         return Ok(None);
     };
-    Ok(Some(llm::embed_entity_name(&model, text).await?))
+    let input = Input::Similarity(text.to_owned());
+    Ok(Some(model.embed_interactive(&input).await?))
 }
 
 fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Result<()> {

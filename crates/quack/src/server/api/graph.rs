@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use quack_core::embedding::{Input, Vector};
 use quack_core::graph::{
     GraphOptions, GraphResult, extract, resolve, store as graph_store, tables, traverse,
 };
@@ -34,11 +35,12 @@ pub(crate) struct SearchQuery {
 /// A label's embedding for fuzzy entity resolution, when a model exists.
 /// The text's embedding for fuzzy entry: `None` when no embedding model
 /// is configured, an error when the model fails.
-pub(crate) async fn entity_embedding(app: &App, text: &str) -> ApiResult<Option<Vec<f32>>> {
+pub(crate) async fn entity_embedding(app: &App, text: &str) -> ApiResult<Option<Vector>> {
     let Some(model) = llm::optional_embedding_model(&app.config).await? else {
         return Ok(None);
     };
-    Ok(Some(llm::embed_entity_name(&model, text).await?))
+    let input = Input::Similarity(text.to_owned());
+    Ok(Some(model.embed_interactive(&input).await?))
 }
 
 pub(crate) async fn search(

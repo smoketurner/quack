@@ -1,3 +1,4 @@
+use crate::embedding::Input;
 use crate::error::{Error, Result};
 use crate::ingestion::parser::{Extracted, Flow, Section};
 
@@ -169,8 +170,8 @@ pub struct Chunk {
 impl Chunk {
     /// What the embedding model is given: the text, under its heading.
     #[must_use]
-    pub fn embedding_input(&self) -> crate::embedding::DocumentInput {
-        crate::embedding::DocumentInput {
+    pub fn embedding_input(&self) -> Input {
+        Input::Document {
             title: self.heading.clone(),
             text: self.content.clone(),
         }
@@ -321,10 +322,21 @@ mod section_tests {
         for chunk in chunks.iter().take(chunks.len() - 1) {
             assert_eq!(chunk.heading.as_deref(), Some("Exclusions"));
             assert_eq!(chunk.page, Some(3));
-            assert_eq!(chunk.embedding_input().title.as_deref(), Some("Exclusions"));
+            assert_eq!(
+                chunk.embedding_input(),
+                Input::Document {
+                    title: Some("Exclusions".into()),
+                    text: chunk.content.clone(),
+                }
+            );
         }
-        assert_eq!(last.embedding_input().title, None);
-        assert_eq!(last.embedding_input().text, "short");
+        assert_eq!(
+            last.embedding_input(),
+            Input::Document {
+                title: None,
+                text: "short".into(),
+            }
+        );
     }
 
     fn page(number: u32, words: usize) -> Section {
@@ -359,7 +371,9 @@ mod section_tests {
         for chunk in &chunks {
             assert!(enc.count(&chunk.content) <= 50);
             assert_eq!(chunk.heading.as_deref(), Some("Report"));
-            assert_eq!(chunk.embedding_input().title.as_deref(), Some("Report"));
+            assert!(
+                matches!(chunk.embedding_input(), Input::Document { title: Some(t), .. } if t == "Report")
+            );
             assert!(!chunk.content.starts_with('\n'));
         }
     }

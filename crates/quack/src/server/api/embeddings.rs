@@ -7,27 +7,18 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use quack_core::embedding::reembed::{self, Plan, Progress};
+use quack_core::embedding::reembed::{self, Plan};
 use quack_core::jobs::{JobId, JobKind, JobSpec, Lane};
 use quack_core::llm::{self, Embeddings};
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::Outcome;
-use quack_core::storage::workspace::{EmbeddingStatus, WorkspaceDb};
+use quack_core::storage::workspace::WorkspaceDb;
 
 use crate::server::api::graph::audit_cancelled;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::ApiResult;
 use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::App;
-
-/// What the status and the re-embed report.
-fn describe(status: &EmbeddingStatus) -> serde_json::Value {
-    serde_json::json!({
-        "status": status,
-        "stale_chunks": status.stale_chunks(),
-        "plan": Plan::from_status(status),
-        "note": status.note(),
-    })
-}
 
 /// `GET .../embeddings`: how many vectors are current, stale (made under
 /// another profile), or missing, and what a re-embed would do.
@@ -41,7 +32,12 @@ pub(crate) async fn show(
     access
         .audit_read(&app, "embeddings_status", "embedding status")
         .await?;
-    Ok(Json(describe(&status)))
+    Ok(Json(serde_json::json!({
+        "status": status,
+        "stale_chunks": status.stale_chunks(),
+        "plan": Plan::from_status(&status),
+        "note": status.note(),
+    })))
 }
 
 /// `POST .../embeddings/reembed`: 200 with nothing to do, else 202 with
@@ -110,15 +106,18 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
     let (cancel_app, cancel_access, cancel_run) =
         (Arc::clone(&app), access.clone(), run_id.clone());
     let id = jobs.submit(spec, move |ctx| async move {
-        let progress = |p: Progress| ctx.progress(p.done, p.total);
+        let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
         let cancel = ctx.cancel_token();
+        let control = RunControl {
+            progress: &progress,
+            cancel: Some(&cancel),
+        };
         let outcome = match app.workspace_db(&workspace_id).await {
             Ok(db) => reembed::run(
                 &db,
                 &embedder,
                 app.config.ingestion.embedding_batch_size,
-                &progress,
-                Some(&cancel),
+                control,
             )
             .await
             .map_err(|e| e.to_string()),

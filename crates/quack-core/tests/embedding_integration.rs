@@ -9,11 +9,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use quack_core::config::Config;
-use quack_core::embedding::reembed::{self, Plan, Progress, Stage};
-use quack_core::embedding::{Embedder, Profile, Prompts};
+use quack_core::embedding::reembed::{self, Plan, Retype};
+use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::store::{self as graph_store, NewNode};
 use quack_core::ingestion::{self, NewFile};
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{ChunkScope, NewChunk, NewDocument, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -149,7 +150,7 @@ fn vectors_made_before_profiles_keep_working_when_nothing_changed() {
     assert_eq!(status.current_chunks, 3);
     assert_eq!(status.stale_chunks(), 0);
     assert_eq!(status.note(), None);
-    assert!(!status.needs_reembed());
+    assert!(Plan::from_status(&status).is_empty());
     assert_eq!(vector_hits(&db, 4), 3);
     assert_eq!(db.meta("embedding_model").unwrap(), None);
 }
@@ -200,7 +201,8 @@ async fn reembed_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
             },
         )
         .unwrap();
-        db.set_node_embedding(&node, &[1.0; 4]).unwrap();
+        let vector = Vector::new(vec![1.0; 4], Dimension::new(4)).unwrap();
+        db.set_node_embedding(&node, &vector).unwrap();
         make_legacy(&db, "embeddinggemma");
     }
     let db = WorkspaceDb::open(&gemma, "ws").unwrap();
@@ -214,8 +216,12 @@ async fn reembed_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
     let tape = Tape::new(4);
     let writer = writer_of(&db);
     let seen = Mutex::new(Vec::new());
-    let progress = |p: Progress| seen.lock().unwrap().push(p);
-    let summary = reembed::run(&writer, &embedder(&gemma, tape.clone()), 2, &progress, None)
+    let progress = |done: ChunkDone| seen.lock().unwrap().push((done.done, done.total));
+    let control = RunControl {
+        progress: &progress,
+        cancel: None,
+    };
+    let summary = reembed::run(&writer, &embedder(&gemma, tape.clone()), 2, control)
         .await
         .unwrap();
     assert_eq!(
@@ -231,17 +237,9 @@ async fn reembed_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
             "task: sentence similarity | query: Acme (organization)",
         ]
     );
-    let seen = seen.into_inner().unwrap();
-    assert!(seen.contains(&Progress {
-        stage: Stage::Chunks,
-        done: 3,
-        total: 3
-    }));
-    assert!(seen.contains(&Progress {
-        stage: Stage::Nodes,
-        done: 1,
-        total: 1
-    }));
+    // Chunks and node labels count together: two chunk batches, then one
+    // node batch.
+    assert_eq!(seen.into_inner().unwrap(), [(2, 4), (3, 4), (4, 4)]);
     let status = db.embedding_status().unwrap();
     assert_eq!(
         (
@@ -259,9 +257,14 @@ async fn reembed_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
         1
     );
     // A second run has nothing to do.
-    let again = reembed::run(&writer, &embedder(&gemma, Tape::new(4)), 2, &|_| {}, None)
-        .await
-        .unwrap();
+    let again = reembed::run(
+        &writer,
+        &embedder(&gemma, Tape::new(4)),
+        2,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
     assert_eq!((again.chunks, again.nodes), (0, 0));
 }
 
@@ -305,8 +308,7 @@ async fn a_configured_prefix_change_makes_vectors_stale() {
         &writer_of(&db),
         &embedder(&after, tape.clone()),
         8,
-        &|_| {},
-        None,
+        RunControl::unobserved(),
     )
     .await
     .unwrap();
@@ -348,14 +350,31 @@ async fn a_width_change_stores_new_chunks_without_vectors_until_reembed_retypes(
     let status = db.embedding_status().unwrap();
     assert_eq!((status.missing_chunks, status.stale_chunks()), (1, 2));
     let plan = Plan::from_status(&status);
-    assert_eq!((plan.retype, plan.chunks), (Some((4, 8)), 3));
+    assert_eq!(
+        (plan.retype, plan.chunks),
+        (
+            Some(Retype {
+                stored: Dimension::new(4),
+                configured: Dimension::new(8)
+            }),
+            3
+        )
+    );
 
-    let summary = reembed::run(&writer, &embedder(&wide, Tape::new(8)), 8, &|_| {}, None)
-        .await
-        .unwrap();
-    assert_eq!((summary.retyped_from, summary.chunks), (Some(4), 3));
+    let summary = reembed::run(
+        &writer,
+        &embedder(&wide, Tape::new(8)),
+        8,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (summary.retyped_from, summary.chunks),
+        (Some(Dimension::new(4)), 3)
+    );
     // Every connection to the workspace sees the new width.
-    assert_eq!(reader.embedding_dimension(), 8);
+    assert_eq!(reader.embedding_dimension(), Dimension::new(8));
     assert_eq!(vector_hits(&reader, 8), 3);
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
@@ -376,8 +395,8 @@ async fn a_cancelled_reembed_keeps_the_batches_it_finished() {
     let cancel = CancellationToken::new();
     let trigger = cancel.clone();
     // Cancel once the first batch is stored.
-    let progress = move |p: Progress| {
-        if p.done >= 1 {
+    let progress = move |done: ChunkDone| {
+        if done.done >= 1 {
             trigger.cancel();
         }
     };
@@ -385,8 +404,10 @@ async fn a_cancelled_reembed_keeps_the_batches_it_finished() {
         &writer_of(&db),
         &embedder(&gemma, Tape::new(4)),
         1,
-        &progress,
-        Some(&cancel),
+        RunControl {
+            progress: &progress,
+            cancel: Some(&cancel),
+        },
     )
     .await;
     assert!(matches!(outcome, Err(Error::Cancelled)), "{outcome:?}");
@@ -399,8 +420,11 @@ async fn reembed_refuses_an_embedder_under_another_profile() {
     let dir = tempfile::tempdir().unwrap();
     let gemma = config(dir.path(), "embeddinggemma", 4, "");
     let db = WorkspaceDb::open(&gemma, "ws").unwrap();
-    let other = Embedder::new(Tape::new(4), Profile::new("other", 4, Prompts::default()));
-    let err = reembed::run(&writer_of(&db), &other, 8, &|_| {}, None)
+    let other = Embedder::new(
+        Tape::new(4),
+        Profile::new("other", Dimension::new(4), Prompts::default()),
+    );
+    let err = reembed::run(&writer_of(&db), &other, 8, RunControl::unobserved())
         .await
         .unwrap_err()
         .to_string();

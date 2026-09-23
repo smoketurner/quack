@@ -18,6 +18,7 @@ use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::embedding::{Input, Vector};
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -356,7 +357,7 @@ impl McpServer {
             .clamp(1, 100);
         let rrf_k = self.inner.config.retrieval.rrf_k;
         let embedding = match llm::optional_embedding_model(&self.inner.config).await {
-            Ok(Some(model)) => match llm::embed_query(&model, &query).await {
+            Ok(Some(model)) => match model.embed_interactive(&Input::Query(query.clone())).await {
                 Ok(vector) => Some(vector),
                 Err(e) => return Ok(failure(format!("embedding failed: {e}"))),
             },
@@ -641,14 +642,15 @@ impl McpServer {
 impl McpServer {
     /// A label's embedding for fuzzy entity resolution: `None` without a
     /// model, an error when the model fails.
-    async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, McpError> {
+    async fn embed(&self, text: &str) -> Result<Option<Vector>, McpError> {
         let Some(model) = llm::optional_embedding_model(&self.inner.config)
             .await
             .map_err(internal)?
         else {
             return Ok(None);
         };
-        llm::embed_entity_name(&model, text)
+        model
+            .embed_interactive(&Input::Similarity(text.to_owned()))
             .await
             .map(Some)
             .map_err(internal)

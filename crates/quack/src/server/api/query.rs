@@ -12,6 +12,7 @@ use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::embedding::{Input, Vector};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane};
 use quack_core::llm;
 use quack_core::storage::control::Outcome;
@@ -484,8 +485,12 @@ pub(crate) async fn search(
     }
     let top_k = q.top_k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
     let rrf_k = app.config.retrieval.rrf_k;
-    let embedding: Option<Vec<f32>> = match llm::optional_embedding_model(&app.config).await? {
-        Some(model) => Some(llm::embed_query(&model, &query).await?),
+    let embedding: Option<Vector> = match llm::optional_embedding_model(&app.config).await? {
+        Some(model) => Some(
+            model
+                .embed_interactive(&Input::Query(query.clone()))
+                .await?,
+        ),
         None => None,
     };
     let reader_db = app.reader_db(&id).await?;

@@ -9,7 +9,8 @@ use quack_core::config::{
     ServerConfig,
 };
 use quack_core::embedding::reembed::Plan;
-use quack_core::embedding::{Embedder, Profile, Prompts};
+use quack_core::embedding::reembed::Retype;
+use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::graph::store as graph_store;
 use quack_core::ingestion;
 use quack_core::ingestion::parser::FileType;
@@ -32,8 +33,18 @@ struct MockEmbeddingModel {
 fn embedder<M: EmbeddingModel>(model: M) -> Embedder<M> {
     Embedder::new(
         model,
-        Profile::new("mock-model", TEST_DIM_U32, Prompts::default()),
+        Profile::new(
+            "mock-model",
+            Dimension::new(TEST_DIM_U32),
+            Prompts::default(),
+        ),
     )
+}
+
+/// `values` as a vector of their own width.
+fn vector(values: &[f32]) -> Vector {
+    let width = u32::try_from(values.len()).unwrap();
+    Vector::new(values.to_vec(), Dimension::new(width)).unwrap()
 }
 
 /// Records the size of every batch it is asked to embed.
@@ -717,8 +728,8 @@ fn workspace_db_set_chunk_embedding() {
     assert_eq!(count, &serde_json::Value::Number(1.into()));
 
     // Update with an embedding
-    let embedding = [1.0_f32, 0.0, 0.0, 0.0];
-    db.set_chunk_embedding("c1", &embedding).unwrap();
+    db.set_chunk_embedding("c1", &vector(&[1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
 
     // Embedding should now be non-NULL
     let qr = db
@@ -1050,16 +1061,22 @@ fn open_records_schema_version_and_embedding_meta() {
     );
     // The profile table replaces the model key.
     assert_eq!(db.meta("embedding_model").unwrap(), None);
-    let profile = Profile::new("mock-model", TEST_DIM_U32, Prompts::default());
+    let profile = Profile::new(
+        "mock-model",
+        Dimension::new(TEST_DIM_U32),
+        Prompts::default(),
+    );
     assert_eq!(db.embedding_profile(), Some(&profile));
     let recorded = db
         .execute_query("SELECT fingerprint FROM _quack_embedding_profiles")
         .unwrap();
     assert_eq!(
         recorded.rows.first().and_then(|r| r.first()),
-        Some(&serde_json::Value::String(profile.fingerprint()))
+        Some(&serde_json::Value::String(
+            profile.fingerprint().as_str().to_owned()
+        ))
     );
-    assert_eq!(db.embedding_dimension(), TEST_DIM_U32);
+    assert_eq!(db.embedding_dimension(), Dimension::new(TEST_DIM_U32));
     assert!(db.list_tables().unwrap().is_empty());
 }
 
@@ -1071,7 +1088,7 @@ fn reopen_without_provider_keeps_recorded_dimension() {
 
     let without = test_config_no_provider(dir.path());
     let db = WorkspaceDb::open(&without, "ws-dim").unwrap();
-    assert_eq!(db.embedding_dimension(), TEST_DIM_U32);
+    assert_eq!(db.embedding_dimension(), Dimension::new(TEST_DIM_U32));
 }
 
 #[test]
@@ -1100,8 +1117,8 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_reembed() {
     changed.general.embedding_model = Some("mock/other-model".into());
     // Opening still works: the old vectors stay, at their width, unsearched.
     let db = WorkspaceDb::open(&changed, "ws-mismatch").unwrap();
-    assert_eq!(db.embedding_dimension(), 4);
-    assert!(!db.accepts_vector_width(8));
+    assert_eq!(db.embedding_dimension(), Dimension::new(4));
+    assert!(!db.embedding_dimension().fits(8));
     assert!(
         db.search_similar_chunks(&[0.5; 8], 5, &ChunkScope::all())
             .unwrap()
@@ -1114,17 +1131,21 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_reembed() {
         1
     );
     let err = db
-        .set_chunk_embedding("c", &[0.5; 8])
+        .set_chunk_embedding("c", &vector(&[0.5; 8]))
         .unwrap_err()
         .to_string();
     assert!(err.contains("quack reembed"), "{err}");
     let status = db.embedding_status().unwrap();
-    assert_eq!(status.column_dimension, 4);
+    assert_eq!(status.column_dimension, Dimension::new(4));
     assert_eq!(status.stale_chunks(), 1);
     let made_with = status.stale.first().and_then(|s| s.profile.clone());
     assert_eq!(
         made_with,
-        Some(Profile::new("mock-model", 4, Prompts::default()))
+        Some(Profile::new(
+            "mock-model",
+            Dimension::new(4),
+            Prompts::default()
+        ))
     );
     let note = status.note().unwrap();
     assert!(
@@ -1133,7 +1154,13 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_reembed() {
         "{note}"
     );
     let plan = Plan::from_status(&status);
-    assert_eq!(plan.retype, Some((4, 8)));
+    assert_eq!(
+        plan.retype,
+        Some(Retype {
+            stored: Dimension::new(4),
+            configured: Dimension::new(8)
+        })
+    );
     assert_eq!(plan.chunks, 1);
 }
 
@@ -1170,7 +1197,8 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             },
         )
         .unwrap();
-        db.set_node_embedding(&node, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        db.set_node_embedding(&node, &vector(&[1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
         assert!(
             graph_store::nodes_needing_embedding(&db, 10)
                 .unwrap()
@@ -1182,11 +1210,11 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         p.embedding_dimension = Some(8);
     }
     let db = WorkspaceDb::open(&changed, "ws-adopt").unwrap();
-    assert_eq!(db.embedding_dimension(), 8);
+    assert_eq!(db.embedding_dimension(), Dimension::new(8));
     let unembedded = graph_store::nodes_needing_embedding(&db, 10).unwrap();
     assert_eq!(unembedded.len(), 1);
     let node_id = unembedded.first().map(|n| n.id.clone()).unwrap();
-    db.set_node_embedding(&node_id, &[0.5; 8]).unwrap();
+    db.set_node_embedding(&node_id, &vector(&[0.5; 8])).unwrap();
     assert_eq!(
         db.meta("embedding_dimension").unwrap().as_deref(),
         Some("8")

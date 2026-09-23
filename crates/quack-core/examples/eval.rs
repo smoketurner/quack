@@ -27,7 +27,7 @@ use quack_core::config::{
     ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
     RetrievalConfig, ServerConfig,
 };
-use quack_core::embedding::{Embedder, Profile, Prompts};
+use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
 use quack_core::graph::extract::{ChunkText, ExtractFuture, Extraction, GraphExtractor};
 use quack_core::graph::{self, store};
@@ -89,7 +89,11 @@ async fn run() -> Result<Report> {
     // add the same tokens to every input.
     let embedder = Embedder::new(
         HashEmbedder,
-        Profile::new("hash-embedder", HASH_DIM_U32, Prompts::default()),
+        Profile::new(
+            "hash-embedder",
+            Dimension::new(HASH_DIM_U32),
+            Prompts::default(),
+        ),
     );
 
     ingest_documents(
@@ -516,7 +520,9 @@ async fn evaluate_retrieval(
 
         let keyword_ids =
             ids_of(db.search_keyword_chunks(&q.question, top_k, &ChunkScope::all())?);
-        let query_vec = embedder.query(&q.question).await?;
+        let query_vec = embedder
+            .embed_one(&Input::Query(q.question.clone()))
+            .await?;
         let similar_ids =
             ids_of(db.search_similar_chunks(&query_vec, top_k, &ChunkScope::all())?);
         let hybrid_ids = ids_of(db.search_hybrid_chunks(

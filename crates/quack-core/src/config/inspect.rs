@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use toml::{Table, Value as TomlValue};
 
-use crate::embedding::presets::{self, Family};
-use crate::embedding::prompts_for;
+use crate::embedding::ResolvedPrompts;
+use crate::embedding::presets::Family;
 
 use super::{
     AuthMode, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, config_file_path,
@@ -500,8 +500,8 @@ fn embedding(inventory: &mut Inventory<'_>, config: &Config) {
         .as_deref()
         .and_then(|spec| spec.split_once('/'))
         .map_or("", |(_, model)| model);
-    let (prompts, _) = prompts_for(config, model);
-    let builtin = presets::family(model).map(Family::prompts);
+    let prompts = ResolvedPrompts::for_model(config, model).prompts;
+    let builtin = Family::of(model).map(Family::prompts);
     let mut s = inventory.section("embedding");
     for (key, value, default) in [
         (

@@ -33,6 +33,70 @@ impl Family {
             similarity: self.similarity.to_owned(),
         }
     }
+
+    /// A family whose authors specify no prefix for any role: known, so
+    /// `quack doctor` does not suggest configuring one.
+    const fn unprefixed(name: &'static str, source: &'static str) -> Self {
+        Self {
+            name,
+            query: "",
+            document: "",
+            similarity: "",
+            source,
+        }
+    }
+
+    /// The family `model` belongs to, or `None` when quack does not know
+    /// it. The match is on the model name's last path segment, tag
+    /// removed, lowercased.
+    #[must_use]
+    pub fn of(model: &str) -> Option<&'static Self> {
+        let segment = model.rsplit('/').next().unwrap_or(model);
+        let name = segment
+            .split_once(':')
+            .map_or(segment, |(name, _)| name)
+            .to_lowercase();
+        let has = |pattern: &str| name.contains(pattern);
+        // BGE's English models: Ollama names them without a language
+        // (`bge-large`), Hugging Face with one (`bge-base-en-v1.5`). The
+        // Chinese ones take a Chinese instruction, which quack does not carry.
+        let bge_english = ["bge-large", "bge-base", "bge-small"]
+            .iter()
+            .any(|size| name == *size || name.starts_with(&format!("{size}-en")));
+        let family = if has("embeddinggemma") {
+            &EMBEDDING_GEMMA
+        } else if has("qwen3-embedding") {
+            &QWEN3_EMBEDDING
+        } else if has("nomic-embed-text-v2") {
+            &NOMIC_V2
+        } else if has("nomic-embed-text") {
+            &NOMIC_V1
+        } else if has("mxbai-embed-large") {
+            &MXBAI_EMBED_LARGE
+        } else if has("arctic-embed2") || has("arctic-embed-l-v2") || has("arctic-embed-m-v2") {
+            &ARCTIC_EMBED_V2
+        } else if has("arctic-embed") {
+            &ARCTIC_EMBED
+        } else if name.starts_with("bge-m3") {
+            &BGE_M3
+        } else if bge_english {
+            &BGE_EN
+        } else if (name.starts_with("e5-") || has("multilingual-e5-")) && !has("instruct") {
+            &E5
+        } else if name.starts_with("all-minilm")
+            || name.starts_with("all-mpnet")
+            || name.starts_with("paraphrase-multilingual")
+        {
+            &SENTENCE_TRANSFORMERS
+        } else if name.starts_with("granite-embedding") {
+            &GRANITE
+        } else if name.starts_with("text-embedding-3") || name.starts_with("text-embedding-ada") {
+            &OPENAI
+        } else {
+            return None;
+        };
+        Some(family)
+    }
 }
 
 const RETRIEVAL_QUERY: &str = "Represent this sentence for searching relevant passages: ";
@@ -124,94 +188,26 @@ const E5: Family = Family {
     source: "https://huggingface.co/intfloat/e5-large-v2",
 };
 
-/// Families whose authors specify no prefix for any role: known, so
-/// `quack doctor` does not suggest configuring one.
-const fn unprefixed(name: &'static str, source: &'static str) -> Family {
-    Family {
-        name,
-        query: "",
-        document: "",
-        similarity: "",
-        source,
-    }
-}
-
-const BGE_M3: Family = unprefixed("BGE-M3", "https://huggingface.co/BAAI/bge-m3");
-const SENTENCE_TRANSFORMERS: Family = unprefixed(
+const BGE_M3: Family = Family::unprefixed("BGE-M3", "https://huggingface.co/BAAI/bge-m3");
+const SENTENCE_TRANSFORMERS: Family = Family::unprefixed(
     "sentence-transformers",
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
 );
-const GRANITE: Family = unprefixed(
+const GRANITE: Family = Family::unprefixed(
     "granite-embedding",
     "https://huggingface.co/ibm-granite/granite-embedding-278m-multilingual",
 );
-const OPENAI: Family = unprefixed(
+const OPENAI: Family = Family::unprefixed(
     "OpenAI embeddings",
     "https://platform.openai.com/docs/guides/embeddings",
 );
-
-/// The model name as matched: last path segment, tag removed, lowercased.
-fn normalized(model: &str) -> String {
-    let segment = model.rsplit('/').next().unwrap_or(model);
-    let name = segment.split_once(':').map_or(segment, |(name, _)| name);
-    name.to_lowercase()
-}
-
-/// The family `model` belongs to, or `None` when quack does not know it.
-#[must_use]
-pub fn family(model: &str) -> Option<&'static Family> {
-    let name = normalized(model);
-    let has = |pattern: &str| name.contains(pattern);
-    let family = if has("embeddinggemma") {
-        &EMBEDDING_GEMMA
-    } else if has("qwen3-embedding") {
-        &QWEN3_EMBEDDING
-    } else if has("nomic-embed-text-v2") {
-        &NOMIC_V2
-    } else if has("nomic-embed-text") {
-        &NOMIC_V1
-    } else if has("mxbai-embed-large") {
-        &MXBAI_EMBED_LARGE
-    } else if has("arctic-embed2") || has("arctic-embed-l-v2") || has("arctic-embed-m-v2") {
-        &ARCTIC_EMBED_V2
-    } else if has("arctic-embed") {
-        &ARCTIC_EMBED
-    } else if name.starts_with("bge-m3") {
-        &BGE_M3
-    } else if is_bge_english(&name) {
-        &BGE_EN
-    } else if (name.starts_with("e5-") || has("multilingual-e5-")) && !has("instruct") {
-        &E5
-    } else if name.starts_with("all-minilm")
-        || name.starts_with("all-mpnet")
-        || name.starts_with("paraphrase-multilingual")
-    {
-        &SENTENCE_TRANSFORMERS
-    } else if name.starts_with("granite-embedding") {
-        &GRANITE
-    } else if name.starts_with("text-embedding-3") || name.starts_with("text-embedding-ada") {
-        &OPENAI
-    } else {
-        return None;
-    };
-    Some(family)
-}
-
-/// BGE's English models: Ollama names them without a language
-/// (`bge-large`), Hugging Face with one (`bge-base-en-v1.5`). The Chinese
-/// ones take a Chinese instruction, which quack does not carry.
-fn is_bge_english(name: &str) -> bool {
-    ["bge-large", "bge-base", "bge-small"]
-        .iter()
-        .any(|size| name == *size || name.starts_with(&format!("{size}-en")))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn family_name(model: &str) -> Option<&'static str> {
-        family(model).map(|f| f.name)
+        Family::of(model).map(|f| f.name)
     }
 
     #[test]
@@ -274,7 +270,7 @@ mod tests {
 
     #[test]
     fn families_carry_their_cards_strings_exactly() {
-        let gemma = family("embeddinggemma").map(Family::prompts);
+        let gemma = Family::of("embeddinggemma").map(Family::prompts);
         assert_eq!(
             gemma,
             Some(Prompts {
@@ -283,7 +279,7 @@ mod tests {
                 similarity: "task: sentence similarity | query: ".into(),
             })
         );
-        let qwen = family("qwen3-embedding").map(Family::prompts);
+        let qwen = Family::of("qwen3-embedding").map(Family::prompts);
         assert_eq!(
             qwen.as_ref().map(|p| p.query.as_str()),
             Some(

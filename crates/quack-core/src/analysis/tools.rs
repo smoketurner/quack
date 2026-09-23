@@ -18,7 +18,7 @@ use super::events::TurnRecorder;
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, Reranker};
 use super::text_to_sql;
-use crate::embedding::{Embedder, Role};
+use crate::embedding::{Embedder, Input, Vector};
 use crate::error::Error;
 use crate::ontology::store as ontology_store;
 use crate::ontology::{self, Ontology};
@@ -723,10 +723,10 @@ where
             ),
         };
         let step = self.recorder.start(Self::NAME, &detail);
-        let query_vec: Option<Vec<f32>> = match &self.embedding_model {
+        let query_vec: Option<Vector> = match &self.embedding_model {
             None => None,
             Some(model) => {
-                match cached_embed(model, &self.recorder, Role::Query, &args.query).await {
+                match cached_embed(model, &self.recorder, Input::Query(args.query.clone())).await {
                     Ok(vector) => Some(vector),
                     Err(e) => {
                         step.finish(format!("error: {e}"));
@@ -1259,6 +1259,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::embedding::{Dimension, Profile, Prompts};
     use crate::storage::workspace::NewDocument;
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -1312,15 +1313,16 @@ mod tests {
             CountingEmbeddingModel {
                 calls: Arc::clone(&calls),
             },
-            crate::embedding::Profile::new("m", 4, crate::embedding::Prompts::default()),
+            Profile::new("m", Dimension::new(4), Prompts::default()),
         );
         let (sink, _rx) = crate::analysis::events::channel();
         let recorder = TurnRecorder::new(sink);
+        let name = |text: &str| Input::Similarity(text.to_owned());
 
-        let first = cached_embed(&model, &recorder, Role::Similarity, "Acme").await;
-        let second = cached_embed(&model, &recorder, Role::Similarity, "Acme").await;
-        let other = cached_embed(&model, &recorder, Role::Similarity, "Beta").await;
-        let as_query = cached_embed(&model, &recorder, Role::Query, "Acme").await;
+        let first = cached_embed(&model, &recorder, name("Acme")).await;
+        let second = cached_embed(&model, &recorder, name("Acme")).await;
+        let other = cached_embed(&model, &recorder, name("Beta")).await;
+        let as_query = cached_embed(&model, &recorder, Input::Query("Acme".into())).await;
 
         assert!(first.is_ok());
         assert_eq!(first.as_ref().ok(), second.as_ref().ok());
@@ -2358,7 +2360,7 @@ struct GraphQuery {
     class: Option<String>,
     relation: Option<String>,
     hops: u32,
-    embedding: Option<Vec<f32>>,
+    embedding: Option<Vector>,
 }
 
 /// A `search_graph` lookup on the database thread: refuse ids the ontology
@@ -2474,14 +2476,13 @@ fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> crate::erro
 async fn cached_embed<M: EmbeddingModel>(
     embedder: &Embedder<M>,
     recorder: &TurnRecorder,
-    role: Role,
-    text: &str,
-) -> crate::error::Result<Vec<f32>> {
-    if let Some(cached) = recorder.cached_embedding(role, text) {
+    input: Input,
+) -> crate::error::Result<Vector> {
+    if let Some(cached) = recorder.cached_embedding(&input) {
         return Ok(cached);
     }
-    let vector = embedder.one(role, text).await?;
-    recorder.cache_embedding(role, text, vector.clone());
+    let vector = embedder.embed_one(&input).await?;
+    recorder.cache_embedding(input, vector.clone());
     Ok(vector)
 }
 
@@ -2493,11 +2494,11 @@ async fn label_embedding<M: EmbeddingModel>(
     embedder: Option<&Embedder<M>>,
     recorder: &TurnRecorder,
     label: &str,
-) -> Result<Option<Vec<f32>>, ToolError> {
+) -> Result<Option<Vector>, ToolError> {
     let Some(embedder) = embedder else {
         return Ok(None);
     };
-    let vector = cached_embed(embedder, recorder, Role::Similarity, label)
+    let vector = cached_embed(embedder, recorder, Input::Similarity(label.to_owned()))
         .await
         .map_err(|e| ToolError::Analysis(format!("embedding failed: {e}")))?;
     Ok(Some(vector))

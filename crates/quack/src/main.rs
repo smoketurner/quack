@@ -29,6 +29,7 @@ use quack_core::llm::oauth::{LoginOptions, LoginPrompt};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store as ontology_store;
 use quack_core::ontology::{Ontology, candidates};
+use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode};
@@ -849,10 +850,16 @@ async fn run_reembed(cli: &Cli, yes: bool) -> Result<ExitCode> {
         reembed_cli::run(
             &config,
             &ws_db,
-            yes,
+            if yes {
+                reembed_cli::Confirm::Assume
+            } else {
+                reembed_cli::Confirm::Ask
+            },
             &mut out,
-            &reembed_cli::print_progress,
-            None,
+            RunControl {
+                progress: &reembed_cli::print_progress,
+                cancel: None,
+            },
         )
         .await,
     )

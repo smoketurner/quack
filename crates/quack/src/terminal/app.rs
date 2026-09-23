@@ -16,7 +16,6 @@ use quack_core::analysis::events::{self, AgentEvent, PermissionRequest};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::embedding::reembed::Progress;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::storage::sessions::{self, ChatMode, MessageRole as StoredRole};
 use quack_core::storage::workspace::{
@@ -35,11 +34,12 @@ use quack_core::llm::{self, CancellationToken};
 use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
 use quack_core::priority::Priority;
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
-use crate::reembed_cli;
+use crate::reembed_cli::{self, Confirm};
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -2345,7 +2345,7 @@ async fn run_job_inner(
     job: CliJob,
     ctx: &JobContext,
 ) -> Result<String> {
-    let progress = |done: quack_core::progress::ChunkDone| ctx.progress(done.done, done.total);
+    let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
     let mut out: Vec<u8> = Vec::new();
     match job {
         CliJob::Ontology(action) => {
@@ -2357,9 +2357,12 @@ async fn run_job_inner(
         CliJob::Reembed => {
             // The terminal owns stdin, so the job never asks; `/cancel`
             // stops it between batches.
-            let progress = |p: Progress| ctx.progress(p.done, p.total);
             let cancel = ctx.cancel_token();
-            reembed_cli::run(config, db, true, &mut out, &progress, Some(&cancel)).await?;
+            let control = RunControl {
+                progress: &progress,
+                cancel: Some(&cancel),
+            };
+            reembed_cli::run(config, db, Confirm::Assume, &mut out, control).await?;
         }
         CliJob::Okf(dir) => {
             let dir = dir.trim();

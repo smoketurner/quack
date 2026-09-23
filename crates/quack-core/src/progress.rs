@@ -1,21 +1,58 @@
-//! Progress of a per-chunk model run (ontology document evidence, graph
-//! extraction), for the interface that shows it (issue #67).
+//! Progress of a long model run (ontology document evidence, graph
+//! extraction, re-embedding), for the interface that shows it, and the
+//! cancel token that stops it (issue #67).
 
 use std::time::Duration;
 
-/// One chunk finished, with the run's totals so far.
+use tokio_util::sync::CancellationToken;
+
+use crate::error::{Error, Result};
+
+/// One unit of work finished (a chunk; for a re-embed, a batch of chunks
+/// or node labels), with the run's totals so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkDone {
-    /// Chunks finished, this one included.
+    /// Units finished, this one included.
     pub done: u32,
     pub total: u32,
-    /// Chunks whose extraction failed so far.
+    /// Units that failed so far.
     pub failed: u32,
-    /// How long this chunk's call took.
+    /// How long this unit took.
     pub took: Duration,
     /// Since the run started.
     pub elapsed: Duration,
 }
 
-/// Called after every chunk; `&|_| {}` when nobody is watching.
+/// Called after every unit; `&|_| {}` when nobody is watching.
 pub type Progress<'a> = &'a (dyn Fn(ChunkDone) + Sync);
+
+/// What a long run reports to, and what stops it between units.
+#[derive(Clone, Copy)]
+pub struct RunControl<'a> {
+    pub progress: Progress<'a>,
+    pub cancel: Option<&'a CancellationToken>,
+}
+
+impl RunControl<'_> {
+    /// Nobody watching, nothing to cancel.
+    #[must_use]
+    pub fn unobserved() -> RunControl<'static> {
+        RunControl {
+            progress: &|_| {},
+            cancel: None,
+        }
+    }
+
+    /// [`Error::Cancelled`] once the run has been cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Cancelled`] when the token has fired.
+    pub fn check(&self) -> Result<()> {
+        if self.cancel.is_some_and(CancellationToken::is_cancelled) {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}

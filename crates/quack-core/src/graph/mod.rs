@@ -17,6 +17,8 @@ pub mod traverse;
 
 use serde::{Deserialize, Serialize};
 
+use crate::embedding::{Dimension, Input};
+
 /// A stored node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
@@ -26,6 +28,19 @@ pub struct Node {
     #[serde(default)]
     pub properties: serde_json::Value,
     pub provisional: bool,
+}
+
+impl Node {
+    /// What the node's label vector is made from: its label and class,
+    /// compared with other labels and with names looked up among them.
+    #[must_use]
+    pub fn embedding_input(&self) -> Input {
+        Input::Similarity(format!(
+            "{} ({})",
+            self.label,
+            self.class_id.replace('_', " ")
+        ))
+    }
 }
 
 /// A stored edge.
@@ -217,7 +232,7 @@ impl Default for GraphOptions {
 
 /// The graph tables, created with the workspace's embedding dimension.
 #[must_use]
-pub fn ddl(dimension: u32) -> String {
+pub fn ddl(dimension: Dimension) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS _quack_graph_nodes (
             id TEXT PRIMARY KEY,

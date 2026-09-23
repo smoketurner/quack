@@ -777,10 +777,19 @@ pub fn nodes_needing_embedding(db: &WorkspaceDb, limit: u32) -> Result<Vec<Node>
     Ok(out)
 }
 
-/// The text a node's embedding is computed from: its label and class.
-#[must_use]
-pub fn embedding_input(node: &Node) -> String {
-    format!("{} ({})", node.label, node.class_id.replace('_', " "))
+/// How many nodes [`nodes_needing_embedding`] would work through.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn count_nodes_needing_embedding(db: &WorkspaceDb) -> Result<u32> {
+    let count: i64 = db.connection().query_row(
+        "SELECT count(*) FROM _quack_graph_nodes \
+         WHERE embedding IS NULL OR embedding_profile IS DISTINCT FROM ?",
+        duckdb::params![db.embedding_fingerprint()],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// Nodes whose label embedding is within `max_distance` (cosine) of
@@ -795,7 +804,7 @@ pub fn nearest_nodes(
     class_id: Option<&str>,
     limit: u32,
 ) -> Result<Vec<(Node, f64)>> {
-    if !db.accepts_vector_width(query.len()) {
+    if !db.embedding_dimension().fits(query.len()) {
         return Ok(Vec::new());
     }
     let sql = format!(

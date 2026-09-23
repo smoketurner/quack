@@ -4,14 +4,15 @@
 //! the rest wait in `_quack_graph_merges` for review.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use rig::embeddings::EmbeddingModel;
-use tokio_util::sync::CancellationToken;
 
 use super::store::{self, id_list};
 use super::{GraphOptions, Node};
-use crate::embedding::Embedder;
+use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
+use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{WorkspaceDb, tokenize};
 use crate::storage::writer::Writer;
 
@@ -49,7 +50,7 @@ pub async fn resolve<M: EmbeddingModel>(
     let Some(embedder) = embedder else {
         return Ok(summary);
     };
-    summary.embedded = embed_nodes(db, embedder, &|_| {}, None).await?;
+    summary.embedded = embed_nodes(db, embedder, RunControl::unobserved()).await?;
     let options = *options;
     let (auto_merged, proposed) = db
         .run(move |db| {
@@ -68,39 +69,47 @@ const NODE_BATCH: u32 = 64;
 /// Give every node whose label vector is missing or stale one made under
 /// the current profile, `NODE_BATCH` at a time; returns how many. Nothing
 /// is embedded while the workspace's vectors are another width (`reembed`
-/// retypes them first). `progress` hears the running count after each
-/// batch; `cancel` stops between batches.
+/// retypes them first). Progress is reported after each batch; a cancel
+/// stops between batches.
 ///
 /// # Errors
 ///
 /// Returns an error when embedding or a write fails, or
-/// [`Error::Cancelled`].
+/// [`Error::Cancelled`](crate::error::Error::Cancelled).
 pub async fn embed_nodes<M: EmbeddingModel>(
     db: &Writer,
     embedder: &Embedder<M>,
-    progress: &(dyn Fn(u32) + Sync),
-    cancel: Option<&CancellationToken>,
+    control: RunControl<'_>,
 ) -> Result<u32> {
-    let width = usize::try_from(embedder.profile().dimension).unwrap_or(usize::MAX);
-    if !db.run(move |db| Ok(db.accepts_vector_width(width))).await? {
+    let dimension = embedder.profile().dimension;
+    let total = db
+        .run(move |db| {
+            if db.embedding_dimension() == dimension {
+                store::count_nodes_needing_embedding(db).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+    let Some(total) = total else {
         tracing::warn!(
             "node label vectors not embedded: run `quack reembed` after the width change"
         );
         return Ok(0);
-    }
+    };
+    let started = Instant::now();
     let mut embedded: u32 = 0;
     loop {
-        if cancel.is_some_and(CancellationToken::is_cancelled) {
-            return Err(Error::Cancelled);
-        }
+        control.check()?;
+        let batch_started = Instant::now();
         let pending = db
             .run(|db| store::nodes_needing_embedding(db, NODE_BATCH))
             .await?;
         if pending.is_empty() {
             return Ok(embedded);
         }
-        let inputs: Vec<String> = pending.iter().map(store::embedding_input).collect();
-        let vectors = embedder.similar(&inputs).await?;
+        let inputs: Vec<Input> = pending.iter().map(Node::embedding_input).collect();
+        let vectors = embedder.embed(&inputs).await?;
         let count = u32::try_from(pending.len()).unwrap_or(u32::MAX);
         db.run(move |db| {
             db.write_transaction(|db| {
@@ -112,7 +121,13 @@ pub async fn embed_nodes<M: EmbeddingModel>(
         })
         .await?;
         embedded = embedded.saturating_add(count);
-        progress(embedded);
+        (control.progress)(ChunkDone {
+            done: embedded,
+            total: total.max(embedded),
+            failed: 0,
+            took: batch_started.elapsed(),
+            elapsed: started.elapsed(),
+        });
     }
 }
 

@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::tools::ReaderDb;
-use crate::embedding::Embedder;
+use crate::embedding::{Embedder, Input, Vector};
 use crate::storage::workspace::ChunkScope;
 
 pub struct DuckDbVectorIndex<M> {
@@ -22,9 +22,9 @@ impl<M> DuckDbVectorIndex<M>
 where
     M: rig::embeddings::EmbeddingModel + Send + Sync,
 {
-    async fn query_vector(&self, query: &str) -> Result<Vec<f32>, VectorStoreError> {
+    async fn query_vector(&self, query: &str) -> Result<Vector, VectorStoreError> {
         self.embedder
-            .query(query)
+            .embed_one(&Input::Query(query.to_owned()))
             .await
             .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))
     }
