@@ -24,7 +24,7 @@ const PHRASE_CANDIDATE_CAP: u32 = 500;
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "8";
+const WORKSPACE_SCHEMA_VERSION: &str = "9";
 
 /// Width used when no embedding provider is configured and the workspace has
 /// not recorded one yet.
@@ -557,7 +557,7 @@ impl WorkspaceDb {
                 sha256 TEXT,
                 source TEXT,
                 ingested_at TIMESTAMP DEFAULT now(),
-                status TEXT DEFAULT 'pending',
+                status TEXT DEFAULT 'queued',
                 error_message TEXT,
                 pinned BOOLEAN NOT NULL DEFAULT false,
                 chunk_count INTEGER,
@@ -659,6 +659,17 @@ impl WorkspaceDb {
         // workspace last recorded.
         if recorded < 8 {
             self.tag_legacy_vectors(dim)?;
+        }
+        // Version 9 reads a document's status as one of four values. Rows
+        // written before every insert named its status took the column's
+        // old default, `pending`, and were never processed.
+        if recorded < 9 {
+            self.conn.execute(
+                "UPDATE _quack_documents SET status = ?, \
+                 error_message = 'never finished processing; upload it again' \
+                 WHERE status IS NULL OR status = 'pending'",
+                duckdb::params![DocumentStatus::Error],
+            )?;
         }
         Ok(())
     }
@@ -944,10 +955,10 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn document_by_sha256(&self, sha256: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> 'error' ORDER BY ingested_at, id LIMIT 1"
+            "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> ? ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![sha256])?;
+        let mut rows = stmt.query(duckdb::params![sha256, DocumentStatus::Error])?;
         match rows.next()? {
             Some(row) => Ok(Some(document_from_row(row)?)),
             None => Ok(None),
@@ -962,11 +973,11 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn table_owner(&self, table: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE status <> 'error' AND tables IS NOT NULL \
+            "{DOCUMENT_SELECT} WHERE status <> ? AND tables IS NOT NULL \
              AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![table])?;
+        let mut rows = stmt.query(duckdb::params![DocumentStatus::Error, table])?;
         match rows.next()? {
             Some(row) => Ok(Some(document_from_row(row)?)),
             None => Ok(None),
@@ -981,7 +992,7 @@ impl WorkspaceDb {
     ///
     /// Returns an error if a query fails.
     pub fn document_intact(&self, doc: &DocumentInfo) -> Result<bool> {
-        if doc.status != "ready" {
+        if doc.status != DocumentStatus::Ready {
             return Ok(true);
         }
         if let Some(tables) = &doc.tables
@@ -1011,10 +1022,14 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn fail_stale_uploads(&self) -> Result<usize> {
         let changed = self.conn.execute(
-            "UPDATE _quack_documents SET status = 'error', \
+            "UPDATE _quack_documents SET status = ?, \
              error_message = 'interrupted by a restart before it was processed; upload it again' \
-             WHERE status IN ('queued', 'processing')",
-            [],
+             WHERE status IN (?, ?)",
+            duckdb::params![
+                DocumentStatus::Error,
+                DocumentStatus::Queued,
+                DocumentStatus::Processing
+            ],
         )?;
         Ok(changed)
     }
@@ -1065,7 +1080,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn update_document_status(&self, id: &str, status: &str) -> Result<()> {
+    pub fn update_document_status(&self, id: &str, status: DocumentStatus) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET status = ?, error_message = NULL WHERE id = ?",
             duckdb::params![status, id],
@@ -1080,8 +1095,8 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn mark_document_error(&self, id: &str, message: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE _quack_documents SET status = 'error', error_message = ? WHERE id = ?",
-            duckdb::params![message, id],
+            "UPDATE _quack_documents SET status = ?, error_message = ? WHERE id = ?",
+            duckdb::params![DocumentStatus::Error, message, id],
         )?;
         Ok(())
     }
@@ -1369,11 +1384,12 @@ impl WorkspaceDb {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.heading, c.content FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE d.status = 'ready' \
+             WHERE d.status = ? \
                AND (c.embedding IS NULL OR c.embedding_profile IS DISTINCT FROM ?) \
              ORDER BY c.id LIMIT ?",
         )?;
         let mut rows = stmt.query(duckdb::params![
+            DocumentStatus::Ready,
             self.embedding_fingerprint(),
             i64::from(limit)
         ])?;
@@ -1400,8 +1416,8 @@ impl WorkspaceDb {
             "SELECT count(*) FILTER (WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ?), \
                     count(*) FILTER (WHERE c.embedding IS NULL) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE d.status = 'ready'",
-            duckdb::params![current],
+             WHERE d.status = ?",
+            duckdb::params![current, DocumentStatus::Ready],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let mut stale = Vec::new();
@@ -1409,11 +1425,11 @@ impl WorkspaceDb {
             "SELECT CAST(p.profile AS VARCHAR), count(*) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
              LEFT JOIN _quack_embedding_profiles p ON p.fingerprint = c.embedding_profile \
-             WHERE d.status = 'ready' AND c.embedding IS NOT NULL \
+             WHERE d.status = ? AND c.embedding IS NOT NULL \
                AND c.embedding_profile IS DISTINCT FROM ? \
              GROUP BY ALL ORDER BY 2 DESC",
         )?;
-        let mut rows = stmt.query(duckdb::params![current])?;
+        let mut rows = stmt.query(duckdb::params![DocumentStatus::Ready, current])?;
         while let Some(row) = rows.next()? {
             let profile: Option<String> = row.get(0)?;
             stale.push(StaleVectors {
@@ -1509,14 +1525,15 @@ impl WorkspaceDb {
              FROM scored sc \
              JOIN _quack_chunks c ON c.id = sc.chunk_id \
              JOIN _quack_documents d ON d.id = c.document_id \
-             WHERE sc.score > 0 AND d.status = 'ready'{filter} \
+             WHERE sc.score > 0 AND d.status = ?{filter} \
              ORDER BY sc.score DESC, c.chunk_index ASC \
              LIMIT ?"
         );
         let limit = i64::from(fetch_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(2));
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(3));
         params.push(&term_list);
+        params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
@@ -1605,7 +1622,7 @@ impl WorkspaceDb {
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ? \
-               AND d.status = 'ready'{filter} \
+               AND d.status = ?{filter} \
              ORDER BY score DESC \
              LIMIT ?",
             self.vector_type()
@@ -1615,9 +1632,10 @@ impl WorkspaceDb {
         let fingerprint = self.embedding_fingerprint();
         let limit = i64::from(top_k);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(3));
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(scope.len().saturating_add(4));
         params.push(&query_literal);
         params.push(&fingerprint);
+        params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
         let mut rows = stmt.query(params.as_slice())?;
@@ -1988,6 +2006,53 @@ pub struct TableDescription {
     pub sample_rows: QueryResults,
 }
 
+/// Where a document is in ingestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocumentStatus {
+    /// Registered; its bytes wait on the work queue.
+    Queued,
+    /// Being parsed, chunked, and embedded, or loaded as a table.
+    Processing,
+    /// Searchable, or its table loaded.
+    Ready,
+    /// Failed; `error_message` says why.
+    Error,
+}
+
+text_enum!(DocumentStatus, "document status", {
+    Queued => "queued",
+    Processing => "processing",
+    Ready => "ready",
+    Error => "error",
+});
+
+impl DocumentStatus {
+    /// Still on its way to `ready` or `error`.
+    #[must_use]
+    pub fn is_in_flight(self) -> bool {
+        match self {
+            Self::Queued | Self::Processing => true,
+            Self::Ready | Self::Error => false,
+        }
+    }
+}
+
+impl duckdb::ToSql for DocumentStatus {
+    fn to_sql(&self) -> duckdb::Result<duckdb::types::ToSqlOutput<'_>> {
+        Ok(duckdb::types::ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl duckdb::types::FromSql for DocumentStatus {
+    fn column_result(value: duckdb::types::ValueRef<'_>) -> duckdb::types::FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|e: Error| duckdb::types::FromSqlError::Other(Box::new(e)))
+    }
+}
+
 /// Document metadata row.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DocumentInfo {
@@ -2002,8 +2067,7 @@ pub struct DocumentInfo {
     /// before the column existed.
     pub sha256: Option<String>,
     pub source: DocumentSource,
-    /// `queued`, `processing`, `ready`, or `error`.
-    pub status: String,
+    pub status: DocumentStatus,
     pub error_message: Option<String>,
     pub pinned: bool,
     /// Chunks stored once processed; `None` until then and for tables.
@@ -2070,7 +2134,7 @@ pub struct NewDocument<'a> {
     pub size_bytes: usize,
     pub sha256: &'a str,
     pub source: DocumentSource,
-    pub status: &'a str,
+    pub status: DocumentStatus,
     pub ingested_by: Option<&'a str>,
 }
 
@@ -2087,13 +2151,13 @@ impl<'a> NewDocument<'a> {
             size_bytes,
             sha256: "",
             source: DocumentSource::Upload,
-            status: "queued",
+            status: DocumentStatus::Queued,
             ingested_by: None,
         }
     }
 
     #[must_use]
-    pub fn with_status(mut self, status: &'a str) -> Self {
+    pub fn with_status(mut self, status: DocumentStatus) -> Self {
         self.status = status;
         self
     }
@@ -3665,8 +3729,11 @@ mod tests {
     }
 
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {
-        db.insert_document(&NewDocument::new(id, "doc.txt", "text/plain", 10).with_status("ready"))
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.insert_document(
+            &NewDocument::new(id, "doc.txt", "text/plain", 10)
+                .with_status(crate::storage::workspace::DocumentStatus::Ready),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
     }
 
     fn insert_text_chunk(

@@ -3764,7 +3764,8 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         .unwrap_or_else(|e| fail(&e.message));
     db.run(|db| {
         db.insert_document(
-            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"),
+            &NewDocument::new("d", "a.md", "text/markdown", 1)
+                .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
         )?;
         db.insert_chunk(&NewChunk {
             id: "c",

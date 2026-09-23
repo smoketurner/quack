@@ -166,7 +166,8 @@ fn workspace() -> WorkspaceDb {
     )
     .unwrap();
     db.insert_document(
-        &NewDocument::new("doc-1", "notes.md", "text/markdown", 10).with_status("ready"),
+        &NewDocument::new("doc-1", "notes.md", "text/markdown", 10)
+            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -264,7 +265,8 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
 fn extraction_samples_evenly_across_documents() {
     let db = workspace();
     db.insert_document(
-        &NewDocument::new("doc-2", "long.md", "text/markdown", 10).with_status("ready"),
+        &NewDocument::new("doc-2", "long.md", "text/markdown", 10)
+            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
     )
     .unwrap();
     for i in 0..4 {
@@ -373,7 +375,8 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     // A second document adds one node of its own, one edge of its own,
     // and a second source for a vendor the table already produced.
     db.insert_document(
-        &NewDocument::new("doc-2", "extra.md", "text/markdown", 10).with_status("ready"),
+        &NewDocument::new("doc-2", "extra.md", "text/markdown", 10)
+            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -424,7 +427,8 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     // The document that loaded the mapped table: the table drops, and
     // with it every node and edge the rows supported.
     db.insert_document(
-        &NewDocument::new("doc-t", "shipments.csv", "text/csv", 10).with_status("ready"),
+        &NewDocument::new("doc-t", "shipments.csv", "text/csv", 10)
+            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
     )
     .unwrap();
     db.set_document_tables("doc-t", &[String::from("shipments")])

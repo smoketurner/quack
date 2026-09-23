@@ -45,8 +45,10 @@ section 5.4) beside the user's tables and views. `WorkspaceDb::open()` creates w
 missing and records `_quack_meta.schema_version`; a bump can trigger a rebuild, as version
 6 rebuilt the term index when stemming arrived, version 7 rebuilt it again to add the
 joined identifier term (`pol8841` alongside `pol` and `8841` for `POL-8841`; issue #77),
-and version 8 tagged every stored vector with the embedding profile it was made under (the
-model the workspace had recorded, no prefixes).
+version 8 tagged every stored vector with the embedding profile it was made under (the
+model the workspace had recorded, no prefixes), and version 9 marks documents still carrying
+the old `pending` default (or no status) as `error`, since a status is now read as one of
+`queued`, `processing`, `ready`, or `error` and those rows were never processed.
 Phrase search (`"..."` in a keyword query) needed no version bump: it post-filters
 candidates by substring rather than adding term positions to `_quack_terms`.
 

@@ -14,7 +14,7 @@ use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
-    DocumentInfo, DocumentSource, NewChunk, NewDocument, WorkspaceDb, quote_ident,
+    DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument, WorkspaceDb, quote_ident,
 };
 use crate::storage::writer::Writer;
 
@@ -289,7 +289,7 @@ fn register_pending(
         size_bytes,
         sha256,
         source,
-        status: "queued",
+        status: DocumentStatus::Queued,
         ingested_by,
     })?;
     Ok(Registration::New(doc_id))
@@ -318,7 +318,7 @@ pub async fn process_document<M: EmbeddingModel>(
     cancel: Option<&CancellationToken>,
 ) -> Result<IngestResult> {
     let id = doc_id.to_owned();
-    db.run(move |db| db.update_document_status(&id, "processing"))
+    db.run(move |db| db.update_document_status(&id, DocumentStatus::Processing))
         .await?;
     let outcome = match check_cancel(cancel) {
         Ok(()) => {
@@ -343,7 +343,7 @@ pub async fn process_document<M: EmbeddingModel>(
             db.run(move |db| {
                 db.set_document_chunk_count(&id, chunks)?;
                 db.set_document_tables(&id, &tables)?;
-                db.update_document_status(&id, "ready")
+                db.update_document_status(&id, DocumentStatus::Ready)
             })
             .await?;
         }

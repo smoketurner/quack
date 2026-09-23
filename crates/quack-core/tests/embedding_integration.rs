@@ -98,8 +98,11 @@ fn writer_of(db: &WorkspaceDb) -> Writer {
 
 /// One ready document with `chunks` chunks, each with a vector of `width`.
 fn seed(db: &WorkspaceDb, chunks: u32, width: usize) {
-    db.insert_document(&NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"))
-        .unwrap();
+    db.insert_document(
+        &NewDocument::new("d", "a.md", "text/markdown", 1)
+            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
+    )
+    .unwrap();
     let vector = vec![1.0_f32; width];
     for i in 0..chunks {
         db.insert_chunk(&NewChunk {

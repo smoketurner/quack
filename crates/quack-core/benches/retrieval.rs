@@ -70,7 +70,7 @@ fn fill(db: &WorkspaceDb, from: usize, to: usize, dim: usize) {
         let doc_id = format!("doc-{doc}");
         db.insert_document(
             &NewDocument::new(&doc_id, &format!("doc-{doc}.md"), "text/markdown", 1)
-                .with_status("ready"),
+                .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
         )
         .unwrap();
         for c in 0..CHUNKS_PER_DOC {

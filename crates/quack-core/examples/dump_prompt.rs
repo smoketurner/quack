@@ -18,7 +18,8 @@ fn main() {
     db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")
         .unwrap();
     db.insert_document(
-        &NewDocument::new("d1", "policy.pdf", "application/pdf", 1).with_status("ready"),
+        &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
     )
     .unwrap();
     quack_core::ontology::store::save(

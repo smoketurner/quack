@@ -64,7 +64,7 @@ mod tests {
     use crate::ontology::PropertyType;
     use crate::storage::control::{Channel, Outcome, Role, Scope};
     use crate::storage::sessions::{ChatMode, MessageRole};
-    use crate::storage::workspace::DocumentSource;
+    use crate::storage::workspace::{DocumentSource, DocumentStatus};
 
     /// Every value's text form is its serde name, and reads back, trimmed
     /// and in any case.
@@ -100,6 +100,7 @@ mod tests {
         round_trips(ChartKind::ALL);
         round_trips(PropertyType::ALL);
         round_trips(DocumentSource::ALL);
+        round_trips(DocumentStatus::ALL);
     }
 
     #[test]

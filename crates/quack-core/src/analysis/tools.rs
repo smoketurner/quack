@@ -1373,7 +1373,8 @@ mod tests {
         use crate::storage::workspace::{NewChunk, NewDocument};
         db.run(|guard| {
             guard.insert_document(
-                &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
+                &NewDocument::new("d", "storms.md", "text/markdown", 1)
+                    .with_status(crate::storage::workspace::DocumentStatus::Ready),
             )?;
             for (i, text) in [
                 "Hail fell on Denver.",
@@ -1403,7 +1404,8 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
             db.insert_document(
-                &NewDocument::new("doc-1", "notes.md", "text/markdown", 1).with_status("ready")
+                &NewDocument::new("doc-1", "notes.md", "text/markdown", 1)
+                    .with_status(crate::storage::workspace::DocumentStatus::Ready)
             )
             .is_ok()
         );
@@ -1622,14 +1624,14 @@ mod tests {
         assert!(
             db.insert_document(
                 &NewDocument::new("01a0-first", "policy.pdf", "application/pdf", 1)
-                    .with_status("ready")
+                    .with_status(crate::storage::workspace::DocumentStatus::Ready)
             )
             .is_ok()
         );
         assert!(
             db.insert_document(
                 &NewDocument::new("01b0-second", "notes.md", "text/markdown", 1)
-                    .with_status("ready")
+                    .with_status(crate::storage::workspace::DocumentStatus::Ready)
             )
             .is_ok()
         );
@@ -2028,7 +2030,8 @@ mod tests {
         let db = shared_db();
         db.run(|guard| {
             guard.insert_document(
-                &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
+                &NewDocument::new("d", "storms.md", "text/markdown", 1)
+                    .with_status(crate::storage::workspace::DocumentStatus::Ready),
             )?;
             for i in 0..(MAX_SEARCH_TOP_K * 2) {
                 guard.insert_chunk(&crate::storage::workspace::NewChunk {

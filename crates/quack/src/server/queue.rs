@@ -160,7 +160,7 @@ async fn mark_unfinished(db: &SharedDb, document_id: &str, message: &str) {
         .run(move |db| {
             let unfinished = db
                 .document(&id)?
-                .is_some_and(|doc| matches!(doc.status.as_str(), "queued" | "processing"));
+                .is_some_and(|doc| doc.status.is_in_flight());
             if unfinished {
                 db.mark_document_error(&id, &text)?;
             }

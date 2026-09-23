@@ -14,7 +14,7 @@ use super::store::{self, NewNode, Source};
 use crate::error::{Error, Result};
 use crate::ontology::{self, Ontology};
 use crate::progress::{ChunkDone, Progress};
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
 use crate::storage::writer::Writer;
 
 /// What the model returns for one chunk.
@@ -185,9 +185,9 @@ pub fn pending_chunk_count(db: &WorkspaceDb) -> Result<i64> {
     let n = db.connection().query_row(
         "SELECT count(*) FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = 'ready' \
+         WHERE d.status = ? \
            AND NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id)",
-        [],
+        [DocumentStatus::Ready],
         |row| row.get(0),
     )?;
     Ok(n)
@@ -206,11 +206,11 @@ pub fn chunks(db: &WorkspaceDb, limit: Option<u32>) -> Result<Vec<ChunkText>> {
     let mut stmt = db.connection().prepare(
         "SELECT c.id, c.document_id, c.content, c.heading FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = 'ready' \
+         WHERE d.status = ? \
            AND NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id) \
          ORDER BY d.ingested_at, d.id, c.chunk_index",
     )?;
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([DocumentStatus::Ready])?;
     let mut by_document: BTreeMap<String, Vec<ChunkText>> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     while let Some(row) = rows.next()? {

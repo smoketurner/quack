@@ -40,7 +40,7 @@ fn workspace() -> WorkspaceDb {
                 "application/pdf",
                 10_000,
             )
-            .with_status("ready"),
+            .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
         )
         .unwrap();
         for c in 0..CHUNKS_PER_DOC {

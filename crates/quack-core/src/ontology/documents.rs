@@ -15,7 +15,7 @@ use super::{Class, Ontology, Property, PropertyType, Relation};
 use crate::error::{Error, Result};
 use crate::llm::{Embeddings, name_similarity};
 use crate::progress::{ChunkDone, Progress};
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
 
 /// What open extraction returns for one chunk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -145,8 +145,8 @@ pub fn estimate(db: &WorkspaceDb, options: &DocumentEvidenceOptions) -> Result<C
     let (documents, chunks): (i64, i64) = db.connection().query_row(
         "SELECT count(DISTINCT c.document_id), count(*) FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = 'ready' AND length(c.content) > 40",
-        [],
+         WHERE d.status = ? AND length(c.content) > 40",
+        [DocumentStatus::Ready],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let documents = u32::try_from(documents).unwrap_or(u32::MAX);
@@ -170,11 +170,13 @@ pub fn sample_chunks(db: &WorkspaceDb, sample: u32) -> Result<Vec<SampledChunk>>
     let mut stmt = db.connection().prepare(
         "SELECT c.id, c.document_id, d.filename FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = 'ready' AND length(c.content) > 40 \
+         WHERE d.status = ? AND length(c.content) > 40 \
          ORDER BY c.document_id, c.chunk_index",
     )?;
     let rows: Vec<(String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map([DocumentStatus::Ready], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
         .filter_map(std::result::Result::ok)
         .collect();
     let mut by_doc: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -821,7 +823,7 @@ mod tests {
             assert!(
                 db.insert_document(
                     &NewDocument::new(&doc, &format!("{doc}.md"), "text/markdown", 10)
-                        .with_status("ready")
+                        .with_status(crate::storage::workspace::DocumentStatus::Ready)
                 )
                 .is_ok()
             );
@@ -846,7 +848,8 @@ mod tests {
         }
         assert!(
             db.insert_document(
-                &NewDocument::new("pending", "p.md", "text/markdown", 1).with_status("queued")
+                &NewDocument::new("pending", "p.md", "text/markdown", 1)
+                    .with_status(crate::storage::workspace::DocumentStatus::Queued)
             )
             .is_ok()
         );

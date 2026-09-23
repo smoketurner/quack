@@ -3241,7 +3241,8 @@ mod tests {
         app.db
             .run(|db| {
                 db.insert_document(
-                    &NewDocument::new("d", "a.md", "text/markdown", 1).with_status("ready"),
+                    &NewDocument::new("d", "a.md", "text/markdown", 1)
+                        .with_status(quack_core::storage::workspace::DocumentStatus::Ready),
                 )?;
                 db.insert_chunk(&NewChunk {
                     id: "c",

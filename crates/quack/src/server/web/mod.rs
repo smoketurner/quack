@@ -883,9 +883,7 @@ async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
     let documents = app
         .read(&access.workspace.id, WorkspaceDb::list_documents)
         .await?;
-    let pending = documents
-        .iter()
-        .any(|d| d.status == "queued" || d.status == "processing");
+    let pending = documents.iter().any(|d| d.status.is_in_flight());
     Ok(DocumentRows {
         ws_id: access.workspace.id.clone(),
         can_write: access.permits(Need::WRITE),
