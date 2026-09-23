@@ -2770,6 +2770,26 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // An unknown action is refused by the API and the page alike, before
+    // anything is decided: a rejection cannot be undone.
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("{base}/merges/nope"),
+            None,
+            Some(serde_json::json!({ "action": "acept" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/graph/merges/nope"), None, "action=acept")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        location(&headers).contains("must"),
+        "{}",
+        location(&headers)
+    );
 
     // The web page renders the status and a search result.
     let (status, html, _) = h.page(&format!("/w/{ws}/graph?entity=Kenya"), None).await;

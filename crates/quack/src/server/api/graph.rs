@@ -531,6 +531,44 @@ pub(crate) struct MergeDecision {
     pub action: String,
 }
 
+/// A decision on a merge proposal. The API's JSON and the graph page's
+/// form both parse into it, so an unknown action is refused by both rather
+/// than read as a rejection, which cannot be undone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeAction {
+    Accept,
+    Reject,
+}
+
+impl std::str::FromStr for MergeAction {
+    type Err = ApiError;
+
+    fn from_str(action: &str) -> ApiResult<Self> {
+        match action {
+            "accept" => Ok(Self::Accept),
+            "reject" => Ok(Self::Reject),
+            other => Err(ApiError::bad_request(format!(
+                "action must be accept or reject, not '{other}'"
+            ))),
+        }
+    }
+}
+
+impl MergeAction {
+    /// Record the decision on proposal `id`.
+    pub(crate) fn apply(
+        self,
+        db: &quack_core::storage::workspace::WorkspaceDb,
+        id: &str,
+        decided_by: Option<&str>,
+    ) -> quack_core::error::Result<resolve::MergeProposal> {
+        match self {
+            Self::Accept => resolve::accept(db, id, decided_by),
+            Self::Reject => resolve::reject(db, id, decided_by),
+        }
+    }
+}
+
 pub(crate) async fn decide_merge(
     State(app): State<App>,
     identity: Identity,
@@ -538,34 +576,20 @@ pub(crate) async fn decide_merge(
     Json(body): Json<MergeDecision>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let accept = match body.action.as_str() {
-        "accept" => true,
-        "reject" => false,
-        other => {
-            return Err(ApiError::bad_request(format!(
-                "action must be accept or reject, not '{other}'"
-            )));
-        }
-    };
+    let action: MergeAction = body.action.parse()?;
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
     let merge_id = mid.clone();
-    let proposal = with_db(db, move |db| {
-        if accept {
-            resolve::accept(db, &merge_id, Some(&author))
-        } else {
-            resolve::reject(db, &merge_id, Some(&author))
-        }
-    })
-    .await
-    .map_err(|e| ApiError::not_found(e.message))?;
+    let proposal = with_db(db, move |db| action.apply(db, &merge_id, Some(&author)))
+        .await
+        .map_err(|e| ApiError::not_found(e.message))?;
     access
         .audit(
             &app,
             "graph_merge",
             Some(("graph_merge", &mid)),
             Outcome::Allowed,
-            Some(serde_json::json!({ "accept": accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
+            Some(serde_json::json!({ "accept": action == MergeAction::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
         )
         .await?;
     Ok(Json(serde_json::to_value(proposal)?))
