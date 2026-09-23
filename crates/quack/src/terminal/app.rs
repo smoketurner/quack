@@ -510,10 +510,9 @@ impl App {
     }
 
     /// After cancelling everything, give the jobs up to `grace` to stop:
-    /// a turn records its cancellation, a statement is interrupted. Work
-    /// with no checkpoint (an ingest mid-embedding) runs on a detached
-    /// thread (see [`on_blocking_thread`]), so it never holds the process
-    /// open past this.
+    /// a turn records its cancellation, a statement is interrupted, an
+    /// ingest drops its embedding requests. Whatever is still running
+    /// after that is dropped with the runtime at its next await.
     async fn wait_for_jobs(&mut self, grace: Duration) {
         let expiry = tokio::time::sleep(grace);
         tokio::pin!(expiry);
@@ -1440,9 +1439,9 @@ impl App {
     }
 
     /// Run an ontology, graph, bundle, or context command as a job and
-    /// show what it printed. It shares the session's workspace handle,
-    /// locked only around each database step, and reports chunk progress
-    /// to the job strip.
+    /// show what it printed. Its database steps go to the session's
+    /// workspace writer one at a time, and it reports chunk progress to the
+    /// job strip.
     fn run_job(&mut self, job: CliJob, label: &str) {
         let config = Arc::clone(&self.config);
         let workspace_name = self.workspace_name.clone();
@@ -1453,10 +1452,7 @@ impl App {
             label.to_owned(),
             Some(&format!("{label}…")),
             move |ctx| async move {
-                on_blocking_thread(move |rt| {
-                    rt.block_on(run_job_inner(&config, &db, &workspace_name, job, &ctx))
-                })
-                .await
+                answered(run_job_inner(&config, &db, &workspace_name, job, &ctx).await)
             },
         );
     }
@@ -1969,16 +1965,7 @@ impl App {
             Some(&format!("Importing from {source}")),
             move |ctx| async move {
                 let cancel = ctx.cancel_token();
-                on_blocking_thread(move |rt| {
-                    rt.block_on(run_import_inner(
-                        &config,
-                        &workspace_id,
-                        &db,
-                        &request,
-                        &cancel,
-                    ))
-                })
-                .await
+                answered(run_import_inner(&config, &workspace_id, &db, &request, &cancel).await)
             },
         );
     }
@@ -1997,16 +1984,7 @@ impl App {
             Some(&format!("Ingesting {}", path.display())),
             move |ctx| async move {
                 let cancel = ctx.cancel_token();
-                on_blocking_thread(move |rt| {
-                    rt.block_on(run_ingest_inner(
-                        &config,
-                        &workspace_id,
-                        &db,
-                        &path,
-                        &cancel,
-                    ))
-                })
-                .await
+                answered(run_ingest_inner(&config, &workspace_id, &db, &path, &cancel).await)
             },
         );
     }
@@ -2312,7 +2290,7 @@ fn resolve_document(
     }
 }
 
-/// Work the terminal hands to a background thread with its own runtime.
+/// A command the terminal runs as a job.
 enum CliJob {
     Ontology(OntologyAction),
     Graph(GraphAction),
@@ -2332,46 +2310,11 @@ impl CliJob {
     }
 }
 
-/// The runtime, seen from a job's own thread, with the job's priority.
-struct Bridge {
-    handle: tokio::runtime::Handle,
-    priority: quack_core::priority::Priority,
-}
-
-impl Bridge {
-    /// Drive `work` to completion at the job's priority.
-    fn block_on<F: Future>(&self, work: F) -> F::Output {
-        self.handle
-            .block_on(quack_core::priority::with_priority(self.priority, work))
-    }
-}
-
-/// Run long blocking work (`DuckDB` steps between model calls, and
-/// ingestion futures that are not `Send`) on a thread of its own, driving
-/// any async part on the runtime, and turn its answer into a transcript
-/// result. A detached thread rather than the blocking pool: the runtime
-/// waits for its blocking pool when it shuts down, and quitting must not
-/// wait for an ingest that has no checkpoint to stop at.
-async fn on_blocking_thread(
-    work: impl FnOnce(&Bridge) -> Result<String> + Send + 'static,
-) -> BackgroundResult {
-    let handle = tokio::runtime::Handle::current();
-    // The thread has no task-local: the job's priority goes with it, and
-    // its `block_on` scopes it again.
-    let priority = quack_core::priority::current_priority();
-    let (done, answer) = tokio::sync::oneshot::channel();
-    let spawned = std::thread::Builder::new()
-        .name(String::from("quack-job"))
-        .spawn(move || drop(done.send(work(&Bridge { handle, priority }))));
-    if let Err(e) = spawned {
-        return BackgroundResult::Error(format!("could not start the job's thread: {e}"));
-    }
-    match answer.await {
-        Ok(Ok(summary)) => BackgroundResult::Ingested { summary },
-        Ok(Err(e)) => BackgroundResult::Error(format!("{e:#}")),
-        Err(_) => {
-            BackgroundResult::Error(String::from("the job's thread ended before it answered"))
-        }
+/// A job's answer as a transcript result.
+fn answered(outcome: Result<String>) -> BackgroundResult {
+    match outcome {
+        Ok(summary) => BackgroundResult::Ingested { summary },
+        Err(e) => BackgroundResult::Error(format!("{e:#}")),
     }
 }
 
@@ -2633,7 +2576,9 @@ async fn run_ingest_inner(
     path: &std::path::Path,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let data = std::fs::read(path)
+    let read = path.to_owned();
+    let data = tokio::task::spawn_blocking(move || std::fs::read(read))
+        .await?
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
 
     let filename = path

@@ -35,7 +35,7 @@ use tokio::sync::oneshot;
 
 use crate::config::ProviderConfig;
 
-pub use crate::priority::{Priority, current_priority, with_priority};
+use crate::priority::{Priority, current_priority};
 
 /// Permits of one provider and model, handed to interactive waiters first.
 struct Gate {
@@ -506,10 +506,5 @@ mod tests {
         drop(gave_up.await);
         drop(held);
         assert_eq!(gate.available(), 1);
-
-        // The priority follows the task that scoped it.
-        assert_eq!(current_priority(), Priority::Interactive);
-        let inside = with_priority(Priority::Background, async { current_priority() }).await;
-        assert_eq!(inside, Priority::Background);
     }
 }

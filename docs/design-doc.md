@@ -166,8 +166,10 @@ line is taken when it is submitted, not when its task first runs). A job with no
 starts at once.
 
 The priority (`crate::priority`, a Tokio task-local) is interactive unless scoped: the job
-queue runs `ingest`, `import`, `ontology`, `graph`, and `export` jobs as background, and a
-bridge onto another thread (the blocking pool, a job's own thread) carries it across.
+queue runs `ingest`, `import`, `ontology`, `graph`, and `export` jobs as background. Every
+job is a task on the runtime, so the scope covers all the work it awaits; the threads
+outside the runtime (the writer, the blocking pool that parses files) decide nothing by
+it, since a closure takes its writer line when it is sent.
 
 The queue does not count jobs against a pool. What is scarce is the resources jobs use,
 and each is limited where it is used:
@@ -181,7 +183,7 @@ and each is limited where it is used:
 
 A turn therefore holds nothing while it waits for the user's answer to a write prompt or
 runs a tool, and a quick `SELECT` never waits behind chat. Requests carry a priority
-(`llm::limit::Priority`, a Tokio task-local): `run_turn` and `embed_query` run interactive,
+(`quack_core::priority`, a Tokio task-local): `run_turn` and `embed_query` run interactive,
 everything else (ingest embeddings, extraction, proposals) background, and a freed permit
 goes to the oldest interactive waiter before any background one, so a question never
 queues behind a whole ingest. rig's streaming loop drains a
@@ -220,8 +222,8 @@ workspace content (section 5), so it never reaches `control.db`; a restart forge
 the durable record of what a job did is the document, table, session, or audit row it
 wrote. Uploads a previous process left `queued` are marked failed when the workspace is
 next opened. Jobs share the workspace's one writer connection with everything else
-(section 7.4); long work (graph extraction, the document pass, ingestion) takes the writer
-only around each database step, never across a model call, so a question asked meanwhile
+(section 7.4); long work (graph extraction, the document pass, ingestion) sends the writer
+one database step at a time, never spanning a model call, so a question asked meanwhile
 records its turn between those steps.
 
 ---
@@ -1794,7 +1796,7 @@ because the system being replaced runs on Postgres.
 4. **Storage backend seam — not built.** The intent was that retrieval, `graph/`, and
    `ontology/` sit behind small traits so a Postgres + pgvector backend could be added
    without touching the agent or the interfaces. In the code they take `&WorkspaceDb`
-   directly; the only traits are `DbHandle`, `Reranker`, `Extractor`, and `GraphExtractor`,
+   directly; the only traits are `Reranker`, `Extractor`, and `GraphExtractor`,
    none of them a storage seam. Adding another backend today means changing graph and
    ontology code.
 5. **Migration from the current deployment.** Documents are re-uploaded and re-embedded
@@ -2003,10 +2005,12 @@ design to the tracker and is updated as issues close. Ordered by risk.
     waiting answers the next with 503 and `Retry-After: 30`; the web Jobs page follows
     `.../jobs/stream` instead of polling; the terminal re-renders only the messages that
     changed. The writer is an actor: one thread per workspace owns the connection and
-    runs the owned closures sent to it, interactive before background; `DbHandle` is
-    async, so no runtime worker ever blocks on the database, and the terminal's
-    commands run their database step, in the order typed, on a worker task, reads on
-    the reader pool. Not yet: MCP `query` calls and
+    runs the owned closures sent to it, interactive before background, so no runtime
+    worker ever blocks on the database. Ingestion, import, extraction, and the CLI
+    commands take the `Writer` itself (the CLI spawns one too), parsing runs on the
+    blocking pool, and every job, the terminal's included, is a plain task on the
+    runtime. The terminal's commands run their database step, in the order typed, on a
+    worker task, reads on the reader pool. Not yet: MCP `query` calls and
     print mode run their turn directly (one call, one answer, nothing to keep
     responsive); the web chat page shows its own turn but not a job strip (the Jobs page
     does); jobs are not persisted across restarts.

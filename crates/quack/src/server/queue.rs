@@ -58,36 +58,25 @@ pub(crate) fn submit_upload(
     let worker_db = Arc::clone(&db);
     let id = app.jobs.submit(spec, move |ctx| async move {
         let cancel = ctx.cancel_token();
-        let handle = tokio::runtime::Handle::current();
-        // The blocking thread has no task-local: keep the job's priority.
-        let priority = quack_core::priority::current_priority();
-        let document_id = job.document_id.clone();
-        // Parsing and DuckDB writes are blocking work; the embedding calls
-        // inside need the runtime, so block on it from a blocking thread.
-        let outcome = tokio::task::spawn_blocking({
-            let db = Arc::clone(&worker_db);
-            move || {
-                handle.block_on(quack_core::priority::with_priority(
-                    priority,
-                    process(&config, &workspace, &db, job, &cancel),
-                ))
-            }
-        })
-        .await;
-        match outcome {
-            Ok(result) => result,
-            Err(e) => {
-                // The task died before `process` could record an outcome;
-                // the document must not stay `processing` forever.
-                tracing::error!(error = %e, document = %document_id, "upload worker task failed");
-                let message = "the ingestion worker failed before finishing this file";
-                mark_error(&worker_db, &document_id, message).await;
-                Err(String::from(message))
-            }
-        }
+        process(&config, &workspace, &worker_db, job, &cancel).await
     });
-    when_cancelled_unstarted(&app.jobs, id, move || async move {
-        mark_error(&db, &document_id, "cancelled before processing started").await;
+    // The work records its own outcome; a job that ends without running it
+    // (cancelled while queued) or that died mid-way (a panic) must not
+    // leave the document `queued` or `processing` forever.
+    let jobs = app.jobs.clone();
+    tokio::spawn(async move {
+        let Some(ended) = jobs.wait(id).await else {
+            return;
+        };
+        let message = match ended.state {
+            JobState::Cancelled if ended.started_at.is_none() => {
+                "cancelled before processing started"
+            }
+            JobState::Cancelled => "cancelled",
+            JobState::Failed => "the ingestion worker failed before finishing this file",
+            _ => return,
+        };
+        mark_unfinished(&db, &document_id, message).await;
     });
     id
 }
@@ -160,5 +149,31 @@ async fn mark_error(db: &SharedDb, document_id: &str, message: &str) {
     let (id, text) = (document_id.to_owned(), message.to_owned());
     if let Err(mark) = db.run(move |db| db.mark_document_error(&id, &text)).await {
         tracing::error!(error = %mark, document = %document_id, "could not record the upload failure");
+    }
+}
+
+/// [`mark_error`] for a document the work left `queued` or `processing`;
+/// one it finished (ready, or failed with its own message) is left alone.
+async fn mark_unfinished(db: &SharedDb, document_id: &str, message: &str) {
+    let (id, text) = (document_id.to_owned(), message.to_owned());
+    let marked = db
+        .run(move |db| {
+            let unfinished = db
+                .document(&id)?
+                .is_some_and(|doc| matches!(doc.status.as_str(), "queued" | "processing"));
+            if unfinished {
+                db.mark_document_error(&id, &text)?;
+            }
+            Ok(unfinished)
+        })
+        .await;
+    match marked {
+        Ok(true) => {
+            tracing::warn!(document = %document_id, reason = message, "upload ended unfinished");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = %e, document = %document_id, "could not record the upload failure");
+        }
     }
 }

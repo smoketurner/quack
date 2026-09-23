@@ -4,7 +4,6 @@ pub mod office;
 pub mod parser;
 pub mod xlsx;
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rig::embeddings::EmbeddingModel;
@@ -17,43 +16,6 @@ use crate::storage::workspace::{
     DocumentInfo, DocumentSource, NewChunk, NewDocument, WorkspaceDb, quote_ident,
 };
 use crate::storage::writer::Writer;
-
-/// Access to a workspace database for long work (ingestion, extraction,
-/// proposals): the CLI's own connection, or a workspace's shared writer,
-/// which takes each step as an owned closure on its own thread so the work
-/// between steps (parsing, model calls) holds nothing and no async worker
-/// ever waits on the connection.
-pub trait DbHandle {
-    /// Run `f` against the database and await its answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `f`'s error, or the writer's (a panic in `f`, a stopped
-    /// writer).
-    fn with<R: Send + 'static>(
-        &self,
-        f: impl FnOnce(&WorkspaceDb) -> Result<R> + Send + 'static,
-    ) -> impl std::future::Future<Output = Result<R>>;
-}
-
-impl DbHandle for WorkspaceDb {
-    /// The CLI's own connection: nothing to wait for, `f` runs here.
-    fn with<R: Send + 'static>(
-        &self,
-        f: impl FnOnce(&WorkspaceDb) -> Result<R> + Send + 'static,
-    ) -> impl std::future::Future<Output = Result<R>> {
-        std::future::ready(f(self))
-    }
-}
-
-impl DbHandle for Arc<Writer> {
-    fn with<R: Send + 'static>(
-        &self,
-        f: impl FnOnce(&WorkspaceDb) -> Result<R> + Send + 'static,
-    ) -> impl std::future::Future<Output = Result<R>> {
-        self.run(f)
-    }
-}
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -190,15 +152,15 @@ pub enum Registration {
 ///
 /// Returns an error if the file type is unsupported or the file cannot be
 /// parsed or stored; the document row then carries the error.
-pub async fn ingest_file<M: EmbeddingModel, D: DbHandle>(
+pub async fn ingest_file<M: EmbeddingModel>(
     config: &Config,
-    db: &D,
+    db: &Writer,
     workspace_id: &str,
     file: &NewFile<'_>,
     embedding_model: Option<&M>,
 ) -> Result<IngestOutcome> {
     let pending = Pending::of(file)?;
-    let doc_id = match db.with(move |db| pending.register(db)).await? {
+    let doc_id = match db.run(move |db| pending.register(db)).await? {
         Registration::New(id) => id,
         Registration::Duplicate(existing) => return Ok(IngestOutcome::Duplicate(existing)),
     };
@@ -344,9 +306,9 @@ fn register_pending(
     clippy::too_many_arguments,
     reason = "the document's identity, its bytes, the model, and the cancel token"
 )]
-pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
+pub async fn process_document<M: EmbeddingModel>(
     config: &Config,
-    db: &D,
+    db: &Writer,
     workspace_id: &str,
     doc_id: &str,
     filename: &str,
@@ -355,7 +317,7 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     cancel: Option<&CancellationToken>,
 ) -> Result<IngestResult> {
     let id = doc_id.to_owned();
-    db.with(move |db| db.update_document_status(&id, "processing"))
+    db.run(move |db| db.update_document_status(&id, "processing"))
         .await?;
     let outcome = match check_cancel(cancel) {
         Ok(()) => {
@@ -377,7 +339,7 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     match &outcome {
         Ok(result) => {
             let (chunks, tables) = (result.chunks_stored, result.tables.clone());
-            db.with(move |db| {
+            db.run(move |db| {
                 db.set_document_chunk_count(&id, chunks)?;
                 db.set_document_tables(&id, &tables)?;
                 db.update_document_status(&id, "ready")
@@ -386,7 +348,7 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
         }
         Err(e) => {
             let message = e.to_string();
-            db.with(move |db| {
+            db.run(move |db| {
                 db.discard_chunks(&id)?;
                 db.mark_document_error(&id, &message)
             })
@@ -400,9 +362,9 @@ pub async fn process_document<M: EmbeddingModel, D: DbHandle>(
     clippy::too_many_arguments,
     reason = "process_document's arguments, passed through"
 )]
-async fn process_inner<M: EmbeddingModel, D: DbHandle>(
+async fn process_inner<M: EmbeddingModel>(
     config: &Config,
-    db: &D,
+    db: &Writer,
     workspace_id: &str,
     doc_id: &str,
     filename: &str,
@@ -423,7 +385,7 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                 data: data.to_vec(),
                 file_type: file_type.clone(),
             };
-            let table_name = db.with(move |db| step.load(db)).await?;
+            let table_name = db.run(move |db| step.load(db)).await?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
@@ -435,12 +397,14 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
             })
         }
         parser::FileType::Xlsx => {
-            // Parsing the workbook is the slow part: here, not on the writer.
-            let sheets = xlsx::sheets(data)?;
+            // Parsing the workbook is the slow part: off the runtime's
+            // workers, and not on the writer.
+            let bytes = data.to_vec();
+            let sheets = parse_off_runtime(move || xlsx::sheets(&bytes)).await?;
             let files_dir = config.workspace_files_dir(workspace_id);
             let (id, name) = (doc_id.to_owned(), filename.to_owned());
             let tables = db
-                .with(move |db| ingest_workbook(db, &files_dir, &id, &name, sheets))
+                .run(move |db| ingest_workbook(db, &files_dir, &id, &name, sheets))
                 .await?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
@@ -458,13 +422,19 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
         | parser::FileType::Html
         | parser::FileType::Docx
         | parser::FileType::Pptx => {
-            let extracted = parser::extract(&file_type, data)?;
-            if let Some(title) = extracted.title() {
-                let (id, title) = (doc_id.to_owned(), title.to_owned());
-                db.with(move |db| db.set_document_title_if_empty(&id, &title))
+            // Parsing and chunking are the slow, CPU-bound part: off the
+            // runtime's workers, and not on the writer.
+            let parsing = Parsing::new(config, &file_type, filename, data);
+            let Parsed {
+                title,
+                pages_skipped,
+                chunks,
+            } = parse_off_runtime(move || parsing.run()).await?;
+            if let Some(title) = title {
+                let id = doc_id.to_owned();
+                db.run(move |db| db.set_document_title_if_empty(&id, &title))
                     .await?;
             }
-            let pages_skipped = extracted.pages_skipped;
             if pages_skipped > 0 {
                 tracing::warn!(
                     document = %doc_id,
@@ -473,16 +443,6 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
                     "ingested with unreadable pages skipped"
                 );
             }
-            let stem = std::path::Path::new(filename)
-                .file_stem()
-                .and_then(|s| s.to_str());
-            let chunks = chunker::chunk_document(
-                &extracted,
-                stem,
-                config.ingestion.chunk_size_tokens,
-                config.ingestion.chunk_overlap_tokens,
-                &config.ingestion.tokenizer_encoding,
-            )?;
             check_cancel(cancel)?;
             let (chunk_count, embedding_time) = embed_and_store(
                 db,
@@ -508,6 +468,66 @@ async fn process_inner<M: EmbeddingModel, D: DbHandle>(
         }
         parser::FileType::Unknown => Err(Error::UnsupportedFileType(filename.to_owned())),
     }
+}
+
+/// A document's bytes on their way to be parsed and chunked.
+struct Parsing {
+    file_type: parser::FileType,
+    stem: Option<String>,
+    data: Vec<u8>,
+    chunk_size: u32,
+    chunk_overlap: u32,
+    encoding: String,
+}
+
+/// What parsing a document found.
+struct Parsed {
+    title: Option<String>,
+    pages_skipped: u32,
+    chunks: Vec<chunker::Chunk>,
+}
+
+impl Parsing {
+    fn new(config: &Config, file_type: &parser::FileType, filename: &str, data: &[u8]) -> Self {
+        Self {
+            file_type: file_type.clone(),
+            stem: std::path::Path::new(filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned),
+            data: data.to_vec(),
+            chunk_size: config.ingestion.chunk_size_tokens,
+            chunk_overlap: config.ingestion.chunk_overlap_tokens,
+            encoding: config.ingestion.tokenizer_encoding.clone(),
+        }
+    }
+
+    fn run(self) -> Result<Parsed> {
+        let extracted = parser::extract(&self.file_type, &self.data)?;
+        let chunks = chunker::chunk_document(
+            &extracted,
+            self.stem.as_deref(),
+            self.chunk_size,
+            self.chunk_overlap,
+            &self.encoding,
+        )?;
+        Ok(Parsed {
+            title: extracted.title().map(str::to_owned),
+            pages_skipped: extracted.pages_skipped,
+            chunks,
+        })
+    }
+}
+
+/// Run CPU-bound parsing on the blocking pool, so an async worker (a
+/// terminal's input loop, a server's handlers) never stalls on a large
+/// file.
+async fn parse_off_runtime<T: Send + 'static>(
+    parse: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(parse)
+        .await
+        .map_err(|e| Error::Ingestion(format!("parsing stopped before it finished: {e}")))?
 }
 
 /// One document per table: refuse when a live document other than
@@ -712,8 +732,8 @@ struct EmbedPlan<'a> {
     cancel: Option<&'a CancellationToken>,
 }
 
-async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
-    db: &D,
+async fn embed_and_store<M: EmbeddingModel>(
+    db: &Writer,
     document_id: &str,
     chunks: &[chunker::Chunk],
     embedding_model: Option<&M>,
@@ -729,7 +749,7 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
 
     let (owned, id) = (chunks.to_vec(), document_id.to_owned());
     let stored = db
-        .with(move |db| {
+        .run(move |db| {
             db.write_transaction(|db| {
                 let mut stored: u32 = 0;
                 for (i, chunk) in owned.iter().enumerate() {
@@ -789,7 +809,7 @@ async fn embed_and_store<M: EmbeddingModel, D: DbHandle>(
         let (offset, embeddings) = next?;
         batches = batches.saturating_add(1);
         let id = document_id.to_owned();
-        db.with(move |db| {
+        db.run(move |db| {
             db.write_transaction(|db| {
                 for (j, embedding) in embeddings.into_iter().enumerate() {
                     let chunk_idx = u32::try_from(offset.saturating_add(j))

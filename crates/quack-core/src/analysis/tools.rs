@@ -388,6 +388,7 @@ pub struct RunSqlTool {
 }
 
 impl RunSqlTool {
+    #[must_use]
     pub fn new(
         db: SharedDb,
         reader_db: ReaderDb,
@@ -1353,9 +1354,9 @@ mod tests {
     }
 
     /// Two chunks about hail, the denser one second, for the search tests.
-    fn seed_hail_chunks(db: &SharedDb) {
+    async fn seed_hail_chunks(db: &SharedDb) {
         use crate::storage::workspace::{NewChunk, NewDocument};
-        db.call(|guard| {
+        db.run(|guard| {
             guard.insert_document(
                 &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
             )?;
@@ -1378,6 +1379,7 @@ mod tests {
             }
             Ok(())
         })
+        .await
         .unwrap_or_else(|e| fail_test(&e.to_string()));
     }
 
@@ -1920,7 +1922,7 @@ mod tests {
             }
         }
         let db = shared_db();
-        seed_hail_chunks(&db);
+        seed_hail_chunks(&db).await;
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
@@ -2009,7 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn search_documents_top_k_is_capped_regardless_of_what_the_model_asks_for() {
         let db = shared_db();
-        db.call(|guard| {
+        db.run(|guard| {
             guard.insert_document(
                 &NewDocument::new("d", "storms.md", "text/markdown", 1).with_status("ready"),
             )?;
@@ -2026,6 +2028,7 @@ mod tests {
             }
             Ok(())
         })
+        .await
         .unwrap_or_else(|e| fail_test(&e.to_string()));
         let (sink, _rx) = super::super::events::channel();
         let recorder = TurnRecorder::new(sink);
@@ -2153,7 +2156,8 @@ mod tests {
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         assert!(
-            db.call(|guard| guard.execute_statement("CREATE TABLE trips(trip_distance DOUBLE)"))
+            db.run(|guard| guard.execute_statement("CREATE TABLE trips(trip_distance DOUBLE)"))
+                .await
                 .is_ok()
         );
         let tool = RunSqlTool::new(

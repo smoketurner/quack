@@ -23,6 +23,7 @@ use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
 use crate::graph::extract as graph_extract;
 use crate::ontology::{Ontology, documents};
+use crate::priority::{Priority, with_priority};
 use crate::storage::{context, sessions};
 pub use tokio_util::sync::CancellationToken;
 
@@ -470,7 +471,7 @@ fn cosine(a: &[f64], b: &[f64]) -> f64 {
 /// Returns an error when the provider call fails.
 pub async fn embed_query(model: &EmbedModel, text: &str) -> Result<Vec<f32>> {
     // A query embedding is a lookup someone is waiting on.
-    let embedding = limit::with_priority(limit::Priority::Interactive, model.embed_text(text))
+    let embedding = with_priority(Priority::Interactive, model.embed_text(text))
         .await
         .map_err(|e| Error::Embedding(e.to_string()))?;
     #[expect(clippy::cast_possible_truncation, reason = "stored vectors are f32")]
@@ -820,8 +821,8 @@ pub async fn run_turn(
     });
     // Someone is watching this turn: its model calls, and the tools' calls
     // inside it, go ahead of background work at the provider (design 4.1).
-    let turn = limit::with_priority(
-        limit::Priority::Interactive,
+    let turn = with_priority(
+        Priority::Interactive,
         dispatch(
             config,
             Arc::clone(&db),

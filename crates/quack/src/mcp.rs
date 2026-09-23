@@ -1054,8 +1054,9 @@ mod tests {
                 mode: mode.map(str::to_owned),
             })
         };
-        let session_count = || {
-            db.call(|db| sessions::list_sessions(db, 10))
+        let session_count = || async {
+            db.run(|db| sessions::list_sessions(db, 10))
+                .await
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .len()
         };
@@ -1068,7 +1069,7 @@ mod tests {
             let text = error_text(&failed);
             assert!(text.contains("the agent turn failed"), "{text}");
             assert!(!text.contains("does not exist"), "{text}");
-            assert_eq!(session_count(), 0);
+            assert_eq!(session_count().await, 0);
         }
 
         let bad_mode = server
@@ -1084,7 +1085,8 @@ mod tests {
         assert!(error_text(&unknown).contains("does not exist"));
 
         let existing = db
-            .call(|db| sessions::create_session(db, "o/m", ChatMode::Chat, None))
+            .run(|db| sessions::create_session(db, "o/m", ChatMode::Chat, None))
+            .await
             .unwrap_or_else(|e| fail(&e.to_string()))
             .id;
         let failed = server
@@ -1093,7 +1095,8 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&failed).contains("the agent turn failed"));
         let kept = db
-            .call(move |db| sessions::get_session(db, &existing))
+            .run(move |db| sessions::get_session(db, &existing))
+            .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         // The mode given with an existing session id does not change it.
         assert_eq!(kept.map(|s| s.mode), Some(ChatMode::Chat));

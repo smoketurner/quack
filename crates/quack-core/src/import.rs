@@ -20,8 +20,9 @@ use sqlx::{
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::ingestion::{self, DbHandle, IngestOutcome, NewFile};
+use crate::ingestion::{self, IngestOutcome, NewFile};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
+use crate::storage::writer::Writer;
 use tokio_util::sync::CancellationToken;
 
 /// What to import and where to put it.
@@ -175,9 +176,9 @@ fn table_name(raw: &str) -> Result<String> {
 /// Returns an error when the URL is unsupported, the source cannot be
 /// reached or queried, or the load fails; [`Error::Cancelled`] when
 /// `cancel` fires first (a download or query in flight is abandoned).
-pub async fn import<M: EmbeddingModel, D: DbHandle>(
+pub async fn import<M: EmbeddingModel>(
     config: &Config,
-    db: &D,
+    db: &Writer,
     workspace_id: &str,
     request: &ImportRequest,
     policy: ImportPolicy,
@@ -267,7 +268,7 @@ pub async fn import<M: EmbeddingModel, D: DbHandle>(
         (columns, rows)
     } else {
         let table = loaded.clone();
-        db.with(move |db| cap_loaded_table(db, &table, limit))
+        db.run(move |db| cap_loaded_table(db, &table, limit))
             .await?
     };
     tracing::info!(table = %loaded, rows, source = %source, "imported external data");
@@ -782,7 +783,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
         let mut config = Config::default();
         config.general.data_dir = dir.path().to_path_buf();
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| no_workspace(&e.to_string()));
+        let db = open_writer(&config);
         let url = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nn,s\n1,a\n2,b\n3,c\n",
         )
@@ -809,7 +810,8 @@ mod tests {
         assert_eq!(summary.rows, 2);
         assert_eq!(summary.columns, vec![String::from("n"), String::from("s")]);
         let kept = db
-            .execute_query("SELECT n FROM rows ORDER BY n")
+            .run(|db| db.execute_query("SELECT n FROM rows ORDER BY n"))
+            .await
             .map(|r| r.rows.len())
             .unwrap_or_default();
         assert_eq!(kept, 2);
@@ -826,8 +828,10 @@ mod tests {
     }
 
     #[expect(clippy::panic, reason = "test helper: the workspace must open")]
-    fn no_workspace(msg: &str) -> WorkspaceDb {
-        panic!("cannot open the workspace: {msg}")
+    fn open_writer(config: &Config) -> Writer {
+        WorkspaceDb::open(config, "ws")
+            .and_then(Writer::spawn)
+            .unwrap_or_else(|e| panic!("cannot open the workspace: {e}"))
     }
 
     #[expect(clippy::panic, reason = "test asserts Ok")]
@@ -850,7 +854,7 @@ mod tests {
         let link = dir.path().join("elsewhere.db");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&control, &link).unwrap_or_else(|e| no_file(&e.to_string()));
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| no_workspace(&e.to_string()));
+        let db = open_writer(&config);
         let control = control.display();
         let mut urls = vec![
             format!("sqlite:{control}"),

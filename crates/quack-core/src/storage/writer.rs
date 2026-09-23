@@ -10,13 +10,12 @@
 //! write), so a person never queues behind a whole ingest. The line is
 //! [`crate::priority`]'s task-local, or explicit with [`Writer::run_at`].
 //!
-//! Nothing ever locks the connection: async code awaits [`Writer::run`]
-//! and never blocks a runtime worker; sync code outside the runtime (a
-//! job's own thread, a startup step) uses [`Writer::call`]. A closure is
-//! owned (`Send + 'static`) because it crosses to the writer's thread; one
-//! that panics comes back as an error and the writer carries on (a
-//! transaction it left open rolls back with it). Readers are separate
-//! connections ([`crate::analysis::tools::ReaderDb`]) and never wait here.
+//! Nothing ever locks the connection: callers await [`Writer::run`] and
+//! never block a runtime worker. A closure is owned (`Send + 'static`)
+//! because it crosses to the writer's thread; one that panics comes back
+//! as an error and the writer carries on (a transaction it left open rolls
+//! back with it). Readers are separate connections
+//! ([`crate::analysis::tools::ReaderDb`]) and never wait here.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -55,7 +54,9 @@ impl Shared {
 /// A workspace connection on its own thread, served interactive first.
 pub struct Writer {
     shared: Arc<Shared>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    thread: Option<JoinHandle<()>>,
+    /// The writer's thread never joins itself (a closure that held the last
+    /// handle).
     thread_id: ThreadId,
 }
 
@@ -87,7 +88,7 @@ impl Writer {
         Ok(Self {
             thread_id: thread.thread().id(),
             shared,
-            thread: Mutex::new(Some(thread)),
+            thread: Some(thread),
         })
     }
 
@@ -116,32 +117,8 @@ impl Writer {
         f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let (answer, answered) = oneshot::channel();
-        self.submit(priority, f, move |outcome| drop(answer.send(outcome)))?;
+        self.submit(priority, f, answer)?;
         answered.await.unwrap_or_else(|_| Err(stopped()))
-    }
-
-    /// Run `f` and wait for its answer, blocking this thread: for sync code
-    /// off the runtime (a job's own thread, startup, shutdown). Async code
-    /// uses [`Self::run`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::run`]; also when called from the writer's own thread
-    /// (from inside another closure), which would wait on itself.
-    pub fn call<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        if std::thread::current().id() == self.thread_id {
-            return Err(Error::Analysis(String::from(
-                "a writer closure asked the writer for more work; it would wait on itself",
-            )));
-        }
-        let (answer, answered) = std::sync::mpsc::sync_channel(1);
-        self.submit(current_priority(), f, move |outcome| {
-            drop(answer.send(outcome));
-        })?;
-        answered.recv().unwrap_or_else(|_| Err(stopped()))
     }
 
     /// Queue `f`; `reply` gets its outcome on the writer's thread.
@@ -149,7 +126,7 @@ impl Writer {
         &self,
         priority: Priority,
         f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
-        reply: impl FnOnce(Result<T>) + Send + 'static,
+        reply: oneshot::Sender<Result<T>>,
     ) -> Result<()> {
         let job: Job =
             Box::new(move |db| {
@@ -163,7 +140,7 @@ impl Writer {
                 Err(Error::Analysis(format!("the workspace write failed: {what}")))
             });
                 // A caller that stopped waiting (a dropped future) is fine.
-                reply(outcome);
+                drop(reply.send(outcome));
             });
         let mut lines = self.shared.lines();
         if lines.closed {
@@ -219,12 +196,7 @@ impl Drop for Writer {
     fn drop(&mut self) {
         self.shared.lines().closed = true;
         self.shared.ready.notify_all();
-        let thread = self
-            .thread
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(thread) = thread
+        if let Some(thread) = self.thread.take()
             && std::thread::current().id() != self.thread_id
             && thread.join().is_err()
         {
@@ -327,24 +299,21 @@ mod tests {
         assert!(writer.run(WorkspaceDb::list_tables).await.is_ok());
     }
 
-    #[test]
-    fn blocking_callers_and_shutdown() {
+    #[tokio::test]
+    async fn writes_are_seen_and_dropping_the_writer_joins_its_thread() {
         let writer = writer();
-        writer
-            .call(|db| db.execute_with_params("CREATE TABLE t (a INTEGER)", []))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
+        let created = writer
+            .run(|db| db.execute_with_params("CREATE TABLE t (a INTEGER)", []))
+            .await;
+        assert!(created.is_ok());
+        assert!(
             writer
-                .call(WorkspaceDb::list_tables)
-                .unwrap_or_else(|e| fail(&e.to_string())),
-            vec![String::from("t")]
+                .run(WorkspaceDb::list_tables)
+                .await
+                .is_ok_and(|tables| tables == vec![String::from("t")])
         );
-        // A closure that asks its own writer for more work is refused, not
-        // deadlocked.
-        let inner = Arc::clone(&writer);
-        let nested = writer.call(move |_| Ok(inner.call(|_| Ok(())).is_err()));
-        assert!(nested.is_ok_and(|refused| refused));
-        // Dropping the last handle finishes the queue and joins the thread.
+        // The last handle: the queue is empty, so this returns once the
+        // thread has closed the connection.
         drop(writer);
     }
 }

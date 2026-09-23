@@ -33,6 +33,7 @@ use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, WorkspaceDb};
+use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use serde::{Deserialize, Serialize};
 
@@ -245,6 +246,12 @@ fn to_f32(embedding: &[f64]) -> Vec<f32> {
 // Ingestion
 // ---------------------------------------------------------------------------
 
+/// A writer over a second connection to `db`'s database, for the
+/// pipeline steps that take one, while the eval reads through `db`.
+fn writer_of(db: &WorkspaceDb) -> Result<Writer> {
+    Writer::spawn(db.try_clone_reader()?)
+}
+
 async fn ingest_documents(
     config: &Config,
     db: &WorkspaceDb,
@@ -252,12 +259,13 @@ async fn ingest_documents(
     dir: &Path,
     embedder: &HashEmbedder,
 ) -> Result<()> {
+    let writer = writer_of(db)?;
     for path in list_files(dir, "md")? {
         let data = std::fs::read(&path)?;
         let filename = file_name(&path)?;
         ingestion::ingest_file(
             config,
-            db,
+            &writer,
             workspace_id,
             &NewFile::new(filename, &data),
             Some(embedder),
@@ -273,12 +281,13 @@ async fn ingest_tables(
     workspace_id: &str,
     dir: &Path,
 ) -> Result<()> {
+    let writer = writer_of(db)?;
     for path in list_files(dir, "csv")? {
         let data = std::fs::read(&path)?;
         let filename = file_name(&path)?;
-        ingestion::ingest_file::<HashEmbedder, _>(
+        ingestion::ingest_file::<HashEmbedder>(
             config,
-            db,
+            &writer,
             workspace_id,
             &NewFile::new(filename, &data),
             None,
@@ -755,8 +764,17 @@ async fn evaluate_graph(
     }
     let extractor = FixtureExtractor { answers };
 
-    let summary =
-        graph::extract::run(db, chunk_texts, &extractor, &ontology, false, 4, &|_| {}).await?;
+    let writer = writer_of(db)?;
+    let summary = graph::extract::run(
+        &writer,
+        chunk_texts,
+        &extractor,
+        &ontology,
+        false,
+        4,
+        &|_| {},
+    )
+    .await?;
 
     let node_ids = store::all_node_ids(db)?;
     let nodes = store::nodes(db, &node_ids)?;

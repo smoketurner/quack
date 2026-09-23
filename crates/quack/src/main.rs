@@ -754,6 +754,21 @@ async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
     WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")
 }
 
+/// The workspace's connection on a writer thread of its own: the commands
+/// that run core's multi-step work (ingestion, import, graph and ontology
+/// commands) send it their steps exactly as the server and the terminal do.
+async fn open_writer(cli: &Cli) -> Result<Writer> {
+    init_logging();
+    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    spawn_writer(&config, &workspace.id)
+}
+
+/// Open workspace `id` and move its connection onto a writer thread.
+fn spawn_writer(config: &Config, id: &str) -> Result<Writer> {
+    let ws_db = WorkspaceDb::open(config, id).context("failed to open workspace database")?;
+    Writer::spawn(ws_db).context("failed to start the workspace writer")
+}
+
 /// `quack user|token|member|audit`: server administration from the shell.
 async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) -> Result<()> {
     match command {
@@ -794,7 +809,7 @@ async fn run_export(cli: &Cli, session_id: &str, sql: bool) -> Result<ExitCode> 
 
 /// `quack graph ...`: the knowledge graph from the shell.
 async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode> {
-    let ws_db = open_workspace(cli).await?;
+    let ws_db = open_writer(cli).await?;
     let config = Config::load().context("failed to load configuration")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -811,7 +826,7 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
 }
 
 async fn run_ontology(cli: &Cli, action: ontology_cli::OntologyAction) -> Result<ExitCode> {
-    let ws_db = open_workspace(cli).await?;
+    let ws_db = open_writer(cli).await?;
     let config = Config::load().context("failed to load configuration")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -859,8 +874,7 @@ async fn run_import(
         limit,
     };
     let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let ws_db = spawn_writer(&config, &workspace.id)?;
     let embedding_model = llm::optional_embedding_model(&config).await?;
     let summary = import::import(
         &config,
@@ -1484,8 +1498,7 @@ async fn run_ingest(
     }
     let (data, effective_filename) = read_input(file, filename_override)?;
 
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let ws_db = spawn_writer(&config, &workspace.id)?;
 
     let embedding_model = if no_embed {
         None
@@ -1529,7 +1542,10 @@ async fn run_ingest(
     };
 
     if pin {
-        ws_db.set_document_pinned(&result.document_id, true)?;
+        let id = result.document_id.clone();
+        ws_db
+            .run(move |db| db.set_document_pinned(&id, true))
+            .await?;
     }
 
     writeln!(out, "Ingested: {}", result.filename)?;
@@ -1580,8 +1596,7 @@ async fn ingest_bundle(
     no_embed: bool,
 ) -> Result<()> {
     let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
-    let ws_db =
-        WorkspaceDb::open(config, workspace_id).context("failed to open workspace database")?;
+    let ws_db = spawn_writer(config, workspace_id)?;
     let embedding_model = if no_embed {
         None
     } else {
@@ -1619,50 +1634,68 @@ async fn ingest_bundle(
             String::new()
         }
     )?;
-    let current = restore_bundle_ontology(&ws_db, &bundle, dir, &mut out)?;
-    let candidates = okf::propose(&bundle, current.as_ref());
+    let index_body = bundle
+        .index()
+        .map(|index| okf::parse_front_matter(&index.content).1.trim().to_owned())
+        .filter(|body| !body.is_empty());
+    // The ontology, the review queue, and the current context: one step on
+    // the writer, its report rendered there.
+    let owned_dir = dir.to_owned();
+    let (report, existing) = ws_db
+        .run(move |db| Ok(restore_bundle(db, &bundle, &owned_dir)))
+        .await??;
+    out.write_all(&report)?;
+    if let Some(body) = index_body {
+        if existing.as_deref() == Some(body.as_str()) {
+            writeln!(out, "index.md already is the workspace context.")?;
+        } else {
+            write!(
+                out,
+                "index.md can become the workspace context{}. Apply it? [y/N] ",
+                if existing.is_some() {
+                    " (replacing the current one)"
+                } else {
+                    ""
+                }
+            )?;
+            out.flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if matches!(answer.trim(), "y" | "Y" | "yes") {
+                let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
+                writeln!(out, "context is now version {}", stored.version)?;
+            } else {
+                writeln!(
+                    out,
+                    "Left the context alone; `quack context import {dir}/index.md` applies it later."
+                )?;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// A bundle's ontology and review candidates, applied on the writer: the
+/// report of what changed, and the workspace context now in force.
+fn restore_bundle(
+    ws_db: &WorkspaceDb,
+    bundle: &Bundle,
+    dir: &str,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let mut out = Vec::new();
+    let current = restore_bundle_ontology(ws_db, bundle, dir, &mut out)?;
+    let candidates = okf::propose(bundle, current.as_ref());
     if !candidates.is_empty() {
-        candidates::store_run(&ws_db, &candidates)?;
+        candidates::store_run(ws_db, &candidates)?;
         writeln!(
             out,
             "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
             candidates.len()
         )?;
     }
-    if let Some(index) = bundle.index() {
-        let (_, body) = okf::parse_front_matter(&index.content);
-        let body = body.trim();
-        if !body.is_empty() {
-            let existing = context::current(&ws_db)?.map(|c| c.content);
-            if existing.as_deref() == Some(body) {
-                writeln!(out, "index.md already is the workspace context.")?;
-            } else {
-                write!(
-                    out,
-                    "index.md can become the workspace context{}. Apply it? [y/N] ",
-                    if existing.is_some() {
-                        " (replacing the current one)"
-                    } else {
-                        ""
-                    }
-                )?;
-                out.flush()?;
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                if matches!(answer.trim(), "y" | "Y" | "yes") {
-                    let stored = context::set(&ws_db, body, None)?;
-                    writeln!(out, "context is now version {}", stored.version)?;
-                } else {
-                    writeln!(
-                        out,
-                        "Left the context alone; `quack context import {dir}/index.md` applies it later."
-                    )?;
-                }
-            }
-        }
-    }
-    out.flush()?;
-    Ok(())
+    let existing = context::current(ws_db)?.map(|c| c.content);
+    Ok((out, existing))
 }
 
 /// quack's own export carries the ontology exactly: a workspace without

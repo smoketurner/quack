@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::store::{self, id_list};
 use super::{GraphOptions, Node};
 use crate::error::{Error, Result};
-use crate::ingestion::DbHandle;
 use crate::storage::workspace::{WorkspaceDb, tokenize};
+use crate::storage::writer::Writer;
 
 /// A proposed merge: `drop` folds into `keep`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -37,7 +37,7 @@ pub struct ResolutionSummary {
 ///
 /// Returns an error when embedding or a write fails.
 pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
-    db: &impl DbHandle,
+    db: &Writer,
     model: Option<&M>,
     options: &GraphOptions,
 ) -> Result<ResolutionSummary> {
@@ -46,7 +46,7 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
         return Ok(summary);
     };
     loop {
-        let pending = db.with(|db| store::nodes_without_embedding(db, 64)).await?;
+        let pending = db.run(|db| store::nodes_without_embedding(db, 64)).await?;
         if pending.is_empty() {
             break;
         }
@@ -56,7 +56,7 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
             .await
             .map_err(|e| Error::Embedding(e.to_string()))?;
         let embedded = u32::try_from(pending.len()).unwrap_or(u32::MAX);
-        db.with(move |db| {
+        db.run(move |db| {
             for (node, embedding) in pending.iter().zip(embeddings) {
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -72,7 +72,7 @@ pub async fn resolve<M: rig::embeddings::EmbeddingModel>(
     }
     let options = *options;
     let (auto_merged, proposed) = db
-        .with(move |db| {
+        .run(move |db| {
             log_memory(db, "before merge proposals");
             propose_merges(db, &options)
         })

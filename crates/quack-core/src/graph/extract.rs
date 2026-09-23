@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use super::Drift;
 use super::store::{self, NewNode, Source};
 use crate::error::{Error, Result};
-use crate::ingestion::DbHandle;
 use crate::ontology::{self, Ontology};
 use crate::progress::{ChunkDone, Progress};
 use crate::storage::workspace::WorkspaceDb;
+use crate::storage::writer::Writer;
 
 /// What the model returns for one chunk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -301,7 +301,7 @@ const MODEL_CONFIDENCE: f64 = 0.8;
 ///
 /// Returns an error when every chunk fails or a write fails.
 pub async fn run(
-    db: &impl DbHandle,
+    db: &Writer,
     chunks: Vec<ChunkText>,
     extractor: &dyn GraphExtractor,
     ontology: &Ontology,
@@ -358,7 +358,7 @@ pub async fn run(
             ontology.version,
         );
         let (nodes, edges) = db
-            .with(move |db| {
+            .run(move |db| {
                 db.under_timeout(|db| {
                     let counts = store_validated(
                         db,
@@ -385,7 +385,7 @@ pub async fn run(
         )));
     }
     let drift = summary.drift.clone();
-    db.with(move |db| store::record_drift(db, &drift, false))
+    db.run(move |db| store::record_drift(db, &drift, false))
         .await?;
     Ok(summary)
 }

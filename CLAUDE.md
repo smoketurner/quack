@@ -124,7 +124,7 @@ resources are limited where they are used. Every rig client is built over
 `llm::LimitedHttp`, which holds one permit of the process-wide gate for the provider and
 the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
-requests (`run_turn`, `embed_query`, via the `llm::limit::Priority` task-local) before
+requests (`run_turn`, `embed_query`, via the `quack_core::priority` task-local) before
 background ones. The registry is in memory only (labels can be workspace content).
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
@@ -137,12 +137,13 @@ interactive line), never on the loop's thread; input typed during `/new`, `/resu
 thread per workspace owns the writer connection and runs the owned (`Send + 'static`)
 closures sent to it one at a time, interactive before background by
 `quack_core::priority` (a task-local, interactive unless the job queue scopes a
-background job kind). Async code awaits `Writer::run` (or the server's `with_db`); sync
-code off the runtime uses `Writer::call`; nothing locks the writer. `DbHandle` is async
-and takes owned closures (`Arc<Writer>` sends them to the actor, the CLI's own
-`WorkspaceDb` runs them in place), so `graph_cli`, `ontology_cli`, ingestion, import,
-and extraction send one step at a time and render command output into a buffer on the
-writer's thread (`graph_cli::rendered`).
+background job kind). Callers await `Writer::run` (or the server's `with_db`); nothing
+locks the writer. Ingestion, import, extraction, `graph_cli`, and `ontology_cli` take
+`&Writer` (the CLI spawns one per command, like the server and the terminal) and send
+one step at a time, rendering command output into a buffer on the writer's thread
+(`graph_cli::rendered`); file parsing runs on the blocking pool, so every job, the
+terminal's included, is a plain task on the runtime. Tests that also read through a
+`WorkspaceDb` give the pipeline a writer over its `try_clone_reader` connection.
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes
