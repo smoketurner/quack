@@ -20,10 +20,9 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    AuthMode, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, config_file_path,
-    default_redirect_uri,
+    AuthMode, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Overrides,
+    config_file_path, default_redirect_uri,
 };
-use crate::error::Result;
 
 /// How an unset optional setting is rendered.
 pub const UNSET: &str = "(unset)";
@@ -175,7 +174,8 @@ impl Inspection {
     #[must_use]
     pub fn of(config_path: PathBuf, contents: Option<&str>) -> Self {
         let raw = contents.and_then(|text| toml::from_str::<Table>(text).ok());
-        let loaded = load_from(contents);
+        let overrides = Overrides::from_env();
+        let loaded = Config::from_contents(contents, &overrides);
         let (config, file_state) = match loaded {
             Ok(config) => (
                 config,
@@ -187,7 +187,7 @@ impl Inspection {
             ),
             Err(e) => {
                 let mut fallback = Config::default();
-                fallback.apply_env();
+                overrides.apply(&mut fallback);
                 (fallback, FileState::Rejected(e.to_string()))
             }
         };
@@ -219,18 +219,6 @@ impl Inspection {
             .iter()
             .filter(|s| !s.is_default() || s.file_value.is_some())
     }
-}
-
-/// `Config::load` without the file lookup: parse, apply the environment,
-/// validate — the same order, so this reports exactly what that would.
-fn load_from(contents: Option<&str>) -> Result<Config> {
-    let mut config = match contents {
-        Some(text) => Config::parse(text)?,
-        None => Config::default(),
-    };
-    config.apply_env();
-    config.validate()?;
-    Ok(config)
 }
 
 /// Every section and the keys it accepts. A test probes each section
