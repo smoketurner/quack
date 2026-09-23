@@ -2,7 +2,7 @@
 //! one or all at once, and applied as a new ontology version.
 
 use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
-use super::{Ontology, ROOT_CLASS, store};
+use super::{Class, Ontology, ROOT_CLASS, store};
 use crate::error::{Error, Record, Result};
 use crate::storage::workspace::WorkspaceDb;
 
@@ -189,7 +189,7 @@ fn row_from(row: &duckdb::Row<'_>) -> duckdb::Result<CandidateRow> {
     Ok(CandidateRow {
         id: row.get(0)?,
         kind: row.get(1)?,
-        proposal: serde_json::from_str(&proposal).unwrap_or(Proposal::Class(super::Class {
+        proposal: serde_json::from_str(&proposal).unwrap_or(Proposal::Class(Class {
             id: String::from("unparseable"),
             parent: String::from(ROOT_CLASS),
             label: None,
@@ -243,7 +243,7 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<CandidateRow> {
     let mut stmt = db.connection().prepare(&sql)?;
     let rows: Vec<CandidateRow> = stmt
         .query_map(duckdb::params![prefix, prefix], row_from)?
-        .filter_map(std::result::Result::ok)
+        .flatten()
         .collect();
     match rows.len() {
         1 => rows
@@ -354,7 +354,6 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ontology::Class;
     use crate::ontology::induction::{Candidate, TableEvidenceOptions, propose_from_tables};
 
     #[expect(clippy::panic, reason = "test failure path")]

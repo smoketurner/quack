@@ -456,7 +456,7 @@ mod tests {
             let rows = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
                 .unwrap_or_else(|e| fail(&e.to_string()));
-            rows.filter_map(std::result::Result::ok).collect()
+            rows.flatten().collect()
         };
         assert_eq!(
             since,

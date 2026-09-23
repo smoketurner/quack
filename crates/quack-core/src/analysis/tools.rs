@@ -1262,6 +1262,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::analysis::events::{self, AgentEvent};
     use crate::embedding::{Dimension, Profile, Prompts};
     use crate::storage::workspace::{DocumentStatus, NewDocument};
 
@@ -1746,7 +1747,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_runs_reads_and_rejects_internal_tables_and_syntax_errors() {
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         let refused = RefusalFlag::default();
@@ -1863,7 +1864,7 @@ mod tests {
         ] {
             let db = shared_db();
             let reader_db = open_reader(&db, 2).await;
-            let (sink, _rx) = super::super::events::channel();
+            let (sink, _rx) = events::channel();
             let recorder = TurnRecorder::new(sink);
             let tool = RunSqlTool::new(
                 Arc::clone(&db),
@@ -1902,7 +1903,7 @@ mod tests {
     /// create one outright rather than let that happen.
     #[tokio::test]
     async fn gate_refuses_statements_that_create_temp_tables() {
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         let refused = RefusalFlag::default();
@@ -1940,7 +1941,7 @@ mod tests {
         }
         let db = shared_db();
         seed_hail_chunks(&db).await;
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
@@ -2004,7 +2005,7 @@ mod tests {
 
     #[test]
     fn search_documents_offers_the_entity_argument_only_with_a_graph() {
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
             ReaderDb::new(shared_db()),
             None,
@@ -2048,7 +2049,7 @@ mod tests {
         })
         .await
         .unwrap_or_else(|e| fail_test(&e.to_string()));
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let tool = SearchDocumentsTool::<crate::llm::EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
@@ -2082,7 +2083,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_sql_caps_rows_and_reports_the_rest() {
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         let tool = RunSqlTool::new(
@@ -2120,7 +2121,7 @@ mod tests {
     /// different statement gets the budget alone.
     #[tokio::test]
     async fn run_sql_flags_a_statement_repeated_with_other_literals() {
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink).with_turn_limit(15);
         let db = shared_db();
         let tool = RunSqlTool::new(
@@ -2170,7 +2171,7 @@ mod tests {
     /// rather than as a tool failure whose message rig withholds.
     #[tokio::test]
     async fn run_sql_hands_duckdb_errors_to_the_model_with_candidate_bindings() {
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         assert!(
@@ -2238,7 +2239,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_applies_allow_and_deny_to_writes() {
-        let (sink, _rx) = super::super::events::channel();
+        let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         let refused = RefusalFlag::default();
@@ -2264,8 +2265,7 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test asserts the event kind")]
     async fn gate_ask_waits_for_the_interface() {
-        use super::super::events::AgentEvent;
-        let (sink, mut rx) = super::super::events::channel();
+        let (sink, mut rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         let refused = RefusalFlag::default();

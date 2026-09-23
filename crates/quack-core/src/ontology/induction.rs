@@ -138,7 +138,7 @@ fn profile_table(db: &WorkspaceDb, table: &str) -> Result<TableProfile> {
         ))?;
         let samples: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(0))?
-            .filter_map(std::result::Result::ok)
+            .flatten()
             .collect();
         columns.push(ColumnProfile {
             name: column.name.clone(),
@@ -267,7 +267,7 @@ fn enum_values(db: &WorkspaceDb, table: &str, column: &str) -> Result<Vec<String
     ))?;
     Ok(stmt
         .query_map([], |r| r.get::<_, String>(0))?
-        .filter_map(std::result::Result::ok)
+        .flatten()
         .collect())
 }
 

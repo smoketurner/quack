@@ -177,7 +177,7 @@ pub fn sample_chunks(db: &WorkspaceDb, sample: u32) -> Result<Vec<SampledChunk>>
         .query_map([DocumentStatus::Ready], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
-        .filter_map(std::result::Result::ok)
+        .flatten()
         .collect();
     let mut by_doc: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (id, document_id, filename) in rows {
