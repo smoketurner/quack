@@ -255,6 +255,28 @@ pub struct JobProgress {
     pub total: u32,
 }
 
+impl JobProgress {
+    /// The share done, in whole percent rounded down, so 100 means finished;
+    /// `None` when there is nothing to count.
+    #[must_use]
+    pub fn percent(self) -> Option<u64> {
+        u64::from(self.done)
+            .saturating_mul(100)
+            .checked_div(u64::from(self.total))
+    }
+}
+
+/// `1576/3835 (41%)`, or `0/0` when there is nothing to count.
+impl fmt::Display for JobProgress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.done, self.total)?;
+        match self.percent() {
+            Some(percent) => write!(f, " ({percent}%)"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// A job as it stands: what every subscriber receives on each change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobInfo {
@@ -774,6 +796,20 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    #[test]
+    fn progress_shows_percent_rounded_down() {
+        let shown = |done, total| JobProgress { done, total }.to_string();
+        assert_eq!(shown(1576, 3835), "1576/3835 (41%)");
+        assert_eq!(shown(0, 5), "0/5 (0%)");
+        assert_eq!(shown(3834, 3835), "3834/3835 (99%)");
+        assert_eq!(shown(3835, 3835), "3835/3835 (100%)");
+        assert_eq!(
+            shown(u32::MAX, u32::MAX),
+            format!("{0}/{0} (100%)", u32::MAX)
+        );
+        assert_eq!(shown(0, 0), "0/0");
     }
 
     async fn finished(queue: &JobQueue, id: JobId) -> JobInfo {

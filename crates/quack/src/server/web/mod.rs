@@ -909,10 +909,7 @@ fn render_jobs(app: &App, access: &Access) -> WebResult<String> {
                 j.state.to_string()
             },
             active: !j.state.is_finished(),
-            progress: j
-                .progress
-                .map(|p| format!("{} / {}", p.done, p.total))
-                .unwrap_or_default(),
+            progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
             outcome: j.outcome.or(j.status),
             queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
         })

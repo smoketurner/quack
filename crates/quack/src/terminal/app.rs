@@ -2552,10 +2552,7 @@ fn one_line(text: &str) -> String {
 
 /// One job as `/jobs` lists it.
 pub(crate) fn job_line(job: &JobInfo) -> String {
-    let progress = job
-        .progress
-        .map(|p| format!(" {}/{}", p.done, p.total))
-        .unwrap_or_default();
+    let progress = job.progress.map(|p| format!(" {p}")).unwrap_or_default();
     let outcome = match (&job.outcome, job.state) {
         (Some(text), JobState::Succeeded | JobState::Failed | JobState::Cancelled)
             if !text.is_empty() =>
