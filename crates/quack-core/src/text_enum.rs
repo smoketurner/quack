@@ -87,6 +87,7 @@ mod tests {
     use crate::error::{Error, Record};
     use crate::graph::ExtractSource;
     use crate::graph::resolve::{MergeDecision, MergeStatus};
+    use crate::okf::ConceptType;
     use crate::ontology::PropertyType;
     use crate::ontology::candidates::{CandidateAction, CandidateStatus, Queue};
     use crate::ontology::induction::ItemKind;
@@ -153,6 +154,7 @@ mod tests {
         text_round_trips(doctor::Status::ALL);
         text_round_trips(doctor::Area::ALL);
         text_round_trips(MetaKey::ALL);
+        text_round_trips(ConceptType::ALL);
     }
 
     #[test]

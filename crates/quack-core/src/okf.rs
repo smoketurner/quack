@@ -389,7 +389,7 @@ pub fn export(db: &WorkspaceDb, workspace_name: &str) -> Result<Bundle> {
     let context_text = context::current(db)?.map(|c| c.content).unwrap_or_default();
     let mut index = front(
         &[
-            ("type", String::from("index")),
+            ("type", ConceptType::Index.to_string()),
             ("title", workspace_name.to_owned()),
         ],
         &[],
@@ -412,7 +412,7 @@ pub fn export(db: &WorkspaceDb, workspace_name: &str) -> Result<Bundle> {
 
     export_entities(db, &mut bundle, &mut index, &documents)?;
 
-    let mut log = front(&[("type", String::from("log"))], &[]);
+    let mut log = front(&[("type", ConceptType::Log.to_string())], &[]);
     log.push_str("# Log\n\n## Ontology versions\n\n");
     for version in ontology_store::versions(db, 100)? {
         writeln!(
@@ -453,7 +453,7 @@ fn export_tables(
         let mapping = ontology.and_then(|o| o.mappings.iter().find(|m| &m.table == table));
         let mut text = front(
             &[
-                ("type", String::from("DuckDB Table")),
+                ("type", ConceptType::Table.to_string()),
                 ("generator", String::from(GENERATOR)),
                 ("title", table.clone()),
                 (
@@ -528,7 +528,7 @@ fn export_documents(
         let path = format!("documents/{}.md", slug(&document.filename));
         let mut text = front(
             &[
-                ("type", String::from("document")),
+                ("type", ConceptType::Document.to_string()),
                 ("generator", String::from(GENERATOR)),
                 ("title", document.display_name().to_owned()),
                 ("resource", document.filename.clone()),
@@ -584,7 +584,7 @@ fn export_ontology(bundle: &mut Bundle, index: &mut String, ontology: &Ontology)
     for class in &ontology.classes {
         let mut text = front(
             &[
-                ("type", String::from("class")),
+                ("type", ConceptType::Class.to_string()),
                 ("generator", String::from(GENERATOR)),
                 (
                     "title",
@@ -636,7 +636,7 @@ fn export_ontology(bundle: &mut Bundle, index: &mut String, ontology: &Ontology)
     export_relations_and_properties(bundle, ontology)?;
     let mut snapshot = front(
         &[
-            ("type", String::from("ontology")),
+            ("type", ConceptType::Ontology.to_string()),
             ("generator", String::from(GENERATOR)),
             ("version", ontology.version.to_string()),
         ],
@@ -656,7 +656,7 @@ fn export_relations_and_properties(bundle: &mut Bundle, ontology: &Ontology) -> 
     for relation in &ontology.relations {
         let mut text = front(
             &[
-                ("type", String::from("relation")),
+                ("type", ConceptType::Relation.to_string()),
                 ("generator", String::from(GENERATOR)),
                 (
                     "title",
@@ -689,7 +689,7 @@ fn export_relations_and_properties(bundle: &mut Bundle, ontology: &Ontology) -> 
     for property in &ontology.properties {
         let mut text = front(
             &[
-                ("type", String::from("property")),
+                ("type", ConceptType::Property.to_string()),
                 ("generator", String::from(GENERATOR)),
                 (
                     "title",
@@ -887,7 +887,7 @@ pub fn propose(bundle: &Bundle, current: Option<&Ontology>) -> Vec<Candidate> {
         if front.get("resource").is_some() {
             resource_seen = true;
         }
-        if kind.is_empty() || STRUCTURAL_TYPES.contains(&kind.as_str()) {
+        if kind.is_empty() || ConceptType::is_structural(&kind) {
             continue;
         }
         examples
@@ -1025,17 +1025,38 @@ fn labelled_link(line: &str) -> Option<&str> {
     Some(label)
 }
 
-/// Types a quack export uses for its own structure; they describe the
-/// bundle, not the domain, so they never become class candidates.
-const STRUCTURAL_TYPES: &[&str] = &[
-    "index",
-    "log",
-    "class",
-    "relation",
-    "property",
-    "duckdb_table",
-    "document",
-];
+/// The `type`s a quack export writes for its own structure; they describe
+/// the bundle, not the domain, so they never become class candidates.
+/// Entity files carry their class id instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConceptType {
+    Index,
+    Log,
+    Table,
+    Document,
+    Ontology,
+    Class,
+    Relation,
+    Property,
+}
+
+text_enum!(ConceptType, "concept type", {
+    Index => "index",
+    Log => "log",
+    Table => "DuckDB Table",
+    Document => "document",
+    Ontology => "ontology",
+    Class => "class",
+    Relation => "relation",
+    Property => "property",
+});
+
+impl ConceptType {
+    /// Whether `id`, an imported `type` through [`type_id`], is one of these.
+    fn is_structural(id: &str) -> bool {
+        Self::ALL.iter().any(|t| type_id(t.as_str()) == id)
+    }
+}
 
 /// An OKF `type` as an ontology id: lowercase, words joined by `_`,
 /// a trailing `s` dropped from the last word.
@@ -1097,6 +1118,16 @@ mod tests {
             "see [Kenya](../country/kenya.md) and [site](https://x.y/z.md) and [self](#top) and [t](../../tables/shipments.md)",
         );
         assert_eq!(found, ["entities/country/kenya.md", "tables/shipments.md"]);
+    }
+
+    #[test]
+    fn exported_structural_types_are_never_domain_types() {
+        for &concept in ConceptType::ALL {
+            assert!(ConceptType::is_structural(&type_id(&concept.to_string())));
+        }
+        assert!(ConceptType::is_structural("duckdb_table"));
+        assert!(!ConceptType::is_structural("organization"));
+        assert!(!ConceptType::is_structural(""));
     }
 
     #[test]
