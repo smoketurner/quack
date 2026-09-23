@@ -86,6 +86,8 @@ mod tests {
     use crate::error::Error;
     use crate::graph::resolve::{MergeDecision, MergeStatus};
     use crate::ontology::PropertyType;
+    use crate::ontology::candidates::{CandidateAction, CandidateStatus, Queue};
+    use crate::ontology::induction::ItemKind;
     use crate::storage::control::{Channel, Outcome, Role, Scope};
     use crate::storage::sessions::{ChatMode, MessageRole};
     use crate::storage::workspace::{DocumentSource, DocumentStatus};
@@ -127,6 +129,10 @@ mod tests {
         round_trips(DocumentStatus::ALL);
         round_trips(MergeStatus::ALL);
         round_trips(MergeDecision::ALL);
+        round_trips(CandidateStatus::ALL);
+        round_trips(Queue::ALL);
+        round_trips(CandidateAction::ALL);
+        round_trips(ItemKind::ALL);
     }
 
     #[test]

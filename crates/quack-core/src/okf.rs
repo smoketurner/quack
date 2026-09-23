@@ -1272,11 +1272,9 @@ mod tests {
         // With a document class in the ontology, `resource` is proposed on it.
         let with_documents = Ontology::builtin_default();
         let candidates = propose(&bundle, Some(&with_documents));
-        assert!(
-            candidates
-                .iter()
-                .any(|c| c.proposal.kind() == "property" && c.proposal.id() == "resource")
-        );
+        assert!(candidates.iter().any(|c| c.proposal.kind()
+            == crate::ontology::induction::ItemKind::Property
+            && c.proposal.id() == "resource"));
         let mut current = Ontology::default();
         current.classes.push(Class {
             id: String::from("vendor"),
@@ -1310,7 +1308,7 @@ mod tests {
         let ids = |candidates: &[Candidate]| -> Vec<String> {
             candidates
                 .iter()
-                .filter(|c| c.proposal.kind() == "relation")
+                .filter(|c| c.proposal.kind() == crate::ontology::induction::ItemKind::Relation)
                 .map(|c| c.proposal.id().to_owned())
                 .collect()
         };

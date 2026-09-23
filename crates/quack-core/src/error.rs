@@ -136,6 +136,7 @@ pub enum Record {
     Document,
     OntologyVersion,
     MergeProposal,
+    Candidate,
 }
 
 text_enum!(Record, "record", {
@@ -143,6 +144,7 @@ text_enum!(Record, "record", {
     Document => "document",
     OntologyVersion => "ontology version",
     MergeProposal => "merge proposal",
+    Candidate => "candidate",
 });
 
 impl Record {

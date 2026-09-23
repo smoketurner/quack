@@ -18,9 +18,9 @@
 <section class="mt-4">
   <h2 class="text-sm font-semibold uppercase text-slate-500">Review queue</h2>
   <p class="mt-1 flex flex-wrap items-center gap-3 text-sm">
-    {% if queue_status == "pending" %}<span class="font-medium">{{ pending_total }} pending</span>{% else %}<a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology">{{ pending_total }} pending</a>{% endif %}
-    {% if queue_status == "low_support" %}<span class="font-medium">{{ low_support_total }} low support</span>{% else %}<a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology?status=low_support">{{ low_support_total }} low support</a>{% endif %}
-    {% if queue_status == "low_support" %}<span class="text-slate-500">seen in fewer documents than <code>[ontology].min_support_documents</code>; accept what you know to be right</span>{% endif %}
+    {% if queue_status == Queue::Pending %}<span class="font-medium">{{ pending_total }} pending</span>{% else %}<a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology">{{ pending_total }} pending</a>{% endif %}
+    {% if queue_status == Queue::LowSupport %}<span class="font-medium">{{ low_support_total }} low support</span>{% else %}<a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology?status=low_support">{{ low_support_total }} low support</a>{% endif %}
+    {% if queue_status == Queue::LowSupport %}<span class="text-slate-500">seen in fewer documents than <code>[ontology].min_support_documents</code>; accept what you know to be right</span>{% endif %}
     {% if queue_pages > 1 %}<span class="text-slate-500">page {{ queue_page }} of {{ queue_pages }}{% if queue_page > 1 %} · <a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology?status={{ queue_status }}&page={{ queue_page - 1 }}">previous</a>{% endif %}{% if queue_page < queue_pages %} · <a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/ontology?status={{ queue_status }}&page={{ queue_page + 1 }}">next</a>{% endif %}</span>{% endif %}
   </p>
   {% if ws.can_write && !queue.is_empty() %}
@@ -48,7 +48,7 @@
             <option value="accept">accept</option>
             <option value="rename">rename to</option>
             <option value="merge_into">merge into</option>
-            {% if c.kind == "class" %}<option value="reparent">under parent</option>{% endif %}
+            {% if c.kind == ItemKind::Class %}<option value="reparent">under parent</option>{% endif %}
             <option value="reject">reject</option>
           </select>
           <input name="target" placeholder="id" class="w-28 rounded border border-slate-300 px-1 py-0.5 text-xs">

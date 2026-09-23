@@ -10,7 +10,8 @@ use quack_core::config::Config;
 
 use crate::graph_cli::rendered;
 use quack_core::ontology::Ontology;
-use quack_core::ontology::induction::{Candidate, Decision, propose_from_tables};
+use quack_core::ontology::candidates::{CandidateStatus, Queue};
+use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::{candidates, documents, store};
 use quack_core::progress::Progress;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -255,15 +256,16 @@ async fn run_propose(
 fn run_review(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) -> Result<()> {
     match action {
         OntologyAction::Review { low_support } => {
-            let pending = if low_support {
-                candidates::low_support(db)?
+            let queue = if low_support {
+                Queue::LowSupport
             } else {
-                candidates::pending(db)?
+                Queue::Pending
             };
+            let pending = candidates::queue(db, queue)?;
             if pending.is_empty() && low_support {
                 writeln!(out, "No low-support candidates.")?;
             } else if pending.is_empty() {
-                let aside = candidates::low_support(db)?.len();
+                let aside = candidates::queue(db, Queue::LowSupport)?.len();
                 writeln!(
                     out,
                     "No pending candidates. Run `quack ontology propose`.{}",
@@ -424,7 +426,7 @@ async fn propose(
     } else {
         let run = proposals.clone();
         db.run(move |db| candidates::store_run(db, &run)).await?;
-        let by_kind = |kind: &str| {
+        let by_kind = |kind: ItemKind| {
             proposals
                 .iter()
                 .filter(|c| c.proposal.kind() == kind)
@@ -435,10 +437,10 @@ async fn propose(
             out,
             "{} candidates queued: {} classes, {} properties, {} relations, {} mappings ({low} with low support, kept aside). Run `quack ontology review`.",
             proposals.len(),
-            by_kind("class"),
-            by_kind("property"),
-            by_kind("relation"),
-            by_kind("mapping")
+            by_kind(ItemKind::Class),
+            by_kind(ItemKind::Property),
+            by_kind(ItemKind::Relation),
+            by_kind(ItemKind::Mapping)
         )?;
     }
     Ok(())
@@ -556,21 +558,21 @@ fn evidence_line(c: &candidates::CandidateRow) -> String {
             "{} mentions in {} documents{} e.g. {examples}",
             get("occurrences"),
             get("documents"),
-            if c.status == "low_support" {
+            if c.status == CandidateStatus::LowSupport {
                 " (low support)"
             } else {
                 ""
             }
         );
     }
-    match c.kind.as_str() {
-        "class" => format!(
+    match c.kind {
+        ItemKind::Class => format!(
             "table {} ({} rows, key {})",
             get("table"),
             get("rows"),
             get("key_column")
         ),
-        "property" => format!(
+        ItemKind::Property => format!(
             "{}.{} {} distinct {} of {} e.g. {}",
             get("table"),
             get("column"),
@@ -579,7 +581,7 @@ fn evidence_line(c: &candidates::CandidateRow) -> String {
             get("rows"),
             get("samples")
         ),
-        "relation" => format!(
+        ItemKind::Relation => format!(
             "{}.{} matches {}.{} for {} of values",
             get("table"),
             get("column"),
@@ -587,7 +589,7 @@ fn evidence_line(c: &candidates::CandidateRow) -> String {
             get("target_key"),
             get("overlap")
         ),
-        _ => format!("table {}", get("table")),
+        ItemKind::Mapping => format!("table {}", get("table")),
     }
 }
 

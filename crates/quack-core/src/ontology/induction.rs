@@ -57,15 +57,33 @@ impl Proposal {
     }
 
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> ItemKind {
         match self {
-            Self::Class(_) => "class",
-            Self::Property { .. } => "property",
-            Self::Relation(_) => "relation",
-            Self::Mapping(_) => "mapping",
+            Self::Class(_) => ItemKind::Class,
+            Self::Property { .. } => ItemKind::Property,
+            Self::Relation(_) => ItemKind::Relation,
+            Self::Mapping(_) => ItemKind::Mapping,
         }
     }
 }
+
+/// The kinds of item an ontology holds and a proposal adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ItemKind {
+    Class,
+    Property,
+    Relation,
+    Mapping,
+}
+
+text_enum!(ItemKind, "item kind", {
+    Class => "class",
+    Property => "property",
+    Relation => "relation",
+    Mapping => "mapping",
+});
+text_enum_sql!(ItemKind);
 
 /// A proposal with its evidence, before it is stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -837,7 +855,7 @@ mod tests {
         let find = |kind: &str, id: &str| {
             candidates
                 .iter()
-                .find(|c| c.proposal.kind() == kind && c.proposal.id() == id)
+                .find(|c| c.proposal.kind().as_str() == kind && c.proposal.id() == id)
         };
         let claim = find("class", "claim").unwrap_or_else(|| fail("no claim class"));
         assert!(

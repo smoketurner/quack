@@ -915,7 +915,7 @@ mod tests {
         let find = |kind: &str, id: &str| {
             candidates
                 .iter()
-                .find(|c| c.proposal.kind() == kind && c.proposal.id() == id)
+                .find(|c| c.proposal.kind().as_str() == kind && c.proposal.id() == id)
         };
         let vendor = find("class", "vendor").unwrap_or_else(|| fail("no vendor"));
         assert!(

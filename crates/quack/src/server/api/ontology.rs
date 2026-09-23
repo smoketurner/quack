@@ -3,6 +3,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::Outcome;
 use serde::Deserialize;
@@ -252,7 +253,8 @@ pub(crate) async fn propose(
 #[derive(Deserialize, Default)]
 pub(crate) struct CandidatesQuery {
     /// `pending` (default) or `low_support`.
-    pub status: Option<String>,
+    #[serde(default)]
+    pub status: Queue,
 }
 
 pub(crate) async fn list_candidates(
@@ -265,15 +267,10 @@ pub(crate) async fn list_candidates(
     access
         .audit_read(&app, "list", "ontology_candidates")
         .await?;
-    let rows = match q.status.as_deref() {
-        None | Some("pending") => app.read(&id, candidates::pending).await?,
-        Some("low_support") => app.read(&id, candidates::low_support).await?,
-        Some(other) => {
-            return Err(ApiError::bad_request(format!(
-                "status must be pending or low_support, not '{other}'"
-            )));
-        }
-    };
+    let queue = q.status;
+    let rows = app
+        .read(&id, move |db| candidates::queue(db, queue))
+        .await?;
     Ok(Json(serde_json::json!({ "candidates": rows })))
 }
 
@@ -321,8 +318,7 @@ pub(crate) async fn decide_many(
         };
         Ok((version, rejected))
     })
-    .await
-    .map_err(|e| ApiError::bad_request(e.message))?;
+    .await?;
     access
         .audit(
             &app,
@@ -346,7 +342,7 @@ pub(crate) async fn decide_many(
 #[derive(Deserialize)]
 pub(crate) struct DecideRequest {
     /// `accept`, `rename`, `merge_into`, `reparent`, or `reject`.
-    pub action: String,
+    pub action: CandidateAction,
     /// The new id for `rename`, the target for `merge_into`, or the parent for `reparent`.
     pub target: Option<String>,
 }
@@ -360,20 +356,7 @@ pub(crate) async fn decide(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let db = app.workspace_db(&id).await?;
     let author = access.identity.username.clone();
-    let target = || {
-        body.target
-            .clone()
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| ApiError::bad_request("this action needs a target"))
-    };
-    let decision = match body.action.as_str() {
-        "accept" => Some(Decision::Accept),
-        "rename" => Some(Decision::Rename(target()?)),
-        "merge_into" => Some(Decision::MergeInto(target()?)),
-        "reparent" => Some(Decision::Reparent(target()?)),
-        "reject" => None,
-        other => return Err(ApiError::bad_request(format!("unknown action '{other}'"))),
-    };
+    let decision = body.action.decision(body.target.as_deref())?;
     let candidate_id = cid.clone();
     let version = with_db(db, move |db| {
         if let Some(decision) = decision {
@@ -383,8 +366,7 @@ pub(crate) async fn decide(
         candidates::reject(db, &[candidate_id], Some(&author))?;
         Ok(None)
     })
-    .await
-    .map_err(|e| ApiError::bad_request(e.message))?;
+    .await?;
     access
         .audit(
             &app,

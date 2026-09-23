@@ -18,7 +18,8 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use axum_extra::extract::cookie::Cookie;
-use quack_core::ontology::induction::{Decision, Proposal, propose_from_tables};
+use quack_core::ontology::candidates::{CandidateAction, Queue};
+use quack_core::ontology::induction::{Decision, ItemKind, Proposal, propose_from_tables};
 use quack_core::ontology::store as ontology_store;
 use quack_core::ontology::{Ontology, OntologyDiff, candidates};
 use quack_core::storage::context;
@@ -313,7 +314,7 @@ struct ClassRow {
 
 struct CandidateView {
     id: String,
-    kind: String,
+    kind: ItemKind,
     proposal_id: String,
     confidence: String,
     evidence: String,
@@ -331,8 +332,8 @@ struct OntologyPage {
     diff: Option<OntologyDiff>,
     /// The page of the queue being shown.
     queue: Vec<CandidateView>,
-    /// `pending` or `low_support`: which queue `queue` shows.
-    queue_status: String,
+    /// Which queue `queue` shows.
+    queue_status: Queue,
     queue_page: usize,
     queue_pages: usize,
     pending_total: usize,
@@ -349,19 +350,21 @@ const CANDIDATES_PER_PAGE: usize = 50;
 struct OntologyQuery {
     error: Option<String>,
     notice: Option<String>,
-    /// `pending` (default) or `low_support`.
-    status: Option<String>,
+    /// The main queue unless `low_support` is asked for.
+    #[serde(default, deserialize_with = "blank_as_none")]
+    status: Option<Queue>,
     page: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct BulkDecideForm {
     /// `accept` or `reject`.
-    bulk: String,
+    bulk: CandidateAction,
     #[serde(default)]
     ids: Vec<String>,
+    /// The queue to return to.
     #[serde(default)]
-    status: String,
+    status: Queue,
 }
 
 /// One node as the graph page's inspector shows it.
@@ -1381,10 +1384,7 @@ async fn ontology_page(
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, "page", "ontology").await?;
-    let queue_status = match q.status.as_deref() {
-        Some("low_support") => "low_support",
-        _ => "pending",
-    };
+    let queue_status = q.status.unwrap_or_default();
     let (ontology, versions, diff, pending, low_support, has_tables) = app
         .read(&id, |db| {
             let current = ontology_store::current(db)?;
@@ -1396,17 +1396,16 @@ async fn ontology_page(
                 }
                 _ => None,
             };
-            let pending = candidates::pending(db)?;
-            let low_support = candidates::low_support(db)?;
+            let pending = candidates::queue(db, Queue::Pending)?;
+            let low_support = candidates::queue(db, Queue::LowSupport)?;
             let has_tables = !db.list_tables()?.is_empty();
             Ok((current, versions, diff, pending, low_support, has_tables))
         })
         .await?;
     let (pending_total, low_support_total) = (pending.len(), low_support.len());
-    let rows = if queue_status == "low_support" {
-        low_support
-    } else {
-        pending
+    let rows = match queue_status {
+        Queue::Pending => pending,
+        Queue::LowSupport => low_support,
     };
     // The queue is paged (issue #55): 221 candidates from one document
     // pass are not one wall of rows.
@@ -1434,7 +1433,7 @@ async fn ontology_page(
         versions,
         diff,
         queue,
-        queue_status: queue_status.to_owned(),
+        queue_status,
         queue_page,
         queue_pages,
         pending_total,
@@ -1453,10 +1452,9 @@ async fn ontology_decide_many(
     MultiForm(form): MultiForm<BulkDecideForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let back = if form.status == "low_support" {
-        format!("/w/{id}/ontology?status=low_support")
-    } else {
-        format!("/w/{id}/ontology")
+    let back = match form.status {
+        Queue::LowSupport => format!("/w/{id}/ontology?status={}", Queue::LowSupport),
+        Queue::Pending => format!("/w/{id}/ontology"),
     };
     if form.ids.is_empty() {
         return Ok(Redirect::to(&format!(
@@ -1465,10 +1463,10 @@ async fn ontology_decide_many(
         ))
         .into_response());
     }
-    let accept = match form.bulk.as_str() {
-        "accept" => true,
-        "reject" => false,
-        _ => {
+    let accept = match form.bulk {
+        CandidateAction::Accept => true,
+        CandidateAction::Reject => false,
+        CandidateAction::Rename | CandidateAction::MergeInto | CandidateAction::Reparent => {
             return Ok(Redirect::to(&format!(
                 "{back}{}error=unknown+bulk+action",
                 if back.contains('?') { "&" } else { "?" }
@@ -1586,10 +1584,10 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
     let source = e.get("source").and_then(|v| v.as_str());
     let from_documents = source == Some("documents");
     let from_bundle = source == Some("okf");
-    let (evidence, detail) = match c.kind.as_str() {
+    let (evidence, detail) = match c.kind {
         _ if from_bundle => (bundle_evidence(e), proposal_detail(&c.proposal)),
         _ if from_documents => (document_evidence(e), proposal_detail(&c.proposal)),
-        "class" => (
+        ItemKind::Class => (
             format!(
                 "table {} · {} rows · key {}",
                 get("table"),
@@ -1598,7 +1596,7 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
             ),
             String::new(),
         ),
-        "property" => (
+        ItemKind::Property => (
             format!(
                 "{}.{} · {} · {} distinct of {} · e.g. {}",
                 get("table"),
@@ -1620,7 +1618,7 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
                 _ => String::new(),
             },
         ),
-        "relation" => (
+        ItemKind::Relation => (
             format!(
                 "{}.{} matches {}.{} for {} of values",
                 get("table"),
@@ -1634,7 +1632,7 @@ fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
                 _ => String::new(),
             },
         ),
-        _ => (
+        ItemKind::Mapping => (
             format!("table {}", get("table")),
             match &c.proposal {
                 Proposal::Mapping(m) => format!(
@@ -1722,7 +1720,7 @@ async fn ontology_propose(
 
 #[derive(Deserialize)]
 struct DecideForm {
-    action: String,
+    action: CandidateAction,
     #[serde(default)]
     target: String,
 }
@@ -1734,15 +1732,10 @@ async fn ontology_decide(
     Form(form): Form<DecideForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let target = form.target.trim().to_owned();
-    let decision = match form.action.as_str() {
-        "accept" => Some(Decision::Accept),
-        "rename" if !target.is_empty() => Some(Decision::Rename(target)),
-        "merge_into" if !target.is_empty() => Some(Decision::MergeInto(target)),
-        "reparent" if !target.is_empty() => Some(Decision::Reparent(target)),
-        "reject" => None,
-        _ => {
-            let target = format!("/w/{id}/ontology?error=that+action+needs+a+target");
+    let decision = match form.action.decision(Some(&form.target)) {
+        Ok(decision) => decision,
+        Err(e) => {
+            let target = format!("/w/{id}/ontology?error={}", urlencoded(&e.to_string()));
             return Ok(Redirect::to(&target).into_response());
         }
     };

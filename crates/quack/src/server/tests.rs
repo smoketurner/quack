@@ -1351,6 +1351,11 @@ async fn missing_records_answer_404() {
             format!("{base}/graph/merges/nope"),
             serde_json::json!({ "action": "reject" }),
         ),
+        (
+            Method::PUT,
+            format!("{base}/ontology/candidates/nope"),
+            serde_json::json!({ "action": "reject" }),
+        ),
     ] {
         let (status, body) = h.call(method, &path, Some(&token), Some(body)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
