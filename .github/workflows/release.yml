@@ -273,3 +273,78 @@ jobs:
           git add -A
           git commit -m "quack ${VERSION}"
           git push
+
+  # Rewrites Formula/quack.rb in smoketurner/homebrew-tap to point at this
+  # release's macOS arm64 archive. The push uses HOMEBREW_TAP_TOKEN, a
+  # fine-grained token with contents: write on that one repository. Runs after
+  # publish so the formula never names an archive that is not downloadable yet.
+  homebrew:
+    name: Update the Homebrew tap
+    if: github.ref_type == 'tag'
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Read the archive checksum
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "${GITHUB_REF_NAME}" --pattern SHA256SUMS
+          sha="$(awk -v f="quack-${VERSION}-aarch64-apple-darwin.tar.gz" '$2 == f { print $1 }' SHA256SUMS)"
+          if [ -z "${sha}" ]; then
+            echo "::error::no SHA256SUMS entry for the macOS arm64 archive"
+            exit 1
+          fi
+          echo "macos_arm64=${sha}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: # zizmor: ignore[artipacked] — the credentials push the commit below
+          repository: smoketurner/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Write the formula
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          MACOS_ARM64_SHA: ${{ steps.sha.outputs.macos_arm64 }}
+        run: |
+          set -euo pipefail
+          cat > homebrew-tap/Formula/quack.rb << FORMULA
+          class Quack < Formula
+            desc "Knowledge engine: documents, tables, and a knowledge graph in one workspace"
+            homepage "https://github.com/smoketurner/quack"
+            license any_of: ["Apache-2.0", "MIT"]
+
+            on_macos do
+              on_arm do
+                url "https://github.com/smoketurner/quack/releases/download/v${VERSION}/quack-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${MACOS_ARM64_SHA}"
+              end
+            end
+
+            def install
+              bin.install "quack"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/quack -V")
+            end
+          end
+          FORMULA
+
+      - name: Commit and push
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/quack.rb
+          git commit -m "quack ${VERSION}"
+          git push

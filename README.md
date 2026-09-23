@@ -60,7 +60,8 @@ workspace's contents outside that workspace's own file.
 
 Download a static binary for Linux (x86_64, aarch64), macOS (Apple silicon), or Windows
 (x86_64, arm64) from the releases page; each release carries `SHA256SUMS` and a build
-provenance attestation you can check with `gh attestation verify`. On Debian, Ubuntu,
+provenance attestation you can check with `gh attestation verify`. On macOS, install
+it with Homebrew: `brew install smoketurner/tap/quack`. On Debian, Ubuntu,
 Fedora, or RHEL, install the `quack` package from
 [packages.smoketurner.com](https://packages.smoketurner.com), which has the APT and DNF
 setup; the `.deb` and `.rpm` files are on the releases page too. Or run the container,
