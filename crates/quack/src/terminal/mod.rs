@@ -2,6 +2,7 @@
 
 mod app;
 mod chart;
+mod commands;
 mod ui;
 
 use std::sync::Arc;

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use clap::error::ErrorKind;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui_textarea::TextArea;
 use tokio::sync::{broadcast, mpsc};
@@ -23,6 +24,7 @@ use quack_core::storage::workspace::{
 };
 
 use crate::terminal::chart::ChartData;
+use crate::terminal::commands::{Completion, ContextAction, SlashCommand, SlashLine};
 use crate::terminal::ui;
 use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::citations::Citation;
@@ -61,58 +63,6 @@ const NO_CHAT_MODEL_TEXT: &str = "\
 No chat model is configured, so questions cannot be answered yet. SQL, file
 loading, and every /command work without one. Set [general].chat_model (or
 QUACK_MODEL) to PROVIDER/MODEL; `quack doctor` checks the setup and suggests one.";
-
-const HELP_TEXT: &str = "\
-Commands:
-  /help             Show this help message
-  /sql [STATEMENT]  Run SQL directly; with no argument, edit the last query
-  /tables           List tables in the workspace
-  /schema TABLE     Columns, types, and sample rows of a table
-  /ingest PATH      Load a file (a bare path typed at the prompt does the same)
-  /import URL TABLE [SOURCE_TABLE] [--query SQL]  Pull rows from Postgres, SQLite, or a URL
-  /docs             List ingested documents
-  /pin ID, /unpin ID  Pin a document's full text into every prompt
-  /delete ID        Delete a document with its chunks, table, and graph rows
-  /ontology ...     quack ontology: show, init, propose, review, accept, reject, export, import, versions, restore
-  /graph ...        quack graph: status, extract, revalidate, review, merges, merge, reject
-  /graph ENTITY [HOPS], /graph --class CLASS   Walk the knowledge graph
-  /path FROM -> TO  Shortest relation chain between two entities
-  /context [import FILE | export FILE]  Show, replace, or save the workspace context
-  /okf DIR          Export the workspace as an Open Knowledge Format bundle
-  /embeddings refresh  Refresh what the embedding model, width, or prefixes left stale
-  /sessions         List recent sessions
-  /resume ID        Switch to a session (id prefix accepted) and replay it
-  /new              Start a fresh session
-  /mode [chat|query] Show or set the answer mode (query = sources only)
-  /share, /unshare  Share this session with every member, or take it back
-  /export [--sql|--markdown] [FILE]  Save this session
-  /jobs             List running, queued, and recent jobs
-  /cancel N         Cancel job N (queued or running)
-  /chart [N]        Show the chart of the Nth chart-bearing answer (default: the last)
-  /steps            Expand or collapse the tool call details
-  /model            Show the chat and embedding models in use
-  /clear            Clear messages and chart
-  /workspace        Show current workspace and session
-  /quit, /exit      Exit quack
-
-Everything you send runs as a background job, so you can keep typing: ask
-the next question, run SQL, or load a file while an answer streams. Questions
-in one session are answered in order; other work runs alongside, up to
-[jobs].workers at once. The strip above the input shows what is running.
-
-Shortcuts:
-  Enter             Send message
-  Up/Down           Browse input history (kept across sessions)
-  PageUp/PageDown, mouse wheel   Scroll messages; Home/End jump
-  Ctrl+U            Clear input line
-  Ctrl+L            Clear screen
-  Esc or Ctrl+C     Cancel this session's newest question (running or queued)
-  Ctrl+C            Quit (twice while background jobs are still running)
-
-Writes:
-  SELECT queries always run. When the agent wants to modify the workspace
-  you are asked: y runs it, n refuses it, a allows writes for this session.
-  Start with --allow-write to skip the prompt.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum MessageRole {
@@ -226,6 +176,16 @@ struct Turn {
     closed: bool,
 }
 
+/// The command popup's state while a slash command is typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Popup {
+    /// Showing whenever the input has suggestions, with this entry
+    /// highlighted.
+    Open { selected: usize },
+    /// Esc hid it; typing shows it again.
+    Hidden,
+}
+
 pub(crate) struct App {
     pub(crate) messages: Vec<Message>,
     pub(crate) textarea: TextArea<'static>,
@@ -258,6 +218,7 @@ pub(crate) struct App {
     last_sql: Option<String>,
     input_history: Vec<String>,
     history_cursor: Option<usize>,
+    popup: Popup,
     config: Arc<Config>,
     workspace_id: String,
     db: SharedDb,
@@ -321,6 +282,7 @@ impl App {
             last_sql: None,
             input_history: Vec::new(),
             history_cursor: None,
+            popup: Popup::Open { selected: 0 },
             config,
             workspace_id,
             db,
@@ -969,6 +931,9 @@ impl App {
             self.handle_permission_key(code);
             return;
         }
+        if self.handle_completion_key(code, modifiers) {
+            return;
+        }
         match (code, modifiers) {
             (KeyCode::Char('c' | 'q'), KeyModifiers::CONTROL) => {
                 let running = self.jobs.counts(None).active();
@@ -1024,8 +989,12 @@ impl App {
                 self.scroll_offset = 0;
             }
             _ => {
-                self.textarea
-                    .input(crossterm::event::KeyEvent::new(code, modifiers));
+                if self
+                    .textarea
+                    .input(crossterm::event::KeyEvent::new(code, modifiers))
+                {
+                    self.reset_completion();
+                }
                 self.history_cursor = None;
             }
         }
@@ -1093,6 +1062,86 @@ impl App {
         self.execute_direct_sql(sql, true);
     }
 
+    /// What the command popup offers for the input, if it is showing:
+    /// one line with the cursor at its end, not recalled from history, and
+    /// not hidden with Esc.
+    pub(crate) fn completion(&self) -> Option<Completion> {
+        if self.popup == Popup::Hidden
+            || self.history_cursor.is_some()
+            || self.awaiting_permission()
+        {
+            return None;
+        }
+        let [line] = self.textarea.lines() else {
+            return None;
+        };
+        if self.textarea.cursor() != (0, line.chars().count()) {
+            return None;
+        }
+        Completion::for_line(line)
+    }
+
+    /// The highlighted entry of the command popup.
+    pub(crate) fn completion_selected(&self) -> usize {
+        match self.popup {
+            Popup::Open { selected } => selected,
+            Popup::Hidden => 0,
+        }
+    }
+
+    fn reset_completion(&mut self) {
+        self.popup = Popup::Open { selected: 0 };
+    }
+
+    /// Up/Down move through the popup, Tab fills the highlighted entry in,
+    /// Enter fills it in and sends the line when nothing more may follow
+    /// (or sends it as typed when there is nothing to fill in), and Esc
+    /// hides the popup. Returns whether the key was the popup's.
+    fn handle_completion_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if modifiers != KeyModifiers::NONE {
+            return false;
+        }
+        let Some(completion) = self.completion() else {
+            return false;
+        };
+        let last = completion.items.len().saturating_sub(1);
+        let selected = self.completion_selected().min(last);
+        match code {
+            KeyCode::Up => {
+                self.popup = Popup::Open {
+                    selected: selected.checked_sub(1).unwrap_or(last),
+                };
+            }
+            KeyCode::Down => {
+                self.popup = Popup::Open {
+                    selected: if selected >= last {
+                        0
+                    } else {
+                        selected.saturating_add(1)
+                    },
+                };
+            }
+            KeyCode::Esc => self.popup = Popup::Hidden,
+            KeyCode::Tab | KeyCode::Enter => {
+                let Some(item) = completion.get(selected) else {
+                    return false;
+                };
+                let line = self.textarea.lines().concat();
+                let filled = completion.apply(&line, item);
+                if code == KeyCode::Enter && filled.trim_end() == line.trim_end() {
+                    return false;
+                }
+                let send = code == KeyCode::Enter && item.finishes();
+                self.set_textarea_content(&filled);
+                if send {
+                    self.submit_message();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn history_up(&mut self) {
         if self.input_history.is_empty() {
             return;
@@ -1125,6 +1174,7 @@ impl App {
     }
 
     fn set_textarea_content(&mut self, text: &str) {
+        self.reset_completion();
         self.textarea = TextArea::default();
         configure_textarea(&mut self.textarea);
         for ch in text.chars() {
@@ -1139,127 +1189,158 @@ impl App {
         let (cmd, args) = input
             .split_once(' ')
             .map_or((input, ""), |(c, a)| (c, a.trim()));
-
-        match cmd {
-            "/quit" | "/exit" | "/q" => {
-                self.should_quit = true;
-            }
-            "/clear" => {
+        let Some(command) = self.parse_slash_command(cmd, input) else {
+            return;
+        };
+        match command {
+            SlashCommand::Quit => self.should_quit = true,
+            SlashCommand::Clear => {
                 self.clear_transcript();
                 self.messages
                     .push(Message::new(MessageRole::System, WELCOME_TEXT));
             }
-            "/jobs" => self.show_jobs(),
-            "/cancel" => self.cancel_job(args),
-            "/help" | "/?" => {
+            SlashCommand::Jobs => self.show_jobs(),
+            SlashCommand::Cancel { .. } => self.cancel_job(args),
+            SlashCommand::Help => {
                 self.messages
-                    .push(Message::new(MessageRole::System, HELP_TEXT));
+                    .push(Message::new(MessageRole::System, SlashCommand::help()));
             }
-            "/workspace" => {
-                self.messages.push(Message::new(
-                    MessageRole::System,
-                    format!(
-                        "Workspace: {} ({})\nSession: {}",
-                        self.workspace_name, self.workspace_id, self.session_id
-                    ),
-                ));
-            }
-            "/sessions" => self.show_sessions(),
-            "/resume" => self.switch_session(args),
-            "/new" => self.new_session(),
-            "/mode" => self.set_mode(args),
-            "/docs" => self.show_documents(),
-            "/context" => match args.split_once(' ') {
-                Some(("import", file)) => {
-                    self.run_job(
-                        CliJob::ContextImport(file.trim().to_owned()),
-                        "Importing the context",
-                    );
-                }
-                Some(("export", file)) => {
-                    self.run_job(
-                        CliJob::ContextExport(file.trim().to_owned()),
-                        "Exporting the context",
-                    );
-                }
-                _ => self.show_context(),
-            },
-            "/pin" => self.set_pinned(args, true),
-            "/unpin" => self.set_pinned(args, false),
-            "/tables" => self.show_tables(),
-            "/schema" => self.show_schema(args),
-            "/ingest" | "/attach" => match detect_file_path(args) {
+            SlashCommand::Workspace => self.show_workspace(),
+            SlashCommand::Sessions => self.show_sessions(),
+            SlashCommand::Resume { .. } => self.switch_session(args),
+            SlashCommand::New => self.new_session(),
+            SlashCommand::Mode { .. } => self.set_mode(args),
+            SlashCommand::Docs => self.show_documents(),
+            SlashCommand::Context { action } => self.run_context_command(action.as_ref(), args),
+            SlashCommand::Pin { .. } => self.set_pinned(args, true),
+            SlashCommand::Unpin { .. } => self.set_pinned(args, false),
+            SlashCommand::Tables => self.show_tables(),
+            SlashCommand::Schema { .. } => self.show_schema(args),
+            SlashCommand::Ingest { .. } => match detect_file_path(args) {
                 Some(path) => self.start_ingest(path),
                 None => self.messages.push(Message::new(
                     MessageRole::Error,
                     format!("'{args}' is not a file quack can ingest"),
                 )),
             },
-            "/graph" if is_graph_subcommand(args) => self.run_graph_command(args),
-            "/graph" => self.show_graph(args),
-            "/ontology" => self.run_ontology_command(args),
-            "/delete" => self.delete_document(args),
-            "/import" => self.start_import(args),
-            "/path" => self.show_path(args),
-            "/sql" => {
-                if args.is_empty() {
-                    match self.last_sql.clone() {
-                        Some(sql) => self.set_textarea_content(&sql),
-                        None => self.messages.push(Message::new(
-                            MessageRole::System,
-                            "No query has run yet. Use /sql STATEMENT.",
-                        )),
-                    }
-                } else {
-                    self.run_direct_sql(args);
-                }
+            SlashCommand::Graph {
+                action: Some(action),
+                ..
+            } => self.run_graph_command(action),
+            SlashCommand::Graph { action: None, .. } => self.show_graph(args),
+            SlashCommand::Ontology { action } => self.run_ontology_command(action),
+            SlashCommand::Delete { .. } => self.delete_document(args),
+            SlashCommand::Import { .. } => self.start_import(args),
+            SlashCommand::Path { .. } => self.show_path(args),
+            SlashCommand::Sql { .. } => self.edit_or_run_sql(args),
+            SlashCommand::Share => self.set_shared(true),
+            SlashCommand::Unshare => self.set_shared(false),
+            SlashCommand::Export { .. } => self.export_session(args),
+            SlashCommand::Okf { .. } => {
+                self.run_job(CliJob::Okf(args.to_owned()), "Exporting the bundle");
             }
-            other => self.handle_session_command(other, args),
+            SlashCommand::Embeddings { action } => self.run_embeddings_command(&action),
+            SlashCommand::Chart { .. } => self.show_chart(args),
+            SlashCommand::Steps => self.toggle_steps(),
+            SlashCommand::Model => self.show_models(),
         }
     }
 
-    /// The session, chart, and view commands.
-    fn handle_session_command(&mut self, cmd: &str, args: &str) {
-        match cmd {
-            "/share" => self.set_shared(true),
-            "/unshare" => self.set_shared(false),
-            "/export" => self.export_session(args),
-            "/okf" => self.run_job(CliJob::Okf(args.to_owned()), "Exporting the bundle"),
-            "/embeddings" => self.run_embeddings_command(args),
-            "/chart" => self.show_chart(args),
-            "/steps" => {
-                self.expand_steps = !self.expand_steps;
-                self.messages.push(Message::new(
-                    MessageRole::System,
-                    if self.expand_steps {
-                        "Tool call details expanded."
-                    } else {
-                        "Tool call details collapsed."
-                    },
-                ));
-            }
-            "/model" => self.messages.push(Message::new(
-                MessageRole::System,
-                format!(
-                    "Chat model: {}\nEmbedding model: {}",
-                    self.provider_display,
-                    self.config
-                        .embedding_model_ref()
-                        .ok()
-                        .flatten()
-                        .map_or_else(
-                            || String::from("none (keyword search only)"),
-                            |m| m.to_string()
-                        )
-                ),
-            )),
-            other => {
-                self.messages.push(Message::new(
-                    MessageRole::Error,
-                    format!("unknown command: {other}"),
-                ));
+    /// The command `input` names, parsed; a line clap refuses is answered
+    /// in the transcript instead (its help as a note, anything else as an
+    /// error).
+    fn parse_slash_command(&mut self, cmd: &str, input: &str) -> Option<SlashCommand> {
+        match SlashLine::try_parse_from(split_args(input)) {
+            Ok(line) => Some(line.command),
+            Err(e) => {
+                let (role, text) = match e.kind() {
+                    ErrorKind::InvalidSubcommand => {
+                        (MessageRole::Error, format!("unknown command: {cmd}"))
+                    }
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                        (MessageRole::System, e.to_string())
+                    }
+                    _ => (MessageRole::Error, e.to_string()),
+                };
+                self.messages
+                    .push(Message::new(role, text.trim_end().to_owned()));
+                None
             }
         }
+    }
+
+    fn show_workspace(&mut self) {
+        self.messages.push(Message::new(
+            MessageRole::System,
+            format!(
+                "Workspace: {} ({})\nSession: {}",
+                self.workspace_name, self.workspace_id, self.session_id
+            ),
+        ));
+    }
+
+    /// `/context`, `/context import FILE`, `/context export FILE`; the
+    /// file comes from the line as typed, spaces and all.
+    fn run_context_command(&mut self, action: Option<&ContextAction>, args: &str) {
+        let file = args
+            .split_once(' ')
+            .map_or("", |(_, file)| file.trim())
+            .to_owned();
+        match action {
+            Some(ContextAction::Import { .. }) => {
+                self.run_job(CliJob::ContextImport(file), "Importing the context");
+            }
+            Some(ContextAction::Export { .. }) => {
+                self.run_job(CliJob::ContextExport(file), "Exporting the context");
+            }
+            None => self.show_context(),
+        }
+    }
+
+    /// `/sql STATEMENT` runs it; a bare `/sql` puts the last query back
+    /// in the input to edit.
+    fn edit_or_run_sql(&mut self, args: &str) {
+        if !args.is_empty() {
+            self.run_direct_sql(args);
+            return;
+        }
+        match self.last_sql.clone() {
+            Some(sql) => self.set_textarea_content(&sql),
+            None => self.messages.push(Message::new(
+                MessageRole::System,
+                "No query has run yet. Use /sql STATEMENT.",
+            )),
+        }
+    }
+
+    fn toggle_steps(&mut self) {
+        self.expand_steps = !self.expand_steps;
+        self.messages.push(Message::new(
+            MessageRole::System,
+            if self.expand_steps {
+                "Tool call details expanded."
+            } else {
+                "Tool call details collapsed."
+            },
+        ));
+    }
+
+    fn show_models(&mut self) {
+        self.messages.push(Message::new(
+            MessageRole::System,
+            format!(
+                "Chat model: {}\nEmbedding model: {}",
+                self.provider_display,
+                self.config
+                    .embedding_model_ref()
+                    .ok()
+                    .flatten()
+                    .map_or_else(
+                        || String::from("none (keyword search only)"),
+                        |m| m.to_string()
+                    )
+            ),
+        ));
     }
 
     fn show_sessions(&mut self) {
@@ -1424,52 +1505,29 @@ impl App {
 
     /// `/ontology ARGS`: the CLI's `quack ontology` verbs, parsed the same
     /// way, run in the background with the answer in the transcript.
-    fn run_ontology_command(&mut self, args: &str) {
-        match OntologyArgs::try_parse_from(split_args(args)) {
-            Ok(parsed) => {
-                let mut action = parsed.action;
-                // The terminal owns stdin: nothing may prompt there.
-                if let OntologyAction::Propose { yes, .. } = &mut action {
-                    *yes = true;
-                }
-                self.run_job(CliJob::Ontology(action), "Running ontology command");
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, e.to_string())),
+    fn run_ontology_command(&mut self, mut action: OntologyAction) {
+        // The terminal owns stdin: nothing may prompt there.
+        if let OntologyAction::Propose { yes, .. } = &mut action {
+            *yes = true;
         }
+        self.run_job(CliJob::Ontology(action), "Running ontology command");
     }
 
     /// `/embeddings refresh`: the CLI's `quack embeddings` verbs. The
     /// terminal owns stdin, so a refresh never asks.
-    fn run_embeddings_command(&mut self, args: &str) {
-        match EmbeddingsArgs::try_parse_from(split_args(args)) {
-            Ok(parsed) => {
-                let action = match parsed.action {
-                    EmbeddingsAction::Refresh { .. } => EmbeddingsAction::Refresh { yes: true },
-                };
-                self.run_job(CliJob::Embeddings(action), "Refreshing embeddings");
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, e.to_string())),
-        }
+    fn run_embeddings_command(&mut self, action: &EmbeddingsAction) {
+        let action = match action {
+            EmbeddingsAction::Refresh { .. } => EmbeddingsAction::Refresh { yes: true },
+        };
+        self.run_job(CliJob::Embeddings(action), "Refreshing embeddings");
     }
 
     /// `/graph status|extract|...`: the CLI's `quack graph` verbs.
-    fn run_graph_command(&mut self, args: &str) {
-        match GraphArgs::try_parse_from(split_args(args)) {
-            Ok(parsed) => {
-                let mut action = parsed.action;
-                if let GraphAction::Extract { yes, .. } = &mut action {
-                    *yes = true;
-                }
-                self.run_job(CliJob::Graph(action), "Running graph command");
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(MessageRole::Error, e.to_string())),
+    fn run_graph_command(&mut self, mut action: GraphAction) {
+        if let GraphAction::Extract { yes, .. } = &mut action {
+            *yes = true;
         }
+        self.run_job(CliJob::Graph(action), "Running graph command");
     }
 
     /// Run an ontology, graph, bundle, or context command as a job and
@@ -2241,28 +2299,6 @@ impl App {
     }
 }
 
-/// `/ontology` and `/graph` arguments, parsed as the CLI parses them.
-#[derive(Parser)]
-#[command(name = "/ontology", no_binary_name = true, disable_help_flag = false)]
-struct OntologyArgs {
-    #[command(subcommand)]
-    action: OntologyAction,
-}
-
-#[derive(Parser)]
-#[command(name = "/embeddings", no_binary_name = true)]
-struct EmbeddingsArgs {
-    #[command(subcommand)]
-    action: EmbeddingsAction,
-}
-
-#[derive(Parser)]
-#[command(name = "/graph", no_binary_name = true)]
-struct GraphArgs {
-    #[command(subcommand)]
-    action: GraphAction,
-}
-
 /// Whitespace-split with single or double quotes kept together.
 fn split_args(args: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2284,27 +2320,6 @@ fn split_args(args: &str) -> Vec<String> {
         out.push(current);
     }
     out
-}
-
-/// Whether `/graph ARGS` names a `quack graph` verb rather than an entity.
-fn is_graph_subcommand(args: &str) -> bool {
-    matches!(
-        args.split_whitespace().next(),
-        Some(
-            "status"
-                | "extract"
-                | "revalidate"
-                | "review"
-                | "merges"
-                | "merge"
-                | "reject"
-                | "search"
-                | "path"
-                | "help"
-                | "--help"
-                | "-h"
-        )
-    )
 }
 
 /// The document whose id starts with `prefix`, when exactly one does.
@@ -3037,6 +3052,98 @@ mod tests {
         assert!(sql_sink.send(()).is_ok());
         pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
         assert!(ui::job_strip(&app).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_command_popup_picks_fills_in_and_runs() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let typed = |app: &mut App, text: &str| {
+            for ch in text.chars() {
+                app.handle_key_event(KeyCode::Char(ch), KeyModifiers::NONE);
+            }
+        };
+        let input = |app: &App| app.textarea.lines().join("\n");
+        let highlighted = |app: &App| {
+            app.completion()
+                .and_then(|c| c.get(app.completion_selected()).map(|s| s.word.clone()))
+        };
+
+        // Tab fills the highlighted command in; its verbs follow.
+        typed(&mut app, "/gr");
+        assert_eq!(highlighted(&app).as_deref(), Some("/graph"));
+        app.handle_key_event(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(input(&app), "/graph ");
+        typed(&mut app, "me");
+        assert_eq!(highlighted(&app).as_deref(), Some("merges"));
+
+        // Down and Up move the highlight and wrap; they leave history alone.
+        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        typed(&mut app, "/s");
+        assert_eq!(highlighted(&app).as_deref(), Some("/sql"));
+        app.handle_key_event(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(highlighted(&app).as_deref(), Some("/schema"));
+        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(highlighted(&app).as_deref(), Some("/steps"));
+        assert_eq!(input(&app), "/s");
+
+        // Esc hides it without cancelling anything; typing brings it back.
+        app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.completion().is_none());
+        typed(&mut app, "c");
+        assert_eq!(highlighted(&app).as_deref(), Some("/schema"));
+
+        // Enter on a command that takes nothing fills it in and runs it.
+        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        typed(&mut app, "/he");
+        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.textarea.is_empty());
+        assert!(last(&app).content.contains("Commands:"));
+
+        // Enter on one that takes more only fills it in; with nothing left
+        // to fill, Enter sends the line as typed.
+        typed(&mut app, "/mo");
+        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(input(&app), "/mode ");
+        typed(&mut app, "q");
+        app.handle_key_event(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(input(&app), "/mode query");
+        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.textarea.is_empty(), "sent as typed");
+        db_settle(&mut app).await;
+        assert!(
+            last(&app).content.contains("query"),
+            "{}",
+            last(&app).content
+        );
+
+        // Plain text, and the cursor moved off the end, show no popup.
+        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        typed(&mut app, "what is /s");
+        assert!(app.completion().is_none());
+        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        typed(&mut app, "/s");
+        app.handle_key_event(KeyCode::Left, KeyModifiers::NONE);
+        assert!(app.completion().is_none());
+
+        // The popup's rows: the highlighted one marked, labels aligned.
+        let items = Completion::for_line("/mode ")
+            .map(|c| c.items)
+            .unwrap_or_default();
+        let rows: Vec<String> = ui::completion_lines(&items, 1)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            rows.first().is_some_and(|r| r.starts_with("  chat ")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.get(1)
+                .is_some_and(|r| r.starts_with("\u{25B8} query ")),
+            "{rows:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

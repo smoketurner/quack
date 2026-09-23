@@ -1462,6 +1462,15 @@ output in the transcript; anything that would ask on stdin is answered yes), `/g
 `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`, `/jobs`, `/cancel N`,
 `/chart [N]`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 
+The slash commands are one clap definition (`terminal::commands::SlashLine`): the terminal
+dispatches on it, `/help` is rendered from it, and so is the popup that opens above the
+input when a line starts with `/`. The popup lists the commands matching what is typed,
+then a command's verbs (for `/ontology`, `/graph`, and `/embeddings`, the CLI's own),
+fixed choices such as `/mode chat|query`, and long flags once a word starts with `-`.
+Up/Down move the highlight, Tab fills it in, Enter fills it in and runs it when nothing
+more may follow (or sends the line as typed when there is nothing to fill in), and Esc
+hides the popup until the next keystroke.
+
 Nothing blocks the input (section 4.1). A question, a statement, a file, an import, and an
 ontology or graph verb are each submitted as a job, and the prompt takes the next line at
 once: ask a follow-up while an answer streams (it is queued behind it in the session's

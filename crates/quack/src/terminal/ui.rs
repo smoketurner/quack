@@ -2,14 +2,21 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::terminal::app::{App, MessageRole};
 use crate::terminal::chart;
+use crate::terminal::commands::Suggestion;
 use quack_core::jobs::{JobInfo, JobState};
 
 /// Jobs listed above the input at most; the rest are counted.
 const STRIP_JOBS: usize = 3;
+
+/// Command popup entries shown at once; the list scrolls past them.
+const POPUP_ROWS: usize = 8;
+
+/// The widest a popup entry's label column grows before its description.
+const POPUP_LABEL_WIDTH: usize = 28;
 
 const SPINNER: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -53,6 +60,76 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     }
     draw_input(frame, input_area, app);
     draw_status(frame, status_area, app);
+    draw_completion(frame, messages_area, jobs_area.y, app);
+}
+
+/// The command popup, drawn over the bottom of `area` so its last row sits
+/// just above `bottom` (the job strip, or the input when no job runs).
+fn draw_completion(frame: &mut Frame<'_>, area: Rect, bottom: u16, app: &App) {
+    let Some(completion) = app.completion() else {
+        return;
+    };
+    let lines = completion_lines(&completion.items, app.completion_selected());
+    let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let height = rows.saturating_add(2).min(bottom.saturating_sub(area.y));
+    if height < 3 {
+        return;
+    }
+    let width = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .and_then(|w| u16::try_from(w).ok())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.width.saturating_sub(2));
+    let popup = Rect {
+        x: area.x.saturating_add(1),
+        y: bottom.saturating_sub(height),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        popup,
+    );
+}
+
+/// The popup's visible rows: a window of [`POPUP_ROWS`] that keeps the
+/// highlighted entry in view, each a label column and a dim description.
+pub(crate) fn completion_lines(items: &[Suggestion], selected: usize) -> Vec<Line<'static>> {
+    let selected = selected.min(items.len().saturating_sub(1));
+    let first = selected.saturating_sub(POPUP_ROWS.saturating_sub(1));
+    let label_width = items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(POPUP_LABEL_WIDTH);
+    let mut lines = Vec::new();
+    for (index, item) in items.iter().enumerate().skip(first).take(POPUP_ROWS) {
+        let (marker, label_style) = if index == selected {
+            (
+                "\u{25B8} ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("  ", Style::default())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, label_style),
+            Span::styled(format!("{:<label_width$}  ", item.label), label_style),
+            Span::styled(item.about.clone(), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
 }
 
 /// The strip above the input: one line per active job (running first),
