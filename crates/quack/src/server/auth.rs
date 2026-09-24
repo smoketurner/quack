@@ -302,10 +302,7 @@ impl FromRequestParts<App> for Identity {
             app.control.record_audit(&entry).await?;
             return Err(ApiError::unauthorized("unknown token"));
         };
-        let now = jiff::Timestamp::now()
-            .strftime("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        if token.is_expired(&now) {
+        if token.is_expired(jiff::Timestamp::now()) {
             let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
             entry.user_id = Some(token.user_id.clone());
             entry.token_hash = Some(token.token_hash.clone());

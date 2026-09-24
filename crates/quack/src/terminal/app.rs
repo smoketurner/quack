@@ -1661,7 +1661,7 @@ impl App {
                 source_table,
                 limit: None,
             })),
-            SlashCommand::Path { route } => self.show_path(route),
+            SlashCommand::Path { route } => self.show_path(&route),
             SlashCommand::Sql {
                 statement: Some(sql),
             } => self.run_direct_sql(sql),
@@ -2018,7 +2018,7 @@ impl App {
     }
 
     /// `/path FROM -> TO`: the shortest relation chain.
-    fn show_path(&mut self, route: Route) {
+    fn show_path(&mut self, route: &Route) {
         let options = self.config.graph.options();
         let query = match PathQuery::new(&route.from, &route.to, None) {
             Ok(query) => query,

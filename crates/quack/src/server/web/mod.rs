@@ -26,8 +26,8 @@ use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{Ontology, OntologyDiff, candidates, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
-    Scope, TokenRow, UserRow, WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, Expiry, MemberRow, Outcome, ProviderAllowList,
+    ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
@@ -1794,14 +1794,11 @@ async fn token_create(
         );
     }
     let scopes = form.scopes;
-    let expires_at = form.expires_days.filter(|d| *d > 0).and_then(|days| {
-        jiff::Timestamp::now()
-            .checked_add(jiff::SignedDuration::from_hours(
-                i64::from(days).saturating_mul(24),
-            ))
-            .ok()
-            .map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string())
-    });
+    let expires_at = form
+        .expires_days
+        .filter(|d| *d > 0)
+        .map(Expiry::after_days)
+        .transpose()?;
     let (token, row) = app
         .control
         .create_token(
@@ -1809,7 +1806,7 @@ async fn token_create(
             &access.identity.user_id,
             form.name.trim(),
             &scopes,
-            expires_at.as_deref(),
+            expires_at,
         )
         .await?;
     access

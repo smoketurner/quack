@@ -11,8 +11,8 @@ use quack_core::csv::CsvField;
 use quack_core::error::Record;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, ResourceKind, Role,
-    Scope, WorkspaceRow,
+    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Expiry, Outcome, ResourceKind,
+    Role, Scope, WorkspaceRow,
 };
 
 #[derive(Subcommand)]
@@ -159,7 +159,7 @@ pub(crate) async fn run_token(
     action: TokenAction,
 ) -> Result<()> {
     let control = ControlPlane::open(config).await?;
-    let ws = resolve_workspace(&control, config, workspace).await?;
+    let ws = existing_workspace(&control, config, workspace).await?;
     match action {
         TokenAction::Create {
             user,
@@ -192,18 +192,9 @@ async fn create_token(
         .find_user_by_username(user)
         .await?
         .with_context(|| format!("no user named '{user}'"))?;
-    let expires_at = expires
-        .map(|days| {
-            jiff::Timestamp::now()
-                .checked_add(jiff::SignedDuration::from_hours(
-                    i64::from(days).saturating_mul(24),
-                ))
-                .map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string())
-        })
-        .transpose()
-        .context("expiry is too far in the future")?;
+    let expires_at = expires.map(Expiry::after_days).transpose()?;
     let (token, row) = control
-        .create_token(&ws.id, &user_row.id, name, scopes, expires_at.as_deref())
+        .create_token(&ws.id, &user_row.id, name, scopes, expires_at)
         .await?;
     let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
     entry.workspace_id = Some(ws.id.clone());
@@ -279,7 +270,7 @@ pub(crate) async fn run_member(
     action: MemberAction,
 ) -> Result<()> {
     let control = ControlPlane::open(config).await?;
-    let ws = resolve_workspace(&control, config, workspace).await?;
+    let ws = existing_workspace(&control, config, workspace).await?;
     let stdout = std::io::stdout();
     match action {
         MemberAction::Add { username, role } => {
@@ -427,7 +418,9 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_workspace(
+/// The named workspace, or the default one, which must already exist: an
+/// admin command never creates one by mistyping it.
+async fn existing_workspace(
     control: &ControlPlane,
     config: &Config,
     name: Option<&str>,

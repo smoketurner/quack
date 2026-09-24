@@ -13,7 +13,10 @@ use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::str::FromStr;
+
+use jiff::{SignedDuration, Timestamp};
 
 use super::queries::{ApiTokens, AuditLog, Members, Users, Workspaces};
 use crate::config::Config;
@@ -179,10 +182,52 @@ impl TokenRow {
         self.scopes.contains(&scope)
     }
 
-    /// Whether `expires_at` is in the past.
+    /// Whether `expires_at` is before `now`. An expiry that does not
+    /// parse counts as passed, so a damaged row never grants access.
     #[must_use]
-    pub fn is_expired(&self, now: &str) -> bool {
-        self.expires_at.as_deref().is_some_and(|e| e < now)
+    pub fn is_expired(&self, now: Timestamp) -> bool {
+        self.expires_at
+            .as_deref()
+            .is_some_and(|at| at.parse::<Expiry>().map_or(true, |at| at.0 < now))
+    }
+}
+
+/// When a token stops working, as `control.db` stores it: UTC
+/// `YYYY-MM-DD HH:MM:SS`, the form `SQLite`'s own `datetime()` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Expiry(Timestamp);
+
+/// How `control.db` writes a moment.
+const SQLITE_TIME: &str = "%Y-%m-%d %H:%M:%S";
+
+impl Expiry {
+    /// `days` from now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when that is past the last moment `jiff` can hold.
+    pub fn after_days(days: u32) -> Result<Self> {
+        Timestamp::now()
+            .checked_add(SignedDuration::from_hours(
+                i64::from(days).saturating_mul(24),
+            ))
+            .map(Self)
+            .map_err(|_| Error::Config(format!("an expiry {days} days away is too far off")))
+    }
+}
+
+impl fmt::Display for Expiry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.strftime(SQLITE_TIME))
+    }
+}
+
+impl FromStr for Expiry {
+    type Err = jiff::Error;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        let at = jiff::fmt::strtime::parse(SQLITE_TIME, text)?.to_datetime()?;
+        Ok(Self(at.to_zoned(jiff::tz::TimeZone::UTC)?.timestamp()))
     }
 }
 
@@ -1077,7 +1122,7 @@ impl ControlPlane {
         user_id: &str,
         name: &str,
         scopes: &[Scope],
-        expires_at: Option<&str>,
+        expires_at: Option<Expiry>,
     ) -> Result<(String, TokenRow)> {
         let mut secret = [0u8; 32];
         random_bytes(&mut secret)?;
@@ -1107,7 +1152,7 @@ impl ControlPlane {
                 user_id.into(),
                 name.into(),
                 serde_json::to_string(&scopes)?.into(),
-                expires_at.into(),
+                expires_at.map(|at| at.to_string()).into(),
             ])?
             .to_string(SqliteQueryBuilder);
         sqlx::query(AssertSqlSafe(sql.as_str()))
@@ -1605,7 +1650,7 @@ mod tests {
                 &bob.id,
                 "ci",
                 &[Scope::Read, Scope::Write],
-                Some("2000-01-01 00:00:00"),
+                "2000-01-01 00:00:00".parse().ok(),
             )
             .await;
         let Ok((token, row)) = minted else {
@@ -1614,8 +1659,22 @@ mod tests {
         assert!(token.starts_with("qk_"));
         assert_eq!(row.token_hash, sha256_hex(token.as_bytes()));
         assert!(row.has_scope(Scope::Write) && !row.has_scope(Scope::Admin));
-        assert!(row.is_expired("2001-01-01 00:00:00"));
-        assert!(!row.is_expired("1999-01-01 00:00:00"));
+        let at = |text: &str| {
+            text.parse::<Expiry>()
+                .map_or_else(|e| fail(&e.to_string()), |at| at.0)
+        };
+        assert!(row.is_expired(at("2001-01-01 00:00:00")));
+        assert!(!row.is_expired(at("1999-01-01 00:00:00")));
+        assert_eq!(
+            at("2000-01-01 00:00:00").to_string(),
+            "2000-01-01T00:00:00Z",
+            "stored expiries are UTC"
+        );
+        let unreadable = TokenRow {
+            expires_at: Some(String::from("soon")),
+            ..row.clone()
+        };
+        assert!(unreadable.is_expired(at("1999-01-01 00:00:00")));
         assert!(
             cp.find_token(&row.token_hash)
                 .await

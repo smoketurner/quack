@@ -247,7 +247,7 @@ destroy the directory and you have done so to the whole workspace.
 
 Named workspaces live under `<data_dir>/workspaces/<id>/` and are what every interface
 serves. A workspace is always reached by name through the control plane
-(`resolve_workspace`); there is no directory-local workspace. An earlier design had the TUI
+(`load_workspace` in the CLI); there is no directory-local workspace. An earlier design had the TUI
 walk up from the current directory to a `.quack/` folder the way `git` finds `.git/`; that
 was never built, and nothing in the code looks for one.
 
