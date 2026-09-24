@@ -109,6 +109,9 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 
     #[error(transparent)]
+    Csv(#[from] csv::Error),
+
+    #[error(transparent)]
     SeaQuery(#[from] sea_query::error::Error),
 
     #[error("format error: {0}")]

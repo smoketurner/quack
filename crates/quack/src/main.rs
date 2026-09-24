@@ -472,15 +472,25 @@ async fn main() -> Result<ExitCode> {
 /// transparent `Io` and `Json` variants (which hide them from the chain).
 fn is_broken_pipe(error: &anyhow::Error) -> bool {
     use quack_core::error::Error as Core;
+    // A CSV write that failed on its output.
+    fn csv_io_kind(error: &csv::Error) -> Option<std::io::ErrorKind> {
+        match error.kind() {
+            csv::ErrorKind::Io(e) => Some(e.kind()),
+            _ => None,
+        }
+    }
     error.chain().any(|cause| {
         let kind = if let Some(e) = cause.downcast_ref::<std::io::Error>() {
             Some(e.kind())
         } else if let Some(e) = cause.downcast_ref::<serde_json::Error>() {
             e.io_error_kind()
+        } else if let Some(e) = cause.downcast_ref::<csv::Error>() {
+            csv_io_kind(e)
         } else {
             match cause.downcast_ref::<Core>() {
                 Some(Core::Io(e)) => Some(e.kind()),
                 Some(Core::Json(e)) => e.io_error_kind(),
+                Some(Core::Csv(e)) => csv_io_kind(e),
                 _ => None,
             }
         };
@@ -910,7 +920,7 @@ async fn run_import(
 ) -> Result<ExitCode> {
     init_logging();
     let request = &ImportRequest {
-        url,
+        url: url.into(),
         table,
         query,
         source_table: from,
@@ -1611,7 +1621,7 @@ async fn ingest_bundle(
     let mut skipped = 0usize;
     for file in bundle.documents() {
         let (front, _) = okf::parse_front_matter(&file.content);
-        let name = okf::document_name(&file.path);
+        let name = file.document_name();
         let outcome = ingestion::ingest_file(
             config,
             &ws_db,
@@ -1754,8 +1764,8 @@ mod tests {
     use quack_core::error::AuthReason;
     use quack_core::storage::workspace::NewDocument;
 
-    /// A closed reader surfaces as an `io::Error`, a `serde_json` error, or
-    /// core's transparent `Io` and `Json` variants; each one ends the
+    /// A closed reader surfaces as an `io::Error`, a `serde_json` or `csv`
+    /// error, or core's transparent `Io`, `Json`, and `Csv` variants; each one ends the
     /// command quietly (issue #68). Anything else still reports.
     #[test]
     fn broken_pipe_is_recognised_through_every_wrapper() {
@@ -1767,6 +1777,12 @@ mod tests {
         assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Io(pipe()))));
         assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Json(
             serde_json::Error::io(pipe())
+        ))));
+        assert!(is_broken_pipe(&anyhow::Error::from(csv::Error::from(
+            pipe()
+        ))));
+        assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Csv(
+            csv::Error::from(pipe())
         ))));
         assert!(!is_broken_pipe(&anyhow::Error::from(std::io::Error::from(
             std::io::ErrorKind::NotFound

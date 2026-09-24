@@ -466,7 +466,7 @@ impl CliJob {
             Self::Okf(_) => String::from("Exporting the bundle"),
             Self::ContextImport(_) => String::from("Importing the context"),
             Self::ContextExport(_) => String::from("Exporting the context"),
-            Self::Import(request) => format!("import {}", import::redact(&request.url)),
+            Self::Import(request) => format!("import {}", request.url),
             Self::Ingest(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -477,7 +477,7 @@ impl CliJob {
     /// What the transcript says when it starts.
     fn announcement(&self) -> String {
         match self {
-            Self::Import(request) => format!("Importing from {}", import::redact(&request.url)),
+            Self::Import(request) => format!("Importing from {}", request.url),
             Self::Ingest(path) => format!("Ingesting {}", path.display()),
             Self::Ontology(_)
             | Self::Graph(_)
@@ -1656,7 +1656,7 @@ impl App {
                 source_table,
                 query,
             } => self.run_job(CliJob::Import(ImportRequest {
-                url,
+                url: url.into(),
                 table,
                 query,
                 source_table,

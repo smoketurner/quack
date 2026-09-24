@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::csv::CsvField;
 use crate::embedding::{
-    Dimension, EmbeddingStatus, Fingerprint, Profile, Prompts, StaleVectors, Vector,
+    Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
 use crate::error::{Error, Record, Result};
 use crate::graph;
-use crate::ingestion::{self, parser};
+use crate::ingestion::TableName;
+use crate::ingestion::parser::{FileType, Load};
 use crate::ontology::store::Acceptance;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
@@ -876,7 +876,7 @@ impl WorkspaceDb {
             )?;
         }
         tracing::info!(
-            profile = %legacy.describe(),
+            profile = %legacy,
             vectors = untagged,
             "recorded the profile of existing vectors"
         );
@@ -2329,10 +2329,9 @@ impl DocumentInfo {
     /// arrived with the `tables` column, so their rows always carry it.
     #[must_use]
     pub fn fallback_tables(&self) -> Vec<String> {
-        if parser::detect_file_type(&self.filename).is_single_table() {
-            vec![ingestion::table_name_for(&self.filename)]
-        } else {
-            Vec::new()
+        match FileType::of(&self.filename).map(FileType::load) {
+            Some(Load::Table(_)) => vec![TableName::of_file(&self.filename).into_string()],
+            Some(Load::Workbook | Load::Chunks) | None => Vec::new(),
         }
     }
 }
@@ -2448,6 +2447,18 @@ pub struct PendingChunk {
     pub id: String,
     pub heading: Option<String>,
     pub content: String,
+}
+
+impl PendingChunk {
+    /// What the embedder is given for this chunk: its text under its
+    /// heading, as at ingestion.
+    #[must_use]
+    pub fn embedding_input(&self) -> Input {
+        Input::Document {
+            title: self.heading.clone(),
+            text: self.content.clone(),
+        }
+    }
 }
 
 /// A row of `id, heading, content`.
@@ -3275,22 +3286,19 @@ impl QueryResults {
     ///
     /// Returns an error if writing fails.
     pub fn write_csv(&self, out: &mut impl Write) -> Result<()> {
-        let header: Vec<String> = self
-            .columns
-            .iter()
-            .map(|c| CsvField(c).to_string())
-            .collect();
-        writeln!(out, "{}", header.join(","))?;
+        let mut writer = csv::Writer::from_writer(out);
+        writer.write_record(&self.columns)?;
         for row in &self.rows {
             let cells: Vec<String> = row
                 .iter()
                 .map(|v| match v {
                     serde_json::Value::Null => String::new(),
-                    other => CsvField(&display_json_value(other)).to_string(),
+                    other => display_json_value(other),
                 })
                 .collect();
-            writeln!(out, "{}", cells.join(","))?;
+            writer.write_record(&cells)?;
         }
+        writer.flush()?;
         Ok(())
     }
 
@@ -4285,6 +4293,36 @@ mod tests {
     }
 
     /// Paging by id visits every chunk of the pool once, in id order.
+    #[test]
+    fn csv_quotes_only_what_needs_it_and_keeps_a_lone_empty_field() {
+        let written = |columns: &[&str], rows: Vec<Vec<serde_json::Value>>| {
+            let results = QueryResults {
+                columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+                rows,
+            };
+            let mut out = Vec::new();
+            results.write_csv(&mut out).map_or_else(
+                |e| e.to_string(),
+                |()| String::from_utf8_lossy(&out).into_owned(),
+            )
+        };
+        assert_eq!(
+            written(
+                &["name", "note"],
+                vec![
+                    vec![serde_json::json!("x,y"), serde_json::json!("say \"hi\"")],
+                    vec![serde_json::json!(""), serde_json::Value::Null],
+                ]
+            ),
+            "name,note\n\"x,y\",\"say \"\"hi\"\"\"\n,\n"
+        );
+        // One empty field alone would be a blank line, which readers skip.
+        assert_eq!(
+            written(&["n"], vec![vec![serde_json::Value::Null]]),
+            "n\n\"\"\n"
+        );
+    }
+
     #[test]
     fn chunk_pages_visit_the_pool_once() {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));

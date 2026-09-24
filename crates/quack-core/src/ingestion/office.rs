@@ -8,7 +8,7 @@ use std::io::{Cursor, Read};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use super::parser::{Extracted, Flow, Section};
+use super::parser::{Extracted, FileType, Flow, Section, SectionBuilder};
 use crate::error::{Error, Result};
 
 /// A DOCX package as sections with headings.
@@ -17,36 +17,32 @@ use crate::error::{Error, Result};
 ///
 /// Returns an error when the bytes are not a Word package or hold no text.
 pub fn docx(data: &[u8]) -> Result<Extracted> {
-    let mut archive = open(data, "DOCX")?;
+    let mut archive = open(data, FileType::Docx)?;
     let document = part(&mut archive, "word/document.xml")?.ok_or_else(|| {
-        Error::Ingestion(String::from("not a DOCX: word/document.xml is missing"))
+        Error::Ingestion(String::from(
+            "not a Word file: word/document.xml is missing",
+        ))
     })?;
     let paragraphs = word_paragraphs(&document)?;
     let core_title = part(&mut archive, "docProps/core.xml")?
         .as_deref()
         .and_then(core_title);
 
-    let mut sections = Vec::new();
-    let mut heading: Option<String> = None;
-    let mut buf: Vec<String> = Vec::new();
+    let mut builder = SectionBuilder::default();
     let mut style_title: Option<String> = None;
     for paragraph in paragraphs {
         match paragraph.kind {
             ParagraphKind::Title => {
-                flush(&mut sections, heading.as_deref(), &mut buf);
                 if style_title.is_none() && !paragraph.text.trim().is_empty() {
                     style_title = Some(paragraph.text.trim().to_owned());
                 }
-                heading = Some(paragraph.text.trim().to_owned());
+                builder.heading(paragraph.text.trim());
             }
-            ParagraphKind::Heading => {
-                flush(&mut sections, heading.as_deref(), &mut buf);
-                heading = Some(paragraph.text.trim().to_owned());
-            }
-            ParagraphKind::Body => buf.push(paragraph.text),
+            ParagraphKind::Heading => builder.heading(paragraph.text.trim()),
+            ParagraphKind::Body => builder.line(paragraph.text),
         }
     }
-    flush(&mut sections, heading.as_deref(), &mut buf);
+    let sections = builder.finish();
     if sections.is_empty() {
         return Err(Error::Ingestion(String::from(
             "no extractable text: the DOCX has no paragraphs",
@@ -67,7 +63,7 @@ pub fn docx(data: &[u8]) -> Result<Extracted> {
 /// Returns an error when the bytes are not a `PowerPoint` package or hold no
 /// text.
 pub fn pptx(data: &[u8]) -> Result<Extracted> {
-    let mut archive = open(data, "PPTX")?;
+    let mut archive = open(data, FileType::Pptx)?;
     let mut slide_names: Vec<(u32, String)> = Vec::new();
     for i in 0..archive.len() {
         let Ok(entry) = archive.by_index(i) else {
@@ -80,7 +76,7 @@ pub fn pptx(data: &[u8]) -> Result<Extracted> {
     }
     if slide_names.is_empty() {
         return Err(Error::Ingestion(String::from(
-            "not a PPTX: no ppt/slides/slideN.xml parts",
+            "not a PowerPoint file: no ppt/slides/slideN.xml parts",
         )));
     }
     slide_names.sort();
@@ -125,9 +121,10 @@ pub fn pptx(data: &[u8]) -> Result<Extracted> {
     })
 }
 
-fn open<'a>(data: &'a [u8], what: &str) -> Result<zip::ZipArchive<Cursor<&'a [u8]>>> {
+/// The package's zip archive, or an error naming the type expected.
+fn open(data: &[u8], file_type: FileType) -> Result<zip::ZipArchive<Cursor<&[u8]>>> {
     zip::ZipArchive::new(Cursor::new(data))
-        .map_err(|e| Error::Ingestion(format!("not a {what}: {e}")))
+        .map_err(|e| Error::Ingestion(format!("not a {file_type} file: {e}")))
 }
 
 fn part(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<String>> {
@@ -191,6 +188,29 @@ enum ParagraphKind {
     Body,
 }
 
+impl ParagraphKind {
+    /// The kind a `w:pStyle`'s `w:val` names: `Title` and
+    /// `Heading1`..`Heading9` (the localized style ids Word writes in some
+    /// locales start differently, so only the English ids and `Title` are
+    /// recognized).
+    fn of_style(e: &BytesStart<'_>) -> Self {
+        let value = e
+            .try_get_attribute("w:val")
+            .ok()
+            .flatten()
+            .map(|a| a.value.into_owned())
+            .unwrap_or_default();
+        let lower = value.to_ascii_lowercase();
+        if lower == "title" {
+            Self::Title
+        } else if lower.starts_with("heading") {
+            Self::Heading
+        } else {
+            Self::Body
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Paragraph {
     kind: ParagraphKind,
@@ -218,7 +238,7 @@ fn word_paragraphs(xml: &str) -> Result<Vec<Paragraph>> {
                 }
                 "pStyle" => {
                     if let Some(p) = current.as_mut() {
-                        p.kind = style_kind(&e);
+                        p.kind = ParagraphKind::of_style(&e);
                     }
                 }
                 _ => {}
@@ -226,7 +246,7 @@ fn word_paragraphs(xml: &str) -> Result<Vec<Paragraph>> {
             Event::Empty(e) => match e.local_name().as_ref() {
                 "pStyle" => {
                     if let Some(p) = current.as_mut() {
-                        p.kind = style_kind(&e);
+                        p.kind = ParagraphKind::of_style(&e);
                     }
                 }
                 "tab" => {
@@ -271,26 +291,6 @@ fn word_paragraphs(xml: &str) -> Result<Vec<Paragraph>> {
         buf.clear();
     }
     Ok(out)
-}
-
-/// `w:val` of a `w:pStyle`: `Title` and `Heading1`..`Heading9` (also the
-/// localized `berschrift1` style ids Word writes in some locales start
-/// differently, so only the English ids and `Title` are recognized).
-fn style_kind(e: &BytesStart<'_>) -> ParagraphKind {
-    let value = e
-        .try_get_attribute("w:val")
-        .ok()
-        .flatten()
-        .map(|a| a.value.into_owned())
-        .unwrap_or_default();
-    let lower = value.to_ascii_lowercase();
-    if lower == "title" {
-        ParagraphKind::Title
-    } else if lower.starts_with("heading") {
-        ParagraphKind::Heading
-    } else {
-        ParagraphKind::Body
-    }
 }
 
 #[derive(Debug, Default)]
@@ -383,18 +383,6 @@ fn slide_text(xml: &str) -> Result<SlideText> {
     Ok(out)
 }
 
-fn flush(sections: &mut Vec<Section>, heading: Option<&str>, buf: &mut Vec<String>) {
-    let text = buf.join("\n").trim().to_owned();
-    if !text.is_empty() {
-        sections.push(Section {
-            heading: heading.filter(|h| !h.is_empty()).map(str::to_owned),
-            page: None,
-            text,
-        });
-    }
-    buf.clear();
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::io::Write;
@@ -470,7 +458,7 @@ pub(crate) mod tests {
 
     #[test]
     fn docx_errors_are_specific() {
-        assert!(docx(b"not a zip").is_err_and(|e| e.to_string().contains("not a DOCX")));
+        assert!(docx(b"not a zip").is_err_and(|e| e.to_string().contains("not a Word file")));
         let no_part = package(&[("other.xml", "<a/>")]);
         assert!(docx(&no_part).is_err_and(|e| e.to_string().contains("word/document.xml")));
         let empty = package(&[(

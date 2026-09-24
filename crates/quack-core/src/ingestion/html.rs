@@ -5,7 +5,7 @@
 
 use scraper::{Html, Node, Selector};
 
-use super::parser::{Extracted, Flow, Section};
+use super::parser::{Extracted, Flow, SectionBuilder};
 use crate::error::{Error, Result};
 
 /// An HTML document as sections with headings and its `<title>`.
@@ -25,15 +25,16 @@ pub fn html(text: &str) -> Result<Extracted> {
     let mut walker = Walker::default();
     let root = document.tree.root();
     walker.visit(root);
-    walker.flush();
-    if walker.sections.is_empty() {
+    walker.end_line();
+    let sections = walker.sections.finish();
+    if sections.is_empty() {
         return Err(Error::Ingestion(String::from(
             "no extractable text: the HTML has no body text",
         )));
     }
     Ok(Extracted {
         title,
-        sections: walker.sections,
+        sections,
         flow: Flow::Sectioned,
         pages_skipped: 0,
     })
@@ -41,10 +42,7 @@ pub fn html(text: &str) -> Result<Extracted> {
 
 #[derive(Default)]
 struct Walker {
-    sections: Vec<Section>,
-    heading: Option<String>,
-    /// Lines of the section being built.
-    lines: Vec<String>,
+    sections: SectionBuilder,
     /// Text of the current line.
     line: String,
 }
@@ -91,9 +89,8 @@ impl Walker {
                     return;
                 }
                 if HEADINGS.contains(&name) {
-                    let title = collapse(&subtree_text(node));
-                    self.flush();
-                    self.heading = (!title.is_empty()).then_some(title);
+                    self.end_line();
+                    self.sections.heading(collapse(&subtree_text(node)));
                     return;
                 }
                 let block = BLOCKS.contains(&name);
@@ -123,20 +120,7 @@ impl Walker {
         let line = collapse(&self.line);
         self.line.clear();
         if !line.is_empty() {
-            self.lines.push(line);
-        }
-    }
-
-    fn flush(&mut self) {
-        self.end_line();
-        let text = self.lines.join("\n");
-        self.lines.clear();
-        if !text.trim().is_empty() {
-            self.sections.push(Section {
-                heading: self.heading.clone(),
-                page: None,
-                text,
-            });
+            self.sections.line(line);
         }
     }
 }

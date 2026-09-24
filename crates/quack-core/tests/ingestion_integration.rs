@@ -13,7 +13,7 @@ use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::Properties;
 use quack_core::graph::store as graph_store;
-use quack_core::import::{ImportPolicy, ImportRequest};
+use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
 use quack_core::llm::CancellationToken;
 use quack_core::progress::RunControl;
@@ -2047,7 +2047,7 @@ async fn office_and_html_documents_are_chunked_with_titles() {
     assert!(
         errored
             .error_message
-            .is_some_and(|m| m.contains("not a PPTX"))
+            .is_some_and(|m| m.contains("not a PowerPoint file"))
     );
 }
 
@@ -2076,7 +2076,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     }
     let url = format!("sqlite://{}", source_path.display());
     let request = ImportRequest {
-        url: url.clone(),
+        url: url.clone().into(),
         table: String::from("Orders Import"),
         query: None,
         source_table: Some(String::from("orders")),
@@ -2130,7 +2130,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
 
     // A query with a limit, into another table.
     let request = ImportRequest {
-        url: url.clone(),
+        url: url.clone().into(),
         table: String::from("big"),
         query: Some(String::from(
             "SELECT region, total * 2 AS doubled FROM orders ORDER BY id",
@@ -2371,13 +2371,13 @@ async fn server_policy_refuses_local_sqlite_files() {
     let writer = writer_of(&db);
     let server_policy = ImportPolicy::server(&config);
     assert!(!server_policy.local_files);
-    assert!(!server_policy.private_hosts);
+    assert_eq!(server_policy.hosts, HostReach::PublicOnly);
     let local_file = import::import(
         &config,
         &writer,
         "ws-import-policy",
         &ImportRequest {
-            url: format!("sqlite://{}", dir.path().join("control.db").display()),
+            url: format!("sqlite://{}", dir.path().join("control.db").display()).into(),
             table: String::from("x"),
             query: None,
             source_table: Some(String::from("users")),
@@ -2413,7 +2413,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     }
     let url = format!("sqlite://{}", source_path.display());
     let first = ImportRequest {
-        url: url.clone(),
+        url: url.clone().into(),
         table: String::from("Orders Import"),
         query: None,
         source_table: Some(String::from("orders")),
@@ -2437,7 +2437,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         &writer,
         "ws-import-errors",
         &ImportRequest {
-            url: url.clone(),
+            url: url.clone().into(),
             table: String::from("Orders Import"),
             query: None,
             source_table: Some(String::from("orders")),
@@ -2454,7 +2454,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         &writer,
         "ws-import-errors",
         &ImportRequest {
-            url,
+            url: url.into(),
             table: String::from("x"),
             query: Some(String::from("SELECT * FROM nope")),
             source_table: None,
@@ -2471,7 +2471,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         &writer,
         "ws-import-errors",
         &ImportRequest {
-            url: String::from("mysql://h/db"),
+            url: String::from("mysql://h/db").into(),
             table: String::from("x"),
             query: None,
             source_table: Some(String::from("t")),

@@ -54,7 +54,6 @@ use super::api::{
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
 use super::state::App;
-use quack_core::csv::CsvField;
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
@@ -1248,25 +1247,17 @@ async fn sql_csv(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let outcome = access.execute_sql(&app, &q.sql).await?;
-    let mut csv = String::new();
-    csv.push_str(
-        &outcome
-            .columns
-            .iter()
-            .map(|c| CsvField(c).to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    csv.push('\n');
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record(&outcome.columns)
+        .map_err(CoreError::from)?;
     for row in &outcome.rows {
-        csv.push_str(
-            &row.iter()
-                .map(|v| CsvField(&JsonText(v).to_string()).to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        csv.push('\n');
+        let cells: Vec<String> = row.iter().map(|v| JsonText(v).to_string()).collect();
+        writer.write_record(&cells).map_err(CoreError::from)?;
     }
+    let csv = writer
+        .into_inner()
+        .map_err(|e| CoreError::Io(e.into_error()))?;
     Ok((
         [
             (header::CONTENT_TYPE, "text/csv; charset=utf-8"),

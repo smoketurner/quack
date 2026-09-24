@@ -111,6 +111,7 @@ impl From<CoreError> for ApiError {
             | CoreError::Io(_)
             | CoreError::TomlParse(_)
             | CoreError::Json(_)
+            | CoreError::Csv(_)
             | CoreError::SeaQuery(_)
             | CoreError::Fmt(_)
             | CoreError::WriterStopped

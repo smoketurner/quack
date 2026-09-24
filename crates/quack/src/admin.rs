@@ -7,7 +7,6 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use quack_core::config::Config;
-use quack_core::csv::CsvField;
 use quack_core::error::Record;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
@@ -373,10 +372,21 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
             writeln!(out)?;
         }
     } else if args.csv {
-        writeln!(
-            out,
-            "id,timestamp,user_id,token_hash,workspace_id,action,resource_type,resource_id,outcome,channel,client_addr,request_id"
-        )?;
+        let mut writer = csv::Writer::from_writer(&mut out);
+        writer.write_record([
+            "id",
+            "timestamp",
+            "user_id",
+            "token_hash",
+            "workspace_id",
+            "action",
+            "resource_type",
+            "resource_id",
+            "outcome",
+            "channel",
+            "client_addr",
+            "request_id",
+        ])?;
         for r in &rows {
             let fields = [
                 r.id.as_str(),
@@ -392,9 +402,9 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
                 r.client_addr.as_deref().unwrap_or(""),
                 r.request_id.as_deref().unwrap_or(""),
             ];
-            let line: Vec<String> = fields.iter().map(|f| CsvField(f).to_string()).collect();
-            writeln!(out, "{}", line.join(","))?;
+            writer.write_record(fields)?;
         }
+        writer.flush()?;
     } else if rows.is_empty() {
         writeln!(out, "No audit rows match.")?;
     } else {

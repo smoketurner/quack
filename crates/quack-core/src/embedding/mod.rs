@@ -18,6 +18,7 @@ pub mod refresh;
 mod status;
 mod vector;
 
+use std::fmt;
 use std::slice;
 use std::sync::Arc;
 
@@ -29,7 +30,7 @@ pub use vector::{Dimension, Fingerprint, Vector, WidthMismatch};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::priority::{Priority, with_priority};
+use crate::priority::Priority;
 use crate::storage::control::sha256_hex;
 use crate::text::NonBlankText;
 
@@ -180,16 +181,21 @@ impl Profile {
         let json = serde_json::to_vec(self).unwrap_or_default();
         Fingerprint::new(sha256_hex(&json))
     }
+}
 
-    /// One line for notes: `embeddinggemma (768 dimensions, with prefixes)`.
-    #[must_use]
-    pub fn describe(&self) -> String {
+/// One line for notes: `embeddinggemma (768 dimensions, with prefixes)`.
+impl fmt::Display for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let prompts = if self.prompts.is_empty() {
             "no prefixes"
         } else {
             "with prefixes"
         };
-        format!("{} ({} dimensions, {prompts})", self.model, self.dimension)
+        write!(
+            f,
+            "{} ({} dimensions, {prompts})",
+            self.model, self.dimension
+        )
     }
 }
 
@@ -229,7 +235,7 @@ impl<M: EmbeddingModel> Embedder<M> {
     /// Returns an error when the model fails or answers with the wrong
     /// width.
     pub async fn embed_interactive(&self, input: &Input) -> Result<Vector> {
-        with_priority(Priority::Interactive, self.embed_one(input)).await
+        Priority::Interactive.scope(self.embed_one(input)).await
     }
 
     /// A label or name, embedded to be compared with entity labels, for
@@ -463,11 +469,11 @@ mod tests {
     fn describe_says_whether_prefixes_apply() {
         let four = Dimension::new(4);
         assert_eq!(
-            Profile::new("m", four, Prompts::default()).describe(),
+            Profile::new("m", four, Prompts::default()).to_string(),
             "m (4 dimensions, no prefixes)"
         );
         assert_eq!(
-            Profile::new("m", four, gemma()).describe(),
+            Profile::new("m", four, gemma()).to_string(),
             "m (4 dimensions, with prefixes)"
         );
     }

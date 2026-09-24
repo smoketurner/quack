@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use clap::error::ErrorKind;
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use quack_core::graph::traverse::Hops;
-use quack_core::ingestion::parser::{self, FileType};
+use quack_core::ingestion::parser::FileType;
 use quack_core::jobs::JobNumber;
 use quack_core::storage::workspace::looks_like_direct_sql;
 
@@ -333,9 +333,7 @@ impl Input {
         if cleaned.is_empty() || cleaned.contains('\n') {
             return None;
         }
-        if parser::detect_file_type(cleaned) == FileType::Unknown {
-            return None;
-        }
+        FileType::of(cleaned)?;
         let path = match cleaned.strip_prefix("~/") {
             Some(under_home) => dirs::home_dir()?.join(under_home),
             None => PathBuf::from(cleaned),

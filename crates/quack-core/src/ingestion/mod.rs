@@ -4,6 +4,8 @@ pub mod office;
 pub mod parser;
 pub mod xlsx;
 
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rig::embeddings::EmbeddingModel;
@@ -18,13 +20,15 @@ use crate::storage::workspace::{
 };
 use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
+use chunker::Chunker;
+use parser::{FileType, Load, Reader};
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
 pub struct IngestResult {
     pub document_id: String,
     pub filename: String,
-    pub file_type: parser::FileType,
+    pub file_type: FileType,
     pub chunks_stored: u32,
     /// Tables a structured file loaded into: one, or one per workbook sheet.
     pub tables: Vec<String>,
@@ -170,16 +174,15 @@ struct Pending {
     source: DocumentSource,
     size_bytes: usize,
     sha256: String,
-    file_type: parser::FileType,
+    file_type: FileType,
 }
 
 impl Pending {
     /// Hash the bytes and refuse a type nothing can parse, before any write.
     fn of(file: &NewFile<'_>) -> Result<Self> {
-        let file_type = parser::detect_file_type(file.filename);
-        if matches!(file_type, parser::FileType::Unknown) {
+        let Some(file_type) = FileType::of(file.filename) else {
             return Err(Error::UnsupportedFileType(file.filename.to_owned()));
-        }
+        };
         Ok(Self {
             filename: file.filename.to_owned(),
             title: file.title.and_then(str::non_blank).map(str::to_owned),
@@ -191,72 +194,39 @@ impl Pending {
         })
     }
 
+    /// Insert the document row, or return the live document that already
+    /// holds these bytes.
     fn register(&self, db: &WorkspaceDb) -> Result<Registration> {
-        let Self {
-            filename,
-            title,
-            ingested_by,
-            source,
-            size_bytes,
-            sha256,
-            file_type,
-        } = self;
-        register_pending(
-            db,
-            filename,
-            title.as_deref(),
-            ingested_by.as_deref(),
-            *source,
-            *size_bytes,
-            sha256,
-            file_type,
-        )
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the document row's fields, destructured from Pending"
-)]
-fn register_pending(
-    db: &WorkspaceDb,
-    filename: &str,
-    title: Option<&str>,
-    ingested_by: Option<&str>,
-    source: DocumentSource,
-    size_bytes: usize,
-    sha256: &str,
-    file_type: &parser::FileType,
-) -> Result<Registration> {
-    if let Some(existing) = db.document_by_sha256(sha256)? {
-        if db.document_intact(&existing)? {
-            return Ok(Registration::Duplicate(Box::new(existing)));
+        if let Some(existing) = db.document_by_sha256(&self.sha256)? {
+            if db.document_intact(&existing)? {
+                return Ok(Registration::Duplicate(Box::new(existing)));
+            }
+            // Its table was dropped (or its chunks are gone): the row no
+            // longer describes anything, so it fails and the bytes load
+            // again as a new document.
+            tracing::warn!(document = %existing.id, file = %existing.filename, "document lost its table or chunks; re-ingesting");
+            db.mark_document_error(
+                &existing.id,
+                "its table or chunks were dropped; the file was ingested again",
+            )?;
         }
-        // Its table was dropped (or its chunks are gone): the row no
-        // longer describes anything, so it fails and the bytes load
-        // again as a new document.
-        tracing::warn!(document = %existing.id, file = %existing.filename, "document lost its table or chunks; re-ingesting");
-        db.mark_document_error(
-            &existing.id,
-            "its table or chunks were dropped; the file was ingested again",
-        )?;
+        if let Load::Table(_) = self.file_type.load() {
+            TableName::of_file(&self.filename).check_free(db, None)?;
+        }
+        let doc_id = uuid::Uuid::now_v7().to_string();
+        db.insert_document(&NewDocument {
+            id: &doc_id,
+            filename: &self.filename,
+            title: self.title.as_deref(),
+            mime_type: self.file_type.mime_type(),
+            size_bytes: self.size_bytes,
+            sha256: &self.sha256,
+            source: self.source,
+            status: DocumentStatus::Queued,
+            ingested_by: self.ingested_by.as_deref(),
+        })?;
+        Ok(Registration::New(doc_id))
     }
-    if file_type.is_single_table() {
-        check_table_free(db, &sanitize_table_name(filename), None)?;
-    }
-    let doc_id = uuid::Uuid::now_v7().to_string();
-    db.insert_document(&NewDocument {
-        id: &doc_id,
-        filename,
-        title,
-        mime_type: file_type.mime_type(),
-        size_bytes,
-        sha256,
-        source,
-        status: DocumentStatus::Queued,
-        ingested_by,
-    })?;
-    Ok(Registration::New(doc_id))
 }
 
 /// Parse, store, and embed a registered document, moving its status from
@@ -337,9 +307,11 @@ async fn process_inner<M: EmbeddingModel>(
     embedder: Option<&Embedder<M>>,
     control: RunControl<'_>,
 ) -> Result<IngestResult> {
-    let file_type = parser::detect_file_type(filename);
-    match file_type {
-        parser::FileType::Csv | parser::FileType::Parquet | parser::FileType::Json => {
+    let Some(file_type) = FileType::of(filename) else {
+        return Err(Error::UnsupportedFileType(filename.to_owned()));
+    };
+    match file_type.load() {
+        Load::Table(reader) => {
             // One step on the writer: check the table is free, write the
             // bytes under `files/`, load them.
             let step = StructuredLoad {
@@ -348,7 +320,7 @@ async fn process_inner<M: EmbeddingModel>(
                 doc_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
                 data: data.to_vec(),
-                file_type: file_type.clone(),
+                reader,
             };
             let table_name = db.run(move |db| step.load(db)).await?;
             Ok(IngestResult {
@@ -361,16 +333,18 @@ async fn process_inner<M: EmbeddingModel>(
                 embedding_time: None,
             })
         }
-        parser::FileType::Xlsx => {
+        Load::Workbook => {
             // Parsing the workbook is the slow part: off the runtime's
             // workers, and not on the writer.
             let bytes = data.to_vec();
             let sheets = parse_off_runtime(move || xlsx::sheets(&bytes)).await?;
-            let files_dir = config.workspace_files_dir(workspace_id);
-            let (id, name) = (doc_id.to_owned(), filename.to_owned());
-            let tables = db
-                .run(move |db| ingest_workbook(db, &files_dir, &id, &name, sheets))
-                .await?;
+            let load = WorkbookLoad {
+                files_dir: config.workspace_files_dir(workspace_id),
+                doc_id: doc_id.to_owned(),
+                filename: filename.to_owned(),
+                sheets,
+            };
+            let tables = db.run(move |db| load.load(db)).await?;
             Ok(IngestResult {
                 document_id: doc_id.to_owned(),
                 filename: filename.to_owned(),
@@ -381,15 +355,10 @@ async fn process_inner<M: EmbeddingModel>(
                 embedding_time: None,
             })
         }
-        parser::FileType::Pdf
-        | parser::FileType::Text
-        | parser::FileType::Markdown
-        | parser::FileType::Html
-        | parser::FileType::Docx
-        | parser::FileType::Pptx => {
+        Load::Chunks => {
             // Parsing and chunking are the slow, CPU-bound part: off the
             // runtime's workers, and not on the writer.
-            let parsing = Parsing::new(config, &file_type, filename, data);
+            let parsing = Parsing::new(config, file_type, filename, data);
             let Parsed {
                 title,
                 pages_skipped,
@@ -431,13 +400,12 @@ async fn process_inner<M: EmbeddingModel>(
                 embedding_time,
             })
         }
-        parser::FileType::Unknown => Err(Error::UnsupportedFileType(filename.to_owned())),
     }
 }
 
 /// A document's bytes on their way to be parsed and chunked.
 struct Parsing {
-    file_type: parser::FileType,
+    file_type: FileType,
     stem: Option<String>,
     data: Vec<u8>,
     chunk_size: u32,
@@ -453,10 +421,10 @@ struct Parsed {
 }
 
 impl Parsing {
-    fn new(config: &Config, file_type: &parser::FileType, filename: &str, data: &[u8]) -> Self {
+    fn new(config: &Config, file_type: FileType, filename: &str, data: &[u8]) -> Self {
         Self {
-            file_type: file_type.clone(),
-            stem: std::path::Path::new(filename)
+            file_type,
+            stem: Path::new(filename)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(str::to_owned),
@@ -468,14 +436,9 @@ impl Parsing {
     }
 
     fn run(self) -> Result<Parsed> {
-        let extracted = parser::extract(&self.file_type, &self.data)?;
-        let chunks = chunker::chunk_document(
-            &extracted,
-            self.stem.as_deref(),
-            self.chunk_size,
-            self.chunk_overlap,
-            &self.encoding,
-        )?;
+        let extracted = parser::extract(self.file_type, &self.data)?;
+        let chunks = Chunker::new(self.chunk_size, self.chunk_overlap, &self.encoding)?
+            .document(&extracted, self.stem.as_deref())?;
         Ok(Parsed {
             title: extracted.title().map(str::to_owned),
             pages_skipped: extracted.pages_skipped,
@@ -493,19 +456,6 @@ async fn parse_off_runtime<T: Send + 'static>(
     tokio::task::spawn_blocking(parse)
         .await
         .map_err(|e| Error::Ingestion(format!("parsing stopped before it finished: {e}")))?
-}
-
-/// One document per table: refuse when a live document other than
-/// `owner` already loaded `table`.
-fn check_table_free(db: &WorkspaceDb, table: &str, owner: Option<&str>) -> Result<()> {
-    match db.table_owner(table)? {
-        Some(doc) if owner != Some(doc.id.as_str()) => Err(Error::TableTaken {
-            table: table.to_owned(),
-            document: doc.id,
-            filename: doc.filename,
-        }),
-        _ => Ok(()),
-    }
 }
 
 /// The table piped data loads into for one invocation.
@@ -529,14 +479,7 @@ pub fn load_stdin_table(
     if data.iter().all(u8::is_ascii_whitespace) {
         return Ok(None);
     }
-    let first = data.iter().find(|b| !b.is_ascii_whitespace()).copied();
-    let reader = if data.starts_with(b"PAR1") {
-        "read_parquet"
-    } else if matches!(first, Some(b'{' | b'[')) {
-        "read_json_auto"
-    } else {
-        "read_csv_auto"
-    };
+    let reader = Reader::sniff(data).sql_fn();
     let files_dir = config.workspace_files_dir(workspace_id);
     std::fs::create_dir_all(&files_dir)?;
     let dest = files_dir.join(format!(".stdin-{}", uuid::Uuid::now_v7()));
@@ -560,13 +503,6 @@ pub fn load_stdin_table(
     Ok(Some(STDIN_TABLE))
 }
 
-/// The table a structured file loads into: its stem with anything outside
-/// `[A-Za-z0-9_]` replaced by `_`.
-#[must_use]
-pub fn table_name_for(filename: &str) -> String {
-    sanitize_table_name(filename)
-}
-
 /// A structured file's load, owned, for the workspace writer's thread.
 struct StructuredLoad {
     config: Config,
@@ -574,114 +510,82 @@ struct StructuredLoad {
     doc_id: String,
     filename: String,
     data: Vec<u8>,
-    file_type: parser::FileType,
+    reader: Reader,
 }
 
 impl StructuredLoad {
+    /// Write the bytes under `files/` and load them as a table with
+    /// `DuckDB`'s reader for the type. The path is bound, never
+    /// interpolated.
     fn load(&self, db: &WorkspaceDb) -> Result<String> {
-        ingest_structured(
-            &self.config,
-            db,
-            &self.workspace_id,
-            &self.doc_id,
-            &self.filename,
-            &self.data,
-            &self.file_type,
-        )
-    }
-}
-
-/// Write the bytes under `files/` and load them as a table with `DuckDB`'s
-/// reader for the type. The path is bound, never interpolated.
-fn ingest_structured(
-    config: &Config,
-    db: &WorkspaceDb,
-    workspace_id: &str,
-    doc_id: &str,
-    filename: &str,
-    data: &[u8],
-    file_type: &parser::FileType,
-) -> Result<String> {
-    let table_name = sanitize_table_name(filename);
-    check_table_free(db, &table_name, Some(doc_id))?;
-    let files_dir = config.workspace_files_dir(workspace_id);
-    std::fs::create_dir_all(&files_dir)?;
-    let dest = files_dir.join(
-        std::path::Path::new(filename)
-            .file_name()
-            .ok_or_else(|| Error::Ingestion(format!("'{filename}' is not a file name")))?,
-    );
-    std::fs::write(&dest, data)?;
-
-    let path = dest.to_string_lossy();
-
-    let reader = match file_type {
-        parser::FileType::Csv => "read_csv_auto",
-        parser::FileType::Parquet => "read_parquet",
-        parser::FileType::Json => "read_json_auto",
-        parser::FileType::Xlsx
-        | parser::FileType::Pdf
-        | parser::FileType::Text
-        | parser::FileType::Markdown
-        | parser::FileType::Html
-        | parser::FileType::Docx
-        | parser::FileType::Pptx
-        | parser::FileType::Unknown => {
-            return Err(Error::Ingestion("not a structured file type".into()));
-        }
-    };
-
-    let create_sql = format!(
-        "CREATE OR REPLACE TABLE {} AS SELECT * FROM {reader}(?)",
-        quote_ident(&table_name)
-    );
-    db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
-    tracing::info!(table = %table_name, file = %filename, "created table from structured file");
-
-    Ok(table_name)
-}
-
-/// Every data sheet of a workbook as its own table: `<stem>` for a single
-/// sheet, `<stem>_<sheet>` otherwise. The sheets pass through `files/` as
-/// CSV for `DuckDB`'s reader (the `excel` extension is not in the static
-/// binary).
-fn ingest_workbook(
-    db: &WorkspaceDb,
-    files_dir: &std::path::Path,
-    doc_id: &str,
-    filename: &str,
-    sheets: Vec<xlsx::SheetCsv>,
-) -> Result<Vec<String>> {
-    std::fs::create_dir_all(files_dir)?;
-    let stem = sanitize_table_name(filename);
-    let single = sheets.len() == 1;
-    let names: Vec<String> = sheets
-        .iter()
-        .map(|sheet| {
-            if single {
-                stem.clone()
-            } else {
-                format!("{stem}_{}", sanitize_identifier(&sheet.sheet))
-            }
-        })
-        .collect();
-    for name in &names {
-        check_table_free(db, name, Some(doc_id))?;
-    }
-    let mut tables = Vec::with_capacity(sheets.len());
-    for (sheet, table_name) in sheets.into_iter().zip(names) {
-        let dest = files_dir.join(format!("{table_name}.csv"));
-        std::fs::write(&dest, &sheet.csv)?;
+        let table_name = TableName::of_file(&self.filename);
+        table_name.check_free(db, Some(&self.doc_id))?;
+        let files_dir = self.config.workspace_files_dir(&self.workspace_id);
+        std::fs::create_dir_all(&files_dir)?;
+        let dest =
+            files_dir.join(Path::new(&self.filename).file_name().ok_or_else(|| {
+                Error::Ingestion(format!("'{}' is not a file name", self.filename))
+            })?);
+        std::fs::write(&dest, &self.data)?;
         let path = dest.to_string_lossy();
         let create_sql = format!(
-            "CREATE OR REPLACE TABLE {} AS SELECT * FROM read_csv_auto(?, header = true)",
-            quote_ident(&table_name)
+            "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}(?)",
+            quote_ident(table_name.as_str()),
+            self.reader.sql_fn()
         );
         db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
-        tracing::info!(table = %table_name, sheet = %sheet.sheet, rows = sheet.rows, file = %filename, "created table from workbook sheet");
-        tables.push(table_name);
+        tracing::info!(table = %table_name, file = %self.filename, "created table from structured file");
+        Ok(table_name.into_string())
     }
-    Ok(tables)
+}
+
+/// A workbook's sheets, parsed, for the workspace writer's thread.
+struct WorkbookLoad {
+    files_dir: PathBuf,
+    doc_id: String,
+    filename: String,
+    sheets: Vec<xlsx::SheetCsv>,
+}
+
+impl WorkbookLoad {
+    /// Every data sheet as its own table: `<stem>` for a single sheet,
+    /// `<stem>_<sheet>` otherwise. The sheets pass through `files/` as CSV
+    /// for `DuckDB`'s reader (the `excel` extension is not in the static
+    /// binary).
+    fn load(self, db: &WorkspaceDb) -> Result<Vec<String>> {
+        std::fs::create_dir_all(&self.files_dir)?;
+        let stem = TableName::of_file(&self.filename);
+        let single = self.sheets.len() == 1;
+        let names: Vec<TableName> = self
+            .sheets
+            .iter()
+            .map(|sheet| {
+                if single {
+                    stem.clone()
+                } else {
+                    stem.with_sheet(&sheet.sheet)
+                }
+            })
+            .collect();
+        for name in &names {
+            name.check_free(db, Some(&self.doc_id))?;
+        }
+        let mut tables = Vec::with_capacity(self.sheets.len());
+        for (sheet, table_name) in self.sheets.into_iter().zip(names) {
+            let dest = self.files_dir.join(format!("{table_name}.csv"));
+            std::fs::write(&dest, &sheet.csv)?;
+            let path = dest.to_string_lossy();
+            let create_sql = format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}(?, header = true)",
+                quote_ident(table_name.as_str()),
+                Reader::Csv.sql_fn()
+            );
+            db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
+            tracing::info!(table = %table_name, sheet = %sheet.sheet, rows = sheet.rows, file = %self.filename, "created table from workbook sheet");
+            tables.push(table_name.into_string());
+        }
+        Ok(tables)
+    }
 }
 
 /// How `embed_and_store` sends its batches.
@@ -846,24 +750,84 @@ async fn embed_and_store<M: EmbeddingModel>(
     Ok((stored, Some(elapsed)))
 }
 
-fn sanitize_table_name(filename: &str) -> String {
-    let stem = std::path::Path::new(filename)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("imported");
-    sanitize_identifier(stem)
+/// A workspace table's name: letters, digits, and `_`, anything else
+/// replaced by `_`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableName(String);
+
+impl TableName {
+    /// The table a structured file loads into: its stem, `imported` when
+    /// it has none.
+    #[must_use]
+    pub fn of_file(filename: &str) -> Self {
+        let stem = Path::new(filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported");
+        Self::sanitized(stem)
+    }
+
+    /// A table name someone typed, read as a file name is, so an
+    /// extension is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `raw` is blank.
+    pub fn given(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(Error::Ingestion(String::from("a table name is needed")));
+        }
+        Ok(Self::of_file(raw))
+    }
+
+    /// One sheet's table in a workbook of several: `<this>_<sheet>`.
+    fn with_sheet(&self, sheet: &str) -> Self {
+        Self(format!("{}_{}", self.0, Self::sanitized(sheet).0))
+    }
+
+    fn sanitized(name: &str) -> Self {
+        Self(
+            name.chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// One document per table: refuse when a live document other than
+    /// `owner` already loaded this one.
+    fn check_free(&self, db: &WorkspaceDb, owner: Option<&str>) -> Result<()> {
+        match db.table_owner(&self.0)? {
+            Some(doc) if owner != Some(doc.id.as_str()) => Err(Error::TableTaken {
+                table: self.0.clone(),
+                document: doc.id,
+                filename: doc.filename,
+            }),
+            _ => Ok(()),
+        }
+    }
 }
 
-fn sanitize_identifier(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+impl fmt::Display for TableName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[cfg(test)]
@@ -872,41 +836,67 @@ mod tests {
 
     #[test]
     fn sanitize_strips_extension() {
-        assert_eq!(sanitize_table_name("data.csv"), "data");
+        assert_eq!(TableName::of_file("data.csv").as_str(), "data");
     }
 
     #[test]
     fn sanitize_replaces_non_alphanumeric() {
-        assert_eq!(sanitize_table_name("my-data file.csv"), "my_data_file");
+        assert_eq!(
+            TableName::of_file("my-data file.csv").as_str(),
+            "my_data_file"
+        );
     }
 
     #[test]
     fn sanitize_preserves_underscores() {
-        assert_eq!(sanitize_table_name("my_data.json"), "my_data");
+        assert_eq!(TableName::of_file("my_data.json").as_str(), "my_data");
     }
 
     #[test]
     fn sanitize_no_extension() {
-        assert_eq!(sanitize_table_name("readme"), "readme");
+        assert_eq!(TableName::of_file("readme").as_str(), "readme");
     }
 
     #[test]
     fn sanitize_empty_uses_fallback() {
-        assert_eq!(sanitize_table_name(""), "imported");
+        assert_eq!(TableName::of_file("").as_str(), "imported");
     }
 
     #[test]
     fn sanitize_dotfile_replaces_leading_dot() {
-        assert_eq!(sanitize_table_name(".hidden"), "_hidden");
+        assert_eq!(TableName::of_file(".hidden").as_str(), "_hidden");
     }
 
     #[test]
     fn sanitize_multiple_extensions() {
-        assert_eq!(sanitize_table_name("data.2024.csv"), "data_2024");
+        assert_eq!(TableName::of_file("data.2024.csv").as_str(), "data_2024");
     }
 
     #[test]
     fn sanitize_preserves_alphanumeric() {
-        assert_eq!(sanitize_table_name("Sales2024.parquet"), "Sales2024");
+        assert_eq!(
+            TableName::of_file("Sales2024.parquet").as_str(),
+            "Sales2024"
+        );
+    }
+
+    #[test]
+    fn given_names_are_trimmed_and_blank_ones_refused() {
+        assert_eq!(
+            TableName::given(" sales ").ok().map(TableName::into_string),
+            Some(String::from("sales"))
+        );
+        assert!(TableName::given("   ").is_err());
+        assert!(TableName::given("").is_err());
+    }
+
+    #[test]
+    fn sheet_tables_join_the_file_and_the_sheet() {
+        assert_eq!(
+            TableName::of_file("book.xlsx")
+                .with_sheet("Q1 2024")
+                .as_str(),
+            "book_Q1_2024"
+        );
     }
 }

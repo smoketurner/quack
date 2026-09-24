@@ -67,7 +67,7 @@ impl EmbeddingStatus {
         Some(format!(
             "{}; the configured model is {}, so they are found by keyword search only.",
             parts.join(", "),
-            profile.describe()
+            profile
         ))
     }
 }
@@ -78,6 +78,6 @@ impl StaleVectors {
     pub fn made_with(&self) -> String {
         self.profile
             .as_ref()
-            .map_or_else(|| String::from("an unrecorded profile"), Profile::describe)
+            .map_or_else(|| String::from("an unrecorded profile"), Profile::to_string)
     }
 }
