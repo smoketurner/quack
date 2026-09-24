@@ -16,8 +16,8 @@ use crate::error::{Error, Result};
 /// Install aws-lc-rs as the process-wide rustls crypto provider.
 ///
 /// Call this first in `main`, before building any HTTP client or runtime.
-/// Call [`log_provider`] once a tracing subscriber exists to record which
-/// module this installed.
+/// Call [`CryptoModule::log`] once a tracing subscriber exists to record
+/// which module this installed.
 ///
 /// # Errors
 ///
@@ -41,47 +41,70 @@ pub fn install_default_provider() -> Result<()> {
     })
 }
 
-/// Report the crypto module behind the installed provider: the version of the
-/// AWS-LC library it links (`awslc_version`, the trailing token of
-/// `AWS-LC FIPS 4.2.0`) and, for a FIPS build, the module version that names the
-/// certification. aws-lc-rs exposes no runtime API for its own crate version, so
-/// that stays in `Cargo.lock`.
-///
-/// Belongs right after the tracing subscriber is installed, not next to
-/// [`install_default_provider`]: that runs at the top of `main`, before any
-/// subscriber exists, so a log there goes nowhere. A build that should be FIPS
-/// but reports no FIPS module still works, so this warns rather than failing.
-/// One line naming the crypto module this binary links, for `--version`:
-/// `AWS-LC FIPS 4.2.0 (FIPS module 40200)` for a FIPS build, `AWS-LC 5.7.0`
-/// otherwise. The AWS-LC library version is the one that matters for a CVE or a
-/// certificate; aws-lc-rs has no runtime API for its own crate version, which
-/// stays in `Cargo.lock`.
-#[must_use]
-pub fn provider_description() -> String {
-    let awslc = aws_lc_rs::awslc_version();
-    match aws_lc_rs::fips_version() {
-        Some(module) => format!("AWS-LC FIPS {awslc} (FIPS module {module})"),
-        None => format!("AWS-LC {awslc}"),
+/// The AWS-LC module this binary links: the library version that matters for
+/// a CVE or a certificate (`awslc_version`, the trailing token of
+/// `AWS-LC FIPS 4.2.0`) and, for a FIPS build, the module version that names
+/// the certification. aws-lc-rs has no runtime API for its own crate version,
+/// which stays in `Cargo.lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CryptoModule {
+    pub awslc: &'static str,
+    pub fips_module: Option<u32>,
+}
+
+impl CryptoModule {
+    /// The module linked into this binary.
+    #[must_use]
+    pub fn linked() -> Self {
+        Self {
+            awslc: aws_lc_rs::awslc_version(),
+            fips_module: aws_lc_rs::fips_version(),
+        }
+    }
+
+    /// Whether this is a Linux build without the FIPS module, which every
+    /// release for Linux links.
+    #[must_use]
+    pub fn lacks_expected_fips(self) -> bool {
+        self.fips_module.is_none() && cfg!(target_os = "linux")
+    }
+
+    /// Log which module the installed provider runs on.
+    ///
+    /// Belongs right after the tracing subscriber is installed, not next to
+    /// [`install_default_provider`]: that runs at the top of `main`, before
+    /// any subscriber exists, so a log there goes nowhere. A build that
+    /// should be FIPS but reports no FIPS module still works, so this warns
+    /// rather than failing.
+    pub fn log(self) {
+        let awslc = self.awslc;
+        let fips =
+            rustls::crypto::CryptoProvider::get_default().is_some_and(|provider| provider.fips());
+        if fips {
+            tracing::info!(
+                awslc,
+                fips_module = self.fips_module,
+                "installed the FIPS AWS-LC crypto provider"
+            );
+        } else if cfg!(target_os = "linux") {
+            tracing::warn!(
+                awslc,
+                "installed a non-FIPS AWS-LC crypto provider on Linux"
+            );
+        } else {
+            tracing::info!(awslc, "installed the AWS-LC crypto provider");
+        }
     }
 }
 
-pub fn log_provider() {
-    let awslc = aws_lc_rs::awslc_version();
-    let fips =
-        rustls::crypto::CryptoProvider::get_default().is_some_and(|provider| provider.fips());
-    if fips {
-        tracing::info!(
-            awslc,
-            fips_module = aws_lc_rs::fips_version(),
-            "installed the FIPS AWS-LC crypto provider"
-        );
-    } else if cfg!(target_os = "linux") {
-        tracing::warn!(
-            awslc,
-            "installed a non-FIPS AWS-LC crypto provider on Linux"
-        );
-    } else {
-        tracing::info!(awslc, "installed the AWS-LC crypto provider");
+/// One line for `--version`: `AWS-LC FIPS 4.2.0 (FIPS module 40200)` for a
+/// FIPS build, `AWS-LC 5.7.0` otherwise.
+impl std::fmt::Display for CryptoModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.fips_module {
+            Some(module) => write!(f, "AWS-LC FIPS {} (FIPS module {module})", self.awslc),
+            None => write!(f, "AWS-LC {}", self.awslc),
+        }
     }
 }
 

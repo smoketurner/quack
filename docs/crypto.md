@@ -14,13 +14,13 @@ build, and no ambiguity about which backend rustls picks at runtime.
   `rustls::crypto::default_fips_provider()`, which exists only under rustls's `fips`
   feature and returns the same provider: dropping that feature becomes a build failure
   instead of a silent return to non-FIPS key exchange.
-- `crypto::log_provider()` records the module behind the installed provider — the AWS-LC
+- `crypto::CryptoModule::log` records the module behind the installed provider — the AWS-LC
   version and, for a FIPS build, the module version. It runs from `init_logging_at`, not
   next to the install: the install happens before any tracing subscriber exists, so a log
   there would go nowhere. It logs at `info`, which `quack serve` shows by default while the
   other subcommands (default `warn`) need `RUST_LOG=info`.
 - `quack --version` prints the same module on its second line
-  (`crypto::provider_description()`), so a FIPS binary is identifiable without turning on
+  (`CryptoModule`'s `Display`), so a FIPS binary is identifiable without turning on
   logging; `-V` stays the bare version. The AWS-LC library version is the one that matters
   for a CVE or a certificate — aws-lc-rs exposes no runtime API for its own crate version,
   which stays in `Cargo.lock`.

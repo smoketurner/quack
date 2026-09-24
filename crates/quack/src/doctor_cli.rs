@@ -9,23 +9,11 @@ use serde_json::json;
 
 pub(crate) fn write(out: &mut impl Write, report: &Report, as_json: bool) -> Result<()> {
     if as_json {
-        let checks: Vec<_> = report
-            .checks
-            .iter()
-            .map(|c| {
-                json!({
-                    "area": c.area.as_str(),
-                    "status": c.status.as_str(),
-                    "summary": c.summary,
-                    "fix": c.fix,
-                })
-            })
-            .collect();
         let doc = json!({
             "ok": !report.has_failures(),
             "failures": report.count(Status::Fail),
             "warnings": report.count(Status::Warn),
-            "checks": checks,
+            "checks": report.checks,
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
         return Ok(());
@@ -43,8 +31,8 @@ pub(crate) fn write(out: &mut impl Write, report: &Report, as_json: bool) -> Res
         writeln!(
             out,
             "{:<4}  {:width$}  {}",
-            check.status.as_str(),
-            check.area.as_str(),
+            check.status,
+            check.area,
             summary.next().unwrap_or_default()
         )?;
         for line in summary {

@@ -196,8 +196,8 @@ impl Inspection {
         };
         let in_force = file_state == FileState::Loaded;
         let settings = collect(&config, raw.as_ref(), in_force);
-        let unknown = raw.as_ref().map_or_else(Vec::new, unknown_keys);
-        let environment = environment(&config);
+        let unknown = raw.as_ref().map_or_else(Vec::new, UnknownKey::find_in);
+        let environment = EnvVar::read_by(&config);
         Self {
             config_path,
             file_state,
@@ -382,6 +382,7 @@ fn general(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "default_workspace",
         &general.default_workspace,
         &default.default_workspace,
+        None,
     );
     let chat_model = general.chat_model.as_ref().map(ModelSpec::to_string);
     s.optional_text("chat_model", chat_model.as_deref(), Some(ENV_MODEL));
@@ -402,6 +403,7 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 "auth",
                 &provider.auth.mode().to_string(),
                 &AuthMode::default().to_string(),
+                None,
             );
             s.optional_text(
                 "base_url",
@@ -435,8 +437,9 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             "redirect_uri",
             &oauth.redirect_uri,
             OAuthConfig::DEFAULT_REDIRECT_URI,
+            None,
         );
-        s.flag("device_code", oauth.device_code, false);
+        s.literal("device_code", oauth.device_code, false);
         s.optional_text(
             "client_secret_env",
             oauth.client_secret_env.as_deref(),
@@ -448,22 +451,22 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
 fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (ingestion, default) = (&config.ingestion, &defaults.ingestion);
     let mut s = inventory.section("ingestion");
-    s.number(
+    s.literal(
         "chunk_size_tokens",
         ingestion.chunk_size_tokens,
         default.chunk_size_tokens,
     );
-    s.number(
+    s.literal(
         "chunk_overlap_tokens",
         ingestion.chunk_overlap_tokens,
         default.chunk_overlap_tokens,
     );
-    s.number(
+    s.literal(
         "embedding_batch_size",
         ingestion.embedding_batch_size,
         default.embedding_batch_size,
     );
-    s.number(
+    s.literal(
         "embedding_concurrency",
         ingestion.embedding_concurrency,
         default.embedding_concurrency,
@@ -472,8 +475,9 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         "tokenizer_encoding",
         &ingestion.tokenizer_encoding,
         &default.tokenizer_encoding,
+        None,
     );
-    s.number(
+    s.literal(
         "upload_max_mb",
         ingestion.upload_max_mb,
         default.upload_max_mb,
@@ -515,14 +519,14 @@ fn embedding(inventory: &mut Inventory<'_>, config: &Config) {
 fn retrieval(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (retrieval, default) = (&config.retrieval, &defaults.retrieval);
     let mut s = inventory.section("retrieval");
-    s.number("top_k", retrieval.top_k, default.top_k);
-    s.number("rrf_k", retrieval.rrf_k, default.rrf_k);
-    s.number(
+    s.literal("top_k", retrieval.top_k, default.top_k);
+    s.literal("rrf_k", retrieval.rrf_k, default.rrf_k);
+    s.literal(
         "pinned_token_budget",
         retrieval.pinned_token_budget,
         default.pinned_token_budget,
     );
-    s.flag(
+    s.literal(
         "always_retrieve",
         retrieval.always_retrieve,
         default.always_retrieve,
@@ -531,8 +535,9 @@ fn retrieval(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         "rerank",
         &retrieval.rerank.to_string(),
         &default.rerank.to_string(),
+        None,
     );
-    s.number(
+    s.literal(
         "rerank_candidates",
         retrieval.rerank_candidates,
         default.rerank_candidates,
@@ -541,7 +546,7 @@ fn retrieval(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
 
 fn context(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let mut s = inventory.section("context");
-    s.number(
+    s.literal(
         "max_tokens",
         config.context.max_tokens,
         defaults.context.max_tokens,
@@ -551,44 +556,44 @@ fn context(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
 fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (analysis, default) = (&config.analysis, &defaults.analysis);
     let mut s = inventory.section("analysis");
-    s.number(
+    s.literal(
         "max_query_rows",
         analysis.max_query_rows,
         default.max_query_rows,
     );
-    s.number(
+    s.literal(
         "query_timeout_seconds",
         analysis.query_timeout_seconds,
         default.query_timeout_seconds,
     );
-    s.number(
+    s.literal(
         "memory_limit_mb",
         analysis.memory_limit_mb,
         default.memory_limit_mb,
     );
-    s.number("threads", analysis.threads, default.threads);
-    s.number("max_turns", analysis.max_turns, default.max_turns);
-    s.number(
+    s.literal("threads", analysis.threads, default.threads);
+    s.literal("max_turns", analysis.max_turns, default.max_turns);
+    s.literal(
         "history_token_budget",
         analysis.history_token_budget,
         default.history_token_budget,
     );
-    s.number(
+    s.literal(
         "max_context_tokens",
         analysis.max_context_tokens,
         default.max_context_tokens,
     );
-    s.number(
+    s.literal(
         "extraction_timeout_seconds",
         analysis.extraction_timeout_seconds,
         default.extraction_timeout_seconds,
     );
-    s.number(
+    s.literal(
         "extraction_concurrency",
         analysis.extraction_concurrency,
         default.extraction_concurrency,
     );
-    s.number(
+    s.literal(
         "reader_pool_size",
         analysis.reader_pool_size,
         default.reader_pool_size,
@@ -598,19 +603,19 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
 fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (server, default) = (&config.server, &defaults.server);
     let mut s = inventory.section("server");
-    s.text_with_env("bind", &server.bind, &default.bind, ENV_BIND);
-    s.flag("local", server.local, default.local);
-    s.number(
+    s.text("bind", &server.bind, &default.bind, Some(ENV_BIND));
+    s.literal("local", server.local, default.local);
+    s.literal(
         "workers_per_workspace",
         server.workers_per_workspace,
         default.workers_per_workspace,
     );
-    s.number(
+    s.literal(
         "session_max_age_hours",
         server.session_max_age_hours,
         default.session_max_age_hours,
     );
-    s.number(
+    s.literal(
         "session_idle_minutes",
         server.session_idle_minutes,
         default.session_idle_minutes,
@@ -620,28 +625,28 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
 fn jobs(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (jobs, default) = (&config.jobs, &defaults.jobs);
     let mut s = inventory.section("jobs");
-    s.number("history", jobs.history, default.history);
+    s.literal("history", jobs.history, default.history);
 }
 
 fn ontology(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (ontology, default) = (&config.ontology, &defaults.ontology);
     let mut s = inventory.section("ontology");
-    s.number(
+    s.literal(
         "key_overlap_threshold",
         ontology.key_overlap_threshold,
         default.key_overlap_threshold,
     );
-    s.number(
+    s.literal(
         "enum_max_values",
         ontology.enum_max_values,
         default.enum_max_values,
     );
-    s.number(
+    s.literal(
         "propose_sample_chunks",
         ontology.propose_sample_chunks,
         default.propose_sample_chunks,
     );
-    s.number(
+    s.literal(
         "min_support_documents",
         ontology.min_support_documents,
         default.min_support_documents,
@@ -651,18 +656,18 @@ fn ontology(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
 fn graph(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (graph, default) = (&config.graph, &defaults.graph);
     let mut s = inventory.section("graph");
-    s.number(
+    s.literal(
         "max_traversal_depth",
         graph.max_traversal_depth,
         default.max_traversal_depth,
     );
-    s.number("max_nodes", graph.max_nodes, default.max_nodes);
-    s.number(
+    s.literal("max_nodes", graph.max_nodes, default.max_nodes);
+    s.literal(
         "merge_threshold",
         graph.merge_threshold,
         default.merge_threshold,
     );
-    s.number(
+    s.literal(
         "auto_merge_threshold",
         graph.auto_merge_threshold,
         default.auto_merge_threshold,
@@ -672,152 +677,163 @@ fn graph(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
 fn import(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (import, default) = (&config.import, &defaults.import);
     let mut s = inventory.section("import");
-    s.number("max_rows", import.max_rows, default.max_rows);
-    s.number(
+    s.literal("max_rows", import.max_rows, default.max_rows);
+    s.literal(
         "max_download_mb",
         import.max_download_mb,
         default.max_download_mb,
     );
-    s.number(
+    s.literal(
         "timeout_seconds",
         import.timeout_seconds,
         default.timeout_seconds,
     );
-    s.flag(
+    s.literal(
         "allow_local_files",
         import.allow_local_files,
         default.allow_local_files,
     );
-    s.flag(
+    s.literal(
         "allow_private_hosts",
         import.allow_private_hosts,
         default.allow_private_hosts,
     );
 }
 
-/// The environment variables this configuration reads: the four that
-/// override settings, and the ones the providers name for their
-/// credentials. Only whether each is set, never what it holds.
-fn environment(config: &Config) -> Vec<EnvVar> {
-    let mut vars = vec![
-        var(ENV_CONFIG_DIR, "the directory holding config.toml"),
-        var(ENV_DATA_DIR, "overrides [general].data_dir"),
-        var(ENV_MODEL, "overrides [general].chat_model"),
-        var(ENV_BIND, "overrides [server].bind"),
-    ];
-    for (name, provider) in &config.providers {
-        if let Some(key) = provider.auth.api_key_env() {
-            vars.push(var(key, &format!("[providers.{name}].api_key_env")));
-        }
-        if let Some(secret) = provider
-            .auth
-            .oauth()
-            .and_then(|o| o.client_secret_env.as_ref())
-        {
-            vars.push(var(
-                secret,
-                &format!("[providers.{name}.oauth].client_secret_env"),
-            ));
-        }
-    }
-    vars
-}
-
-fn var(name: &str, purpose: &str) -> EnvVar {
-    EnvVar {
-        name: name.to_owned(),
-        set: std::env::var_os(name).is_some(),
-        purpose: purpose.to_owned(),
-    }
-}
-
-/// Every key in the file that no setting corresponds to, in file order.
-fn unknown_keys(file: &Table) -> Vec<UnknownKey> {
-    let mut unknown = Vec::new();
-    for (name, value) in file {
-        if name == PROVIDERS {
-            let Some(providers) = value.as_table() else {
-                continue;
-            };
-            for (provider, entry) in providers {
-                let Some(entry) = entry.as_table() else {
-                    continue;
-                };
-                let section = format!("{PROVIDERS}.{provider}");
-                for key in entry.keys() {
-                    if !PROVIDER_KEYS.contains(&key.as_str()) {
-                        unknown.push(unknown_key(&section, key, PROVIDER_KEYS));
-                    }
-                }
-                let Some(oauth) = entry.get("oauth").and_then(TomlValue::as_table) else {
-                    continue;
-                };
-                for key in oauth.keys() {
-                    if !OAUTH_KEYS.contains(&key.as_str()) {
-                        unknown.push(unknown_key(&format!("{section}.oauth"), key, OAUTH_KEYS));
-                    }
-                }
+impl EnvVar {
+    /// The environment variables this configuration reads: the four that
+    /// override settings, and the ones the providers name for their
+    /// credentials. Only whether each is set, never what it holds.
+    fn read_by(config: &Config) -> Vec<Self> {
+        let mut vars = vec![
+            Self::new(ENV_CONFIG_DIR, "the directory holding config.toml"),
+            Self::new(ENV_DATA_DIR, "overrides [general].data_dir"),
+            Self::new(ENV_MODEL, "overrides [general].chat_model"),
+            Self::new(ENV_BIND, "overrides [server].bind"),
+        ];
+        for (name, provider) in &config.providers {
+            if let Some(key) = provider.auth.api_key_env() {
+                vars.push(Self::new(key, &format!("[providers.{name}].api_key_env")));
             }
-            continue;
-        }
-        let Some((_, keys)) = SECTIONS.iter().find(|(section, _)| *section == name) else {
-            unknown.push(UnknownKey {
-                path: name.clone(),
-                suggestion: closest(name, &section_names()),
-            });
-            continue;
-        };
-        let Some(table) = value.as_table() else {
-            continue;
-        };
-        for key in table.keys() {
-            if !keys.contains(&key.as_str()) {
-                unknown.push(unknown_key(name, key, keys));
+            if let Some(secret) = provider
+                .auth
+                .oauth()
+                .and_then(|o| o.client_secret_env.as_ref())
+            {
+                vars.push(Self::new(
+                    secret,
+                    &format!("[providers.{name}.oauth].client_secret_env"),
+                ));
             }
         }
+        vars
     }
-    unknown
-}
 
-fn unknown_key(section: &str, key: &str, keys: &[&str]) -> UnknownKey {
-    let suggestion = closest(key, keys).or_else(|| elsewhere(section, key));
-    UnknownKey {
-        path: format!("{section}.{key}"),
-        suggestion,
+    fn new(name: &str, purpose: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            set: std::env::var_os(name).is_some(),
+            purpose: purpose.to_owned(),
+        }
     }
 }
 
-/// Another section that accepts this exact key, for a setting written
-/// under the wrong heading.
-fn elsewhere(section: &str, key: &str) -> Option<String> {
-    SECTIONS
-        .iter()
-        .find(|(name, keys)| *name != section && keys.contains(&key))
-        .map(|(name, _)| format!("[{name}].{key}"))
-}
-
-fn section_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = SECTIONS.iter().map(|(name, _)| *name).collect();
-    names.push(PROVIDERS);
-    names
-}
-
-/// The candidate sharing the longest prefix with `name`, when that is at
-/// least [`PREFIX_MATCH`] characters — enough for `topk` to find `top_k`
-/// without naming something unrelated.
-fn closest(name: &str, candidates: &[&str]) -> Option<String> {
-    candidates
-        .iter()
-        .map(|candidate| (common_prefix(name, candidate), *candidate))
-        .filter(|(shared, _)| *shared >= PREFIX_MATCH)
-        .max_by_key(|(shared, _)| *shared)
-        .map(|(_, candidate)| candidate.to_owned())
-}
-
+/// How many leading characters a suggestion must share with the unknown
+/// key: enough for `topk` to find `top_k` without naming something
+/// unrelated.
 const PREFIX_MATCH: usize = 3;
 
-fn common_prefix(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+impl UnknownKey {
+    /// Every key in the file that no setting corresponds to, in file order.
+    fn find_in(file: &Table) -> Vec<Self> {
+        let mut unknown = Vec::new();
+        for (name, value) in file {
+            if name == PROVIDERS {
+                let Some(providers) = value.as_table() else {
+                    continue;
+                };
+                for (provider, entry) in providers {
+                    let Some(entry) = entry.as_table() else {
+                        continue;
+                    };
+                    let section = format!("{PROVIDERS}.{provider}");
+                    for key in entry.keys() {
+                        if !PROVIDER_KEYS.contains(&key.as_str()) {
+                            unknown.push(Self::new(&section, key, PROVIDER_KEYS));
+                        }
+                    }
+                    let Some(oauth) = entry.get("oauth").and_then(TomlValue::as_table) else {
+                        continue;
+                    };
+                    for key in oauth.keys() {
+                        if !OAUTH_KEYS.contains(&key.as_str()) {
+                            unknown.push(Self::new(&format!("{section}.oauth"), key, OAUTH_KEYS));
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some((_, keys)) = SECTIONS.iter().find(|(section, _)| *section == name) else {
+                unknown.push(Self {
+                    path: name.clone(),
+                    suggestion: Self::closest(name, &Self::section_names()),
+                });
+                continue;
+            };
+            let Some(table) = value.as_table() else {
+                continue;
+            };
+            for key in table.keys() {
+                if !keys.contains(&key.as_str()) {
+                    unknown.push(Self::new(name, key, keys));
+                }
+            }
+        }
+        unknown
+    }
+
+    /// `key` in `section`, which accepts `keys`, with the closest one or
+    /// the section that does accept it.
+    fn new(section: &str, key: &str, keys: &[&str]) -> Self {
+        let suggestion = Self::closest(key, keys).or_else(|| Self::elsewhere(section, key));
+        Self {
+            path: format!("{section}.{key}"),
+            suggestion,
+        }
+    }
+
+    /// Another section that accepts this exact key, for a setting written
+    /// under the wrong heading.
+    fn elsewhere(section: &str, key: &str) -> Option<String> {
+        SECTIONS
+            .iter()
+            .find(|(name, keys)| *name != section && keys.contains(&key))
+            .map(|(name, _)| format!("[{name}].{key}"))
+    }
+
+    fn section_names() -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = SECTIONS.iter().map(|(name, _)| *name).collect();
+        names.push(PROVIDERS);
+        names
+    }
+
+    /// The candidate sharing the longest prefix with `name`, when that is
+    /// at least [`PREFIX_MATCH`] characters.
+    fn closest(name: &str, candidates: &[&str]) -> Option<String> {
+        candidates
+            .iter()
+            .map(|candidate| {
+                let shared = name
+                    .chars()
+                    .zip(candidate.chars())
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                (shared, *candidate)
+            })
+            .filter(|(shared, _)| *shared >= PREFIX_MATCH)
+            .max_by_key(|(shared, _)| *shared)
+            .map(|(_, candidate)| candidate.to_owned())
+    }
 }
 
 /// Builds the settings list, resolving each setting's origin against the
@@ -893,23 +909,14 @@ impl Section<'_, '_> {
         self.inventory.push(&self.name, key, value, None, env);
     }
 
-    fn text(&mut self, key: &'static str, value: &str, default: &str) {
+    /// A text setting, and the environment variable that overrides it.
+    fn text(&mut self, key: &'static str, value: &str, default: &str, env: Option<&'static str>) {
         self.inventory.push(
             &self.name,
             key,
             Some(quoted(value)),
             Some(quoted(default)),
-            None,
-        );
-    }
-
-    fn text_with_env(&mut self, key: &'static str, value: &str, default: &str, env: &'static str) {
-        self.inventory.push(
-            &self.name,
-            key,
-            Some(quoted(value)),
-            Some(quoted(default)),
-            Some(env),
+            env,
         );
     }
 
@@ -923,17 +930,8 @@ impl Section<'_, '_> {
         );
     }
 
-    fn number<T: fmt::Display>(&mut self, key: &'static str, value: T, default: T) {
-        self.inventory.push(
-            &self.name,
-            key,
-            Some(value.to_string()),
-            Some(default.to_string()),
-            None,
-        );
-    }
-
-    fn flag(&mut self, key: &'static str, value: bool, default: bool) {
+    /// A number or a flag: shown as TOML writes it, unquoted.
+    fn literal<T: fmt::Display>(&mut self, key: &'static str, value: T, default: T) {
         self.inventory.push(
             &self.name,
             key,
@@ -1194,7 +1192,10 @@ top_k = 3
 
     #[test]
     fn the_section_list_matches_the_config_struct() {
-        let declared: BTreeSet<String> = section_names().iter().map(|s| (*s).to_owned()).collect();
+        let declared: BTreeSet<String> = UnknownKey::section_names()
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         assert_eq!(fields_of(""), declared);
     }
 

@@ -1299,7 +1299,7 @@ carry the `fips` feature there, so every distributed Linux binary runs on the FI
 AWS-LC module and the approved cipher suites; naming that function makes dropping the
 feature a build error. macOS and Windows install the aws-lc-sys provider, because a FIPS
 build links statically only on Linux. `--version` names the module it linked and
-`log_provider()` logs it once a subscriber exists (`docs/crypto.md`).
+`CryptoModule::log` logs it once a subscriber exists (`docs/crypto.md`).
 
 SHA-256, AES-256-GCM and randomness come from aws-lc-rs; password hashing is the RustCrypto
 `argon2` crate, salted from `getrandom`. No runtime code links OpenSSL or `ring`:

@@ -6,17 +6,19 @@
 //! reported, not created, and a workspace is opened only when its file
 //! already exists. Network probes (one short `GET` per model's provider,
 //! plus a look for a local Ollama when no chat model is set) are skipped
-//! with [`Options::offline`]. No credential is ever printed: a check says
+//! with [`Probing::Offline`]. No credential is ever printed: a check says
 //! which environment variable a key comes from and whether it is set.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::config;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{
     BaseUrl, Config, ModelRef, OAuthConfig, ProviderAuth, ProviderName, ProviderType,
 };
+use crate::crypto::CryptoModule;
 use crate::embedding::Dimension;
 use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::error::Error;
@@ -25,11 +27,12 @@ use crate::llm::oauth::TokenManager;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::Count;
-use crate::{config, crypto};
 use secrecy::ExposeSecret;
+use serde::Serialize;
 
 /// How one check came out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Status {
     Ok,
     /// Not a problem, but worth knowing (a feature that is off).
@@ -48,13 +51,16 @@ text_enum!(Status, "check status", {
 });
 
 /// The part of the setup a check looked at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Area {
     Config,
     Crypto,
     Data,
+    #[serde(rename = "control db")]
     ControlDb,
     Workspace,
+    #[serde(rename = "chat model")]
     ChatModel,
     Embeddings,
     Server,
@@ -72,7 +78,7 @@ text_enum!(Area, "doctor area", {
 });
 
 /// One finding: what was checked, how it came out, and what to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
     pub area: Area,
     pub status: Status,
@@ -122,23 +128,43 @@ impl Report {
 }
 
 /// What to check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Options {
     /// The workspace to open; `[general].default_workspace` when unset.
     pub workspace: Option<String>,
-    /// Skip every network probe.
-    pub offline: bool,
-    /// How long one probe may take.
-    pub timeout: Duration,
+    pub probing: Probing,
 }
 
-impl Default for Options {
+/// Whether the checks reach the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probing {
+    /// Skip every network probe.
+    Offline,
+    /// Probe, allowing each probe `timeout`.
+    Online { timeout: Duration },
+}
+
+impl Default for Probing {
     fn default() -> Self {
-        Self {
-            workspace: None,
-            offline: false,
+        Self::Online {
             timeout: Duration::from_secs(5),
         }
+    }
+}
+
+impl Probing {
+    /// The client the probes share, or `None` offline.
+    fn client(self) -> Option<reqwest::Client> {
+        let Self::Online { timeout } = self else {
+            return None;
+        };
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .inspect_err(|e| tracing::warn!(error = %e, "cannot build the probe client"))
+            .ok()
     }
 }
 
@@ -155,7 +181,7 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
         None
     };
     check_workspace(&mut report, config, control.as_ref(), options).await;
-    let http = probe_client(options);
+    let http = options.probing.client();
     check_chat_model(&mut report, config, http.as_ref()).await;
     check_embedding_model(&mut report, config, http.as_ref()).await;
     check_server(&mut report, config, control.as_ref()).await;
@@ -204,10 +230,8 @@ fn check_config(report: &mut Report, inspection: &Inspection) {
 }
 
 fn check_crypto(report: &mut Report) {
-    let module = crypto::provider_description();
-    if aws_lc_rs::fips_version().is_some() || !cfg!(target_os = "linux") {
-        report.push(Check::new(Area::Crypto, Status::Ok, module));
-    } else {
+    let module = CryptoModule::linked();
+    if module.lacks_expected_fips() {
         report.push(
             Check::new(
                 Area::Crypto,
@@ -216,6 +240,8 @@ fn check_crypto(report: &mut Report) {
             )
             .fix("use a release binary or image, which link AWS-LC FIPS (docs/crypto.md)"),
         );
+    } else {
+        report.push(Check::new(Area::Crypto, Status::Ok, module.to_string()));
     }
 }
 
@@ -555,7 +581,7 @@ impl OllamaShow {
             .json(&serde_json::json!({ "model": model }))
             .send()
             .await
-            .map_err(|e| Probe::Unreachable(error_chain(&e)))?;
+            .map_err(Probe::from)?;
         let status = response.status();
         if !status.is_success() {
             return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
@@ -563,7 +589,7 @@ impl OllamaShow {
         response
             .json()
             .await
-            .map_err(|e| Probe::Unexpected(error_chain(&e)))
+            .map_err(|e| Probe::Unexpected(ErrorChain(&e).to_string()))
     }
 
     /// The model's vector width: `<architecture>.embedding_length`.
@@ -649,7 +675,7 @@ async fn check_model(
         ));
         return;
     };
-    let listing = list_models(http, provider.provider_type, &base, credential.as_deref()).await;
+    let listing = Listing::fetch(http, provider.provider_type, &base, credential.as_deref()).await;
     report.push(listing_check(area, model, &base, listing));
 }
 
@@ -789,7 +815,7 @@ async fn oauth_token(
 /// answers, otherwise the general shape.
 async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
     let pulled = match http {
-        Some(http) => match list_models(
+        Some(http) => match Listing::fetch(
             http,
             ProviderType::Ollama,
             &ProviderType::Ollama.default_base_url(),
@@ -887,6 +913,29 @@ enum Probe {
     Unexpected(String),
 }
 
+impl From<reqwest::Error> for Probe {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Unreachable(ErrorChain(&error).to_string())
+    }
+}
+
+/// An error and its sources on one line: reqwest's own message is only
+/// "error sending request", and the cause (refused, timed out, DNS) is
+/// what the user needs.
+struct ErrorChain<'a>(&'a dyn std::error::Error);
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct IdList {
     #[serde(default)]
@@ -898,88 +947,59 @@ struct IdEntry {
     id: String,
 }
 
-fn probe_client(options: &Options) -> Option<reqwest::Client> {
-    if options.offline {
-        return None;
-    }
-    reqwest::Client::builder()
-        .timeout(options.timeout)
-        .connect_timeout(options.timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .inspect_err(|e| tracing::warn!(error = %e, "cannot build the probe client"))
-        .ok()
-}
-
-/// One `GET` for the provider's model list.
-async fn list_models(
-    http: &reqwest::Client,
-    provider: ProviderType,
-    base: &BaseUrl,
-    credential: Option<&str>,
-) -> std::result::Result<Listing, Probe> {
-    let request = match provider {
-        ProviderType::Ollama => {
-            let request = http.get(format!("{}/api/tags", base.root()));
-            match credential {
-                Some(key) => request.bearer_auth(key),
-                None => request,
+impl Listing {
+    /// One `GET` for the provider's model list.
+    async fn fetch(
+        http: &reqwest::Client,
+        provider: ProviderType,
+        base: &BaseUrl,
+        credential: Option<&str>,
+    ) -> std::result::Result<Self, Probe> {
+        let request = match provider {
+            ProviderType::Ollama => {
+                let request = http.get(format!("{}/api/tags", base.root()));
+                match credential {
+                    Some(key) => request.bearer_auth(key),
+                    None => request,
+                }
+            }
+            ProviderType::Openai => {
+                let request = http.get(format!("{}/models", base.trimmed()));
+                match credential {
+                    Some(key) => request.bearer_auth(key),
+                    None => request,
+                }
+            }
+            ProviderType::Anthropic => {
+                let request = http
+                    .get(format!("{}/v1/models?limit=1000", base.trimmed()))
+                    .header("anthropic-version", "2023-06-01");
+                match credential {
+                    Some(key) => request.header("x-api-key", key),
+                    None => request,
+                }
+            }
+        };
+        let response = request.send().await.map_err(Probe::from)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(Probe::Rejected(status.as_u16()));
+        }
+        if !status.is_success() {
+            return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
+        }
+        let bytes = response.bytes().await.map_err(Probe::from)?;
+        match provider {
+            ProviderType::Ollama => serde_json::from_slice::<OllamaRunningModels>(&bytes)
+                .map(Self::Ollama)
+                .map_err(|e| Probe::Unexpected(e.to_string())),
+            ProviderType::Openai | ProviderType::Anthropic => {
+                serde_json::from_slice::<IdList>(&bytes)
+                    .map(|list| Self::Ids(list.data.into_iter().map(|e| e.id).collect()))
+                    .map_err(|e| Probe::Unexpected(e.to_string()))
             }
         }
-        ProviderType::Openai => {
-            let request = http.get(format!("{}/models", base.trimmed()));
-            match credential {
-                Some(key) => request.bearer_auth(key),
-                None => request,
-            }
-        }
-        ProviderType::Anthropic => {
-            let request = http
-                .get(format!("{}/v1/models?limit=1000", base.trimmed()))
-                .header("anthropic-version", "2023-06-01");
-            match credential {
-                Some(key) => request.header("x-api-key", key),
-                None => request,
-            }
-        }
-    };
-    let response = request
-        .send()
-        .await
-        .map_err(|e| Probe::Unreachable(error_chain(&e)))?;
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(Probe::Rejected(status.as_u16()));
     }
-    if !status.is_success() {
-        return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| Probe::Unreachable(error_chain(&e)))?;
-    match provider {
-        ProviderType::Ollama => serde_json::from_slice::<OllamaRunningModels>(&bytes)
-            .map(Listing::Ollama)
-            .map_err(|e| Probe::Unexpected(e.to_string())),
-        ProviderType::Openai | ProviderType::Anthropic => serde_json::from_slice::<IdList>(&bytes)
-            .map(|list| Listing::Ids(list.data.into_iter().map(|e| e.id).collect()))
-            .map_err(|e| Probe::Unexpected(e.to_string())),
-    }
-}
-
-/// An error and its sources on one line: reqwest's own message is only
-/// "error sending request", and the cause (refused, timed out, DNS) is
-/// what the user needs.
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
 }
 
 #[cfg(test)]
@@ -1065,7 +1085,7 @@ mod tests {
 
     fn offline() -> Options {
         Options {
-            offline: true,
+            probing: Probing::Offline,
             ..Options::default()
         }
     }
@@ -1141,7 +1161,9 @@ mod tests {
         let toml = "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\n\
                     base_url = \"http://127.0.0.1:9\"\n";
         let options = Options {
-            timeout: Duration::from_secs(2),
+            probing: Probing::Online {
+                timeout: Duration::from_secs(2),
+            },
             ..Options::default()
         };
         let report = run(&inspection(dir.path(), Some(toml)), &options).await;

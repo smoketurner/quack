@@ -19,7 +19,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::doctor::Options;
+use quack_core::crypto::{self, CryptoModule};
+use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
@@ -35,7 +36,7 @@ use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
 use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
 use quack_core::storage::writer::Writer;
-use quack_core::{config, crypto, doctor};
+use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -61,11 +62,7 @@ const EXIT_BAD_CONFIG: u8 = 2;
 /// binary from a non-FIPS one without turning on `RUST_LOG=info`. `-V` stays
 /// the bare version. A static because clap takes a `&'static str`.
 static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!(
-        "{}\n{}",
-        env!("CARGO_PKG_VERSION"),
-        crypto::provider_description()
-    )
+    format!("{}\n{}", env!("CARGO_PKG_VERSION"), CryptoModule::linked())
 });
 
 #[derive(Parser)]
@@ -634,8 +631,11 @@ async fn run_doctor(cli: &Cli, offline: bool, json: bool) -> Result<ExitCode> {
     let inspection = config::inspect::Inspection::load();
     let options = Options {
         workspace: cli.workspace.clone(),
-        offline,
-        ..Options::default()
+        probing: if offline {
+            Probing::Offline
+        } else {
+            Probing::default()
+        },
     };
     let report = doctor::run(&inspection, &options).await;
     let stdout = std::io::stdout();
@@ -1432,7 +1432,7 @@ fn init_logging_at(default: &str) {
         .init();
     // The provider is installed at the top of `main`, before any subscriber
     // exists; this is the first point where saying so reaches a log.
-    crypto::log_provider();
+    CryptoModule::linked().log();
 }
 
 /// The configuration and the workspace this command runs in: the named one,
