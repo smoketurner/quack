@@ -738,6 +738,30 @@ impl JobQueue {
             }
         }
     }
+
+    /// Run `record` with the job's final snapshot once it ends, on a task
+    /// of its own: for what the work would have recorded itself had it run
+    /// to its end (a job cancelled while queued never runs it).
+    pub fn when_ended<F, Fut>(&self, id: JobId, record: F)
+    where
+        F: FnOnce(JobInfo) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let queue = self.clone();
+        tokio::spawn(async move {
+            if let Some(ended) = queue.wait(id).await {
+                record(ended).await;
+            }
+        });
+    }
+}
+
+impl JobInfo {
+    /// Cancelled while still queued: its work never ran.
+    #[must_use]
+    pub fn never_started(&self) -> bool {
+        self.state == JobState::Cancelled && self.started_at.is_none()
+    }
 }
 
 /// Wait for the lane, run the work, and record its end. The end is recorded
