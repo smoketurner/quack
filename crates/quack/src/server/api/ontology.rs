@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::extraction::ExtractionRun;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -265,7 +265,7 @@ pub(crate) async fn propose(
 pub(crate) struct TableProposal {
     /// Candidates queued; zero when the ontology already covers the tables.
     pub candidates: usize,
-    pub run: Option<String>,
+    pub run: Option<RunId>,
     /// The version accepting them all made, with `auto_accept`.
     pub version: Option<OntologyVersion>,
 }
@@ -324,7 +324,7 @@ impl Access {
         self.audit(
             app,
             AuditAction::Propose,
-            proposed.run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
+            proposed.run.as_ref().map(|r| ResourceKind::InductionRun.id(r)),
             Outcome::Allowed,
             Some(serde_json::json!({ "candidates": proposed.candidates, "auto_accept": auto_accept, "version": proposed.version })),
         )
@@ -532,7 +532,7 @@ impl Access {
             serde_json::json!({ "documents": true, "cost": cost }),
         )
         .await?;
-        let run_id = run.id().to_owned();
+        let run_id = run.id().clone();
         let concurrency = app.config.analysis.extraction_concurrency;
         let progress_run = run_id.clone();
         let job = run.submit(move |ctx| async move {

@@ -17,7 +17,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{BaseUrl, Config, ProviderConfig, ProviderName, ProviderType};
 use quack_core::embedding::Dimension;
-use quack_core::ids::{ChunkId, DocumentId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -4013,10 +4013,10 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let outcomes = |run: &str| -> Vec<Outcome> {
+    let outcomes = |run: &RunId| -> Vec<Outcome> {
         let mut found: Vec<Outcome> = rows
             .iter()
-            .filter(|r| r.resource_id.as_deref() == Some(run))
+            .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
             .map(|r| r.outcome)
             .collect();
         found.sort_by_key(|o| o.as_str());

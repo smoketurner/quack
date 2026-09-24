@@ -15,7 +15,7 @@ use quack_core::graph::store::Revalidation;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphStatus, extract, resolve, store as graph_store, tables,
 };
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -165,7 +165,7 @@ pub(crate) enum ExtractionStarted {
     Running {
         tables: Vec<tables::MappingSummary>,
         cost: ExtractionCost,
-        run: String,
+        run: RunId,
         job: JobId,
     },
 }
@@ -266,7 +266,7 @@ impl Access {
             serde_json::json!({ "tables": table_summaries, "cost": cost }),
         )
         .await?;
-        let run_id = run.id().to_owned();
+        let run_id = run.id().clone();
         let job = DocumentJob {
             db,
             chunks,
@@ -340,7 +340,7 @@ impl DocumentJob {
     /// `run`'s job with a chunk count for its progress. The extraction slot
     /// is held until the pass ends.
     fn run_in_background(self, run: BackgroundRun, app: App) -> JobId {
-        let run_id = run.id().to_owned();
+        let run_id = run.id().clone();
         run.submit(move |ctx| async move {
             let Self {
                 db,

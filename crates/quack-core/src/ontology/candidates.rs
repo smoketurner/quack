@@ -5,7 +5,7 @@ use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
 use super::store::{self, Acceptance, Revision};
 use super::{Class, Ontology, ROOT_CLASS};
 use crate::error::{Error, Record, Result};
-use crate::ids::{CandidateId, ClassId};
+use crate::ids::{CandidateId, ClassId, RunId};
 use crate::prefix::PrefixMatch;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::NonBlankText;
@@ -218,8 +218,8 @@ impl CandidateAction {
 /// # Errors
 ///
 /// Returns an error if a write fails.
-pub fn store_run(db: &WorkspaceDb, candidates: &[Candidate]) -> Result<String> {
-    let run = uuid::Uuid::now_v7().to_string();
+pub fn store_run(db: &WorkspaceDb, candidates: &[Candidate]) -> Result<RunId> {
+    let run = RunId::generate();
     let conn = db.connection();
     for candidate in candidates {
         // The id sits at the top for classes and relations, under
@@ -516,7 +516,7 @@ mod tests {
         let proposals = propose_from_tables(&db, None, &TableEvidenceOptions::default())
             .unwrap_or_else(|e| fail(&e.to_string()));
         let run = store_run(&db, &proposals).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(!run.is_empty());
+        assert!(!run.as_str().is_empty());
         let listed = queue(&db, Queue::Pending).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(listed.len(), 5, "class, three properties, mapping");
         let country = listed

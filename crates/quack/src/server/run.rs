@@ -10,7 +10,7 @@ use std::sync::Arc;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
 use quack_core::graph::resolve::ResolutionSummary;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::jobs::{JobContext, JobId, JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::documents;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -129,7 +129,7 @@ impl RunReport for documents::RunSummary {
 pub(crate) struct BackgroundRun {
     app: App,
     access: Access,
-    id: String,
+    id: RunId,
     kind: RunKind,
 }
 
@@ -142,7 +142,7 @@ impl BackgroundRun {
         kind: RunKind,
         detail: Value,
     ) -> ApiResult<Self> {
-        let id = uuid::Uuid::now_v7().to_string();
+        let id = RunId::generate();
         access
             .audit(
                 app,
@@ -160,7 +160,7 @@ impl BackgroundRun {
         })
     }
 
-    pub(crate) fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &RunId {
         &self.id
     }
 

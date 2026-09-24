@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use crate::analysis::agent::AgentResponse;
 use crate::error::{Error, Record, Result};
-use crate::ids::{SessionId, UserId};
+use crate::ids::{MessageId, SessionId, UserId};
 
 use super::workspace::WorkspaceDb;
 
@@ -113,7 +113,7 @@ pub enum SessionViewer {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageRow {
-    pub id: String,
+    pub id: MessageId,
     pub session_id: SessionId,
     pub seq: i64,
     pub role: MessageRole,
@@ -294,7 +294,7 @@ pub fn append_message(
         "INSERT INTO _quack_messages (id, session_id, seq, role, content, metadata) \
          VALUES (?, ?, ?, ?, ?, ?)",
         duckdb::params![
-            uuid::Uuid::now_v7().to_string(),
+            MessageId::generate(),
             session_id,
             seq,
             role.as_str(),
