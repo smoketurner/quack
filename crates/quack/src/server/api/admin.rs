@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, Outcome, ResourceKind, UserKind, UserRow,
+    AuditAction, AuditCursor, AuditFilter, Outcome, ResourceKind, UserKind, UserRow,
 };
 use serde::Deserialize;
 
@@ -69,13 +69,14 @@ pub(crate) struct AuditQuery {
     pub until: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    pub cursor: Option<AuditCursor>,
 }
 
 fn default_limit() -> u32 {
     100
 }
 
-/// At most 1000 rows per request.
+/// At most 1000 rows per page.
 impl From<AuditQuery> for AuditFilter {
     fn from(q: AuditQuery) -> Self {
         Self {
@@ -86,6 +87,7 @@ impl From<AuditQuery> for AuditFilter {
             since: q.since,
             until: q.until,
             limit: q.limit.min(1000),
+            after: q.cursor,
         }
     }
 }
@@ -96,6 +98,8 @@ pub(crate) async fn audit(
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     identity.require_admin()?;
-    let rows = app.control.query_audit(&AuditFilter::from(q)).await?;
-    Ok(Json(serde_json::json!({ "audit": rows })))
+    let page = app.control.query_audit(&AuditFilter::from(q)).await?;
+    Ok(Json(
+        serde_json::json!({ "audit": page.rows, "next_cursor": page.next }),
+    ))
 }
