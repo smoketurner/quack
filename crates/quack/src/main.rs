@@ -48,6 +48,7 @@ use std::time::Duration;
 
 use crate::confirm::Confirm;
 use crate::print::{PrintTurn, TurnOutcome};
+use crate::server::state::ServeMode;
 use crate::stdio::{NamedInput, StdioPath};
 use crate::terminal::SessionSetup;
 use crate::text_or_json::TextOrJson;
@@ -563,11 +564,7 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
 async fn run() -> Result<ExitCode> {
     let mut cli = Cli::parse();
 
-    let policy = if cli.allow_write {
-        WritePolicy::Allow
-    } else {
-        WritePolicy::Deny
-    };
+    let policy = WritePolicy::Deny.allowed_if(cli.allow_write);
     let stdout_is_tty = std::io::stdout().is_terminal();
 
     if let Some(prompt) = cli.prompt.as_deref() {
@@ -626,7 +623,12 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             // The server logs each request at info; other commands stay quiet.
             init_logging_at("info,sqlx=warn,hyper=warn,h2=warn");
             let config = Config::load().context("failed to load configuration")?;
-            server::serve(config, args.bind, args.local).await?;
+            let mode = if args.local {
+                ServeMode::Local
+            } else {
+                ServeMode::Login
+            };
+            server::serve(config, args.bind, mode).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Admin(command) => {
@@ -719,8 +721,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     let session_id = resolve_session(
         config,
         &ws_db,
-        cli.continue_latest,
-        cli.resume.as_deref(),
+        cli.session_choice(),
         cli.mode.map(ChatMode::from),
     )?;
     let (db, reader_db) = opened.shared(ws_db).await?;
@@ -830,7 +831,7 @@ async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
 /// `quack sessions`: the session list.
 async fn run_sessions(cli: &Cli, args: &SessionsArgs) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
-    list_sessions(&ws_db, args.json, args.limit)?;
+    list_sessions(&ws_db, TextOrJson::of(args.json), args.limit)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -861,7 +862,7 @@ impl WriterCommand for graph_cli::GraphAction {
         out: &mut impl Write,
         control: RunControl<'_>,
     ) -> Result<()> {
-        graph_cli::run(config, db, self, out, control).await
+        graph_cli::run(config, db, self, Confirm::Ask, out, control).await
     }
 }
 
@@ -873,7 +874,7 @@ impl WriterCommand for ontology_cli::OntologyAction {
         out: &mut impl Write,
         control: RunControl<'_>,
     ) -> Result<()> {
-        ontology_cli::run(config, db, self, out, control).await
+        ontology_cli::run(config, db, self, Confirm::Ask, out, control).await
     }
 }
 
@@ -885,7 +886,7 @@ impl WriterCommand for embeddings_cli::EmbeddingsAction {
         out: &mut impl Write,
         control: RunControl<'_>,
     ) -> Result<()> {
-        embeddings_cli::run(config, db, self, out, control).await
+        embeddings_cli::run(config, db, self, Confirm::Ask, out, control).await
     }
 }
 
@@ -975,11 +976,7 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     let OpenedWorkspace {
         config, workspace, ..
     } = opened;
-    let policy = if allow_write {
-        WritePolicy::Allow
-    } else {
-        WritePolicy::Deny
-    };
+    let policy = WritePolicy::Deny.allowed_if(allow_write);
     mcp::serve_stdio(config, db, reader_db, workspace, policy).await?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1154,8 +1151,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     let session_id = resolve_session(
         &opened.config,
         &ws_db,
-        cli.continue_latest,
-        cli.resume.as_deref(),
+        cli.session_choice(),
         cli.mode.map(ChatMode::from),
     )?;
     let (db, reader_db) = opened.shared(ws_db).await?;
@@ -1171,10 +1167,30 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         db,
         reader_db,
         session_id,
-        allow_write: cli.allow_write,
+        writes: WritePolicy::Ask.allowed_if(cli.allow_write),
     })
     .await?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Which session a run continues.
+#[derive(Debug, Clone, Copy)]
+enum SessionChoice<'a> {
+    New,
+    /// `--continue`: the most recent one, or a new one when there is none.
+    Latest,
+    /// `--resume ID`: this one (prefixes accepted).
+    Resume(&'a str),
+}
+
+impl Cli {
+    fn session_choice(&self) -> SessionChoice<'_> {
+        match (self.resume.as_deref(), self.continue_latest) {
+            (Some(prefix), _) => SessionChoice::Resume(prefix),
+            (None, true) => SessionChoice::Latest,
+            (None, false) => SessionChoice::New,
+        }
+    }
 }
 
 /// Pick the session for this run: the latest with `--continue`, a specific
@@ -1183,16 +1199,13 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
 fn resolve_session(
     config: &Config,
     db: &WorkspaceDb,
-    continue_latest: bool,
-    resume: Option<&str>,
+    choice: SessionChoice<'_>,
     mode: Option<ChatMode>,
 ) -> Result<SessionId> {
-    let existing = if let Some(prefix) = resume {
-        Some(find_session(db, prefix)?.id)
-    } else if continue_latest {
-        sessions::latest_session(db)?.map(|s| s.id)
-    } else {
-        None
+    let existing = match choice {
+        SessionChoice::Resume(prefix) => Some(find_session(db, prefix)?.id),
+        SessionChoice::Latest => sessions::latest_session(db)?.map(|s| s.id),
+        SessionChoice::New => None,
     };
     if let Some(id) = existing {
         if let Some(mode) = mode {
@@ -1305,7 +1318,7 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
     }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    list_documents(db, args.json, &mut out)
+    list_documents(db, TextOrJson::of(args.json), &mut out)
 }
 
 /// Resolve a full document id or a unique prefix.
@@ -1315,32 +1328,23 @@ fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<DocumentId> {
     Ok(document.id)
 }
 
-fn list_documents(db: &WorkspaceDb, json: bool, out: &mut impl Write) -> Result<()> {
+fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) -> Result<()> {
     let docs = db.list_documents()?;
-    if json {
-        for doc in &docs {
-            serde_json::to_writer(&mut *out, doc)?;
-            writeln!(out)?;
-        }
-    } else if docs.is_empty() {
-        writeln!(out, "No documents yet.")?;
-    } else {
-        for doc in &docs {
-            let title = doc
-                .title
-                .as_deref()
-                .map_or(String::new(), |t| format!("  ({t})"));
-            writeln!(
-                out,
-                "{}  {:<10}  {:<6}  {}  {}{title}",
-                doc.id,
-                doc.status,
-                doc.source,
-                if doc.pinned { "pinned  " } else { "        " },
-                doc.filename
-            )?;
-        }
-    }
+    format.write_rows(out, &docs, "No documents yet.", |out, doc| {
+        let title = doc
+            .title
+            .as_deref()
+            .map_or(String::new(), |t| format!("  ({t})"));
+        writeln!(
+            out,
+            "{}  {:<10}  {:<6}  {}  {}{title}",
+            doc.id,
+            doc.status,
+            doc.source,
+            if doc.pinned { "pinned  " } else { "        " },
+            doc.filename
+        )
+    })?;
     out.flush()?;
     Ok(())
 }
@@ -1358,31 +1362,22 @@ fn find_session(db: &WorkspaceDb, prefix: &str) -> Result<sessions::SessionRow> 
     )
 }
 
-fn list_sessions(db: &WorkspaceDb, json: bool, limit: u32) -> Result<()> {
+fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()> {
     let rows = sessions::list_sessions(db, limit)?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    if json {
-        for row in &rows {
-            serde_json::to_writer(&mut out, row)?;
-            writeln!(out)?;
-        }
-    } else if rows.is_empty() {
-        writeln!(out, "No sessions yet.")?;
-    } else {
-        for row in &rows {
-            writeln!(
-                out,
-                "{}  {}  {:>3} msgs  {}  {}{}",
-                row.id,
-                row.updated_at,
-                row.message_count,
-                row.model,
-                row.title.as_deref().unwrap_or("(untitled)"),
-                if row.shared { "  (shared)" } else { "" }
-            )?;
-        }
-    }
+    format.write_rows(&mut out, &rows, "No sessions yet.", |out, row| {
+        writeln!(
+            out,
+            "{}  {}  {:>3} msgs  {}  {}{}",
+            row.id,
+            row.updated_at,
+            row.message_count,
+            row.model,
+            row.title.as_deref().unwrap_or("(untitled)"),
+            if row.shared { "  (shared)" } else { "" }
+        )
+    })?;
     out.flush()?;
     Ok(())
 }
@@ -1753,7 +1748,7 @@ mod tests {
         db.mark_document_error(&DocumentId::from("d1"), "no text layer")
             .unwrap();
         let mut out = Vec::new();
-        list_documents(&db, true, &mut out).unwrap();
+        list_documents(&db, TextOrJson::Json, &mut out).unwrap();
         let row: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(row.get("status").unwrap(), "error", "{row}");
         assert_eq!(row.get("error_message").unwrap(), "no text layer", "{row}");

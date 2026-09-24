@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::server::auth::Identity;
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::state::App;
+use crate::server::state::{App, ServeMode};
 
 pub(crate) async fn users(
     State(app): State<App>,
@@ -45,7 +45,7 @@ impl Identity {
     /// and not in local mode, which has no logins.
     pub(crate) async fn create_user(&self, app: &App, user: &CreateUser) -> ApiResult<UserRow> {
         self.require_admin()?;
-        if app.local {
+        if app.mode == ServeMode::Local {
             return Err(ApiError::bad_request("local mode has no users"));
         }
         let created = app

@@ -15,6 +15,8 @@ use quack_core::storage::control::{
     Role, Scope, UserKind, WorkspaceRow,
 };
 
+use crate::text_or_json::TextOrJson;
+
 /// Server administration: users, tokens, membership, and the audit log.
 #[derive(Subcommand)]
 pub(crate) enum AdminCommand {
@@ -137,6 +139,24 @@ pub(crate) struct AuditArgs {
     csv: bool,
 }
 
+/// How `quack audit` prints: a listing (text or one JSON object per row),
+/// or CSV with a header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditFormat {
+    Rows(TextOrJson),
+    Csv,
+}
+
+impl AuditArgs {
+    const fn format(&self) -> AuditFormat {
+        if self.csv {
+            AuditFormat::Csv
+        } else {
+            AuditFormat::Rows(TextOrJson::of(self.json))
+        }
+    }
+}
+
 pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> {
     let control = ControlPlane::open(config).await?;
     let stdout = std::io::stdout();
@@ -162,15 +182,11 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
         UserAction::List { json } => {
             let users = control.list_users().await?;
             let mut out = std::io::BufWriter::new(stdout.lock());
-            if json {
-                for user in &users {
-                    serde_json::to_writer(&mut out, user)?;
-                    writeln!(out)?;
-                }
-            } else if users.is_empty() {
-                writeln!(out, "No users yet. Run `quack user add NAME`.")?;
-            } else {
-                for user in &users {
+            TextOrJson::of(json).write_rows(
+                &mut out,
+                &users,
+                "No users yet. Run `quack user add NAME`.",
+                |out, user| {
                     writeln!(
                         out,
                         "{}  {:<24} {}  {}",
@@ -178,9 +194,9 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
                         user.username,
                         if user.is_admin { "admin " } else { "      " },
                         user.created_at
-                    )?;
-                }
-            }
+                    )
+                },
+            )?;
             out.flush()?;
         }
     }
@@ -201,7 +217,7 @@ pub(crate) async fn run_token(
             scopes,
             expires,
         } => create_token(&control, &ws, &user, &name, &scopes, expires).await,
-        TokenAction::List { json } => list_tokens(&control, &ws, json).await,
+        TokenAction::List { json } => list_tokens(&control, &ws, TextOrJson::of(json)).await,
         TokenAction::Revoke { token_hash } => revoke_token(&control, &ws, &token_hash).await,
     }
 }
@@ -252,19 +268,15 @@ async fn create_token(
     Ok(())
 }
 
-async fn list_tokens(control: &ControlPlane, ws: &WorkspaceRow, json: bool) -> Result<()> {
+async fn list_tokens(control: &ControlPlane, ws: &WorkspaceRow, format: TextOrJson) -> Result<()> {
     let tokens = control.list_tokens(&ws.id).await?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    if json {
-        for token in &tokens {
-            serde_json::to_writer(&mut out, token)?;
-            writeln!(out)?;
-        }
-    } else if tokens.is_empty() {
-        writeln!(out, "No tokens in workspace '{}'.", ws.name)?;
-    } else {
-        for token in &tokens {
+    format.write_rows(
+        &mut out,
+        &tokens,
+        &format!("No tokens in workspace '{}'.", ws.name),
+        |out, token| {
             writeln!(
                 out,
                 "{}  {:<16} {:<16} {}  {}",
@@ -273,9 +285,9 @@ async fn list_tokens(control: &ControlPlane, ws: &WorkspaceRow, json: bool) -> R
                 scope_list(&token.scopes),
                 token.expires_at.as_deref().unwrap_or("no expiry"),
                 token.last_used_at.as_deref().unwrap_or("never used")
-            )?;
-        }
-    }
+            )
+        },
+    )?;
     out.flush()?;
     Ok(())
 }
@@ -340,22 +352,18 @@ pub(crate) async fn run_member(
         MemberAction::List { json } => {
             let members = control.list_members(&ws.id).await?;
             let mut out = std::io::BufWriter::new(stdout.lock());
-            if json {
-                for member in &members {
-                    serde_json::to_writer(&mut out, member)?;
-                    writeln!(out)?;
-                }
-            } else if members.is_empty() {
-                writeln!(out, "No members in '{}'.", ws.name)?;
-            } else {
-                for member in &members {
+            TextOrJson::of(json).write_rows(
+                &mut out,
+                &members,
+                &format!("No members in '{}'.", ws.name),
+                |out, member| {
                     writeln!(
                         out,
                         "{:<24} {:<8} {}",
                         member.username, member.role, member.created_at
-                    )?;
-                }
-            }
+                    )
+                },
+            )?;
             out.flush()?;
         }
     }
@@ -370,6 +378,7 @@ fn member_entry(ws: &WorkspaceRow, user_id: &str) -> AuditEntry {
 }
 
 pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
+    let format = args.format();
     let control = ControlPlane::open(config).await?;
     let user_id = match args.user.as_deref() {
         Some(name) => Some(
@@ -404,52 +413,48 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         .await?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    if args.json {
-        for row in &rows {
-            serde_json::to_writer(&mut out, row)?;
-            writeln!(out)?;
+    match format {
+        AuditFormat::Csv => {
+            // The header is written even for no rows; each row serializes in
+            // the same column order.
+            let mut writer = csv::WriterBuilder::new()
+                .has_headers(false)
+                .from_writer(&mut out);
+            writer.write_record([
+                "id",
+                "timestamp",
+                "user_id",
+                "token_hash",
+                "workspace_id",
+                "action",
+                "resource_type",
+                "resource_id",
+                "outcome",
+                "channel",
+                "client_addr",
+                "request_id",
+            ])?;
+            for r in &rows {
+                writer.serialize(r)?;
+            }
+            writer.flush()?;
         }
-    } else if args.csv {
-        // The header is written even for no rows; each row serializes in
-        // the same column order.
-        let mut writer = csv::WriterBuilder::new()
-            .has_headers(false)
-            .from_writer(&mut out);
-        writer.write_record([
-            "id",
-            "timestamp",
-            "user_id",
-            "token_hash",
-            "workspace_id",
-            "action",
-            "resource_type",
-            "resource_id",
-            "outcome",
-            "channel",
-            "client_addr",
-            "request_id",
-        ])?;
-        for r in &rows {
-            writer.serialize(r)?;
-        }
-        writer.flush()?;
-    } else if rows.is_empty() {
-        writeln!(out, "No audit rows match.")?;
-    } else {
-        for r in &rows {
-            writeln!(
-                out,
-                "{}  {:<7} {:<5} {:<12} {:<10} {:<36} {}",
-                r.timestamp,
-                r.outcome,
-                r.channel,
-                r.action,
-                r.user_id
-                    .as_ref()
-                    .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
-                r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
-                r.resource_id.as_deref().unwrap_or("")
-            )?;
+        AuditFormat::Rows(format) => {
+            format.write_rows(&mut out, &rows, "No audit rows match.", |out, r| {
+                writeln!(
+                    out,
+                    "{}  {:<7} {:<5} {:<12} {:<10} {:<36} {}",
+                    r.timestamp,
+                    r.outcome,
+                    r.channel,
+                    r.action,
+                    r.user_id
+                        .as_ref()
+                        .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
+                    r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
+                    r.resource_id.as_deref().unwrap_or("")
+                )
+            })?;
         }
     }
     out.flush()?;

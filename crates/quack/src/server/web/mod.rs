@@ -56,7 +56,7 @@ use super::api::{
 };
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
-use super::state::App;
+use super::state::{App, ServeMode};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
@@ -175,7 +175,7 @@ impl Page {
             title: title.to_owned(),
             username: identity.username.clone(),
             is_admin: identity.is_admin,
-            local: app.local,
+            local: app.mode == ServeMode::Local,
             workspace: None,
         }
     }
@@ -598,7 +598,7 @@ struct LoginQuery {
 }
 
 async fn login_page(State(app): State<App>, Query(q): Query<LoginQuery>) -> WebResult<Response> {
-    if app.local {
+    if app.mode == ServeMode::Local {
         return Ok(Redirect::to("/workspaces").into_response());
     }
     html(&LoginPage { error: q.error })
@@ -611,7 +611,7 @@ async fn login_submit(
     request_id: RequestId,
     Form(form): Form<LoginRequest>,
 ) -> WebResult<Response> {
-    if app.local {
+    if app.mode == ServeMode::Local {
         return Ok(Redirect::to("/workspaces").into_response());
     }
     // A wrong password is the form again with a message, not a 401; any
@@ -651,8 +651,8 @@ async fn workspaces(
     WebUser(identity): WebUser,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
-    let items: Vec<WsItem> = if app.local || identity.is_admin {
-        let mine = if app.local {
+    let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.is_admin {
+        let mine = if app.mode == ServeMode::Local {
             Vec::new()
         } else {
             app.control.workspaces_for_user(&identity.user_id).await?
@@ -662,7 +662,7 @@ async fn workspaces(
             .await?
             .into_iter()
             .map(|w| WsItem {
-                role: if app.local {
+                role: if app.mode == ServeMode::Local {
                     Standing::Member(Role::Owner)
                 } else {
                     Standing::of(mine.iter().find(|(m, _)| m.id == w.id).map(|(_, r)| *r))
@@ -1758,7 +1758,7 @@ async fn token_create(
     MultiForm(form): MultiForm<TokenForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
-    if app.local {
+    if app.mode == ServeMode::Local {
         return Ok(
             Flash::error(format!("/w/{id}/settings"), "local mode has no users").into_response(),
         );

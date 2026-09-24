@@ -103,11 +103,7 @@ impl PreparedTurn {
             }
         })
         .await?;
-        let policy = if body.allow_write {
-            WritePolicy::Allow
-        } else {
-            WritePolicy::Deny
-        };
+        let policy = WritePolicy::Deny.allowed_if(body.allow_write);
         Ok(Self {
             access,
             db,

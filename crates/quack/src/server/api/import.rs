@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::state::App;
+use crate::server::state::{App, ServeMode};
 use quack_core::import::{self, ImportPolicy, ImportRequest, ImportSummary};
 
 #[derive(Deserialize)]
@@ -66,7 +66,7 @@ pub(crate) async fn run_import(
     let embeddings = Embeddings::from_config(&app.config).await?;
     // `--local` is the owner at a keyboard; anyone else is held to
     // `[import]`: no files from the server's disk, no private hosts.
-    let policy = if app.local {
+    let policy = if app.mode == ServeMode::Local {
         ImportPolicy::owner()
     } else {
         ImportPolicy::server(&app.config)

@@ -6,6 +6,7 @@ mod commands;
 mod ui;
 
 use anyhow::{Context, Result};
+use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::ids::{SessionId, WorkspaceId};
@@ -19,8 +20,8 @@ pub(crate) struct SessionSetup {
     pub(crate) db: SharedDb,
     pub(crate) reader_db: ReaderDb,
     pub(crate) session_id: SessionId,
-    /// `--allow-write`: the agent may modify the workspace without asking.
-    pub(crate) allow_write: bool,
+    /// `Allow` with `--allow-write`, else `Ask`.
+    pub(crate) writes: WritePolicy,
 }
 
 /// Run the terminal session against a resolved workspace until the user quits.

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::state::App;
+use crate::server::state::{App, ServeMode};
 
 /// A workspace as the API shows it: its row, and the caller's role in it.
 #[derive(Debug, Serialize)]
@@ -36,7 +36,7 @@ pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let rows = if app.local {
+    let rows = if app.mode == ServeMode::Local {
         app.control
             .list_workspaces()
             .await?
@@ -105,7 +105,7 @@ impl Identity {
             return Err(ApiError::conflict("workspace exists"));
         }
         let ws = app.control.create_workspace(name).await?;
-        if !app.local {
+        if app.mode == ServeMode::Login {
             app.control
                 .set_member(&ws.id, &self.user_id, Role::Owner)
                 .await?;
