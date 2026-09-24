@@ -24,6 +24,9 @@ const PHRASE_OVER_FETCH: u32 = 4;
 /// Absolute cap on phrase-search candidates, regardless of `top_k`.
 const PHRASE_CANDIDATE_CAP: u32 = 500;
 
+/// Chunks the keyword index rebuild reads at a time.
+const REINDEX_PAGE: u32 = 1000;
+
 /// Every internal table carries this prefix; anything starting with it is hidden.
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
@@ -1498,22 +1501,38 @@ impl WorkspaceDb {
     ///
     /// Returns an error if reading chunks or writing terms fails.
     pub fn reindex_terms(&self) -> Result<()> {
+        self.reindex_terms_by(REINDEX_PAGE)
+    }
+
+    /// [`Self::reindex_terms`], reading `page` chunks at a time.
+    fn reindex_terms_by(&self, page: u32) -> Result<()> {
         self.conn.execute("DELETE FROM _quack_terms", [])?;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, heading, content FROM _quack_chunks")?;
-        let chunks = stmt
-            .query_map([], |row| PendingChunk::try_from(row))?
-            .collect::<duckdb::Result<Vec<_>>>()?;
-        for chunk in &chunks {
-            let terms = TermFrequencies::of(&chunk.content, chunk.heading.as_deref());
-            self.conn.execute(
-                "UPDATE _quack_chunks SET token_count = ? WHERE id = ?",
-                duckdb::params![terms.total(), chunk.id],
-            )?;
-            self.insert_terms(&chunk.id, &terms)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, heading, content FROM _quack_chunks \
+             WHERE ?::VARCHAR IS NULL OR id > ? ORDER BY id LIMIT ?",
+        )?;
+        // A page at a time by id, so a large workspace never holds every
+        // chunk's text at once.
+        let mut after: Option<String> = None;
+        loop {
+            let page = stmt
+                .query_map(duckdb::params![after, after, i64::from(page)], |row| {
+                    PendingChunk::try_from(row)
+                })?
+                .collect::<duckdb::Result<Vec<_>>>()?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            after = Some(last.id.clone());
+            for chunk in &page {
+                let terms = TermFrequencies::of(&chunk.content, chunk.heading.as_deref());
+                self.conn.execute(
+                    "UPDATE _quack_chunks SET token_count = ? WHERE id = ?",
+                    duckdb::params![terms.total(), chunk.id],
+                )?;
+                self.insert_terms(&chunk.id, &terms)?;
+            }
         }
-        Ok(())
     }
 
     /// Store a chunk's vector, made under the current profile.
@@ -4239,6 +4258,30 @@ mod tests {
                 assert_eq!(sampled, expected, "{pool:?} limit {limit}");
             }
         }
+    }
+
+    /// A rebuild read a page at a time indexes every chunk, the last page
+    /// short, exactly as the inserts did.
+    #[test]
+    fn a_paged_reindex_restores_every_chunk() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "d0");
+        for i in 0..7 {
+            insert_text_chunk(&db, &format!("c{i}"), "d0", i, &format!("flood report {i}"));
+        }
+        let snapshot = |db: &WorkspaceDb| {
+            db.execute_query(
+                "SELECT (SELECT count(*) FROM _quack_terms), (SELECT sum(token_count) FROM _quack_chunks)",
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .rows
+        };
+        let indexed = snapshot(&db);
+        db.execute_statement("DELETE FROM _quack_terms")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.reindex_terms_by(3)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(snapshot(&db), indexed);
     }
 
     /// Paging by id visits every chunk of the pool once, in id order.

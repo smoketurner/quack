@@ -53,7 +53,8 @@ pub struct Extracted<'a, P, T> {
 }
 
 /// The extractions of `passages`, up to `concurrency` at a time, in the
-/// passages' order.
+/// passages' order. Every call is built before the first runs, so
+/// callers pass one page of a run, never the whole of it.
 pub fn extractions<'a, P: Passage, T: 'a>(
     extractor: &'a dyn Extract<T>,
     passages: &'a [P],

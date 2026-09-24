@@ -722,6 +722,64 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     assert_eq!(status.built_with_version, None);
 }
 
+/// Revalidation drops edges whose relation no longer fits their ends,
+/// checked once per relation and class combination, and edges left
+/// dangling, with their provenance, and keeps every node.
+#[test]
+fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, false).unwrap();
+    let before = graph_store::status(&db).unwrap();
+
+    // An edge between two nodes that do not exist, with provenance.
+    let dangling = graph_store::upsert_edge(
+        &db,
+        "no-such-source",
+        "no-such-target",
+        "mentions",
+        &Properties::default(),
+        false,
+    )
+    .unwrap();
+    graph_store::add_provenance(&db, &dangling, &graph_store::Source::row("shipments", "x"))
+        .unwrap();
+
+    // `supplied_by` now ends at a country, so every shipment -> vendor
+    // edge of it no longer fits.
+    let mut edited = current.clone();
+    for relation in &mut edited.relations {
+        if relation.id == "supplied_by" {
+            relation.range = String::from("country");
+        }
+    }
+    if let Some(mapping) = edited.mappings.first_mut() {
+        mapping.relations.retain(|r| r.relation != "supplied_by");
+    }
+    store::save(
+        &db,
+        &edited,
+        Revision::reviewed(None, Some("supplied_by moved")),
+    )
+    .unwrap();
+
+    let outcome = graph_store::revalidate(&db).unwrap();
+    assert_eq!(outcome.dropped_nodes, 0);
+    assert_eq!(
+        outcome.dropped_edges, 4,
+        "three supplied_by edges and the dangling one"
+    );
+    let after = graph_store::status(&db).unwrap();
+    assert_eq!(after.nodes, before.nodes);
+    assert_eq!(after.edges, before.edges - 3);
+    assert!(
+        graph_store::provenance_of(&db, &[dangling])
+            .unwrap()
+            .is_empty(),
+        "the dangling edge's provenance went with it"
+    );
+}
+
 #[test]
 fn auto_accepted_ontologies_are_provisional_until_reviewed() {
     let db = WorkspaceDb::open_in_memory(4).unwrap();
@@ -786,6 +844,70 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert_eq!(samples, ["Country 00", "Country 01", "Country 02"]);
     let (none, _) = graph_store::class_census(&db, &[String::from("vendor")], 3).unwrap();
     assert_eq!(none, 0);
+}
+
+/// A run over more chunks than one page reads every chunk once, page by
+/// page: the fixture's two plus 150 more, three pages of 64.
+#[tokio::test]
+async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
+    let db = workspace();
+    db.insert_document(
+        &NewDocument::new("doc-2", "long.md", "text/markdown", 10)
+            .with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    for i in 0..150 {
+        db.insert_chunk(&NewChunk {
+            id: &format!("l{i:03}"),
+            document_id: "doc-2",
+            chunk_index: i,
+            content: "Filler text about nothing in particular.",
+            heading: None,
+            page: None,
+            embedding: None,
+        })
+        .unwrap();
+    }
+    let writer = writer_of(&db);
+    let current = store::current(&db).unwrap().unwrap();
+    let plan = ChunkPlan::new(&db, None).unwrap();
+    assert_eq!(plan, ChunkPlan::All { total: 152 });
+    let seen = std::sync::Mutex::new(Vec::new());
+    let progress = |done: quack_core::progress::ChunkDone| {
+        seen.lock().unwrap().push(done.done);
+    };
+    let control = RunControl {
+        progress: &progress,
+        cancel: None,
+    };
+    let summary = extract::run(&writer, &plan, &Canned, &current, false, 4, control)
+        .await
+        .unwrap();
+    assert_eq!((summary.chunks, summary.failed_chunks), (152, 1));
+    assert_eq!(graph_store::extracted_chunks(&db).unwrap(), 151);
+    assert_eq!(seen.into_inner().unwrap(), (1..=152).collect::<Vec<u32>>());
+
+    // A sample reads only its chunks, across the same pages. Each document
+    // gets a quota of 50, which the two-chunk one cannot fill.
+    graph_store::clear(&db).unwrap();
+    let plan = ChunkPlan::new(&db, Some(100)).unwrap();
+    assert_eq!(plan.len(), 52);
+    let summary = extract::run(
+        &writer,
+        &plan,
+        &Canned,
+        &current,
+        false,
+        4,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.chunks, 52);
+    assert_eq!(
+        graph_store::extracted_chunks(&db).unwrap(),
+        52 - u64::from(summary.failed_chunks)
+    );
 }
 
 /// Provenance joins the two substrates both ways: an entity names the
