@@ -1795,6 +1795,98 @@ impl WorkspaceDb {
         Ok(results)
     }
 
+    /// How many chunks `pool` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn pool_size(&self, pool: SamplePool) -> Result<u64> {
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM _quack_chunks c \
+                 JOIN _quack_documents d ON d.id = c.document_id \
+                 WHERE d.status = ? AND {}",
+                pool.filter()
+            ),
+            duckdb::params![DocumentStatus::Ready],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Up to `limit` chunk ids from `pool`, spread evenly over its
+    /// documents: each gets an equal quota, taken at evenly spaced
+    /// positions through it, so a sample covers every document and not
+    /// just the first one's front matter. Chosen in SQL, so only the ids
+    /// of the chosen chunks leave the database.
+    ///
+    /// A document of `len` chunks with a quota of `take` keeps the chunks
+    /// at `floor(k * len / take)` for `k` below `take`; the chunk at
+    /// `pos` is one of them when `k = ceil(pos * take / len)` is below
+    /// `take` and maps back to `pos`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn sample_chunk_ids(&self, pool: SamplePool, limit: u32) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "WITH pool AS ( \
+                 SELECT c.id, c.document_id, c.chunk_index, d.ingested_at, d.id AS doc, \
+                        row_number() OVER (PARTITION BY c.document_id ORDER BY c.chunk_index) - 1 AS pos, \
+                        count(*) OVER (PARTITION BY c.document_id) AS len \
+                 FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+                 WHERE d.status = ? AND {filter}), \
+             quota AS ( \
+                 SELECT greatest(1, (?::BIGINT + count(DISTINCT document_id) - 1) \
+                                    // greatest(count(DISTINCT document_id), 1)) AS q \
+                 FROM pool), \
+             placed AS ( \
+                 SELECT p.*, least(quota.q, p.len) AS take FROM pool p, quota) \
+             SELECT id FROM placed \
+             WHERE (pos * take + len - 1) // len < take \
+               AND (((pos * take + len - 1) // len) * len) // take = pos \
+             ORDER BY {order}, chunk_index \
+             LIMIT ?",
+            filter = pool.filter(),
+            order = pool.document_order(),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let ids = stmt.query_map(
+            duckdb::params![DocumentStatus::Ready, i64::from(limit), i64::from(limit)],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(ids.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Up to `size` chunks of `pool` after the chunk `after`, by id, with
+    /// the citation metadata a search hit carries (score 1): how a run
+    /// over every chunk reads them a page at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn chunk_page(
+        &self,
+        pool: SamplePool,
+        after: Option<&str>,
+        size: u32,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE d.status = ? AND {} AND (?::VARCHAR IS NULL OR c.id > ?) \
+             ORDER BY c.id LIMIT ?",
+            pool.filter()
+        ))?;
+        let rows = stmt.query_map(
+            duckdb::params![DocumentStatus::Ready, after, after, i64::from(size)],
+            |row| ChunkSearchResult::try_from(row),
+        )?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
+    }
+
     /// Chunks by id, in the order given, with the citation metadata a
     /// search hit carries (score 1).
     ///
@@ -2528,6 +2620,38 @@ impl TermFrequencies {
         self.0
             .iter()
             .fold(0i64, |acc, (_, tf)| acc.saturating_add(i64::from(*tf)))
+    }
+}
+
+/// The chunks of ready documents a long run draws from, and the order
+/// its documents come in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplePool {
+    /// Chunks the graph has not extracted yet, documents in ingest order.
+    NotGraphExtracted,
+    /// Chunks with more than a line of text, documents by id: what the
+    /// ontology's document evidence reads.
+    Substantive,
+}
+
+impl SamplePool {
+    /// The `AND ...` condition on `_quack_chunks c`.
+    const fn filter(self) -> &'static str {
+        match self {
+            Self::NotGraphExtracted => {
+                "NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id)"
+            }
+            Self::Substantive => "length(c.content) > 40",
+        }
+    }
+
+    /// How the documents are ordered, in the sampler's own columns: when
+    /// the document was ingested, and its id.
+    const fn document_order(self) -> &'static str {
+        match self {
+            Self::NotGraphExtracted => "ingested_at, doc",
+            Self::Substantive => "doc",
+        }
     }
 }
 
@@ -4031,6 +4155,111 @@ mod tests {
         let output = String::from_utf8_lossy(&buf);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    /// Up to `limit` items spread evenly over the groups: each group (one
+    /// document's chunks, in order) gets an equal quota, taken at evenly
+    /// spaced positions, so a sample covers every document and not just the
+    /// front matter of the first.
+    fn evenly_spaced<T>(groups: impl IntoIterator<Item = Vec<T>>, limit: usize) -> Vec<T> {
+        let groups: Vec<Vec<T>> = groups.into_iter().filter(|g| !g.is_empty()).collect();
+        if limit == 0 || groups.is_empty() {
+            return Vec::new();
+        }
+        let quota = limit.div_ceil(groups.len()).max(1);
+        let mut chosen = Vec::with_capacity(limit);
+        for group in groups {
+            let len = group.len();
+            let take = quota.min(len);
+            let mut positions: Vec<usize> = (0..take)
+                .map(|k| {
+                    k.saturating_mul(len)
+                        .checked_div(take)
+                        .unwrap_or(0)
+                        .min(len.saturating_sub(1))
+                })
+                .collect();
+            positions.dedup();
+            let mut positions = positions.into_iter().peekable();
+            for (index, item) in group.into_iter().enumerate() {
+                if positions.peek() == Some(&index) {
+                    positions.next();
+                    chosen.push(item);
+                }
+            }
+        }
+        chosen.truncate(limit);
+        chosen
+    }
+
+    #[test]
+    fn a_sample_spreads_across_every_group() {
+        let groups = vec![(0..10).collect::<Vec<u32>>(), vec![100, 101], vec![]];
+        assert_eq!(evenly_spaced(groups.clone(), 4), vec![0, 5, 100, 101]);
+        assert_eq!(evenly_spaced(groups.clone(), 3), vec![0, 5, 100]);
+        assert!(evenly_spaced(groups, 0).is_empty());
+        assert_eq!(evenly_spaced(vec![vec![1, 2, 3]], 10), vec![1, 2, 3]);
+    }
+
+    /// The SQL sampler picks exactly what `evenly_spaced` picks from the
+    /// same documents in the same order, for every limit, from both pools.
+    #[test]
+    fn the_sql_sample_matches_evenly_spaced() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        // Ids sort in insertion order, so ingest order and id order agree.
+        let sizes = [10_u32, 2, 7, 1, 13, 3];
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for (d, size) in sizes.iter().enumerate() {
+            let doc = format!("d{d}");
+            insert_ready_document(&db, &doc);
+            let mut group = Vec::new();
+            for i in 0..*size {
+                let id = format!("{doc}-c{i:02}");
+                insert_text_chunk(
+                    &db,
+                    &id,
+                    &doc,
+                    i,
+                    "a passage long enough to count as more than a line of text",
+                );
+                group.push(id);
+            }
+            groups.push(group);
+        }
+        for pool in [SamplePool::NotGraphExtracted, SamplePool::Substantive] {
+            assert_eq!(
+                db.pool_size(pool).unwrap_or_else(|e| fail(&e.to_string())),
+                36
+            );
+            for limit in 0..40_u32 {
+                let expected = evenly_spaced(groups.clone(), limit as usize);
+                let sampled = db
+                    .sample_chunk_ids(pool, limit)
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                assert_eq!(sampled, expected, "{pool:?} limit {limit}");
+            }
+        }
+    }
+
+    /// Paging by id visits every chunk of the pool once, in id order.
+    #[test]
+    fn chunk_pages_visit_the_pool_once() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "d0");
+        for i in 0..7 {
+            insert_text_chunk(&db, &format!("c{i}"), "d0", i, "some text");
+        }
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = db
+                .chunk_page(SamplePool::NotGraphExtracted, after.as_deref(), 3)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let Some(last) = page.last() else { break };
+            after = Some(last.id.clone());
+            seen.extend(page.into_iter().map(|c| c.id));
+        }
+        assert_eq!(seen, ["c0", "c1", "c2", "c3", "c4", "c5", "c6"]);
     }
 
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture};
-use quack_core::graph::extract::Extraction;
+use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::traverse::Hops;
@@ -20,7 +20,9 @@ use quack_core::graph::{
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::progress::RunControl;
-use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
+use quack_core::storage::workspace::{
+    DocumentStatus, NewChunk, NewDocument, SamplePool, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
@@ -300,13 +302,23 @@ fn extraction_samples_evenly_across_documents() {
         })
         .unwrap();
     }
-    let sampled = extract::chunks(&db, Some(2)).unwrap();
+    let sampled = db
+        .sample_chunk_ids(SamplePool::NotGraphExtracted, 2)
+        .unwrap();
+    assert_eq!(
+        ChunkPlan::new(&db, Some(2)).unwrap(),
+        ChunkPlan::Sample(sampled.clone())
+    );
+    let chunks = db.chunks_by_ids(&sampled).unwrap();
     let docs: std::collections::BTreeSet<&str> =
-        sampled.iter().map(|c| c.document_id.as_str()).collect();
-    assert_eq!(sampled.len(), 2, "{sampled:?}");
+        chunks.iter().map(|c| c.document_id.as_str()).collect();
+    assert_eq!(chunks.len(), 2, "{sampled:?}");
     assert_eq!(docs.len(), 2, "one chunk from each document: {sampled:?}");
-    assert_eq!(extract::chunks(&db, Some(0)).unwrap().len(), 0);
-    assert_eq!(extract::chunks(&db, None).unwrap().len(), 6);
+    assert!(ChunkPlan::new(&db, Some(0)).unwrap().is_empty());
+    assert_eq!(
+        ChunkPlan::new(&db, None).unwrap(),
+        ChunkPlan::All { total: 6 }
+    );
 }
 
 /// Resolution respects provenance (issue #41): two nodes from keyed rows
@@ -504,11 +516,11 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 
     // Constrained extraction: the vessel and docked_at are drift, the
     // failed chunk is skipped, Kenya merges with the table's Kenya.
-    let chunks = extract::chunks(&db, None).unwrap();
-    assert_eq!(chunks.len(), 2);
+    let plan = ChunkPlan::new(&db, None).unwrap();
+    assert_eq!(plan.len(), 2);
     let summary = extract::run(
         &writer,
-        chunks,
+        &plan,
         &Canned,
         &current,
         false,
@@ -520,9 +532,11 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     // Both chunks are on record (the failed one is not), so the next run
     // sends only the failed one again.
     assert_eq!(graph_store::extracted_chunks(&db).unwrap(), 1);
-    let remaining = extract::chunks(&db, None).unwrap();
+    let remaining = db
+        .chunk_page(SamplePool::NotGraphExtracted, None, 10)
+        .unwrap();
     assert_eq!(remaining.len(), 1, "{remaining:?}");
-    assert_eq!(remaining.first().map(|c| c.chunk_id.as_str()), Some("c2"));
+    assert_eq!(remaining.first().map(|c| c.id.as_str()), Some("c2"));
     assert_eq!(
         (
             summary.chunks,
@@ -782,10 +796,10 @@ async fn provenance_maps_between_entities_and_chunks() {
     let writer = writer_of(&db);
     let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, false).unwrap();
-    let chunks = extract::chunks(&db, None).unwrap();
+    let plan = ChunkPlan::new(&db, None).unwrap();
     extract::run(
         &writer,
-        chunks,
+        &plan,
         &Canned,
         &current,
         false,

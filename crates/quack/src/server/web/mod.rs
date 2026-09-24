@@ -32,7 +32,7 @@ use quack_core::storage::control::{
     ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
+use quack_core::storage::workspace::{DocumentInfo, DocumentSource, SamplePool};
 use rust_embed::Embed;
 use serde::Deserialize;
 
@@ -61,8 +61,7 @@ use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphResult, GraphStatus, Origin, extract, resolve,
-    store as graph_store,
+    ExtractSource, GraphOptions, GraphResult, GraphStatus, Origin, resolve, store as graph_store,
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
@@ -2117,7 +2116,8 @@ impl GraphPageData {
     fn read(db: &WorkspaceDb, ask: &GraphAsk, options: &GraphOptions) -> CoreResult<Self> {
         let status = graph_store::status(db)?;
         let ontology = ontology_store::current(db)?;
-        let chunk_count = usize::try_from(extract::pending_chunk_count(db)?).unwrap_or(0);
+        let chunk_count =
+            usize::try_from(db.pool_size(SamplePool::NotGraphExtracted)?).unwrap_or(0);
         let merges = resolve::pending(db)?;
         let result = ask.run(db, options);
         Ok(Self {

@@ -11,13 +11,11 @@ use serde::{Deserialize, Serialize};
 use super::induction::{Candidate, Proposal};
 use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation, SnakeId};
 use crate::error::{Error, Result};
-use crate::extraction::{
-    Extract, Extracted, Passage, RunProgress, Tally, evenly_spaced, extractions,
-};
+use crate::extraction::{Extract, Extracted, Passage, RunProgress, Tally, extractions};
 use crate::graph::NormalizedLabel;
 use crate::llm::{Embeddings, name_similarity};
 use crate::progress::RunControl;
-use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
+use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
 /// What open extraction returns for one chunk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -148,44 +146,17 @@ pub fn estimate(db: &WorkspaceDb, options: &DocumentEvidenceOptions) -> Result<C
 ///
 /// Returns an error if a query fails.
 pub fn sample_chunks(db: &WorkspaceDb, sample: u32) -> Result<Vec<SampledChunk>> {
-    let mut stmt = db.connection().prepare(
-        "SELECT c.id, c.document_id, d.filename FROM _quack_chunks c \
-         JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = ? AND length(c.content) > 40 \
-         ORDER BY c.document_id, c.chunk_index",
-    )?;
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([DocumentStatus::Ready], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?
-        .flatten()
-        .collect();
-    let mut by_doc: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
-    for (id, document_id, filename) in rows {
-        by_doc
-            .entry(document_id.clone())
-            .or_default()
-            .push((id, document_id, filename));
-    }
-    let chosen = evenly_spaced(
-        by_doc.into_values(),
-        usize::try_from(sample).unwrap_or(usize::MAX),
-    );
-    let mut out = Vec::with_capacity(chosen.len());
-    for (id, document_id, filename) in chosen {
-        let content: String = db.connection().query_row(
-            "SELECT content FROM _quack_chunks WHERE id = ?",
-            duckdb::params![id],
-            |r| r.get(0),
-        )?;
-        out.push(SampledChunk {
-            id,
-            document_id,
-            filename,
-            content,
-        });
-    }
-    Ok(out)
+    let ids = db.sample_chunk_ids(SamplePool::Substantive, sample)?;
+    Ok(db
+        .chunks_by_ids(&ids)?
+        .into_iter()
+        .map(|chunk| SampledChunk {
+            id: chunk.id,
+            document_id: chunk.document_id,
+            filename: chunk.filename,
+            content: chunk.content,
+        })
+        .collect())
 }
 
 /// The outcome of a document-evidence run.

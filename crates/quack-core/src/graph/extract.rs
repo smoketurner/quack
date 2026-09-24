@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use super::store::{self, NewNode, Source};
 use super::{Drift, NormalizedLabel, Properties};
 use crate::error::{Error, Result};
-use crate::extraction::{Extract, Extracted, Passage, RunProgress, evenly_spaced, extractions};
-use crate::ontology::{self, Ontology};
+use crate::extraction::{Extract, Extracted, Passage, RunProgress, extractions};
+use crate::ontology::{self, Ontology, OntologyVersion};
 use crate::progress::RunControl;
-use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
+use crate::storage::workspace::{ChunkSearchResult, SamplePool, WorkspaceDb};
 use crate::storage::writer::Writer;
 
 /// What the model returns for one chunk.
@@ -150,71 +150,112 @@ impl Passage for ChunkText {
     }
 }
 
-/// How many chunks [`chunks`] would return, without loading their content:
-/// the graph page shows this as a count, and loading every chunk's full
-/// text just to call `.len()` on the result is wasted work (and, once that
-/// query runs through a reader connection shared by every other read, no
-/// longer confined to the one requester who pays for it).
-///
-/// # Errors
-///
-/// Returns an error if the query fails.
-pub fn pending_chunk_count(db: &WorkspaceDb) -> Result<i64> {
-    let n = db.connection().query_row(
-        "SELECT count(*) FROM _quack_chunks c \
-         JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = ? \
-           AND NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id)",
-        [DocumentStatus::Ready],
-        |row| row.get(0),
-    )?;
-    Ok(n)
+/// Chunks an extraction run reads from the workspace at a time: a run
+/// holds one page's text, never every chunk's.
+const PAGE: u32 = 64;
+
+/// The chunks an extraction run covers, chosen before it starts: every
+/// chunk of a ready document the graph has not extracted, or an even
+/// sample of them (issue #60: the first N chunks by ingest order were one
+/// document's front matter). A run records each chunk it processed, so
+/// the next run sends only what is new; `graph extract --reset` clears
+/// the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkPlan {
+    /// Every unextracted chunk, read a page at a time by id.
+    All { total: usize },
+    /// The sampled chunks, by id.
+    Sample(Vec<String>),
 }
 
-/// Chunks of ready documents not yet extracted under any ontology
-/// version, sampled evenly across documents when `limit` is given
-/// (issue #60: the first N chunks by ingest order were one document's
-/// front matter). A run records each chunk it processed, so the next run
-/// sends only what is new; `graph extract --reset` clears the record.
-///
-/// # Errors
-///
-/// Returns an error if the query fails.
-pub fn chunks(db: &WorkspaceDb, limit: Option<u32>) -> Result<Vec<ChunkText>> {
-    let mut stmt = db.connection().prepare(
-        "SELECT c.id, c.document_id, c.content, c.heading FROM _quack_chunks c \
-         JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = ? \
-           AND NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id) \
-         ORDER BY d.ingested_at, d.id, c.chunk_index",
-    )?;
-    let mut rows = stmt.query([DocumentStatus::Ready])?;
-    let mut by_document: BTreeMap<String, Vec<ChunkText>> = BTreeMap::new();
-    let mut order: Vec<String> = Vec::new();
-    while let Some(row) = rows.next()? {
-        let heading: Option<String> = row.get(3)?;
-        let content: String = row.get(2)?;
-        let document_id: String = row.get(1)?;
-        if !by_document.contains_key(&document_id) {
-            order.push(document_id.clone());
-        }
-        by_document
-            .entry(document_id.clone())
-            .or_default()
-            .push(ChunkText {
-                chunk_id: row.get(0)?,
-                document_id,
-                text: match heading {
-                    Some(h) => format!("{h}\n\n{content}"),
-                    None => content,
-                },
-            });
+impl ChunkPlan {
+    /// Every unextracted chunk, or `sample` of them spread evenly over
+    /// their documents. Only the sample's ids are read here, never text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query fails.
+    pub fn new(db: &WorkspaceDb, sample: Option<u32>) -> Result<Self> {
+        let pool = SamplePool::NotGraphExtracted;
+        Ok(match sample {
+            None => Self::All {
+                total: usize::try_from(db.pool_size(pool)?).unwrap_or(usize::MAX),
+            },
+            Some(limit) => Self::Sample(db.sample_chunk_ids(pool, limit)?),
+        })
     }
-    let documents = order.into_iter().filter_map(|id| by_document.remove(&id));
-    Ok(match limit {
-        None => documents.flatten().collect(),
-        Some(limit) => evenly_spaced(documents, usize::try_from(limit).unwrap_or(usize::MAX)),
-    })
+
+    /// How many chunks the run will read.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::All { total } => *total,
+            Self::Sample(ids) => ids.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The next page of the plan after `cursor`, which it advances; `None`
+    /// once the plan is read.
+    async fn page(&self, db: &Writer, cursor: &mut PlanCursor) -> Result<Option<Vec<ChunkText>>> {
+        let chunks = match self {
+            Self::All { .. } => {
+                let after = cursor.after.take();
+                db.run(move |db| {
+                    db.chunk_page(SamplePool::NotGraphExtracted, after.as_deref(), PAGE)
+                })
+                .await?
+            }
+            Self::Sample(ids) => {
+                let page: Vec<String> = ids
+                    .iter()
+                    .skip(cursor.consumed)
+                    .take(usize::try_from(PAGE).unwrap_or(usize::MAX))
+                    .cloned()
+                    .collect();
+                if page.is_empty() {
+                    return Ok(None);
+                }
+                cursor.consumed = cursor.consumed.saturating_add(page.len());
+                // A chunk whose document was deleted since is left out.
+                db.run(move |db| db.chunks_by_ids(&page)).await?
+            }
+        };
+        if let Self::All { .. } = self {
+            let Some(last) = chunks.last() else {
+                return Ok(None);
+            };
+            cursor.after = Some(last.id.clone());
+        }
+        Ok(Some(chunks.into_iter().map(ChunkText::from).collect()))
+    }
+}
+
+/// How far a run has read its [`ChunkPlan`].
+#[derive(Debug, Default)]
+struct PlanCursor {
+    /// Sampled ids taken so far.
+    consumed: usize,
+    /// The last chunk id read, for the next page of every chunk.
+    after: Option<String>,
+}
+
+/// A chunk as the extractor reads it: its heading above its text.
+impl From<ChunkSearchResult> for ChunkText {
+    fn from(chunk: ChunkSearchResult) -> Self {
+        Self {
+            text: match chunk.heading {
+                Some(h) => format!("{h}\n\n{}", chunk.content),
+                None => chunk.content,
+            },
+            chunk_id: chunk.id,
+            document_id: chunk.document_id,
+        }
+    }
 }
 
 /// What an extraction run did.
@@ -231,41 +272,79 @@ pub struct RunSummary {
 /// Confidence recorded for model-extracted provenance.
 const MODEL_CONFIDENCE: f64 = 0.8;
 
-/// Run constrained extraction over `chunks`, up to `concurrency` at a
-/// time, and store what fits; each finished chunk goes to `progress`. A
-/// failed chunk is logged and skipped; only every chunk failing is an
-/// error.
+/// Run constrained extraction over the chunks `plan` names, a page at a
+/// time with up to `concurrency` model calls in flight, and store what
+/// fits; each finished chunk goes to `control`, which can also stop the
+/// run. A failed chunk is logged and skipped; only every chunk failing is
+/// an error.
 ///
 /// # Errors
 ///
-/// Returns an error when every chunk fails or a write fails.
+/// Returns an error when every chunk fails, a write fails, or the run is
+/// cancelled.
 pub async fn run(
     db: &Writer,
-    chunks: Vec<ChunkText>,
+    plan: &ChunkPlan,
     extractor: &dyn Extract<Extraction>,
     ontology: &Ontology,
     provisional: bool,
     concurrency: u32,
     control: RunControl<'_>,
 ) -> Result<RunSummary> {
-    let version = ontology.saved_version()?;
-    let mut summary = RunSummary::default();
-    let mut run = RunProgress::new(chunks.len(), control.progress);
-    let mut calls = extractions(extractor, &chunks, concurrency);
-    while let Some(Extracted {
-        passage: chunk,
-        outcome,
-        took,
-    }) = control
-        .or_cancelled(async { Ok(calls.next().await) })
-        .await?
-    {
+    let mut pass = Pass {
+        db,
+        ontology,
+        provisional,
+        version: ontology.saved_version()?,
+        summary: RunSummary::default(),
+    };
+    let mut run = RunProgress::new(plan.len(), control.progress);
+    let mut cursor = PlanCursor::default();
+    while let Some(page) = plan.page(db, &mut cursor).await? {
+        let mut calls = extractions(extractor, &page, concurrency);
+        while let Some(Extracted {
+            passage: chunk,
+            outcome,
+            took,
+        }) = control
+            .or_cancelled(async { Ok(calls.next().await) })
+            .await?
+        {
+            let kept = pass.keep(chunk, outcome).await?;
+            run.finished(took, kept);
+        }
+    }
+    let mut summary = pass.summary;
+    summary.chunks = run.total();
+    summary.failed_chunks = run.failed();
+    if run.all_failed() {
+        return Err(Error::Llm(String::from(
+            "every chunk failed extraction; check the model and provider",
+        )));
+    }
+    let drift = summary.drift.clone();
+    db.run(move |db| store::record_drift(db, &drift)).await?;
+    Ok(summary)
+}
+
+/// One extraction run's writes and tallies.
+struct Pass<'a> {
+    db: &'a Writer,
+    ontology: &'a Ontology,
+    provisional: bool,
+    version: OntologyVersion,
+    summary: RunSummary,
+}
+
+impl Pass<'_> {
+    /// Validate and store one chunk's extraction, and record the chunk as
+    /// extracted; whether the model answered.
+    async fn keep(&mut self, chunk: &ChunkText, outcome: Result<Extraction>) -> Result<bool> {
         let extraction = match outcome {
             Ok(extraction) => extraction,
             Err(e) => {
                 tracing::warn!(chunk = %chunk.chunk_id, error = %e, "extraction failed; skipping chunk");
-                run.finished(took, false);
-                continue;
+                return Ok(false);
             }
         };
         tracing::debug!(
@@ -274,13 +353,16 @@ pub async fn run(
             edges = extraction.edges.len(),
             "graph extraction parsed"
         );
-        let validated = extraction.validate(ontology);
-        summary.invalid_edges = summary
+        let validated = extraction.validate(self.ontology);
+        self.summary.invalid_edges = self
+            .summary
             .invalid_edges
             .saturating_add(validated.invalid_edges);
-        summary.drift.absorb(&validated.drift);
+        self.summary.drift.absorb(&validated.drift);
         let (document_id, chunk_id) = (chunk.document_id.clone(), chunk.chunk_id.clone());
-        let (nodes, edges) = db
+        let (provisional, version) = (self.provisional, self.version);
+        let (nodes, edges) = self
+            .db
             .run(move |db| {
                 db.under_timeout(|db| {
                     let counts = store_validated(
@@ -297,21 +379,10 @@ pub async fn run(
         if nodes == 0 && edges == 0 {
             tracing::debug!(chunk = %chunk.chunk_id, "graph extraction kept nothing from this chunk");
         }
-        summary.nodes = summary.nodes.saturating_add(nodes);
-        summary.edges = summary.edges.saturating_add(edges);
-        run.finished(took, true);
+        self.summary.nodes = self.summary.nodes.saturating_add(nodes);
+        self.summary.edges = self.summary.edges.saturating_add(edges);
+        Ok(true)
     }
-    drop(calls);
-    summary.chunks = run.total();
-    summary.failed_chunks = run.failed();
-    if run.all_failed() {
-        return Err(Error::Llm(String::from(
-            "every chunk failed extraction; check the model and provider",
-        )));
-    }
-    let drift = summary.drift.clone();
-    db.run(move |db| store::record_drift(db, &drift)).await?;
-    Ok(summary)
 }
 
 /// Store one validated extraction with `source` as provenance; returns the

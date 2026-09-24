@@ -7,6 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
@@ -313,8 +314,8 @@ async fn run_extract(
     }
     if args.sources.includes_documents() {
         let sample = args.sample;
-        let chunks = db.run(move |db| extract::chunks(db, sample)).await?;
-        if chunks.is_empty() {
+        let plan = db.run(move |db| ChunkPlan::new(db, sample)).await?;
+        if plan.is_empty() {
             writeln!(
                 out,
                 "No chunks left to extract: every chunk of every ready document is on record (`--reset` starts over)."
@@ -324,14 +325,14 @@ async fn run_extract(
             writeln!(
                 out,
                 "Document extraction: {} chunks, one model call each to {chat}.",
-                chunks.len()
+                plan.len()
             )?;
             out.flush()?;
             if Confirm::from_yes(args.yes).ask(out, "Proceed?", Some("--yes"))? {
                 let extractor = llm::graph_extractor(config, &ontology).await?;
                 let summary = extract::run(
                     db,
-                    chunks,
+                    &plan,
                     extractor.as_ref(),
                     &ontology,
                     provisional,
