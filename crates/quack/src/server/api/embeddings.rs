@@ -8,16 +8,15 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::embedding::refresh::{self, Plan};
-use quack_core::jobs::{JobId, JobKind, JobSpec, Lane, LaneKey};
+use quack_core::jobs::JobId;
 use quack_core::llm::{self, Embeddings};
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, Outcome};
 use quack_core::storage::workspace::WorkspaceDb;
 
-use crate::server::api::graph::audit_cancelled;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::ApiResult;
-use crate::server::queue::when_cancelled_unstarted;
+use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::App;
 
 /// `GET .../embeddings`: how many vectors are current, stale (made under
@@ -78,41 +77,36 @@ pub(crate) async fn start(
             serde_json::json!({ "plan": plan, "status": "current" }),
         ));
     }
-    let run = uuid::Uuid::now_v7().to_string();
-    access
-        .audit(
-            app,
-            AuditAction::EmbeddingsRefresh,
-            Some(ResourceKind::EmbeddingsRun.id(&run)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "plan": plan, "profile": embedder.profile() })),
-        )
-        .await?;
-    let job = spawn(Arc::clone(app), access.clone(), run.clone(), embedder);
+    let run = BackgroundRun::start(
+        app,
+        access,
+        RunKind::Embeddings,
+        serde_json::json!({ "plan": plan, "profile": embedder.profile() }),
+    )
+    .await?;
+    let run_id = run.id().to_owned();
+    let job = refresh_in_background(run, Arc::clone(app), access.workspace.id.clone(), embedder);
     Ok((
         StatusCode::ACCEPTED,
-        serde_json::json!({ "plan": plan, "run": run, "job": job, "status": "running" }),
+        serde_json::json!({ "plan": plan, "run": run_id, "job": job, "status": "running" }),
     ))
 }
 
-/// Run the refresh as a job and audit its end under `run_id`.
-fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobId {
-    let workspace_id = access.workspace.id.clone();
-    let spec = JobSpec::new(JobKind::Embeddings, "embeddings refresh")
-        .workspace(workspace_id.clone())
-        .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(&LaneKey::Embeddings(workspace_id.clone())));
-    let jobs = app.jobs.clone();
-    let (cancel_app, cancel_access, cancel_run) =
-        (Arc::clone(&app), access.clone(), run_id.clone());
-    let id = jobs.submit(spec, move |ctx| async move {
+/// Run the refresh as `run`'s job.
+fn refresh_in_background(
+    run: BackgroundRun,
+    app: App,
+    workspace_id: String,
+    embedder: Embeddings,
+) -> JobId {
+    run.submit(move |ctx| async move {
         let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
         let cancel = ctx.cancel_token();
         let control = RunControl {
             progress: &progress,
             cancel: Some(&cancel),
         };
-        let outcome = match app.workspace_db(&workspace_id).await {
+        match app.workspace_db(&workspace_id).await {
             Ok(db) => refresh::run(
                 &db,
                 &embedder,
@@ -122,45 +116,6 @@ fn spawn(app: App, access: Access, run_id: String, embedder: Embeddings) -> JobI
             .await
             .map_err(|e| e.to_string()),
             Err(e) => Err(e.message),
-        };
-        let (audit_outcome, detail) = match &outcome {
-            Ok(summary) => (
-                Outcome::Allowed,
-                serde_json::json!({ "finished": true, "summary": summary }),
-            ),
-            Err(e) => (
-                Outcome::Error,
-                serde_json::json!({ "finished": true, "error": e }),
-            ),
-        };
-        if let Err(e) = access
-            .audit(
-                &app,
-                AuditAction::EmbeddingsRefresh,
-                Some(ResourceKind::EmbeddingsRun.id(&run_id)),
-                audit_outcome,
-                Some(detail),
-            )
-            .await
-        {
-            tracing::error!(error = %e.message, "audit write failed after refreshing embeddings");
         }
-        outcome.map(|summary| {
-            format!(
-                "{} chunks and {} graph node labels refreshed",
-                summary.chunks, summary.nodes
-            )
-        })
-    });
-    when_cancelled_unstarted(&jobs, id, move || async move {
-        audit_cancelled(
-            &cancel_app,
-            &cancel_access,
-            AuditAction::EmbeddingsRefresh,
-            ResourceKind::EmbeddingsRun,
-            &cancel_run,
-        )
-        .await;
-    });
-    id
+    })
 }

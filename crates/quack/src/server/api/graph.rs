@@ -21,10 +21,10 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::queue::when_cancelled_unstarted;
+use crate::server::run::{BackgroundRun, GraphReport, RunKind};
 use crate::server::state::{App, ExtractionSlot, with_db};
 use quack_core::analysis::tools::SharedDb;
-use quack_core::jobs::{JobId, JobKind, JobSpec, Lane, LaneKey};
+use quack_core::jobs::JobId;
 use quack_core::ontology::Ontology;
 use quack_core::progress::ChunkDone;
 
@@ -277,33 +277,27 @@ pub(crate) async fn start_extraction(
     // Fail now, not in the background, when no model can be built.
     let extractor = llm::graph_extractor(&app.config, &ontology).await?;
     let cost = serde_json::json!({ "chunks": chunks.len(), "model": app.config.chat_model_ref()?.to_string() });
-    let run = uuid::Uuid::now_v7().to_string();
-    access
-        .audit(
-            app,
-            AuditAction::GraphExtract,
-            Some(ResourceKind::GraphRun.id(&run)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "tables": table_summaries, "cost": cost })),
-        )
-        .await?;
-    let job = spawn_document_extraction(
-        Arc::clone(app),
-        access.clone(),
-        run.clone(),
-        DocumentJob {
-            db,
-            chunks,
-            extractor,
-            ontology,
-            provisional,
-            embeddings,
-            slot,
-            options,
-        },
-    );
+    let run = BackgroundRun::start(
+        app,
+        access,
+        RunKind::Graph,
+        serde_json::json!({ "tables": table_summaries, "cost": cost }),
+    )
+    .await?;
+    let run_id = run.id().to_owned();
+    let job = DocumentJob {
+        db,
+        chunks,
+        extractor,
+        ontology,
+        provisional,
+        embeddings,
+        slot,
+        options,
+    }
+    .run_in_background(run, Arc::clone(app));
     Ok(
-        serde_json::json!({ "tables": table_summaries, "cost": cost, "run": run, "job": job, "status": "running" }),
+        serde_json::json!({ "tables": table_summaries, "cost": cost, "run": run_id, "job": job, "status": "running" }),
     )
 }
 
@@ -351,130 +345,65 @@ struct DocumentJob {
     options: GraphOptions,
 }
 
-/// Run the model over the chunks, resolve, record the version, and audit
-/// the run's end under `run_id`, as a job in the workspace's graph lane
-/// with a chunk count for its progress.
-fn spawn_document_extraction(app: App, access: Access, run_id: String, job: DocumentJob) -> JobId {
-    let spec = JobSpec::new(JobKind::Graph, "graph extraction")
-        .workspace(access.workspace.id.clone())
-        .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(&LaneKey::Graph(access.workspace.id.clone())));
-    let jobs = app.jobs.clone();
-    let (cancel_app, cancel_access, cancel_run) =
-        (Arc::clone(&app), access.clone(), run_id.clone());
-    let id = jobs.submit(spec, move |ctx| async move {
-        let DocumentJob {
-            db,
-            chunks,
-            extractor,
-            ontology,
-            provisional,
-            embeddings,
-            options,
-            slot,
-        } = job;
-        let progress = |done: ChunkDone| {
-            ctx.progress(done.done, done.total);
-            tracing::info!(
-                run = %run_id,
-                done = done.done,
-                total = done.total,
-                failed = done.failed,
-                "graph extraction progress"
-            );
-        };
-        let outcome = extract::run(
-            &db,
-            chunks,
-            extractor.as_ref(),
-            &ontology,
-            provisional,
-            app.config.analysis.extraction_concurrency,
-            &progress,
-        )
-        .await;
-        let version = ontology.version;
-        let result = match outcome {
-            Ok(summary) => {
-                let resolution = resolve::resolve(&db, embeddings.as_ref(), &options).await;
-                let finish = with_db(Arc::clone(&db), move |db| {
-                    graph_store::set_built_with(db, version)
-                })
-                .await;
-                match (resolution, finish) {
-                    (Ok(resolution), Ok(())) => Ok((summary, resolution)),
-                    (Err(e), _) => Err(e.to_string()),
-                    (_, Err(e)) => Err(e.message),
-                }
-            }
-            Err(e) => Err(e.to_string()),
-        };
-        let (outcome, detail) = match &result {
-            Ok((summary, resolution)) => (
-                Outcome::Allowed,
-                serde_json::json!({ "finished": true, "summary": summary, "resolution": resolution }),
-            ),
-            Err(e) => (
-                Outcome::Error,
-                serde_json::json!({ "finished": true, "error": e }),
-            ),
-        };
-        if let Err(e) = access
-            .audit(
-                &app,
-                AuditAction::GraphExtract,
-                Some(ResourceKind::GraphRun.id(&run_id)),
-                outcome,
-                Some(detail),
+impl DocumentJob {
+    /// Run the model over the chunks, resolve, and record the version, as
+    /// `run`'s job with a chunk count for its progress. The extraction slot
+    /// is held until the pass ends.
+    fn run_in_background(self, run: BackgroundRun, app: App) -> JobId {
+        let run_id = run.id().to_owned();
+        run.submit(move |ctx| async move {
+            let Self {
+                db,
+                chunks,
+                extractor,
+                ontology,
+                provisional,
+                embeddings,
+                options,
+                slot,
+            } = self;
+            let progress = |done: ChunkDone| {
+                ctx.progress(done.done, done.total);
+                tracing::info!(
+                    run = %run_id,
+                    done = done.done,
+                    total = done.total,
+                    failed = done.failed,
+                    "graph extraction progress"
+                );
+            };
+            let outcome = extract::run(
+                &db,
+                chunks,
+                extractor.as_ref(),
+                &ontology,
+                provisional,
+                app.config.analysis.extraction_concurrency,
+                &progress,
             )
-            .await
-        {
-            tracing::error!(error = %e.message, "audit write failed after graph extraction");
-        }
-        drop(slot);
-        match result {
-            Ok((summary, _)) => Ok(format!(
-                "{} nodes, {} edges from {} chunks",
-                summary.nodes, summary.edges, summary.chunks
-            )),
-            Err(e) => {
-                tracing::warn!(run = %run_id, error = %e, "graph extraction failed");
-                Err(e)
-            }
-        }
-    });
-    when_cancelled_unstarted(&jobs, id, move || async move {
-        audit_cancelled(
-            &cancel_app,
-            &cancel_access,
-            AuditAction::GraphExtract,
-            ResourceKind::GraphRun,
-            &cancel_run,
-        )
-        .await;
-    });
-    id
-}
-
-/// The closing audit row of a background run cancelled before it started.
-pub(crate) async fn audit_cancelled(
-    app: &App,
-    access: &Access,
-    action: AuditAction,
-    resource: ResourceKind,
-    run_id: &str,
-) {
-    if let Err(e) = access
-        .audit(
-            app,
-            action,
-            Some(resource.id(run_id)),
-            Outcome::Error,
-            Some(serde_json::json!({ "finished": true, "error": "cancelled before it started" })),
-        )
-        .await
-    {
-        tracing::error!(error = %e.message, "audit write failed after a cancelled run");
+            .await;
+            let version = ontology.version;
+            let result = match outcome {
+                Ok(summary) => {
+                    let resolution = resolve::resolve(&db, embeddings.as_ref(), &options).await;
+                    let finish = with_db(Arc::clone(&db), move |db| {
+                        graph_store::set_built_with(db, version)
+                    })
+                    .await;
+                    match (resolution, finish) {
+                        (Ok(resolution), Ok(())) => Ok(GraphReport {
+                            summary,
+                            resolution,
+                        }),
+                        (Err(e), _) => Err(e.to_string()),
+                        (_, Err(e)) => Err(e.message),
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            drop(slot);
+            result
+        })
     }
 }
 
