@@ -798,6 +798,13 @@ impl JobInfo {
 /// The lane slot a running job holds; dropped after its end is recorded.
 type Held = Option<LanePermit>;
 
+/// How a job ended, and the lane slot it holds until that is recorded.
+struct Ended {
+    state: JobState,
+    outcome: Option<String>,
+    held: Held,
+}
+
 impl Inner {
     /// Wait for the lane, run the work, and record its end. The end is recorded
     /// while the lane slot is still held, so the next job in the lane never
@@ -814,7 +821,11 @@ impl Inner {
     {
         let id = ctx.id;
         // The lane slot lives in `_held` until the end is recorded.
-        let (state, outcome, _held) = self.run_held(lane, ctx, kind, work).await;
+        let Ended {
+            state,
+            outcome,
+            held: _held,
+        } = self.run_held(lane, ctx, kind, work).await;
         self.finish(id, state, outcome);
     }
 
@@ -824,18 +835,16 @@ impl Inner {
         ctx: JobContext,
         kind: JobKind,
         work: F,
-    ) -> (JobState, Option<String>, Held)
+    ) -> Ended
     where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: Future<Output = JobResult> + Send + 'static,
     {
         let cancel = ctx.cancel_token();
-        let cancelled_while_queued = || {
-            (
-                JobState::Cancelled,
-                Some(String::from("cancelled before it started")),
-                None,
-            )
+        let cancelled_while_queued = || Ended {
+            state: JobState::Cancelled,
+            outcome: Some(String::from("cancelled before it started")),
+            held: None,
         };
         let lane_permit: Option<LanePermit> = match lane {
             Some(LaneTicket::Ready(permit)) => Some(permit),
@@ -845,7 +854,11 @@ impl Inner {
                 permit = receiver => match permit {
                     Ok(permit) => Some(permit),
                     Err(_) => {
-                        return (JobState::Failed, Some(String::from("the lane closed")), None);
+                        return Ended {
+                            state: JobState::Failed,
+                            outcome: Some(String::from("the lane closed")),
+                            held: None,
+                        };
                     }
                 },
             },
@@ -873,7 +886,11 @@ impl Inner {
                 )
             }
         };
-        (state, text, lane_permit)
+        Ended {
+            state,
+            outcome: text,
+            held: lane_permit,
+        }
     }
 }
 

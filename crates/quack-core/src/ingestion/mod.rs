@@ -362,7 +362,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     );
                 }
                 control.check()?;
-                let (chunk_count, embedding_time) = embed_and_store(
+                let stored = embed_and_store(
                     db,
                     doc_id,
                     &chunks,
@@ -378,10 +378,10 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     document_id: doc_id.to_owned(),
                     filename: filename.to_owned(),
                     file_type,
-                    chunks_stored: chunk_count,
+                    chunks_stored: stored.chunks,
                     tables: Vec::new(),
                     pages_skipped,
-                    embedding_time,
+                    embedding_time: stored.embedding_time,
                 })
             }
         }
@@ -672,18 +672,24 @@ impl EmbedPlan<'_> {
     }
 }
 
+/// What `embed_and_store` stored, and how long embedding took when a
+/// model ran.
+struct Stored {
+    chunks: u32,
+    embedding_time: Option<Duration>,
+}
+
 /// Store `chunks`, then embed them `batch_size` at a time
 /// (`[ingestion].embedding_batch_size`, at least one per request) with up
 /// to `concurrency` requests in flight (`[ingestion].embedding_concurrency`),
 /// each batch's vectors written as one transaction as soon as it returns.
-/// Returns the chunk count and, when a model ran, how long embedding took.
 async fn embed_and_store<M: EmbeddingModel>(
     db: &Writer,
     document_id: &DocumentId,
     chunks: &[chunker::Chunk],
     embedder: Option<&Embedder<M>>,
     plan: EmbedPlan<'_>,
-) -> Result<(u32, Option<Duration>)> {
+) -> Result<Stored> {
     let (owned, id) = (chunks.to_vec(), document_id.clone());
     let chunk_ids = db
         .run(move |db| {
@@ -712,10 +718,16 @@ async fn embed_and_store<M: EmbeddingModel>(
         .map_err(|_| Error::Ingestion("chunk count overflow".into()))?;
 
     let Some(embedder) = embedder else {
-        return Ok((stored, None));
+        return Ok(Stored {
+            chunks: stored,
+            embedding_time: None,
+        });
     };
     if chunks.is_empty() {
-        return Ok((stored, Some(Duration::ZERO)));
+        return Ok(Stored {
+            chunks: stored,
+            embedding_time: Some(Duration::ZERO),
+        });
     }
     let dimension = embedder.profile().dimension;
     if db.run(move |db| Ok(db.embedding_dimension())).await? != dimension {
@@ -726,13 +738,19 @@ async fn embed_and_store<M: EmbeddingModel>(
             document_id = %document_id,
             "chunks stored without vectors: run `quack embeddings refresh` after the embedding width change"
         );
-        return Ok((stored, None));
+        return Ok(Stored {
+            chunks: stored,
+            embedding_time: None,
+        });
     }
 
     let elapsed = plan
         .embed(db, document_id, &chunk_ids, chunks, embedder)
         .await?;
-    Ok((stored, Some(elapsed)))
+    Ok(Stored {
+        chunks: stored,
+        embedding_time: Some(elapsed),
+    })
 }
 
 /// A workspace table's name: letters, digits, and `_`, anything else

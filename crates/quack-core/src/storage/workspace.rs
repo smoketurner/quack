@@ -362,6 +362,13 @@ impl Vectors {
     }
 }
 
+/// A pinned document with its full text, chunks joined in order.
+#[derive(Debug, Clone)]
+pub struct PinnedDocument {
+    pub document: DocumentInfo,
+    pub text: String,
+}
+
 /// Whether a document is sent to the model in full on every turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(from = "bool")]
@@ -1961,7 +1968,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn pinned_documents(&self) -> Result<Vec<(DocumentInfo, String)>> {
+    pub fn pinned_documents(&self) -> Result<Vec<PinnedDocument>> {
         let mut out = Vec::new();
         for doc in self.list_documents()?.into_iter().filter(|d| d.pinned) {
             let mut stmt = self.conn.prepare(
@@ -1970,7 +1977,10 @@ impl WorkspaceDb {
             let parts = stmt
                 .query_map(duckdb::params![doc.id], |row| row.get::<_, String>(0))?
                 .collect::<duckdb::Result<Vec<_>>>()?;
-            out.push((doc, parts.join("\n")));
+            out.push(PinnedDocument {
+                document: doc,
+                text: parts.join("\n"),
+            });
         }
         Ok(out)
     }

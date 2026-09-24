@@ -9,7 +9,9 @@ use axum_extra::extract::CookieJar;
 use quack_core::storage::control::{AuditAction, Outcome};
 use serde::Deserialize;
 
-use crate::server::auth::{Credential, Identity, Peer, RequestId, SessionCookie, password_login};
+use crate::server::auth::{
+    Credential, Identity, Login, Peer, RequestId, SessionCookie, password_login,
+};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, ServeMode};
 
@@ -29,7 +31,7 @@ pub(crate) async fn login(
     if app.mode == ServeMode::Local {
         return Err(ApiError::bad_request("local mode has no login"));
     }
-    let (user, token) =
+    let Login { user, token } =
         password_login(&app, peer, request_id, &body.username, &body.password).await?;
     Ok((
         jar.add(SessionCookie::issue(&app, peer, token.clone())),
