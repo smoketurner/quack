@@ -16,8 +16,10 @@ use crate::graph::Origin;
 use crate::graph::store::EdgeScope;
 use crate::graph::{self, store as graph_store};
 use crate::ontology::induction::{Candidate, Proposal};
+use crate::ontology::store::Revision;
 use crate::ontology::{
-    self, Class, Ontology, Property, PropertyType, Relation, store as ontology_store,
+    self, Class, Ontology, OntologyVersion, Property, PropertyType, Relation, candidates,
+    store as ontology_store,
 };
 use crate::storage::context;
 use crate::storage::workspace::{DocumentInfo, WorkspaceDb};
@@ -178,6 +180,34 @@ impl Bundle {
             .filter(|f| parse_front_matter(&f.content).0.get("generator") != Some(GENERATOR))
     }
 
+    /// Restore the bundle into a workspace: when the workspace has no
+    /// ontology, the snapshot quack's export carries is saved under
+    /// `revision`; then the bundle's types and links go to the review
+    /// queue as candidates against the ontology now in force.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot does not parse or a write fails.
+    pub fn restore_into(&self, db: &WorkspaceDb, revision: Revision<'_>) -> Result<RestoreReport> {
+        let mut current = ontology_store::current(db)?;
+        let mut restored = None;
+        if current.is_none()
+            && let Some(snapshot) = self.ontology()?
+        {
+            let saved = ontology_store::save(db, &snapshot, revision)?;
+            restored = Some(saved.saved_version()?);
+            current = Some(saved);
+        }
+        let candidates = propose(self, current.as_ref());
+        if !candidates.is_empty() {
+            candidates::store_run(db, &candidates)?;
+        }
+        Ok(RestoreReport {
+            restored,
+            candidates: candidates.len(),
+        })
+    }
+
     /// The exact ontology snapshot quack's export carries, if any.
     ///
     /// # Errors
@@ -195,6 +225,16 @@ impl Bundle {
             .ok_or_else(|| Error::Ingestion(format!("{ONTOLOGY_SNAPSHOT} holds no JSON")))?;
         Ontology::from_json(json.trim()).map(Some)
     }
+}
+
+/// What restoring a bundle did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// The version the bundle's ontology was saved as, when the workspace
+    /// had none and the bundle carried one.
+    pub restored: Option<OntologyVersion>,
+    /// Candidates the bundle's types and links queued for review.
+    pub candidates: usize,
 }
 
 /// The `generator` front-matter value on every stub quack exports.

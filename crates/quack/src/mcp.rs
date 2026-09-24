@@ -105,15 +105,17 @@ impl Auditor {
     }
 }
 
-struct Inner {
-    config: Config,
-    db: SharedDb,
-    reader: ReaderDb,
-    workspace: WorkspaceRow,
-    policy: WritePolicy,
-    /// The server user, for session ownership; `None` over stdio.
-    user_id: Option<String>,
-    auditor: Auditor,
+/// What an MCP server serves: the configuration, the workspace and its
+/// handles, the write policy, the server user (for session ownership;
+/// `None` over stdio), and where audit rows go.
+pub(crate) struct McpSetup {
+    pub config: Config,
+    pub db: SharedDb,
+    pub reader: ReaderDb,
+    pub workspace: WorkspaceRow,
+    pub policy: WritePolicy,
+    pub user_id: Option<String>,
+    pub auditor: Auditor,
 }
 
 /// One MCP server over one workspace. The tool router comes from the
@@ -121,7 +123,7 @@ struct Inner {
 /// into `list_tools` and `call_tool`.
 #[derive(Clone)]
 pub(crate) struct McpServer {
-    inner: Arc<Inner>,
+    inner: Arc<McpSetup>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -179,10 +181,15 @@ pub(crate) struct DescribeTableArgs {
     pub table: String,
 }
 
-/// The session a turn runs in, and whether this call made it.
-struct ResolvedSession {
-    id: String,
-    created: bool,
+/// The session a `query` call runs in.
+enum TurnSession {
+    /// One the caller named, which exists and they may see.
+    Existing(String),
+    /// A new one this call made; removed again if the turn records
+    /// nothing.
+    Created(String),
+    /// The caller named one that does not exist or they may not see.
+    NotFound,
 }
 
 fn internal(e: impl std::fmt::Display) -> McpError {
@@ -278,25 +285,9 @@ impl<'a> WorkspaceResource<'a> {
 
 #[tool_router]
 impl McpServer {
-    pub(crate) fn new(
-        config: Config,
-        db: SharedDb,
-        reader: ReaderDb,
-        workspace: WorkspaceRow,
-        policy: WritePolicy,
-        user_id: Option<String>,
-        auditor: Auditor,
-    ) -> Self {
+    pub(crate) fn new(setup: McpSetup) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                config,
-                db,
-                reader,
-                workspace,
-                policy,
-                user_id,
-                auditor,
-            }),
+            inner: Arc::new(setup),
         }
     }
 
@@ -351,25 +342,25 @@ impl McpServer {
                 Err(e) => return Ok(failure(e.to_string())),
             },
         };
-        let session = match self.resolve_session(args.session_id, mode).await? {
-            Ok(session) => session,
-            Err(message) => return Ok(failure(message)),
+        let (session_id, created) = match self.resolve_session(args.session_id, mode).await? {
+            TurnSession::Existing(id) => (id, false),
+            TurnSession::Created(id) => (id, true),
+            TurnSession::NotFound => return Ok(failure("that session does not exist")),
         };
-        let session_id = session.id;
         let (sink, mut events) = events::channel();
         // Nothing renders the stream here; drain it so the turn never
         // blocks on a full channel.
         let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        let outcome = llm::run_turn(
-            &self.inner.config,
-            Arc::clone(&self.inner.db),
-            self.inner.reader.clone(),
-            &session_id,
-            self.inner.policy,
-            &question,
+        let outcome = llm::TurnRequest {
+            db: Arc::clone(&self.inner.db),
+            reader_db: self.inner.reader.clone(),
+            session_id: &session_id,
+            policy: self.inner.policy,
+            message: &question,
             sink,
-            llm::CancellationToken::new(),
-        )
+            cancel: llm::CancellationToken::new(),
+        }
+        .run(&self.inner.config)
         .await;
         drop(drain);
         let detail = serde_json::json!({ "prompt": question, "session_id": session_id });
@@ -410,7 +401,7 @@ impl McpServer {
                     .await?;
                 // A turn that never recorded a message leaves no session
                 // behind; the next call starts afresh.
-                if session.created {
+                if created {
                     let sid = session_id.clone();
                     drop(self.db(move |db| sessions::delete_if_empty(db, &sid)).await);
                 }
@@ -718,7 +709,7 @@ impl McpServer {
         &self,
         requested: Option<String>,
         mode: Option<ChatMode>,
-    ) -> Result<Result<ResolvedSession, String>, McpError> {
+    ) -> Result<TurnSession, McpError> {
         let user = self.inner.user_id.clone();
         let viewer = self.inner.auditor.session_viewer();
         if let Some(id) = requested
@@ -738,12 +729,9 @@ impl McpServer {
                 })
                 .await?;
             return Ok(if found {
-                Ok(ResolvedSession {
-                    id: requested_id,
-                    created: false,
-                })
+                TurnSession::Existing(requested_id)
             } else {
-                Err(String::from("that session does not exist"))
+                TurnSession::NotFound
             });
         }
         let model = self
@@ -758,7 +746,7 @@ impl McpServer {
                     .map(|s| s.id)
             })
             .await?;
-        Ok(Ok(ResolvedSession { id, created: true }))
+        Ok(TurnSession::Created(id))
     }
 
     async fn describe(&self, name: &str) -> Result<Option<serde_json::Value>, McpError> {
@@ -907,7 +895,15 @@ pub(crate) async fn serve_stdio(
     workspace: WorkspaceRow,
     policy: WritePolicy,
 ) -> anyhow::Result<()> {
-    let server = McpServer::new(config, db, reader, workspace, policy, None, Auditor::None);
+    let server = McpServer::new(McpSetup {
+        config,
+        db,
+        reader,
+        workspace,
+        policy,
+        user_id: None,
+        auditor: Auditor::None,
+    });
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
@@ -938,20 +934,20 @@ mod tests {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
         let reader = ReaderDb::new(Arc::clone(&db));
-        McpServer::new(
+        McpServer::new(McpSetup {
             config,
             db,
             reader,
-            WorkspaceRow {
+            workspace: WorkspaceRow {
                 id: String::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
                 allowed_providers: AllowedProviders::All,
             },
             policy,
-            None,
-            Auditor::None,
-        )
+            user_id: None,
+            auditor: Auditor::None,
+        })
     }
 
     fn field(result: &CallToolResult, key: &str) -> serde_json::Value {
@@ -1061,20 +1057,20 @@ mod tests {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
         let reader = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
-        let server = McpServer::new(
+        let server = McpServer::new(McpSetup {
             config,
-            Arc::clone(&db),
+            db: Arc::clone(&db),
             reader,
-            WorkspaceRow {
+            workspace: WorkspaceRow {
                 id: String::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
                 allowed_providers: AllowedProviders::All,
             },
-            WritePolicy::Deny,
-            None,
-            Auditor::None,
-        );
+            policy: WritePolicy::Deny,
+            user_id: None,
+            auditor: Auditor::None,
+        });
         let ask = |session_id: Option<&str>, mode: Option<&str>| {
             Parameters(QueryArgs {
                 question: String::from("how many?"),

@@ -338,6 +338,13 @@ impl AuditEntry {
         }
     }
 
+    /// The workspace the action concerned.
+    #[must_use]
+    pub fn in_workspace(mut self, workspace_id: &str) -> Self {
+        self.workspace_id = Some(workspace_id.to_owned());
+        self
+    }
+
     /// The resource the action touched.
     #[must_use]
     pub fn on(mut self, resource: AuditResource<'_>) -> Self {
@@ -1724,12 +1731,12 @@ mod tests {
     #[tokio::test]
     async fn audit_rows_append_and_filter() {
         let (_dir, cp) = open().await;
-        let mut allowed = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api);
+        let mut allowed =
+            AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api).in_workspace("w1");
         allowed.user_id = Some(String::from("u1"));
-        allowed.workspace_id = Some(String::from("w1"));
-        let mut denied = AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Web);
+        let mut denied =
+            AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Web).in_workspace("w1");
         denied.user_id = Some(String::from("u2"));
-        denied.workspace_id = Some(String::from("w1"));
         let login = AuditEntry::new(AuditAction::Login, Outcome::Error, Channel::Web);
         for e in [&allowed, &denied, &login] {
             assert!(cp.record_audit(e).await.is_ok());

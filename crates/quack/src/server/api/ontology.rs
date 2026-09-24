@@ -4,6 +4,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use quack_core::extraction::ExtractionRun;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -552,12 +553,14 @@ impl Access {
             };
             let outcome = documents::run(
                 chunks,
-                extractor.as_ref(),
                 current.as_ref(),
                 &options,
                 embeddings.as_ref(),
-                concurrency,
-                control,
+                ExtractionRun {
+                    extractor: extractor.as_ref(),
+                    concurrency,
+                    control,
+                },
             )
             .await;
             match outcome {

@@ -14,7 +14,7 @@ use tower::ServiceExt;
 use super::auth::{Access, Identity, Need};
 use super::error::ApiResult;
 use super::state::{App, McpEntry, McpKey};
-use crate::mcp::{Auditor, McpServer, ServerAuditor};
+use crate::mcp::{Auditor, McpServer, McpSetup, ServerAuditor};
 
 pub(crate) async fn handle(
     State(app): State<App>,
@@ -38,18 +38,18 @@ pub(crate) async fn handle(
     let reader = app.reader_db(&access.workspace.id).await?;
     let McpEntry { transport, server } = app
         .mcp_transport(key, || {
-            McpServer::new(
-                app.config.clone(),
+            McpServer::new(McpSetup {
+                config: app.config.clone(),
                 db,
                 reader,
-                access.workspace.clone(),
+                workspace: access.workspace.clone(),
                 policy,
-                Some(access.identity.user_id.clone()),
-                Auditor::Server(Box::new(ServerAuditor {
+                user_id: Some(access.identity.user_id.clone()),
+                auditor: Auditor::Server(Box::new(ServerAuditor {
                     app: std::sync::Arc::clone(&app),
                     access: std::sync::Mutex::new(access.clone()),
                 })),
-            )
+            })
         })
         .await;
     // Every request is audited as the identity that made it, not the one

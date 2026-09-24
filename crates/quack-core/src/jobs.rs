@@ -393,7 +393,7 @@ impl JobContext {
     }
 
     /// Cancelled when someone cancels the job; long work should watch it
-    /// (an agent turn passes it to `run_turn`).
+    /// (an agent turn passes it in its `TurnRequest`).
     #[must_use]
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()

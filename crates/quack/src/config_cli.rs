@@ -12,31 +12,31 @@
 use std::io::Write;
 
 use anyhow::Result;
-use quack_core::config::inspect::{EnvVar, FileState, Inspection, Origin, Setting, UnknownKey};
+use quack_core::config::inspect::{FileState, Inspection, Origin, Setting, SettingFilter};
 use quack_core::text::Count;
-use serde_json::{Value, json};
+
+use crate::text_or_json::TextOrJson;
 
 /// Print the report. Returns whether the configuration is one the binary
 /// would start on, which the caller turns into the exit status.
 pub(crate) fn run(
     out: &mut impl Write,
     inspection: &Inspection,
-    json: bool,
-    changed: bool,
+    format: TextOrJson,
+    filter: SettingFilter,
 ) -> Result<bool> {
-    if json {
-        writeln!(
+    match format {
+        TextOrJson::Json => writeln!(
             out,
             "{}",
-            serde_json::to_string_pretty(&as_json(inspection, changed))?
-        )?;
-    } else {
-        write_text(out, inspection, changed)?;
+            serde_json::to_string_pretty(&inspection.report(filter))?
+        )?,
+        TextOrJson::Text => write_text(out, inspection, filter)?,
     }
     Ok(inspection.is_usable())
 }
 
-fn write_text(out: &mut impl Write, inspection: &Inspection, changed: bool) -> Result<()> {
+fn write_text(out: &mut impl Write, inspection: &Inspection, filter: SettingFilter) -> Result<()> {
     let path = inspection.config_path.display();
     match &inspection.file_state {
         FileState::Missing => writeln!(
@@ -56,10 +56,7 @@ fn write_text(out: &mut impl Write, inspection: &Inspection, changed: bool) -> R
         inspection.config.data_dir().display()
     )?;
 
-    let rows: Vec<Row<'_>> = settings(inspection, changed)
-        .into_iter()
-        .map(Row::of)
-        .collect();
+    let rows: Vec<Row<'_>> = inspection.shown(filter).into_iter().map(Row::of).collect();
     if rows.is_empty() {
         writeln!(
             out,
@@ -125,16 +122,6 @@ fn write_text(out: &mut impl Write, inspection: &Inspection, changed: bool) -> R
     Ok(())
 }
 
-/// The settings to report: every one, or only those the file or the
-/// environment has a say in.
-fn settings(inspection: &Inspection, changed: bool) -> Vec<&Setting> {
-    if changed {
-        inspection.changed().collect()
-    } else {
-        inspection.settings.iter().collect()
-    }
-}
-
 /// One printed setting with the note that explains its origin.
 struct Row<'a> {
     setting: &'a Setting,
@@ -175,47 +162,6 @@ fn indented(message: &str) -> String {
         .join("\n")
 }
 
-fn as_json(inspection: &Inspection, changed: bool) -> Value {
-    let (state, error) = match &inspection.file_state {
-        FileState::Missing => ("missing", None),
-        FileState::Loaded => ("loaded", None),
-        FileState::Rejected(error) => ("rejected", Some(error.clone())),
-    };
-    json!({
-        "config_file": {
-            "path": inspection.config_path.display().to_string(),
-            "state": state,
-            "error": error,
-        },
-        "data_dir": inspection.config.data_dir().display().to_string(),
-        "settings": settings(inspection, changed).into_iter().map(setting_json).collect::<Vec<_>>(),
-        "unrecognized": inspection.unknown.iter().map(unknown_json).collect::<Vec<_>>(),
-        "environment": inspection.environment.iter().map(env_json).collect::<Vec<_>>(),
-    })
-}
-
-/// Values are rendered as TOML, the form the config file writes them in,
-/// so a string keeps its quotes.
-fn setting_json(setting: &Setting) -> Value {
-    json!({
-        "section": setting.section,
-        "key": setting.key,
-        "value": setting.value,
-        "default": setting.default,
-        "origin": setting.origin.to_string(),
-        "file_value": setting.file_value,
-        "env": setting.env,
-    })
-}
-
-fn unknown_json(unknown: &UnknownKey) -> Value {
-    json!({ "path": unknown.path, "suggestion": unknown.suggestion })
-}
-
-fn env_json(var: &EnvVar) -> Value {
-    json!({ "name": var.name, "set": var.set, "purpose": var.purpose })
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -227,6 +173,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use serde_json::Value;
 
     const SAMPLE: &str = "[general]\nchat_model = \"ollama/llama3.1:8b\"\n\
                           [providers.ollama]\ntype = \"ollama\"\n[retrieval]\ntop_k = 3\n";
@@ -234,7 +181,12 @@ mod tests {
     fn report(contents: Option<&str>, json: bool, changed: bool) -> (String, bool) {
         let inspection = Inspection::of(PathBuf::from("/tmp/config.toml"), contents);
         let mut out = Vec::new();
-        let usable = run(&mut out, &inspection, json, changed).unwrap();
+        let filter = if changed {
+            SettingFilter::Changed
+        } else {
+            SettingFilter::All
+        };
+        let usable = run(&mut out, &inspection, TextOrJson::of(json), filter).unwrap();
         (String::from_utf8(out).unwrap(), usable)
     }
 

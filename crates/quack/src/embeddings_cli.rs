@@ -3,14 +3,14 @@
 //! width, or its input prefixes changed. Until then the chunks those
 //! vectors belong to are found by keyword search only.
 
-use std::io::{self, Write};
+use std::io::Write;
 
 use anyhow::Result;
 use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::embedding::refresh::{self, Plan};
 use quack_core::llm::Embeddings;
-use quack_core::progress::{ChunkDone, RunControl};
+use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
@@ -81,15 +81,4 @@ async fn refresh(
     .await?;
     writeln!(out, "{summary}")?;
     Ok(())
-}
-
-/// Progress on stderr, for the shell: chunks and node labels together.
-pub(crate) fn print_progress(done: ChunkDone) {
-    drop(writeln!(
-        io::stderr(),
-        "{}/{} refreshed; {} s elapsed",
-        done.done,
-        done.total,
-        done.elapsed.as_secs()
-    ));
 }

@@ -109,6 +109,20 @@ pub struct Report {
     pub checks: Vec<Check>,
 }
 
+/// Written as `quack doctor --json` prints it: whether anything failed,
+/// the failure and warning counts, then every check.
+impl Serialize for Report {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut report = serializer.serialize_struct("Report", 4)?;
+        report.serialize_field("ok", &!self.has_failures())?;
+        report.serialize_field("failures", &self.count(Status::Fail))?;
+        report.serialize_field("warnings", &self.count(Status::Warn))?;
+        report.serialize_field("checks", &self.checks)?;
+        report.end()
+    }
+}
+
 impl Report {
     /// How many checks came out with `status`.
     #[must_use]

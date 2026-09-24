@@ -393,6 +393,71 @@ impl GraphStatus {
     }
 }
 
+/// The status as `quack graph status` prints it, one line per finding.
+impl fmt::Display for GraphStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ontology_version = self
+            .ontology_version
+            .map_or_else(|| String::from("none"), |v| v.to_string());
+        let built_with = self.built_with_version.map_or_else(
+            || String::from("never built"),
+            |v| format!("built with {v}"),
+        );
+        writeln!(
+            f,
+            "Graph: {} nodes, {} edges (ontology version {ontology_version}, {built_with}){}{}",
+            self.nodes,
+            self.edges,
+            if self.stale {
+                "; stale: run `quack graph revalidate` or `quack graph extract`"
+            } else {
+                ""
+            },
+            if self.provisional() {
+                "; provisional: built from an unreviewed ontology, `quack graph review` clears it"
+            } else {
+                ""
+            }
+        )?;
+        if self.pending_merges > 0 {
+            writeln!(
+                f,
+                "{} merge proposals pending: `quack graph merges`",
+                self.pending_merges
+            )?;
+        }
+        if !self.missing_tables.is_empty() {
+            writeln!(
+                f,
+                "Mapped tables no longer in the workspace (extraction skips them): {}",
+                self.missing_tables.join(", ")
+            )?;
+        }
+        if self.drift.total() > 0 {
+            let mut items: Vec<String> = self
+                .drift
+                .classes
+                .iter()
+                .map(|(k, v)| format!("class {k} ({v})"))
+                .chain(
+                    self.drift
+                        .relations
+                        .iter()
+                        .map(|(k, v)| format!("relation {k} ({v})")),
+                )
+                .collect();
+            items.sort();
+            writeln!(
+                f,
+                "The corpus expressed {} things the ontology lacks: {}",
+                self.drift.total(),
+                items.join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// A label as the graph compares it: lowercased, whitespace collapsed.
 /// Nodes merge on it with their class, and it is the tables'
 /// `normalized_label`.

@@ -23,6 +23,88 @@ pub struct CandidateRow {
     pub decided_at: Option<String>,
 }
 
+impl CandidateRow {
+    /// One line of evidence for the review listing.
+    #[must_use]
+    pub fn evidence_line(&self) -> String {
+        let e = &self.evidence;
+        let get = |k: &str| {
+            e.get(k)
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default()
+        };
+        if e.get("source").and_then(|v| v.as_str()) == Some("okf") {
+            let examples = e
+                .get("examples")
+                .and_then(|x| x.as_array())
+                .map(|xs| {
+                    xs.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            return format!("{} bundle files, e.g. {examples}", get("files"));
+        }
+        if e.get("source").and_then(|v| v.as_str()) == Some("documents") {
+            let examples = e
+                .get("examples")
+                .and_then(|x| x.as_array())
+                .map(|xs| {
+                    xs.iter()
+                        .filter_map(|x| {
+                            x.get("mention")
+                                .or_else(|| x.get("subject"))
+                                .or_else(|| x.get("value"))
+                                .and_then(|v| v.as_str())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            return format!(
+                "{} mentions in {} documents{} e.g. {examples}",
+                get("occurrences"),
+                get("documents"),
+                if self.status == CandidateStatus::LowSupport {
+                    " (low support)"
+                } else {
+                    ""
+                }
+            );
+        }
+        match self.kind {
+            ItemKind::Class => format!(
+                "table {} ({} rows, key {})",
+                get("table"),
+                get("rows"),
+                get("key_column")
+            ),
+            ItemKind::Property => format!(
+                "{}.{} {} distinct {} of {} e.g. {}",
+                get("table"),
+                get("column"),
+                get("duckdb_type"),
+                get("distinct"),
+                get("rows"),
+                get("samples")
+            ),
+            ItemKind::Relation => format!(
+                "{}.{} matches {}.{} for {} of values",
+                get("table"),
+                get("column"),
+                get("target_table"),
+                get("target_key"),
+                get("overlap")
+            ),
+            ItemKind::Mapping => format!("table {}", get("table")),
+        }
+    }
+}
+
 /// Where a candidate stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

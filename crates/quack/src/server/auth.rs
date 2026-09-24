@@ -308,7 +308,7 @@ impl FromRequestParts<App> for Identity {
             let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
             entry.user_id = Some(token.user_id.clone());
             entry.token_hash = Some(token.token_hash.clone());
-            entry.workspace_id = Some(token.workspace_id.clone());
+            entry = entry.in_workspace(&token.workspace_id);
             entry.client_addr = client_addr;
             entry.request_id = request_id;
             app.control.record_audit(&entry).await?;
@@ -422,7 +422,7 @@ impl Access {
         detail: Option<serde_json::Value>,
     ) -> ApiResult<String> {
         let mut entry = self.identity.audit(action, outcome);
-        entry.workspace_id = Some(self.workspace.id.clone());
+        entry = entry.in_workspace(&self.workspace.id);
         if let Some(resource) = resource {
             entry = entry.on(resource);
         }
@@ -473,7 +473,7 @@ impl Access {
     ) -> ApiResult<Self> {
         let Some(workspace) = app.control.get_workspace(workspace_id).await? else {
             let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
-            entry.workspace_id = Some(workspace_id.to_owned());
+            entry = entry.in_workspace(workspace_id);
             app.control.record_audit(&entry).await?;
             return Err(ApiError::not_found("no such workspace"));
         };
@@ -513,7 +513,7 @@ impl Identity {
     /// Record a refused attempt on `workspace` and return 403 with `reason`.
     async fn deny(&self, app: &App, workspace: &WorkspaceRow, reason: &str) -> ApiResult<()> {
         let mut entry = self.audit(AuditAction::Open, Outcome::Denied);
-        entry.workspace_id = Some(workspace.id.clone());
+        entry = entry.in_workspace(&workspace.id);
         app.control.record_audit(&entry).await?;
         Err(ApiError::forbidden(reason))
     }

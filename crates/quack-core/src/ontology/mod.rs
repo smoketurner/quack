@@ -918,6 +918,70 @@ pub struct OntologyDiff {
     pub mappings: Changes,
 }
 
+impl Ontology {
+    /// A readable rendering: the class tree, then relations, properties,
+    /// mappings.
+    #[must_use]
+    pub fn render_summary(&self) -> String {
+        fn children(ontology: &Ontology, parent: &str, depth: usize, lines: &mut Vec<String>) {
+            for class in ontology.classes.iter().filter(|c| c.parent == parent) {
+                let key = class
+                    .key
+                    .as_deref()
+                    .map_or(String::new(), |k| format!(" [key {k}]"));
+                let props = if class.properties.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {{{}}}", class.properties.join(", "))
+                };
+                lines.push(format!(
+                    "{}- {}{key}{props}",
+                    "  ".repeat(depth.saturating_add(1)),
+                    class.id
+                ));
+                children(ontology, &class.id, depth.saturating_add(1), lines);
+            }
+        }
+        let mut lines = vec![
+            match self.version {
+                Some(version) => format!("Ontology version {version}"),
+                None => String::from("Ontology (unsaved)"),
+            },
+            String::from("classes:"),
+        ];
+        children(self, ROOT_CLASS, 0, &mut lines);
+        lines.push(String::from("relations:"));
+        for r in &self.relations {
+            lines.push(format!("  - {}: {} -> {}", r.id, r.domain, r.range));
+        }
+        lines.push(String::from("properties:"));
+        for p in &self.properties {
+            let values = if p.values.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", p.values.join(", "))
+            };
+            lines.push(format!("  - {}: {}{values}", p.id, p.kind.as_str()));
+        }
+        if !self.mappings.is_empty() {
+            lines.push(String::from("mappings:"));
+            for m in &self.mappings {
+                lines.push(format!(
+                    "  - {} -> {} (key {}, {} properties, {} relations)",
+                    m.table,
+                    m.class,
+                    m.key,
+                    m.properties.len(),
+                    m.relations.len()
+                ));
+            }
+        }
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text
+    }
+}
+
 impl OntologyDiff {
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -964,6 +1028,26 @@ impl std::fmt::Display for OntologyDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_nests_subclasses_under_parents() {
+        let mut ontology = Ontology::builtin_default();
+        ontology.classes.push(Class {
+            id: String::from("vendor"),
+            parent: String::from("organization"),
+            label: None,
+            description: None,
+            key: None,
+            properties: Vec::new(),
+        });
+        let text = ontology.render_summary();
+        assert!(
+            text.contains("  - organization {industry, country}\n    - vendor\n"),
+            "{text}"
+        );
+        assert!(text.contains("  - works_at: person -> organization"));
+        assert!(text.contains("  - date: date"));
+    }
 
     #[test]
     fn versions_count_from_one() {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
-use quack_core::ingestion;
+use quack_core::ingestion::{NewFile, Processing};
 use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
 use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
@@ -99,16 +99,16 @@ impl UploadJob {
                 return Err(e.to_string());
             }
         };
-        let result = ingestion::process_document(
+        let file = NewFile::new(&self.filename, &self.data).control(control);
+        let result = Processing {
             config,
             db,
             workspace_id,
-            &self.document_id,
-            &self.filename,
-            &self.data,
-            model.as_ref(),
-            control,
-        )
+            document_id: &self.document_id,
+            file: &file,
+            embedder: model.as_ref(),
+        }
+        .run()
         .await;
         match result {
             Ok(r) => {

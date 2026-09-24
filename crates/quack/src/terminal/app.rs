@@ -423,16 +423,16 @@ enum CliJob {
 impl CliJob {
     /// `/ontology VERB`. The terminal owns stdin, so nothing may prompt.
     fn ontology(mut action: OntologyAction) -> Self {
-        if let OntologyAction::Propose { yes, .. } = &mut action {
-            *yes = true;
+        if let OntologyAction::Propose(args) = &mut action {
+            args.yes = true;
         }
         Self::Ontology(action)
     }
 
     /// `/graph VERB`, never prompting.
     fn graph(mut action: GraphAction) -> Self {
-        if let GraphAction::Extract { yes, .. } = &mut action {
-            *yes = true;
+        if let GraphAction::Extract(args) = &mut action {
+            args.yes = true;
         }
         Self::Graph(action)
     }
@@ -550,15 +550,16 @@ impl CliJob {
         control: RunControl<'_>,
     ) -> Result<String> {
         let embedding_model = Embeddings::from_config(&env.config).await?;
-        let summary = import::import(
-            &env.config,
-            &env.db,
-            &env.workspace_id,
+        let summary = import::Importing {
+            config: &env.config,
+            db: &env.db,
+            workspace_id: &env.workspace_id,
             request,
-            ImportPolicy::owner(),
-            embedding_model.as_ref(),
+            policy: ImportPolicy::owner(),
+            embedder: embedding_model.as_ref(),
             control,
-        )
+        }
+        .run()
         .await?;
         Ok(format!(
             "Imported {} rows from {} as table \"{}\" ({} columns).\nYou can now ask questions about this data.",
@@ -2343,18 +2344,18 @@ impl App {
             } else {
                 WritePolicy::Ask
             };
-            // run_turn emits TurnComplete or Failed itself; the returned
+            // The turn emits TurnComplete or Failed itself; the returned
             // value is the same response, and the job keeps its outline.
-            match llm::run_turn(
-                &config,
+            match (llm::TurnRequest {
                 db,
                 reader_db,
-                &session_id,
+                session_id: &session_id,
                 policy,
-                &message,
+                message: &message,
                 sink,
-                ctx.cancel_token(),
-            )
+                cancel: ctx.cancel_token(),
+            })
+            .run(&config)
             .await
             {
                 Ok(response) if response.cancelled => Err(String::from("cancelled")),

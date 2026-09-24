@@ -12,10 +12,9 @@ use super::induction::{Candidate, Proposal};
 use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation, SnakeId};
 use crate::embedding::Input;
 use crate::error::{Error, Result};
-use crate::extraction::{Extract, Extracted, Passage, RunProgress, Tally, extractions};
+use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, Tally, extractions};
 use crate::graph::NormalizedLabel;
 use crate::llm::Embeddings;
-use crate::progress::RunControl;
 use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
 /// What open extraction returns for one chunk.
@@ -219,15 +218,13 @@ pub struct RunSummary {
 /// Returns an error when every extraction failed or embedding fails.
 pub async fn run(
     sample: Vec<SampledChunk>,
-    extractor: &dyn Extract<OpenExtraction>,
     current: Option<&Ontology>,
     options: &DocumentEvidenceOptions,
     embeddings: Option<&Embeddings>,
-    concurrency: u32,
-    control: RunControl<'_>,
+    extraction: ExtractionRun<'_, OpenExtraction>,
 ) -> Result<(Vec<Candidate>, RunSummary)> {
     let sampled = u32::try_from(sample.len()).unwrap_or(u32::MAX);
-    let (observations, failed) = observe(extractor, &sample, concurrency, control).await?;
+    let (observations, failed) = observe(&sample, extraction).await?;
     let table = match embeddings {
         Some(model) => {
             let mut names: BTreeSet<String> = BTreeSet::new();
@@ -265,19 +262,23 @@ pub struct Observation {
     pub extraction: OpenExtraction,
 }
 
-/// Run the extractor over the sample, up to `concurrency` chunks at a
-/// time, reporting each finished chunk to `progress`. Failed chunks are
-/// skipped and counted, so one bad answer does not sink the run.
+/// Run the extractor over the sample, up to the run's concurrency of
+/// chunks at a time, reporting each finished chunk to its control. Failed
+/// chunks are skipped and counted, so one bad answer does not sink the
+/// run.
 ///
 /// # Errors
 ///
 /// Returns an error only when every chunk failed.
 pub async fn observe(
-    extractor: &dyn Extract<OpenExtraction>,
     chunks: &[SampledChunk],
-    concurrency: u32,
-    control: RunControl<'_>,
+    extraction: ExtractionRun<'_, OpenExtraction>,
 ) -> Result<(Vec<Observation>, u32)> {
+    let ExtractionRun {
+        extractor,
+        concurrency,
+        control,
+    } = extraction;
     let mut run = RunProgress::new(chunks.len(), control.progress);
     let mut calls = extractions(extractor, chunks, concurrency);
     let mut observations = Vec::with_capacity(chunks.len());
@@ -746,8 +747,9 @@ fn propose_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extraction::{ExtractFuture, parse_answer};
+    use crate::extraction::{Extract, ExtractFuture, parse_answer};
     use crate::progress::ChunkDone;
+    use crate::progress::RunControl;
     use crate::storage::workspace::{NewChunk, NewDocument};
 
     struct Canned;
@@ -860,9 +862,16 @@ mod tests {
     async fn observations_become_classes_relations_hierarchy_and_properties() {
         let db = workspace_with_docs();
         let sample = sample_chunks(&db, 8).unwrap_or_else(|e| fail(&e.to_string()));
-        let (observations, failures) = observe(&Canned, &sample, 1, RunControl::unobserved())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (observations, failures) = observe(
+            &sample,
+            ExtractionRun {
+                extractor: &Canned,
+                concurrency: 1,
+                control: RunControl::unobserved(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!((observations.len(), failures), (8, 0));
         let options = DocumentEvidenceOptions {
             min_support_documents: 3,
@@ -965,9 +974,16 @@ mod tests {
             progress: &progress,
             cancel: None,
         };
-        let (observations, failures) = observe(&Canned, &chunks, 2, control)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (observations, failures) = observe(
+            &chunks,
+            ExtractionRun {
+                extractor: &Canned,
+                concurrency: 2,
+                control,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!((observations.len(), failures), (1, 1));
         // Every chunk reports once, in order, with the failure count so
         // far (issue #67: the run was silent until the end).
@@ -982,9 +998,16 @@ mod tests {
             content: String::from("FAIL"),
         }];
         assert!(
-            observe(&Canned, &all_bad, 1, RunControl::unobserved())
-                .await
-                .is_err()
+            observe(
+                &all_bad,
+                ExtractionRun {
+                    extractor: &Canned,
+                    concurrency: 1,
+                    control: RunControl::unobserved()
+                }
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1003,7 +1026,15 @@ mod tests {
             cancel: Some(&cancel),
         };
         assert!(matches!(
-            observe(&Canned, &chunks, 1, control).await,
+            observe(
+                &chunks,
+                ExtractionRun {
+                    extractor: &Canned,
+                    concurrency: 1,
+                    control
+                }
+            )
+            .await,
             Err(Error::Cancelled)
         ));
     }

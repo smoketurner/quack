@@ -5,17 +5,12 @@ use std::io::Write;
 
 use anyhow::Result;
 use quack_core::doctor::{Report, Status};
-use serde_json::json;
 
-pub(crate) fn write(out: &mut impl Write, report: &Report, as_json: bool) -> Result<()> {
-    if as_json {
-        let doc = json!({
-            "ok": !report.has_failures(),
-            "failures": report.count(Status::Fail),
-            "warnings": report.count(Status::Warn),
-            "checks": report.checks,
-        });
-        writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
+use crate::text_or_json::TextOrJson;
+
+pub(crate) fn write(out: &mut impl Write, report: &Report, format: TextOrJson) -> Result<()> {
+    if format == TextOrJson::Json {
+        writeln!(out, "{}", serde_json::to_string_pretty(report)?)?;
         return Ok(());
     }
 
@@ -88,7 +83,7 @@ mod tests {
             ],
         };
         let mut text = Vec::new();
-        write(&mut text, &report, false).unwrap();
+        write(&mut text, &report, TextOrJson::Text).unwrap();
         let text = String::from_utf8(text).unwrap();
         assert!(
             text.contains("fail  chat model  o/m: cannot reach"),
@@ -99,7 +94,7 @@ mod tests {
         assert!(text.ends_with("1 failed, 0 to look at.\n"));
 
         let mut json = Vec::new();
-        write(&mut json, &report, true).unwrap();
+        write(&mut json, &report, TextOrJson::Json).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(value["ok"], false);
         assert_eq!(value["failures"], 1);

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use quack_core::extraction::Extract;
+use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
@@ -370,11 +370,13 @@ impl DocumentJob {
             let outcome = extract::run(
                 &db,
                 &chunks,
-                extractor.as_ref(),
                 &ontology,
                 provisional,
-                app.config.analysis.extraction_concurrency,
-                control,
+                ExtractionRun {
+                    extractor: extractor.as_ref(),
+                    concurrency: app.config.analysis.extraction_concurrency,
+                    control,
+                },
             )
             .await;
             let result = match outcome {

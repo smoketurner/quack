@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::progress::{ChunkDone, Progress};
+use crate::progress::{ChunkDone, Progress, RunControl};
 
 /// Boxed future so an extractor can be a trait object.
 pub type ExtractFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -21,6 +21,16 @@ pub type ExtractFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 
 /// Extraction of a `T` from one passage.
 pub trait Extract<T>: Send + Sync {
     fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a, T>;
+}
+
+/// How an extraction pass calls the model: the extractor, how many calls
+/// may be in flight, and the control each finished passage reports to and
+/// that can stop the pass.
+#[derive(Clone, Copy)]
+pub struct ExtractionRun<'a, T> {
+    pub extractor: &'a dyn Extract<T>,
+    pub concurrency: u32,
+    pub control: RunControl<'a>,
 }
 
 /// A model's answer read leniently: the first `{` to the last `}`, as `T`.

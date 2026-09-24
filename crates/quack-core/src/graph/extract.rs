@@ -10,9 +10,8 @@ use serde::{Deserialize, Serialize};
 use super::store::{self, NewNode, Source};
 use super::{Drift, NormalizedLabel, Properties};
 use crate::error::{Error, Result};
-use crate::extraction::{Extract, Extracted, Passage, RunProgress, extractions};
+use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, extractions};
 use crate::ontology::{self, Ontology, OntologyVersion};
-use crate::progress::RunControl;
 use crate::storage::workspace::{ChunkSearchResult, SamplePool, WorkspaceDb};
 use crate::storage::writer::Writer;
 
@@ -273,10 +272,10 @@ pub struct RunSummary {
 const MODEL_CONFIDENCE: f64 = 0.8;
 
 /// Run constrained extraction over the chunks `plan` names, a page at a
-/// time with up to `concurrency` model calls in flight, and store what
-/// fits; each finished chunk goes to `control`, which can also stop the
-/// run. A failed chunk is logged and skipped; only every chunk failing is
-/// an error.
+/// time with up to the run's concurrency of model calls in flight, and
+/// store what fits; each finished chunk goes to the run's control, which
+/// can also stop the run. A failed chunk is logged and skipped; only every
+/// chunk failing is an error.
 ///
 /// # Errors
 ///
@@ -285,12 +284,15 @@ const MODEL_CONFIDENCE: f64 = 0.8;
 pub async fn run(
     db: &Writer,
     plan: &ChunkPlan,
-    extractor: &dyn Extract<Extraction>,
     ontology: &Ontology,
     provisional: bool,
-    concurrency: u32,
-    control: RunControl<'_>,
+    extraction: ExtractionRun<'_, Extraction>,
 ) -> Result<RunSummary> {
+    let ExtractionRun {
+        extractor,
+        concurrency,
+        control,
+    } = extraction;
     let mut pass = Pass {
         db,
         ontology,

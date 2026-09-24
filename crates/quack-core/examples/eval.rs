@@ -29,6 +29,7 @@ use quack_core::config::{
 };
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
+use quack_core::extraction::ExtractionRun;
 use quack_core::extraction::{Extract, ExtractFuture};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
@@ -768,11 +769,13 @@ async fn evaluate_graph(
     let summary = graph::extract::run(
         &writer,
         &ChunkPlan::Sample(chunk_ids),
-        &extractor,
         &ontology,
         false,
-        4,
-        RunControl::unobserved(),
+        ExtractionRun {
+            extractor: &extractor,
+            concurrency: 4,
+            control: RunControl::unobserved(),
+        },
     )
     .await?;
 
