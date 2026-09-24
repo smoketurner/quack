@@ -60,6 +60,24 @@ macro_rules! id_type {
             }
         }
 
+        impl ::std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+
         impl From<String> for $name {
             fn from(id: String) -> Self {
                 Self(id)
@@ -151,6 +169,16 @@ id_type!(
 id_type!(
     /// A knowledge-graph edge.
     EdgeId
+);
+
+id_type!(
+    /// An ontology class: a `snake_case` name such as `person`.
+    ClassId
+);
+
+id_type!(
+    /// An ontology relation: a `snake_case` name such as `works_at`.
+    RelationId
 );
 
 id_type!(

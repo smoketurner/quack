@@ -34,7 +34,7 @@ use quack_core::extraction::{Extract, ExtractFuture};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, store};
-use quack_core::ids::{ChunkId, DocumentId, NodeId};
+use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
@@ -572,15 +572,15 @@ async fn evaluate_retrieval(
 
 #[derive(Debug, Deserialize)]
 struct ExpectedClass {
-    id: String,
+    id: ClassId,
     properties: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ExpectedRelation {
-    id: String,
-    domain: String,
-    range: String,
+    id: RelationId,
+    domain: ClassId,
+    range: ClassId,
 }
 
 #[derive(Debug, Deserialize)]
@@ -651,14 +651,14 @@ fn evaluate_induction(db: &WorkspaceDb, expected_path: &Path) -> Result<Inductio
         }
     }
 
-    let expected_classes: BTreeSet<String> =
+    let expected_classes: BTreeSet<ClassId> =
         expected.classes.iter().map(|c| c.id.clone()).collect();
-    let expected_properties: BTreeSet<(String, String)> = expected
+    let expected_properties: BTreeSet<(ClassId, String)> = expected
         .classes
         .iter()
         .flat_map(|c| c.properties.iter().map(move |p| (c.id.clone(), p.clone())))
         .collect();
-    let expected_relations: BTreeSet<(String, String, String)> = expected
+    let expected_relations: BTreeSet<(RelationId, ClassId, ClassId)> = expected
         .relations
         .iter()
         .map(|r| (r.id.clone(), r.domain.clone(), r.range.clone()))
@@ -685,14 +685,14 @@ struct FixtureChunk {
 #[derive(Debug, Deserialize)]
 struct FixtureNode {
     label: String,
-    class: String,
+    class: ClassId,
 }
 
 #[derive(Debug, Deserialize)]
 struct FixtureEdge {
     source: String,
     target: String,
-    relation: String,
+    relation: RelationId,
 }
 
 #[derive(Debug, Deserialize)]
@@ -788,17 +788,17 @@ async fn evaluate_graph(
         .map(|n| (n.id.clone(), n.label.clone()))
         .collect();
 
-    let actual_nodes: BTreeSet<(String, String)> = nodes
+    let actual_nodes: BTreeSet<(String, ClassId)> = nodes
         .iter()
         .map(|n| (n.label.clone(), n.class_id.clone()))
         .collect();
-    let expected_nodes: BTreeSet<(String, String)> = fixture
+    let expected_nodes: BTreeSet<(String, ClassId)> = fixture
         .expected_nodes
         .iter()
         .map(|n| (n.label.clone(), n.class.clone()))
         .collect();
 
-    let actual_edges: BTreeSet<(String, String, String)> = edges
+    let actual_edges: BTreeSet<(String, String, RelationId)> = edges
         .iter()
         .filter_map(|e| {
             let source = label_of.get(&e.source_node_id)?;
@@ -806,7 +806,7 @@ async fn evaluate_graph(
             Some((source.clone(), target.clone(), e.relation_id.clone()))
         })
         .collect();
-    let expected_edges: BTreeSet<(String, String, String)> = fixture
+    let expected_edges: BTreeSet<(String, String, RelationId)> = fixture
         .expected_edges
         .iter()
         .map(|e| (e.source.clone(), e.target.clone(), e.relation.clone()))

@@ -9,7 +9,7 @@ use duckdb::types::ToSqlOutput;
 use super::resolve::MergeStatus;
 use super::{Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance};
 use crate::error::{Error, Result};
-use crate::ids::{ChunkId, DocumentId, EdgeId, NodeId};
+use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId};
 use crate::ontology::{self, OntologyVersion, store as ontology_store};
 use crate::storage::workspace::{MetaKey, WorkspaceDb, embedding_literal};
 
@@ -18,7 +18,7 @@ use crate::storage::workspace::{MetaKey, WorkspaceDb, embedding_literal};
 #[derive(Debug, Clone)]
 pub struct NewNode {
     pub label: String,
-    pub class_id: String,
+    pub class_id: ClassId,
     pub properties: Properties,
     pub provisional: bool,
 }
@@ -309,7 +309,7 @@ pub fn entities_of_chunks(
 /// Returns an error if a query fails.
 pub fn class_census(
     db: &WorkspaceDb,
-    class_ids: &[String],
+    class_ids: &[ClassId],
     samples: u32,
 ) -> Result<(u64, Vec<String>)> {
     let total = class_count(db, class_ids)?;
@@ -330,7 +330,7 @@ pub fn class_census(
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn class_count(db: &WorkspaceDb, class_ids: &[String]) -> Result<u64> {
+pub fn class_count(db: &WorkspaceDb, class_ids: &[ClassId]) -> Result<u64> {
     Ok(db.connection().query_row(
         "SELECT count(*) FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id)",
         duckdb::params![IdList::new(class_ids)],
@@ -631,8 +631,8 @@ pub fn revalidate(db: &WorkspaceDb) -> Result<Revalidation> {
     let ontology = ontology_store::current(db)?
         .ok_or_else(|| Error::Ontology(String::from("no ontology to validate against")))?;
     let version = ontology.saved_version()?;
-    let mut classes: Vec<String> = ontology.classes.iter().map(|c| c.id.clone()).collect();
-    classes.push(String::from(ontology::ROOT_CLASS));
+    let mut classes: Vec<ClassId> = ontology.classes.iter().map(|c| c.id.clone()).collect();
+    classes.push(ClassId::from(ontology::ROOT_CLASS));
     let dropped_nodes = delete_nodes_outside(db, &IdList::new(&classes))?;
 
     let conn = db.connection();

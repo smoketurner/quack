@@ -13,7 +13,7 @@ use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::Properties;
 use quack_core::graph::store as graph_store;
-use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
 use quack_core::llm::CancellationToken;
@@ -1244,7 +1244,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             &db,
             &graph_store::NewNode {
                 label: String::from("Kenya"),
-                class_id: String::from("country"),
+                class_id: ClassId::from("country"),
                 properties: Properties::default(),
                 provisional: false,
             },
@@ -1501,10 +1501,7 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
             &only_a0,
         )
         .unwrap();
-    assert!(
-        hybrid.iter().all(|h| h.id == ChunkId::from("a0")),
-        "{hybrid:?}"
-    );
+    assert!(hybrid.iter().all(|h| h.id == "a0"), "{hybrid:?}");
 
     // Both filters at once, contradicting each other.
     let crossed =

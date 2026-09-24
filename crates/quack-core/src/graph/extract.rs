@@ -11,7 +11,7 @@ use super::store::{self, NewNode, Source};
 use super::{Drift, NormalizedLabel, Properties};
 use crate::error::{Error, Result};
 use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, extractions};
-use crate::ids::{ChunkId, DocumentId, NodeId};
+use crate::ids::{ChunkId, ClassId, DocumentId, NodeId};
 use crate::ontology::{self, Ontology, OntologyVersion};
 use crate::storage::workspace::{ChunkSearchResult, SamplePool, WorkspaceDb};
 use crate::storage::writer::Writer;
@@ -405,7 +405,7 @@ pub fn store_validated(
             db,
             &NewNode {
                 label: node.label.clone(),
-                class_id: node.class.clone(),
+                class_id: ClassId::from(node.class.clone()),
                 properties: node.properties.clone(),
                 provisional,
             },
@@ -433,40 +433,41 @@ pub fn store_validated(
 mod tests {
     use super::*;
     use crate::extraction::parse_answer;
+    use crate::ids::RelationId;
     use crate::ontology::{Class, Relation};
 
     fn ontology() -> Ontology {
         let mut o = Ontology::default();
         o.classes.push(Class {
-            id: String::from("organization"),
-            parent: String::from(ontology::ROOT_CLASS),
+            id: ClassId::from("organization"),
+            parent: ClassId::from(String::from(ontology::ROOT_CLASS)),
             label: None,
             description: None,
             key: None,
             properties: Vec::new(),
         });
         o.classes.push(Class {
-            id: String::from("vendor"),
-            parent: String::from("organization"),
+            id: ClassId::from("vendor"),
+            parent: ClassId::from("organization"),
             label: None,
             description: None,
             key: None,
             properties: Vec::new(),
         });
         o.classes.push(Class {
-            id: String::from("country"),
-            parent: String::from(ontology::ROOT_CLASS),
+            id: ClassId::from("country"),
+            parent: ClassId::from(String::from(ontology::ROOT_CLASS)),
             label: None,
             description: None,
             key: None,
             properties: Vec::new(),
         });
         o.relations.push(Relation {
-            id: String::from("ships_to"),
+            id: RelationId::from("ships_to"),
             label: None,
             description: None,
-            domain: String::from("organization"),
-            range: String::from("country"),
+            domain: ClassId::from("organization"),
+            range: ClassId::from("country"),
         });
         o
     }

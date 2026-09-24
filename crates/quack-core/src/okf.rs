@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::graph::Origin;
 use crate::graph::store::EdgeScope;
 use crate::graph::{self, store as graph_store};
-use crate::ids::{DocumentId, NodeId};
+use crate::ids::{ClassId, DocumentId, NodeId, RelationId};
 use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::store::Revision;
 use crate::ontology::{
@@ -566,7 +566,7 @@ impl Exporter<'_> {
                     text,
                     "\n## Ontology\n\nRows are [{}](../ontology/classes/{}.md) keyed by `{}`.",
                     mapping.class,
-                    slug(&mapping.class),
+                    slug(mapping.class.as_str()),
                     mapping.key
                 )?;
                 for relation in &mapping.relations {
@@ -575,9 +575,9 @@ impl Exporter<'_> {
                         "- `{}` [{}](../ontology/relations/{}.md) [{}](../ontology/classes/{}.md)",
                         relation.column,
                         relation.relation,
-                        slug(&relation.relation),
+                        slug(relation.relation.as_str()),
                         relation.target_class,
-                        slug(&relation.target_class)
+                        slug(relation.target_class.as_str())
                     )?;
                     if let Some(other) = ontology
                         .mappings
@@ -634,7 +634,7 @@ impl Exporter<'_> {
             let mut text = FrontMatter::generated(ConceptType::Class)
                 .field(
                     "title",
-                    class.label.clone().unwrap_or_else(|| class.id.clone()),
+                    class.label.clone().unwrap_or_else(|| class.id.to_string()),
                 )
                 .field("description", class.description.clone().unwrap_or_default())
                 .to_string();
@@ -644,7 +644,7 @@ impl Exporter<'_> {
                     text,
                     "- parent: [{}](./{}.md)",
                     class.parent,
-                    slug(&class.parent)
+                    slug(class.parent.as_str())
                 )?;
             }
             if let Some(key) = &class.key {
@@ -666,12 +666,12 @@ impl Exporter<'_> {
                     text,
                     "- relation: [{}](../relations/{}.md)",
                     relation.id,
-                    slug(&relation.id)
+                    slug(relation.id.as_str())
                 )?;
             }
             self.listed(
-                format!("ontology/classes/{}.md", slug(&class.id)),
-                &class.id,
+                format!("ontology/classes/{}.md", slug(class.id.as_str())),
+                class.id.as_str(),
                 text,
             )?;
         }
@@ -699,7 +699,7 @@ impl Exporter<'_> {
                     relation
                         .label
                         .clone()
-                        .unwrap_or_else(|| relation.id.clone()),
+                        .unwrap_or_else(|| relation.id.to_string()),
                 )
                 .field(
                     "description",
@@ -711,12 +711,12 @@ impl Exporter<'_> {
                 "# {}\n\n- domain: [{}](../classes/{}.md)\n- range: [{}](../classes/{}.md)",
                 relation.id,
                 relation.domain,
-                slug(&relation.domain),
+                slug(relation.domain.as_str()),
                 relation.range,
-                slug(&relation.range)
+                slug(relation.range.as_str())
             )?;
             self.bundle.push(
-                format!("ontology/relations/{}.md", slug(&relation.id)),
+                format!("ontology/relations/{}.md", slug(relation.id.as_str())),
                 text,
             );
         }
@@ -765,11 +765,15 @@ impl Exporter<'_> {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut paths: BTreeMap<&str, String> = BTreeMap::new();
         for node in &nodes {
-            let mut path = format!("entities/{}/{}.md", slug(&node.class_id), slug(&node.label));
+            let mut path = format!(
+                "entities/{}/{}.md",
+                slug(node.class_id.as_str()),
+                slug(&node.label)
+            );
             if !seen.insert(path.clone()) {
                 path = format!(
                     "entities/{}/{}-{}.md",
-                    slug(&node.class_id),
+                    slug(node.class_id.as_str()),
                     slug(&node.label),
                     node.id.as_str().chars().rev().take(6).collect::<String>()
                 );
@@ -828,7 +832,7 @@ impl EntityExport<'_> {
             text,
             "Class: [{}](../../ontology/classes/{}.md)\n",
             node.class_id,
-            slug(&node.class_id)
+            slug(node.class_id.as_str())
         )?;
         if !node.properties.is_empty() {
             text.push_str("## Properties\n\n");
@@ -937,8 +941,8 @@ pub fn propose(bundle: &Bundle, current: Option<&Ontology>) -> Vec<Candidate> {
         }
         candidates.push(Candidate {
             proposal: Proposal::Class(Class {
-                id: kind.clone(),
-                parent: String::from(ontology::ROOT_CLASS),
+                id: ClassId::from(kind.clone()),
+                parent: ClassId::from(String::from(ontology::ROOT_CLASS)),
                 label: None,
                 description: None,
                 key: None,
@@ -1026,20 +1030,21 @@ fn propose_links(
         if current.is_some_and(|o| {
             o.relation(id).is_some()
                 || o.relations.iter().any(|r| {
-                    o.is_subclass_of(source, &r.domain) && o.is_subclass_of(target, &r.range)
+                    o.is_subclass_of(source, r.domain.as_str())
+                        && o.is_subclass_of(target, r.range.as_str())
                 })
         }) {
             continue;
         }
         candidates.push(Candidate {
             proposal: Proposal::Relation(Relation {
-                id: id.clone(),
+                id: RelationId::from(id.clone()),
                 label: None,
                 description: Some(format!(
                     "OKF links from {source} concepts to {target} concepts"
                 )),
-                domain: source.clone(),
-                range: target.clone(),
+                domain: ClassId::from(source.clone()),
+                range: ClassId::from(target.clone()),
             }),
             evidence: serde_json::json!({
                 "source": "okf",
@@ -1234,19 +1239,19 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| unreachable_db(&e.to_string()));
         let mut ontology = Ontology::builtin_default();
         ontology.classes.push(ontology::Class {
-            id: String::from("harbour"),
-            parent: String::from(ontology::ROOT_CLASS),
+            id: ClassId::from("harbour"),
+            parent: ClassId::from(String::from(ontology::ROOT_CLASS)),
             label: None,
             description: None,
             key: None,
             properties: Vec::new(),
         });
         ontology.relations.push(ontology::Relation {
-            id: String::from("near"),
+            id: RelationId::from("near"),
             label: None,
             description: None,
-            domain: String::from("harbour"),
-            range: String::from("harbour"),
+            domain: ClassId::from("harbour"),
+            range: ClassId::from("harbour"),
         });
         let saved = ontology_store::save(&db, &ontology, Revision::reviewed(None, None))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
@@ -1260,7 +1265,7 @@ mod tests {
         .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         let node = |label: &str| graph_store::NewNode {
             label: label.to_owned(),
-            class_id: String::from("harbour"),
+            class_id: ClassId::from("harbour"),
             properties: Properties::default(),
             provisional: false,
         };
@@ -1380,8 +1385,8 @@ mod tests {
         );
         let mut current = Ontology::default();
         current.classes.push(Class {
-            id: String::from("vendor"),
-            parent: String::from(ontology::ROOT_CLASS),
+            id: ClassId::from("vendor"),
+            parent: ClassId::from(String::from(ontology::ROOT_CLASS)),
             label: None,
             description: None,
             key: None,
@@ -1420,15 +1425,15 @@ mod tests {
             ["ships_to", "vendor_links_country"]
         );
         let relation = |id: &str, domain: &str, range: &str| Relation {
-            id: String::from(id),
+            id: RelationId::from(String::from(id)),
             label: None,
             description: None,
-            domain: String::from(domain),
-            range: String::from(range),
+            domain: ClassId::from(String::from(domain)),
+            range: ClassId::from(String::from(range)),
         };
         let class = |id: &str, parent: &str| Class {
-            id: String::from(id),
-            parent: String::from(parent),
+            id: ClassId::from(String::from(id)),
+            parent: ClassId::from(String::from(parent)),
             label: None,
             description: None,
             key: None,

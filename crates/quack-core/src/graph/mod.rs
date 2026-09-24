@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::embedding::{Dimension, Input};
 use crate::extraction::Tally;
-use crate::ids::{ChunkId, DocumentId, EdgeId, NodeId};
+use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId, RelationId};
 use crate::ontology::OntologyVersion;
 
 /// A stored node.
@@ -31,7 +31,7 @@ use crate::ontology::OntologyVersion;
 pub struct Node {
     pub id: NodeId,
     pub label: String,
-    pub class_id: String,
+    pub class_id: ClassId,
     #[serde(default)]
     pub properties: Properties,
     pub provisional: bool,
@@ -52,7 +52,7 @@ impl Node {
         Input::Similarity(format!(
             "{} ({})",
             self.label,
-            self.class_id.replace('_', " ")
+            self.class_id.as_str().replace('_', " ")
         ))
     }
 }
@@ -63,7 +63,7 @@ pub struct Edge {
     pub id: EdgeId,
     pub source_node_id: NodeId,
     pub target_node_id: NodeId,
-    pub relation_id: String,
+    pub relation_id: RelationId,
     pub weight: f64,
     #[serde(default)]
     pub properties: Properties,
@@ -746,7 +746,7 @@ mod tests {
         let node = |id: &str, provisional: bool| Node {
             id: NodeId::from(id.to_owned()),
             label: id.to_owned(),
-            class_id: String::from("entity"),
+            class_id: ClassId::from("entity"),
             properties: Properties::default(),
             provisional,
         };
@@ -757,7 +757,7 @@ mod tests {
                     id: EdgeId::from("ab"),
                     source_node_id: NodeId::from("a"),
                     target_node_id: NodeId::from("b"),
-                    relation_id: String::from("mentions"),
+                    relation_id: RelationId::from("mentions"),
                     weight: 1.0,
                     properties: Properties::default(),
                     provisional: false,
@@ -766,7 +766,7 @@ mod tests {
                     id: EdgeId::from("ac"),
                     source_node_id: NodeId::from("a"),
                     target_node_id: NodeId::from("c"),
-                    relation_id: String::from("mentions"),
+                    relation_id: RelationId::from("mentions"),
                     weight: 1.0,
                     properties: Properties::default(),
                     provisional: false,

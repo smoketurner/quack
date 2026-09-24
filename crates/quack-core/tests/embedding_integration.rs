@@ -14,7 +14,7 @@ use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::Properties;
 use quack_core::graph::store::{self as graph_store, NewNode};
-use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
@@ -210,7 +210,7 @@ async fn refresh_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
             &db,
             &NewNode {
                 label: String::from("Acme"),
-                class_id: String::from("organization"),
+                class_id: ClassId::from("organization"),
                 properties: Properties::default(),
                 provisional: false,
             },

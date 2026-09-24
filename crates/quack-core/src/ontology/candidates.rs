@@ -5,7 +5,7 @@ use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
 use super::store::{self, Acceptance, Revision};
 use super::{Class, Ontology, ROOT_CLASS};
 use crate::error::{Error, Record, Result};
-use crate::ids::CandidateId;
+use crate::ids::{CandidateId, ClassId};
 use crate::prefix::PrefixMatch;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::NonBlankText;
@@ -275,8 +275,8 @@ fn row_from(row: &duckdb::Row<'_>) -> duckdb::Result<CandidateRow> {
         id: row.get(0)?,
         kind: row.get(1)?,
         proposal: serde_json::from_str(&proposal).unwrap_or(Proposal::Class(Class {
-            id: String::from("unparseable"),
-            parent: String::from(ROOT_CLASS),
+            id: ClassId::from("unparseable"),
+            parent: ClassId::from(String::from(ROOT_CLASS)),
             label: None,
             description: None,
             key: None,
@@ -451,8 +451,8 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
         let thin = Candidate {
             proposal: Proposal::Class(Class {
-                id: String::from("rumor"),
-                parent: String::from(ROOT_CLASS),
+                id: ClassId::from("rumor"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
                 label: None,
                 description: None,
                 key: None,

@@ -14,7 +14,7 @@ use crate::embedding::Input;
 use crate::error::{Error, Result};
 use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, Tally, extractions};
 use crate::graph::NormalizedLabel;
-use crate::ids::{ChunkId, DocumentId};
+use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
 use crate::llm::Embeddings;
 use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
@@ -636,8 +636,8 @@ fn propose_classes(
             .unwrap_or_else(|| String::from(ROOT_CLASS));
         candidates.push(Candidate {
             proposal: Proposal::Class(Class {
-                id: class.clone(),
-                parent,
+                id: ClassId::from(class.clone()),
+                parent: ClassId::from(parent),
                 label: None,
                 description: None,
                 key: None,
@@ -683,11 +683,11 @@ fn propose_relations(
         }
         candidates.push(Candidate {
             proposal: Proposal::Relation(Relation {
-                id: id.clone(),
+                id: RelationId::from(id.clone()),
                 label: None,
                 description: None,
-                domain: evidence.hierarchy.generalize(&stat.domains),
-                range: evidence.hierarchy.generalize(&stat.ranges),
+                domain: ClassId::from(evidence.hierarchy.generalize(&stat.domains)),
+                range: ClassId::from(evidence.hierarchy.generalize(&stat.ranges)),
             }),
             evidence: support.evidence(serde_json::json!({
                 "source": "documents",
@@ -852,14 +852,10 @@ mod tests {
             m
         });
         assert!(per_doc.values().all(|n| *n == 2), "{per_doc:?}");
-        assert!(
-            sample
-                .iter()
-                .all(|c| c.document_id != DocumentId::from("pending"))
-        );
+        assert!(sample.iter().all(|c| c.document_id != "pending"));
         let ids: Vec<&str> = sample
             .iter()
-            .filter(|c| c.document_id == DocumentId::from("doc1"))
+            .filter(|c| c.document_id == "doc1")
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["doc1-0", "doc1-2"], "evenly spaced");
@@ -933,8 +929,8 @@ mod tests {
         // Extend mode skips what exists; low support marks thin evidence.
         let mut existing = Ontology::builtin_default();
         existing.classes.push(Class {
-            id: String::from("vendor"),
-            parent: String::from("organization"),
+            id: ClassId::from("vendor"),
+            parent: ClassId::from("organization"),
             label: None,
             description: None,
             key: None,
