@@ -13,7 +13,7 @@ use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
-use super::text_to_sql::{self, PromptOptions, SystemPrompt};
+use super::text_to_sql::{self, Modeled, PromptOptions, SystemPrompt};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphResults, GraphTools,
     ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
@@ -211,11 +211,7 @@ where
 /// turn's reader connection: the two decide which tools register.
 struct PromptAndModel {
     system_prompt: String,
-    /// The graph has nodes, so `search_graph` and `find_path` can answer.
-    graph_enabled: bool,
-    /// An ontology exists, so `describe_class` has something to describe —
-    /// true even before anything has been extracted into the graph.
-    ontology_present: bool,
+    modeled: Modeled,
 }
 
 impl PromptAndModel {
@@ -225,8 +221,10 @@ impl PromptAndModel {
             .with_db(move |db| {
                 Ok(Self {
                     system_prompt: SystemPrompt::build(db, &prompt)?,
-                    graph_enabled: graph_store::status(db)?.enabled(),
-                    ontology_present: ontology_store::current(db)?.is_some(),
+                    modeled: Modeled::of(
+                        ontology_store::current(db)?.as_ref(),
+                        &graph_store::status(db)?,
+                    ),
                 })
             })
             .await
@@ -265,8 +263,7 @@ where
         } = self;
         let PromptAndModel {
             system_prompt,
-            graph_enabled,
-            ontology_present,
+            modeled,
         } = PromptAndModel::read(&reader_db, &prompt).await?;
         let outputs = TurnOutputs::new(recorder.clone());
         let window = prompt.ollama_context_cap.map_or(Window::Provider, |cap| {
@@ -278,10 +275,8 @@ where
             analysis_config,
             retrieval_config,
             graph_options,
-            graph_enabled,
-            ontology_present,
-            // Query mode never answers from an unreviewed graph.
-            exclude_provisional: prompt.mode == ChatMode::Query,
+            modeled,
+            mode: prompt.mode,
             write_policy,
             window,
             outputs: outputs.clone(),
@@ -499,9 +494,8 @@ struct BuildContext<'a> {
     analysis_config: &'a AnalysisConfig,
     retrieval_config: &'a RetrievalConfig,
     graph_options: GraphOptions,
-    graph_enabled: bool,
-    ontology_present: bool,
-    exclude_provisional: bool,
+    modeled: Modeled,
+    mode: ChatMode,
     write_policy: WritePolicy,
     window: Window,
     outputs: TurnOutputs,
@@ -526,7 +520,7 @@ impl BuildContext<'_> {
             ctx.retrieval_config,
             ctx.outputs.recorder.clone(),
         )
-        .with_graph(ctx.graph_enabled);
+        .with_model(ctx.modeled);
         let deps = ToolDeps {
             db: ctx.reader_db.clone(),
             recorder: ctx.outputs.recorder.clone(),
@@ -573,16 +567,16 @@ impl BuildContext<'_> {
         // The ontology is describable as soon as it exists: the prompt block
         // is capped, so a class the model wants the detail of may not be in it
         // even when nothing has been extracted into the graph yet.
-        if ctx.ontology_present {
+        if ctx.modeled.has_ontology() {
             builder = builder.tool(DescribeClassTool(deps));
         }
 
-        if ctx.graph_enabled {
+        if ctx.modeled.has_graph() {
             let graph = GraphTools {
                 db: ctx.reader_db.clone(),
                 embedding_model: embedding_model.clone(),
                 options: ctx.graph_options,
-                exclude_provisional: ctx.exclude_provisional,
+                mode: ctx.mode,
                 results: Arc::clone(&ctx.outputs.graph),
                 recorder: ctx.outputs.recorder.clone(),
             };

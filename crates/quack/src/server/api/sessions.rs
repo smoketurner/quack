@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
 use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
@@ -91,7 +91,7 @@ pub(crate) async fn show(
 
 #[derive(Deserialize)]
 pub(crate) struct UpdateSession {
-    pub shared: Option<bool>,
+    pub shared: Option<Sharing>,
     /// `chat` or `query`: the explicit way to change a session's mode.
     pub mode: Option<ChatMode>,
 }
@@ -109,8 +109,8 @@ pub(crate) async fn update(
         return Err(ApiError::bad_request("give shared or mode"));
     }
     let mut session = None;
-    if let Some(shared) = body.shared {
-        session = Some(access.set_session_shared(&app, &sid, shared).await?);
+    if let Some(sharing) = body.shared {
+        session = Some(access.set_session_sharing(&app, &sid, sharing).await?);
     }
     if let Some(mode) = body.mode {
         session = Some(access.set_session_mode(&app, &sid, mode).await?);
@@ -192,11 +192,11 @@ impl Access {
     }
 
     /// Share a session with every member, or take it back.
-    pub(crate) async fn set_session_shared(
+    pub(crate) async fn set_session_sharing(
         &self,
         app: &App,
         sid: &SessionId,
-        shared: bool,
+        sharing: Sharing,
     ) -> ApiResult<sessions::SessionRow> {
         let session = self
             .own_session(
@@ -209,7 +209,7 @@ impl Access {
         let db = app.workspace_db(&self.workspace.id).await?;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
-            sessions::set_session_shared(db, &session_id, shared)?;
+            sessions::set_session_sharing(db, &session_id, sharing)?;
             sessions::get_session(db, &session_id)?
                 .ok_or_else(|| Record::Session.missing(session_id.as_str()))
         })
@@ -219,7 +219,7 @@ impl Access {
             AuditAction::Share,
             Some(ResourceKind::Session.id(sid)),
             Outcome::Allowed,
-            Some(serde_json::json!({ "shared": shared })),
+            Some(serde_json::json!({ "shared": bool::from(sharing) })),
         )
         .await?;
         Ok(updated)

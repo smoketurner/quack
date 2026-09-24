@@ -29,7 +29,7 @@ use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
-use quack_core::llm::oauth::{LoginOptions, LoginPrompt, TokenManager};
+use quack_core::llm::oauth::{LoginFlow, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
@@ -37,7 +37,7 @@ use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
-use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
+use quack_core::storage::workspace::{DocumentSource, Pinning, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
@@ -1008,10 +1008,12 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             device_code,
         } => {
             let manager = TokenManager::for_provider(config, &provider)?;
-            let options = LoginOptions {
-                device_code: device_code || !browser_can_open(),
+            let flow = if device_code || !browser_can_open() {
+                LoginFlow::DeviceCode
+            } else {
+                LoginFlow::Configured
             };
-            let token = manager.login(options, &show_login_prompt).await?;
+            let token = manager.login(flow, &show_login_prompt).await?;
             let mut out = stdout.lock();
             writeln!(
                 out,
@@ -1044,16 +1046,12 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             }
             for name in names {
                 let status = TokenManager::for_provider(config, name)?.status().await?;
-                let state = match status.expires_at {
-                    Some(at) if status.logged_in => format!(
-                        "logged in, token expires {at}{}",
-                        if status.has_refresh_token {
-                            ", refreshable"
-                        } else {
-                            ", no refresh token"
-                        }
+                let state = match status.token {
+                    Some(token) => format!(
+                        "logged in, token expires {}, {}",
+                        token.expires_at, token.renewal
                     ),
-                    _ => format!("not logged in; run `quack auth login {name}`"),
+                    None => format!("not logged in; run `quack auth login {name}`"),
                 };
                 writeln!(out, "{name}: {state} (key in {})", status.key_location)?;
             }
@@ -1295,11 +1293,11 @@ fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
 fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
     if let Some(prefix) = args.pin.as_deref() {
         let id = find_document(db, prefix)?;
-        db.set_document_pinned(&id, true)?;
+        db.set_document_pinning(&id, Pinning::Pinned)?;
     }
     if let Some(prefix) = args.unpin.as_deref() {
         let id = find_document(db, prefix)?;
-        db.set_document_pinned(&id, false)?;
+        db.set_document_pinning(&id, Pinning::Unpinned)?;
     }
     if let Some(prefix) = args.delete.as_deref() {
         let id = find_document(db, prefix)?;
@@ -1568,7 +1566,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     if pin {
         let id = result.document_id.clone();
         ws_db
-            .run(move |db| db.set_document_pinned(&id, true))
+            .run(move |db| db.set_document_pinning(&id, Pinning::Pinned))
             .await?;
     }
 

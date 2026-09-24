@@ -350,7 +350,7 @@ async fn device_code_login_polls_until_approved_and_caches() {
             v.push(p);
         }
     };
-    let token = m.login(LoginOptions::default(), &notify).await;
+    let token = m.login(LoginFlow::Configured, &notify).await;
     assert!(token.is_ok_and(|t| t.access_token.expose_secret() == "device-access"));
     let seen = prompts.into_inner().unwrap_or_default();
     assert!(matches!(
@@ -361,8 +361,7 @@ async fn device_code_login_polls_until_approved_and_caches() {
     assert_eq!(idp.state.pending_polls.load(Ordering::SeqCst), 0);
     let status = m.status().await;
     assert!(
-        status.is_ok_and(|s| s.logged_in
-            && !s.has_refresh_token
+        status.is_ok_and(|s| s.token.is_some_and(|t| t.renewal == Renewal::Relogin)
             && s.key_location == KeyLocation::File)
     );
     assert!(
@@ -371,7 +370,7 @@ async fn device_code_login_polls_until_approved_and_caches() {
             .is_ok_and(|t| t.expose_secret() == "device-access")
     );
     assert!(m.logout().await.is_ok());
-    assert!(m.status().await.is_ok_and(|s| !s.logged_in));
+    assert!(m.status().await.is_ok_and(|s| s.token.is_none()));
     assert!(m.access_token().await.is_err());
 }
 
@@ -385,7 +384,7 @@ async fn browser_login_rejects_bad_state_then_accepts_the_code() {
         let m = Arc::clone(&m);
         tokio::spawn(async move {
             let notify = move |p: LoginPrompt| drop(tx.send(p));
-            m.login(LoginOptions::default(), &notify).await
+            m.login(LoginFlow::Configured, &notify).await
         })
     };
     let Some(LoginPrompt::Browser { url }) = rx.recv().await else {
@@ -438,7 +437,7 @@ async fn browser_login_reports_the_issuer_error() {
         let m = Arc::clone(&m);
         tokio::spawn(async move {
             let notify = move |p: LoginPrompt| drop(tx.send(p));
-            m.login(LoginOptions::default(), &notify).await
+            m.login(LoginFlow::Configured, &notify).await
         })
     };
     let Some(LoginPrompt::Browser { url }) = rx.recv().await else {
@@ -475,7 +474,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         device_authorization: None,
     };
     assert!(m.endpoints.set(endpoints).is_ok());
-    let err = m.login(LoginOptions::default(), &|_| {}).await.err();
+    let err = m.login(LoginFlow::Configured, &|_| {}).await.err();
     assert!(err.is_some_and(|e| e.to_string().contains("no device_authorization_endpoint")));
 }
 

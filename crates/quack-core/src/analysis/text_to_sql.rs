@@ -1,7 +1,7 @@
 use crate::analysis::policy::WritePolicy;
 use crate::error::Result;
-use crate::graph::store as graph_store;
-use crate::ontology::store as ontology_store;
+use crate::graph::{GraphStatus, store as graph_store};
+use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::WorkspaceDb;
 use std::fmt::Write;
@@ -86,6 +86,49 @@ const SAMPLED_COLUMNS: usize = 20;
 /// A sample cell longer than this is cut, with an ellipsis.
 const SAMPLE_CELL_CHARS: usize = 60;
 
+/// How far the workspace's knowledge model goes, which decides the
+/// ontology and graph tools a turn registers and the guidance the prompt
+/// gives for them. A graph is built from an ontology, so each level has
+/// what the one before it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modeled {
+    Nothing,
+    /// An ontology exists, so `describe_class` has something to describe,
+    /// even before anything has been extracted into the graph.
+    Ontology,
+    /// The graph has nodes, so `search_graph` and `find_path` can answer.
+    Graph,
+}
+
+impl Modeled {
+    #[must_use]
+    pub fn of(ontology: Option<&Ontology>, graph: &GraphStatus) -> Self {
+        if graph.enabled() {
+            Self::Graph
+        } else if ontology.is_some() {
+            Self::Ontology
+        } else {
+            Self::Nothing
+        }
+    }
+
+    #[must_use]
+    pub fn has_ontology(self) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Ontology | Self::Graph => true,
+        }
+    }
+
+    #[must_use]
+    pub fn has_graph(self) -> bool {
+        match self {
+            Self::Nothing | Self::Ontology => false,
+            Self::Graph => true,
+        }
+    }
+}
+
 impl SystemPrompt {
     /// The prompt for `db` under `options`.
     ///
@@ -118,7 +161,7 @@ impl SystemPrompt {
 
         let ontology = ontology_store::current(db)?;
         let graph = graph_store::status(db)?;
-        prompt.tool_guidance(graph.enabled(), ontology.is_some());
+        prompt.tool_guidance(Modeled::of(ontology.as_ref(), &graph));
 
         let version = db.duckdb_version()?;
         writeln!(
@@ -181,7 +224,7 @@ impl SystemPrompt {
     /// only when the graph tools do and the `describe_class` line only when
     /// an ontology exists (design doc 7.2), since guidance for a tool the
     /// model cannot call is worse than none.
-    fn tool_guidance(&mut self, graph_enabled: bool, ontology_present: bool) {
+    fn tool_guidance(&mut self, modeled: Modeled) {
         self.text.push_str(
             "When answering analytical questions about structured data:\n\
              1. First use list_tables or describe_table to understand the available data; run \
@@ -206,7 +249,7 @@ impl SystemPrompt {
              4. Do not write a Sources or References section; one is appended for you from the markers\n\n",
         );
 
-        if ontology_present {
+        if modeled.has_ontology() {
             self.text.push_str(
                 "The ontology block below is capped. describe_class gives one class in full: what \
                  it inherits, its subclasses, its typed properties with their enum values, the \
@@ -216,7 +259,7 @@ impl SystemPrompt {
             );
         }
 
-        if graph_enabled {
+        if modeled.has_graph() {
             self.text.push_str(
                 "When answering questions about how entities relate:\n\
                  1. Call search_graph with an entity's name for what it connects to, or with an \
@@ -433,12 +476,12 @@ pub fn ollama_context_size(prompt_chars: usize, cap: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::Properties;
     use crate::graph::store::NewNode;
+    use crate::graph::{Properties, Standing};
     use crate::ids::{ChunkId, ClassId, DocumentId};
     use crate::ontology::Ontology;
     use crate::ontology::store::Revision;
-    use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
+    use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning};
 
     fn db() -> WorkspaceDb {
         WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
@@ -447,6 +490,26 @@ mod tests {
     #[expect(clippy::panic, reason = "test helper: in-memory DuckDB must open")]
     fn open_failed(msg: &str) -> WorkspaceDb {
         panic!("in-memory DuckDB failed to open: {msg}");
+    }
+
+    /// A graph with nodes is the top level whatever else is there; an
+    /// ontology alone gives `describe_class` but not the graph tools.
+    #[test]
+    fn modeled_is_the_furthest_level_the_workspace_reaches() {
+        let ontology = Ontology::builtin_default();
+        let empty = GraphStatus::default();
+        let built = GraphStatus {
+            nodes: 3,
+            ..GraphStatus::default()
+        };
+        assert_eq!(Modeled::of(None, &empty), Modeled::Nothing);
+        assert_eq!(Modeled::of(Some(&ontology), &empty), Modeled::Ontology);
+        assert_eq!(Modeled::of(Some(&ontology), &built), Modeled::Graph);
+        let levels = [Modeled::Nothing, Modeled::Ontology, Modeled::Graph];
+        assert_eq!(
+            levels.map(|m| (m.has_ontology(), m.has_graph())),
+            [(false, false), (true, false), (true, true)]
+        );
     }
 
     fn options(mode: ChatMode, pinned: u32) -> PromptOptions {
@@ -483,7 +546,7 @@ mod tests {
                 label: String::from("Acme"),
                 class_id: ClassId::from("organization"),
                 properties: Properties::default(),
-                provisional: false,
+                standing: Standing::Reviewed,
             },
         )
         .unwrap();
@@ -534,7 +597,7 @@ mod tests {
                 label: String::from("Acme"),
                 class_id: ClassId::from("organization"),
                 properties: Properties::default(),
-                provisional: false,
+                standing: Standing::Reviewed,
             },
         )
         .unwrap();
@@ -659,9 +722,9 @@ mod tests {
             })
             .unwrap();
         }
-        db.set_document_pinned(&DocumentId::from("d1"), true)
+        db.set_document_pinning(&DocumentId::from("d1"), Pinning::Pinned)
             .unwrap();
-        db.set_document_pinned(&DocumentId::from("d2"), true)
+        db.set_document_pinning(&DocumentId::from("d2"), Pinning::Pinned)
             .unwrap();
         // Budget of 20 tokens fits rules.md (~6 tokens) but not big.md (100).
         let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 20)).unwrap();
@@ -673,7 +736,7 @@ mod tests {
             prompt.contains("--- big.md (omitted: pinned text exceeds the 20-token budget) ---")
         );
         assert!(
-            db.set_document_pinned(&DocumentId::from("missing"), true)
+            db.set_document_pinning(&DocumentId::from("missing"), Pinning::Pinned)
                 .is_err()
         );
     }

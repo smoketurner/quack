@@ -299,7 +299,7 @@ async fn run_extract(
         .run(ontology_store::current)
         .await?
         .context("no ontology yet: run `quack ontology init` or `quack ontology propose` first")?;
-    let provisional = db.run(ontology_store::current_is_auto_accepted).await?;
+    let standing = db.run(ontology_store::current_standing).await?;
     if args.reset {
         db.run(graph_store::clear).await?;
         writeln!(out, "Cleared the graph.")?;
@@ -314,7 +314,7 @@ async fn run_extract(
         } else {
             let mapped = ontology.clone();
             let summaries = db
-                .run(move |db| tables::extract(db, &mapped, provisional))
+                .run(move |db| tables::extract(db, &mapped, standing))
                 .await?;
             for summary in summaries {
                 match &summary.skipped {
@@ -350,7 +350,7 @@ async fn run_extract(
                     db,
                     &plan,
                     &ontology,
-                    provisional,
+                    standing,
                     ExtractionRun {
                         extractor: extractor.as_ref(),
                         concurrency: config.analysis.extraction_concurrency,

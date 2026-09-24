@@ -30,7 +30,7 @@ use quack_core::llm::CancellationToken;
 use quack_core::okf::{Bundle, BundleFile};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope,
+    AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope, UserKind,
 };
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
@@ -122,10 +122,10 @@ impl Harness {
             .await
     }
 
-    async fn user(&self, name: &str, admin: bool) -> UserId {
+    async fn user(&self, name: &str, kind: UserKind) -> UserId {
         self.app
             .control
-            .create_user(name, "pw", admin)
+            .create_user(name, "pw", kind)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()))
             .id
@@ -208,7 +208,7 @@ async fn unauthenticated_requests_are_rejected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn login_sets_a_cookie_and_audits_both_outcomes() {
     let h = harness(false).await;
-    let alice = h.user("alice", false).await;
+    let alice = h.user("alice", UserKind::Standard).await;
     let (status, _) = h
         .call(
             Method::POST,
@@ -269,9 +269,9 @@ async fn login_sets_a_cookie_and_audits_both_outcomes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn workspaces_follow_membership_roles_and_admin_limits() {
     let h = harness(false).await;
-    h.user("root", true).await;
-    let bob = h.user("bob", false).await;
-    let carol = h.user("carol", false).await;
+    h.user("root", UserKind::Admin).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    let carol = h.user("carol", UserKind::Standard).await;
     let root = h.login("root").await;
     let bob_token = h.login("bob").await;
     let carol_token = h.login("carol").await;
@@ -431,7 +431,7 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["classification"], "secret");
-    let dave_root = h.user("dave", true).await;
+    let dave_root = h.user("dave", UserKind::Admin).await;
     let dave = h.login("dave").await;
     let (status, _) = h.get(&format!("/api/v1/workspaces/{ws}"), &dave).await;
     assert_eq!(status, StatusCode::OK);
@@ -480,8 +480,8 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
-    let viewer = h.user("viewer", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
     let ws = h.workspace("data", &owner).await;
     h.app
         .control
@@ -599,7 +599,7 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
 #[tokio::test]
 async fn sql_refuses_to_create_a_temp_table() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("data", &owner).await;
     let owner_token = h.login("owner").await;
     let (status, body) = h
@@ -619,7 +619,7 @@ async fn sql_refuses_to_create_a_temp_table() {
 #[tokio::test]
 async fn sql_bypass_temp_tables_are_still_visible_after_the_reader_degrades() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("data", &owner).await;
     let owner_token = h.login("owner").await;
     let sql = |s: &str| serde_json::json!({ "sql": s });
@@ -655,7 +655,7 @@ async fn read_requests_never_wait_for_the_writer() {
     use quack_core::storage::workspace::WorkspaceDb;
 
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("data", &owner).await;
     let writer = h
         .app
@@ -721,7 +721,7 @@ fn multipart(filename: &str, content_type: &str, data: &str) -> (String, Vec<u8>
 #[tokio::test(flavor = "multi_thread")]
 async fn uploads_are_queued_processed_pinned_and_deleted() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("docs", &owner).await;
     let token = h.login("owner").await;
     let base = format!("/api/v1/workspaces/{ws}/documents");
@@ -874,7 +874,7 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("a", &owner).await;
     let other = h.workspace("b", &owner).await;
     let (read_token, _) = h
@@ -976,8 +976,8 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
 #[tokio::test(flavor = "multi_thread")]
 async fn query_endpoints_fail_cleanly_without_a_chat_model() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
-    let viewer = h.user("viewer", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
     let ws = h.workspace("q", &owner).await;
     h.app
         .control
@@ -1095,9 +1095,9 @@ async fn a_failed_first_turn_leaves_no_empty_session_behind() {
 async fn sessions_are_deleted_by_their_creator_or_an_owner() {
     use quack_core::storage::sessions::{ChatMode, create_session};
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
-    let viewer = h.user("viewer", false).await;
-    let other = h.user("other", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
+    let other = h.user("other", UserKind::Standard).await;
     let ws = h.workspace("s", &owner).await;
     for u in [&viewer, &other] {
         h.app
@@ -1327,7 +1327,7 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_records_answer_404() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("m", &owner).await;
     let token = h.login("owner").await;
     let base = format!("/api/v1/workspaces/{ws}");
@@ -1370,8 +1370,8 @@ async fn missing_records_answer_404() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ontology_is_versioned_over_the_api_and_the_web_page() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
-    let viewer = h.user("viewer", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
     let ws = h.workspace("o", &owner).await;
     h.app
         .control
@@ -1770,8 +1770,8 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_endpoints_manage_users_and_read_the_audit() {
     let h = harness(false).await;
-    h.user("root", true).await;
-    h.user("bob", false).await;
+    h.user("root", UserKind::Admin).await;
+    h.user("bob", UserKind::Standard).await;
     let root = h.login("root").await;
     let bob = h.login("bob").await;
     let (status, _) = h.get("/api/v1/admin/users", &bob).await;
@@ -1864,7 +1864,7 @@ async fn responses_are_not_cached_unless_the_handler_sets_a_policy() {
         assert_eq!(get(header::PRAGMA), Some("no-cache"), "{what}");
     }
     let h = harness(false).await;
-    let alice = h.user("alice", false).await;
+    let alice = h.user("alice", UserKind::Standard).await;
     let ws = h.workspace("docs", &alice).await;
 
     // Login sets the session cookie; its response is not kept either.
@@ -2009,7 +2009,7 @@ fn location(headers: &axum::http::HeaderMap) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     let h = harness(false).await;
-    h.user("root", true).await;
+    h.user("root", UserKind::Admin).await;
     let (status, _, headers) = h.page("/workspaces", None).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), "/login");
@@ -2255,7 +2255,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     assert!(html.contains("no such workspace"), "{html}");
 
     // A non-member sees the 403 page, not the content.
-    h.user("bob", false).await;
+    h.user("bob", UserKind::Standard).await;
     let (_, _, headers) = h.form("/login", None, "username=bob&password=pw").await;
     let bob = headers
         .get(header::SET_COOKIE)
@@ -2409,7 +2409,7 @@ async fn mcp_session(h: &Harness, ws: &WorkspaceId, token: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("mcp", &owner).await;
     let (read_token, _) = h
         .app
@@ -2628,7 +2628,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("data", &owner).await;
     let token = h.login("owner").await;
     let (status, _) = h
@@ -3342,7 +3342,7 @@ async fn an_idle_session_expires_and_is_audited() {
     // Zero is "already idle", so the very next request is past the bound.
     config.server.session_idle_minutes = 0;
     let h = harness_with(false, config).await;
-    h.user("root", true).await;
+    h.user("root", UserKind::Admin).await;
     let token = h.login("root").await;
 
     let (status, body) = h.get("/api/v1/workspaces", &token).await;
@@ -3384,7 +3384,7 @@ async fn a_session_expires_at_its_absolute_age_however_busy() {
     // Generous idle bound, so only the absolute one can fire.
     config.server.session_idle_minutes = 600;
     let h = harness_with(false, config).await;
-    h.user("root", true).await;
+    h.user("root", UserKind::Admin).await;
     let token = h.login("root").await;
 
     let (status, body) = h.get("/api/v1/workspaces", &token).await;
@@ -3404,7 +3404,7 @@ async fn a_session_expires_at_its_absolute_age_however_busy() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_session_cookie_is_secure_off_loopback_and_carries_max_age() {
     let h = harness(false).await;
-    h.user("root", true).await;
+    h.user("root", UserKind::Admin).await;
 
     let (status, _, headers) = h
         .form_from("/login", "127.0.0.1:51000", "username=root&password=pw")
@@ -3460,7 +3460,7 @@ async fn rate_limiter_state_is_swept_repeatedly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_login_form_is_rate_limited_and_healthz_is_not() {
     let h = harness(false).await;
-    h.user("root", true).await;
+    h.user("root", UserKind::Admin).await;
     // An unknown username, so each rejection costs only a password hash.
     let form = "username=nobody&password=wrong";
     // The attempts go out together. A sequential loop races the bucket
@@ -3498,10 +3498,10 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
     use quack_core::jobs::{JobKind, JobSpec, JobState, Lane};
 
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
-    let member = h.user("member", false).await;
-    let other = h.user("other", false).await;
-    let viewer = h.user("viewer", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let member = h.user("member", UserKind::Standard).await;
+    let other = h.user("other", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
     let ws = h.workspace("work", &owner).await;
     let elsewhere = h.workspace("elsewhere", &owner).await;
     for (user, role) in [
@@ -3637,7 +3637,7 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
     use quack_core::jobs::{JobKind, JobSpec, Lane};
 
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("busy", &owner).await;
     let token = h.login("owner").await;
     let release = CancellationToken::new();
@@ -3698,7 +3698,7 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_jobs_page_follows_the_job_stream_with_the_session_cookie() {
     let h = harness(false).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("live", &owner).await;
     let cookie = h.login("owner").await;
     let (status, html, _) = h.page(&format!("/w/{ws}/jobs"), Some(&cookie)).await;
@@ -3774,8 +3774,8 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         },
     );
     let h = harness_with(false, config).await;
-    let owner = h.user("owner", false).await;
-    let viewer = h.user("viewer", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
     let ws = h.workspace("vectors", &owner).await;
     h.app
         .control
@@ -3936,7 +3936,7 @@ impl RunReport for Done {
 #[tokio::test(flavor = "multi_thread")]
 async fn background_runs_audit_their_start_and_end_under_one_id() {
     let h = harness(true).await;
-    let owner = h.user("owner", false).await;
+    let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("runs", &owner).await;
     let workspace = h
         .app
@@ -4065,8 +4065,8 @@ async fn web_session(h: &Harness, username: &str) -> String {
 #[tokio::test]
 async fn web_forms_follow_the_api_rules_and_say_why() {
     let h = harness(false).await;
-    h.user("root", true).await;
-    h.user("bob", false).await;
+    h.user("root", UserKind::Admin).await;
+    h.user("bob", UserKind::Standard).await;
     let cookie = web_session(&h, "root").await;
 
     // Workspace names: the API's validation and message.

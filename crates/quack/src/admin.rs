@@ -12,7 +12,7 @@ use quack_core::ids::WorkspaceId;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Expiry, Outcome, ResourceKind,
-    Role, Scope, WorkspaceRow,
+    Role, Scope, UserKind, WorkspaceRow,
 };
 
 /// Server administration: users, tokens, membership, and the audit log.
@@ -143,7 +143,9 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
     match action {
         UserAction::Add { username, admin } => {
             let password = read_password(&format!("Password for {username}: "))?;
-            let user = control.create_user(&username, &password, admin).await?;
+            let user = control
+                .create_user(&username, &password, UserKind::from(admin))
+                .await?;
             let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
                 .on(ResourceKind::User.id(user.id.as_str()));
             control.record_audit(&entry).await?;

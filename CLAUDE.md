@@ -241,7 +241,7 @@ to the chunks that entity was extracted from (`graph::store::chunks_of_nodes` in
 `storage::workspace::ChunkScope`, which bounds both the vector and the BM25 leg), and every
 hit names the entities the graph took from it (`graph::store::entities_of_chunks`). An
 entity that exists only in mapped table rows says so instead of returning nothing. The
-`entity` argument is offered only while the graph has nodes (`SearchDocumentsTool::with_graph`),
+`entity` argument is offered only while the graph has nodes (`SearchDocumentsTool::with_model`, `text_to_sql::Modeled`),
 like the graph tools themselves. Ollama embedding requests go through `llm::OllamaEmbedder`,
 not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
 

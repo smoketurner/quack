@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::NormalizedLabel;
+use super::{NormalizedLabel, Standing};
 use crate::error::{Error, Result};
 use crate::ids::{EdgeId, NodeId};
 use crate::ontology::{Mapping, Ontology};
@@ -50,7 +50,7 @@ pub const BATCH_ROWS: u32 = 5_000;
 pub fn extract(
     db: &WorkspaceDb,
     ontology: &Ontology,
-    provisional: bool,
+    standing: Standing,
 ) -> Result<Vec<MappingSummary>> {
     let mut out = Vec::with_capacity(ontology.mappings.len());
     for mapping in &ontology.mappings {
@@ -60,7 +60,7 @@ pub fn extract(
         };
         let mut offset = 0;
         loop {
-            let (batch, more) = extract_batch(db, mapping, provisional, offset)?;
+            let (batch, more) = extract_batch(db, mapping, standing, offset)?;
             total.absorb(&batch);
             if !more {
                 break;
@@ -84,7 +84,7 @@ pub fn extract(
 pub fn extract_batch(
     db: &WorkspaceDb,
     mapping: &Mapping,
-    provisional: bool,
+    standing: Standing,
     offset: u64,
 ) -> Result<(MappingSummary, bool)> {
     if offset == 0 && !db.list_tables()?.iter().any(|t| t == &mapping.table) {
@@ -100,7 +100,7 @@ pub fn extract_batch(
     }
     db.under_timeout(|db| {
         let tx = db.connection().unchecked_transaction()?;
-        let outcome = extract_rows(db, mapping, provisional, offset)?;
+        let outcome = extract_rows(db, mapping, standing, offset)?;
         tx.commit()?;
         Ok(outcome)
     })
@@ -207,7 +207,7 @@ impl Staged {
 fn extract_rows(
     db: &WorkspaceDb,
     mapping: &Mapping,
-    provisional: bool,
+    standing: Standing,
     offset: u64,
 ) -> Result<(MappingSummary, bool)> {
     let mut columns: Vec<&str> = vec![mapping.key.as_str()];
@@ -283,7 +283,7 @@ fn extract_rows(
             staged.summary.edges = staged.summary.edges.saturating_add(1);
         }
     }
-    staged.write(db, &mapping.table, provisional)?;
+    staged.write(db, &mapping.table, standing)?;
     Ok((staged.summary, more))
 }
 
@@ -292,9 +292,9 @@ impl Staged {
     /// then one statement per kind. Nodes that exist keep their id and their
     /// own property values (incoming keys only fill gaps); edges that exist
     /// keep their id; provenance is `INSERT OR IGNORE`.
-    fn write(&self, db: &WorkspaceDb, table: &str, provisional: bool) -> Result<()> {
+    fn write(&self, db: &WorkspaceDb, table: &str, standing: Standing) -> Result<()> {
         self.fill_scratch_tables(db)?;
-        merge_scratch_tables(db, table, provisional)
+        merge_scratch_tables(db, table, standing)
     }
 
     fn fill_scratch_tables(&self, db: &WorkspaceDb) -> Result<()> {
@@ -358,7 +358,7 @@ impl Staged {
     }
 }
 
-fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Result<()> {
+fn merge_scratch_tables(db: &WorkspaceDb, table: &str, standing: Standing) -> Result<()> {
     let conn = db.connection();
     // Nodes: fill in missing property keys and clear the provisional flag
     // on the ones that exist, insert the rest.
@@ -371,7 +371,7 @@ fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Res
            AND (json_merge_patch(t.properties::JSON, coalesce(_quack_graph_nodes.properties, '{}'::JSON))::VARCHAR \
                   <> coalesce(_quack_graph_nodes.properties, '{}'::JSON)::VARCHAR \
                 OR (_quack_graph_nodes.provisional AND NOT ?))",
-        duckdb::params![provisional, provisional],
+        duckdb::params![standing, standing],
     )?;
     conn.execute(
         "INSERT INTO _quack_graph_nodes (id, label, normalized_label, class_id, properties, provisional) \
@@ -379,7 +379,7 @@ fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Res
          FROM _quack_tmp_graph_nodes t \
          WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n \
                            WHERE n.normalized_label = t.normalized_label AND n.class_id = t.class_id)",
-        duckdb::params![provisional],
+        duckdb::params![standing],
     )?;
     conn.execute(
         "INSERT OR IGNORE INTO _quack_provenance (subject_id, document_id, chunk_id, table_name, row_key, confidence) \
@@ -398,7 +398,7 @@ fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Res
            AND _quack_graph_edges.source_node_id = s.id AND _quack_graph_edges.target_node_id = g.id \
            AND _quack_graph_edges.relation_id = t.relation_id \
            AND _quack_graph_edges.provisional AND NOT ?",
-        duckdb::params![provisional],
+        duckdb::params![standing],
     )?;
     conn.execute(
         "INSERT INTO _quack_graph_edges (id, source_node_id, target_node_id, relation_id, properties, provisional) \
@@ -408,7 +408,7 @@ fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Res
          JOIN _quack_graph_nodes g ON g.normalized_label = t.target_norm AND g.class_id = t.target_class \
          WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_edges e \
                            WHERE e.source_node_id = s.id AND e.target_node_id = g.id AND e.relation_id = t.relation_id)",
-        duckdb::params![provisional],
+        duckdb::params![standing],
     )?;
     conn.execute(
         "INSERT OR IGNORE INTO _quack_provenance (subject_id, document_id, chunk_id, table_name, row_key, confidence) \
