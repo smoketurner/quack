@@ -710,7 +710,7 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
     let (name, provider) = (model.provider_name, model.provider);
     match crate::llm::bedrock::client(name, provider).await {
         Ok(_) => {
-            let region = match crate::llm::bedrock::sdk_config(name, provider).await {
+            let region = match Box::pin(crate::llm::bedrock::sdk_config(name, provider)).await {
                 Ok(sdk) => sdk.region().map(ToString::to_string).unwrap_or_default(),
                 Err(_) => String::new(),
             };

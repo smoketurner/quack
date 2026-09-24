@@ -21,7 +21,7 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant, ModelSpec,
+    AuthMode, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant, ModelSpec,
     OAuthConfig, Overrides, config_file_path,
 };
 
@@ -398,6 +398,8 @@ const PROVIDER_KEYS: &[&str] = &[
     "auth",
     "base_url",
     "api_key_env",
+    "aws_profile",
+    "region",
     "embedding_dimension",
     "max_concurrent_requests",
     "oauth",
@@ -800,6 +802,23 @@ impl EnvVar {
                     secret,
                     &format!("[providers.{name}.oauth].client_secret_env"),
                 ));
+            }
+        }
+        if config
+            .providers
+            .values()
+            .any(|p| p.auth.mode() == AuthMode::Aws)
+        {
+            // What the AWS SDK's chain reads first for a Bedrock provider.
+            for (var, purpose) in [
+                ("AWS_PROFILE", "the AWS profile when aws_profile is unset"),
+                ("AWS_REGION", "the AWS region when region is unset"),
+                (
+                    "AWS_ACCESS_KEY_ID",
+                    "static AWS credentials, ahead of any profile",
+                ),
+            ] {
+                vars.push(Self::new(var, purpose));
             }
         }
         vars

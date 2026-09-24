@@ -313,7 +313,9 @@ impl EmbeddingModel for EmbedModel {
             Self::Ollama(m) => m.embed_texts(texts).await,
             Self::OpenAi(m) => m.embed_texts(texts).await,
             Self::OpenAiOAuth(oauth) => oauth.model().await?.embed_texts(texts).await,
-            Self::Bedrock(m) => m.embed_texts(texts).await,
+            // Boxed: the AWS SDK's request future is ~25 KB, which every
+            // caller's future would otherwise carry.
+            Self::Bedrock(m) => Box::pin(m.embed_texts(texts)).await,
         }
     }
 }
@@ -883,9 +885,7 @@ async fn dispatch(
                 .await
         }
         ChatClient::Bedrock(client) => {
-            analysis
-                .run(client.completion_model(chat.model), sink)
-                .await
+            Box::pin(analysis.run(client.completion_model(chat.model), sink)).await
         }
     }
 }

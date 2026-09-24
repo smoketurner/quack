@@ -88,8 +88,10 @@ pub(crate) async fn client(
     {
         return Ok(client.clone());
     }
-    let sdk = sdk_config(name, provider).await?;
-    check_credentials(name, provider, &sdk).await?;
+    // Boxed: loading the SDK config and resolving credentials is a future of
+    // tens of kilobytes, which every caller's would otherwise carry.
+    let sdk = Box::pin(sdk_config(name, provider)).await?;
+    Box::pin(check_credentials(name, provider, &sdk)).await?;
     let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk);
     if let Some(endpoint) = &provider.base_url {
         // On the Bedrock client only: SSO and STS keep their own endpoints.
