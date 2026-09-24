@@ -1288,25 +1288,28 @@ async fn sql_csv(
         .into_response())
 }
 
-fn class_rows(ontology: &Ontology) -> Vec<ClassRow> {
-    fn walk(ontology: &Ontology, parent: &str, depth: usize, out: &mut Vec<ClassRow>) {
-        for class in ontology.classes.iter().filter(|c| c.parent == parent) {
-            out.push(ClassRow {
-                depth,
-                id: class.id.clone(),
-                key: class.key.clone(),
-                properties: ontology
-                    .class_properties(&class.id)
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            });
-            walk(ontology, &class.id, depth.saturating_add(1), out);
+impl ClassRow {
+    /// The ontology's classes depth-first from the root, each with its depth.
+    fn tree(ontology: &Ontology) -> Vec<Self> {
+        fn walk(ontology: &Ontology, parent: &str, depth: usize, out: &mut Vec<ClassRow>) {
+            for class in ontology.classes.iter().filter(|c| c.parent == parent) {
+                out.push(ClassRow {
+                    depth,
+                    id: class.id.clone(),
+                    key: class.key.clone(),
+                    properties: ontology
+                        .class_properties(&class.id)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+                walk(ontology, &class.id, depth.saturating_add(1), out);
+            }
         }
+        let mut out = Vec::new();
+        walk(ontology, ROOT_CLASS, 0, &mut out);
+        out
     }
-    let mut out = Vec::new();
-    walk(ontology, ROOT_CLASS, 0, &mut out);
-    out
 }
 
 async fn ontology_page(
@@ -1354,7 +1357,7 @@ async fn ontology_page(
                 .saturating_mul(CANDIDATES_PER_PAGE),
         )
         .take(CANDIDATES_PER_PAGE)
-        .map(candidate_view)
+        .map(CandidateView::from_row)
         .collect();
     let json = match &ontology {
         Some(o) => o.to_json()?,
@@ -1362,7 +1365,7 @@ async fn ontology_page(
     };
     html(&OntologyPage {
         page: Page::in_workspace(&app, "Ontology", &access),
-        classes: ontology.as_ref().map(class_rows).unwrap_or_default(),
+        classes: ontology.as_ref().map(ClassRow::tree).unwrap_or_default(),
         ontology,
         json,
         versions,
@@ -1402,143 +1405,149 @@ async fn ontology_decide_many(
     Ok(Flash::after(back, decided, |_| None).into_response())
 }
 
-/// The one-line detail of a model- or bundle-sourced proposal.
-fn proposal_detail(proposal: &Proposal) -> String {
-    match proposal {
-        Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
-        Proposal::Class(cl) => format!("parent {}", cl.parent),
-        Proposal::Property { class, property } => {
-            format!("{}: {}", class, property.kind.as_str())
+/// A review-queue row: what the candidate is and the evidence for it.
+impl CandidateView {
+    /// The one-line detail of a model- or bundle-sourced proposal.
+    fn proposal_detail(proposal: &Proposal) -> String {
+        match proposal {
+            Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
+            Proposal::Class(cl) => format!("parent {}", cl.parent),
+            Proposal::Property { class, property } => {
+                format!("{}: {}", class, property.kind.as_str())
+            }
+            Proposal::Mapping(_) => String::new(),
         }
-        Proposal::Mapping(_) => String::new(),
     }
-}
 
-/// "N bundle files, e.g. ..." for an OKF-bundle candidate.
-fn bundle_evidence(e: &serde_json::Value) -> String {
-    let examples = e
-        .get("examples")
-        .and_then(|x| x.as_array())
-        .map(|xs| {
-            xs.iter()
-                .filter_map(|x| x.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    format!(
-        "{} bundle files · e.g. {examples}",
-        e.get("files").map(ToString::to_string).unwrap_or_default()
-    )
-}
-
-/// "N mentions in M documents, e.g. ..." for a document-evidence candidate.
-fn document_evidence(e: &serde_json::Value) -> String {
-    let get = |k: &str| e.get(k).map(ToString::to_string).unwrap_or_default();
-    let examples = e
-        .get("examples")
-        .and_then(|x| x.as_array())
-        .map(|xs| {
-            xs.iter()
-                .filter_map(|x| {
-                    x.get("mention")
-                        .or_else(|| x.get("subject"))
-                        .or_else(|| x.get("value"))
-                        .and_then(|v| v.as_str())
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    format!(
-        "{} mentions in {} documents · e.g. {examples}",
-        get("occurrences"),
-        get("documents")
-    )
-}
-
-fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
-    let e = &c.evidence;
-    let get = |k: &str| {
-        e.get(k)
-            .map(|v| match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
+    /// "N bundle files, e.g. ..." for an OKF-bundle candidate.
+    fn bundle_evidence(e: &serde_json::Value) -> String {
+        let examples = e
+            .get("examples")
+            .and_then(|x| x.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             })
-            .unwrap_or_default()
-    };
-    let source = e.get("source").and_then(|v| v.as_str());
-    let from_documents = source == Some("documents");
-    let from_bundle = source == Some("okf");
-    let (evidence, detail) = match c.kind {
-        _ if from_bundle => (bundle_evidence(e), proposal_detail(&c.proposal)),
-        _ if from_documents => (document_evidence(e), proposal_detail(&c.proposal)),
-        ItemKind::Class => (
-            format!(
-                "table {} · {} rows · key {}",
-                get("table"),
-                get("rows"),
-                get("key_column")
+            .unwrap_or_default();
+        format!(
+            "{} bundle files · e.g. {examples}",
+            e.get("files").map(ToString::to_string).unwrap_or_default()
+        )
+    }
+
+    /// "N mentions in M documents, e.g. ..." for a document-evidence candidate.
+    fn document_evidence(e: &serde_json::Value) -> String {
+        let get = |k: &str| e.get(k).map(ToString::to_string).unwrap_or_default();
+        let examples = e
+            .get("examples")
+            .and_then(|x| x.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| {
+                        x.get("mention")
+                            .or_else(|| x.get("subject"))
+                            .or_else(|| x.get("value"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        format!(
+            "{} mentions in {} documents · e.g. {examples}",
+            get("occurrences"),
+            get("documents")
+        )
+    }
+
+    fn from_row(c: candidates::CandidateRow) -> Self {
+        let e = &c.evidence;
+        let get = |k: &str| {
+            e.get(k)
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default()
+        };
+        let source = e.get("source").and_then(|v| v.as_str());
+        let from_documents = source == Some("documents");
+        let from_bundle = source == Some("okf");
+        let (evidence, detail) = match c.kind {
+            _ if from_bundle => (Self::bundle_evidence(e), Self::proposal_detail(&c.proposal)),
+            _ if from_documents => (
+                Self::document_evidence(e),
+                Self::proposal_detail(&c.proposal),
             ),
-            String::new(),
-        ),
-        ItemKind::Property => (
-            format!(
-                "{}.{} · {} · {} distinct of {} · e.g. {}",
-                get("table"),
-                get("column"),
-                get("duckdb_type"),
-                get("distinct"),
-                get("rows"),
-                get("samples")
-            ),
-            match &c.proposal {
-                Proposal::Property { class, property } => {
-                    let values = if property.values.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", property.values.join(", "))
-                    };
-                    format!("{}: {}{values}", class, property.kind.as_str())
-                }
-                _ => String::new(),
-            },
-        ),
-        ItemKind::Relation => (
-            format!(
-                "{}.{} matches {}.{} for {} of values",
-                get("table"),
-                get("column"),
-                get("target_table"),
-                get("target_key"),
-                get("overlap")
-            ),
-            match &c.proposal {
-                Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
-                _ => String::new(),
-            },
-        ),
-        ItemKind::Mapping => (
-            format!("table {}", get("table")),
-            match &c.proposal {
-                Proposal::Mapping(m) => format!(
-                    "{} → {} (key {}, {} relations)",
-                    m.table,
-                    m.class,
-                    m.key,
-                    m.relations.len()
+            ItemKind::Class => (
+                format!(
+                    "table {} · {} rows · key {}",
+                    get("table"),
+                    get("rows"),
+                    get("key_column")
                 ),
-                _ => String::new(),
-            },
-        ),
-    };
-    CandidateView {
-        id: c.id,
-        kind: c.kind,
-        proposal_id: c.proposal.id().to_owned(),
-        confidence: format!("{:.2}", c.confidence),
-        evidence,
-        detail,
+                String::new(),
+            ),
+            ItemKind::Property => (
+                format!(
+                    "{}.{} · {} · {} distinct of {} · e.g. {}",
+                    get("table"),
+                    get("column"),
+                    get("duckdb_type"),
+                    get("distinct"),
+                    get("rows"),
+                    get("samples")
+                ),
+                match &c.proposal {
+                    Proposal::Property { class, property } => {
+                        let values = if property.values.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", property.values.join(", "))
+                        };
+                        format!("{}: {}{values}", class, property.kind.as_str())
+                    }
+                    _ => String::new(),
+                },
+            ),
+            ItemKind::Relation => (
+                format!(
+                    "{}.{} matches {}.{} for {} of values",
+                    get("table"),
+                    get("column"),
+                    get("target_table"),
+                    get("target_key"),
+                    get("overlap")
+                ),
+                match &c.proposal {
+                    Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
+                    _ => String::new(),
+                },
+            ),
+            ItemKind::Mapping => (
+                format!("table {}", get("table")),
+                match &c.proposal {
+                    Proposal::Mapping(m) => format!(
+                        "{} → {} (key {}, {} relations)",
+                        m.table,
+                        m.class,
+                        m.key,
+                        m.relations.len()
+                    ),
+                    _ => String::new(),
+                },
+            ),
+        };
+        CandidateView {
+            id: c.id,
+            kind: c.kind,
+            proposal_id: c.proposal.id().to_owned(),
+            confidence: format!("{:.2}", c.confidence),
+            evidence,
+            detail,
+        }
     }
 }
 
@@ -1667,36 +1676,40 @@ struct SettingsQuery {
     error: Option<String>,
 }
 
-async fn settings_view(
-    app: &App,
-    access: &Access,
-    new_token: Option<String>,
-    error: Option<String>,
-) -> WebResult<Response> {
-    let allowed = &access.workspace.allowed_providers;
-    let providers = app
-        .config
-        .providers
-        .keys()
-        .map(|name| (name.to_string(), allowed.permits(name.as_str())))
-        .collect();
-    let (members, tokens) = if access.permits(Need::OWN) {
-        (
-            app.control.list_members(&access.workspace.id).await?,
-            app.control.list_tokens(&access.workspace.id).await?,
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    html(&SettingsPage {
-        page: Page::in_workspace(app, "Settings", access),
-        classification: access.workspace.classification.clone(),
-        providers,
-        members,
-        tokens,
-        new_token,
-        error,
-    })
+impl SettingsPage {
+    /// The settings page: providers, and for owners the members and tokens;
+    /// `new_token` is a token just created, shown once.
+    async fn load(
+        app: &App,
+        access: &Access,
+        new_token: Option<String>,
+        error: Option<String>,
+    ) -> WebResult<Self> {
+        let allowed = &access.workspace.allowed_providers;
+        let providers = app
+            .config
+            .providers
+            .keys()
+            .map(|name| (name.to_string(), allowed.permits(name.as_str())))
+            .collect();
+        let (members, tokens) = if access.permits(Need::OWN) {
+            (
+                app.control.list_members(&access.workspace.id).await?,
+                app.control.list_tokens(&access.workspace.id).await?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Self {
+            page: Page::in_workspace(app, "Settings", access),
+            classification: access.workspace.classification.clone(),
+            providers,
+            members,
+            tokens,
+            new_token,
+            error,
+        })
+    }
 }
 
 async fn settings(
@@ -1709,7 +1722,7 @@ async fn settings(
     access
         .audit_read(&app, AuditAction::Page, "settings")
         .await?;
-    settings_view(&app, &access, None, q.error).await
+    html(&SettingsPage::load(&app, &access, None, q.error).await?)
 }
 
 #[derive(Deserialize)]
@@ -1818,7 +1831,7 @@ async fn token_create(
         .await?;
     // The secret is shown once in this response body, never in a URL where
     // browser history, proxy logs, or a Referer would keep it.
-    settings_view(&app, &access, Some(token), None).await
+    html(&SettingsPage::load(&app, &access, Some(token), None).await?)
 }
 
 async fn token_revoke(
