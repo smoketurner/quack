@@ -22,7 +22,8 @@ use sqlx::{
 use crate::config::Config;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
-use crate::ingestion::{self, IngestOutcome, NewFile, parser};
+use crate::ingestion::parser::{FileType, Load};
+use crate::ingestion::{self, IngestOutcome, NewFile, TableName};
 use crate::progress::RunControl;
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
@@ -209,15 +210,6 @@ impl SourceUrl {
     }
 }
 
-/// A table name for the workspace: `[A-Za-z0-9_]` runs, else `_`.
-fn table_name(raw: &str) -> Result<String> {
-    let name = ingestion::table_name_for(raw);
-    if name.is_empty() || name == "imported" && raw.trim().is_empty() {
-        return Err(Error::Ingestion(String::from("a table name is needed")));
-    }
-    Ok(name)
-}
-
 /// Pull the rows and load them as `request.table`. The source's rows go
 /// through `files/<table>.csv` and `read_csv_auto`, so the table is
 /// registered as a document (source `import`) and can be deleted like
@@ -238,7 +230,7 @@ pub async fn import<M: EmbeddingModel>(
     embedder: Option<&Embedder<M>>,
     control: RunControl<'_>,
 ) -> Result<ImportSummary> {
-    let table = table_name(&request.table)?;
+    let table = TableName::given(&request.table)?;
     let limit = request
         .limit
         .unwrap_or(config.import.max_rows)
@@ -254,7 +246,7 @@ pub async fn import<M: EmbeddingModel>(
                 hosts: policy.hosts,
             };
             let (filename, bytes) = control
-                .or_cancelled(download.fetch(&request.url, &table))
+                .or_cancelled(download.fetch(&request.url, table.as_str()))
                 .await?;
             (filename, bytes, Vec::new(), None)
         }
@@ -470,11 +462,11 @@ impl Download {
             .split(['?', '#'])
             .next()
             .and_then(|path| path.rsplit('/').next())
-            .filter(|name| parser::detect_file_type(name).is_structured())
+            .filter(|name| FileType::of(name).is_some_and(|t| t.load() != Load::Chunks))
             .and_then(|name| name.rsplit_once('.'))
             .map(|(_, ext)| ext.to_ascii_lowercase())
             .ok_or_else(|| {
-                let accepted: Vec<String> = parser::table_extensions()
+                let accepted: Vec<String> = FileType::table_extensions()
                     .map(|e| format!(".{e}"))
                     .collect();
                 Error::Ingestion(format!(

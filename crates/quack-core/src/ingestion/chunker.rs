@@ -1,77 +1,175 @@
+use std::ops::Range;
+
 use crate::embedding::Input;
 use crate::error::{Error, Result};
 use crate::ingestion::parser::{Extracted, Flow, Section};
 
-/// Split text into overlapping chunks by BPE token count.
+/// Splits text into overlapping windows of BPE tokens.
 ///
 /// Uses tiktoken's BPE tokenizer for accurate token boundaries. The encoding
 /// name must match one of tiktoken's supported encodings (e.g., `cl100k_base`
 /// for `OpenAI` embedding models).
-///
-/// # Errors
-///
-/// Returns an error if the encoding name is not recognized.
-pub fn chunk_text(
-    text: &str,
-    chunk_size_tokens: u32,
-    overlap_tokens: u32,
-    encoding_name: &str,
-) -> Result<Vec<String>> {
-    let chunk_size = chunk_size_tokens as usize;
-
-    if text.is_empty() || chunk_size == 0 {
-        return Ok(Vec::new());
-    }
-
-    let enc = tiktoken::get_encoding(encoding_name)
-        .ok_or_else(|| Error::Config(format!("unknown tiktoken encoding: {encoding_name}")))?;
-
-    let tokens = enc.encode(text);
-    if tokens.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut chunks = Vec::new();
-    for (start, end) in windows(tokens.len(), chunk_size, overlap_tokens as usize) {
-        chunks.push(decode(enc, &tokens, start, end)?);
-    }
-    Ok(chunks)
+#[derive(Clone, Copy)]
+pub struct Chunker {
+    bpe: &'static tiktoken::CoreBpe,
+    /// Tokens per chunk at most; zero makes no chunks.
+    size: usize,
+    /// Tokens each chunk shares with the one before it.
+    overlap: usize,
 }
 
-/// The `[start, end)` token ranges of a text `len` tokens long: windows of
-/// at most `chunk_size`, each starting `chunk_size - overlap` after the
-/// last, the final one ending at `len`.
-fn windows(len: usize, chunk_size: usize, overlap: usize) -> Vec<(usize, usize)> {
-    if len == 0 || chunk_size == 0 {
-        return Vec::new();
+impl Chunker {
+    /// Chunks of `size_tokens`, each overlapping the last by
+    /// `overlap_tokens`, counted in `encoding`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the encoding name is not recognized.
+    pub fn new(size_tokens: u32, overlap_tokens: u32, encoding: &str) -> Result<Self> {
+        let bpe = tiktoken::get_encoding(encoding)
+            .ok_or_else(|| Error::Config(format!("unknown tiktoken encoding: {encoding}")))?;
+        Ok(Self {
+            bpe,
+            size: size_tokens as usize,
+            overlap: overlap_tokens as usize,
+        })
     }
-    if len <= chunk_size {
-        return vec![(0, len)];
-    }
-    let overlap = overlap.min(chunk_size.saturating_sub(1));
-    let step = chunk_size.saturating_sub(overlap).max(1);
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < len {
-        ranges.push((start, len.min(start.saturating_add(chunk_size))));
-        let next = start.saturating_add(step);
-        if next <= start || next >= len {
-            break;
+
+    /// Split one text into chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a window falls outside the text's tokens.
+    pub fn text(&self, text: &str) -> Result<Vec<String>> {
+        if text.is_empty() || self.size == 0 {
+            return Ok(Vec::new());
         }
-        start = next;
+        let tokens = self.bpe.encode(text);
+        let mut chunks = Vec::new();
+        for window in self.windows(tokens.len()) {
+            chunks.push(self.decode(&tokens, window)?);
+        }
+        Ok(chunks)
     }
-    ranges
-}
 
-/// The text of `tokens[start..end]`. A BPE token can hold part of a
-/// multi-byte character, so a window edge may cut one; the cut bytes
-/// become U+FFFD, and the overlap carries the whole character in the
-/// neighbouring chunk.
-fn decode(enc: &tiktoken::CoreBpe, tokens: &[u32], start: usize, end: usize) -> Result<String> {
-    let slice = tokens
-        .get(start..end)
-        .ok_or_else(|| Error::Ingestion("chunk slice out of bounds".into()))?;
-    Ok(String::from_utf8_lossy(&enc.decode(slice)).into_owned())
+    /// The token ranges of a text `len` tokens long: windows of at most
+    /// `size`, each starting `size - overlap` after the last, the final one
+    /// ending at `len`.
+    fn windows(&self, len: usize) -> Vec<Range<usize>> {
+        if len == 0 || self.size == 0 {
+            return Vec::new();
+        }
+        if len <= self.size {
+            return std::iter::once(0..len).collect();
+        }
+        let overlap = self.overlap.min(self.size.saturating_sub(1));
+        let step = self.size.saturating_sub(overlap).max(1);
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        while start < len {
+            ranges.push(start..len.min(start.saturating_add(self.size)));
+            let next = start.saturating_add(step);
+            if next <= start || next >= len {
+                break;
+            }
+            start = next;
+        }
+        ranges
+    }
+
+    /// The text of `tokens[window]`. A BPE token can hold part of a
+    /// multi-byte character, so a window edge may cut one; the cut bytes
+    /// become U+FFFD, and the overlap carries the whole character in the
+    /// neighbouring chunk.
+    fn decode(&self, tokens: &[u32], window: Range<usize>) -> Result<String> {
+        let slice = tokens
+            .get(window)
+            .ok_or_else(|| Error::Ingestion("chunk slice out of bounds".into()))?;
+        Ok(String::from_utf8_lossy(&self.bpe.decode(slice)).into_owned())
+    }
+
+    /// Chunk a parsed document by its flow: sectioned sources chunk
+    /// section by section; a continuous source is windowed across its
+    /// pages under its title, else `fallback_heading`, each chunk carrying
+    /// the page it starts on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a window falls outside the text's tokens.
+    pub fn document(
+        &self,
+        extracted: &Extracted,
+        fallback_heading: Option<&str>,
+    ) -> Result<Vec<Chunk>> {
+        match extracted.flow {
+            Flow::Sectioned => self.sections(&extracted.sections),
+            Flow::Continuous => {
+                self.pages(&extracted.sections, extracted.title().or(fallback_heading))
+            }
+        }
+    }
+
+    /// Window one running text across `pages`, with the pages' tokens
+    /// joined by a blank line, so a window may span a page break. Each
+    /// chunk records the page its first token lies on and carries
+    /// `heading`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a window falls outside the text's tokens.
+    pub fn pages(&self, pages: &[Section], heading: Option<&str>) -> Result<Vec<Chunk>> {
+        let separator = self.bpe.encode("\n\n");
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut page_starts: Vec<(usize, Option<u32>)> = Vec::new();
+        for page in pages {
+            let page_tokens = self.bpe.encode(&page.text);
+            if page_tokens.is_empty() {
+                continue;
+            }
+            if !tokens.is_empty() {
+                tokens.extend_from_slice(&separator);
+            }
+            page_starts.push((tokens.len(), page.page));
+            tokens.extend_from_slice(&page_tokens);
+        }
+        let mut chunks = Vec::new();
+        for window in self.windows(tokens.len()) {
+            let page = page_starts
+                .iter()
+                .rev()
+                .find(|(first_token, _)| *first_token <= window.start)
+                .and_then(|(_, page)| *page);
+            let content = self.decode(&tokens, window)?.trim().to_owned();
+            if content.is_empty() {
+                continue;
+            }
+            chunks.push(Chunk {
+                content,
+                heading: heading.map(str::to_owned),
+                page,
+            });
+        }
+        Ok(chunks)
+    }
+
+    /// Chunk every section, carrying its heading and page onto each chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a window falls outside the text's tokens.
+    pub fn sections(&self, sections: &[Section]) -> Result<Vec<Chunk>> {
+        let mut out = Vec::new();
+        for section in sections {
+            for content in self.text(&section.text)? {
+                out.push(Chunk {
+                    content,
+                    heading: section.heading.clone(),
+                    page: section.page,
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -82,7 +180,7 @@ mod tests {
 
     #[test]
     fn empty_text_returns_empty() {
-        let result = chunk_text("", 100, 10, ENC);
+        let result = Chunker::new(100, 10, ENC).and_then(|c| c.text(""));
         assert!(result.is_ok_and(|v| v.is_empty()));
     }
 
@@ -90,7 +188,9 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn short_text_single_chunk() {
         let text = "one two three";
-        let chunks = chunk_text(text, 100, 10, ENC).unwrap();
+        let chunks = Chunker::new(100, 10, ENC)
+            .and_then(|c| c.text(text))
+            .unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks.first().map(String::as_str), Some("one two three"));
     }
@@ -100,7 +200,9 @@ mod tests {
     fn splits_into_multiple_chunks() {
         let words: Vec<String> = (0..200).map(|i| format!("word{i}")).collect();
         let text = words.join(" ");
-        let chunks = chunk_text(&text, 50, 10, ENC).unwrap();
+        let chunks = Chunker::new(50, 10, ENC)
+            .and_then(|c| c.text(&text))
+            .unwrap();
         assert!(chunks.len() > 1, "expected multiple chunks");
     }
 
@@ -110,7 +212,9 @@ mod tests {
         let words: Vec<String> = (0..200).map(|i| format!("word{i}")).collect();
         let text = words.join(" ");
         let chunk_size: u32 = 50;
-        let chunks = chunk_text(&text, chunk_size, 10, ENC).unwrap();
+        let chunks = Chunker::new(chunk_size, 10, ENC)
+            .and_then(|c| c.text(&text))
+            .unwrap();
         let enc = tiktoken::get_encoding(ENC).unwrap();
         for chunk in &chunks {
             let count = enc.count(chunk);
@@ -123,19 +227,29 @@ mod tests {
 
     #[test]
     fn zero_chunk_size_returns_empty() {
-        assert!(chunk_text("hello world", 0, 0, ENC).is_ok_and(|v| v.is_empty()));
+        assert!(
+            Chunker::new(0, 0, ENC)
+                .and_then(|c| c.text("hello world"))
+                .is_ok_and(|v| v.is_empty())
+        );
     }
 
     #[test]
     fn overlap_larger_than_chunk_still_works() {
         let text = "a b c d e f g h i j k l m n o p q r s t u v w x y z";
-        assert!(chunk_text(text, 3, 10, ENC).is_ok_and(|v| !v.is_empty()));
+        assert!(
+            Chunker::new(3, 10, ENC)
+                .and_then(|c| c.text(text))
+                .is_ok_and(|v| !v.is_empty())
+        );
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn whitespace_only_returns_single_chunk() {
-        let chunks = chunk_text("   \n\t  ", 10, 2, ENC).unwrap();
+        let chunks = Chunker::new(10, 2, ENC)
+            .and_then(|c| c.text("   \n\t  "))
+            .unwrap();
         assert_eq!(chunks.len(), 1);
     }
 
@@ -145,7 +259,7 @@ mod tests {
         // Em dashes and accented letters span several BPE byte tokens;
         // a one-token window must land inside some of them.
         let text = "café — naïve — résumé — coöperate — façade — jalapeño";
-        let chunks = chunk_text(text, 1, 0, ENC).unwrap();
+        let chunks = Chunker::new(1, 0, ENC).and_then(|c| c.text(text)).unwrap();
         assert!(chunks.len() > 5);
         let joined: String = chunks.concat();
         assert!(joined.contains("caf"));
@@ -153,7 +267,7 @@ mod tests {
 
     #[test]
     fn invalid_encoding_returns_error() {
-        let result = chunk_text("hello", 10, 2, "nonexistent_encoding");
+        let result = Chunker::new(10, 2, "nonexistent_encoding").and_then(|c| c.text("hello"));
         assert!(result.is_err());
     }
 }
@@ -178,121 +292,6 @@ impl Chunk {
     }
 }
 
-/// Chunk a parsed document by its flow: sectioned sources chunk section by
-/// section; a continuous source is windowed across its pages under
-/// `heading` (its title, else `fallback_heading`), each chunk carrying the
-/// page it starts on.
-///
-/// # Errors
-///
-/// Returns an error if the encoding name is not recognized.
-pub fn chunk_document(
-    extracted: &Extracted,
-    fallback_heading: Option<&str>,
-    chunk_size_tokens: u32,
-    overlap_tokens: u32,
-    encoding_name: &str,
-) -> Result<Vec<Chunk>> {
-    match extracted.flow {
-        Flow::Sectioned => chunk_sections(
-            &extracted.sections,
-            chunk_size_tokens,
-            overlap_tokens,
-            encoding_name,
-        ),
-        Flow::Continuous => chunk_pages(
-            &extracted.sections,
-            extracted.title().or(fallback_heading),
-            chunk_size_tokens,
-            overlap_tokens,
-            encoding_name,
-        ),
-    }
-}
-
-/// Window one running text across `pages`, with the pages' tokens joined
-/// by a blank line, so a window may span a page break. Each chunk records
-/// the page its first token lies on and carries `heading`.
-///
-/// # Errors
-///
-/// Returns an error if the encoding name is not recognized.
-pub fn chunk_pages(
-    pages: &[Section],
-    heading: Option<&str>,
-    chunk_size_tokens: u32,
-    overlap_tokens: u32,
-    encoding_name: &str,
-) -> Result<Vec<Chunk>> {
-    let enc = tiktoken::get_encoding(encoding_name)
-        .ok_or_else(|| Error::Config(format!("unknown tiktoken encoding: {encoding_name}")))?;
-    let separator = enc.encode("\n\n");
-    let mut tokens: Vec<u32> = Vec::new();
-    let mut page_starts: Vec<(usize, Option<u32>)> = Vec::new();
-    for page in pages {
-        let page_tokens = enc.encode(&page.text);
-        if page_tokens.is_empty() {
-            continue;
-        }
-        if !tokens.is_empty() {
-            tokens.extend_from_slice(&separator);
-        }
-        page_starts.push((tokens.len(), page.page));
-        tokens.extend_from_slice(&page_tokens);
-    }
-    let mut chunks = Vec::new();
-    for (start, end) in windows(
-        tokens.len(),
-        chunk_size_tokens as usize,
-        overlap_tokens as usize,
-    ) {
-        let page = page_starts
-            .iter()
-            .rev()
-            .find(|(first_token, _)| *first_token <= start)
-            .and_then(|(_, page)| *page);
-        let content = decode(enc, &tokens, start, end)?.trim().to_owned();
-        if content.is_empty() {
-            continue;
-        }
-        chunks.push(Chunk {
-            content,
-            heading: heading.map(str::to_owned),
-            page,
-        });
-    }
-    Ok(chunks)
-}
-
-/// Chunk every section, carrying its heading and page onto each chunk.
-///
-/// # Errors
-///
-/// Returns an error if the encoding name is not recognized.
-pub fn chunk_sections(
-    sections: &[Section],
-    chunk_size_tokens: u32,
-    overlap_tokens: u32,
-    encoding_name: &str,
-) -> Result<Vec<Chunk>> {
-    let mut out = Vec::new();
-    for section in sections {
-        for content in chunk_text(
-            &section.text,
-            chunk_size_tokens,
-            overlap_tokens,
-            encoding_name,
-        )? {
-            out.push(Chunk {
-                content,
-                heading: section.heading.clone(),
-                page: section.page,
-            });
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod section_tests {
     use super::*;
@@ -313,7 +312,9 @@ mod section_tests {
                 text: String::from("short"),
             },
         ];
-        let chunks = chunk_sections(&sections, 40, 5, "cl100k_base").unwrap();
+        let chunks = Chunker::new(40, 5, "cl100k_base")
+            .and_then(|c| c.sections(&sections))
+            .unwrap();
         assert!(chunks.len() > 2);
         let last = chunks.last().unwrap();
         assert_eq!(last.content, "short");
@@ -352,7 +353,9 @@ mod section_tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn continuous_pages_are_windowed_across_page_breaks() {
         let pages = vec![page(1, 8), page(2, 8), page(3, 8)];
-        let chunks = chunk_pages(&pages, Some("Report"), 50, 10, "cl100k_base").unwrap();
+        let chunks = Chunker::new(50, 10, "cl100k_base")
+            .and_then(|c| c.pages(&pages, Some("Report")))
+            .unwrap();
         assert!(chunks.len() > 1, "{chunks:?}");
         let enc = tiktoken::get_encoding("cl100k_base").unwrap();
         let first = chunks.first().unwrap();
@@ -385,42 +388,46 @@ mod section_tests {
             page: Some(1),
             text: String::new(),
         }];
-        assert!(chunk_pages(&pages, None, 50, 10, "cl100k_base").is_ok_and(|c| c.is_empty()));
+        assert!(
+            Chunker::new(50, 10, "cl100k_base")
+                .and_then(|c| c.pages(&pages, None))
+                .is_ok_and(|c| c.is_empty())
+        );
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn chunk_document_dispatches_on_flow() {
         let sections = vec![page(1, 8), page(2, 8)];
-        let sectioned = chunk_document(
-            &Extracted {
-                title: None,
-                sections: sections.clone(),
-                flow: Flow::Sectioned,
-                pages_skipped: 0,
-            },
-            Some("file"),
-            50,
-            10,
-            "cl100k_base",
-        )
-        .unwrap();
+        let sectioned = Chunker::new(50, 10, "cl100k_base")
+            .and_then(|c| {
+                c.document(
+                    &Extracted {
+                        title: None,
+                        sections: sections.clone(),
+                        flow: Flow::Sectioned,
+                        pages_skipped: 0,
+                    },
+                    Some("file"),
+                )
+            })
+            .unwrap();
         assert_eq!(sectioned.len(), 2);
         assert!(sectioned.iter().all(|c| c.heading.is_none()));
 
-        let continuous = chunk_document(
-            &Extracted {
-                title: None,
-                sections,
-                flow: Flow::Continuous,
-                pages_skipped: 0,
-            },
-            Some("file"),
-            50,
-            10,
-            "cl100k_base",
-        )
-        .unwrap();
+        let continuous = Chunker::new(50, 10, "cl100k_base")
+            .and_then(|c| {
+                c.document(
+                    &Extracted {
+                        title: None,
+                        sections,
+                        flow: Flow::Continuous,
+                        pages_skipped: 0,
+                    },
+                    Some("file"),
+                )
+            })
+            .unwrap();
         assert!(
             continuous
                 .iter()

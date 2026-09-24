@@ -2047,7 +2047,7 @@ async fn office_and_html_documents_are_chunked_with_titles() {
     assert!(
         errored
             .error_message
-            .is_some_and(|m| m.contains("not a PPTX"))
+            .is_some_and(|m| m.contains("not a PowerPoint file"))
     );
 }
 

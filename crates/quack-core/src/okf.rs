@@ -1109,13 +1109,6 @@ fn type_id(raw: &str) -> String {
     }
 }
 
-/// The document file name a concept file is ingested under: its path with
-/// the separators folded, so a bundle's files stay distinct.
-#[must_use]
-pub fn document_name(path: &str) -> String {
-    path.replace('/', "__")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

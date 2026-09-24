@@ -9,7 +9,7 @@ use crate::okf::parse_front_matter;
 use crate::text::NonBlankText;
 
 /// Recognized file types for ingestion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Csv,
     Parquet,
@@ -21,12 +21,91 @@ pub enum FileType {
     Html,
     Docx,
     Pptx,
-    Unknown,
+}
+
+/// How a file type loads into a workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Load {
+    /// One table named after the file, read by this reader.
+    Table(Reader),
+    /// One table per sheet.
+    Workbook,
+    /// Text, parsed and chunked.
+    Chunks,
+}
+
+/// A `DuckDB` reader for a data file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    Csv,
+    Parquet,
+    Json,
+}
+
+impl Reader {
+    /// The table function that reads the file.
+    #[must_use]
+    pub fn sql_fn(self) -> &'static str {
+        match self {
+            Self::Csv => "read_csv_auto",
+            Self::Parquet => "read_parquet",
+            Self::Json => "read_json_auto",
+        }
+    }
+
+    /// The reader for bytes of no known name: Parquet by its magic, JSON
+    /// when they start with `{` or `[`, else CSV (its delimiter sniffed).
+    #[must_use]
+    pub fn sniff(data: &[u8]) -> Self {
+        if data.starts_with(b"PAR1") {
+            return Self::Parquet;
+        }
+        match data.iter().find(|b| !b.is_ascii_whitespace()) {
+            Some(b'{' | b'[') => Self::Json,
+            _ => Self::Csv,
+        }
+    }
 }
 
 impl FileType {
+    /// The type a file name's extension says, in any case; `None` for a
+    /// file nothing here reads.
     #[must_use]
-    pub fn mime_type(&self) -> &'static str {
+    pub fn of(filename: &str) -> Option<Self> {
+        let ext = Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())?
+            .to_ascii_lowercase();
+        EXTENSIONS
+            .iter()
+            .find(|(known, _)| *known == ext)
+            .map(|(_, file_type)| *file_type)
+    }
+
+    /// How files of this type load.
+    #[must_use]
+    pub fn load(self) -> Load {
+        match self {
+            Self::Csv => Load::Table(Reader::Csv),
+            Self::Parquet => Load::Table(Reader::Parquet),
+            Self::Json => Load::Table(Reader::Json),
+            Self::Xlsx => Load::Workbook,
+            Self::Pdf | Self::Text | Self::Markdown | Self::Html | Self::Docx | Self::Pptx => {
+                Load::Chunks
+            }
+        }
+    }
+
+    /// The extensions of the files that load as tables, in table order.
+    pub fn table_extensions() -> impl Iterator<Item = &'static str> {
+        EXTENSIONS
+            .iter()
+            .filter(|(_, file_type)| file_type.load() != Load::Chunks)
+            .map(|(ext, _)| *ext)
+    }
+
+    #[must_use]
+    pub fn mime_type(self) -> &'static str {
         match self {
             Self::Csv => "text/csv",
             Self::Parquet => "application/vnd.apache.parquet",
@@ -40,30 +119,6 @@ impl FileType {
             Self::Pptx => {
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             }
-            Self::Unknown => "application/octet-stream",
-        }
-    }
-
-    /// Loaded as tables rather than chunked.
-    #[must_use]
-    pub fn is_structured(&self) -> bool {
-        self.is_single_table() || *self == Self::Xlsx
-    }
-
-    /// Loaded as one table named after the file; a workbook makes one per
-    /// sheet instead.
-    #[must_use]
-    pub fn is_single_table(&self) -> bool {
-        match self {
-            Self::Csv | Self::Parquet | Self::Json => true,
-            Self::Xlsx
-            | Self::Pdf
-            | Self::Text
-            | Self::Markdown
-            | Self::Html
-            | Self::Docx
-            | Self::Pptx
-            | Self::Unknown => false,
         }
     }
 }
@@ -81,7 +136,6 @@ impl std::fmt::Display for FileType {
             Self::Html => "HTML",
             Self::Docx => "Word",
             Self::Pptx => "PowerPoint",
-            Self::Unknown => "Unknown",
         };
         f.write_str(label)
     }
@@ -161,28 +215,6 @@ const EXTENSIONS: &[(&str, FileType)] = &[
     ("pptx", FileType::Pptx),
 ];
 
-/// Detect file type from the filename extension.
-#[must_use]
-pub fn detect_file_type(filename: &str) -> FileType {
-    let ext = Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    EXTENSIONS
-        .iter()
-        .find(|(known, _)| *known == ext)
-        .map_or(FileType::Unknown, |(_, file_type)| file_type.clone())
-}
-
-/// The extensions of the files that load as tables, in table order.
-pub fn table_extensions() -> impl Iterator<Item = &'static str> {
-    EXTENSIONS
-        .iter()
-        .filter(|(_, file_type)| file_type.is_structured())
-        .map(|(ext, _)| *ext)
-}
-
 /// Extract an unstructured file: PDFs one section per page, Markdown one
 /// per heading, HTML one per heading with the `<title>`, DOCX one per
 /// heading style with the core title, PPTX one per slide, plain text a
@@ -193,7 +225,7 @@ pub fn table_extensions() -> impl Iterator<Item = &'static str> {
 /// Returns an error if the file cannot be parsed, or if it has no text at
 /// all (a scanned PDF without a text layer needs OCR, which is not
 /// supported).
-pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
+pub fn extract(file_type: FileType, data: &[u8]) -> Result<Extracted> {
     match file_type {
         FileType::Pdf => extract_pdf(data),
         FileType::Markdown => {
@@ -221,11 +253,9 @@ pub fn extract(file_type: &FileType, data: &[u8]) -> Result<Extracted> {
         FileType::Html => html::html(&utf8(data)?),
         FileType::Docx => office::docx(data),
         FileType::Pptx => office::pptx(data),
-        FileType::Csv | FileType::Parquet | FileType::Json | FileType::Xlsx | FileType::Unknown => {
-            Err(Error::Ingestion(format!(
-                "cannot extract text from {file_type} files"
-            )))
-        }
+        FileType::Csv | FileType::Parquet | FileType::Json | FileType::Xlsx => Err(
+            Error::Ingestion(format!("cannot extract text from {file_type} files")),
+        ),
     }
 }
 
@@ -323,29 +353,13 @@ fn pdf_title(doc: &PdfDocument) -> Option<String> {
 /// before the first heading becomes a section without one.
 fn markdown_sections(text: &str) -> Vec<Section> {
     let lines: Vec<&str> = text.lines().collect();
-    let mut sections: Vec<Section> = Vec::new();
-    let mut heading: Option<String> = None;
-    let mut buf: Vec<&str> = Vec::new();
-
-    let flush = |heading: &Option<String>, buf: &mut Vec<&str>, out: &mut Vec<Section>| {
-        let body = buf.join("\n");
-        if !body.trim().is_empty() {
-            out.push(Section {
-                heading: heading.clone(),
-                page: None,
-                text: body.trim().to_owned(),
-            });
-        }
-        buf.clear();
-    };
-
+    let mut sections = SectionBuilder::default();
     let mut i = 0;
     while i < lines.len() {
         let line = lines.get(i).copied().unwrap_or_default();
         let next = lines.get(i.saturating_add(1)).copied();
         if let Some(title) = atx_heading(line) {
-            flush(&heading, &mut buf, &mut sections);
-            heading = Some(title);
+            sections.heading(title);
             i = i.saturating_add(1);
             continue;
         }
@@ -354,16 +368,57 @@ fn markdown_sections(text: &str) -> Vec<Section> {
             && !line.trim().is_empty()
             && !line.trim_start().starts_with(['-', '*', '+', '>', '|'])
         {
-            flush(&heading, &mut buf, &mut sections);
-            heading = Some(line.trim().to_owned());
+            sections.heading(line.trim().to_owned());
             i = i.saturating_add(2);
             continue;
         }
-        buf.push(line);
+        sections.line(line);
         i = i.saturating_add(1);
     }
-    flush(&heading, &mut buf, &mut sections);
-    sections
+    sections.finish()
+}
+
+/// Sections built a line at a time: the lines under the current heading
+/// become one section when the next heading starts, trimmed, and only when
+/// they hold text.
+#[derive(Debug, Default)]
+pub(crate) struct SectionBuilder {
+    sections: Vec<Section>,
+    heading: Option<String>,
+    lines: Vec<String>,
+}
+
+impl SectionBuilder {
+    /// Add a line to the current section.
+    pub(crate) fn line(&mut self, line: impl Into<String>) {
+        self.lines.push(line.into());
+    }
+
+    /// End the current section and start one under `heading` (none when
+    /// it is blank).
+    pub(crate) fn heading(&mut self, heading: impl Into<String>) {
+        self.flush();
+        let heading = heading.into();
+        self.heading = (!heading.trim().is_empty()).then_some(heading);
+    }
+
+    fn flush(&mut self) {
+        let text = self.lines.join("\n").trim().to_owned();
+        self.lines.clear();
+        if !text.is_empty() {
+            self.sections.push(Section {
+                heading: self.heading.clone(),
+                page: None,
+                text,
+            });
+        }
+    }
+
+    /// Every section, the last one included.
+    pub(crate) fn finish(mut self) -> Vec<Section> {
+        self.flush();
+        self.sections
+    }
 }
 
 fn atx_heading(line: &str) -> Option<String> {
@@ -396,7 +451,7 @@ mod tests {
     #[test]
     fn markdown_front_matter_gives_the_title_and_is_not_chunked() {
         let extracted = extract(
-            &FileType::Markdown,
+            FileType::Markdown,
             b"---\ntitle: Renewal Guide\ntags: [a]\n---\n\n# Terms\n\nThirty days.\n",
         )
         .unwrap_or_else(|_| Extracted {
@@ -425,44 +480,44 @@ mod tests {
 
     #[test]
     fn detects_csv() {
-        assert_eq!(detect_file_type("sales.csv"), FileType::Csv);
-        assert_eq!(detect_file_type("DATA.CSV"), FileType::Csv);
+        assert_eq!(FileType::of("sales.csv"), Some(FileType::Csv));
+        assert_eq!(FileType::of("DATA.CSV"), Some(FileType::Csv));
     }
 
     #[test]
     fn detects_parquet() {
-        assert_eq!(detect_file_type("data.parquet"), FileType::Parquet);
-        assert_eq!(detect_file_type("data.pq"), FileType::Parquet);
+        assert_eq!(FileType::of("data.parquet"), Some(FileType::Parquet));
+        assert_eq!(FileType::of("data.pq"), Some(FileType::Parquet));
     }
 
     #[test]
     fn detects_json() {
-        assert_eq!(detect_file_type("config.json"), FileType::Json);
-        assert_eq!(detect_file_type("events.jsonl"), FileType::Json);
-        assert_eq!(detect_file_type("stream.ndjson"), FileType::Json);
+        assert_eq!(FileType::of("config.json"), Some(FileType::Json));
+        assert_eq!(FileType::of("events.jsonl"), Some(FileType::Json));
+        assert_eq!(FileType::of("stream.ndjson"), Some(FileType::Json));
     }
 
     #[test]
     fn detects_pdf() {
-        assert_eq!(detect_file_type("report.pdf"), FileType::Pdf);
+        assert_eq!(FileType::of("report.pdf"), Some(FileType::Pdf));
     }
 
     #[test]
     fn detects_text() {
-        assert_eq!(detect_file_type("notes.txt"), FileType::Text);
-        assert_eq!(detect_file_type("readme.md"), FileType::Markdown);
+        assert_eq!(FileType::of("notes.txt"), Some(FileType::Text));
+        assert_eq!(FileType::of("readme.md"), Some(FileType::Markdown));
     }
 
     #[test]
     fn unknown_extension() {
-        assert_eq!(detect_file_type("image.png"), FileType::Unknown);
-        assert_eq!(detect_file_type("noext"), FileType::Unknown);
+        assert_eq!(FileType::of("image.png"), None);
+        assert_eq!(FileType::of("noext"), None);
     }
 
     #[test]
     fn extracts_plain_text() {
         let data = b"Hello, world!";
-        let text = extract(&FileType::Text, data)
+        let text = extract(FileType::Text, data)
             .ok()
             .and_then(|e| e.sections.into_iter().next())
             .map(|s| s.text);
@@ -471,7 +526,7 @@ mod tests {
 
     #[test]
     fn rejects_structured_extraction() {
-        let result = extract(&FileType::Csv, b"a,b,c");
+        let result = extract(FileType::Csv, b"a,b,c");
         assert!(result.is_err());
     }
 
@@ -511,7 +566,7 @@ mod tests {
 
     #[test]
     fn pdf_without_text_layer_is_an_error() {
-        let err = extract(&FileType::Pdf, b"%PDF-1.4\n%%EOF").err();
+        let err = extract(FileType::Pdf, b"%PDF-1.4\n%%EOF").err();
         assert!(err.is_some());
     }
 
@@ -530,7 +585,7 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn every_page_of_a_long_pdf_is_kept_with_its_number_and_title() {
-        let extracted = extract(&FileType::Pdf, &long_pdf(60, "Long Report")).unwrap();
+        let extracted = extract(FileType::Pdf, &long_pdf(60, "Long Report")).unwrap();
         assert_eq!(extracted.title.as_deref(), Some("Long Report"));
         assert_eq!(extracted.pages_skipped, 0);
         assert_eq!(extracted.sections.len(), 60);

@@ -10,7 +10,8 @@ use crate::embedding::{
 };
 use crate::error::{Error, Record, Result};
 use crate::graph;
-use crate::ingestion::{self, parser};
+use crate::ingestion::TableName;
+use crate::ingestion::parser::{FileType, Load};
 use crate::ontology::store::Acceptance;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
@@ -2328,10 +2329,9 @@ impl DocumentInfo {
     /// arrived with the `tables` column, so their rows always carry it.
     #[must_use]
     pub fn fallback_tables(&self) -> Vec<String> {
-        if parser::detect_file_type(&self.filename).is_single_table() {
-            vec![ingestion::table_name_for(&self.filename)]
-        } else {
-            Vec::new()
+        match FileType::of(&self.filename).map(FileType::load) {
+            Some(Load::Table(_)) => vec![TableName::of_file(&self.filename).into_string()],
+            Some(Load::Workbook | Load::Chunks) | None => Vec::new(),
         }
     }
 }
