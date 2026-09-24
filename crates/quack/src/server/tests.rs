@@ -3955,7 +3955,7 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
             credential: Credential::Local,
             client_addr: None,
             request_id: None,
-            via_mcp: false,
+            channel: None,
         },
         workspace,
         role: Some(Role::Owner),

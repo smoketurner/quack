@@ -254,10 +254,7 @@ impl Access {
         let (access, id) = (self, self.workspace.id.as_str());
         let (sample, reset) = (plan.sample, plan.reset);
         let slot = app.begin_extraction(id).ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "a graph extraction is already running for this workspace",
-            )
+            ApiError::conflict("a graph extraction is already running for this workspace")
         })?;
         let db = app.workspace_db(id).await?;
         let (ontology, provisional) = app

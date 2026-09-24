@@ -1685,11 +1685,7 @@ async fn settings(
     Path(id): Path<String>,
     Query(q): Query<SettingsQuery>,
 ) -> WebResult<Response> {
-    let need = Need {
-        admin_ok: true,
-        ..Need::READ
-    };
-    let access = Access::resolve(&app, identity, &id, need).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit_read(&app, AuditAction::Page, "settings")
         .await?;

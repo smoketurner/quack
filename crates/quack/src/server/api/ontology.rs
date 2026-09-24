@@ -102,7 +102,7 @@ impl Access {
             .map(Some)
         })
         .await?
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "an ontology already exists"))?;
+        .ok_or_else(|| ApiError::conflict("an ontology already exists"))?;
         self.audit(
             app,
             AuditAction::Ontology,

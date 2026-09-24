@@ -48,6 +48,16 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, message)
     }
 
+    /// 409: the request conflicts with what already exists or is running.
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
+    /// 422: well-formed, but its content cannot be carried out.
+    pub(crate) fn unprocessable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }

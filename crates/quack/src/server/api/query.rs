@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
@@ -432,15 +431,11 @@ pub(crate) async fn execute_sql(
             .await
             .map_err(ApiError::from)
     };
-    let outcome = if result.is_ok() {
-        Outcome::Allowed
-    } else {
-        Outcome::Error
-    };
+    let outcome = Outcome::of(&result);
     access
         .audit(app, AuditAction::Sql, None, outcome, Some(detail))
         .await?;
-    let capped = result.map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e.message))?;
+    let capped = result.map_err(|e| ApiError::unprocessable(e.message))?;
     Ok(SqlOutcome {
         truncated: capped.truncated(),
         columns: capped.results.columns,

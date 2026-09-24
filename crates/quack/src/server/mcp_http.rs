@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use quack_core::analysis::policy::WritePolicy;
+use quack_core::storage::control::Channel;
 use tower::ServiceExt;
 
 use super::auth::{Access, Identity, Need};
@@ -21,7 +22,7 @@ pub(crate) async fn handle(
     Path(workspace): Path<String>,
     request: Request,
 ) -> ApiResult<Response> {
-    identity.via_mcp = true;
+    identity.channel = Some(Channel::Mcp);
     let access = Access::resolve(&app, identity, &workspace, Need::READ).await?;
     let can_write = access.permits(Need::WRITE);
     let key = format!(

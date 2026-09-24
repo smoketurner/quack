@@ -51,20 +51,17 @@ pub(crate) struct Identity {
     pub credential: Credential,
     pub client_addr: Option<String>,
     pub request_id: Option<String>,
-    /// Set for requests that arrived over the MCP transport, so audit rows
-    /// name that channel rather than the credential's.
-    pub via_mcp: bool,
+    /// Set for requests that arrived over a transport of their own (MCP),
+    /// so audit rows name that channel rather than the credential's.
+    pub channel: Option<Channel>,
 }
 
 impl Identity {
     pub(crate) fn channel(&self) -> Channel {
-        if self.via_mcp {
-            return Channel::Mcp;
-        }
-        match self.credential {
+        self.channel.unwrap_or(match self.credential {
             Credential::Token(_) => Channel::Api,
             Credential::Local | Credential::Session(_) => Channel::Web,
-        }
+        })
     }
 
     fn token_hash(&self) -> Option<String> {
@@ -252,7 +249,7 @@ impl FromRequestParts<App> for Identity {
                 credential: Credential::Local,
                 client_addr,
                 request_id,
-                via_mcp: false,
+                channel: None,
             });
         }
 
@@ -281,7 +278,7 @@ impl FromRequestParts<App> for Identity {
                     credential: Credential::Session(presented),
                     client_addr,
                     request_id,
-                    via_mcp: false,
+                    channel: None,
                 });
             }
             // Saying so, rather than falling through to "unknown token",
@@ -331,7 +328,7 @@ impl FromRequestParts<App> for Identity {
             credential: Credential::Token(token),
             client_addr,
             request_id,
-            via_mcp: false,
+            channel: None,
         })
     }
 }
@@ -351,6 +348,12 @@ impl Need {
         role: Role::Viewer,
         scope: Scope::Read,
         admin_ok: false,
+    };
+    /// Reading, or a server admin without membership: settings and
+    /// members, never content.
+    pub(crate) const READ_OR_ADMIN: Self = Self {
+        admin_ok: true,
+        ..Self::READ
     };
     pub(crate) const WRITE: Self = Self {
         role: Role::Member,

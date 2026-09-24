@@ -95,7 +95,7 @@ impl Identity {
             ));
         }
         if app.control.find_workspace_by_name(name).await?.is_some() {
-            return Err(ApiError::new(StatusCode::CONFLICT, "workspace exists"));
+            return Err(ApiError::conflict("workspace exists"));
         }
         let ws = app.control.create_workspace(name).await?;
         if !app.local {
@@ -116,11 +116,7 @@ pub(crate) async fn show(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let need = Need {
-        admin_ok: true,
-        ..Need::READ
-    };
-    let access = Access::resolve(&app, identity, &id, need).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit(&app, AuditAction::Open, None, Outcome::Allowed, None)
         .await?;

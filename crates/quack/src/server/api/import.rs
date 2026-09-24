@@ -81,13 +81,9 @@ pub(crate) async fn run_import(
         "source_table": request.source_table,
         "rows": outcome.as_ref().ok().map(|s| s.rows),
     });
-    let audit_outcome = if outcome.is_ok() {
-        Outcome::Allowed
-    } else {
-        Outcome::Error
-    };
+    let audit_outcome = Outcome::of(&outcome);
     access
         .audit(app, AuditAction::Import, None, audit_outcome, Some(detail))
         .await?;
-    outcome.map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+    outcome.map_err(|e| ApiError::unprocessable(e.to_string()))
 }
