@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use induction::ItemKind;
 
 /// The implicit root class every class descends from.
 pub const ROOT_CLASS: &str = "entity";
@@ -87,6 +88,39 @@ impl std::fmt::Display for SnakeId {
         f.write_str(&self.0)
     }
 }
+
+/// An id that is already `snake_case`: a lowercase letter, then lowercase
+/// letters, digits, or underscores.
+impl TryFrom<&str> for SnakeId {
+    type Error = NotSnakeCase;
+
+    fn try_from(id: &str) -> std::result::Result<Self, NotSnakeCase> {
+        let mut chars = id.chars();
+        let valid = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if valid {
+            Ok(Self(id.to_owned()))
+        } else {
+            Err(NotSnakeCase(id.to_owned()))
+        }
+    }
+}
+
+/// An id [`SnakeId`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotSnakeCase(String);
+
+impl NotSnakeCase {
+    /// The refusal as the ontology error for an id of `kind`.
+    #[must_use]
+    pub fn for_item(self, kind: ItemKind) -> Error {
+        Error::Ontology(format!(
+            "{kind} id '{}' must be snake_case: a lowercase letter, then lowercase letters, digits, or underscores",
+            self.0
+        ))
+    }
+}
+
 /// The implicit relation from any entity to any entity.
 pub const MENTIONS_RELATION: &str = "mentions";
 
@@ -207,12 +241,6 @@ pub struct Ontology {
     pub properties: Vec<Property>,
     #[serde(default)]
     pub mappings: Vec<Mapping>,
-}
-
-fn is_snake_case(id: &str) -> bool {
-    let mut chars = id.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 impl Ontology {
@@ -394,7 +422,7 @@ impl Ontology {
     fn validate_properties(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for property in &self.properties {
-            check_id("property", &property.id)?;
+            SnakeId::try_from(property.id.as_str()).map_err(|e| e.for_item(ItemKind::Property))?;
             if !seen.insert(property.id.as_str()) {
                 return Err(Error::Ontology(format!(
                     "property '{}' is declared twice",
@@ -424,7 +452,7 @@ impl Ontology {
     fn validate_classes(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for class in &self.classes {
-            check_id("class", &class.id)?;
+            SnakeId::try_from(class.id.as_str()).map_err(|e| e.for_item(ItemKind::Class))?;
             if class.id == ROOT_CLASS {
                 return Err(Error::Ontology(format!(
                     "'{ROOT_CLASS}' is the implicit root and cannot be declared"
@@ -473,7 +501,7 @@ impl Ontology {
     fn validate_relations(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for relation in &self.relations {
-            check_id("relation", &relation.id)?;
+            SnakeId::try_from(relation.id.as_str()).map_err(|e| e.for_item(ItemKind::Relation))?;
             if relation.id == MENTIONS_RELATION {
                 return Err(Error::Ontology(format!(
                     "'{MENTIONS_RELATION}' is implicit and cannot be declared"
@@ -681,10 +709,10 @@ impl Ontology {
         OntologyDiff {
             from: older.version,
             to: this.version,
-            classes: changes(&older.classes, &this.classes, |c| c.id.as_str()),
-            relations: changes(&older.relations, &this.relations, |r| r.id.as_str()),
-            properties: changes(&older.properties, &this.properties, |p| p.id.as_str()),
-            mappings: changes(&older.mappings, &this.mappings, Mapping::id),
+            classes: Changes::between(&older.classes, &this.classes, |c| c.id.as_str()),
+            relations: Changes::between(&older.relations, &this.relations, |r| r.id.as_str()),
+            properties: Changes::between(&older.properties, &this.properties, |p| p.id.as_str()),
+            mappings: Changes::between(&older.mappings, &this.mappings, Mapping::id),
         }
     }
 
@@ -742,34 +770,6 @@ impl Ontology {
     }
 }
 
-fn check_id(kind: &str, id: &str) -> Result<()> {
-    if is_snake_case(id) {
-        Ok(())
-    } else {
-        Err(Error::Ontology(format!(
-            "{kind} id '{id}' must be snake_case: a lowercase letter, then lowercase letters, digits, or underscores"
-        )))
-    }
-}
-
-/// Added, removed, and changed ids between two lists of one kind.
-fn changes<T: PartialEq>(old: &[T], new: &[T], id: impl Fn(&T) -> &str) -> Changes {
-    let mut out = Changes::default();
-    for item in new {
-        match old.iter().find(|o| id(o) == id(item)) {
-            None => out.added.push(id(item).to_owned()),
-            Some(before) if before != item => out.changed.push(id(item).to_owned()),
-            Some(_) => {}
-        }
-    }
-    for item in old {
-        if !new.iter().any(|n| id(n) == id(item)) {
-            out.removed.push(id(item).to_owned());
-        }
-    }
-    out
-}
-
 /// Ids added, removed, or changed for one kind.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Changes {
@@ -779,6 +779,25 @@ pub struct Changes {
 }
 
 impl Changes {
+    /// Added, removed, and changed ids between two lists of one kind.
+    #[must_use]
+    pub fn between<T: PartialEq>(old: &[T], new: &[T], id: impl Fn(&T) -> &str) -> Self {
+        let mut out = Self::default();
+        for item in new {
+            match old.iter().find(|o| id(o) == id(item)) {
+                None => out.added.push(id(item).to_owned()),
+                Some(before) if before != item => out.changed.push(id(item).to_owned()),
+                Some(_) => {}
+            }
+        }
+        for item in old {
+            if !new.iter().any(|n| id(n) == id(item)) {
+                out.removed.push(id(item).to_owned());
+            }
+        }
+        out
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
@@ -839,6 +858,26 @@ impl std::fmt::Display for OntologyDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snake_ids_are_checked_not_repaired() {
+        assert_eq!(
+            SnakeId::try_from("ship_mode_2").map(SnakeId::into_string),
+            Ok(String::from("ship_mode_2"))
+        );
+        for bad in ["", "Ship", "2024", "_x", "ship mode", "ship-mode"] {
+            let refused =
+                SnakeId::try_from(bad).map_err(|e| e.for_item(ItemKind::Class).to_string());
+            assert_eq!(
+                refused,
+                Err(format!(
+                    "ontology error: class id '{bad}' must be snake_case: a lowercase letter, then \
+                     lowercase letters, digits, or underscores"
+                )),
+                "{bad}"
+            );
+        }
+    }
 
     fn err_of(json: &str) -> String {
         match Ontology::from_json(json) {
