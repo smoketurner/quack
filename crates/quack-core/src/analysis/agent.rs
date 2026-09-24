@@ -15,9 +15,9 @@ use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::ModelReranker;
 use super::text_to_sql::{self, PromptOptions};
 use super::tools::{
-    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphResults,
+    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphResults, GraphTools,
     ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
-    SharedDb,
+    SharedDb, ToolDeps,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphOptions, GraphResult, store as graph_store};
@@ -545,6 +545,10 @@ where
         &ctx.recorder,
     )
     .with_graph(ctx.graph_enabled);
+    let deps = ToolDeps {
+        db: ctx.reader_db.clone(),
+        recorder: ctx.recorder.clone(),
+    };
     let mut builder = completion_model
         .into_agent_builder()
         .preamble(system_prompt)
@@ -557,18 +561,9 @@ where
             ctx.refused.clone(),
             ctx.recorder.clone(),
         ))
-        .tool(DescribeTableTool::new(
-            ctx.reader_db.clone(),
-            ctx.recorder.clone(),
-        ))
-        .tool(ListTablesTool::new(
-            ctx.reader_db.clone(),
-            ctx.recorder.clone(),
-        ))
-        .tool(ListDocumentsTool::new(
-            ctx.reader_db.clone(),
-            ctx.recorder.clone(),
-        ))
+        .tool(DescribeTableTool(deps.clone()))
+        .tool(ListTablesTool(deps.clone()))
+        .tool(ListDocumentsTool(deps.clone()))
         .tool(CreateChartTool::new(
             ctx.reader_db.clone(),
             Arc::clone(&ctx.chart_spec),
@@ -597,30 +592,21 @@ where
     // is capped, so a class the model wants the detail of may not be in it
     // even when nothing has been extracted into the graph yet.
     if ctx.ontology_present {
-        builder = builder.tool(DescribeClassTool::new(
-            ctx.reader_db.clone(),
-            ctx.recorder.clone(),
-        ));
+        builder = builder.tool(DescribeClassTool(deps));
     }
 
     if ctx.graph_enabled {
+        let graph = GraphTools {
+            db: ctx.reader_db.clone(),
+            embedding_model: embedding_model.clone(),
+            options: ctx.graph_options,
+            exclude_provisional: ctx.exclude_provisional,
+            results: Arc::clone(&ctx.graph_results),
+            recorder: ctx.recorder.clone(),
+        };
         builder = builder
-            .tool(SearchGraphTool::new(
-                ctx.reader_db.clone(),
-                embedding_model.clone(),
-                ctx.graph_options,
-                ctx.exclude_provisional,
-                Arc::clone(&ctx.graph_results),
-                ctx.recorder.clone(),
-            ))
-            .tool(FindPathTool::new(
-                ctx.reader_db.clone(),
-                embedding_model.clone(),
-                ctx.graph_options,
-                ctx.exclude_provisional,
-                Arc::clone(&ctx.graph_results),
-                ctx.recorder.clone(),
-            ));
+            .tool(SearchGraphTool(graph.clone()))
+            .tool(FindPathTool(graph));
     }
 
     if ctx.retrieval_config.always_retrieve
