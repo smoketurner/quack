@@ -23,6 +23,11 @@ pub enum Error {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    /// A sign-in through the server's `OpenID` Connect issuer was refused or
+    /// could not be verified.
+    #[error("sign-in failed: {0}")]
+    SignIn(String),
+
     /// An OAuth provider has no usable token and no login flow can run here.
     #[error("provider '{provider}' needs a login ({reason}); run `quack auth login {provider}`")]
     AuthRequired {

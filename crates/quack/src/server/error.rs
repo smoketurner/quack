@@ -92,6 +92,7 @@ impl From<CoreError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+            CoreError::SignIn(_) => StatusCode::UNAUTHORIZED,
             CoreError::Config(_)
             | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }

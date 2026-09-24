@@ -747,6 +747,95 @@ pub struct ServerConfig {
     pub session_max_age_hours: u32,
     /// How long a browser session survives with no request on it.
     pub session_idle_minutes: u32,
+    /// Sign-in through the organization's `OpenID` Connect issuer, beside
+    /// password login.
+    pub oidc: Option<OidcConfig>,
+}
+
+/// `[server.oidc]`: people sign in to `quack serve` with the organization's
+/// `OpenID` Connect issuer (Authorization Code with PKCE). A first sign-in
+/// creates a user with no workspace access.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawOidcConfig")]
+pub struct OidcConfig {
+    /// Issuer whose `/.well-known/openid-configuration` names the endpoints;
+    /// ID tokens must name exactly this issuer.
+    pub issuer_url: String,
+    pub client_id: String,
+    /// Environment variable holding the client secret, for an issuer that
+    /// registers quack as a confidential client.
+    pub client_secret_env: Option<String>,
+    /// Requested at sign-in; `openid` is required, and `offline_access` is
+    /// what makes most issuers return the refresh token quack keeps.
+    pub scopes: Vec<String>,
+    /// Where the issuer sends the browser back: this server's public URL
+    /// ending in [`OidcConfig::CALLBACK_PATH`].
+    pub redirect_uri: String,
+}
+
+impl OidcConfig {
+    /// The route that receives the issuer's redirect.
+    pub const CALLBACK_PATH: &str = "/login/oidc/callback";
+
+    /// The scopes requested when `scopes` is unset.
+    #[must_use]
+    pub fn default_scopes() -> Vec<String> {
+        ["openid", "profile", "email", "offline_access"]
+            .map(String::from)
+            .to_vec()
+    }
+}
+
+/// `[server.oidc]` as the file writes it, before its values are checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOidcConfig {
+    issuer_url: String,
+    client_id: String,
+    client_secret_env: Option<String>,
+    #[serde(default = "OidcConfig::default_scopes")]
+    scopes: Vec<String>,
+    redirect_uri: String,
+}
+
+impl TryFrom<RawOidcConfig> for OidcConfig {
+    type Error = Error;
+
+    fn try_from(raw: RawOidcConfig) -> Result<Self> {
+        if raw.issuer_url.trim().is_empty() || raw.client_id.trim().is_empty() {
+            return Err(Error::Config(String::from(
+                "[server.oidc] needs issuer_url and client_id",
+            )));
+        }
+        if !raw.scopes.iter().any(|scope| scope == "openid") {
+            return Err(Error::Config(String::from(
+                "[server.oidc].scopes must include \"openid\"",
+            )));
+        }
+        let redirect = oauth2::url::Url::parse(&raw.redirect_uri).map_err(|e| {
+            Error::Config(format!(
+                "[server.oidc].redirect_uri '{}' is not a URL: {e}",
+                raw.redirect_uri
+            ))
+        })?;
+        if !matches!(redirect.scheme(), "http" | "https")
+            || redirect.path() != Self::CALLBACK_PATH
+            || redirect.query().is_some()
+        {
+            return Err(Error::Config(format!(
+                "[server.oidc].redirect_uri must be this server's http(s) URL ending in {}, e.g. https://quack.example.com{}",
+                Self::CALLBACK_PATH,
+                Self::CALLBACK_PATH
+            )));
+        }
+        Ok(Self {
+            issuer_url: raw.issuer_url.trim().trim_end_matches('/').to_owned(),
+            client_id: raw.client_id.trim().to_owned(),
+            client_secret_env: raw.client_secret_env,
+            scopes: raw.scopes,
+            redirect_uri: raw.redirect_uri,
+        })
+    }
 }
 
 impl Default for ServerConfig {
@@ -757,6 +846,7 @@ impl Default for ServerConfig {
             workers_per_workspace: 1,
             session_max_age_hours: 12,
             session_idle_minutes: 120,
+            oidc: None,
         }
     }
 }
@@ -1528,6 +1618,50 @@ rerank = "model"
         let empty = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"\"\nclient_id = \"c\"\n";
         assert!(err_of(empty).contains("needs issuer_url and client_id"));
         assert!(err_of("[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\ntenant = \"x\"\n").contains("tenant"));
+    }
+
+    #[test]
+    fn the_oidc_section_is_checked_when_read() {
+        let section = |extra: &str| {
+            format!(
+                "[server.oidc]\nissuer_url = \"https://login.example.com/\"\nclient_id = \"quack\"\n{extra}"
+            )
+        };
+        let good = section("redirect_uri = \"https://quack.example.com/login/oidc/callback\"\n");
+        let config = Config::parse(&good);
+        let Ok(config) = config else {
+            return assert!(config.is_ok(), "{config:?}");
+        };
+        let oidc = config.server.oidc;
+        assert!(
+            oidc.is_some_and(|o| o.issuer_url == "https://login.example.com"
+                && o.scopes == OidcConfig::default_scopes()
+                && o.client_secret_env.is_none())
+        );
+        assert!(Config::default().server.oidc.is_none());
+
+        assert!(
+            err_of(&section("redirect_uri = \"https://q/callback\"\n"))
+                .contains("ending in /login/oidc/callback")
+        );
+        assert!(
+            err_of(&section("redirect_uri = \"ftp://q/login/oidc/callback\"\n"))
+                .contains("ending in")
+        );
+        assert!(err_of(&section("redirect_uri = \"not a url\"\n")).contains("is not a URL"));
+        assert!(
+            err_of(&section(
+                "redirect_uri = \"https://q/login/oidc/callback\"\nscopes = [\"email\"]\n"
+            ))
+            .contains("must include \"openid\"")
+        );
+        assert!(err_of("[server.oidc]\nissuer_url = \" \"\nclient_id = \"c\"\nredirect_uri = \"https://q/login/oidc/callback\"\n").contains("needs issuer_url"));
+        assert!(
+            err_of(&section(
+                "redirect_uri = \"https://q/login/oidc/callback\"\ntenant = \"t\"\n"
+            ))
+            .contains("tenant")
+        );
     }
 
     #[test]

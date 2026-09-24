@@ -126,11 +126,11 @@ impl Peer {
     /// the hop in front of a TLS-terminating proxy, so the cookie must never
     /// go back in the clear. Loopback is the plain-HTTP local case, and an
     /// unknown peer is treated the same way.
-    fn needs_secure(self) -> bool {
+    pub(crate) fn needs_secure(self) -> bool {
         self.0.is_some_and(|addr| !addr.ip().is_loopback())
     }
 
-    fn ip(self) -> Option<String> {
+    pub(crate) fn ip(self) -> Option<String> {
         self.0.map(|addr| addr.ip().to_string())
     }
 }
@@ -234,7 +234,7 @@ pub(crate) async fn password_login(
     let Some(user) = verified else {
         return Err(ApiError::unauthorized("wrong username or password"));
     };
-    let token = app.sessions.open(&user.id)?;
+    let token = app.sessions.open(&user.id, None)?;
     Ok(Login { user, token })
 }
 
@@ -274,7 +274,18 @@ impl FromRequestParts<App> for Identity {
         };
 
         match app.sessions.lookup(&presented) {
-            SessionLookup::Active(user_id) => {
+            SessionLookup::Active {
+                user_id,
+                renewal_due,
+            } => {
+                if renewal_due && let Some(oidc) = &app.oidc {
+                    let mut entry =
+                        AuditEntry::new(AuditAction::Session, Outcome::Denied, Channel::Web);
+                    entry.client_addr.clone_from(&client_addr);
+                    entry.request_id.clone_from(&request_id);
+                    oidc.require_current(app, &user_id, &presented, entry)
+                        .await?;
+                }
                 let user = app
                     .control
                     .get_user(&user_id)

@@ -22,6 +22,7 @@ use super::queries::{ApiTokens, AuditLog, Bound, Members, Users, Workspaces};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
+use crate::oidc::OidcSubject;
 
 /// The `control.db` schema, as plain SQL files embedded at compile time.
 ///
@@ -1119,6 +1120,84 @@ impl ControlPlane {
         Ok(bound.query_as().fetch_all(&self.pool).await?)
     }
 
+    /// The user a sign-in through the server's issuer belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn find_user_by_oidc_subject(
+        &self,
+        subject: &OidcSubject,
+    ) -> Result<Option<UserRow>> {
+        let bound = Bound::new(
+            Self::user_select().and_where(Expr::col(Users::OidcSubject).eq(subject.as_str())),
+        )?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
+    }
+
+    /// The user for a sign-in through the server's issuer, created on the
+    /// first one: no password, not an admin, and no workspace memberships
+    /// until an owner adds them. The username is the issuer's name for them;
+    /// when another user already has it, the new user gets it with a suffix,
+    /// so a sign-in never takes over an account by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is empty or a query fails.
+    pub async fn oidc_user(&self, subject: &OidcSubject, username: &str) -> Result<UserRow> {
+        if let Some(user) = self.find_user_by_oidc_subject(subject).await? {
+            return Ok(user);
+        }
+        let username = username.trim();
+        if username.is_empty() {
+            return Err(Error::Config(String::from("username must not be empty")));
+        }
+        let id = UserId::generate();
+        // The random tail of a UUID v7; its head is the creation time, shared
+        // by users made in the same millisecond.
+        let text = id.as_str();
+        let suffix = text.get(text.len().saturating_sub(8)..).unwrap_or(text);
+        for name in [username.to_owned(), format!("{username}-{suffix}")] {
+            let bound = Bound::new(
+                Query::insert()
+                    .into_table(Users::Table)
+                    .columns([
+                        Users::Id,
+                        Users::Username,
+                        Users::OidcSubject,
+                        Users::IsAdmin,
+                    ])
+                    .values([
+                        (&id).into(),
+                        name.as_str().into(),
+                        subject.as_str().into(),
+                        0_i64.into(),
+                    ])?,
+            )?;
+            match bound.query().execute(&self.pool).await {
+                Ok(_) => {
+                    tracing::info!(username = %name, "created user on first sign-in");
+                    return self
+                        .get_user(&id)
+                        .await?
+                        .ok_or_else(|| Error::Config(String::from("user vanished after insert")));
+                }
+                Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    // A concurrent first sign-in by the same person got there
+                    // first; otherwise the name is taken and the next one is
+                    // tried.
+                    if let Some(user) = self.find_user_by_oidc_subject(subject).await? {
+                        return Ok(user);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(Error::Config(format!(
+            "no free username for '{username}'; both it and its suffixed form are taken"
+        )))
+    }
+
     /// Check a password login. Returns the user on success; `None` for an
     /// unknown user, a user without a password, or a wrong password. The
     /// unknown-user path still runs a hash verification so the two cases
@@ -1807,6 +1886,58 @@ mod tests {
             cp.find_user_by_username(" alice ")
                 .await
                 .is_ok_and(|u| u.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_sign_in_creates_a_plain_user_and_never_takes_a_name() {
+        let (_dir, cp) = open().await;
+        let existing = cp.create_user("ada", "pw", UserKind::Admin).await;
+        assert!(existing.is_ok());
+        let ada = OidcSubject::from("sub-ada");
+
+        let first = cp.oidc_user(&ada, "ada").await;
+        let Ok(first) = first else {
+            fail(&format!("{:?}", first.err()));
+        };
+        assert!(
+            first.username.starts_with("ada-") && first.username.len() == 12,
+            "{}",
+            first.username
+        );
+        assert!(!first.is_admin);
+        assert!(
+            cp.workspaces_for_user(&first.id)
+                .await
+                .is_ok_and(|w| w.is_empty())
+        );
+        assert!(
+            cp.verify_password(&first.username, "")
+                .await
+                .is_ok_and(|u| u.is_none())
+        );
+
+        let again = cp.oidc_user(&ada, "renamed-at-the-issuer").await;
+        assert!(again.is_ok_and(|u| u.id == first.id && u.username == first.username));
+        assert!(
+            cp.find_user_by_oidc_subject(&ada)
+                .await
+                .is_ok_and(|u| u.is_some_and(|u| u.id == first.id))
+        );
+
+        let grace = cp
+            .oidc_user(&OidcSubject::from("sub-grace"), " grace ")
+            .await;
+        assert!(grace.is_ok_and(|u| u.username == "grace"));
+        assert!(
+            cp.oidc_user(&OidcSubject::from("sub-x"), "  ")
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.find_user_by_oidc_subject(&OidcSubject::from("nobody"))
+                .await
+                .is_ok_and(|u| u.is_none())
         );
     }
 

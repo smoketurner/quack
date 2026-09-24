@@ -1630,9 +1630,34 @@ roadmap and may never be built.
   wants the browser.
 - Otherwise, users in `control.db` with argon2id password hashes and a login form that sets
   a session cookie; API tokens (`quack token create` or the admin UI) as bearer tokens
-  scoped to a workspace with `read` / `write` / `admin` scopes. OIDC login for users (the
-  PKCE machinery from 10.2 pointed at the org IdP, `sub` as `oidc_subject`) is the intended
-  production path and is scheduled after the token path ships.
+  scoped to a workspace with `read` / `write` / `admin` scopes.
+- **Sign-in through the organization's identity provider** (`[server.oidc]`, beside the
+  password form). The login page's "Sign in with <issuer>" goes to `GET /login/oidc`, which
+  starts Authorization Code with PKCE, a `state`, and a `nonce`; the pending sign-in waits
+  in memory for ten minutes (at most 10,000 at once), and an `HttpOnly` state cookie scoped
+  to the callback ties the return to the browser that left, so a callback link someone else
+  started cannot sign this browser in. `GET /login/oidc/callback` exchanges the code, reads
+  the ID token straight from the token endpoint over TLS (OpenID Connect Core 3.1.3.7: no
+  signature check, so no JWT library, but `iss`, `aud`, `azp`, `exp`, and the nonce are
+  checked), and finds the user by `sub` (`oidc_subject`). A first sign-in creates the user
+  with no password, no admin, and no memberships (just-in-time provisioning: they see
+  nothing until an owner adds them); its username is `preferred_username`, else `email`,
+  else `sub`, suffixed when another user has it, so a sign-in never takes over an account
+  by name. Both outcomes are audited as `login`. Both routes share the login rate limit.
+- **A sign-in stays tied to the issuer.** The user's token (with its refresh token) is kept
+  in `<data_dir>/tokens/users/<user-id>.json`, AES-256-GCM under one key every user shares
+  (`users.key` beside it, or the OS keychain entry `oidc:users`), the user id as associated
+  data; one key, not one keychain entry per user, because the Linux kernel keyring's
+  default per-user quota (200 keys, 20 KB) would cap the server at a few dozen users. The
+  session records when that token must be renewed; the first request after that renews it
+  under a per-user lock (a token another session already renewed is reused). A refusal
+  (`invalid_grant`: revoked, expired, the account disabled) removes the stored token, ends
+  every session the user has, and is audited as a denied `session`; an issuer that cannot be
+  reached is asked again a minute later while the session goes on. A sign-in the issuer
+  gave no refresh token for lives by quack's own session bounds. Logging out of the last
+  session removes the stored token. On Linux the keychain key is in memory, so after a
+  reboot everyone signs in again. The stored token is what on-behalf-of calls to model
+  providers will exchange (#211).
 - **A browser session is bounded at both ends** (issue #73). It dies
   `[server].session_max_age_hours` after login however much it is used, and
   `[server].session_idle_minutes` after its last request, whichever comes first; the
@@ -1787,6 +1812,13 @@ local = false
 workers_per_workspace = 1               # uploads processed at once per workspace (a lane)
 session_max_age_hours = 12              # a browser session dies this long after login
 session_idle_minutes = 120              # ... or this long after its last request
+
+[server.oidc]            # optional: "Sign in with <issuer>" beside the password form
+issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
+client_id = "..."
+redirect_uri = "https://quack.example.com/login/oidc/callback"   # this server's URL
+# client_secret_env = "QUACK_OIDC_SECRET"      # confidential client
+# scopes = ["openid", "profile", "email", "offline_access"]
 ```
 
 Every section sets `deny_unknown_fields`, so a key that is not in this list is a startup
@@ -2143,26 +2175,26 @@ design to the tracker and is updated as issues close. Ordered by risk.
   print mode, and `quack desktop` (last, if ever)
 - Open Knowledge Format bundles: `quack okf export` writes one, `quack ingest DIR` and a tar
   upload read one back as documents and ontology candidates
-- Server: users with password login, tokens with scopes, roles, audit, upload queue
+- Server: users with password login or sign-in through the organization's OpenID Connect
+  issuer, tokens with scopes, roles, audit, upload queue
 - Static builds, container image and compose, desktop bundles
 
 ### Deferred, in rough priority order
 
 1. AnythingLLM import command (workspaces, documents, system prompts, threads via its API)
-2. OIDC login for server users
-3. Data connectors: GitHub, Confluence, SharePoint (fetching a data file over http(s)
+2. Data connectors: GitHub, Confluence, SharePoint (fetching a data file over http(s)
    already ships in `quack import`)
-4. Cross-encoder reranking provider
-5. OCR for scanned PDFs
-6. Postgres + pgvector storage backend, which now also means building the seam section 15
+3. Cross-encoder reranking provider
+4. OCR for scanned PDFs
+5. Postgres + pgvector storage backend, which now also means building the seam section 15
    item 4 describes
-7. Ontology import from OWL / SKOS; a registry of domain packs
-8. Web search tool for the agent
-9. OpenAI-compatible `/v1/chat/completions` endpoint
-10. In-process embedding models (ONNX) to drop the Ollama requirement offline
-11. DuckPGQ for graph queries
-12. Kubernetes manifests; WebSocket MCP transport; object-storage file backend
-13. Web UI localization via fluent (pattern already documented in `docs/web-ui.md`)
+6. Ontology import from OWL / SKOS; a registry of domain packs
+7. Web search tool for the agent
+8. OpenAI-compatible `/v1/chat/completions` endpoint
+9. In-process embedding models (ONNX) to drop the Ollama requirement offline
+10. DuckPGQ for graph queries
+11. Kubernetes manifests; WebSocket MCP transport; object-storage file backend
+12. Web UI localization via fluent (pattern already documented in `docs/web-ui.md`)
 
 ---
 

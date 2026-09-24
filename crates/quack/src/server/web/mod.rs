@@ -5,6 +5,7 @@
 
 mod flash;
 pub(crate) mod markdown;
+mod sign_in;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -57,7 +58,9 @@ use super::api::{
 };
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
+use super::oidc::Oidc;
 use super::state::{App, ServeMode};
+use quack_core::config::OidcConfig;
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
@@ -213,6 +216,8 @@ struct ErrorPage {
 #[template(path = "login.html")]
 struct LoginPage {
     error: Option<String>,
+    /// The issuer's host, when sign-in through it is configured.
+    sign_in: Option<String>,
 }
 
 struct WsItem {
@@ -512,6 +517,11 @@ pub(crate) fn router() -> Router<App> {
             get(login_page).merge(super::throttled_login(post(login_submit))),
         )
         .route("/logout", post(logout))
+        .route("/login/oidc", super::throttled_login(get(sign_in::begin)))
+        .route(
+            OidcConfig::CALLBACK_PATH,
+            super::throttled_login(get(sign_in::finish)),
+        )
         .route("/workspaces", get(workspaces).post(create_workspace))
         .route("/w/{id}", get(workspace_index))
         .route("/w/{id}/chat", get(chat))
@@ -605,7 +615,10 @@ async fn login_page(State(app): State<App>, Query(q): Query<LoginQuery>) -> WebR
     if app.mode == ServeMode::Local {
         return Ok(Redirect::to("/workspaces").into_response());
     }
-    html(&LoginPage { error: q.error })
+    html(&LoginPage {
+        error: q.error,
+        sign_in: app.oidc.as_ref().map(Oidc::issuer_host),
+    })
 }
 
 async fn login_submit(

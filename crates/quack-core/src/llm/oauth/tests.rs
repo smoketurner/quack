@@ -469,6 +469,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         fail("manager build failed");
     };
     let endpoints = Endpoints {
+        issuer: None,
         authorization: String::from("http://127.0.0.1:9/a"),
         token: String::from("http://127.0.0.1:9/t"),
         device_authorization: None,

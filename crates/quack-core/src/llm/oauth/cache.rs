@@ -1,10 +1,13 @@
-//! The encrypted on-disk token cache: `<data_dir>/tokens/<provider>.json`.
+//! The encrypted on-disk token caches: a provider's at
+//! `<data_dir>/tokens/<provider>.json`, and each signed-in server user's at
+//! `<data_dir>/tokens/users/<user-id>.json`.
 //!
-//! The file holds AES-256-GCM ciphertext under a 32-byte key that lives in
-//! the OS keychain (`keychain.rs`) or, when no keychain is usable, in a
-//! `<provider>.key` file beside the cache with mode 0600. The provider name is
-//! the associated data, so a cache copied under another provider's name does
-//! not decrypt.
+//! A file holds AES-256-GCM ciphertext under a 32-byte key that lives in the
+//! OS keychain (`keychain.rs`) or, when no keychain is usable, in a key file
+//! with mode 0600. A provider has a key of its own (`<provider>.key`); every
+//! user's file shares one (`users.key`), so the number of keychain entries
+//! does not grow with the number of users. The owner's name is the
+//! associated data, so a cache copied under another name does not decrypt.
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::keychain::KeychainEntry;
 use crate::config::ProviderName;
 use crate::error::{Error, Result};
+use crate::ids::UserId;
 
 const FORMAT_VERSION: u32 = 1;
 
@@ -150,24 +154,106 @@ impl std::fmt::Display for KeyLocation {
     }
 }
 
-/// One provider's cache file and its key.
+/// Whose token a cache holds, which decides its file, its key, and the
+/// associated data that binds the ciphertext to it.
+#[derive(Debug, Clone)]
+enum CacheOwner {
+    /// A provider's token, under a key of its own.
+    Provider(ProviderName),
+    /// A signed-in server user's token, under the key all users share.
+    User(UserId),
+}
+
+impl CacheOwner {
+    /// The keychain account and key-file stem every user's cache shares.
+    const USERS: &str = "users";
+
+    fn aad(&self) -> String {
+        match self {
+            Self::Provider(provider) => provider.to_string(),
+            Self::User(user) => format!("user:{user}"),
+        }
+    }
+
+    fn keychain(&self) -> KeychainEntry {
+        KeychainEntry::new(match self {
+            Self::Provider(provider) => format!("oauth:{provider}"),
+            Self::User(_) => format!("oidc:{}", Self::USERS),
+        })
+    }
+
+    /// Whether the key belongs to this cache alone, so clearing the cache
+    /// removes it too.
+    const fn owns_key(&self) -> bool {
+        match self {
+            Self::Provider(_) => true,
+            Self::User(_) => false,
+        }
+    }
+
+    /// What someone does when the cache no longer decrypts.
+    fn recovery(&self) -> String {
+        match self {
+            Self::Provider(provider) => {
+                format!("run `quack auth logout {provider}` and log in again")
+            }
+            Self::User(_) => String::from("the user signs in again"),
+        }
+    }
+}
+
+impl std::fmt::Display for CacheOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(provider) => write!(f, "provider '{provider}'"),
+            Self::User(user) => write!(f, "user {user}"),
+        }
+    }
+}
+
+/// One cache file and its key.
 #[derive(Debug, Clone)]
 pub struct TokenCache {
-    provider: ProviderName,
+    owner: CacheOwner,
     path: PathBuf,
     key_path: PathBuf,
     key_source: KeySource,
 }
 
 impl TokenCache {
+    /// A provider's cache, `<tokens_dir>/<provider>.json`.
     #[must_use]
     pub fn new(tokens_dir: &Path, provider: &ProviderName, key_source: KeySource) -> Self {
         Self {
-            provider: provider.clone(),
+            owner: CacheOwner::Provider(provider.clone()),
             path: tokens_dir.join(format!("{provider}.json")),
             key_path: tokens_dir.join(format!("{provider}.key")),
             key_source,
         }
+    }
+
+    /// A server user's cache, `<tokens_dir>/users/<user-id>.json`, sealed
+    /// under the key every user shares.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the id could not be a file name: anything but
+    /// ASCII letters, digits, and `-`.
+    pub fn for_user(tokens_dir: &Path, user: &UserId, key_source: KeySource) -> Result<Self> {
+        let id = user.as_str();
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(Error::Llm(format!(
+                "user id '{id}' cannot name a token cache file"
+            )));
+        }
+        Ok(Self {
+            owner: CacheOwner::User(user.clone()),
+            path: tokens_dir
+                .join(CacheOwner::USERS)
+                .join(format!("{id}.json")),
+            key_path: tokens_dir.join(format!("{}.key", CacheOwner::USERS)),
+            key_source,
+        })
     }
 
     #[must_use]
@@ -192,7 +278,7 @@ impl TokenCache {
     }
 
     fn keychain(&self) -> KeychainEntry {
-        KeychainEntry::new(&self.provider)
+        self.owner.keychain()
     }
 
     /// Read and decrypt the cached token, or `None` when there is no cache or
@@ -210,7 +296,7 @@ impl TokenCache {
         };
         let Some(key) = self.key(KeyLookup::Existing).await? else {
             tracing::warn!(
-                provider = %self.provider,
+                owner = %self.owner,
                 "token cache exists but its encryption key is gone; a new login is needed"
             );
             return Ok(None);
@@ -236,14 +322,14 @@ impl TokenCache {
             .aead()?
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
-                Aad::from(self.provider.as_str().as_bytes()),
+                Aad::from(self.owner.aad().as_bytes()),
                 &mut ciphertext,
             )
             .map_err(|_| {
                 Error::Llm(format!(
-                    "token cache {} does not decrypt with the stored key; run `quack auth logout {}` and log in again",
+                    "token cache {} does not decrypt with the stored key; {}",
                     self.path.display(),
-                    self.provider
+                    self.owner.recovery()
                 ))
             })?;
         let plain: Plaintext = serde_json::from_slice(plaintext)?;
@@ -264,7 +350,7 @@ impl TokenCache {
         let mut in_out = serde_json::to_vec(&Plaintext::from(token))?;
         let nonce = key
             .aead()?
-            .seal_in_place_append_tag(Aad::from(self.provider.as_str().as_bytes()), &mut in_out)
+            .seal_in_place_append_tag(Aad::from(self.owner.aad().as_bytes()), &mut in_out)
             .map_err(|_| Error::Llm(String::from("token cache encryption failed")))?;
         let envelope = Envelope {
             version: FORMAT_VERSION,
@@ -277,18 +363,22 @@ impl TokenCache {
         write_private(&self.path, &serde_json::to_vec(&envelope)?)
     }
 
-    /// Delete the cache file and its key wherever it lives.
+    /// Delete the cache file, and its key wherever it lives when the key is
+    /// this cache's alone.
     ///
     /// # Errors
     ///
     /// Returns an error when a file or keychain entry cannot be removed.
     pub async fn clear(&self) -> Result<()> {
         remove_if_present(&self.path)?;
+        if !self.owner.owns_key() {
+            return Ok(());
+        }
         remove_if_present(&self.key_path)?;
         if self.key_source == KeySource::Keychain
             && let Err(e) = self.keychain().delete().await
         {
-            tracing::warn!(provider = %self.provider, error = %e, "keychain entry not removed");
+            tracing::warn!(owner = %self.owner, error = %e, "keychain entry not removed");
         }
         Ok(())
     }
@@ -300,7 +390,7 @@ impl TokenCache {
             match self.keychain_key(lookup).await {
                 Ok(key) => return Ok(key),
                 Err(e) => {
-                    tracing::warn!(provider = %self.provider, error = %e, "keychain unavailable; using the key file");
+                    tracing::warn!(owner = %self.owner, error = %e, "keychain unavailable; using the key file");
                 }
             }
         }
@@ -469,6 +559,51 @@ mod tests {
         assert!(cache.clear().await.is_ok());
         assert!(!cache.exists());
         assert!(cache.clear().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn users_share_one_key_that_clearing_a_user_keeps() {
+        let dir = temp();
+        let alice = UserId::from("0190a1b2-0000-7000-8000-000000000001");
+        let bob = UserId::from("0190a1b2-0000-7000-8000-000000000002");
+        let Ok(a) = TokenCache::for_user(dir.path(), &alice, KeySource::File) else {
+            fail("cache for alice");
+        };
+        let Ok(b) = TokenCache::for_user(dir.path(), &bob, KeySource::File) else {
+            fail("cache for bob");
+        };
+        assert!(a.store(&token("alice-at", Some("alice-rt"))).await.is_ok());
+        assert!(b.store(&token("bob-at", None)).await.is_ok());
+        assert!(a.path().ends_with(format!("users/{alice}.json")));
+        assert!(dir.path().join("users.key").exists());
+        assert!(!dir.path().join("users").join("users.key").exists());
+
+        // Bob's ciphertext under Alice's name does not open: the user id is
+        // the associated data.
+        assert!(std::fs::copy(b.path(), a.path()).is_ok());
+        let err = a.load().await.err();
+        assert!(err.is_some_and(|e| e.to_string().contains("the user signs in again")));
+
+        assert!(a.clear().await.is_ok());
+        assert!(!a.exists());
+        assert!(dir.path().join("users.key").exists());
+        assert!(
+            b.load()
+                .await
+                .is_ok_and(|t| t.is_some_and(|t| t.access_token.expose_secret() == "bob-at"))
+        );
+    }
+
+    #[test]
+    fn a_user_id_that_cannot_be_a_file_name_is_refused() {
+        let dir = temp();
+        for id in ["", "../escape", "a/b", "local.json"] {
+            assert!(
+                TokenCache::for_user(dir.path(), &UserId::from(id), KeySource::File).is_err(),
+                "{id}"
+            );
+        }
+        assert!(TokenCache::for_user(dir.path(), &UserId::from("local"), KeySource::File).is_ok());
     }
 
     #[test]

@@ -55,7 +55,7 @@ async fn harness_with(mode: ServeMode, mut config: Config) -> Harness {
     let control = ControlPlane::open(&config)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let app = Arc::new(AppState::new(config, control, mode));
+    let app = Arc::new(AppState::new(config, control, mode, None));
     let router = super::router(Arc::clone(&app));
     Harness {
         _dir: dir,

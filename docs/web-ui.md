@@ -29,6 +29,11 @@ mime_guess = { workspace = true }
 redirect to `/login`; API routes answer 401 JSON instead. Errors render `error.html` with
 the status and message through `HtmlError`.
 
+With `[server.oidc]` set, `login.html` shows "Sign in with <issuer host>" above the password
+form. `web::sign_in` serves `GET /login/oidc` (redirect to the issuer, plus the state cookie)
+and `GET /login/oidc/callback` (a refusal lands back on `/login` with the reason in the
+flash slot; success opens the same session cookie a password login does).
+
 ## Templates
 
 Every page struct carries a `page: Page` (title, username, admin flag, local flag, and the

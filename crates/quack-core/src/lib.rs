@@ -15,6 +15,7 @@ pub mod ingestion;
 pub mod jobs;
 pub mod llm;
 pub mod ocsf;
+pub mod oidc;
 pub mod okf;
 pub mod ontology;
 pub mod prefix;
