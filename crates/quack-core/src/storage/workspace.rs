@@ -2331,7 +2331,7 @@ impl DocumentInfo {
     pub fn fallback_tables(&self) -> Vec<String> {
         match FileType::of(&self.filename).map(FileType::load) {
             Some(Load::Table(_)) => vec![TableName::of_file(&self.filename).into_string()],
-            Some(Load::Workbook | Load::Chunks) | None => Vec::new(),
+            Some(Load::Workbook | Load::Chunks(_)) | None => Vec::new(),
         }
     }
 }

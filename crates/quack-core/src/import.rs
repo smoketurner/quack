@@ -492,7 +492,7 @@ impl Download {
             .split(['?', '#'])
             .next()
             .and_then(|path| path.rsplit('/').next())
-            .filter(|name| FileType::of(name).is_some_and(|t| t.load() != Load::Chunks))
+            .filter(|name| FileType::of(name).is_some_and(|t| !matches!(t.load(), Load::Chunks(_))))
             .and_then(|name| name.rsplit_once('.'))
             .map(|(_, ext)| ext.to_ascii_lowercase())
             .ok_or_else(|| {
