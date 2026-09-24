@@ -37,7 +37,7 @@ use self::flash::{Flash, UrlEncoded};
 use super::api::admin::CreateUser;
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
-use super::api::documents::Enqueued;
+use super::api::documents::{Enqueued, IncomingFile, UploadForm};
 use super::api::embeddings::RefreshStarted;
 use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
@@ -995,43 +995,16 @@ async fn upload(
     multipart: Multipart,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let mut files = Vec::new();
-    let mut text = String::new();
-    let mut title = String::new();
-    let mut multipart = multipart;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?
-    {
-        let name = field.name().unwrap_or("").to_owned();
-        if let Some(filename) = field.file_name().map(str::to_owned) {
-            let data = field
-                .bytes()
-                .await
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            if !filename.is_empty() && !data.is_empty() {
-                files.push((filename, data.to_vec()));
-            }
-        } else {
-            let value = field
-                .text()
-                .await
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            match name.as_str() {
-                "text" => text = value,
-                "title" => title = value,
-                _ => {}
-            }
-        }
-    }
+    let form = UploadForm::read(multipart).await?;
+    let text = form.fields.get("text").map_or("", String::as_str);
     let pasted = if text.trim().is_empty() {
         Vec::new()
     } else {
-        vec![docs_api::pasted_file(&text, Some(&title))?]
+        let title = form.fields.get("title").map(String::as_str);
+        vec![IncomingFile::pasted(text, title)?]
     };
     let back = format!("/w/{id}/documents");
-    let skipped = match enqueue_web(&app, &access, files, pasted).await {
+    let skipped = match enqueue_web(&app, &access, form.files, pasted).await {
         Ok(skipped) => skipped,
         Err(e) => return Ok(Flash::error(back, e.message).into_response()),
     };
@@ -1051,8 +1024,8 @@ async fn upload(
 async fn enqueue_web(
     app: &App,
     access: &Access,
-    files: Vec<(String, Vec<u8>)>,
-    pasted: Vec<(String, Vec<u8>)>,
+    files: Vec<IncomingFile>,
+    pasted: Vec<IncomingFile>,
 ) -> Result<Vec<String>, ApiError> {
     if files.is_empty() && pasted.is_empty() {
         return Err(ApiError::bad_request("no file or text in the request"));

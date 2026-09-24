@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Multipart, Path, State};
+use std::collections::HashMap;
+
+use axum::extract::{FromRequest, Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use quack_core::error::Record;
@@ -90,14 +92,14 @@ pub(crate) async fn upload(
         let multipart = Multipart::from_request(request, &app)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        multipart_files(multipart).await?
+        UploadForm::read(multipart).await?.files
     } else {
         let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         let pasted: PastedText =
             serde_json::from_slice(&bytes).map_err(|e| ApiError::bad_request(e.to_string()))?;
-        vec![pasted_file(&pasted.text, pasted.title.as_deref())?]
+        vec![IncomingFile::pasted(&pasted.text, pasted.title.as_deref())?]
     };
     let source = if content_type.starts_with("multipart/form-data") {
         DocumentSource::Upload
@@ -122,9 +124,12 @@ async fn import_bundle(
     access: &Access,
     bundle: Bundle,
 ) -> ApiResult<axum::response::Response> {
-    let files: Vec<(String, Vec<u8>)> = bundle
+    let files: Vec<IncomingFile> = bundle
         .documents()
-        .map(|f| (okf::document_name(&f.path), f.content.as_bytes().to_vec()))
+        .map(|f| IncomingFile {
+            name: okf::document_name(&f.path),
+            data: f.content.as_bytes().to_vec(),
+        })
         .collect();
     let queued = if files.is_empty() {
         Vec::new()
@@ -167,48 +172,80 @@ async fn import_bundle(
         .into_response())
 }
 
-/// Every part that carries a file name, as `(name, bytes)`.
-pub(crate) async fn multipart_files(mut multipart: Multipart) -> ApiResult<Vec<(String, Vec<u8>)>> {
-    let mut files = Vec::new();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?
-    {
-        let Some(name) = field.file_name().map(str::to_owned) else {
-            continue;
-        };
-        let data = field
-            .bytes()
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        if name.is_empty() && data.is_empty() {
-            continue;
-        }
-        files.push((name, data.to_vec()));
-    }
-    Ok(files)
+/// One file an upload carried.
+pub(crate) struct IncomingFile {
+    pub name: String,
+    pub data: Vec<u8>,
 }
 
-/// A pasted text becomes a Markdown (or `.txt`) file named by its title.
-pub(crate) fn pasted_file(text: &str, title: Option<&str>) -> ApiResult<(String, Vec<u8>)> {
-    if text.trim().is_empty() {
-        return Err(ApiError::bad_request("text must not be empty"));
+impl IncomingFile {
+    /// A pasted text as a Markdown (or `.txt`) file named by its title.
+    pub(crate) fn pasted(text: &str, title: Option<&str>) -> ApiResult<Self> {
+        if text.trim().is_empty() {
+            return Err(ApiError::bad_request("text must not be empty"));
+        }
+        let title = title
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("pasted")
+            .to_owned();
+        let has_text_extension = std::path::Path::new(&title)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"));
+        let name = if has_text_extension {
+            title
+        } else {
+            format!("{title}.md")
+        };
+        Ok(Self {
+            name,
+            data: text.as_bytes().to_vec(),
+        })
     }
-    let title = title
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("pasted")
-        .to_owned();
-    let has_text_extension = std::path::Path::new(&title)
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"));
-    let filename = if has_text_extension {
-        title
-    } else {
-        format!("{title}.md")
-    };
-    Ok((filename, text.as_bytes().to_vec()))
+}
+
+/// A `multipart/form-data` upload: every part with a file name, and the
+/// plain fields beside them (the web form's pasted `text` and `title`).
+pub(crate) struct UploadForm {
+    pub files: Vec<IncomingFile>,
+    pub fields: HashMap<String, String>,
+}
+
+impl UploadForm {
+    /// Read every part. A file part with neither a name nor bytes (a form's
+    /// file input left empty) is skipped.
+    pub(crate) async fn read(mut multipart: Multipart) -> ApiResult<Self> {
+        let mut form = Self {
+            files: Vec::new(),
+            fields: HashMap::new(),
+        };
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?
+        {
+            let field_name = field.name().unwrap_or_default().to_owned();
+            if let Some(name) = field.file_name().map(str::to_owned) {
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                if !(name.is_empty() && data.is_empty()) {
+                    form.files.push(IncomingFile {
+                        name,
+                        data: data.to_vec(),
+                    });
+                }
+            } else {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                form.fields.insert(field_name, value);
+            }
+        }
+        Ok(form)
+    }
 }
 
 /// Register each file with status `queued`, audit it, and hand it to the
@@ -220,7 +257,7 @@ pub(crate) async fn enqueue(
     app: &App,
     access: &Access,
     source: DocumentSource,
-    files: Vec<(String, Vec<u8>)>,
+    files: Vec<IncomingFile>,
 ) -> ApiResult<Vec<Enqueued>> {
     if files.is_empty() {
         return Err(ApiError::bad_request("no file or text in the request"));
@@ -237,7 +274,11 @@ pub(crate) async fn enqueue(
     }
     let db = app.workspace_db(&id).await?;
     let mut queued = Vec::new();
-    for (filename, data) in files {
+    for IncomingFile {
+        name: filename,
+        data,
+    } in files
+    {
         let filename = std::path::Path::new(&filename)
             .file_name()
             .and_then(|n| n.to_str())
@@ -415,5 +456,3 @@ pub(crate) async fn delete_document(app: &App, access: &Access, doc: &str) -> Ap
         .await?;
     Ok(filename)
 }
-
-use axum::extract::FromRequest;
