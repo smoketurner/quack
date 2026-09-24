@@ -22,6 +22,7 @@ axum-extra         = { workspace = true, features = ["cookie", "form"] }
 base64             = { workspace = true, features = ["std"] }
 clap               = { workspace = true, features = ["derive", "error-context", "help", "std", "usage"] }
 crossterm          = { workspace = true, features = ["events", "event-stream"] }
+csv                = { workspace = true }
 dirs               = { workspace = true }
 futures            = { workspace = true, features = ["std"] }
 jiff               = { workspace = true, features = ["std"] }

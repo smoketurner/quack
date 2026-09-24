@@ -2,11 +2,10 @@
 //! extension cannot be compiled into the static binary). Each sheet is
 //! written as CSV under `files/` and loaded as its own table.
 
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 
 use calamine::{Data, Reader};
 
-use crate::csv::CsvRecord;
 use crate::error::{Error, Result};
 
 /// One sheet of a workbook as CSV bytes, with its name.
@@ -36,20 +35,21 @@ pub fn sheets(data: &[u8]) -> Result<Vec<SheetCsv>> {
                 continue;
             }
         };
-        let mut csv = Vec::new();
+        let mut writer = csv::Writer::from_writer(Vec::new());
         let mut rows = 0usize;
         for row in range.rows() {
             if row.iter().all(|c| matches!(c, Data::Empty)) {
                 continue;
             }
             let fields: Vec<String> = row.iter().map(cell_text).collect();
-            writeln!(csv, "{}", CsvRecord(&fields))?;
+            writer.write_record(&fields)?;
             rows = rows.saturating_add(1);
         }
         if rows < 2 {
             tracing::info!(sheet = %name, "skipping sheet without data rows");
             continue;
         }
+        let csv = writer.into_inner().map_err(|e| Error::Io(e.into_error()))?;
         out.push(SheetCsv {
             sheet: name,
             csv,

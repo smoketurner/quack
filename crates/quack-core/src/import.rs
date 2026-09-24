@@ -20,7 +20,6 @@ use sqlx::{
 };
 
 use crate::config::Config;
-use crate::csv::CsvRecord;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ingestion::{self, IngestOutcome, NewFile, parser};
@@ -286,7 +285,7 @@ pub async fn import<M: EmbeddingModel>(
             let fetched = control.or_cancelled(fetch).await?;
             (
                 format!("{table}.csv"),
-                fetched.csv.into_bytes(),
+                fetched.csv,
                 fetched.columns,
                 Some(fetched.rows),
             )
@@ -388,7 +387,7 @@ impl ImportRequest {
 /// plus the file (issue #62).
 struct Fetched {
     columns: Vec<String>,
-    csv: String,
+    csv: Vec<u8>,
     rows: u64,
 }
 
@@ -421,8 +420,8 @@ async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
         write!(select, "CAST({quoted} AS TEXT) AS {quoted}")?;
     }
     write!(select, " FROM ({inner}) AS quack_q LIMIT {limit}")?;
-    let mut csv = String::new();
-    writeln!(csv, "{}", CsvRecord(&columns))?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer.write_record(&columns)?;
     let mut rows = 0u64;
     let mut stream = sqlx::query(AssertSqlSafe(select)).fetch(&mut conn);
     while let Some(row) = stream
@@ -442,9 +441,10 @@ async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
             })?;
             cells.push(cell.unwrap_or_default());
         }
-        writeln!(csv, "{}", CsvRecord(&cells))?;
+        writer.write_record(&cells)?;
         rows = rows.saturating_add(1);
     }
+    let csv = writer.into_inner().map_err(|e| Error::Io(e.into_error()))?;
     Ok(Fetched { columns, csv, rows })
 }
 
