@@ -129,7 +129,7 @@ async fn import_bundle(
     let files: Vec<IncomingFile> = bundle
         .documents()
         .map(|f| IncomingFile {
-            name: okf::document_name(&f.path),
+            name: f.document_name(),
             data: f.content.as_bytes().to_vec(),
         })
         .collect();

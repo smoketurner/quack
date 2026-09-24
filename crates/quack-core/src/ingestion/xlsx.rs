@@ -6,7 +6,7 @@ use std::io::{Cursor, Write};
 
 use calamine::{Data, Reader};
 
-use crate::csv::CsvField;
+use crate::csv::CsvRecord;
 use crate::error::{Error, Result};
 
 /// One sheet of a workbook as CSV bytes, with its name.
@@ -43,13 +43,7 @@ pub fn sheets(data: &[u8]) -> Result<Vec<SheetCsv>> {
                 continue;
             }
             let fields: Vec<String> = row.iter().map(cell_text).collect();
-            let line = fields
-                .iter()
-                .map(|f| CsvField(f).to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            csv.write_all(line.as_bytes())?;
-            csv.write_all(b"\n")?;
+            writeln!(csv, "{}", CsvRecord(&fields))?;
             rows = rows.saturating_add(1);
         }
         if rows < 2 {

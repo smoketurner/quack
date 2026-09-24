@@ -7,7 +7,7 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use quack_core::config::Config;
-use quack_core::csv::CsvField;
+use quack_core::csv::CsvRecord;
 use quack_core::error::Record;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
@@ -392,8 +392,7 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
                 r.client_addr.as_deref().unwrap_or(""),
                 r.request_id.as_deref().unwrap_or(""),
             ];
-            let line: Vec<String> = fields.iter().map(|f| CsvField(f).to_string()).collect();
-            writeln!(out, "{}", line.join(","))?;
+            writeln!(out, "{}", CsvRecord(&fields))?;
         }
     } else if rows.is_empty() {
         writeln!(out, "No audit rows match.")?;

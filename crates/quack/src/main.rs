@@ -910,7 +910,7 @@ async fn run_import(
 ) -> Result<ExitCode> {
     init_logging();
     let request = &ImportRequest {
-        url,
+        url: url.into(),
         table,
         query,
         source_table: from,
@@ -1611,7 +1611,7 @@ async fn ingest_bundle(
     let mut skipped = 0usize;
     for file in bundle.documents() {
         let (front, _) = okf::parse_front_matter(&file.content);
-        let name = okf::document_name(&file.path);
+        let name = file.document_name();
         let outcome = ingestion::ingest_file(
             config,
             &ws_db,

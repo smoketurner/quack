@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::csv::CsvField;
+use crate::csv::CsvRecord;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
@@ -3287,21 +3287,16 @@ impl QueryResults {
     ///
     /// Returns an error if writing fails.
     pub fn write_csv(&self, out: &mut impl Write) -> Result<()> {
-        let header: Vec<String> = self
-            .columns
-            .iter()
-            .map(|c| CsvField(c).to_string())
-            .collect();
-        writeln!(out, "{}", header.join(","))?;
+        writeln!(out, "{}", CsvRecord(&self.columns))?;
         for row in &self.rows {
             let cells: Vec<String> = row
                 .iter()
                 .map(|v| match v {
                     serde_json::Value::Null => String::new(),
-                    other => CsvField(&display_json_value(other)).to_string(),
+                    other => display_json_value(other),
                 })
                 .collect();
-            writeln!(out, "{}", cells.join(","))?;
+            writeln!(out, "{}", CsvRecord(&cells))?;
         }
         Ok(())
     }

@@ -8,8 +8,9 @@
 //! used once and never stored: the document row and the audit detail
 //! carry the redacted URL.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 
 use futures::TryStreamExt as _;
@@ -19,7 +20,7 @@ use sqlx::{
 };
 
 use crate::config::Config;
-use crate::csv::CsvField;
+use crate::csv::CsvRecord;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ingestion::{self, IngestOutcome, NewFile, parser};
@@ -30,9 +31,7 @@ use crate::storage::writer::Writer;
 /// What to import and where to put it.
 #[derive(Debug, Clone)]
 pub struct ImportRequest {
-    /// `postgres://...`, `sqlite://path` or `sqlite:path`, or an
-    /// `http(s)://` URL of a data file.
-    pub url: String,
+    pub url: SourceUrl,
     /// The workspace table to create (replaced when it exists).
     pub table: String,
     /// A query to run on the source, else `SELECT * FROM source_table`.
@@ -49,9 +48,19 @@ pub struct ImportRequest {
 pub struct ImportPolicy {
     /// `sqlite:` paths on the local disk.
     pub local_files: bool,
-    /// HTTP(S) hosts that resolve to loopback, private, or link-local
-    /// addresses.
-    pub private_hosts: bool,
+    pub hosts: HostReach,
+}
+
+/// Which HTTP(S) hosts a download may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostReach {
+    /// Only hosts whose every address is public; the connection is pinned
+    /// to the checked addresses and redirects are not followed, since a
+    /// redirect's target would escape the check.
+    PublicOnly,
+    /// Any host, loopback, private, and link-local included; redirects are
+    /// followed.
+    Any,
 }
 
 impl ImportPolicy {
@@ -60,7 +69,7 @@ impl ImportPolicy {
     pub const fn owner() -> Self {
         Self {
             local_files: true,
-            private_hosts: true,
+            hosts: HostReach::Any,
         }
     }
 
@@ -69,7 +78,11 @@ impl ImportPolicy {
     pub fn server(config: &Config) -> Self {
         Self {
             local_files: config.import.allow_local_files,
-            private_hosts: config.import.allow_private_hosts,
+            hosts: if config.import.allow_private_hosts {
+                HostReach::Any
+            } else {
+                HostReach::PublicOnly
+            },
         }
     }
 }
@@ -93,69 +106,107 @@ pub enum SourceKind {
     Http,
 }
 
-/// Classify a source URL.
-///
-/// # Errors
-///
-/// Returns an error for a scheme quack does not import from.
-pub fn source_kind(url: &str) -> Result<SourceKind> {
-    let lower = url.trim().to_ascii_lowercase();
-    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-        Ok(SourceKind::Postgres)
-    } else if lower.starts_with("sqlite:") {
-        Ok(SourceKind::Sqlite)
-    } else if lower.starts_with("http://") || lower.starts_with("https://") {
-        Ok(SourceKind::Http)
-    } else if lower.starts_with("mysql://") || lower.starts_with("s3://") {
-        Err(Error::Ingestion(format!(
-            "{} sources are not supported yet; Postgres, SQLite, and HTTP(S) files are",
-            lower.split("://").next().unwrap_or("such")
-        )))
-    } else {
-        Err(Error::Ingestion(String::from(
-            "the source must be a postgres://, sqlite:, or http(s):// URL",
-        )))
+/// A source URL: `postgres://...`, `sqlite://path` or `sqlite:path`, or an
+/// `http(s)://` URL of a data file. It can carry a password, so `Debug`
+/// and `Display` show it redacted; only [`SourceUrl::expose`] gives the
+/// whole of it, to connect with.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourceUrl(String);
+
+impl From<String> for SourceUrl {
+    fn from(url: String) -> Self {
+        Self(url)
+    }
+}
+
+impl From<&str> for SourceUrl {
+    fn from(url: &str) -> Self {
+        Self(url.to_owned())
+    }
+}
+
+impl fmt::Debug for SourceUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SourceUrl").field(&self.redacted()).finish()
     }
 }
 
 /// The URL with the password of its user info removed.
-#[must_use]
-pub fn redact(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
-    };
-    let Some((userinfo, host)) = rest.split_once('@') else {
-        return url.to_owned();
-    };
-    let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
-    if user.is_empty() {
-        format!("{scheme}://{host}")
-    } else {
-        format!("{scheme}://{user}:***@{host}")
+impl fmt::Display for SourceUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.redacted())
     }
 }
 
-/// The file a `sqlite:` URL names: the scheme and any `//` stripped, the
-/// query string dropped.
-fn sqlite_path(url: &str) -> &str {
-    let rest = url.trim().get("sqlite:".len()..).unwrap_or_default();
-    let rest = rest.strip_prefix("//").unwrap_or(rest);
-    rest.split_once('?').map_or(rest, |(path, _)| path)
-}
-
-/// Whether a `sqlite:` URL points inside `[general].data_dir`: the control
-/// database and the workspace files are quack's own, and nothing in them
-/// belongs in a workspace table, whoever asks (issue #69).
-fn under_data_dir(config: &Config, url: &str) -> bool {
-    let path = std::path::Path::new(sqlite_path(url));
-    let data_dir = &config.general.data_dir;
-    let inside = |p: &std::path::Path, d: &std::path::Path| p.starts_with(d);
-    if inside(path, data_dir) {
-        return true;
+impl SourceUrl {
+    /// The whole URL, password included, for the one call that connects.
+    fn expose(&self) -> &str {
+        &self.0
     }
-    match (std::fs::canonicalize(path), std::fs::canonicalize(data_dir)) {
-        (Ok(p), Ok(d)) => inside(&p, &d),
-        _ => false,
+
+    /// The kind of source this names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a scheme quack does not import from.
+    pub fn kind(&self) -> Result<SourceKind> {
+        let lower = self.0.trim().to_ascii_lowercase();
+        if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+            Ok(SourceKind::Postgres)
+        } else if lower.starts_with("sqlite:") {
+            Ok(SourceKind::Sqlite)
+        } else if lower.starts_with("http://") || lower.starts_with("https://") {
+            Ok(SourceKind::Http)
+        } else if lower.starts_with("mysql://") || lower.starts_with("s3://") {
+            Err(Error::Ingestion(format!(
+                "{} sources are not supported yet; Postgres, SQLite, and HTTP(S) files are",
+                lower.split("://").next().unwrap_or("such")
+            )))
+        } else {
+            Err(Error::Ingestion(String::from(
+                "the source must be a postgres://, sqlite:, or http(s):// URL",
+            )))
+        }
+    }
+
+    /// The URL with the password of its user info removed.
+    #[must_use]
+    pub fn redacted(&self) -> String {
+        let url = self.0.as_str();
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return url.to_owned();
+        };
+        let Some((userinfo, host)) = rest.split_once('@') else {
+            return url.to_owned();
+        };
+        let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
+        if user.is_empty() {
+            format!("{scheme}://{host}")
+        } else {
+            format!("{scheme}://{user}:***@{host}")
+        }
+    }
+
+    /// The file a `sqlite:` URL names: the scheme and any `//` stripped,
+    /// the query string dropped.
+    fn sqlite_path(&self) -> &Path {
+        let rest = self.0.trim().get("sqlite:".len()..).unwrap_or_default();
+        let rest = rest.strip_prefix("//").unwrap_or(rest);
+        Path::new(rest.split_once('?').map_or(rest, |(path, _)| path))
+    }
+
+    /// Whether a `sqlite:` URL points inside `data_dir`: the control
+    /// database and the workspace files are quack's own, and nothing in
+    /// them belongs in a workspace table, whoever asks.
+    fn is_under(&self, data_dir: &Path) -> bool {
+        let path = self.sqlite_path();
+        if path.starts_with(data_dir) {
+            return true;
+        }
+        match (std::fs::canonicalize(path), std::fs::canonicalize(data_dir)) {
+            (Ok(p), Ok(d)) => p.starts_with(d),
+            _ => false,
+        }
     }
 }
 
@@ -195,17 +246,16 @@ pub async fn import<M: EmbeddingModel>(
         .min(config.import.max_rows)
         .max(1);
     let timeout = config.import.timeout();
-    let source = redact(&request.url);
-    let (filename, bytes, columns, rows) = match source_kind(&request.url)? {
+    let source = request.url.redacted();
+    let (filename, bytes, columns, rows) = match request.url.kind()? {
         SourceKind::Http => {
             let download = Download {
                 timeout,
                 max_mb: config.import.max_download_mb,
-                private_hosts: policy.private_hosts,
-                redirects: policy.private_hosts,
+                hosts: policy.hosts,
             };
             let (filename, bytes) = control
-                .or_cancelled(fetch_http(&request.url, &table, &download))
+                .or_cancelled(download.fetch(&request.url, &table))
                 .await?;
             (filename, bytes, Vec::new(), None)
         }
@@ -215,16 +265,16 @@ pub async fn import<M: EmbeddingModel>(
                  run `quack import` on the host, or set [import].allow_local_files",
             )));
         }
-        SourceKind::Sqlite if under_data_dir(config, &request.url) => {
+        SourceKind::Sqlite if request.url.is_under(&config.general.data_dir) => {
             return Err(Error::Ingestion(String::from(
                 "quack's own data directory (control.db and the workspace files) \
                  cannot be imported into a workspace",
             )));
         }
         SourceKind::Postgres | SourceKind::Sqlite => {
-            let sql = source_query(request)?;
+            let sql = request.source_query()?;
             let fetch = async {
-                tokio::time::timeout(timeout, fetch_rows(&request.url, &sql, limit))
+                tokio::time::timeout(timeout, fetch_rows(request.url.expose(), &sql, limit))
                     .await
                     .map_err(|_| {
                         Error::Ingestion(format!(
@@ -304,28 +354,30 @@ fn cap_loaded_table(db: &WorkspaceDb, table: &str, limit: u64) -> Result<(Vec<St
     ))
 }
 
-/// The inner query the source runs: the caller's, or the whole source
-/// table.
-fn source_query(request: &ImportRequest) -> Result<String> {
-    match (&request.query, &request.source_table) {
-        (Some(query), _) if !query.trim().is_empty() => {
-            Ok(query.trim().trim_end_matches(';').to_owned())
-        }
-        (_, Some(table)) if !table.trim().is_empty() => {
-            let name = table.trim();
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-            {
-                return Err(Error::Ingestion(format!(
-                    "source table '{name}' must be a plain identifier (letters, digits, _, .)"
-                )));
+impl ImportRequest {
+    /// The inner query the source runs: the caller's, or the whole source
+    /// table.
+    fn source_query(&self) -> Result<String> {
+        match (&self.query, &self.source_table) {
+            (Some(query), _) if !query.trim().is_empty() => {
+                Ok(query.trim().trim_end_matches(';').to_owned())
             }
-            Ok(format!("SELECT * FROM {name}"))
+            (_, Some(table)) if !table.trim().is_empty() => {
+                let name = table.trim();
+                if !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                {
+                    return Err(Error::Ingestion(format!(
+                        "source table '{name}' must be a plain identifier (letters, digits, _, .)"
+                    )));
+                }
+                Ok(format!("SELECT * FROM {name}"))
+            }
+            _ => Err(Error::Ingestion(String::from(
+                "give a query or a source table",
+            ))),
         }
-        _ => Err(Error::Ingestion(String::from(
-            "give a query or a source table",
-        ))),
     }
 }
 
@@ -369,7 +421,8 @@ async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
         write!(select, "CAST({quoted} AS TEXT) AS {quoted}")?;
     }
     write!(select, " FROM ({inner}) AS quack_q LIMIT {limit}")?;
-    let mut csv = Csv::with_header(&columns);
+    let mut csv = String::new();
+    writeln!(csv, "{}", CsvRecord(&columns))?;
     let mut rows = 0u64;
     let mut stream = sqlx::query(AssertSqlSafe(select)).fetch(&mut conn);
     while let Some(row) = stream
@@ -379,151 +432,119 @@ async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
     {
         let mut cells = Vec::with_capacity(columns.len());
         for i in 0..columns.len() {
+            // NULL is an empty field, which `read_csv_auto` reads back as
+            // NULL.
             let cell: Option<String> = row.try_get(i).map_err(|e| {
                 Error::Ingestion(format!(
                     "cannot read column {}: {e}",
                     columns.get(i).map_or("?", String::as_str)
                 ))
             })?;
-            cells.push(cell);
+            cells.push(cell.unwrap_or_default());
         }
-        csv.row(&cells);
+        writeln!(csv, "{}", CsvRecord(&cells))?;
         rows = rows.saturating_add(1);
     }
-    Ok(Fetched {
-        columns,
-        csv: csv.text,
-        rows,
-    })
-}
-
-/// CSV text built a row at a time; `DuckDB` sniffs the types back.
-struct Csv {
-    text: String,
-}
-
-impl Csv {
-    fn with_header(columns: &[String]) -> Self {
-        let mut csv = Self {
-            text: String::new(),
-        };
-        csv.line(columns.iter().map(|c| Some(c.as_str())));
-        csv
-    }
-
-    fn row(&mut self, cells: &[Option<String>]) {
-        self.line(cells.iter().map(Option::as_deref));
-    }
-
-    fn line<'a>(&mut self, cells: impl Iterator<Item = Option<&'a str>>) {
-        for (i, cell) in cells.enumerate() {
-            if i > 0 {
-                self.text.push(',');
-            }
-            let Some(value) = cell else {
-                continue;
-            };
-            self.text.push_str(&CsvField(value).to_string());
-        }
-        self.text.push('\n');
-    }
+    Ok(Fetched { columns, csv, rows })
 }
 
 /// How a download is bounded.
 struct Download {
     timeout: Duration,
     max_mb: u64,
-    private_hosts: bool,
-    /// Follow redirects; off whenever hosts are checked, since a
-    /// redirect's target would escape the check.
-    redirects: bool,
+    hosts: HostReach,
 }
 
-/// Download a data file; the workspace file name keeps the URL's
-/// extension so the usual reader loads it, under the requested table name.
-///
-/// When private hosts are off, the name is resolved first, every address
-/// is checked, and the connection is pinned to those addresses so a
-/// second lookup cannot answer differently.
-async fn fetch_http(url: &str, table: &str, download: &Download) -> Result<(String, Vec<u8>)> {
-    // The same extensions `quack ingest` loads as tables.
-    let extension = url
-        .split(['?', '#'])
-        .next()
-        .and_then(|path| path.rsplit('/').next())
-        .filter(|name| parser::detect_file_type(name).is_structured())
-        .and_then(|name| name.rsplit_once('.'))
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .ok_or_else(|| {
-            let accepted: Vec<String> = parser::table_extensions()
-                .map(|e| format!(".{e}"))
-                .collect();
+impl Download {
+    /// Download a data file; the workspace file name keeps the URL's
+    /// extension so the usual reader loads it, under the requested table name.
+    ///
+    /// When only public hosts may be reached, the name is resolved first,
+    /// every address is checked, and the connection is pinned to those
+    /// addresses so a second lookup cannot answer differently.
+    async fn fetch(&self, url: &SourceUrl, table: &str) -> Result<(String, Vec<u8>)> {
+        let download = self;
+        let url = url.expose();
+        // The same extensions `quack ingest` loads as tables.
+        let extension = url
+            .split(['?', '#'])
+            .next()
+            .and_then(|path| path.rsplit('/').next())
+            .filter(|name| parser::detect_file_type(name).is_structured())
+            .and_then(|name| name.rsplit_once('.'))
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .ok_or_else(|| {
+                let accepted: Vec<String> = parser::table_extensions()
+                    .map(|e| format!(".{e}"))
+                    .collect();
+                Error::Ingestion(format!(
+                    "the URL must name a table file ending in {}",
+                    accepted.join(", ")
+                ))
+            })?;
+        let parsed =
+            reqwest::Url::parse(url).map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
+        let mut builder = reqwest::Client::builder().timeout(download.timeout);
+        if download.hosts == HostReach::PublicOnly {
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| Error::Ingestion(String::from("the URL has no host")))?;
+            let port = parsed
+                .port_or_known_default()
+                .ok_or_else(|| Error::Ingestion(String::from("the URL has no port")))?;
+            let addresses = public_addresses(host, port).await?;
+            builder = builder.resolve_to_addrs(host, &addresses);
+        }
+        if download.hosts == HostReach::PublicOnly {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let client = builder
+            .build()
+            .map_err(|e| Error::Ingestion(e.to_string()))?;
+        let mut response = client
+            .get(parsed)
+            .send()
+            .await
+            .map_err(|e| Error::Ingestion(format!("download failed: {e}")))?;
+        if response.status().is_redirection() {
+            return Err(Error::Ingestion(format!(
+                "download failed: the server answered {}; import the URL it points to",
+                response.status()
+            )));
+        }
+        if !response.status().is_success() {
+            return Err(Error::Ingestion(format!(
+                "download failed: the server answered {}",
+                response.status()
+            )));
+        }
+        let max_bytes = download.max_mb.saturating_mul(1024 * 1024);
+        let too_large = || {
             Error::Ingestion(format!(
-                "the URL must name a table file ending in {}",
-                accepted.join(", ")
+                "the file is larger than [import].max_download_mb ({} MB)",
+                download.max_mb
             ))
-        })?;
-    let parsed = reqwest::Url::parse(url).map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
-    let mut builder = reqwest::Client::builder().timeout(download.timeout);
-    if !download.private_hosts {
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| Error::Ingestion(String::from("the URL has no host")))?;
-        let port = parsed
-            .port_or_known_default()
-            .ok_or_else(|| Error::Ingestion(String::from("the URL has no port")))?;
-        let addresses = public_addresses(host, port).await?;
-        builder = builder.resolve_to_addrs(host, &addresses);
-    }
-    if !download.redirects {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
-    }
-    let client = builder
-        .build()
-        .map_err(|e| Error::Ingestion(e.to_string()))?;
-    let mut response = client
-        .get(parsed)
-        .send()
-        .await
-        .map_err(|e| Error::Ingestion(format!("download failed: {e}")))?;
-    if response.status().is_redirection() {
-        return Err(Error::Ingestion(format!(
-            "download failed: the server answered {}; import the URL it points to",
-            response.status()
-        )));
-    }
-    if !response.status().is_success() {
-        return Err(Error::Ingestion(format!(
-            "download failed: the server answered {}",
-            response.status()
-        )));
-    }
-    let max_bytes = download.max_mb.saturating_mul(1024 * 1024);
-    let too_large = || {
-        Error::Ingestion(format!(
-            "the file is larger than [import].max_download_mb ({} MB)",
-            download.max_mb
-        ))
-    };
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_bytes)
-    {
-        return Err(too_large());
-    }
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| Error::Ingestion(format!("download failed: {e}")))?
-    {
-        let next = u64::try_from(bytes.len().saturating_add(chunk.len())).unwrap_or(u64::MAX);
-        if next > max_bytes {
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
             return Err(too_large());
         }
-        bytes.extend_from_slice(&chunk);
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::Ingestion(format!("download failed: {e}")))?
+        {
+            let next = u64::try_from(bytes.len().saturating_add(chunk.len())).unwrap_or(u64::MAX);
+            if next > max_bytes {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((format!("{table}.{extension}"), bytes))
     }
-    Ok((format!("{table}.{extension}"), bytes))
 }
 
 /// The addresses `host` resolves to, all of them public.
@@ -581,56 +602,62 @@ mod tests {
     #[test]
     fn urls_classify_and_redact() {
         assert_eq!(
-            source_kind("postgres://u:p@h/db").ok(),
+            SourceUrl::from("postgres://u:p@h/db").kind().ok(),
             Some(SourceKind::Postgres)
         );
         assert_eq!(
-            source_kind("sqlite:/tmp/x.db").ok(),
+            SourceUrl::from("sqlite:/tmp/x.db").kind().ok(),
             Some(SourceKind::Sqlite)
         );
-        assert_eq!(source_kind("https://x/y.csv").ok(), Some(SourceKind::Http));
-        assert!(source_kind("mysql://h/db").is_err());
-        assert!(source_kind("ftp://h/f").is_err());
         assert_eq!(
-            redact("postgres://alice:secret@db.local:5432/sales"),
+            SourceUrl::from("https://x/y.csv").kind().ok(),
+            Some(SourceKind::Http)
+        );
+        assert!(SourceUrl::from("mysql://h/db").kind().is_err());
+        assert!(SourceUrl::from("ftp://h/f").kind().is_err());
+        assert_eq!(
+            SourceUrl::from("postgres://alice:secret@db.local:5432/sales").redacted(),
             "postgres://alice:***@db.local:5432/sales"
         );
         assert_eq!(
-            redact("postgres://db.local/sales"),
+            SourceUrl::from("postgres://db.local/sales").redacted(),
             "postgres://db.local/sales"
         );
-        assert_eq!(redact("sqlite:/tmp/x.db"), "sqlite:/tmp/x.db");
+        assert_eq!(
+            SourceUrl::from("sqlite:/tmp/x.db").redacted(),
+            "sqlite:/tmp/x.db"
+        );
     }
 
     #[test]
     fn queries_come_from_the_request_and_tables_are_checked() {
         let base = ImportRequest {
-            url: String::new(),
+            url: SourceUrl::from(""),
             table: String::from("t"),
             query: None,
             source_table: None,
             limit: None,
         };
-        assert!(source_query(&base).is_err());
+        assert!(base.source_query().is_err());
         let by_table = ImportRequest {
             source_table: Some(String::from("public.orders")),
             ..base.clone()
         };
         assert_eq!(
-            source_query(&by_table).ok().as_deref(),
+            by_table.source_query().ok().as_deref(),
             Some("SELECT * FROM public.orders")
         );
         let bad = ImportRequest {
             source_table: Some(String::from("orders; DROP TABLE x")),
             ..base.clone()
         };
-        assert!(source_query(&bad).is_err());
+        assert!(bad.source_query().is_err());
         let by_query = ImportRequest {
             query: Some(String::from(" SELECT 1 AS n; ")),
             ..base
         };
         assert_eq!(
-            source_query(&by_query).ok().as_deref(),
+            by_query.source_query().ok().as_deref(),
             Some("SELECT 1 AS n")
         );
     }
@@ -677,16 +704,17 @@ mod tests {
         let download = Download {
             timeout: Duration::from_secs(5),
             max_mb: 1,
-            private_hosts: false,
-            redirects: false,
+            hosts: HostReach::PublicOnly,
         };
-        let err = fetch_http("http://127.0.0.1:9/x.csv", "x", &download)
+        let err = download
+            .fetch(&SourceUrl::from("http://127.0.0.1:9/x.csv"), "x")
             .await
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("private address"), "{err}");
-        let err = fetch_http("http://localhost:9/x.csv", "x", &download)
+        let err = download
+            .fetch(&SourceUrl::from("http://localhost:9/x.csv"), "x")
             .await
             .err()
             .map(|e| e.to_string())
@@ -702,8 +730,7 @@ mod tests {
         let download = Download {
             timeout: Duration::from_secs(5),
             max_mb: 1,
-            private_hosts: false,
-            redirects: false,
+            hosts: HostReach::PublicOnly,
         };
         for accepted in [
             "http://127.0.0.1:9/book.ods",
@@ -711,7 +738,8 @@ mod tests {
             "http://127.0.0.1:9/data.pq#part",
             "http://127.0.0.1:9/rows.ndjson",
         ] {
-            let err = fetch_http(accepted, "t", &download)
+            let err = download
+                .fetch(&SourceUrl::from(accepted), "t")
                 .await
                 .err()
                 .map(|e| e.to_string())
@@ -719,7 +747,8 @@ mod tests {
             assert!(err.contains("private address"), "{accepted}: {err}");
         }
         for refused in ["http://127.0.0.1:9/notes.pdf", "http://127.0.0.1:9/data"] {
-            let err = fetch_http(refused, "t", &download)
+            let err = download
+                .fetch(&SourceUrl::from(refused), "t")
                 .await
                 .err()
                 .map(|e| e.to_string())
@@ -757,18 +786,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downloads_stop_at_the_byte_cap_and_do_not_follow_redirects() {
+    async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
         let owner = Download {
             timeout: Duration::from_secs(5),
             max_mb: 0,
-            private_hosts: true,
-            redirects: false,
+            hosts: HostReach::Any,
         };
         let url = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\na,b\n1,2\n3,4\n",
         )
         .await;
-        let err = fetch_http(&url, "t", &owner)
+        let err = owner
+            .fetch(&SourceUrl::from(url.as_str()), "t")
             .await
             .err()
             .map(|e| e.to_string())
@@ -779,7 +808,8 @@ mod tests {
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\na,b\n1,\r\n6\r\n2\n3,4\n\r\n0\r\n\r\n",
         )
         .await;
-        let err = fetch_http(&url, "t", &owner)
+        let err = owner
+            .fetch(&SourceUrl::from(url.as_str()), "t")
             .await
             .err()
             .map(|e| e.to_string())
@@ -791,22 +821,29 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\na,b\n1,2\n3,4\n",
         )
         .await;
-        let (name, bytes) = fetch_http(&url, "t", &roomy)
+        let (name, bytes) = roomy
+            .fetch(&SourceUrl::from(url.as_str()), "t")
             .await
             .unwrap_or_else(|e| (e.to_string(), Vec::new()));
         assert_eq!(name, "t.csv");
         assert_eq!(bytes, b"a,b\n1,2\n3,4\n");
 
+        // The owner may reach any host, so a redirect is followed: here to
+        // a closed port, which fails the download itself.
         let url = serve_once(
             "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/other.csv\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
         .await;
-        let err = fetch_http(&url, "t", &roomy)
+        let err = roomy
+            .fetch(&SourceUrl::from(url.as_str()), "t")
             .await
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        assert!(err.contains("302 Found"), "{err}");
+        assert!(
+            err.contains("download failed") && !err.contains("302 Found"),
+            "{err}"
+        );
     }
 
     /// A file source has no query to limit: the cap applies after the
@@ -822,7 +859,7 @@ mod tests {
         )
         .await;
         let request = ImportRequest {
-            url,
+            url: url.into(),
             table: String::from("rows"),
             query: None,
             source_table: None,
@@ -899,7 +936,7 @@ mod tests {
         }
         for url in urls {
             let request = ImportRequest {
-                url: url.clone(),
+                url: url.clone().into(),
                 table: String::from("x"),
                 query: None,
                 source_table: Some(String::from("users")),
@@ -920,14 +957,10 @@ mod tests {
             .unwrap_or_default();
             assert!(err.contains("own data directory"), "{url}: {err}");
         }
-        assert!(!under_data_dir(&config, "sqlite:/tmp/other.db"));
-        assert_eq!(sqlite_path("sqlite://a/b.db?x=1"), "a/b.db");
-    }
-
-    #[test]
-    fn csv_quotes_and_leaves_nulls_empty() {
-        let mut csv = Csv::with_header(&[String::from("a"), String::from("b,c")]);
-        csv.row(&[Some(String::from("x\"y")), None]);
-        assert_eq!(csv.text, "a,\"b,c\"\n\"x\"\"y\",\n");
+        assert!(!SourceUrl::from("sqlite:/tmp/other.db").is_under(&config.general.data_dir));
+        assert_eq!(
+            SourceUrl::from("sqlite://a/b.db?x=1").sqlite_path(),
+            Path::new("a/b.db")
+        );
     }
 }

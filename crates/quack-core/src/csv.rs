@@ -20,6 +20,23 @@ impl fmt::Display for CsvField<'_> {
     }
 }
 
+/// One CSV record: the fields as [`CsvField`]s joined by commas, without
+/// the line ending.
+#[derive(Debug, Clone, Copy)]
+pub struct CsvRecord<'a, S>(pub &'a [S]);
+
+impl<S: AsRef<str>> fmt::Display for CsvRecord<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, field) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}", CsvField(field.as_ref()))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +50,11 @@ mod tests {
         assert_eq!(written("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(written("two\nlines"), "\"two\nlines\"");
         assert_eq!(written("carriage\rreturn"), "\"carriage\rreturn\"");
+    }
+
+    #[test]
+    fn records_join_quoted_fields() {
+        assert_eq!(CsvRecord(&["a", "b,c", ""]).to_string(), "a,\"b,c\",");
+        assert_eq!(CsvRecord::<&str>(&[]).to_string(), "");
     }
 }

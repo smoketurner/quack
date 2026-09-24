@@ -30,7 +30,7 @@ impl From<ImportBody> for ImportRequest {
         let given =
             |field: Option<String>| field.as_deref().and_then(str::non_blank).map(str::to_owned);
         Self {
-            url: body.url,
+            url: body.url.into(),
             table: body.table,
             query: given(body.query),
             source_table: given(body.source_table),
@@ -56,8 +56,11 @@ pub(crate) async fn run_import(
     access: &Access,
     request: &ImportRequest,
 ) -> ApiResult<ImportSummary> {
-    let source = import::redact(&request.url);
-    import::source_kind(&request.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let source = request.url.redacted();
+    request
+        .url
+        .kind()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let db = app.workspace_db(&access.workspace.id).await?;
     let embeddings = Embeddings::from_config(&app.config).await?;
     // `--local` is the owner at a keyboard; anyone else is held to
