@@ -1262,6 +1262,7 @@ mod tests {
     use crate::embedding::{Dimension, Profile, Prompts};
     use crate::graph::Properties;
     use crate::graph::store::NewNode;
+    use crate::ids::ClassId;
     use crate::ids::DocumentId;
     use crate::llm::EmbedModel;
     use crate::ontology::Mapping;
@@ -1398,7 +1399,7 @@ mod tests {
         );
         let node = |label: &str| NewNode {
             label: String::from(label),
-            class_id: String::from("organization"),
+            class_id: ClassId::from("organization"),
             properties: Properties::default(),
             provisional: false,
         };
@@ -1464,7 +1465,7 @@ mod tests {
         let mut ontology = Ontology::builtin_default();
         ontology.mappings.push(Mapping {
             table: String::from("orders"),
-            class: String::from("organization"),
+            class: ClassId::from("organization"),
             key: String::from("order id"),
             properties: BTreeMap::new(),
             relations: Vec::new(),

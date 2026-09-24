@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Class, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation, SnakeId};
 use crate::error::{Error, Result};
+use crate::ids::{ClassId, RelationId};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
 /// Tuning for table evidence.
@@ -49,9 +50,9 @@ impl Proposal {
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
-            Self::Class(c) => &c.id,
+            Self::Class(c) => c.id.as_str(),
             Self::Property { property, .. } => &property.id,
-            Self::Relation(r) => &r.id,
+            Self::Relation(r) => r.id.as_str(),
             Self::Mapping(m) => &m.table,
         }
     }
@@ -338,7 +339,7 @@ impl Known<'_> {
     fn class_for_table(&self, table: &str) -> String {
         self.0.and_then(|o| o.mapping_for_table(table)).map_or_else(
             || SnakeId::singular_from(table).into_string(),
-            |m| m.class.clone(),
+            |m| m.class.to_string(),
         )
     }
     /// Whether the table's mapping already turns this column into a
@@ -427,8 +428,8 @@ impl InductionPass<'_> {
         if !self.known.class(&class_id) {
             self.candidates.push(Candidate {
                 proposal: Proposal::Class(Class {
-                    id: class_id.clone(),
-                    parent: String::from(super::ROOT_CLASS),
+                    id: ClassId::from(class_id.clone()),
+                    parent: ClassId::from(super::ROOT_CLASS),
                     label: None,
                     description: Some(format!("Rows of table {}", profile.name)),
                     key: profile
@@ -453,7 +454,7 @@ impl InductionPass<'_> {
             self.candidates.push(Candidate {
                 proposal: Proposal::Mapping(Mapping {
                     table: profile.name.clone(),
-                    class: class_id,
+                    class: ClassId::from(class_id),
                     key: key.clone(),
                     properties: property_map,
                     relations,
@@ -490,19 +491,19 @@ impl InductionPass<'_> {
                     RelationName::Existing(id) => (id, false),
                 };
             relations.push(MappingRelation {
-                relation: relation_id.clone(),
+                relation: RelationId::from(relation_id.clone()),
                 column: column.name.clone(),
-                target_class: target_class.clone(),
+                target_class: ClassId::from(target_class.clone()),
                 target_key: SnakeId::from_name(other_key).into_string(),
             });
             if new {
                 self.candidates.push(Candidate {
                     proposal: Proposal::Relation(Relation {
-                        id: relation_id,
+                        id: RelationId::from(relation_id),
                         label: None,
                         description: None,
-                        domain: class_id.clone(),
-                        range: target_class,
+                        domain: ClassId::from(class_id.clone()),
+                        range: ClassId::from(target_class),
                     }),
                     evidence: serde_json::json!({
                         "table": profile.name,
@@ -584,10 +585,10 @@ impl From<&[(Proposal, Decision)]> for Renames {
             };
             match proposal {
                 Proposal::Class(c) => {
-                    out.classes.0.insert(c.id.clone(), target.clone());
+                    out.classes.0.insert(c.id.to_string(), target.clone());
                 }
                 Proposal::Relation(r) => {
-                    out.relations.0.insert(r.id.clone(), target.clone());
+                    out.relations.0.insert(r.id.to_string(), target.clone());
                 }
                 Proposal::Property { property, .. } => {
                     out.properties.0.insert(property.id.clone(), target.clone());
@@ -604,10 +605,10 @@ impl Renames {
     /// class already there with its properties and key.
     fn apply_class(&self, ontology: &mut Ontology, class: &Class, decision: &Decision) {
         let mut class = class.clone();
-        class.id = self.classes.follow(&class.id);
-        class.parent = self.classes.follow(&class.parent);
+        class.id = ClassId::from(self.classes.follow(class.id.as_str()));
+        class.parent = ClassId::from(self.classes.follow(class.parent.as_str()));
         if let Decision::Reparent(parent) = decision {
-            class.parent.clone_from(parent);
+            class.parent = ClassId::from(parent.as_str());
         }
         class.key = class.key.as_deref().map(|k| self.properties.follow(k));
         class.properties = class
@@ -668,7 +669,10 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
         {
             let class_id = names.classes.follow(class);
             let property_id = names.properties.follow(&property.id);
-            if let Some(class) = ontology.classes.iter_mut().find(|c| c.id == class_id)
+            if let Some(class) = ontology
+                .classes
+                .iter_mut()
+                .find(|c| c.id == class_id.as_str())
                 && !class.properties.contains(&property_id)
             {
                 class.properties.push(property_id);
@@ -680,10 +684,10 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
             && !merged(decision)
         {
             let mut relation = relation.clone();
-            relation.id = names.relations.follow(&relation.id);
-            relation.domain = names.classes.follow(&relation.domain);
-            relation.range = names.classes.follow(&relation.range);
-            if ontology.relation(&relation.id).is_none() {
+            relation.id = RelationId::from(names.relations.follow(relation.id.as_str()));
+            relation.domain = ClassId::from(names.classes.follow(relation.domain.as_str()));
+            relation.range = ClassId::from(names.classes.follow(relation.range.as_str()));
+            if ontology.relation(relation.id.as_str()).is_none() {
                 ontology.relations.push(relation);
             }
         }
@@ -691,15 +695,15 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
     for (proposal, _) in accepted {
         if let Proposal::Mapping(mapping) = proposal {
             let mut mapping = mapping.clone();
-            mapping.class = names.classes.follow(&mapping.class);
+            mapping.class = ClassId::from(names.classes.follow(mapping.class.as_str()));
             mapping.properties = mapping
                 .properties
                 .iter()
                 .map(|(column, p)| (column.clone(), names.properties.follow(p)))
                 .collect();
             for link in &mut mapping.relations {
-                link.relation = names.relations.follow(&link.relation);
-                link.target_class = names.classes.follow(&link.target_class);
+                link.relation = RelationId::from(names.relations.follow(link.relation.as_str()));
+                link.target_class = ClassId::from(names.classes.follow(link.target_class.as_str()));
                 link.target_key = names.properties.follow(&link.target_key);
             }
             ontology.mappings.retain(|m| m.table != mapping.table);
@@ -912,20 +916,20 @@ mod tests {
         let mut renamed = ontology.clone();
         for class in &mut renamed.classes {
             if class.id == "claim" {
-                class.id = String::from("insurance_claim");
+                class.id = ClassId::from("insurance_claim");
             }
         }
         for mapping in &mut renamed.mappings {
             if mapping.class == "claim" {
-                mapping.class = String::from("insurance_claim");
+                mapping.class = ClassId::from("insurance_claim");
             }
         }
         for relation in &mut renamed.relations {
             if relation.domain == "claim" {
-                relation.domain = String::from("insurance_claim");
+                relation.domain = ClassId::from("insurance_claim");
             }
             if relation.range == "claim" {
-                relation.range = String::from("insurance_claim");
+                relation.range = ClassId::from("insurance_claim");
             }
         }
         let again = propose_from_tables(&db, Some(&renamed), &TableEvidenceOptions::default())
@@ -998,8 +1002,8 @@ mod tests {
 
         let bad = vec![(
             Proposal::Class(Class {
-                id: String::from("x"),
-                parent: String::from("ghost"),
+                id: ClassId::from("x"),
+                parent: ClassId::from("ghost"),
                 label: None,
                 description: None,
                 key: None,

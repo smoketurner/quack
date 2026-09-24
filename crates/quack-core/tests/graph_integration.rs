@@ -18,7 +18,7 @@ use quack_core::graph::{
     GraphOptions, GraphResult, Node, Origin, Properties, extract, resolve, store as graph_store,
     tables, traverse,
 };
-use quack_core::ids::{ChunkId, DocumentId, NodeId};
+use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::progress::RunControl;
@@ -94,8 +94,8 @@ impl EmbeddingModel for LetterEmbedding {
 
 fn ontology() -> Ontology {
     let class = |id: &str, parent: &str, key: Option<&str>| Class {
-        id: id.to_owned(),
-        parent: parent.to_owned(),
+        id: ClassId::from(id.to_owned()),
+        parent: ClassId::from(parent.to_owned()),
         label: None,
         description: None,
         key: key.map(str::to_owned),
@@ -106,11 +106,11 @@ fn ontology() -> Ontology {
             .collect(),
     };
     let relation = |id: &str, domain: &str, range: &str| Relation {
-        id: id.to_owned(),
+        id: RelationId::from(id.to_owned()),
         label: None,
         description: None,
-        domain: domain.to_owned(),
-        range: range.to_owned(),
+        domain: ClassId::from(domain.to_owned()),
+        range: ClassId::from(range.to_owned()),
     };
     Ontology {
         version: None,
@@ -147,20 +147,20 @@ fn ontology() -> Ontology {
         ],
         mappings: vec![Mapping {
             table: String::from("shipments"),
-            class: String::from("shipment"),
+            class: ClassId::from("shipment"),
             key: String::from("po"),
             properties: BTreeMap::from([(String::from("mode"), String::from("mode"))]),
             relations: vec![
                 MappingRelation {
-                    relation: String::from("supplied_by"),
+                    relation: RelationId::from("supplied_by"),
                     column: String::from("vendor"),
-                    target_class: String::from("vendor"),
+                    target_class: ClassId::from("vendor"),
                     target_key: String::from("name"),
                 },
                 MappingRelation {
-                    relation: String::from("delivered_to"),
+                    relation: RelationId::from("delivered_to"),
                     column: String::from("country"),
-                    target_class: String::from("country"),
+                    target_class: ClassId::from("country"),
                     target_key: String::from("name"),
                 },
             ],
@@ -335,7 +335,7 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     tables::extract(&db, &current, false).unwrap();
     let node = |label: &str| NewNode {
         label: label.to_owned(),
-        class_id: String::from("country"),
+        class_id: ClassId::from("country"),
         properties: Properties::default(),
         provisional: false,
     };
@@ -426,7 +426,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     .unwrap();
     let node = |label: &str, class: &str| NewNode {
         label: label.to_owned(),
-        class_id: class.to_owned(),
+        class_id: ClassId::from(class.to_owned()),
         properties: Properties::default(),
         provisional: false,
     };
@@ -652,7 +652,7 @@ fn paths_merges_and_listing(
     // provenance move, the alias is kept, and the path shortens.
     let proposal = resolve::decide(
         db,
-        &pending.first().unwrap().id,
+        pending.first().unwrap().id.as_str(),
         MergeDecision::Accept,
         Some("tester"),
     )
@@ -673,7 +673,7 @@ fn paths_merges_and_listing(
         "the merged vendor's ships_to edge shortens it"
     );
     assert!(resolve::pending(db).unwrap().is_empty());
-    assert!(resolve::decide(db, &proposal.id, MergeDecision::Accept, None).is_err());
+    assert!(resolve::decide(db, proposal.id.as_str(), MergeDecision::Accept, None).is_err());
 }
 
 #[tokio::test]
@@ -756,7 +756,7 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
     let mut edited = current.clone();
     for relation in &mut edited.relations {
         if relation.id == "supplied_by" {
-            relation.range = String::from("country");
+            relation.range = ClassId::from("country");
         }
     }
     if let Some(mapping) = edited.mappings.first_mut() {
@@ -817,7 +817,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
             &db,
             &NewNode {
                 label: format!("Country {i:02}"),
-                class_id: String::from("country"),
+                class_id: ClassId::from("country"),
                 properties: Properties::default(),
                 provisional: false,
             },
@@ -845,10 +845,10 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert!(!whole.to_string().contains("cut off"), "{tree}");
 
     // The census counts the class and its subclasses without listing them.
-    let (total, samples) = graph_store::class_census(&db, &[String::from("country")], 3).unwrap();
+    let (total, samples) = graph_store::class_census(&db, &[ClassId::from("country")], 3).unwrap();
     assert_eq!(total, 12);
     assert_eq!(samples, ["Country 00", "Country 01", "Country 02"]);
-    let (none, _) = graph_store::class_census(&db, &[String::from("vendor")], 3).unwrap();
+    let (none, _) = graph_store::class_census(&db, &[ClassId::from("vendor")], 3).unwrap();
     assert_eq!(none, 0);
 }
 
@@ -1012,7 +1012,7 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
             &db,
             &NewNode {
                 label: String::from(label),
-                class_id: String::from(class_id),
+                class_id: ClassId::from(String::from(class_id)),
                 properties: Properties::default(),
                 provisional: false,
             },

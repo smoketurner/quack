@@ -9,7 +9,7 @@ use std::fmt;
 use super::store::{self, EdgeScope, IdList};
 use super::{GraphOptions, GraphResult, Node, NormalizedLabel, Properties};
 use crate::error::Result;
-use crate::ids::{EdgeId, NodeId};
+use crate::ids::{ClassId, EdgeId, NodeId};
 use crate::ontology::Ontology;
 use crate::storage::workspace::WorkspaceDb;
 
@@ -359,7 +359,7 @@ pub fn by_class(
     options: &GraphOptions,
 ) -> Result<GraphResult> {
     let classes = ontology.map_or_else(
-        || vec![class_id.to_owned()],
+        || vec![ClassId::from(class_id)],
         |o| o.class_and_descendants(class_id),
     );
     // Counted before the cap applies: a listing that silently stopped at
@@ -519,6 +519,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::ids::RelationId;
 
     #[test]
     fn hops_are_at_least_one_with_named_defaults() {
@@ -536,7 +537,7 @@ mod tests {
         Node {
             id: NodeId::from(String::from(id)),
             label: String::from(label),
-            class_id: String::from("organization"),
+            class_id: ClassId::from("organization"),
             properties: Properties::from(properties),
             provisional: false,
         }
@@ -553,7 +554,7 @@ mod tests {
                 id: EdgeId::from("e"),
                 source_node_id: NodeId::from("a"),
                 target_node_id: NodeId::from("b"),
-                relation_id: String::from("supplies"),
+                relation_id: RelationId::from("supplies"),
                 weight: 1.0,
                 properties: Properties::from(json!({ "since": "2020" })),
                 provisional: false,
@@ -576,7 +577,7 @@ mod tests {
             id: EdgeId::from(String::from(id)),
             source_node_id: NodeId::from(String::from(from)),
             target_node_id: NodeId::from(String::from(to)),
-            relation_id: String::from("knows"),
+            relation_id: RelationId::from("knows"),
             weight: 1.0,
             properties: Properties::default(),
             provisional: false,

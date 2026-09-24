@@ -5,6 +5,7 @@ use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
 use super::store::{self, Acceptance, Revision};
 use super::{Class, Ontology, ROOT_CLASS};
 use crate::error::{Error, Record, Result};
+use crate::ids::{CandidateId, ClassId};
 use crate::prefix::PrefixMatch;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::NonBlankText;
@@ -12,7 +13,7 @@ use crate::text::NonBlankText;
 /// A stored candidate.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CandidateRow {
-    pub id: String,
+    pub id: CandidateId,
     pub kind: ItemKind,
     pub proposal: Proposal,
     pub evidence: serde_json::Value,
@@ -254,7 +255,7 @@ pub fn store_run(db: &WorkspaceDb, candidates: &[Candidate]) -> Result<String> {
             "INSERT INTO _quack_ontology_candidates (id, kind, proposal, evidence, confidence, status, proposed_by) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
-                uuid::Uuid::now_v7().to_string(),
+                CandidateId::generate(),
                 candidate.proposal.kind(),
                 serde_json::to_string(&candidate.proposal)?,
                 serde_json::to_string(&candidate.evidence)?,
@@ -274,8 +275,8 @@ fn row_from(row: &duckdb::Row<'_>) -> duckdb::Result<CandidateRow> {
         id: row.get(0)?,
         kind: row.get(1)?,
         proposal: serde_json::from_str(&proposal).unwrap_or(Proposal::Class(Class {
-            id: String::from("unparseable"),
-            parent: String::from(ROOT_CLASS),
+            id: ClassId::from("unparseable"),
+            parent: ClassId::from(String::from(ROOT_CLASS)),
             label: None,
             description: None,
             key: None,
@@ -426,7 +427,7 @@ fn accept_as(
 pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology> {
     let ids: Vec<(String, Decision)> = queue(db, Queue::Pending)?
         .into_iter()
-        .map(|c| (c.id, Decision::Accept))
+        .map(|c| (c.id.into_string(), Decision::Accept))
         .collect();
     if ids.is_empty() {
         return Err(Error::Ontology(String::from("no pending candidates")));
@@ -450,8 +451,8 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
         let thin = Candidate {
             proposal: Proposal::Class(Class {
-                id: String::from("rumor"),
-                parent: String::from(ROOT_CLASS),
+                id: ClassId::from("rumor"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
                 label: None,
                 description: None,
                 key: None,
@@ -465,7 +466,7 @@ mod tests {
         assert!(queue(&db, Queue::Pending).is_ok_and(|p| p.is_empty()));
         let aside = queue(&db, Queue::LowSupport).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(aside.len(), 1);
-        let id = aside.first().map(|c| c.id.clone()).unwrap_or_default();
+        let id = aside.first().map(|c| c.id.to_string()).unwrap_or_default();
         let stored =
             accept(&db, &[(id, Decision::Accept)], None).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(stored.class("rumor").is_some());
@@ -523,14 +524,14 @@ mod tests {
             .find(|c| c.proposal.id() == "country")
             .unwrap_or_else(|| fail("no country"));
         assert_eq!(
-            reject(&db, std::slice::from_ref(&country.id), Some("alice")).unwrap_or(0),
+            reject(&db, &[country.id.to_string()], Some("alice")).unwrap_or(0),
             1
         );
         assert!(
-            reject(&db, std::slice::from_ref(&country.id), None).is_err(),
+            reject(&db, &[country.id.to_string()], None).is_err(),
             "already decided"
         );
-        let prefix = country.id.get(..30).unwrap_or(&country.id);
+        let prefix = country.id.as_str().get(..30).unwrap_or(country.id.as_str());
         let found = find(&db, prefix).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(found.status, CandidateStatus::Rejected);
         assert_eq!(found.decided_by.as_deref(), Some("alice"));
@@ -544,7 +545,7 @@ mod tests {
                 } else {
                     Decision::Accept
                 };
-                (c.id, d)
+                (c.id.into_string(), d)
             })
             .collect();
         let stored = accept(&db, &rest, Some("bob")).unwrap_or_else(|e| fail(&e.to_string()));

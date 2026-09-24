@@ -435,7 +435,7 @@ mod tests {
     use super::*;
     use crate::graph::Properties;
     use crate::graph::store::NewNode;
-    use crate::ids::{ChunkId, DocumentId};
+    use crate::ids::{ChunkId, ClassId, DocumentId};
     use crate::ontology::Ontology;
     use crate::ontology::store::Revision;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
@@ -481,7 +481,7 @@ mod tests {
             &db,
             &NewNode {
                 label: String::from("Acme"),
-                class_id: String::from("organization"),
+                class_id: ClassId::from("organization"),
                 properties: Properties::default(),
                 provisional: false,
             },
@@ -532,7 +532,7 @@ mod tests {
             &db,
             &NewNode {
                 label: String::from("Acme"),
-                class_id: String::from("organization"),
+                class_id: ClassId::from("organization"),
                 properties: Properties::default(),
                 provisional: false,
             },

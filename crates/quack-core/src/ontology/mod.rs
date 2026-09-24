@@ -19,6 +19,7 @@ use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef}
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
+use crate::ids::{ClassId, RelationId};
 use induction::ItemKind;
 
 /// The implicit root class every class descends from.
@@ -209,9 +210,9 @@ impl FromSql for OntologyVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Class {
-    pub id: String,
+    pub id: ClassId,
     #[serde(default = "root_class")]
-    pub parent: String,
+    pub parent: ClassId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,8 +224,8 @@ pub struct Class {
     pub properties: Vec<String>,
 }
 
-fn root_class() -> String {
-    String::from(ROOT_CLASS)
+fn root_class() -> ClassId {
+    ClassId::from(ROOT_CLASS)
 }
 
 /// How many items a `take(limit)` left out, or `None` when it left none.
@@ -235,13 +236,13 @@ fn hidden(total: usize, limit: usize) -> Option<usize> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relation {
-    pub id: String,
+    pub id: RelationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub domain: String,
-    pub range: String,
+    pub domain: ClassId,
+    pub range: ClassId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,9 +280,9 @@ pub struct Property {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MappingRelation {
-    pub relation: String,
+    pub relation: RelationId,
     pub column: String,
-    pub target_class: String,
+    pub target_class: ClassId,
     pub target_key: String,
 }
 
@@ -290,7 +291,7 @@ pub struct MappingRelation {
 #[serde(deny_unknown_fields)]
 pub struct Mapping {
     pub table: String,
-    pub class: String,
+    pub class: ClassId,
     /// The column holding the class key.
     pub key: String,
     /// Column to property id.
@@ -382,11 +383,11 @@ impl Ontology {
 
     /// The class and its ancestors up to `entity`, nearest first.
     #[must_use]
-    pub fn ancestry(&self, class_id: &str) -> Vec<String> {
-        let mut chain = vec![class_id.to_owned()];
-        let mut current = class_id.to_owned();
+    pub fn ancestry(&self, class_id: &str) -> Vec<ClassId> {
+        let mut chain = vec![ClassId::from(class_id)];
+        let mut current = ClassId::from(class_id);
         while current != ROOT_CLASS {
-            let Some(class) = self.class(&current) else {
+            let Some(class) = self.class(current.as_str()) else {
                 break;
             };
             if chain.len() > self.classes.len().saturating_add(1) {
@@ -415,8 +416,8 @@ impl Ontology {
         let Some(relation) = self.relation(relation) else {
             return false;
         };
-        self.is_subclass_of(source_class, &relation.domain)
-            && self.is_subclass_of(target_class, &relation.range)
+        self.is_subclass_of(source_class, relation.domain.as_str())
+            && self.is_subclass_of(target_class, relation.range.as_str())
     }
 
     /// The classes whose parent is this one, nearest first.
@@ -434,10 +435,10 @@ impl Ontology {
     pub fn relations_of(&self, class_id: &str) -> (Vec<&Relation>, Vec<&Relation>) {
         let mut out = (Vec::new(), Vec::new());
         for relation in &self.relations {
-            if self.is_subclass_of(class_id, &relation.domain) {
+            if self.is_subclass_of(class_id, relation.domain.as_str()) {
                 out.0.push(relation);
             }
-            if self.is_subclass_of(class_id, &relation.range) {
+            if self.is_subclass_of(class_id, relation.range.as_str()) {
                 out.1.push(relation);
             }
         }
@@ -487,10 +488,10 @@ impl Ontology {
     /// A class and every class under it: what a listing of the class
     /// covers and what its census counts.
     #[must_use]
-    pub fn class_and_descendants(&self, class_id: &str) -> Vec<String> {
-        let mut out = vec![class_id.to_owned()];
+    pub fn class_and_descendants(&self, class_id: &str) -> Vec<ClassId> {
+        let mut out = vec![ClassId::from(class_id)];
         for class in &self.classes {
-            if class.id != class_id && self.is_subclass_of(&class.id, class_id) {
+            if class.id != class_id && self.is_subclass_of(class.id.as_str(), class_id) {
                 out.push(class.id.clone());
             }
         }
@@ -502,7 +503,7 @@ impl Ontology {
     pub fn class_properties(&self, class_id: &str) -> BTreeSet<String> {
         self.ancestry(class_id)
             .iter()
-            .filter_map(|id| self.class(id))
+            .filter_map(|id| self.class(id.as_str()))
             .flat_map(|c| c.properties.iter().cloned())
             .collect()
     }
@@ -566,13 +567,13 @@ impl Ontology {
             }
         }
         for class in &self.classes {
-            if class.parent != ROOT_CLASS && self.class(&class.parent).is_none() {
+            if class.parent != ROOT_CLASS && self.class(class.parent.as_str()).is_none() {
                 return Err(Error::Ontology(format!(
                     "class '{}' has unknown parent '{}'",
                     class.id, class.parent
                 )));
             }
-            if self.ancestry(&class.id).last().map(String::as_str) != Some(ROOT_CLASS) {
+            if self.ancestry(class.id.as_str()).last().map(ClassId::as_str) != Some(ROOT_CLASS) {
                 return Err(Error::Ontology(format!(
                     "class '{}' is in an inheritance cycle",
                     class.id
@@ -587,7 +588,7 @@ impl Ontology {
                 }
             }
             if let Some(key) = &class.key
-                && !self.class_properties(&class.id).contains(key)
+                && !self.class_properties(class.id.as_str()).contains(key)
             {
                 return Err(Error::Ontology(format!(
                     "class '{}' has key '{key}', which is not one of its properties",
@@ -614,7 +615,7 @@ impl Ontology {
                 )));
             }
             for (end, class) in [("domain", &relation.domain), ("range", &relation.range)] {
-                if class != ROOT_CLASS && self.class(class).is_none() {
+                if class != ROOT_CLASS && self.class(class.as_str()).is_none() {
                     return Err(Error::Ontology(format!(
                         "relation '{}' has unknown {end} class '{class}'",
                         relation.id
@@ -639,13 +640,13 @@ impl Ontology {
                     mapping.table
                 )));
             }
-            if self.class(&mapping.class).is_none() {
+            if self.class(mapping.class.as_str()).is_none() {
                 return Err(Error::Ontology(format!(
                     "mapping for '{}' names unknown class '{}'",
                     mapping.table, mapping.class
                 )));
             }
-            let allowed = self.class_properties(&mapping.class);
+            let allowed = self.class_properties(mapping.class.as_str());
             for (column, property) in &mapping.properties {
                 if !allowed.contains(property) {
                     return Err(Error::Ontology(format!(
@@ -662,20 +663,20 @@ impl Ontology {
     }
 
     fn validate_mapping_relation(&self, mapping: &Mapping, link: &MappingRelation) -> Result<()> {
-        let Some(relation) = self.relation(&link.relation) else {
+        let Some(relation) = self.relation(link.relation.as_str()) else {
             return Err(Error::Ontology(format!(
                 "mapping for '{}' uses unknown relation '{}'",
                 mapping.table, link.relation
             )));
         };
-        if self.class(&link.target_class).is_none() {
+        if self.class(link.target_class.as_str()).is_none() {
             return Err(Error::Ontology(format!(
                 "mapping for '{}' targets unknown class '{}'",
                 mapping.table, link.target_class
             )));
         }
-        if !self.is_subclass_of(&mapping.class, &relation.domain)
-            || !self.is_subclass_of(&link.target_class, &relation.range)
+        if !self.is_subclass_of(mapping.class.as_str(), relation.domain.as_str())
+            || !self.is_subclass_of(link.target_class.as_str(), relation.range.as_str())
         {
             return Err(Error::Ontology(format!(
                 "mapping for '{}': relation '{}' goes {} -> {}, not {} -> {}",
@@ -688,7 +689,7 @@ impl Ontology {
             )));
         }
         if !self
-            .class_properties(&link.target_class)
+            .class_properties(link.target_class.as_str())
             .contains(&link.target_key)
         {
             return Err(Error::Ontology(format!(
@@ -722,7 +723,7 @@ impl Ontology {
             String::from("- classes (child: parent [key] {properties}):"),
         ];
         for class in self.classes.iter().take(limit) {
-            let props = self.class_properties(&class.id);
+            let props = self.class_properties(class.id.as_str());
             let key = class
                 .key
                 .as_deref()
@@ -823,19 +824,19 @@ impl Ontology {
     #[must_use]
     pub fn builtin_default() -> Self {
         let class = |id: &str, parent: &str, properties: &[&str]| Class {
-            id: id.to_owned(),
-            parent: parent.to_owned(),
+            id: ClassId::from(id.to_owned()),
+            parent: ClassId::from(parent.to_owned()),
             label: None,
             description: None,
             key: None,
             properties: properties.iter().map(|p| (*p).to_owned()).collect(),
         };
         let relation = |id: &str, domain: &str, range: &str| Relation {
-            id: id.to_owned(),
+            id: RelationId::from(id.to_owned()),
             label: None,
             description: None,
-            domain: domain.to_owned(),
-            range: range.to_owned(),
+            domain: ClassId::from(domain.to_owned()),
+            range: ClassId::from(range.to_owned()),
         };
         let property = |id: &str, kind: PropertyType| Property {
             id: id.to_owned(),
@@ -939,7 +940,7 @@ impl Ontology {
                     "  ".repeat(depth.saturating_add(1)),
                     class.id
                 ));
-                children(ontology, &class.id, depth.saturating_add(1), lines);
+                children(ontology, class.id.as_str(), depth.saturating_add(1), lines);
             }
         }
         let mut lines = vec![
@@ -1033,8 +1034,8 @@ mod tests {
     fn summary_nests_subclasses_under_parents() {
         let mut ontology = Ontology::builtin_default();
         ontology.classes.push(Class {
-            id: String::from("vendor"),
-            parent: String::from("organization"),
+            id: ClassId::from("vendor"),
+            parent: ClassId::from("organization"),
             label: None,
             description: None,
             key: None,
@@ -1257,8 +1258,8 @@ mod tests {
         next.version = OntologyVersion::new(2);
         next.classes.retain(|c| c.id != "vendor");
         next.classes.push(Class {
-            id: String::from("adjuster"),
-            parent: String::from("organization"),
+            id: ClassId::from("adjuster"),
+            parent: ClassId::from("organization"),
             label: None,
             description: None,
             key: None,

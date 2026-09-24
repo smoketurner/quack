@@ -257,7 +257,7 @@ fn extract_rows(
                 properties.insert(property.clone(), value.clone());
             }
         }
-        let Some(node) = staged.node(&key, &mapping.class, properties) else {
+        let Some(node) = staged.node(&key, mapping.class.as_str(), properties) else {
             continue;
         };
         staged.summary.rows = staged.summary.rows.saturating_add(1);
@@ -270,13 +270,15 @@ fn extract_rows(
             let Some(target_key) = row.get(idx).map(cell_text).filter(|k| !k.is_empty()) else {
                 continue;
             };
-            let Some(target) =
-                staged.node(&target_key, &relation.target_class, serde_json::Map::new())
-            else {
+            let Some(target) = staged.node(
+                &target_key,
+                relation.target_class.as_str(),
+                serde_json::Map::new(),
+            ) else {
                 continue;
             };
             staged.claim_node(&target, &key);
-            staged.edge(&node, &target, &relation.relation, &key);
+            staged.edge(&node, &target, relation.relation.as_str(), &key);
             staged.summary.edges = staged.summary.edges.saturating_add(1);
         }
     }

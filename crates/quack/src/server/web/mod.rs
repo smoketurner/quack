@@ -21,7 +21,9 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::citations::Citation;
-use quack_core::ids::{DocumentId, NodeId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{
+    CandidateId, ClassId, DocumentId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
+};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
@@ -360,13 +362,13 @@ struct ContextPage {
 
 struct ClassRow {
     depth: usize,
-    id: String,
+    id: ClassId,
     key: Option<String>,
     properties: String,
 }
 
 struct CandidateView {
-    id: String,
+    id: CandidateId,
     kind: ItemKind,
     proposal_id: String,
     confidence: String,
@@ -424,7 +426,7 @@ struct BulkDecideForm {
 struct GraphNodeView {
     id: NodeId,
     label: String,
-    class_id: String,
+    class_id: ClassId,
     provisional: bool,
     properties: String,
     sources: String,
@@ -432,7 +434,7 @@ struct GraphNodeView {
 
 struct GraphEdgeView {
     source: String,
-    relation: String,
+    relation: RelationId,
     target: String,
     sources: String,
 }
@@ -1282,12 +1284,12 @@ impl ClassRow {
                     id: class.id.clone(),
                     key: class.key.clone(),
                     properties: ontology
-                        .class_properties(&class.id)
+                        .class_properties(class.id.as_str())
                         .into_iter()
                         .collect::<Vec<_>>()
                         .join(", "),
                 });
-                walk(ontology, &class.id, depth.saturating_add(1), out);
+                walk(ontology, class.id.as_str(), depth.saturating_add(1), out);
             }
         }
         let mut out = Vec::new();

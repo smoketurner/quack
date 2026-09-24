@@ -13,6 +13,7 @@ use super::{
     Relation,
 };
 use crate::error::{Error, Record, Result};
+use crate::ids::ClassId;
 use crate::storage::workspace::WorkspaceDb;
 
 /// Whether a person reviewed a version before it was saved. A graph
@@ -119,8 +120,8 @@ pub fn current(db: &WorkspaceDb) -> Result<Option<Ontology>> {
         ontology.classes.push(Class {
             id: row.get(0)?,
             parent: row
-                .get::<_, Option<String>>(1)?
-                .unwrap_or_else(|| String::from(ROOT_CLASS)),
+                .get::<_, Option<ClassId>>(1)?
+                .unwrap_or_else(|| ClassId::from(ROOT_CLASS)),
             label: row.get(2)?,
             description: row.get(3)?,
             key: row.get(4)?,
@@ -148,7 +149,11 @@ pub fn current(db: &WorkspaceDb) -> Result<Option<Ontology>> {
             kind,
             values,
         });
-        if let Some(class) = ontology.classes.iter_mut().find(|c| c.id == class_id) {
+        if let Some(class) = ontology
+            .classes
+            .iter_mut()
+            .find(|c| c.id == class_id.as_str())
+        {
             class.properties.push(id);
         }
     }
@@ -297,17 +302,17 @@ fn write_version(
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
     for class in &stored.classes {
-        let existed = previous.is_some_and(|p| p.class(&class.id).is_some());
+        let existed = previous.is_some_and(|p| p.class(class.id.as_str()).is_some());
         conn.execute(
             "INSERT INTO _quack_ontology_classes (id, parent_id, label, description, key_property, since_version) \
              VALUES (?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 class.id,
                 class.parent,
-                class.label.clone().unwrap_or_else(|| class.id.clone()),
+                class.label.clone().unwrap_or_else(|| class.id.to_string()),
                 class.description,
                 class.key,
-                since(existed, "class", &class.id)
+                since(existed, "class", class.id.as_str())
             ],
         )?;
         for property_id in &class.properties {
@@ -315,7 +320,7 @@ fn write_version(
                 continue;
             };
             let existed = previous.is_some_and(|p| {
-                p.class(&class.id)
+                p.class(class.id.as_str())
                     .is_some_and(|c| c.properties.contains(property_id))
             });
             conn.execute(
@@ -333,17 +338,17 @@ fn write_version(
         }
     }
     for relation in &stored.relations {
-        let existed = previous.is_some_and(|p| p.relation(&relation.id).is_some());
+        let existed = previous.is_some_and(|p| p.relation(relation.id.as_str()).is_some());
         conn.execute(
             "INSERT INTO _quack_ontology_relations (id, label, description, domain_class, range_class, since_version) \
              VALUES (?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 relation.id,
-                relation.label.clone().unwrap_or_else(|| relation.id.clone()),
+                relation.label.clone().unwrap_or_else(|| relation.id.to_string()),
                 relation.description,
                 relation.domain,
                 relation.range,
-                since(existed, "relation", &relation.id)
+                since(existed, "relation", relation.id.as_str())
             ],
         )?;
     }
@@ -455,6 +460,7 @@ pub fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::ClassId;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -489,8 +495,8 @@ mod tests {
 
         let mut edited = live.clone();
         edited.classes.push(Class {
-            id: String::from("vendor"),
-            parent: String::from("organization"),
+            id: ClassId::from("vendor"),
+            parent: ClassId::from("organization"),
             label: Some(String::from("Vendor")),
             description: None,
             key: None,

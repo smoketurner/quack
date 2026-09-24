@@ -11,7 +11,7 @@ use rig::embeddings::EmbeddingModel;
 use super::{GraphOptions, Node, store};
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Record, Result};
-use crate::ids::NodeId;
+use crate::ids::{MergeId, NodeId};
 use crate::prefix::PrefixMatch;
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{WorkspaceDb, tokenize};
@@ -20,7 +20,7 @@ use crate::storage::writer::Writer;
 /// A proposed merge: `drop` folds into `keep`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct MergeProposal {
-    pub id: String,
+    pub id: MergeId,
     pub keep: Node,
     pub drop: Node,
     pub distance: f64,
@@ -312,7 +312,7 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
         }
         db.connection().execute(
             "INSERT INTO _quack_graph_merges (id, keep_node_id, drop_node_id, distance) VALUES (?, ?, ?, ?)",
-            duckdb::params![uuid::Uuid::now_v7().to_string(), keep, drop, distance],
+            duckdb::params![MergeId::generate(), keep, drop, distance],
         )?;
         proposed = proposed.saturating_add(1);
     }
@@ -461,7 +461,7 @@ pub fn pending(db: &WorkspaceDb) -> Result<Vec<MergeProposal>> {
          WHERE status = ? ORDER BY distance, id",
     )?;
     let mut rows = stmt.query([MergeStatus::Pending])?;
-    let mut raw: Vec<(String, NodeId, NodeId, f64, MergeStatus)> = Vec::new();
+    let mut raw: Vec<(MergeId, NodeId, NodeId, f64, MergeStatus)> = Vec::new();
     while let Some(row) = rows.next()? {
         raw.push((
             row.get(0)?,
