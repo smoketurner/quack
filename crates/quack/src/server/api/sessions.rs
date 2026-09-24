@@ -7,7 +7,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
@@ -34,12 +34,11 @@ pub(crate) async fn list(
     access
         .audit_read(&app, AuditAction::List, "sessions")
         .await?;
-    let user = access.identity.user_id.clone();
-    let sees_all = access.sees_all_sessions();
+    let viewer = access.session_viewer();
     let limit = q.limit;
     let rows = app
         .read(&id, move |db| {
-            sessions::list_sessions_for(db, limit, &user, sees_all)
+            sessions::list_sessions_for(db, limit, &viewer)
         })
         .await?;
     Ok(Json(serde_json::json!({ "sessions": rows })))
@@ -54,12 +53,10 @@ impl Access {
         session_id: &str,
     ) -> ApiResult<sessions::SessionRow> {
         let sid = session_id.to_owned();
-        let user = self.identity.user_id.clone();
-        let sees_all = self.sees_all_sessions();
+        let viewer = self.session_viewer();
         let found = app
             .read(&self.workspace.id, move |db| {
-                Ok(sessions::get_session(db, &sid)?
-                    .filter(|s| sessions::visible_to(s, &user, sees_all)))
+                Ok(sessions::get_session(db, &sid)?.filter(|s| s.visible_to(&viewer)))
             })
             .await?;
         found.ok_or_else(|| Record::Session.missing(session_id).into())
@@ -267,9 +264,7 @@ pub(crate) async fn export(
     let session = access.visible_session(&app, &sid).await?;
     let format = q.format;
     let text = app
-        .read(&id, move |db| {
-            format.render(&session, &sessions::messages(db, &session.id)?)
-        })
+        .read(&id, move |db| Transcript::load(db, session)?.render(format))
         .await?;
     access
         .audit(

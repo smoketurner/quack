@@ -84,12 +84,12 @@ impl PreparedTurn {
         let requested = body.session_id.clone();
         let model = chat.to_string();
         let user = access.identity.user_id.clone();
-        let sees_all = access.sees_all_sessions();
+        let viewer = access.session_viewer();
         let session_id = with_db(Arc::clone(&db), move |db| {
             if let Some(id) = requested {
                 // A session the caller may not see reads as missing, not forbidden.
                 sessions::get_session(db, &id)?
-                    .filter(|s| sessions::visible_to(s, &user, sees_all))
+                    .filter(|s| s.visible_to(&viewer))
                     .ok_or_else(|| Record::Session.missing(id.as_str()))?;
                 // A session's mode is set when it is created; `mode` on a
                 // later turn is ignored, and PATCH .../sessions/{sid} changes

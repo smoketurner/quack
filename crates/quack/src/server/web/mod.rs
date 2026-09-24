@@ -807,15 +807,13 @@ async fn chat(
     Query(q): Query<ChatQuery>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let user = access.identity.user_id.clone();
-    let sees_all = access.sees_all_sessions();
+    let viewer = access.session_viewer();
     let wanted = q.session.clone();
     let (sessions_list, current, messages) = app
         .read(&id, move |db| {
-            let list = sessions::list_sessions_for(db, 50, &user, sees_all)?;
+            let list = sessions::list_sessions_for(db, 50, &viewer)?;
             let current = match wanted {
-                Some(id) => sessions::get_session(db, &id)?
-                    .filter(|s| sessions::visible_to(s, &user, sees_all)),
+                Some(id) => sessions::get_session(db, &id)?.filter(|s| s.visible_to(&viewer)),
                 None => None,
             };
             let messages = match &current {

@@ -37,7 +37,7 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, MessageRole};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat, MessageRole, Transcript};
 use quack_core::storage::workspace::{QueryCanceller, StatementKind, WorkspaceDb};
 
 use crate::ModeArg;
@@ -1955,7 +1955,7 @@ impl App {
             move |db| {
                 let found = sessions::get_session(db, &session)?
                     .ok_or_else(|| CoreError::Analysis(String::from("session vanished")))?;
-                format.render(&found, &sessions::messages(db, &session)?)
+                Transcript::load(db, found)?.render(format)
             },
             move |app, text| match file {
                 Some(path) => match std::fs::write(&path, &text) {

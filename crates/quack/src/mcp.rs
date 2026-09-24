@@ -12,7 +12,7 @@
 //! Over HTTP every call is audited through the request's `Access`, like
 //! the REST API; over stdio nothing is audited, like the CLI.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events;
@@ -26,7 +26,7 @@ use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
 };
-use quack_core::storage::sessions::{self, ChatMode};
+use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
     ChunkScope, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
@@ -90,13 +90,17 @@ impl Auditor {
         Ok(())
     }
 
-    fn sees_all_sessions(&self) -> bool {
+    /// Which sessions the caller may read: every one over stdio, and the
+    /// server user's over HTTP.
+    fn session_viewer(&self) -> SessionViewer {
         match self {
-            Self::None => true,
+            Self::None => SessionViewer::All,
+            // Panics abort, so no holder ever poisons the lock.
             Self::Server(server) => server
                 .access
                 .lock()
-                .is_ok_and(|access| access.sees_all_sessions()),
+                .unwrap_or_else(PoisonError::into_inner)
+                .session_viewer(),
         }
     }
 }
@@ -711,7 +715,7 @@ impl McpServer {
         mode: Option<ChatMode>,
     ) -> Result<Result<ResolvedSession, String>, McpError> {
         let user = self.inner.user_id.clone();
-        let sees_all = self.inner.auditor.sees_all_sessions();
+        let viewer = self.inner.auditor.session_viewer();
         if let Some(id) = requested
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty())
@@ -722,7 +726,7 @@ impl McpServer {
                     let Some(session) = sessions::get_session(db, &id)? else {
                         return Ok(false);
                     };
-                    if !sessions::visible_to(&session, user.as_deref().unwrap_or(""), sees_all) {
+                    if !session.visible_to(&viewer) {
                         return Ok(false);
                     }
                     Ok(true)

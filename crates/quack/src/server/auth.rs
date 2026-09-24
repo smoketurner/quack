@@ -18,6 +18,7 @@ use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
     WorkspaceRow, sha256_hex,
 };
+use quack_core::storage::sessions::SessionViewer;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
@@ -374,15 +375,24 @@ pub(crate) struct Access {
 }
 
 impl Access {
-    /// Owners and admins see every session; others see their own.
     /// Whether the caller may act on something `owner` created: their own,
     /// or anyone's as a workspace owner or an admin.
     pub(crate) fn owns(&self, owner: Option<&str>) -> bool {
         owner == Some(self.identity.user_id.as_str()) || self.sees_all_sessions()
     }
 
-    pub(crate) fn sees_all_sessions(&self) -> bool {
+    /// Owners and admins see every session; others see their own.
+    fn sees_all_sessions(&self) -> bool {
         self.identity.is_admin || self.role == Some(Role::Owner)
+    }
+
+    /// Which sessions the caller may read.
+    pub(crate) fn session_viewer(&self) -> SessionViewer {
+        if self.sees_all_sessions() {
+            SessionViewer::All
+        } else {
+            SessionViewer::User(self.identity.user_id.clone())
+        }
     }
 
     /// Whether the caller meets `need`, for a second check inside a handler
