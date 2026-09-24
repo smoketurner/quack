@@ -441,7 +441,7 @@ impl McpServer {
         let hits = self
             .reader_db(move |db| {
                 let scope = ChunkScope::all();
-                match embedding.as_deref() {
+                match embedding.as_ref() {
                     Some(vector) => db.search_hybrid_chunks(
                         &text,
                         vector,
@@ -615,7 +615,7 @@ impl McpServer {
         let result = match self
             .inner
             .reader
-            .with_db(move |db| query.run(db, embedding.as_deref(), &options))
+            .with_db(move |db| query.run(db, embedding.as_ref(), &options))
             .await
         {
             Ok(result) => result,

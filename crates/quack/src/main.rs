@@ -1708,6 +1708,7 @@ async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quack_core::embedding::Dimension;
     use quack_core::error::AuthReason;
     use quack_core::storage::workspace::NewDocument;
 
@@ -1742,7 +1743,7 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test")]
     fn docs_json_carries_every_document_field() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap();
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
         db.insert_document(&NewDocument::new(
             &DocumentId::from("d1"),
             "broken.pdf",

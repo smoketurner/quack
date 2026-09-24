@@ -438,6 +438,7 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
     use crate::ontology::OntologyVersion;
     use crate::ontology::induction::{Candidate, TableEvidenceOptions, propose_from_tables};
 
@@ -448,7 +449,8 @@ mod tests {
 
     #[test]
     fn low_support_candidates_are_kept_aside_but_reviewable() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let thin = Candidate {
             proposal: Proposal::Class(Class {
                 id: ClassId::from("rumor"),
@@ -475,7 +477,8 @@ mod tests {
 
     #[test]
     fn same_named_columns_on_different_tables_are_separate_candidates() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         for sql in [
             "CREATE TABLE vendors (vendor_id INTEGER, name TEXT)",
             "CREATE TABLE sites (site_id INTEGER, name TEXT)",
@@ -497,7 +500,8 @@ mod tests {
 
     #[test]
     fn candidates_are_stored_reviewed_and_applied_as_a_version() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(
             db.execute_statement(
                 "CREATE TABLE vendors (vendor_id INTEGER, name TEXT, country TEXT)"

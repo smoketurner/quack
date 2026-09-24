@@ -112,9 +112,11 @@ pub fn combined(db: &WorkspaceDb) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
 
     fn db() -> WorkspaceDb {
-        WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
+        WorkspaceDb::open_in_memory(Dimension::new(4))
+            .unwrap_or_else(|e| open_failed(&e.to_string()))
     }
 
     #[expect(clippy::panic, reason = "test helper: in-memory DuckDB must open")]

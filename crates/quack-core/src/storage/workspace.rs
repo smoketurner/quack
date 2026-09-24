@@ -396,8 +396,8 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the database cannot be created.
-    pub fn open_in_memory(embedding_dimension: u32) -> Result<Self> {
-        Self::in_memory(Vectors::new(Dimension::new(embedding_dimension), None))
+    pub fn open_in_memory(embedding_dimension: Dimension) -> Result<Self> {
+        Self::in_memory(Vectors::new(embedding_dimension, None))
     }
 
     /// An in-memory database whose vectors are made under `profile` (for
@@ -1471,7 +1471,7 @@ impl WorkspaceDb {
                         chunk.heading,
                         page,
                         length,
-                        format_embedding(emb),
+                        emb.sql_literal(),
                         self.embedding_fingerprint()
                     ],
                 )?;
@@ -1582,11 +1582,7 @@ impl WorkspaceDb {
         );
         self.conn.execute(
             &sql,
-            duckdb::params![
-                format_embedding(embedding),
-                self.embedding_fingerprint(),
-                id
-            ],
+            duckdb::params![embedding.sql_literal(), self.embedding_fingerprint(), id],
         )?;
         Ok(())
     }
@@ -1764,7 +1760,7 @@ impl WorkspaceDb {
     pub fn search_hybrid_chunks(
         &self,
         query_text: &str,
-        query_embedding: &[f32],
+        query_embedding: &Vector,
         limits: HybridLimits,
         scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
@@ -1789,7 +1785,7 @@ impl WorkspaceDb {
     /// Returns an error if the search query fails.
     pub fn search_similar_chunks(
         &self,
-        query_embedding: &[f32],
+        query_embedding: &Vector,
         top_k: u32,
         scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
@@ -1817,7 +1813,7 @@ impl WorkspaceDb {
             self.vector_type()
         );
 
-        let query_literal = format_embedding(query_embedding);
+        let query_literal = query_embedding.sql_literal();
         let fingerprint = self.embedding_fingerprint();
         let limit = i64::from(top_k);
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2510,7 +2506,7 @@ pub struct NewChunk<'a> {
     pub content: &'a str,
     pub heading: Option<&'a str>,
     pub page: Option<u32>,
-    pub embedding: Option<&'a [f32]>,
+    pub embedding: Option<&'a Vector>,
 }
 
 /// A chunk returned from retrieval, with what a citation needs.
@@ -3048,19 +3044,6 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Render a vector as the string literal `DuckDB` casts to `FLOAT[N]`. The
-/// result is always bound as a parameter, never interpolated.
-fn format_embedding(embedding: &[f32]) -> String {
-    let inner: Vec<String> = embedding.iter().map(|v| format!("{v}")).collect();
-    format!("[{}]", inner.join(","))
-}
-
-/// A vector as the list literal `DuckDB` casts to `FLOAT[N]`.
-#[must_use]
-pub fn embedding_literal(embedding: &[f32]) -> String {
-    format_embedding(embedding)
-}
-
 fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {
     match row.get_ref(idx) {
         Ok(value) => json_of(duckdb::types::Value::from(value)),
@@ -3409,7 +3392,8 @@ mod tests {
     /// after its file, and nothing else; a chunked document has none.
     #[test]
     fn deleting_a_row_without_recorded_tables_drops_its_file_table() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         for sql in [
             "CREATE TABLE sales AS SELECT 1 AS n",
             "CREATE TABLE sales_notes AS SELECT 2 AS n",
@@ -3483,7 +3467,7 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test")]
     fn document_sources_read_back_and_unknown_ones_are_refused() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap();
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
         let d1 = DocumentId::from("d1");
         let mut doc = NewDocument::new(&d1, "a.txt", "text/plain", 1);
         doc.source = DocumentSource::Import;
@@ -3518,7 +3502,7 @@ mod tests {
     /// and anything `DuckDB` cannot serialize do not.
     #[test]
     fn a_canceller_interrupts_only_the_work_it_guards() {
-        let db = WorkspaceDb::open_in_memory(4)
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
             .unwrap_or_else(|e| fail(&e.to_string()))
             .with_query_timeout(Duration::from_secs(60));
         // Cancelled before the work starts: it never runs.
@@ -3560,7 +3544,8 @@ mod tests {
 
     #[test]
     fn statement_shape_ignores_literals_and_source_positions() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let shape = |sql: &str| {
             db.statement_shape(sql)
                 .unwrap_or_else(|e| fail(&e.to_string()))
@@ -3643,7 +3628,8 @@ mod tests {
     /// itself, before it ever reaches the workspace's write-gating.
     #[test]
     fn reader_connection_clones_after_lock_configuration_and_cannot_write() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let reader = db.conn.try_clone().unwrap_or_else(|e| fail(&e.to_string()));
 
         reader
@@ -3667,7 +3653,8 @@ mod tests {
     /// is still usable for a genuine read right after.
     #[test]
     fn read_only_on_a_reader_clone_rejects_a_write() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let reader = db
             .try_clone_reader()
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -3689,7 +3676,8 @@ mod tests {
     /// `try_clone`, and the writer's statements autocommit.
     #[test]
     fn reader_clone_sees_the_writers_prior_and_later_writes() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         db.execute_statement("CREATE TABLE t(a INT)")
             .unwrap_or_else(|e| fail(&e.to_string()));
         db.execute_statement("INSERT INTO t VALUES (1)")
@@ -3720,7 +3708,8 @@ mod tests {
     /// `read_only` call: `ReadOnlyGuard::drop` did not leave one open.
     #[test]
     fn read_only_rolls_back_on_error_and_the_connection_stays_usable() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(
             db.read_only(|db| db.execute_query("SELECT * FROM no_such_table"))
                 .is_err()
@@ -3775,7 +3764,8 @@ mod tests {
     /// pointed at it; only the writer connection (`run_sql`) can.
     #[test]
     fn reader_connection_cannot_see_the_writers_temp_tables() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         db.execute_statement("CREATE TEMP TABLE stdin AS SELECT 1 AS a")
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(db.execute_query("SELECT * FROM stdin").is_ok());
@@ -3792,7 +3782,8 @@ mod tests {
 
     #[test]
     fn has_temp_tables_reports_a_piped_stdin_table() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(
             !db.has_temp_tables()
                 .unwrap_or_else(|e| fail(&e.to_string()))
@@ -3810,7 +3801,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let file = dir.path().join("x.csv");
         std::fs::write(&file, "a\n1\n").unwrap_or_else(|e| fail(&e.to_string()));
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let err = db
             .execute_query(&format!(
                 "SELECT * FROM read_csv_auto('{}')",
@@ -3825,7 +3817,8 @@ mod tests {
 
     #[test]
     fn query_values_keep_fractions_dates_and_nested_types() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let results = db
             .execute_query(
                 "SELECT 20.5 AS dec, 20.5::DOUBLE AS dbl, 3.25::FLOAT AS flt, \
@@ -3858,7 +3851,8 @@ mod tests {
 
     #[test]
     fn describe_table_reports_the_exact_row_count() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
         assert!(
             db.execute_statement("INSERT INTO t VALUES (1), (2), (3)")
@@ -3892,7 +3886,8 @@ mod tests {
 
     #[test]
     fn capped_query_keeps_the_cap_and_counts_the_rest() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let capped = db
             .execute_query_capped("SELECT range AS n FROM range(10)", 3)
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -4127,24 +4122,6 @@ mod tests {
     }
 
     #[test]
-    fn format_embedding_multiple_values() {
-        let emb = [1.0_f32, 2.5, -3.0];
-        assert_eq!(format_embedding(&emb), "[1,2.5,-3]");
-    }
-
-    #[test]
-    fn format_embedding_empty() {
-        let emb: [f32; 0] = [];
-        assert_eq!(format_embedding(&emb), "[]");
-    }
-
-    #[test]
-    fn format_embedding_single_value() {
-        let emb = [0.5_f32];
-        assert_eq!(format_embedding(&emb), "[0.5]");
-    }
-
-    #[test]
     fn display_json_null() {
         assert_eq!(display_json_value(&serde_json::Value::Null), "NULL");
     }
@@ -4296,7 +4273,8 @@ mod tests {
     /// same documents in the same order, for every limit, from both pools.
     #[test]
     fn the_sql_sample_matches_evenly_spaced() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         // Ids sort in insertion order, so ingest order and id order agree.
         let sizes = [10_u32, 2, 7, 1, 13, 3];
         let mut groups: Vec<Vec<String>> = Vec::new();
@@ -4337,7 +4315,8 @@ mod tests {
     /// short, exactly as the inserts did.
     #[test]
     fn a_paged_reindex_restores_every_chunk() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "d0");
         for i in 0..7 {
             insert_text_chunk(&db, &format!("c{i}"), "d0", i, &format!("flood report {i}"));
@@ -4390,7 +4369,8 @@ mod tests {
 
     #[test]
     fn chunk_pages_visit_the_pool_once() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "d0");
         for i in 0..7 {
             insert_text_chunk(&db, &format!("c{i}"), "d0", i, "some text");
@@ -4439,7 +4419,8 @@ mod tests {
     /// identifier above one that only contains its split pieces apart.
     #[test]
     fn search_keyword_chunks_ranks_the_exact_identifier_above_split_terms() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
         insert_text_chunk(&db, "c1", "doc1", 0, "Policy POL-8841 covers water damage.");
         insert_text_chunk(
@@ -4462,7 +4443,8 @@ mod tests {
 
     #[test]
     fn search_keyword_chunks_filters_candidates_by_quoted_phrase() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
         insert_text_chunk(
             &db,
@@ -4490,7 +4472,8 @@ mod tests {
 
     #[test]
     fn search_keyword_chunks_phrase_match_in_heading() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
         db.insert_chunk(&NewChunk {
             id: &ChunkId::from("c1"),
@@ -4512,7 +4495,8 @@ mod tests {
 
     #[test]
     fn search_keyword_chunks_phrase_with_no_match_returns_empty() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
         insert_text_chunk(
             &db,
@@ -4533,7 +4517,8 @@ mod tests {
 
     #[test]
     fn search_keyword_chunks_unbalanced_quote_is_ordinary_text() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
         insert_text_chunk(
             &db,
@@ -4553,9 +4538,10 @@ mod tests {
 
     #[test]
     fn search_hybrid_chunks_ranks_identifier_and_filters_phrase() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
-        let embedding = [0.1_f32, 0.2, 0.3, 0.4];
+        let embedding = Vector::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
         db.insert_chunk(&NewChunk {
             id: &ChunkId::from("c1"),
             document_id: &DocumentId::from("doc1"),
@@ -4593,9 +4579,10 @@ mod tests {
 
     #[test]
     fn search_hybrid_chunks_phrase_filters_to_matching_chunks() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
-        let embedding = [0.1_f32, 0.2, 0.3, 0.4];
+        let embedding = Vector::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
         db.insert_chunk(&NewChunk {
             id: &ChunkId::from("c1"),
             document_id: &DocumentId::from("doc1"),

@@ -4,6 +4,7 @@ use crate::graph::{GraphStatus, store as graph_store};
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::{PinnedDocument, WorkspaceDb};
+use crate::text::Tokens;
 use std::fmt::Write;
 
 /// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to
@@ -388,9 +389,7 @@ impl SystemPrompt {
         let Some(context) = options.context.as_deref() else {
             return Ok(());
         };
-        let budget_chars = usize::try_from(options.context_max_tokens)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(4);
+        let budget_chars = Tokens::new(options.context_max_tokens).chars();
         writeln!(
             self.text,
             "Workspace context (written by the workspace owner; follow it over general knowledge):"
@@ -421,8 +420,8 @@ impl SystemPrompt {
         if pinned.is_empty() {
             return Ok(());
         }
-        let budget = usize::try_from(pinned_token_budget).unwrap_or(usize::MAX);
-        let mut used = 0usize;
+        let budget = Tokens::new(pinned_token_budget);
+        let mut used = Tokens::default();
         writeln!(
             self.text,
             "Pinned documents (full text, always in effect; cite them by filename):"
@@ -432,7 +431,7 @@ impl SystemPrompt {
             text,
         } in &pinned
         {
-            let cost = text.len().div_ceil(4);
+            let cost = Tokens::estimate(text);
             if used.saturating_add(cost) > budget {
                 writeln!(
                     self.text,
@@ -451,35 +450,10 @@ impl SystemPrompt {
     }
 }
 
-/// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
-/// room for tool results and the answer, rounded up to 8,192, between
-/// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
-/// most workspace prompts, which loses the tool guidance and the question.
-///
-/// `num_ctx` is a load option: asking Ollama for a different value than
-/// the one the model is already loaded with forces a full model reload,
-/// which measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama
-/// serve`, repeated `/api/generate` calls that only changed `num_ctx`) —
-/// against single-digit milliseconds for a request that keeps the same
-/// value. A session's history only grows turn over turn until the
-/// history trim caps it, so the requested size is non-decreasing within
-/// a session; the step below is deliberately coarse (four tiers instead
-/// of one every 2,048 tokens) so a growing conversation crosses it, and
-/// pays that reload, at most three times instead of up to twelve.
-#[must_use]
-pub fn ollama_context_size(prompt_chars: usize, cap: u32) -> u32 {
-    const HEADROOM: u32 = 8_192;
-    const FLOOR: u32 = 8_192;
-    const STEP: u32 = 8_192;
-    let prompt_tokens = u32::try_from(prompt_chars.div_ceil(4)).unwrap_or(u32::MAX);
-    let needed = prompt_tokens.saturating_add(HEADROOM);
-    let rounded = needed.div_ceil(STEP).saturating_mul(STEP).max(FLOOR);
-    rounded.min(cap.max(FLOOR))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
     use crate::graph::store::NewNode;
     use crate::graph::{Properties, Standing};
     use crate::ids::{ChunkId, ClassId, DocumentId};
@@ -488,7 +462,8 @@ mod tests {
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning};
 
     fn db() -> WorkspaceDb {
-        WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
+        WorkspaceDb::open_in_memory(Dimension::new(4))
+            .unwrap_or_else(|e| open_failed(&e.to_string()))
     }
 
     #[expect(clippy::panic, reason = "test helper: in-memory DuckDB must open")]
@@ -828,16 +803,6 @@ mod tests {
         // The 32 tables all appear by name; the last ones without columns.
         assert!(prompt.contains("- t29 (0 rows)"), "{prompt}");
         assert_eq!(prompt.matches("  Columns:").count(), 25, "{prompt}");
-    }
-
-    #[test]
-    fn ollama_context_size_rounds_up_within_bounds() {
-        assert_eq!(ollama_context_size(0, 32_768), 8_192);
-        assert_eq!(ollama_context_size(4 * 1_000, 32_768), 16_384);
-        // 12,875 prompt tokens plus headroom rounds to 24,576.
-        assert_eq!(ollama_context_size(4 * 12_875, 32_768), 24_576);
-        assert_eq!(ollama_context_size(4 * 100_000, 32_768), 32_768);
-        assert_eq!(ollama_context_size(4 * 100_000, 2_048), 8_192);
     }
 
     #[test]

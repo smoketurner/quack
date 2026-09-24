@@ -10,10 +10,11 @@ use super::resolve::MergeStatus;
 use super::{
     Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance, Standing,
 };
+use crate::embedding::Vector;
 use crate::error::{Error, Result};
 use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId};
 use crate::ontology::{self, OntologyVersion, store as ontology_store};
-use crate::storage::workspace::{MetaKey, WorkspaceDb, embedding_literal};
+use crate::storage::workspace::{MetaKey, WorkspaceDb};
 
 /// A node to store: merged into an existing one with the same normalized
 /// label and class, else inserted.
@@ -848,7 +849,7 @@ pub struct NodeMatch {
 /// Returns an error if the query fails.
 pub fn nearest_nodes(
     db: &WorkspaceDb,
-    query: &[f32],
+    query: &Vector,
     class_id: Option<&str>,
     limit: u32,
 ) -> Result<Vec<NodeMatch>> {
@@ -863,7 +864,7 @@ pub fn nearest_nodes(
            AND (? IS NULL OR class_id = ?) ORDER BY d LIMIT ?",
         vt = db.vector_type()
     );
-    let literal = embedding_literal(query);
+    let literal = query.sql_literal();
     let mut stmt = db.connection().prepare(&sql)?;
     let mut rows = stmt.query(duckdb::params![
         literal,

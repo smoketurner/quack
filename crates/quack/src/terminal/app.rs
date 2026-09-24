@@ -2985,7 +2985,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
         use quack_core::config::{BaseUrl, ProviderConfig, ProviderName, ProviderType};
-        use quack_core::embedding::Dimension;
+        use quack_core::embedding::{Dimension, Vector};
         use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
         // Without an embedding model the job says what is missing.
@@ -3040,7 +3040,7 @@ mod tests {
                     content: "levee report",
                     heading: None,
                     page: None,
-                    embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+                    embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
                 })?;
                 db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
             })

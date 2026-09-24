@@ -461,7 +461,7 @@ pub(crate) async fn search(
     let hits = reader_db
         .with_db(move |db| {
             let scope = ChunkScope::all();
-            match embedding.as_deref() {
+            match embedding.as_ref() {
                 Some(vector) => {
                     db.search_hybrid_chunks(&text, vector, HybridLimits { top_k, rrf_k }, &scope)
                 }

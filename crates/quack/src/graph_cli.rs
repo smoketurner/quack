@@ -252,12 +252,12 @@ async fn run_search(
     let embedding = query.embedding(model.as_ref()).await?;
     let result = db
         .run(move |db| {
-            let result = query.run(db, embedding.as_deref(), &options)?;
+            let result = query.run(db, embedding.as_ref(), &options)?;
             // A walk from an entity always holds that entity, so an empty
             // one means the name resolved to nothing.
             match query.entity.as_deref() {
                 Some(entity) if result.nodes.is_empty() => {
-                    Err(UnknownEntity::find(db, entity, embedding.as_deref()).into())
+                    Err(UnknownEntity::find(db, entity, embedding.as_ref()).into())
                 }
                 Some(_) | None => Ok(result),
             }

@@ -27,6 +27,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use quack_core::embedding::{Dimension, Vector};
 use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::storage::workspace::{
     ChunkScope, DocumentStatus, HybridLimits, NewChunk, NewDocument, WorkspaceDb,
@@ -49,10 +50,12 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 /// A deterministic pseudo-random vector; the scan's cost depends on the
 /// width, not the values.
-fn embedding(seed: usize, dim: usize) -> Vec<f32> {
-    (0..dim)
-        .map(|i| (((seed * 7919 + i * 104_729) % 65_521) as f32 / 65_521.0) - 0.5)
-        .collect()
+fn embedding(seed: usize, dim: usize) -> Vector {
+    Vector::from(
+        (0..dim)
+            .map(|i| (((seed * 7919 + i * 104_729) % 65_521) as f32 / 65_521.0) - 0.5)
+            .collect::<Vec<f32>>(),
+    )
 }
 
 /// Sixty pseudo-words from a 2,000-word vocabulary with a Zipf-like skew,
@@ -100,7 +103,7 @@ fn fill(db: &WorkspaceDb, from: usize, to: usize, dim: usize) {
 fn retrieval(c: &mut Criterion) {
     let max_chunks = env_usize("QUACK_BENCH_CHUNKS", 100_000);
     let dim = env_usize("QUACK_BENCH_DIM", 1_024);
-    let db = WorkspaceDb::open_in_memory(dim as u32).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(dim as u32)).unwrap();
     let query_vec = embedding(usize::MAX / 3, dim);
     let scope = ChunkScope::all();
 

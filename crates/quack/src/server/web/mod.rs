@@ -2131,7 +2131,7 @@ impl GraphAsk {
                 };
                 Some(GraphAnswer {
                     title,
-                    result: search.run(db, embedding.as_deref(), options),
+                    result: search.run(db, embedding.as_ref(), options),
                 })
             }
         }

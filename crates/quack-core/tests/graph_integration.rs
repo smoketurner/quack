@@ -168,7 +168,7 @@ fn ontology() -> Ontology {
 }
 
 fn workspace() -> WorkspaceDb {
-    let db = WorkspaceDb::open_in_memory(4).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
     db.execute_statement(
         "CREATE TABLE shipments AS SELECT * FROM (VALUES \
          ('PO-1', 'Orgenics', 'Kenya', 'Air'), \
@@ -240,7 +240,7 @@ impl Extract<Extraction> for Canned {
 /// `max_nodes` (issue #48).
 #[test]
 fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
-    let db = WorkspaceDb::open_in_memory(4).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
     let rows = tables::BATCH_ROWS * 2 + 1;
     db.execute_statement(&format!(
         "CREATE TABLE shipments AS SELECT 'PO-' || lpad(range::VARCHAR, 5, '0') AS po, \
@@ -787,7 +787,7 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
 
 #[test]
 fn auto_accepted_ontologies_are_provisional_until_reviewed() {
-    let db = WorkspaceDb::open_in_memory(4).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
     assert_eq!(store::current_standing(&db).unwrap(), Standing::Reviewed);
     store::save(
         &db,
