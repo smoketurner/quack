@@ -42,7 +42,12 @@ anyhow               = { version = "=1.0.104", default-features = false }
 apple-native-keyring-store = { version = "=1.0.2", default-features = false }
 argon2               = { version = "=0.6.0", default-features = false }
 askama               = { version = "=0.16.1", default-features = false }
+aws-config           = { version = "=1.12.0", default-features = false } # Bedrock credentials: the SDK's default chain
 aws-lc-rs            = { version = "=1.18.1", default-features = false }
+aws-sdk-bedrockruntime = { version = "=1.146.0", default-features = false } # rig-bedrock's client, built here for the endpoint override
+aws-smithy-http-client = { version = "=1.4.2", default-features = false } # the SDK's HTTPS client, wrapped by the request limit
+aws-smithy-runtime-api = { version = "=1.18.0", default-features = false }
+aws-smithy-types     = { version = "=1.8.1", default-features = false }
 axum                 = { version = "=0.8.9", default-features = false }
 criterion            = { version = "=0.8.2", default-features = false }
 axum-extra           = { version = "=0.12.6", default-features = false }
@@ -59,6 +64,7 @@ ego-tree             = { version = "=0.11.0", default-features = false } # scrap
 fluent-bundle        = { version = "=0.16.0", default-features = false }
 futures              = { version = "=0.3.34", default-features = false }
 http                 = { version = "=1.5.0", default-features = false }
+http-body            = { version = "=1.1.0", default-features = false } # a Bedrock response body that holds its request permit
 i18n-embed           = { version = "=0.16.0", default-features = false }
 i18n-embed-fl        = { version = "=0.10.1", default-features = false }
 jiff                 = { version = "=0.2.37", default-features = false } # date/time — preferred over chrono/time

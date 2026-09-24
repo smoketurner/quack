@@ -59,7 +59,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `extraction` | what both extraction runs share: the `Extract` trait, lenient JSON answers, concurrent calls with per-chunk progress (`RunProgress`), even sampling across documents, name counts (`Tally`) | 6.4, 6.5 |
 | `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
 | `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots | 4.1 |
-| `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `OneShotAgent` (one tool-less prompt, streamed: extraction and reranking), OAuth token management (`oauth`) | 4.1, 10 |
+| `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `OneShotAgent` (one tool-less prompt, streamed: extraction and reranking), OAuth token management (`oauth`), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
 
 ## `quack`
 

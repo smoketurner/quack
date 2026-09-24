@@ -31,7 +31,10 @@ build, and no ambiguity about which backend rustls picks at runtime.
   label keys on; it is resolved from the headers at build time, so the log line asks
   `CryptoProvider::fips()` instead for what rustls actually installed.
 - Features: `reqwest` and `rig` with `rustls`, `sqlx` with `tls-rustls-aws-lc-rs` (the
-  Postgres import). SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
+  Postgres import), and the AWS SDK behind the Bedrock provider (`aws-config` and
+  `aws-sdk-bedrockruntime` with `default-https-client`) on `aws-smithy-http-client`'s
+  `rustls-aws-lc`, plus `rustls-aws-lc-fips` on Linux, where `llm::bedrock` selects
+  `CryptoMode::AwsLcFips`. SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
   AES-256-GCM for the OAuth token cache from `aws_lc_rs::aead`.
 - `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
   (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`

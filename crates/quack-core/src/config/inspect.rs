@@ -21,7 +21,7 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    AuthMode, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant, ModelSpec,
+    BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant, ModelSpec,
     OAuthConfig, Overrides, config_file_path,
 };
 
@@ -471,7 +471,7 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             s.text(
                 "auth",
                 &provider.auth.mode().to_string(),
-                &AuthMode::default().to_string(),
+                &provider.provider_type.default_auth().to_string(),
                 None,
             );
             s.optional_text(
@@ -480,6 +480,8 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 None,
             );
             s.optional_text("api_key_env", provider.auth.api_key_env(), None);
+            s.optional_text("aws_profile", provider.auth.aws_profile(), None);
+            s.optional_text("region", provider.region.as_deref(), None);
             s.optional(
                 "embedding_dimension",
                 provider.embedding_dimension.map(|d| d.to_string()),

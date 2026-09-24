@@ -115,7 +115,7 @@ impl Gate {
 }
 
 /// One held permit; dropping it passes it on.
-struct GatePermit(Option<Arc<Gate>>);
+pub(crate) struct GatePermit(Option<Arc<Gate>>);
 
 impl GatePermit {
     fn new(gate: &Arc<Gate>) -> Self {
@@ -172,31 +172,26 @@ impl GateKey {
     }
 }
 
-/// A reqwest client that takes a permit of its provider's limit for the
-/// request's model before each request. `Default` (required by rig's
-/// provider bounds) is unlimited; quack always builds one with
-/// [`LimitedHttp::for_provider`].
+/// A provider's gates, one per model, shared process-wide by every client
+/// built for it. `Default` is unlimited.
 #[derive(Clone, Default)]
-pub struct LimitedHttp {
-    inner: reqwest::Client,
+pub(crate) struct ProviderGates {
     /// The provider and its limit, or `None` for the unlimited default.
     provider: Option<(ProviderKey, RequestLimit)>,
 }
 
-impl std::fmt::Debug for LimitedHttp {
+impl std::fmt::Debug for ProviderGates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LimitedHttp")
+        f.debug_struct("ProviderGates")
             .field("limit", &self.provider.as_ref().map(|(_, limit)| *limit))
             .finish_non_exhaustive()
     }
 }
 
-impl LimitedHttp {
-    /// The client for provider `name`, sharing its process-wide gates.
-    #[must_use]
-    pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
+impl ProviderGates {
+    /// The gates of provider `name`.
+    pub(crate) fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
-            inner: reqwest::Client::default(),
             provider: Some((
                 ProviderKey {
                     name: name.clone(),
@@ -204,6 +199,22 @@ impl LimitedHttp {
                 },
                 provider.request_limit(),
             )),
+        }
+    }
+
+    /// Wait for a permit of `model`'s gate at the calling task's priority
+    /// (read now, not when the future first runs); `None` when unlimited.
+    pub(crate) fn permit(
+        &self,
+        model: Option<String>,
+    ) -> impl Future<Output = Option<GatePermit>> + Send + 'static {
+        let gate = self.gate(model);
+        let priority = Priority::current();
+        async move {
+            match gate {
+                Some(gate) => Some(gate.acquire(priority).await),
+                None => None,
+            }
         }
     }
 
@@ -222,12 +233,25 @@ impl LimitedHttp {
             Gate::new(usize::try_from(limit.get()).unwrap_or(1))
         })))
     }
+}
 
-    /// Wait for a permit for `model` at the calling task's priority.
-    async fn permit(gate: Option<Arc<Gate>>, priority: Priority) -> Option<GatePermit> {
-        match gate {
-            Some(gate) => Some(gate.acquire(priority).await),
-            None => None,
+/// A reqwest client that takes a permit of its provider's limit for the
+/// request's model before each request. `Default` (required by rig's
+/// provider bounds) is unlimited; quack always builds one with
+/// [`LimitedHttp::for_provider`].
+#[derive(Clone, Default, Debug)]
+pub struct LimitedHttp {
+    inner: reqwest::Client,
+    gates: ProviderGates,
+}
+
+impl LimitedHttp {
+    /// The client for provider `name`, sharing its process-wide gates.
+    #[must_use]
+    pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
+        Self {
+            inner: reqwest::Client::default(),
+            gates: ProviderGates::for_provider(name, provider),
         }
     }
 }
@@ -279,10 +303,9 @@ impl HttpClientExt for LimitedHttp {
         // is chosen by the model it names.
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let gate = self.gate(GateKey::model_of(&body));
-        let priority = Priority::current();
+        let permit = self.gates.permit(GateKey::model_of(&body));
         async move {
-            let permit = Self::permit(gate, priority).await;
+            let permit = permit.await;
             let response = inner.send(Request::from_parts(parts, body)).await?;
             Ok(body_holding(response, permit))
         }
@@ -296,10 +319,9 @@ impl HttpClientExt for LimitedHttp {
         U: From<Bytes> + Send + 'static,
     {
         let inner = self.inner.clone();
-        let gate = self.gate(None);
-        let priority = Priority::current();
+        let permit = self.gates.permit(None);
         async move {
-            let permit = Self::permit(gate, priority).await;
+            let permit = permit.await;
             let response = inner.send_multipart(req).await?;
             Ok(body_holding(response, permit))
         }
@@ -315,10 +337,9 @@ impl HttpClientExt for LimitedHttp {
         let inner = self.inner.clone();
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let gate = self.gate(GateKey::model_of(&body));
-        let priority = Priority::current();
+        let permit = self.gates.permit(GateKey::model_of(&body));
         async move {
-            let permit = Self::permit(gate, priority).await;
+            let permit = permit.await;
             let response = inner
                 .send_streaming(Request::from_parts(parts, body))
                 .await?;
@@ -441,6 +462,7 @@ mod tests {
         }
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         let gate = limited
+            .gates
             .gate(Some(String::from("m")))
             .unwrap_or_else(|| fail("no gate"));
         assert_eq!(gate.available(), 2, "every permit came back");

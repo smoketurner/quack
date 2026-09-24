@@ -23,7 +23,7 @@ section 17 for where the code still lags. The chosen stack:
   tokens, and the mandatory append-only access audit log; nothing workspace-revealing
 - **sea-query** for type-safe SQL generation against `control.db`; bound parameters for
   DuckDB internals
-- **rig** for LLM providers (Ollama, OpenAI-compatible, Anthropic) and the agent loop
+- **rig** for LLM providers (Ollama, OpenAI-compatible, Anthropic, Amazon Bedrock) and the agent loop
 - **aws-lc-rs** as the single crypto/TLS provider (never OpenSSL or `ring`), with its and
   rustls's `fips` features on Linux, so the distributed musl binaries and the image run on
   the FIPS-validated AWS-LC module; it is the only family where the FIPS build links
@@ -126,7 +126,10 @@ resources are limited where they are used. Every rig client is built over
 the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
-background ones. The registry is in memory only (labels can be workspace content).
+background ones. Bedrock (`llm::bedrock`) is the exception to the rig HTTP client: rig-bedrock
+calls the AWS SDK, whose HTTPS client is wrapped to take the same gates for `/model/{id}/`
+requests, and whose config comes from `aws_config::defaults` (env, `aws_profile`, SSO,
+instance roles; `auth = "aws"`, the type's default), one cached client per provider. The registry is in memory only (labels can be workspace content).
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:

@@ -1240,6 +1240,7 @@ rendering.
 | `ollama` | yes | yes | Offline default. `base_url` defaults to `http://localhost:11434` |
 | `openai` | yes | yes | Also OpenAI-compatible endpoints via `base_url` (vLLM, LiteLLM, Azure OpenAI) |
 | `anthropic` | yes | no | Native Messages API with tool use |
+| `bedrock` | yes | yes | Amazon Bedrock's Converse API (rig-bedrock); embeddings take Titan Text Embeddings V2's request shape. `region` and `aws_profile` optional |
 
 `[general].chat_model` and `[general].embedding_model` name `PROVIDER/MODEL` each; a
 workspace's `allowed_providers` filters the choice; the session records the model it used.
@@ -1258,6 +1259,22 @@ are forbidden). The oauth section's `grant` says how the token is obtained:
 `device-code` (a person enters a code on another device), or `client-credentials` (quack
 authenticates as itself with `client_id` and the secret in `client_secret_env`, which that
 grant requires; nobody signs in, and the grant runs again whenever the token runs out).
+
+`bedrock` takes a fourth mode, `aws`, and only that one (it is its default): the AWS SDK
+(`aws-config` with `sso`) signs each request with credentials from its default chain, as
+the AWS CLI finds them: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`,
+the profile named by `aws_profile` (else `AWS_PROFILE`, else `default`) in
+`~/.aws/config` and `~/.aws/credentials` with its `source_profile`/`role_arn`,
+`credential_process`, and IAM Identity Center (`aws sso login`) settings, web identity
+tokens (EKS), and the ECS and EC2 instance roles. quack stores nothing: the SDK's own
+caches and refreshes apply. The region is `region`, else the SDK's chain (`AWS_REGION`, the
+profile's `region`, instance metadata); `base_url`, when set, overrides only the Bedrock
+runtime endpoint (a VPC endpoint, a gateway), never the SSO or STS ones. The first client
+built for a provider resolves credentials once, so a missing or expired login fails there
+with the SDK's reason, and is then reused for the life of the process. The SDK's HTTPS
+client is rustls on aws-lc-rs (FIPS on Linux), wrapped so each model call (a
+`/model/{id}/...` path) takes a permit of `max_concurrent_requests`; the SDK's credential
+requests are not limited.
 
 ```rust
 pub struct OAuthConfig {
@@ -1718,6 +1735,12 @@ type = "anthropic"
 auth = "api-key"
 api_key_env = "ANTHROPIC_API_KEY"
 
+[providers.bedrock]
+type = "bedrock"                       # auth = "aws" (the default): the AWS SDK's credential chain
+# aws_profile = "my-sso-profile"       # else AWS_PROFILE, else default
+# region = "us-east-1"                 # else AWS_REGION or the profile's region
+# embedding_dimension = 1024           # for amazon.titan-embed-text-v2:0
+
 [providers.azure]
 type = "openai"
 auth = "oauth"
@@ -2145,7 +2168,8 @@ design to the tracker and is updated as issues close. Ordered by risk.
 - Workspace context stored and versioned inside the boundary, Markdown import and export
 - Sessions with resume, sharing, export
 - Charts: one spec, rendered everywhere
-- Providers: ollama, openai (and compatible), anthropic; auth none / api-key / OAuth PKCE
+- Providers: ollama, openai (and compatible), anthropic, bedrock; auth none / api-key / OAuth PKCE
+  / the AWS SDK's credential chain (profiles, SSO, instance roles) for Bedrock
   with device code, encrypted cache, confidential-client mode for the server
 - Interfaces, all in one binary: web UI, REST API, MCP (stdio and streamable HTTP), TUI,
   print mode, and `quack desktop` (last, if ever)

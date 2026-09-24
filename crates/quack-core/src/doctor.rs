@@ -525,7 +525,7 @@ async fn check_embedding_model(
                     .provider
                     .base_url
                     .clone()
-                    .unwrap_or_else(|| ProviderType::Ollama.default_base_url());
+                    .unwrap_or(ProviderType::OLLAMA_BASE_URL);
                 let show = OllamaShow::fetch(http, &base, model.model).await;
                 if let Some(check) = width_check(model, configured, show) {
                     report.push(check);
@@ -656,10 +656,14 @@ async fn check_model(
 ) {
     let provider = model.provider;
     let name = model.provider_name;
-    let base = provider
+    let Some(base) = provider
         .base_url
         .clone()
-        .unwrap_or_else(|| provider.provider_type.default_base_url());
+        .or_else(|| provider.provider_type.default_base_url())
+    else {
+        report.push(check_bedrock(area, model, http.is_some()).await);
+        return;
+    };
 
     let credential = match model_credential(area, config, model).await {
         Ok(credential) => credential,
@@ -692,6 +696,47 @@ async fn check_model(
     report.push(listing_check(area, model, &base, listing));
 }
 
+/// Whether the AWS SDK finds a region and credentials for a Bedrock
+/// provider. Whether the account may invoke the model is not probed: that
+/// takes a model call.
+async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
+    if !probe {
+        return Check::new(
+            area,
+            Status::Ok,
+            format!("{model}: configured (not probed: --offline)"),
+        );
+    }
+    let (name, provider) = (model.provider_name, model.provider);
+    match crate::llm::bedrock::client(name, provider).await {
+        Ok(_) => {
+            let region = match crate::llm::bedrock::sdk_config(name, provider).await {
+                Ok(sdk) => sdk.region().map(ToString::to_string).unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            Check::new(
+                area,
+                Status::Ok,
+                format!(
+                    "{model}: AWS credentials found, region {region} (model access is checked on                      the first call)"
+                ),
+            )
+        }
+        Err(e) => Check::new(area, Status::Fail, format!("{model}: {e}")).fix(match provider
+            .auth
+            .aws_profile()
+        {
+            Some(profile) => format!(
+                "aws sso login --profile {profile}, or check [profile {profile}] in ~/.aws/config"
+            ),
+            None => format!(
+                "set aws_profile (and region) under [providers.{name}], or export AWS_PROFILE \
+                 or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+            ),
+        }),
+    }
+}
+
 /// The credential a model's provider is called with, or the failed check
 /// saying why there is none.
 async fn model_credential(
@@ -702,6 +747,8 @@ async fn model_credential(
     let provider = model.provider;
     let name = model.provider_name;
     Ok(match &provider.auth {
+        // The AWS SDK signs Bedrock's requests; `check_bedrock` covers it.
+        ProviderAuth::Aws { .. } => None,
         ProviderAuth::None => {
             if provider.provider_type != ProviderType::Ollama {
                 return Err(Box::new(
@@ -769,7 +816,7 @@ fn listing_check(
         )
         .fix(match provider.auth {
             ProviderAuth::Oauth(_) => format!("quack auth login {name}"),
-            ProviderAuth::None | ProviderAuth::ApiKey { .. } => {
+            ProviderAuth::None | ProviderAuth::ApiKey { .. } | ProviderAuth::Aws { .. } => {
                 String::from("check the key in the environment variable")
             }
         }),
@@ -835,7 +882,7 @@ async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
         Some(http) => match Listing::fetch(
             http,
             ProviderType::Ollama,
-            &ProviderType::Ollama.default_base_url(),
+            &ProviderType::OLLAMA_BASE_URL,
             None,
         )
         .await
@@ -858,7 +905,7 @@ async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
     match pulled.first() {
         Some(first) => format!(
             "Ollama is running at {} with {}; {}",
-            ProviderType::Ollama.default_base_url(),
+            ProviderType::OLLAMA_BASE_URL,
             pulled.join(", "),
             snippet(first)
         ),
@@ -996,6 +1043,12 @@ impl Listing {
                     None => request,
                 }
             }
+            // `check_bedrock` asks the AWS SDK instead.
+            ProviderType::Bedrock => {
+                return Err(Probe::Unexpected(String::from(
+                    "Bedrock is not probed over plain HTTP",
+                )));
+            }
         };
         let response = request.send().await.map_err(Probe::from)?;
         let status = response.status();
@@ -1010,7 +1063,7 @@ impl Listing {
             ProviderType::Ollama => serde_json::from_slice::<OllamaRunningModels>(&bytes)
                 .map(Self::Ollama)
                 .map_err(|e| Probe::Unexpected(e.to_string())),
-            ProviderType::Openai | ProviderType::Anthropic => {
+            ProviderType::Openai | ProviderType::Anthropic | ProviderType::Bedrock => {
                 serde_json::from_slice::<IdList>(&bytes)
                     .map(|list| Self::Ids(list.data.into_iter().map(|e| e.id).collect()))
                     .map_err(|e| Probe::Unexpected(e.to_string()))

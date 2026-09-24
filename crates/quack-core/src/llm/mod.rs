@@ -4,6 +4,7 @@
 //! `PROVIDER/MODEL` reference into a rig client lives here, so the interfaces
 //! never build providers themselves.
 
+pub mod bedrock;
 pub mod oauth;
 
 use rig::client::EmbeddingsClient;
@@ -169,6 +170,7 @@ pub enum EmbedModel {
     Ollama(OllamaEmbedder),
     OpenAi(OpenAiEmbeddingModel),
     OpenAiOAuth(OAuthEmbedding),
+    Bedrock(rig::bedrock::embedding::EmbeddingModel),
 }
 
 /// An OpenAI-compatible embedding endpoint behind OAuth: the bearer can
@@ -237,6 +239,11 @@ impl EmbedModel {
             ProviderType::Anthropic => Err(Error::Config(format!(
                 "embedding_model '{model}': anthropic does not serve embeddings"
             ))),
+            ProviderType::Bedrock => Ok(Self::Bedrock(
+                bedrock::client(name, provider)
+                    .await?
+                    .embedding_model_with_ndims(model.model, ndims),
+            )),
         }
     }
 }
@@ -290,6 +297,7 @@ impl EmbeddingModel for EmbedModel {
             Self::Ollama(m) => m.ndims(),
             Self::OpenAi(m) => m.ndims(),
             Self::OpenAiOAuth(oauth) => oauth.ndims,
+            Self::Bedrock(m) => m.ndims(),
         }
     }
 
@@ -305,6 +313,7 @@ impl EmbeddingModel for EmbedModel {
             Self::Ollama(m) => m.embed_texts(texts).await,
             Self::OpenAi(m) => m.embed_texts(texts).await,
             Self::OpenAiOAuth(oauth) => oauth.model().await?.embed_texts(texts).await,
+            Self::Bedrock(m) => m.embed_texts(texts).await,
         }
     }
 }
@@ -315,6 +324,7 @@ enum ChatClient {
     Ollama(OllamaClient),
     OpenAi(OpenAiClient),
     Anthropic(AnthropicClient),
+    Bedrock(bedrock::BedrockClient),
 }
 
 impl ChatClient {
@@ -330,6 +340,7 @@ impl ChatClient {
             ProviderType::Anthropic => {
                 Self::Anthropic(build_anthropic_client(config, name, provider).await?)
             }
+            ProviderType::Bedrock => Self::Bedrock(bedrock::client(name, provider).await?),
         })
     }
 
@@ -348,6 +359,9 @@ impl ChatClient {
                 OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
             }
             Self::Anthropic(client) => {
+                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
+            }
+            Self::Bedrock(client) => {
                 OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
             }
         }
@@ -481,7 +495,8 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
 impl ProviderAuth {
     /// The bearer credential provider `name` is called with: none, the key
     /// from the environment, or the current OAuth access token. A key
-    /// variable that is unset or blank is an error, not an empty key.
+    /// variable that is unset or blank is an error, not an empty key. `None`
+    /// for `auth = "aws"`, whose requests the AWS SDK signs itself.
     ///
     /// # Errors
     ///
@@ -489,7 +504,7 @@ impl ProviderAuth {
     /// [`Error::AuthRequired`] when an OAuth provider has no login.
     pub async fn credential(&self, config: &Config, name: &ProviderName) -> Result<Option<String>> {
         match self {
-            Self::None => Ok(None),
+            Self::None | Self::Aws { .. } => Ok(None),
             Self::ApiKey { env } => match std::env::var(env) {
                 Ok(key) if !key.trim().is_empty() => Ok(Some(key)),
                 Ok(_) | Err(_) => Err(Error::Config(format!(
@@ -863,6 +878,11 @@ async fn dispatch(
                 .await
         }
         ChatClient::Anthropic(client) => {
+            analysis
+                .run(client.completion_model(chat.model), sink)
+                .await
+        }
+        ChatClient::Bedrock(client) => {
             analysis
                 .run(client.completion_model(chat.model), sink)
                 .await

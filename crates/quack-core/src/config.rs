@@ -199,24 +199,42 @@ pub enum ProviderType {
     #[serde(alias = "openai-compat")]
     Openai,
     Anthropic,
+    /// Amazon Bedrock's Converse API, signed with credentials from the AWS
+    /// SDK's default chain.
+    Bedrock,
 }
 
 text_enum!(ProviderType, "provider type", {
     Ollama => "ollama",
     Openai => "openai",
     Anthropic => "anthropic",
+    Bedrock => "bedrock",
 });
 
 impl ProviderType {
+    /// Ollama's API when `base_url` is unset.
+    pub const OLLAMA_BASE_URL: BaseUrl = BaseUrl(Cow::Borrowed("http://localhost:11434"));
+
     /// Where the provider's API is when `base_url` is unset: the same
-    /// defaults rig's clients use.
+    /// defaults rig's clients use. `None` for Bedrock, whose endpoint the
+    /// AWS SDK derives from the region.
     #[must_use]
-    pub const fn default_base_url(self) -> BaseUrl {
-        BaseUrl(Cow::Borrowed(match self {
-            Self::Ollama => "http://localhost:11434",
-            Self::Openai => "https://api.openai.com/v1",
-            Self::Anthropic => "https://api.anthropic.com",
-        }))
+    pub const fn default_base_url(self) -> Option<BaseUrl> {
+        match self {
+            Self::Ollama => Some(Self::OLLAMA_BASE_URL),
+            Self::Openai => Some(BaseUrl(Cow::Borrowed("https://api.openai.com/v1"))),
+            Self::Anthropic => Some(BaseUrl(Cow::Borrowed("https://api.anthropic.com"))),
+            Self::Bedrock => None,
+        }
+    }
+
+    /// The `auth` a provider of this type has when the file names none.
+    #[must_use]
+    pub const fn default_auth(self) -> AuthMode {
+        match self {
+            Self::Bedrock => AuthMode::Aws,
+            Self::Ollama | Self::Openai | Self::Anthropic => AuthMode::None,
+        }
     }
 }
 
@@ -232,12 +250,18 @@ pub enum AuthMode {
     /// OAuth 2.0 against an identity provider (design doc 10.2): the access
     /// token from `[providers.NAME.oauth]` is the bearer for the endpoint.
     Oauth,
+    /// The AWS SDK's default credential chain (environment, `aws_profile`
+    /// or `AWS_PROFILE`, IAM Identity Center (SSO), web identity, ECS and
+    /// EC2 instance roles) signs each request. Bedrock only, and its
+    /// default.
+    Aws,
 }
 
 text_enum!(AuthMode, "auth mode", {
     None => "none",
     ApiKey => "api-key",
     Oauth => "oauth",
+    Aws => "aws",
 });
 
 /// How a provider's token is obtained from its issuer.
@@ -307,6 +331,10 @@ pub enum ProviderAuth {
     ApiKey { env: String },
     /// OAuth 2.0 against an identity provider (design doc 10.2).
     Oauth(OAuthConfig),
+    /// The AWS SDK's default credential chain, from the named profile of
+    /// the shared config files when `profile` is set (otherwise
+    /// `AWS_PROFILE`, then `default`).
+    Aws { profile: Option<String> },
 }
 
 impl ProviderAuth {
@@ -317,6 +345,7 @@ impl ProviderAuth {
             Self::None => AuthMode::None,
             Self::ApiKey { .. } => AuthMode::ApiKey,
             Self::Oauth(_) => AuthMode::Oauth,
+            Self::Aws { .. } => AuthMode::Aws,
         }
     }
 
@@ -325,7 +354,7 @@ impl ProviderAuth {
     pub fn api_key_env(&self) -> Option<&str> {
         match self {
             Self::ApiKey { env } => Some(env),
-            Self::None | Self::Oauth(_) => None,
+            Self::None | Self::Oauth(_) | Self::Aws { .. } => None,
         }
     }
 
@@ -334,7 +363,16 @@ impl ProviderAuth {
     pub const fn oauth(&self) -> Option<&OAuthConfig> {
         match self {
             Self::Oauth(oauth) => Some(oauth),
-            Self::None | Self::ApiKey { .. } => None,
+            Self::None | Self::ApiKey { .. } | Self::Aws { .. } => None,
+        }
+    }
+
+    /// The AWS profile named by `aws_profile`, for `auth = "aws"`.
+    #[must_use]
+    pub fn aws_profile(&self) -> Option<&str> {
+        match self {
+            Self::Aws { profile } => profile.as_deref(),
+            Self::None | Self::ApiKey { .. } | Self::Oauth(_) => None,
         }
     }
 }
@@ -438,6 +476,9 @@ pub struct ProviderConfig {
     pub provider_type: ProviderType,
     pub auth: ProviderAuth,
     pub base_url: Option<BaseUrl>,
+    /// The AWS region a Bedrock provider calls; unset, the SDK's chain
+    /// decides (`AWS_REGION`, the profile's `region`, instance metadata).
+    pub region: Option<String>,
     /// Width of the vectors this provider's embedding models produce.
     pub embedding_dimension: Option<Dimension>,
     /// Model requests in flight to this provider at once, across the whole
@@ -454,10 +495,11 @@ pub struct ProviderConfig {
 struct RawProviderConfig {
     #[serde(rename = "type")]
     provider_type: ProviderType,
-    #[serde(default)]
-    auth: AuthMode,
+    auth: Option<AuthMode>,
     base_url: Option<BaseUrl>,
     api_key_env: Option<String>,
+    aws_profile: Option<String>,
+    region: Option<String>,
     embedding_dimension: Option<Dimension>,
     max_concurrent_requests: Option<RequestLimit>,
     oauth: Option<OAuthConfig>,
@@ -467,7 +509,44 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
     type Error = Error;
 
     fn try_from(raw: RawProviderConfig) -> Result<Self> {
-        let auth = match (raw.auth, raw.api_key_env, raw.oauth) {
+        let mode = raw.auth.unwrap_or_else(|| raw.provider_type.default_auth());
+        let bedrock = raw.provider_type == ProviderType::Bedrock;
+        if bedrock != (mode == AuthMode::Aws) {
+            return Err(Error::Config(String::from(if bedrock {
+                "type = \"bedrock\" signs with AWS credentials; use auth = \"aws\" or leave auth unset"
+            } else {
+                "auth = \"aws\" is only for type = \"bedrock\""
+            })));
+        }
+        if raw.region.is_some() && !bedrock {
+            return Err(Error::Config(String::from(
+                "region is only for type = \"bedrock\"",
+            )));
+        }
+        if raw.aws_profile.is_some() && mode != AuthMode::Aws {
+            return Err(Error::Config(String::from(
+                "aws_profile is only for auth = \"aws\"",
+            )));
+        }
+        if let Some(region) = &raw.region
+            && (region.is_empty()
+                || !region
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        {
+            return Err(Error::Config(format!(
+                "region \"{region}\" is not an AWS region name such as \"us-east-1\""
+            )));
+        }
+        let auth = match (mode, raw.api_key_env, raw.oauth) {
+            (AuthMode::Aws, None, None) => ProviderAuth::Aws {
+                profile: raw.aws_profile,
+            },
+            (AuthMode::Aws, _, _) => {
+                return Err(Error::Config(String::from(
+                    "auth = \"aws\" takes neither api_key_env nor an oauth section",
+                )));
+            }
             (AuthMode::None, None, None) => ProviderAuth::None,
             (AuthMode::ApiKey, Some(env), None) => ProviderAuth::ApiKey { env },
             (AuthMode::Oauth, None, Some(oauth)) => {
@@ -513,6 +592,7 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
             provider_type: raw.provider_type,
             auth,
             base_url: raw.base_url,
+            region: raw.region,
             embedding_dimension: raw.embedding_dimension,
             max_concurrent_requests: raw.max_concurrent_requests,
         })
@@ -525,8 +605,12 @@ impl ProviderConfig {
     pub fn new(provider_type: ProviderType) -> Self {
         Self {
             provider_type,
-            auth: ProviderAuth::None,
+            auth: match provider_type.default_auth() {
+                AuthMode::Aws => ProviderAuth::Aws { profile: None },
+                AuthMode::None | AuthMode::ApiKey | AuthMode::Oauth => ProviderAuth::None,
+            },
             base_url: None,
+            region: None,
             embedding_dimension: None,
             max_concurrent_requests: None,
         }
@@ -537,7 +621,9 @@ impl ProviderConfig {
     pub const fn default_request_limit(&self) -> RequestLimit {
         RequestLimit(match self.provider_type {
             ProviderType::Ollama => NonZeroU32::MIN,
-            ProviderType::Openai | ProviderType::Anthropic => NonZeroU32::MIN.saturating_add(7),
+            ProviderType::Openai | ProviderType::Anthropic | ProviderType::Bedrock => {
+                NonZeroU32::MIN.saturating_add(7)
+            }
         })
     }
 
@@ -1340,7 +1426,7 @@ rerank = "model"
                 .contains("http:// or https://")
         );
         assert_eq!(
-            ProviderType::Ollama.default_base_url().as_str(),
+            ProviderType::OLLAMA_BASE_URL.as_str(),
             "http://localhost:11434"
         );
     }
@@ -1492,7 +1578,62 @@ rerank = "model"
 
     #[test]
     fn unknown_provider_type_is_rejected() {
-        assert!(err_of("[providers.o]\ntype = \"bedrock\"\n").contains("bedrock"));
+        assert!(err_of("[providers.o]\ntype = \"vertex\"\n").contains("vertex"));
+    }
+
+    #[test]
+    fn bedrock_signs_with_the_aws_chain_by_default() {
+        let config = Config::parse(
+            "[general]\nchat_model = \"aws/us.anthropic.claude-sonnet-5\"\n\
+             [providers.aws]\ntype = \"bedrock\"\naws_profile = \"dev-sso\"\nregion = \"us-west-2\"\n",
+        );
+        assert!(
+            config.is_ok_and(|c| c.providers.get("aws").is_some_and(|p| {
+                p.provider_type == ProviderType::Bedrock
+                    && p.auth.mode() == AuthMode::Aws
+                    && p.auth.aws_profile() == Some("dev-sso")
+                    && p.region.as_deref() == Some("us-west-2")
+                    && p.request_limit().get() == 8
+            }))
+        );
+        // Neither profile nor region is required: the SDK's chain decides.
+        let config = Config::parse("[providers.b]\ntype = \"bedrock\"\nauth = \"aws\"\n");
+        assert!(config.is_ok_and(|c| {
+            c.providers
+                .get("b")
+                .is_some_and(|p| p.auth.aws_profile().is_none() && p.region.is_none())
+        }));
+        assert_eq!(
+            ProviderConfig::new(ProviderType::Bedrock).auth.mode(),
+            AuthMode::Aws
+        );
+        assert!(ProviderType::Bedrock.default_base_url().is_none());
+    }
+
+    #[test]
+    fn aws_settings_are_refused_where_they_mean_nothing() {
+        assert!(
+            err_of("[providers.b]\ntype = \"bedrock\"\nauth = \"api-key\"\napi_key_env = \"K\"\n")
+                .contains("bedrock")
+        );
+        assert!(err_of("[providers.b]\ntype = \"bedrock\"\nauth = \"none\"\n").contains("bedrock"));
+        assert!(err_of("[providers.o]\ntype = \"openai\"\nauth = \"aws\"\n").contains("aws"));
+        assert!(
+            err_of("[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"K\"\nregion = \"us-east-1\"\n")
+                .contains("region")
+        );
+        assert!(
+            err_of("[providers.o]\ntype = \"ollama\"\naws_profile = \"p\"\n")
+                .contains("aws_profile")
+        );
+        assert!(
+            err_of("[providers.b]\ntype = \"bedrock\"\napi_key_env = \"K\"\n")
+                .contains("api_key_env")
+        );
+        assert!(
+            err_of("[providers.b]\ntype = \"bedrock\"\nregion = \"us east\"\n").contains("region")
+        );
+        assert!(err_of("[providers.b]\ntype = \"bedrock\"\nregion = \"\"\n").contains("region"));
     }
 
     #[test]
