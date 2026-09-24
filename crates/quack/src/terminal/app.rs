@@ -32,7 +32,7 @@ use quack_core::jobs::{
     JobState, Lane, LaneKey,
 };
 use quack_core::llm::{self, Embeddings};
-use quack_core::okf;
+use quack_core::okf::{self, DirSink};
 use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
@@ -538,9 +538,12 @@ impl CliJob {
             }
             Self::Okf(dir) => {
                 let name = env.workspace_name.clone();
-                let bundle = env.db.run(move |db| okf::export(db, &name)).await?;
-                bundle.write_to(Path::new(&dir))?;
-                return Ok(format!("Wrote {} files to {dir}.", bundle.files.len()));
+                let target = dir.clone();
+                let summary = env
+                    .db
+                    .run(move |db| okf::export(db, &name, &mut DirSink::new(Path::new(&target))))
+                    .await?;
+                return Ok(format!("Wrote {} files to {dir}.", summary.files));
             }
             Self::ContextImport(file) => {
                 let text = std::fs::read_to_string(&file)

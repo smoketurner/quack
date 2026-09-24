@@ -6,15 +6,16 @@
 //! bundle imports as documents whose front matter and links feed ontology
 //! induction. Design doc section 17, issue #36.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
+use serde::Deserialize;
+
 use crate::error::{Error, Result};
-use crate::graph::store::EdgeScope;
-use crate::graph::{self, Origin, store as graph_store};
-use crate::ids::{ClassId, DocumentId, NodeId, RelationId};
+use crate::graph;
+use crate::ids::{ClassId, RelationId};
 use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::store::Revision;
 use crate::ontology::{
@@ -40,6 +41,87 @@ impl BundleFile {
     }
 }
 
+/// Where a bundle's files go, one at a time: an export writes each file as
+/// it is made, so nothing holds the whole bundle.
+pub trait BundleSink {
+    /// Write one file at `path`, relative to the bundle's root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    fn file(&mut self, path: &str, content: &str) -> Result<()>;
+}
+
+/// A directory: each file lands under the root as it comes, directories
+/// created as needed.
+pub struct DirSink<'a> {
+    root: &'a Path,
+}
+
+impl<'a> DirSink<'a> {
+    #[must_use]
+    pub fn new(root: &'a Path) -> Self {
+        Self { root }
+    }
+}
+
+impl BundleSink for DirSink<'_> {
+    fn file(&mut self, path: &str, content: &str) -> Result<()> {
+        let target = self.root.join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, content)?;
+        Ok(())
+    }
+}
+
+/// An uncompressed tar archive written to `W` entry by entry: stdout, an
+/// HTTP body, or a buffer.
+pub struct TarSink<W: Write> {
+    builder: tar::Builder<W>,
+}
+
+impl<W: Write> TarSink<W> {
+    #[must_use]
+    pub fn new(out: W) -> Self {
+        Self {
+            builder: tar::Builder::new(out),
+        }
+    }
+
+    /// Write the archive's end and hand back the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the final write fails.
+    pub fn finish(self) -> Result<W> {
+        self.builder.into_inner().map_err(Error::Io)
+    }
+}
+
+impl<W: Write> BundleSink for TarSink<W> {
+    fn file(&mut self, path: &str, content: &str) -> Result<()> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(content.len()).unwrap_or(u64::MAX));
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        self.builder
+            .append_data(&mut header, path, content.as_bytes())?;
+        Ok(())
+    }
+}
+
+/// A bundle collected in memory, for tests and callers that already hold
+/// one.
+impl BundleSink for Bundle {
+    fn file(&mut self, path: &str, content: &str) -> Result<()> {
+        self.push(path, content.to_owned());
+        Ok(())
+    }
+}
+
 /// A bundle in memory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Bundle {
@@ -60,16 +142,11 @@ impl Bundle {
     ///
     /// Returns an error if writing the archive fails.
     pub fn to_tar(&self) -> Result<Vec<u8>> {
-        let mut builder = tar::Builder::new(Vec::new());
+        let mut sink = TarSink::new(Vec::new());
         for file in &self.files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(u64::try_from(file.content.len()).unwrap_or(u64::MAX));
-            header.set_mode(0o644);
-            header.set_mtime(0);
-            header.set_cksum();
-            builder.append_data(&mut header, &file.path, file.content.as_bytes())?;
+            sink.file(&file.path, &file.content)?;
         }
-        builder.into_inner().map_err(Error::Io)
+        sink.finish()
     }
 
     /// Read a bundle from tar bytes; only `.md` entries count.
@@ -148,12 +225,9 @@ impl Bundle {
     ///
     /// Returns an error if a write fails.
     pub fn write_to(&self, root: &Path) -> Result<()> {
+        let mut sink = DirSink::new(root);
         for file in &self.files {
-            let target = root.join(&file.path);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&target, &file.content)?;
+            sink.file(&file.path, &file.content)?;
         }
         Ok(())
     }
@@ -467,10 +541,18 @@ pub fn slug(text: &str) -> String {
 /// workspace, table data and document text are not in it, and a
 /// re-import restores the context and the ontology and proposes the rest.
 ///
+/// Files go to `sink` as they are made; graph nodes stream from one
+/// query, so memory holds one node at a time plus the index, which lists
+/// every file and is written last.
+///
 /// # Errors
 ///
-/// Returns an error if a read fails.
-pub fn export(db: &WorkspaceDb, workspace_name: &str) -> Result<Bundle> {
+/// Returns an error if a read or a write to `sink` fails.
+pub fn export(
+    db: &WorkspaceDb,
+    workspace_name: &str,
+    sink: &mut impl BundleSink,
+) -> Result<ExportSummary> {
     let ontology = ontology_store::current(db)?;
     let context_text = context::current(db)?.map(|c| c.content).unwrap_or_default();
     let mut index = FrontMatter::of_type(ConceptType::Index)
@@ -484,63 +566,51 @@ pub fn export(db: &WorkspaceDb, workspace_name: &str) -> Result<Bundle> {
     index.push_str("## Contents\n\n");
     let mut exporter = Exporter {
         db,
-        bundle: Bundle::default(),
+        sink,
         index,
+        files: 0,
     };
 
     exporter.tables(ontology.as_ref())?;
     if let Some(ontology) = &ontology {
         exporter.ontology(ontology)?;
     }
-    let documents = db.list_documents()?;
-    exporter.documents(&documents)?;
-    exporter.entities(&documents)?;
-
-    let Exporter {
-        mut bundle, index, ..
-    } = exporter;
-    let mut log = FrontMatter::of_type(ConceptType::Log).to_string();
-    log.push_str("# Log\n\n## Ontology versions\n\n");
-    for version in ontology_store::versions(db, 100)? {
-        writeln!(
-            log,
-            "- {} version {}{}{}",
-            version.created_at,
-            version.version,
-            version
-                .author
-                .as_deref()
-                .map_or(String::new(), |a| format!(" by {a}")),
-            version
-                .note
-                .as_deref()
-                .map_or(String::new(), |n| format!(": {n}"))
-        )?;
-    }
-    bundle.push(LOG, log);
-    bundle.files.insert(
-        0,
-        BundleFile {
-            path: String::from(INDEX),
-            content: index,
-        },
-    );
-    Ok(bundle)
+    exporter.documents(&db.list_documents()?)?;
+    exporter.entities()?;
+    exporter.log()?;
+    let index = std::mem::take(&mut exporter.index);
+    exporter.write(INDEX, &index)?;
+    Ok(ExportSummary {
+        files: exporter.files,
+    })
 }
 
-/// A bundle being written: the files so far, and the index listing them.
-struct Exporter<'a> {
+/// What an export wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportSummary {
+    pub files: usize,
+}
+
+/// An export in progress: where its files go, and the index listing them.
+struct Exporter<'a, S: BundleSink> {
     db: &'a WorkspaceDb,
-    bundle: Bundle,
+    sink: &'a mut S,
     index: String,
+    files: usize,
 }
 
-impl Exporter<'_> {
-    /// Add a file, listing it in the index under `title`.
-    fn listed(&mut self, path: String, title: &str, text: String) -> Result<()> {
-        writeln!(self.index, "- [{title}]({path})")?;
-        self.bundle.push(path, text);
+impl<S: BundleSink> Exporter<'_, S> {
+    /// Write a file the index does not list.
+    fn write(&mut self, path: &str, text: &str) -> Result<()> {
+        self.sink.file(path, text)?;
+        self.files = self.files.saturating_add(1);
         Ok(())
+    }
+
+    /// Write a file, listing it in the index under `title`.
+    fn listed(&mut self, path: &str, title: &str, text: &str) -> Result<()> {
+        writeln!(self.index, "- [{title}]({path})")?;
+        self.write(path, text)
     }
 
     fn tables(&mut self, ontology: Option<&Ontology>) -> Result<()> {
@@ -606,7 +676,7 @@ impl Exporter<'_> {
                     text.push('\n');
                 }
             }
-            self.listed(format!("tables/{}.md", slug(table)), table, text)?;
+            self.listed(&format!("tables/{}.md", slug(table)), table, &text)?;
         }
         Ok(())
     }
@@ -633,9 +703,9 @@ impl Exporter<'_> {
                 }
             }
             self.listed(
-                format!("documents/{}.md", slug(&document.filename)),
+                &format!("documents/{}.md", slug(&document.filename)),
                 document.display_name(),
-                text,
+                &text,
             )?;
         }
         Ok(())
@@ -682,9 +752,9 @@ impl Exporter<'_> {
                 )?;
             }
             self.listed(
-                format!("ontology/classes/{}.md", slug(class.id.as_str())),
+                &format!("ontology/classes/{}.md", slug(class.id.as_str())),
                 class.id.as_str(),
-                text,
+                &text,
             )?;
         }
         self.relations(ontology)?;
@@ -699,8 +769,7 @@ impl Exporter<'_> {
             version,
             ontology.to_json()?
         )?;
-        self.bundle.push(ONTOLOGY_SNAPSHOT, snapshot);
-        Ok(())
+        self.write(ONTOLOGY_SNAPSHOT, &snapshot)
     }
 
     fn relations(&mut self, ontology: &Ontology) -> Result<()> {
@@ -727,10 +796,10 @@ impl Exporter<'_> {
                 relation.range,
                 slug(relation.range.as_str())
             )?;
-            self.bundle.push(
-                format!("ontology/relations/{}.md", slug(relation.id.as_str())),
-                text,
-            );
+            self.write(
+                &format!("ontology/relations/{}.md", slug(relation.id.as_str())),
+                &text,
+            )?;
         }
         Ok(())
     }
@@ -751,86 +820,159 @@ impl Exporter<'_> {
             if !property.values.is_empty() {
                 writeln!(text, "- values: {}", property.values.join(", "))?;
             }
-            self.bundle.push(
-                format!("ontology/properties/{}.md", slug(&property.id)),
-                text,
-            );
+            self.write(
+                &format!("ontology/properties/{}.md", slug(&property.id)),
+                &text,
+            )?;
         }
         Ok(())
     }
 
-    fn entities(&mut self, documents: &[DocumentInfo]) -> Result<()> {
-        let ids = graph_store::all_node_ids(self.db)?;
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let nodes = graph_store::nodes(self.db, &ids)?;
-        let edges = graph_store::edges(self.db, &ids, EdgeScope::Among)?;
-        let subjects: Vec<String> = ids
-            .iter()
-            .map(NodeId::to_string)
-            .chain(edges.iter().map(|e| e.id.to_string()))
-            .collect();
-        let provenance = graph_store::provenance_of(self.db, &subjects)?;
-        // Every path is fixed before any file is written, so a link to a
-        // node whose label collided points at the suffixed file it got.
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut paths: BTreeMap<&str, String> = BTreeMap::new();
-        for node in &nodes {
-            let mut path = format!(
-                "entities/{}/{}.md",
-                slug(node.class_id.as_str()),
-                slug(&node.label)
-            );
-            if !seen.insert(path.clone()) {
-                path = format!(
-                    "entities/{}/{}-{}.md",
-                    slug(node.class_id.as_str()),
-                    slug(&node.label),
-                    node.id.as_str().chars().rev().take(6).collect::<String>()
-                );
-                seen.insert(path.clone());
-            }
-            paths.insert(node.id.as_str(), path);
-        }
-        let export = EntityExport {
-            edges: &edges,
-            by_id: nodes.iter().map(|n| (n.id.as_str(), n)).collect(),
-            provenance: &provenance,
-            documents,
-        };
-        for node in &nodes {
-            let Some(path) = paths.get(node.id.as_str()) else {
-                continue;
-            };
-            let text = export.file(node, &paths)?;
-            self.listed(path.clone(), &node.label, text)?;
+    /// One file per graph node, streamed from [`ENTITY_QUERY`] in node
+    /// order: nothing about the graph is held but the row in hand.
+    fn entities(&mut self) -> Result<()> {
+        let mut stmt = self.db.connection().prepare(ENTITY_QUERY)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let entity = EntityFile::try_from(row)?;
+            let text = entity.render()?;
+            self.listed(&entity.path, &entity.node.label, &text)?;
         }
         Ok(())
     }
-}
 
-/// What every entity file draws on: the graph's edges, nodes by id, the
-/// provenance of both, and the documents it names.
-struct EntityExport<'a> {
-    edges: &'a [graph::Edge],
-    by_id: BTreeMap<&'a str, &'a graph::Node>,
-    provenance: &'a [graph::Provenance],
-    documents: &'a [DocumentInfo],
-}
-
-impl EntityExport<'_> {
-    /// The file name of a document by id, else the id.
-    fn filename_of(&self, document_id: &DocumentId) -> String {
-        self.documents
-            .iter()
-            .find(|d| &d.id == document_id)
-            .map_or_else(|| document_id.to_string(), |d| d.filename.clone())
+    fn log(&mut self) -> Result<()> {
+        let mut log = FrontMatter::of_type(ConceptType::Log).to_string();
+        log.push_str("# Log\n\n## Ontology versions\n\n");
+        for version in ontology_store::versions(self.db, 100)? {
+            writeln!(
+                log,
+                "- {} version {}{}{}",
+                version.created_at,
+                version.version,
+                version
+                    .author
+                    .as_deref()
+                    .map_or(String::new(), |a| format!(" by {a}")),
+                version
+                    .note
+                    .as_deref()
+                    .map_or(String::new(), |n| format!(": {n}"))
+            )?;
+        }
+        self.write(LOG, &log)
     }
+}
 
-    /// One node as a concept file: front matter, properties, links per
-    /// edge, and provenance. `paths` holds every node's file.
-    fn file(&self, node: &graph::Node, paths: &BTreeMap<&str, String>) -> Result<String> {
+/// [`slug`] in SQL, for a column: every run of characters outside
+/// `[A-Za-z0-9]` becomes one `-`, the rest is lowercased, dashes at either
+/// end are dropped, and nothing left is `untitled`. Replacing before
+/// lowercasing keeps it ASCII-only, as `slug` is; a test holds the two to
+/// the same answers.
+macro_rules! sql_slug {
+    ($column:literal) => {
+        concat!(
+            "coalesce(nullif(trim(lower(regexp_replace(",
+            $column,
+            ", '[^A-Za-z0-9]+', '-', 'g')), '-'), ''), 'untitled')"
+        )
+    };
+}
+
+/// Every graph node with the file it is written to, its outbound links
+/// (with each target's file), and its provenance, in node order.
+///
+/// A node's file is `entities/{class}/{label}.md` by slug; when labels
+/// of one class share a slug, the first in label order keeps the plain
+/// name and the rest add the last six characters of their id, reversed.
+/// The window computes that once in `DuckDB`, which spills to disk as it
+/// needs, instead of a path map over every node in memory.
+const ENTITY_QUERY: &str = concat!(
+    "WITH n AS ( \
+       SELECT id, label, class_id, properties, provisional, ",
+    sql_slug!("class_id"),
+    " AS class_slug, ",
+    sql_slug!("label"),
+    " AS label_slug FROM _quack_graph_nodes), \
+     p AS ( \
+       SELECT *, 'entities/' || class_slug || '/' || label_slug || \
+              CASE WHEN row_number() OVER (PARTITION BY class_slug, label_slug ORDER BY label, id) = 1 \
+                   THEN '' ELSE '-' || reverse(right(id, 6)) END || '.md' AS path \
+       FROM n), \
+     links AS ( \
+       SELECT e.source_node_id AS id, \
+              to_json(list({'relation': e.relation_id, 'label': t.label, 'path': t.path} \
+                           ORDER BY e.relation_id, t.label, e.id))::VARCHAR AS links \
+       FROM _quack_graph_edges e JOIN p t ON t.id = e.target_node_id \
+       GROUP BY e.source_node_id), \
+     sources AS ( \
+       SELECT pr.subject_id AS id, \
+              to_json(list({'table_name': pr.table_name, 'row_key': pr.row_key, \
+                            'chunk_id': pr.chunk_id, \
+                            'document': coalesce(d.filename, pr.document_id), \
+                            'confidence': coalesce(pr.confidence, 1.0)} \
+                           ORDER BY pr.chunk_id, pr.table_name, pr.row_key))::VARCHAR AS sources \
+       FROM _quack_provenance pr \
+       JOIN _quack_graph_nodes g ON g.id = pr.subject_id \
+       LEFT JOIN _quack_documents d ON d.id = pr.document_id \
+       GROUP BY pr.subject_id) \
+     SELECT p.id, p.label, p.class_id, CAST(p.properties AS VARCHAR), p.provisional, \
+            p.path, links.links, sources.sources \
+     FROM p LEFT JOIN links ON links.id = p.id LEFT JOIN sources ON sources.id = p.id \
+     ORDER BY p.class_id, p.label, p.id"
+);
+
+/// One node's concept file, as [`ENTITY_QUERY`] returns it.
+struct EntityFile {
+    node: graph::Node,
+    path: String,
+    links: Vec<EntityLink>,
+    sources: Vec<EntitySource>,
+}
+
+/// An outbound edge, with the file its target is written to.
+#[derive(Deserialize)]
+struct EntityLink {
+    relation: String,
+    label: String,
+    path: String,
+}
+
+/// Where a node came from: a table row, or a document chunk (`document`
+/// is the file name, or the id when the document is gone).
+#[derive(Deserialize)]
+struct EntitySource {
+    table_name: String,
+    row_key: String,
+    chunk_id: String,
+    document: Option<String>,
+    confidence: f64,
+}
+
+impl TryFrom<&duckdb::Row<'_>> for EntityFile {
+    type Error = Error;
+
+    fn try_from(row: &duckdb::Row<'_>) -> Result<Self> {
+        let list = |idx: usize| -> Result<Option<String>> { Ok(row.get(idx)?) };
+        Ok(Self {
+            node: graph::Node::try_from(row)?,
+            path: row.get(5)?,
+            links: list(6)?
+                .map(|text| serde_json::from_str(&text))
+                .transpose()?
+                .unwrap_or_default(),
+            sources: list(7)?
+                .map(|text| serde_json::from_str(&text))
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+}
+
+impl EntityFile {
+    /// Front matter, properties, a link per outbound edge, and provenance.
+    fn render(&self) -> Result<String> {
+        let node = &self.node;
         let mut front = FrontMatter::of_type(&node.class_id)
             .field("generator", GENERATOR)
             .field("id", node.id.to_string())
@@ -858,57 +1000,45 @@ impl EntityExport<'_> {
             text.push('\n');
         }
         // Outbound edges only: a link in both files would read as two relations.
-        let mine: Vec<&graph::Edge> = self
-            .edges
-            .iter()
-            .filter(|e| e.source_node_id == node.id)
-            .collect();
-        if !mine.is_empty() {
+        if !self.links.is_empty() {
             text.push_str("## Links\n\n");
-            for edge in &mine {
-                let other = edge.target_node_id.as_str();
-                if let (Some(target), Some(path)) = (self.by_id.get(other), paths.get(other)) {
-                    writeln!(
-                        text,
-                        "- {}: [{}](../../{path})",
-                        edge.relation_id, target.label,
-                    )?;
-                }
+            for link in &self.links {
+                writeln!(
+                    text,
+                    "- {}: [{}](../../{})",
+                    link.relation, link.label, link.path
+                )?;
             }
             text.push('\n');
         }
-        let sources: Vec<String> = self
-            .provenance
-            .iter()
-            .filter(|p| p.subject_id == node.id.as_str())
-            .map(|p| match &p.origin {
-                Origin::Row {
-                    table_name,
-                    row_key,
-                } => format!(
-                    "- table [{table_name}](../../tables/{}.md) row `{row_key}`",
-                    slug(table_name),
-                ),
-                Origin::Chunk {
-                    document_id: Some(document),
-                    chunk_id,
-                } => format!(
-                    "- document [{}](../../documents/{}.md) chunk `{chunk_id}` (confidence {:.2})",
-                    self.filename_of(document),
-                    slug(&self.filename_of(document)),
-                    p.confidence
-                ),
-                Origin::Chunk {
-                    document_id: None, ..
-                } => String::from("- unknown"),
-            })
-            .collect();
-        if !sources.is_empty() {
+        if !self.sources.is_empty() {
             text.push_str("## Provenance\n\n");
-            text.push_str(&sources.join("\n"));
+            let lines: Vec<String> = self.sources.iter().map(EntitySource::line).collect();
+            text.push_str(&lines.join("\n"));
             text.push('\n');
         }
         Ok(text)
+    }
+}
+
+impl EntitySource {
+    /// The provenance line, linking the table or document stub.
+    fn line(&self) -> String {
+        match (self.table_name.is_empty(), &self.document) {
+            (false, _) => format!(
+                "- table [{}](../../tables/{}.md) row `{}`",
+                self.table_name,
+                slug(&self.table_name),
+                self.row_key
+            ),
+            (true, Some(document)) => format!(
+                "- document [{document}](../../documents/{}.md) chunk `{}` (confidence {:.2})",
+                slug(document),
+                self.chunk_id,
+                self.confidence
+            ),
+            (true, None) => String::from("- unknown"),
+        }
     }
 }
 
@@ -1171,7 +1301,7 @@ fn type_id(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::embedding::Dimension;
-    use crate::graph::{Properties, Standing};
+    use crate::graph::{Properties, Standing, store as graph_store};
     use crate::ontology::induction::ItemKind;
     use crate::ontology::store::Revision;
     use crate::storage::audit;
@@ -1232,6 +1362,39 @@ mod tests {
         );
     }
 
+    /// The entity query names files with a SQL copy of `slug`; a label on
+    /// which the two disagree would link to a file that does not exist.
+    #[test]
+    fn the_sql_slug_matches_slug() {
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
+            .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let labels = [
+            "Orgenics Ltd.",
+            "  ",
+            "",
+            "--a--b--",
+            "C++ & C#",
+            "snake_case_id",
+            "3D Models",
+            "Ünïcode Straße",
+            "\u{130}stanbul",
+            "\u{212a}elvin",
+            "日本",
+            "a\u{00a0}b\tc",
+        ];
+        for label in labels {
+            let from_sql: String = db
+                .connection()
+                .query_row(
+                    concat!("SELECT ", sql_slug!("s"), " FROM (SELECT ?::VARCHAR AS s)"),
+                    duckdb::params![label],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+            assert_eq!(from_sql, slug(label), "{label:?}");
+        }
+    }
+
     #[test]
     fn tar_round_trips_and_ignores_non_markdown() {
         let mut bundle = Bundle::default();
@@ -1243,12 +1406,10 @@ mod tests {
         assert!(Bundle::from_tar(b"not a tar").is_err());
     }
 
-    /// The export is one-way knowledge (issue #53): no audit detail, the
-    /// ontology as an exact snapshot, entity files with ids and links
-    /// that resolve even when two labels share a slug, and quack's stubs
-    /// neither ingested nor proposed on re-import.
-    #[test]
-    fn export_carries_ids_resolved_links_the_ontology_and_no_audit() {
+    /// A workspace with an ontology, an audit detail row, and two nodes of
+    /// one class whose labels share a slug, linked by an edge; returns it
+    /// and how many classes the saved ontology has.
+    fn harbour_workspace() -> (WorkspaceDb, usize) {
         let db = WorkspaceDb::open_in_memory(Dimension::new(4))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         let mut ontology = Ontology::builtin_default();
@@ -1304,8 +1465,20 @@ mod tests {
         .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         graph_store::add_provenance(&db, &edge, &graph_store::Source::row("t", "k"))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        (db, saved.classes.len())
+    }
 
-        let bundle = export(&db, "ws").unwrap_or_else(|e| unreachable_db(&e.to_string()));
+    /// The export is one-way knowledge (issue #53): no audit detail, the
+    /// ontology as an exact snapshot, entity files with ids and links
+    /// that resolve even when two labels share a slug, and quack's stubs
+    /// neither ingested nor proposed on re-import.
+    #[test]
+    fn export_carries_ids_resolved_links_the_ontology_and_no_audit() {
+        let (db, saved_classes) = harbour_workspace();
+        let mut bundle = Bundle::default();
+        let summary =
+            export(&db, "ws", &mut bundle).unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        assert_eq!(summary.files, bundle.files.len());
         let log = bundle
             .files
             .iter()
@@ -1319,7 +1492,7 @@ mod tests {
         let snapshot = bundle
             .ontology()
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
-        assert_eq!(snapshot.map(|o| o.classes.len()), Some(saved.classes.len()));
+        assert_eq!(snapshot.map(|o| o.classes.len()), Some(saved_classes));
         let entities: Vec<&BundleFile> = bundle
             .files
             .iter()
@@ -1332,6 +1505,14 @@ mod tests {
             bundle.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
         let paths: Vec<&str> = entities.iter().map(|f| f.path.as_str()).collect();
+        // "Kenya Coast" sorts first, so it keeps the plain name.
+        assert!(
+            paths.contains(&"entities/harbour/kenya-coast.md")
+                && paths
+                    .iter()
+                    .any(|p| p.starts_with("entities/harbour/kenya-coast-")),
+            "{paths:?}"
+        );
         for file in &entities {
             assert!(file.content.contains("\nid: "), "{}", file.content);
             for link in links(&file.path, &file.content) {
@@ -1355,6 +1536,31 @@ mod tests {
             .ontology()
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         assert!(propose(&bundle, snapshot.as_ref()).is_empty());
+    }
+
+    /// Streamed into a tar or a directory, the export reads back as the
+    /// same files it collects in memory.
+    #[test]
+    fn the_export_streams_to_a_tar_or_a_directory() {
+        let (db, _) = harbour_workspace();
+        let mut bundle = Bundle::default();
+        export(&db, "ws", &mut bundle).unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let mut tar = TarSink::new(Vec::new());
+        export(&db, "ws", &mut tar).unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let bytes = tar
+            .finish()
+            .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let from_tar = Bundle::from_tar(&bytes).unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        assert_eq!(from_tar, bundle);
+        let dir = tempfile::tempdir().unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        export(&db, "ws", &mut DirSink::new(dir.path()))
+            .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let mut from_dir =
+            Bundle::from_dir(dir.path()).unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let mut expected = bundle.clone();
+        from_dir.files.sort_by(|a, b| a.path.cmp(&b.path));
+        expected.files.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(from_dir, expected);
     }
 
     #[expect(clippy::panic, reason = "test helper: the fixture must build")]

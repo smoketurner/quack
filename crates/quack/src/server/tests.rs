@@ -3044,6 +3044,24 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             && paths.contains(&"log.md"),
         "{paths:?}"
     );
+    // The export streams, so it is audited when the stream ends.
+    let mut exported = false;
+    for _ in 0..100 {
+        exported = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(String::from("export")),
+                ..AuditFilter::default()
+            })
+            .await
+            .iter()
+            .any(|r| r.outcome == Outcome::Allowed);
+        if exported {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(exported, "the finished export is audited as allowed");
     assert!(
         paths.contains(&"ontology/classes/organization.md"),
         "{paths:?}"
