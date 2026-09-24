@@ -200,7 +200,7 @@ impl BackgroundRun {
                     Err(e)
                 }
             }
-        });
+        }).id;
         jobs.when_ended(id, move |ended| async move {
             if ended.never_started() {
                 unstarted

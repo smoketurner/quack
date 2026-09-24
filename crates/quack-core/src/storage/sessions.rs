@@ -424,13 +424,35 @@ pub fn history_for_model(
     Ok(kept)
 }
 
+/// How a session is exported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    /// Questions, steps, and answers.
+    #[default]
+    Markdown,
+    /// Every executed statement, each preceded by its question, as a
+    /// runnable `.sql` file.
+    Sql,
+}
+
+impl ExportFormat {
+    /// `session`, whose messages are `rows`, in this format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if formatting into the output buffer fails.
+    pub fn render(self, session: &SessionRow, rows: &[MessageRow]) -> Result<String> {
+        match self {
+            Self::Markdown => export_markdown(session, rows),
+            Self::Sql => export_sql(rows),
+        }
+    }
+}
+
 /// Every executed statement in order, each preceded by the question that
 /// led to it, as a runnable `.sql` file.
-///
-/// # Errors
-///
-/// Returns an error only if formatting into the output buffer fails.
-pub fn export_sql(rows: &[MessageRow]) -> Result<String> {
+fn export_sql(rows: &[MessageRow]) -> Result<String> {
     let mut out = String::new();
     let mut question: Option<&str> = None;
     for row in rows {
@@ -461,11 +483,7 @@ pub fn export_sql(rows: &[MessageRow]) -> Result<String> {
 }
 
 /// The transcript as Markdown: questions, steps, and answers.
-///
-/// # Errors
-///
-/// Returns an error only if formatting into the output buffer fails.
-pub fn export_markdown(session: &SessionRow, rows: &[MessageRow]) -> Result<String> {
+fn export_markdown(session: &SessionRow, rows: &[MessageRow]) -> Result<String> {
     let mut out = String::new();
     let title = session.title.as_deref().unwrap_or("Session");
     writeln!(out, "# {title}\n")?;

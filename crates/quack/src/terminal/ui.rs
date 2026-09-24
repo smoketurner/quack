@@ -1,14 +1,18 @@
+use std::collections::hash_map::DefaultHasher;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::terminal::app::{App, Message, MessageRole};
-use crate::terminal::chart;
+use crate::terminal::app::{App, Message, MessageKind};
+use crate::terminal::chart::ChartData;
 use crate::terminal::commands::Suggestion;
 use quack_core::analysis::events;
-use quack_core::jobs::{JobInfo, JobState};
+use quack_core::jobs::{JobCounts, JobInfo, JobState};
 
 /// Jobs listed above the input at most; the rest are counted.
 const STRIP_JOBS: usize = 3;
@@ -24,11 +28,168 @@ const SPINNER: &[&str] = &[
     "\u{2807}", "\u{280F}",
 ];
 
+/// The spinner's frame, advanced on each tick while a job is active.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Spinner(usize);
+
+impl Spinner {
+    pub(crate) fn advance(&mut self) {
+        let next = self.0.saturating_add(1);
+        self.0 = if next < SPINNER.len() { next } else { 0 };
+    }
+
+    fn symbol(self) -> &'static str {
+        SPINNER.get(self.0).copied().unwrap_or_default()
+    }
+}
+
+/// Where the transcript is scrolled to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Scroll {
+    /// Following the newest line.
+    #[default]
+    Latest,
+    /// This many lines above the newest.
+    Back(usize),
+    /// At the first line.
+    Top,
+}
+
+impl Scroll {
+    pub(crate) fn up(self, lines: usize) -> Self {
+        match self {
+            Self::Latest => Self::Back(lines),
+            Self::Back(back) => Self::Back(back.saturating_add(lines)),
+            Self::Top => Self::Top,
+        }
+    }
+
+    /// `lines` further down, when the transcript scrolls at most `limit`
+    /// lines back.
+    pub(crate) fn down(self, lines: usize, limit: usize) -> Self {
+        match self.lines_back(limit).saturating_sub(lines) {
+            0 => Self::Latest,
+            back => Self::Back(back),
+        }
+    }
+
+    /// How many lines above the newest the view starts, at most `limit`.
+    fn lines_back(self, limit: usize) -> usize {
+        match self {
+            Self::Latest => 0,
+            Self::Back(back) => back.min(limit),
+            Self::Top => limit,
+        }
+    }
+}
+
+/// ` · scroll: +N` for the status line, or nothing while following.
+impl fmt::Display for Scroll {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Latest => Ok(()),
+            Self::Back(back) => write!(f, " \u{00B7} scroll: +{back}"),
+            Self::Top => write!(f, " \u{00B7} scroll: top"),
+        }
+    }
+}
+
+/// ` · 2 running, 1 queued · /jobs`, or nothing when idle.
+struct JobsIndicator(JobCounts);
+
+impl fmt::Display for JobsIndicator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.0.running, self.0.queued) {
+            (0, 0) => Ok(()),
+            (running, 0) => write!(f, " \u{00B7} {running} running \u{00B7} /jobs"),
+            (running, queued) => {
+                write!(
+                    f,
+                    " \u{00B7} {running} running, {queued} queued \u{00B7} /jobs"
+                )
+            }
+        }
+    }
+}
+
+/// One job, as `/jobs` lists it and as the strip above the input shows it.
+pub(crate) struct JobRow<'a>(pub(crate) &'a JobInfo);
+
+impl JobRow<'_> {
+    /// `/jobs`: number, state, kind, label, progress, and how it ended.
+    pub(crate) fn listing(&self) -> String {
+        let job = self.0;
+        let progress = job.progress.map(|p| format!(" {p}")).unwrap_or_default();
+        let outcome = match (&job.outcome, job.state) {
+            (Some(text), JobState::Succeeded | JobState::Failed | JobState::Cancelled)
+                if !text.is_empty() =>
+            {
+                format!(" \u{2014} {}", one_line(text))
+            }
+            _ => String::new(),
+        };
+        format!(
+            "#{:<3} {:<9} {:<8} {}{progress}{outcome}",
+            job.number,
+            job.state.as_str(),
+            job.kind.as_str(),
+            job.label
+        )
+    }
+
+    /// The strip: a spinner while it runs, its number, kind, label,
+    /// progress, and status.
+    fn strip(&self, spinner: Spinner) -> Line<'static> {
+        let job = self.0;
+        let (marker, style) = if job.state == JobState::Running {
+            (spinner.symbol(), Style::default().fg(Color::Yellow))
+        } else {
+            ("\u{00B7}", Style::default().fg(Color::DarkGray))
+        };
+        let mut detail = String::new();
+        if let Some(p) = job.progress {
+            detail = format!("  {p}");
+        }
+        if let Some(status) = job.status.as_deref() {
+            detail.push_str("  ");
+            detail.push_str(status);
+        }
+        if job.state == JobState::Queued {
+            detail.push_str("  queued");
+        }
+        if job.cancel_requested {
+            detail.push_str("  cancelling");
+        }
+        Line::from(vec![
+            Span::styled(format!(" {marker} #{} ", job.number), style),
+            Span::styled(
+                format!("{} ", job.kind),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(job.label.clone()),
+            Span::styled(detail, Style::default().fg(Color::DarkGray)),
+        ])
+    }
+}
+
+/// The first line of `text`, cut to fit a job list.
+pub(crate) fn one_line(text: &str) -> String {
+    const MAX: usize = 60;
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > MAX {
+        let cut: String = line.chars().take(MAX.saturating_sub(1)).collect();
+        format!("{cut}\u{2026}")
+    } else {
+        line.to_owned()
+    }
+}
+
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let chart_height = app
-        .current_chart
-        .as_ref()
-        .map_or(0, chart::ChartData::height);
+    let chart_height = app.current_chart.as_ref().map_or(0, ChartData::height);
     let strip = job_strip(app);
     let strip_height = u16::try_from(strip.len()).unwrap_or(u16::MAX);
 
@@ -51,10 +212,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 
     draw_header(frame, header_area, app);
     draw_messages(frame, messages_area, app);
-    if let Some(chart_data) = &app.current_chart
+    if let Some(chart) = &app.current_chart
         && chart_height > 0
     {
-        chart::render_chart(frame, chart_area, chart_data);
+        frame.render_widget(chart, chart_area);
     }
     if strip_height > 0 {
         frame.render_widget(Paragraph::new(Text::from(strip)), jobs_area);
@@ -142,36 +303,7 @@ pub(crate) fn job_strip(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = jobs
         .iter()
         .take(STRIP_JOBS)
-        .map(|job| {
-            let (marker, style) = if job.state == JobState::Running {
-                (spinner_frame(app.tick), Style::default().fg(Color::Yellow))
-            } else {
-                ("\u{00B7}", Style::default().fg(Color::DarkGray))
-            };
-            let mut detail = String::new();
-            if let Some(p) = job.progress {
-                detail = format!("  {p}");
-            }
-            if let Some(status) = job.status.as_deref() {
-                detail.push_str("  ");
-                detail.push_str(status);
-            }
-            if job.state == JobState::Queued {
-                detail.push_str("  queued");
-            }
-            if job.cancel_requested {
-                detail.push_str("  cancelling");
-            }
-            Line::from(vec![
-                Span::styled(format!(" {marker} #{} ", job.number), style),
-                Span::styled(
-                    format!("{} ", job.kind),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(job.label.clone()),
-                Span::styled(detail, Style::default().fg(Color::DarkGray)),
-            ])
-        })
+        .map(|job| JobRow(job).strip(app.spinner))
         .collect();
     let more = jobs.len().saturating_sub(STRIP_JOBS);
     if more > 0 {
@@ -221,7 +353,8 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let total_lines = lines.len();
     let visible = usize::from(area.height);
     let max_scroll = total_lines.saturating_sub(visible);
-    let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
+    app.scroll_limit.set(max_scroll);
+    let effective_scroll = max_scroll.saturating_sub(app.scroll.lines_back(max_scroll));
     let scroll_u16 = u16::try_from(effective_scroll).unwrap_or(u16::MAX);
 
     let text = Text::from(lines);
@@ -268,12 +401,6 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let scroll_indicator = if app.scroll_offset > 0 {
-        format!(" \u{00B7} scroll: +{}", app.scroll_offset)
-    } else {
-        String::new()
-    };
-
     let status = Line::from(vec![
         Span::styled(
             " enter",
@@ -303,30 +430,22 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        Span::styled(scroll_indicator, Style::default().fg(Color::DarkGray)),
-        Span::styled(jobs_indicator(app), Style::default().fg(Color::DarkGray)),
+        Span::styled(app.scroll.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            JobsIndicator(app.job_counts()).to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
 
     frame.render_widget(Paragraph::new(status), area);
 }
 
-/// ` · 2 running, 1 queued · /jobs`, or nothing when idle.
-fn jobs_indicator(app: &App) -> String {
-    let running = app
-        .active_jobs
-        .iter()
-        .filter(|j| j.state == JobState::Running)
-        .count();
-    let queued = app.active_jobs.len().saturating_sub(running);
-    match (running, queued) {
-        (0, 0) => String::new(),
-        (r, 0) => format!(" \u{00B7} {r} running \u{00B7} /jobs"),
-        (r, q) => format!(" \u{00B7} {r} running, {q} queued \u{00B7} /jobs"),
-    }
-}
-
 /// A message's rendered lines and the fingerprint they were rendered from.
-pub(crate) type WrappedMessage = (u64, Vec<Line<'static>>);
+#[derive(Debug, Clone)]
+pub(crate) struct Wrapped {
+    pub(crate) key: u64,
+    lines: Vec<Line<'static>>,
+}
 
 /// Every message's lines, wrapped to `width`. Each message's lines are
 /// cached on the app by a fingerprint of what it shows, so a redraw
@@ -340,63 +459,65 @@ pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
     cache.resize(app.messages.len(), None);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (msg, slot) in app.messages.iter().zip(cache.iter_mut()) {
-        let key = fingerprint(msg, width, app.expand_steps);
+        let key = msg.fingerprint(width, app.expand_steps);
         match slot {
-            Some((cached, rendered)) if *cached == key => lines.extend(rendered.iter().cloned()),
+            Some(cached) if cached.key == key => lines.extend(cached.lines.iter().cloned()),
             _ => {
-                let rendered = message_lines(msg, width, app.expand_steps);
+                let rendered = msg.lines(width, app.expand_steps);
                 lines.extend(rendered.iter().cloned());
-                *slot = Some((key, rendered));
+                *slot = Some(Wrapped {
+                    key,
+                    lines: rendered,
+                });
             }
         }
     }
     lines
 }
 
-/// What decides a message's rendering.
-fn fingerprint(msg: &Message, width: usize, expand: bool) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    msg.role.hash(&mut hasher);
-    msg.content.hash(&mut hasher);
-    msg.detail.hash(&mut hasher);
-    msg.chart
-        .as_ref()
-        .map(|c| c.title.as_str())
-        .hash(&mut hasher);
-    width.hash(&mut hasher);
-    (expand && msg.role == MessageRole::Step).hash(&mut hasher);
-    hasher.finish()
-}
+impl Message {
+    /// What decides its rendering.
+    fn fingerprint(&self, width: usize, expand: bool) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.kind.hash(&mut hasher);
+        self.content.hash(&mut hasher);
+        self.detail.hash(&mut hasher);
+        self.chart
+            .as_ref()
+            .map(|c| c.title.as_str())
+            .hash(&mut hasher);
+        width.hash(&mut hasher);
+        (expand && self.kind == MessageKind::Step).hash(&mut hasher);
+        hasher.finish()
+    }
 
-/// One message's lines, wrapped to `width`, with the blank line after it.
-fn message_lines(msg: &Message, width: usize, expand_steps: bool) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    {
-        let (prefix, style) = match msg.role {
-            MessageRole::User => (" > ", Style::default().fg(Color::Cyan)),
-            MessageRole::Assistant => ("   ", Style::default()),
-            MessageRole::Step => ("   ", Style::default().fg(Color::Yellow)),
-            MessageRole::Sql => ("   ", Style::default().fg(Color::White)),
-            MessageRole::System => ("   ", Style::default().fg(Color::DarkGray)),
-            MessageRole::Error => ("   ", Style::default().fg(Color::Red)),
+    /// Its lines, wrapped to `width`, with the blank line after it.
+    fn lines(&self, width: usize, expand_steps: bool) -> Vec<Line<'static>> {
+        let (prefix, style) = match self.kind {
+            MessageKind::User => (" > ", Style::default().fg(Color::Cyan)),
+            MessageKind::Assistant => ("   ", Style::default()),
+            MessageKind::Step => ("   ", Style::default().fg(Color::Yellow)),
+            MessageKind::Sql => ("   ", Style::default().fg(Color::White)),
+            MessageKind::System => ("   ", Style::default().fg(Color::DarkGray)),
+            MessageKind::Error => ("   ", Style::default().fg(Color::Red)),
         };
-        let prompt_style = if msg.role == MessageRole::User {
+        let prompt_style = if self.kind == MessageKind::User {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else {
             style
         };
-        let body: Vec<Vec<Span<'static>>> = match msg.role {
-            MessageRole::Assistant => markdown::render(&msg.content),
-            MessageRole::Step => step_body(msg, expand_steps, style),
-            _ => msg
+        let body: Vec<Vec<Span<'static>>> = match self.kind {
+            MessageKind::Assistant => markdown::render(&self.content),
+            MessageKind::Step => self.step_rows(expand_steps, style),
+            MessageKind::User | MessageKind::Sql | MessageKind::System | MessageKind::Error => self
                 .content
                 .lines()
                 .map(|l| vec![Span::styled(l.to_owned(), style)])
                 .collect(),
         };
+        let mut lines: Vec<Line<'static>> = Vec::new();
         let mut first = true;
         for spans in body {
             let p = if first {
@@ -411,7 +532,7 @@ fn message_lines(msg: &Message, width: usize, expand_steps: bool) -> Vec<Line<'s
                 lines.push(Line::from(with_prefix));
             }
         }
-        if let Some(chart) = &msg.chart {
+        if let Some(chart) = &self.chart {
             let note = vec![Span::styled(
                 format!("[chart: {}; /chart shows it]", chart.title),
                 Style::default().fg(Color::Magenta),
@@ -423,50 +544,40 @@ fn message_lines(msg: &Message, width: usize, expand_steps: bool) -> Vec<Line<'s
             }
         }
         lines.push(Line::from(""));
+        lines
     }
 
-    lines
-}
-
-/// A step: its header and outcome, then the detail in full when expanded
-/// or its first lines with a count of the rest.
-fn step_body(msg: &Message, expanded: bool, style: Style) -> Vec<Vec<Span<'static>>> {
-    let mut rows: Vec<Vec<Span<'static>>> = msg
-        .content
-        .lines()
-        .map(|l| vec![Span::styled(l.to_owned(), style)])
-        .collect();
-    let Some(detail) = msg.detail.as_deref().filter(|d| !d.trim().is_empty()) else {
-        return rows;
-    };
-    let dim = Style::default().fg(Color::DarkGray);
-    let (shown, more): (Vec<&str>, usize) = if expanded {
-        (detail.lines().collect(), 0)
-    } else {
-        events::preview_detail(detail)
-    };
-    let at = rows.len().min(1);
-    let mut detail_rows: Vec<Vec<Span<'static>>> = shown
-        .into_iter()
-        .map(|l| vec![Span::styled(format!("  {l}"), dim)])
-        .collect();
-    if more > 0 {
-        detail_rows.push(vec![Span::styled(
-            format!("  ({more} more lines; /steps expands)"),
-            dim,
-        )]);
+    /// A step: its header and outcome, then the detail in full when
+    /// expanded or its first lines with a count of the rest.
+    fn step_rows(&self, expanded: bool, style: Style) -> Vec<Vec<Span<'static>>> {
+        let mut rows: Vec<Vec<Span<'static>>> = self
+            .content
+            .lines()
+            .map(|l| vec![Span::styled(l.to_owned(), style)])
+            .collect();
+        let Some(detail) = self.detail.as_deref().filter(|d| !d.trim().is_empty()) else {
+            return rows;
+        };
+        let dim = Style::default().fg(Color::DarkGray);
+        let (shown, more): (Vec<&str>, usize) = if expanded {
+            (detail.lines().collect(), 0)
+        } else {
+            events::preview_detail(detail)
+        };
+        let at = rows.len().min(1);
+        let mut detail_rows: Vec<Vec<Span<'static>>> = shown
+            .into_iter()
+            .map(|l| vec![Span::styled(format!("  {l}"), dim)])
+            .collect();
+        if more > 0 {
+            detail_rows.push(vec![Span::styled(
+                format!("  ({more} more lines; /steps expands)"),
+                dim,
+            )]);
+        }
+        rows.splice(at..at, detail_rows);
+        rows
     }
-    rows.splice(at..at, detail_rows);
-    rows
-}
-
-#[expect(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    reason = "SPINNER is a non-empty const array; divisor and index are always valid"
-)]
-fn spinner_frame(tick: usize) -> &'static str {
-    SPINNER[tick % SPINNER.len()]
 }
 
 fn separator_line(width: u16) -> Line<'static> {

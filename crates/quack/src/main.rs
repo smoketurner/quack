@@ -28,7 +28,7 @@ use quack_core::ontology::{Ontology, candidates, store as ontology_store};
 use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
-use quack_core::storage::sessions::{self, ChatMode};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat};
 use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, crypto, doctor, llm};
@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::confirm::Confirm;
+use crate::terminal::SessionSetup;
 
 /// Exit status for a usage error (bad flags, no terminal for the session).
 const EXIT_USAGE: u8 = 2;
@@ -148,13 +149,8 @@ enum Commands {
         /// Session id (prefixes accepted)
         session_id: String,
 
-        /// Every executed statement, each preceded by its question
-        #[arg(long, conflicts_with = "markdown")]
-        sql: bool,
-
-        /// Questions, steps, and answers as Markdown (default)
-        #[arg(long)]
-        markdown: bool,
+        #[command(flatten)]
+        flags: ExportFlags,
     },
 
     /// Ingest a file into a workspace
@@ -381,10 +377,35 @@ enum ContextAction {
     },
 }
 
+/// The answer mode as a command-line or slash-command argument.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ModeArg {
+pub(crate) enum ModeArg {
+    /// General knowledge allowed; cite when a source was used
     Chat,
+    /// Every claim must come from a retrieved source
     Query,
+}
+
+/// `--sql` or `--markdown`: how `export` writes a session.
+#[derive(clap::Args)]
+pub(crate) struct ExportFlags {
+    /// Every executed statement, each preceded by its question
+    #[arg(long, conflicts_with = "markdown")]
+    sql: bool,
+
+    /// Questions, steps, and answers as Markdown (the default)
+    #[arg(long)]
+    markdown: bool,
+}
+
+impl ExportFlags {
+    pub(crate) const fn format(&self) -> ExportFormat {
+        if self.sql {
+            ExportFormat::Sql
+        } else {
+            ExportFormat::Markdown
+        }
+    }
 }
 
 impl From<ModeArg> for ChatMode {
@@ -499,11 +520,9 @@ async fn run() -> Result<ExitCode> {
 async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
     match command {
         Commands::Sessions { json, limit } => run_sessions(cli, json, limit).await,
-        Commands::Export {
-            session_id,
-            sql,
-            markdown: _,
-        } => run_export(cli, &session_id, sql).await,
+        Commands::Export { session_id, flags } => {
+            run_export(cli, &session_id, flags.format()).await
+        }
         Commands::Ingest {
             file,
             filename,
@@ -810,9 +829,9 @@ async fn run_sessions(cli: &Cli, json: bool, limit: u32) -> Result<ExitCode> {
 }
 
 /// `quack export SESSION`: a session as SQL or Markdown.
-async fn run_export(cli: &Cli, session_id: &str, sql: bool) -> Result<ExitCode> {
+async fn run_export(cli: &Cli, session_id: &str, format: ExportFormat) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
-    export_session(&ws_db, session_id, sql)?;
+    export_session(&ws_db, session_id, format)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1144,15 +1163,15 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     let db: SharedDb =
         Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
     let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
-    terminal::run(
+    terminal::run(SessionSetup {
         config,
-        ws_name,
-        workspace.id,
+        workspace_name: ws_name,
+        workspace_id: workspace.id,
         db,
         reader_db,
         session_id,
-        cli.allow_write,
-    )
+        allow_write: cli.allow_write,
+    })
     .await?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1389,14 +1408,9 @@ fn list_sessions(db: &WorkspaceDb, json: bool, limit: u32) -> Result<()> {
     Ok(())
 }
 
-fn export_session(db: &WorkspaceDb, prefix: &str, as_sql: bool) -> Result<()> {
+fn export_session(db: &WorkspaceDb, prefix: &str, format: ExportFormat) -> Result<()> {
     let session = find_session(db, prefix)?;
-    let rows = sessions::messages(db, &session.id)?;
-    let text = if as_sql {
-        sessions::export_sql(&rows)?
-    } else {
-        sessions::export_markdown(&session, &rows)?
-    };
+    let text = format.render(&session, &sessions::messages(db, &session.id)?)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     write!(out, "{text}")?;

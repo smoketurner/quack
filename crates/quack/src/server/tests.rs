@@ -3560,16 +3560,20 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
     assert_eq!(body["lane"], format!("ingest:{ws}"));
 
     // A member's question, waiting on its cancel token.
-    let question = h.app.jobs.submit(
-        JobSpec::new(JobKind::Chat, "what is our churn?")
-            .workspace(ws.clone())
-            .owner(Some(member.clone()))
-            .lane(Lane::serial(&LaneKey::Session(String::from("s")))),
-        |ctx| async move {
-            ctx.cancel_token().cancelled().await;
-            Err(String::from("cancelled"))
-        },
-    );
+    let question = h
+        .app
+        .jobs
+        .submit(
+            JobSpec::new(JobKind::Chat, "what is our churn?")
+                .workspace(ws.clone())
+                .owner(Some(member.clone()))
+                .lane(Lane::serial(&LaneKey::Session(String::from("s")))),
+            |ctx| async move {
+                ctx.cancel_token().cancelled().await;
+                Err(String::from("cancelled"))
+            },
+        )
+        .id;
     let (status, body) = h.get(&jobs, &viewer_token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["jobs"].as_array().map(Vec::len), Some(2));

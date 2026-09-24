@@ -50,10 +50,13 @@ impl UploadJob {
         let workspace = workspace_id.to_owned();
         let document_id = self.document_id.clone();
         let worker_db = Arc::clone(&db);
-        let id = app.jobs.submit(spec, move |ctx| async move {
-            let cancel = ctx.cancel_token();
-            self.process(&config, &workspace, &worker_db, &cancel).await
-        });
+        let id = app
+            .jobs
+            .submit(spec, move |ctx| async move {
+                let cancel = ctx.cancel_token();
+                self.process(&config, &workspace, &worker_db, &cancel).await
+            })
+            .id;
         // The work records its own outcome; a job that ends without running
         // it (cancelled while queued) or that died mid-way (a panic) must not
         // leave the document `queued` or `processing` forever.

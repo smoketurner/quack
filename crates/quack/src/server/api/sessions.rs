@@ -7,8 +7,8 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use quack_core::storage::sessions::{self, ChatMode};
-use serde::{Deserialize, Serialize};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat};
+use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
@@ -257,16 +257,6 @@ pub(crate) struct ExportQuery {
     pub format: ExportFormat,
 }
 
-/// How a session is exported.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ExportFormat {
-    #[default]
-    Markdown,
-    /// `INSERT` statements that recreate the session and its messages.
-    Sql,
-}
-
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
@@ -275,18 +265,10 @@ pub(crate) async fn export(
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = access.visible_session(&app, &sid).await?;
-    let as_sql = match q.format {
-        ExportFormat::Sql => true,
-        ExportFormat::Markdown => false,
-    };
+    let format = q.format;
     let text = app
         .read(&id, move |db| {
-            let rows = sessions::messages(db, &session.id)?;
-            if as_sql {
-                sessions::export_sql(&rows)
-            } else {
-                sessions::export_markdown(&session, &rows)
-            }
+            format.render(&session, &sessions::messages(db, &session.id)?)
         })
         .await?;
     access
@@ -298,10 +280,9 @@ pub(crate) async fn export(
             Some(serde_json::json!({ "format": q.format })),
         )
         .await?;
-    let content_type = if as_sql {
-        "application/sql; charset=utf-8"
-    } else {
-        "text/markdown; charset=utf-8"
+    let content_type = match format {
+        ExportFormat::Sql => "application/sql; charset=utf-8",
+        ExportFormat::Markdown => "text/markdown; charset=utf-8",
     };
     Ok(([(header::CONTENT_TYPE, content_type)], text).into_response())
 }
