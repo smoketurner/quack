@@ -433,6 +433,7 @@ pub fn ollama_context_size(prompt_chars: usize, cap: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::Properties;
     use crate::graph::store::NewNode;
     use crate::ontology::Ontology;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
@@ -474,7 +475,7 @@ mod tests {
             &NewNode {
                 label: String::from("Acme"),
                 class_id: String::from("organization"),
-                properties: serde_json::json!({}),
+                properties: Properties::default(),
                 provisional: false,
             },
         )
@@ -520,7 +521,7 @@ mod tests {
             &NewNode {
                 label: String::from("Acme"),
                 class_id: String::from("organization"),
-                properties: serde_json::json!({}),
+                properties: Properties::default(),
                 provisional: false,
             },
         )

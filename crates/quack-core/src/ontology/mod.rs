@@ -276,6 +276,21 @@ impl Ontology {
         ancestor == ROOT_CLASS || self.ancestry(class_id).iter().any(|c| c == ancestor)
     }
 
+    /// Whether an edge of `relation` from a `source_class` node to a
+    /// `target_class` node is valid: the relation exists (or is `mentions`)
+    /// and each end is its domain or range or descends from it.
+    #[must_use]
+    pub fn allows_edge(&self, relation: &str, source_class: &str, target_class: &str) -> bool {
+        if relation == MENTIONS_RELATION {
+            return true;
+        }
+        let Some(relation) = self.relation(relation) else {
+            return false;
+        };
+        self.is_subclass_of(source_class, &relation.domain)
+            && self.is_subclass_of(target_class, &relation.range)
+    }
+
     /// The classes whose parent is this one, nearest first.
     #[must_use]
     pub fn subclasses(&self, class_id: &str) -> Vec<&Class> {

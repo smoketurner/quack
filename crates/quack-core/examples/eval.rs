@@ -31,6 +31,7 @@ use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
 use quack_core::extraction::{Extract, ExtractFuture};
 use quack_core::graph::extract::{ChunkText, Extraction};
+use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, store};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
@@ -781,7 +782,7 @@ async fn evaluate_graph(
 
     let node_ids = store::all_node_ids(db)?;
     let nodes = store::nodes(db, &node_ids)?;
-    let edges = store::edges_among(db, &node_ids)?;
+    let edges = store::edges(db, &node_ids, EdgeScope::Among)?;
     let label_of: BTreeMap<String, String> = nodes
         .iter()
         .map(|n| (n.id.clone(), n.label.clone()))

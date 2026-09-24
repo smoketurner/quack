@@ -25,7 +25,6 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
-use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::jobs::{
@@ -1223,7 +1222,7 @@ impl App {
             }
         }
         for result in response.graph.iter().filter(|r| !r.is_empty()) {
-            self.note(MessageKind::System, traverse::render_tree(result));
+            self.note(MessageKind::System, result.to_string());
         }
         if response.write_refused && !self.writes_allowed() {
             self.note(
@@ -2013,7 +2012,7 @@ impl App {
                     Some(_) | None => Ok(result),
                 }
             },
-            |app, result| app.note(MessageKind::System, traverse::render_tree(&result)),
+            |app, result| app.note(MessageKind::System, result.to_string()),
         );
     }
 
@@ -2038,7 +2037,7 @@ impl App {
                         ),
                     );
                 } else {
-                    app.note(MessageKind::System, traverse::render_tree(&result));
+                    app.note(MessageKind::System, result.to_string());
                 }
             },
         );

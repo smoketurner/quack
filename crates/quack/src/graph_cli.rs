@@ -11,7 +11,6 @@ use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphResult, GraphStatus, extract, resolve, store as graph_store, tables,
-    traverse,
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
@@ -392,7 +391,7 @@ fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Resul
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(result)?)?;
     } else {
-        write!(out, "{}", traverse::render_tree(result))?;
+        write!(out, "{result}")?;
     }
     Ok(())
 }

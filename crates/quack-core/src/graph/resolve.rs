@@ -363,41 +363,16 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
         store::node(db, drop)?.ok_or_else(|| Error::Analysis(format!("no node {drop}")))?;
     let conn = db.connection();
     let mut properties = keep_node.properties;
-    if !properties.is_object() {
-        properties = serde_json::json!({});
+    let mut aliases = properties.aliases();
+    aliases.extend(drop_node.properties.aliases());
+    if !aliases.contains(&drop_node.label) {
+        aliases.push(drop_node.label.clone());
     }
-    if let Some(object) = properties.as_object_mut() {
-        if let Some(incoming) = drop_node.properties.as_object() {
-            for (k, v) in incoming {
-                if k != "aliases" {
-                    object.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-            }
-        }
-        let mut aliases: Vec<String> = object
-            .get("aliases")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(theirs) = drop_node
-            .properties
-            .get("aliases")
-            .and_then(|a| a.as_array())
-        {
-            aliases.extend(theirs.iter().filter_map(|v| v.as_str().map(str::to_owned)));
-        }
-        if !aliases.contains(&drop_node.label) {
-            aliases.push(drop_node.label.clone());
-        }
-        object.insert("aliases".into(), serde_json::json!(aliases));
-    }
+    properties.fill_from(&drop_node.properties);
+    properties.set_aliases(&aliases);
     conn.execute(
         "UPDATE _quack_graph_nodes SET properties = ?, provisional = provisional AND ? WHERE id = ?",
-        duckdb::params![serde_json::to_string(&properties)?, drop_node.provisional, keep],
+        duckdb::params![properties.to_json(), drop_node.provisional, keep],
     )?;
     // Repoint edges, dropping any that would duplicate an existing triple
     // or become a self-loop.

@@ -8,6 +8,7 @@
 
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
+use quack_core::graph::Properties;
 use quack_core::graph::store as graph_store;
 use quack_core::graph::store::NewNode;
 use quack_core::ontology::{Ontology, store as ontology_store};
@@ -31,7 +32,7 @@ fn main() {
         &NewNode {
             label: String::from("Acme"),
             class_id: String::from("organization"),
-            properties: serde_json::json!({}),
+            properties: Properties::default(),
             provisional: false,
         },
     )

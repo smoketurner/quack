@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use super::Drift;
 use super::store::{self, NewNode, Source};
+use super::{Drift, NormalizedLabel, Properties};
 use crate::error::{Error, Result};
 use crate::extraction::{Extract, Extracted, Passage, RunProgress, evenly_spaced, extractions};
 use crate::ontology::{self, Ontology};
@@ -30,7 +30,7 @@ pub struct ExtractedNode {
     pub label: String,
     pub class: String,
     #[serde(default)]
-    pub properties: serde_json::Value,
+    pub properties: Properties,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -39,14 +39,15 @@ pub struct ExtractedEdge {
     pub target: String,
     pub relation: String,
     #[serde(default)]
-    pub properties: serde_json::Value,
+    pub properties: Properties,
 }
 
-/// The preamble for the chat model, with the ontology rendered into it.
-#[must_use]
-pub fn prompt_for(ontology: &Ontology) -> String {
-    let mut prompt = String::from(
-        "Extract the entities and relations a passage states, using only this ontology. \
+impl Ontology {
+    /// The graph extractor's preamble, with this ontology rendered into it.
+    #[must_use]
+    pub fn extraction_prompt(&self) -> String {
+        let mut prompt = String::from(
+            "Extract the entities and relations a passage states, using only this ontology. \
          Return only JSON with this shape and nothing else:\n\
          {\"nodes\": [{\"label\": \"...\", \"class\": \"...\", \"properties\": {}}], \
          \"edges\": [{\"source\": \"...\", \"target\": \"...\", \"relation\": \"...\", \"properties\": {}}]}\n\
@@ -56,9 +57,10 @@ pub fn prompt_for(ontology: &Ontology) -> String {
          written, once each. Properties use the class's property ids with values from the \
          passage. Skip anything that does not fit the ontology; do not invent classes, \
          relations, or facts. Leave a list empty rather than guessing.\n\n",
-    );
-    prompt.push_str(&ontology.render_for_prompt());
-    prompt
+        );
+        prompt.push_str(&self.render_for_prompt());
+        prompt
+    }
 }
 
 /// An extraction filtered against the ontology: what to store, and what
@@ -73,67 +75,61 @@ pub struct Validated {
     pub invalid_edges: u32,
 }
 
-/// Keep what fits: nodes of known classes, edges of known relations
-/// between listed nodes whose classes fit the domain and range. Unknown
-/// classes and relations are counted as drift.
-#[must_use]
-pub fn validate(ontology: &Ontology, extraction: Extraction) -> Validated {
-    let mut out = Validated::default();
-    let mut class_of: BTreeMap<String, String> = BTreeMap::new();
-    for node in extraction.nodes {
-        let label = node.label.trim();
-        if label.is_empty() {
-            continue;
+impl Extraction {
+    /// Keep what fits: nodes of known classes, edges of known relations
+    /// between listed nodes whose classes fit the domain and range. Unknown
+    /// classes and relations are counted as drift.
+    #[must_use]
+    pub fn validate(self, ontology: &Ontology) -> Validated {
+        let mut out = Validated::default();
+        let mut class_of: BTreeMap<NormalizedLabel, String> = BTreeMap::new();
+        for node in self.nodes {
+            let label = node.label.trim();
+            if label.is_empty() {
+                continue;
+            }
+            let class = node.class.trim().to_lowercase();
+            if class != ontology::ROOT_CLASS && ontology.class(&class).is_none() {
+                out.drift.classes.bump(&class);
+                continue;
+            }
+            let key = NormalizedLabel::new(label);
+            if class_of.contains_key(&key) {
+                continue;
+            }
+            class_of.insert(key, class.clone());
+            out.nodes.push(ExtractedNode {
+                label: label.to_owned(),
+                class,
+                properties: node.properties,
+            });
         }
-        let class = node.class.trim().to_lowercase();
-        if class != ontology::ROOT_CLASS && ontology.class(&class).is_none() {
-            out.drift.classes.bump(&class);
-            continue;
+        for edge in self.edges {
+            let relation = edge.relation.trim().to_lowercase();
+            if relation != ontology::MENTIONS_RELATION && ontology.relation(&relation).is_none() {
+                out.drift.relations.bump(&relation);
+                continue;
+            }
+            let (Some(source_class), Some(target_class)) = (
+                class_of.get(&NormalizedLabel::new(&edge.source)),
+                class_of.get(&NormalizedLabel::new(&edge.target)),
+            ) else {
+                out.invalid_edges = out.invalid_edges.saturating_add(1);
+                continue;
+            };
+            if !ontology.allows_edge(&relation, source_class, target_class) {
+                out.invalid_edges = out.invalid_edges.saturating_add(1);
+                continue;
+            }
+            out.edges.push(ExtractedEdge {
+                source: edge.source.trim().to_owned(),
+                target: edge.target.trim().to_owned(),
+                relation,
+                properties: edge.properties,
+            });
         }
-        let key = super::normalize_label(label);
-        if class_of.contains_key(&key) {
-            continue;
-        }
-        class_of.insert(key, class.clone());
-        out.nodes.push(ExtractedNode {
-            label: label.to_owned(),
-            class,
-            properties: if node.properties.is_object() {
-                node.properties
-            } else {
-                serde_json::json!({})
-            },
-        });
+        out
     }
-    for edge in extraction.edges {
-        let relation = edge.relation.trim().to_lowercase();
-        if relation != ontology::MENTIONS_RELATION && ontology.relation(&relation).is_none() {
-            out.drift.relations.bump(&relation);
-            continue;
-        }
-        let (Some(source_class), Some(target_class)) = (
-            class_of.get(&super::normalize_label(&edge.source)),
-            class_of.get(&super::normalize_label(&edge.target)),
-        ) else {
-            out.invalid_edges = out.invalid_edges.saturating_add(1);
-            continue;
-        };
-        if !store::edge_fits(ontology, &relation, source_class, target_class) {
-            out.invalid_edges = out.invalid_edges.saturating_add(1);
-            continue;
-        }
-        out.edges.push(ExtractedEdge {
-            source: edge.source.trim().to_owned(),
-            target: edge.target.trim().to_owned(),
-            relation,
-            properties: if edge.properties.is_object() {
-                edge.properties
-            } else {
-                serde_json::json!({})
-            },
-        });
-    }
-    out
 }
 
 /// A chunk to extract from.
@@ -275,7 +271,7 @@ pub async fn run(
             edges = extraction.edges.len(),
             "graph extraction parsed"
         );
-        let validated = validate(ontology, extraction);
+        let validated = extraction.validate(ontology);
         summary.invalid_edges = summary
             .invalid_edges
             .saturating_add(validated.invalid_edges);
@@ -331,7 +327,7 @@ pub fn store_validated(
     source: &Source,
     provisional: bool,
 ) -> Result<(u32, u32)> {
-    let mut ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut ids: BTreeMap<NormalizedLabel, String> = BTreeMap::new();
     let mut nodes = 0u32;
     for node in &validated.nodes {
         let id = store::upsert_node(
@@ -344,14 +340,14 @@ pub fn store_validated(
             },
         )?;
         store::add_provenance(db, &id, source)?;
-        ids.insert(super::normalize_label(&node.label), id);
+        ids.insert(NormalizedLabel::new(&node.label), id);
         nodes = nodes.saturating_add(1);
     }
     let mut edges = 0u32;
     for edge in &validated.edges {
         let (Some(s), Some(t)) = (
-            ids.get(&super::normalize_label(&edge.source)),
-            ids.get(&super::normalize_label(&edge.target)),
+            ids.get(&NormalizedLabel::new(&edge.source)),
+            ids.get(&NormalizedLabel::new(&edge.target)),
         ) else {
             continue;
         };
@@ -422,7 +418,7 @@ mod tests {
             ]}"#,
         )
         .unwrap_or_default();
-        let v = validate(&ontology(), extraction);
+        let v = extraction.validate(&ontology());
         assert_eq!(
             v.nodes
                 .iter()
@@ -443,7 +439,7 @@ mod tests {
         );
         assert_eq!(v.drift.classes.get("vessel"), 1);
         assert_eq!(v.drift.relations.get("docked_at"), 1);
-        assert!(v.edges.iter().all(|e| e.properties.is_object()));
+        assert!(v.edges.iter().all(|e| e.properties.is_empty()));
     }
 
     #[test]
@@ -458,7 +454,7 @@ mod tests {
 
     #[test]
     fn prompt_carries_the_ontology() {
-        let prompt = prompt_for(&ontology());
+        let prompt = ontology().extraction_prompt();
         assert!(prompt.contains("ships_to: organization -> country"));
         assert!(prompt.starts_with("Extract the entities"));
     }

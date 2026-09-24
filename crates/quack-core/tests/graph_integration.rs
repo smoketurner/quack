@@ -14,7 +14,8 @@ use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    GraphOptions, GraphResult, Node, extract, resolve, store as graph_store, tables, traverse,
+    GraphOptions, GraphResult, Node, Origin, Properties, extract, resolve, store as graph_store,
+    tables, traverse,
 };
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
@@ -309,7 +310,7 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     let node = |label: &str| NewNode {
         label: label.to_owned(),
         class_id: String::from("country"),
-        properties: serde_json::json!({}),
+        properties: Properties::default(),
         provisional: false,
     };
     // "Kenya" (from the table) and "Kenya Coast" embed identically under
@@ -398,7 +399,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     let node = |label: &str, class: &str| NewNode {
         label: label.to_owned(),
         class_id: class.to_owned(),
-        properties: serde_json::json!({}),
+        properties: Properties::default(),
         provisional: false,
     };
     let source = graph_store::Source::chunk("doc-2", "c3", 0.9);
@@ -411,7 +412,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         &orgenics,
         &nowhere,
         "ships_to",
-        &serde_json::json!({}),
+        &Properties::default(),
         false,
     )
     .unwrap();
@@ -427,7 +428,13 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         graph_store::provenance_of(&db, std::slice::from_ref(&orgenics))
             .unwrap()
             .iter()
-            .all(|p| p.document_id.is_none())
+            .all(|p| !matches!(
+                p.origin,
+                Origin::Chunk {
+                    document_id: Some(_),
+                    ..
+                }
+            ))
     );
 
     // The document that loaded the mapped table: the table drops, and
@@ -541,12 +548,12 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     assert!(
         hood.provenance
             .iter()
-            .any(|p| p.chunk_id.as_deref() == Some("c1"))
+            .any(|p| p.origin.chunk_id() == Some("c1"))
     );
     assert!(
-        hood.provenance
-            .iter()
-            .any(|p| p.table_name.as_deref() == Some("shipments"))
+        hood.provenance.iter().any(
+            |p| matches!(&p.origin, Origin::Row { table_name, .. } if table_name == "shipments")
+        )
     );
     let only =
         traverse::neighborhood(&db, &roots, Hops::new(2), Some("delivered_to"), &options).unwrap();
@@ -588,7 +595,7 @@ fn paths_merges_and_listing(
     // By class with subclass expansion: organizations include vendors.
     let orgs = traverse::by_class(db, Some(current), "organization", 50, options).unwrap();
     assert_eq!(orgs.nodes.len(), 3, "{orgs:?}");
-    let tree = traverse::render_tree(hood);
+    let tree = hood.to_string();
     assert!(
         tree.contains("Kenya (country)") && tree.contains("<- delivered_to"),
         "{tree}"
@@ -697,7 +704,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
             &NewNode {
                 label: format!("Country {i:02}"),
                 class_id: String::from("country"),
-                properties: serde_json::json!({}),
+                properties: Properties::default(),
                 provisional: false,
             },
         )
@@ -713,7 +720,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert_eq!(capped.nodes.len(), 5);
     assert_eq!(capped.total_nodes, Some(12));
     assert!(capped.truncated);
-    let tree = traverse::render_tree(&capped);
+    let tree = capped.to_string();
     assert!(tree.contains("5 of 12 matching nodes"), "{tree}");
     assert!(tree.contains("cut off at the node limit"), "{tree}");
 
@@ -721,7 +728,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
         traverse::by_class(&db, Some(&current), "country", 50, &GraphOptions::default()).unwrap();
     assert_eq!(whole.nodes.len(), 12);
     assert!(!whole.truncated);
-    assert!(!traverse::render_tree(&whole).contains("cut off"), "{tree}");
+    assert!(!whole.to_string().contains("cut off"), "{tree}");
 
     // The census counts the class and its subclasses without listing them.
     let (total, samples) = graph_store::class_census(&db, &[String::from("country")], 3).unwrap();
@@ -799,7 +806,7 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
             &NewNode {
                 label: String::from(label),
                 class_id: String::from(class_id),
-                properties: serde_json::json!({}),
+                properties: Properties::default(),
                 provisional: false,
             },
         )

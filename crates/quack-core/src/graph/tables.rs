@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::normalize_label;
+use super::NormalizedLabel;
 use crate::error::{Error, Result};
 use crate::ontology::{Mapping, Ontology};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
@@ -109,7 +109,7 @@ pub fn extract_batch(
 /// graph, `(normalized_label, class_id)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NodeKey {
-    normalized: String,
+    normalized: NormalizedLabel,
     class_id: String,
 }
 
@@ -157,7 +157,7 @@ impl Staged {
         class_id: &str,
         properties: serde_json::Map<String, serde_json::Value>,
     ) -> Option<NodeKey> {
-        let normalized = normalize_label(label);
+        let normalized = NormalizedLabel::new(label);
         if normalized.is_empty() {
             return None;
         }

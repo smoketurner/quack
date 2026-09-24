@@ -12,6 +12,8 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::graph::Origin;
+use crate::graph::store::EdgeScope;
 use crate::graph::{self, store as graph_store};
 use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::{
@@ -733,7 +735,7 @@ fn export_entities(
         return Ok(());
     }
     let nodes = graph_store::nodes(db, &ids)?;
-    let edges = graph_store::edges_among(db, &ids)?;
+    let edges = graph_store::edges(db, &ids, EdgeScope::Among)?;
     let subjects: Vec<String> = ids
         .iter()
         .cloned()
@@ -806,9 +808,9 @@ fn entity_file(
         node.class_id,
         slug(&node.class_id)
     )?;
-    if let Some(properties) = node.properties.as_object().filter(|p| !p.is_empty()) {
+    if !node.properties.is_empty() {
         text.push_str("## Properties\n\n");
-        for (key, value) in properties {
+        for (key, value) in node.properties.iter() {
             let shown = match value {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -839,20 +841,26 @@ fn entity_file(
     let sources: Vec<String> = provenance
         .iter()
         .filter(|p| p.subject_id == node.id)
-        .map(|p| match (&p.table_name, &p.document_id) {
-            (Some(table), _) => format!(
-                "- table [{table}](../../tables/{}.md) row `{}`",
-                slug(table),
-                p.row_key.as_deref().unwrap_or("?")
+        .map(|p| match &p.origin {
+            Origin::Row {
+                table_name,
+                row_key,
+            } => format!(
+                "- table [{table_name}](../../tables/{}.md) row `{row_key}`",
+                slug(table_name),
             ),
-            (None, Some(document)) => format!(
-                "- document [{}](../../documents/{}.md) chunk `{}` (confidence {:.2})",
+            Origin::Chunk {
+                document_id: Some(document),
+                chunk_id,
+            } => format!(
+                "- document [{}](../../documents/{}.md) chunk `{chunk_id}` (confidence {:.2})",
                 filename_of(document),
                 slug(&filename_of(document)),
-                p.chunk_id.as_deref().unwrap_or("?"),
                 p.confidence
             ),
-            (None, None) => String::from("- unknown"),
+            Origin::Chunk {
+                document_id: None, ..
+            } => String::from("- unknown"),
         })
         .collect();
     if !sources.is_empty() {
@@ -1091,6 +1099,7 @@ pub fn document_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::Properties;
     use crate::ontology::induction::ItemKind;
     use crate::storage::audit;
 
@@ -1193,7 +1202,7 @@ mod tests {
         let node = |label: &str| graph_store::NewNode {
             label: label.to_owned(),
             class_id: String::from("harbour"),
-            properties: serde_json::json!({}),
+            properties: Properties::default(),
             provisional: false,
         };
         // Two labels, one slug: the second file gets a suffix and the
@@ -1206,7 +1215,7 @@ mod tests {
             graph_store::add_provenance(&db, id, &graph_store::Source::row("t", "k"))
                 .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         }
-        let edge = graph_store::upsert_edge(&db, &a, &b, "near", &serde_json::json!({}), false)
+        let edge = graph_store::upsert_edge(&db, &a, &b, "near", &Properties::default(), false)
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         graph_store::add_provenance(&db, &edge, &graph_store::Source::row("t", "k"))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));

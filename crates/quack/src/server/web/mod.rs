@@ -59,7 +59,8 @@ use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, store as graph_store,
+    ExtractSource, GraphOptions, GraphResult, GraphStatus, Origin, extract, resolve,
+    store as graph_store,
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
@@ -2135,12 +2136,18 @@ impl GraphResultView {
                 .provenance
                 .iter()
                 .filter(|p| p.subject_id == subject)
-                .map(|p| match (&p.table_name, &p.document_id) {
-                    (Some(table), _) => {
-                        format!("{table} row {}", p.row_key.as_deref().unwrap_or("?"))
-                    }
-                    (None, Some(document)) => format!("document {}", short(document)),
-                    (None, None) => String::from("unknown"),
+                .map(|p| match &p.origin {
+                    Origin::Row {
+                        table_name,
+                        row_key,
+                    } => format!("{table_name} row {row_key}"),
+                    Origin::Chunk {
+                        document_id: Some(document),
+                        ..
+                    } => format!("document {}", short(document)),
+                    Origin::Chunk {
+                        document_id: None, ..
+                    } => String::from("unknown"),
                 })
                 .collect();
             items.sort();
@@ -2162,14 +2169,12 @@ impl GraphResultView {
                 label: n.label.clone(),
                 class_id: n.class_id.clone(),
                 provisional: n.provisional,
-                properties: match &n.properties {
-                    serde_json::Value::Object(map) if !map.is_empty() => map
-                        .iter()
-                        .map(|(k, v)| format!("{k}: {}", JsonText(v)))
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                    _ => String::new(),
-                },
+                properties: n
+                    .properties
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {}", JsonText(v)))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
                 sources: sources_of(&n.id),
             })
             .collect();

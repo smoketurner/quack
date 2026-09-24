@@ -45,7 +45,6 @@ use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
 use quack_core::error::Result as CoreResult;
 use quack_core::graph::query::{GraphQuery, PathQuery};
-use quack_core::graph::traverse;
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
 /// server's access log and the workspace detail table for HTTP.
@@ -627,7 +626,7 @@ impl McpServer {
             .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
             .await?;
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
-        out.content = vec![ContentBlock::text(traverse::render_tree(&result))];
+        out.content = vec![ContentBlock::text(result.to_string())];
         Ok(out)
     }
 
@@ -670,7 +669,7 @@ impl McpServer {
             )));
         }
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
-        out.content = vec![ContentBlock::text(traverse::render_tree(&result))];
+        out.content = vec![ContentBlock::text(result.to_string())];
         Ok(out)
     }
 
