@@ -6,6 +6,7 @@ pub(crate) mod auth;
 mod error;
 mod mcp_http;
 mod queue;
+mod run;
 pub(crate) mod state;
 #[cfg(test)]
 mod tests;

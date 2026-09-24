@@ -20,7 +20,9 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState, with_db};
+use crate::server::auth::{Access, Credential, Identity};
 use crate::server::queue::MAX_WAITING_UPLOADS;
+use crate::server::run::{BackgroundRun, RunKind, RunReport};
 use quack_core::jobs::LaneKey;
 use quack_core::llm::CancellationToken;
 use quack_core::okf::{Bundle, BundleFile};
@@ -3903,4 +3905,133 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         "{}",
         location(&headers)
     );
+}
+
+/// What the stand-in work reports when it succeeds.
+struct Done;
+
+impl RunReport for Done {
+    fn detail(&self) -> serde_json::Value {
+        serde_json::json!({ "summary": "all of it" })
+    }
+
+    fn message(&self) -> String {
+        String::from("done")
+    }
+}
+
+/// Every background run writes its start row and exactly one closing row
+/// under the same run id: allowed with the report's detail, an error with
+/// the work's message, or an error saying it was cancelled before it
+/// started. Three runs share one serial lane; the first holds it until
+/// released, so the third is still queued when it is cancelled.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_runs_audit_their_start_and_end_under_one_id() {
+    let h = harness(true).await;
+    let owner = h.user("owner", false).await;
+    let ws = h.workspace("runs", &owner).await;
+    let workspace = h
+        .app
+        .control
+        .get_workspace(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("the workspace was just created"));
+    let access = Access {
+        identity: Identity {
+            user_id: owner.clone(),
+            username: String::from("owner"),
+            is_admin: false,
+            credential: Credential::Local,
+            client_addr: None,
+            request_id: None,
+            via_mcp: false,
+        },
+        workspace,
+        role: Some(Role::Owner),
+    };
+    let start = |detail: &'static str| {
+        let (app, access) = (Arc::clone(&h.app), access.clone());
+        async move {
+            BackgroundRun::start(
+                &app,
+                &access,
+                RunKind::Graph,
+                serde_json::json!({ "step": detail }),
+            )
+            .await
+            .unwrap_or_else(|e| fail(&e.message))
+        }
+    };
+
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let holder = start("holds the lane").await;
+    let holder_id = holder.id().to_owned();
+    let first = holder.submit(move |_| async move {
+        drop(released.await);
+        Ok(Done)
+    });
+    let failing = start("fails").await;
+    let failing_id = failing.id().to_owned();
+    let second = failing.submit(|_| async { Err::<Done, _>(String::from("the model went away")) });
+    let queued = start("is cancelled").await;
+    let queued_id = queued.id().to_owned();
+    let third = queued.submit(|_| async { Ok(Done) });
+    assert!(h.app.jobs.cancel(third), "the third run is still queued");
+    assert!(
+        release.send(()).is_ok(),
+        "the first run is waiting for the release"
+    );
+    for job in [first, second, third] {
+        let ended =
+            tokio::time::timeout(std::time::Duration::from_secs(10), h.app.jobs.wait(job)).await;
+        assert!(ended.is_ok_and(|info| info.is_some()), "{job:?} ended");
+    }
+
+    // The closing row of a cancelled run is written after the job ends.
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        rows = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                ..AuditFilter::default()
+            })
+            .await
+            .into_iter()
+            .filter(|r| r.resource_type.as_deref() == Some("graph_run"))
+            .collect();
+        if rows.len() == 6 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let outcomes = |run: &str| -> Vec<Outcome> {
+        let mut found: Vec<Outcome> = rows
+            .iter()
+            .filter(|r| r.resource_id.as_deref() == Some(run))
+            .map(|r| r.outcome)
+            .collect();
+        found.sort_by_key(|o| o.as_str());
+        found
+    };
+    assert_eq!(outcomes(&holder_id), [Outcome::Allowed, Outcome::Allowed]);
+    assert_eq!(outcomes(&failing_id), [Outcome::Allowed, Outcome::Error]);
+    assert_eq!(outcomes(&queued_id), [Outcome::Allowed, Outcome::Error]);
+    assert!(rows.iter().all(|r| r.action == "graph_extract"));
+
+    let details = h
+        .app
+        .read(&ws, |db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let closing = |needle: &str| {
+        details.iter().any(|d| {
+            d.detail.as_ref().is_some_and(|v| {
+                v["finished"] == serde_json::json!(true) && v.to_string().contains(needle)
+            })
+        })
+    };
+    assert!(closing("all of it"), "{details:?}");
+    assert!(closing("the model went away"), "{details:?}");
+    assert!(closing("cancelled before it started"), "{details:?}");
 }

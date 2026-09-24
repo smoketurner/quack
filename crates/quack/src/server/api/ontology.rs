@@ -9,12 +9,10 @@ use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
-use super::graph::audit_cancelled;
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::queue::when_cancelled_unstarted;
+use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
-use quack_core::jobs::{JobKind, JobResult, JobSpec, Lane, LaneKey};
 use quack_core::llm;
 use quack_core::ontology::{Ontology, candidates, documents, store};
 use quack_core::progress::ChunkDone;
@@ -414,28 +412,19 @@ pub(crate) async fn start_document_run(
     if chunks.is_empty() {
         return Err(ApiError::bad_request("no ready documents to sample"));
     }
-    let run = uuid::Uuid::now_v7().to_string();
-    access
-        .audit(
-            app,
-            AuditAction::Propose,
-            Some(ResourceKind::InductionRun.id(&run)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "documents": true, "cost": cost })),
-        )
-        .await?;
     let db = app.workspace_db(id).await?;
-    let spec = JobSpec::new(JobKind::Ontology, "ontology document pass")
-        .workspace(id)
-        .owner(Some(access.identity.user_id.clone()))
-        .lane(Lane::serial(&LaneKey::Ontology(id.to_owned())));
-    let (cancel_app, cancel_access, cancel_run) =
-        (std::sync::Arc::clone(app), access.clone(), run.clone());
-    let jobs = app.jobs.clone();
-    let app = std::sync::Arc::clone(app);
-    let access = access.clone();
-    let run_id = run.clone();
-    let job = jobs.submit(spec, move |ctx| async move {
+    let run = BackgroundRun::start(
+        app,
+        access,
+        RunKind::Ontology,
+        serde_json::json!({ "documents": true, "cost": cost }),
+    )
+    .await?;
+    let run_id = run.id().to_owned();
+    let concurrency = app.config.analysis.extraction_concurrency;
+    let progress_run = run_id.clone();
+    let job = run.submit(move |ctx| async move {
+        let run_id = progress_run;
         let progress = |done: ChunkDone| {
             ctx.progress(done.done, done.total);
             tracing::info!(
@@ -452,11 +441,11 @@ pub(crate) async fn start_document_run(
             current.as_ref(),
             &options,
             embeddings.as_ref(),
-            app.config.analysis.extraction_concurrency,
+            concurrency,
             &progress,
         )
         .await;
-        let result = match outcome {
+        match outcome {
             Ok((found, summary)) => with_db(db, move |db| {
                 candidates::store_run(db, &found)?;
                 Ok(summary)
@@ -464,62 +453,9 @@ pub(crate) async fn start_document_run(
             .await
             .map_err(|e| e.message),
             Err(e) => Err(e.to_string()),
-        };
-        finish_document_run(&app, &access, &run_id, result).await
-    });
-    when_cancelled_unstarted(&jobs, job, move || async move {
-        audit_cancelled(
-            &cancel_app,
-            &cancel_access,
-            AuditAction::Propose,
-            ResourceKind::InductionRun,
-            &cancel_run,
-        )
-        .await;
+        }
     });
     Ok(Json(
-        serde_json::json!({ "run": run, "cost": cost, "job": job, "status": "running" }),
+        serde_json::json!({ "run": run_id, "cost": cost, "job": job, "status": "running" }),
     ))
-}
-
-/// Audit the end of a document pass under its run id and turn its result
-/// into the job's outcome.
-async fn finish_document_run(
-    app: &App,
-    access: &Access,
-    run_id: &str,
-    result: Result<documents::RunSummary, String>,
-) -> JobResult {
-    let (outcome, detail) = match &result {
-        Ok(summary) => (
-            Outcome::Allowed,
-            serde_json::json!({ "finished": true, "summary": summary }),
-        ),
-        Err(e) => (
-            Outcome::Error,
-            serde_json::json!({ "finished": true, "error": e }),
-        ),
-    };
-    if let Err(e) = access
-        .audit(
-            app,
-            AuditAction::Propose,
-            Some(ResourceKind::InductionRun.id(run_id)),
-            outcome,
-            Some(detail),
-        )
-        .await
-    {
-        tracing::error!(error = %e.message, "audit write failed after the document pass");
-    }
-    match result {
-        Ok(summary) => Ok(format!(
-            "{} candidates from {} chunks",
-            summary.candidates, summary.sampled_chunks
-        )),
-        Err(e) => {
-            tracing::warn!(run = %run_id, error = %e, "document induction failed");
-            Err(e)
-        }
-    }
 }
