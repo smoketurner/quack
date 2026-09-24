@@ -26,7 +26,7 @@ use crate::server::state::{App, ExtractionSlot, with_db};
 use quack_core::analysis::tools::SharedDb;
 use quack_core::jobs::JobId;
 use quack_core::ontology::{Ontology, OntologyVersion};
-use quack_core::progress::ChunkDone;
+use quack_core::progress::{ChunkDone, RunControl};
 
 #[derive(Deserialize, Default)]
 pub(crate) struct SearchQuery {
@@ -361,6 +361,11 @@ impl DocumentJob {
                     "graph extraction progress"
                 );
             };
+            let cancel = ctx.cancel_token();
+            let control = RunControl {
+                progress: &progress,
+                cancel: Some(&cancel),
+            };
             let outcome = extract::run(
                 &db,
                 chunks,
@@ -368,7 +373,7 @@ impl DocumentJob {
                 &ontology,
                 provisional,
                 app.config.analysis.extraction_concurrency,
-                &progress,
+                control,
             )
             .await;
             let result = match outcome {

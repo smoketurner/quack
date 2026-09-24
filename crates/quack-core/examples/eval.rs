@@ -37,6 +37,7 @@ use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::ontology::store::{self as ontology_store, Revision};
+use quack_core::progress::RunControl;
 use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, HybridLimits, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -782,7 +783,7 @@ async fn evaluate_graph(
         &ontology,
         false,
         4,
-        &|_| {},
+        RunControl::unobserved(),
     )
     .await?;
 

@@ -7,11 +7,11 @@ pub mod xlsx;
 use std::time::{Duration, Instant};
 
 use rig::embeddings::EmbeddingModel;
-use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
+use crate::progress::{ChunkDone, RunControl};
 use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
     DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument, WorkspaceDb, quote_ident,
@@ -62,8 +62,9 @@ pub struct NewFile<'a> {
     pub source: DocumentSource,
     pub title: Option<&'a str>,
     pub ingested_by: Option<&'a str>,
-    /// Stops the ingest between steps and mid-embedding when cancelled.
-    pub cancel: Option<&'a CancellationToken>,
+    /// Stops the ingest between steps and mid-embedding when cancelled, and
+    /// hears how many chunks are embedded.
+    pub control: RunControl<'a>,
 }
 
 impl<'a> NewFile<'a> {
@@ -76,7 +77,7 @@ impl<'a> NewFile<'a> {
             source: DocumentSource::Path,
             title: None,
             ingested_by: None,
-            cancel: None,
+            control: RunControl::unobserved(),
         }
     }
 
@@ -98,42 +99,11 @@ impl<'a> NewFile<'a> {
         self
     }
 
-    /// Stop when `cancel` is cancelled (a job's token).
+    /// Report to and stop with `control` (a job's).
     #[must_use]
-    pub fn cancel(mut self, cancel: Option<&'a CancellationToken>) -> Self {
-        self.cancel = cancel;
+    pub fn control(mut self, control: RunControl<'a>) -> Self {
+        self.control = control;
         self
-    }
-}
-
-/// Run `work` unless `cancel` fires first, in which case it is dropped
-/// (an embedding request in flight is abandoned) and the answer is
-/// [`Error::Cancelled`].
-///
-/// # Errors
-///
-/// `work`'s error, or [`Error::Cancelled`].
-pub async fn or_cancelled<T>(
-    cancel: Option<&CancellationToken>,
-    work: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    match cancel {
-        None => work.await,
-        Some(token) => tokio::select! {
-            biased;
-            () = token.cancelled() => Err(Error::Cancelled),
-            result = work => result,
-        },
-    }
-}
-
-/// [`Error::Cancelled`] when `cancel` has fired, for the checks between
-/// steps.
-fn check_cancel(cancel: Option<&CancellationToken>) -> Result<()> {
-    if cancel.is_some_and(CancellationToken::is_cancelled) {
-        Err(Error::Cancelled)
-    } else {
-        Ok(())
     }
 }
 
@@ -174,7 +144,7 @@ pub async fn ingest_file<M: EmbeddingModel>(
         file.filename,
         file.data,
         embedder,
-        file.cancel,
+        file.control,
     )
     .await?;
     Ok(IngestOutcome::Ingested(result))
@@ -291,7 +261,7 @@ fn register_pending(
 
 /// Parse, store, and embed a registered document, moving its status from
 /// `processing` to `ready`, or to `error` with the message when it fails
-/// (`cancelled` when `cancel` fired: the chunks stored so far are
+/// (`cancelled` when `control` was cancelled: the chunks stored so far are
 /// discarded, as for any failure).
 ///
 /// # Errors
@@ -299,7 +269,7 @@ fn register_pending(
 /// Returns the failure after recording it on the document row.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the document's identity, its bytes, the model, and the cancel token"
+    reason = "the document's identity, its bytes, the model, and the run control"
 )]
 pub async fn process_document<M: EmbeddingModel>(
     config: &Config,
@@ -309,12 +279,12 @@ pub async fn process_document<M: EmbeddingModel>(
     filename: &str,
     data: &[u8],
     embedder: Option<&Embedder<M>>,
-    cancel: Option<&CancellationToken>,
+    control: RunControl<'_>,
 ) -> Result<IngestResult> {
     let id = doc_id.to_owned();
     db.run(move |db| db.update_document_status(&id, DocumentStatus::Processing))
         .await?;
-    let outcome = match check_cancel(cancel) {
+    let outcome = match control.check() {
         Ok(()) => {
             process_inner(
                 config,
@@ -324,7 +294,7 @@ pub async fn process_document<M: EmbeddingModel>(
                 filename,
                 data,
                 embedder,
-                cancel,
+                control,
             )
             .await
         }
@@ -365,7 +335,7 @@ async fn process_inner<M: EmbeddingModel>(
     filename: &str,
     data: &[u8],
     embedder: Option<&Embedder<M>>,
-    cancel: Option<&CancellationToken>,
+    control: RunControl<'_>,
 ) -> Result<IngestResult> {
     let file_type = parser::detect_file_type(filename);
     match file_type {
@@ -438,7 +408,7 @@ async fn process_inner<M: EmbeddingModel>(
                     "ingested with unreadable pages skipped"
                 );
             }
-            check_cancel(cancel)?;
+            control.check()?;
             let (chunk_count, embedding_time) = embed_and_store(
                 db,
                 doc_id,
@@ -447,7 +417,7 @@ async fn process_inner<M: EmbeddingModel>(
                 EmbedPlan {
                     batch_size: config.ingestion.embedding_batch_size,
                     concurrency: config.ingestion.embedding_concurrency,
-                    cancel,
+                    control,
                 },
             )
             .await?;
@@ -714,19 +684,110 @@ fn ingest_workbook(
     Ok(tables)
 }
 
+/// How `embed_and_store` sends its batches.
+struct EmbedPlan<'a> {
+    batch_size: u32,
+    concurrency: u32,
+    /// Checked while each batch is in flight (a cancel drops the
+    /// requests), and told as each batch is stored.
+    control: RunControl<'a>,
+}
+
+impl EmbedPlan<'_> {
+    /// Embed the stored chunks `chunk_ids` (`chunks`, in order) and write
+    /// each batch's vectors as it returns; how long it took.
+    async fn embed<M: EmbeddingModel>(
+        self,
+        db: &Writer,
+        document_id: &str,
+        chunk_ids: &[String],
+        chunks: &[chunker::Chunk],
+        embedder: &Embedder<M>,
+    ) -> Result<Duration> {
+        use futures::StreamExt as _;
+
+        let Self {
+            batch_size,
+            concurrency,
+            control,
+        } = self;
+        let stored = u32::try_from(chunk_ids.len()).unwrap_or(u32::MAX);
+        let started = Instant::now();
+        let batch_size = usize::try_from(batch_size.max(1))
+            .map_err(|_| Error::Ingestion("embedding_batch_size overflow".into()))?;
+        let concurrency = usize::try_from(concurrency.max(1)).unwrap_or(1);
+        // Batches are collected before the futures are built: a closure that
+        // takes the slice by reference would tie each future's type to that
+        // borrow and fail the `Send` check the server's handlers need.
+        let batches_input: Vec<(Vec<String>, Vec<Input>)> = chunk_ids
+            .chunks(batch_size)
+            .zip(chunks.chunks(batch_size))
+            .map(|(ids, slice)| {
+                (
+                    ids.to_vec(),
+                    slice.iter().map(chunker::Chunk::embedding_input).collect(),
+                )
+            })
+            .collect();
+        let calls = batches_input.into_iter().map(|(ids, inputs)| async move {
+            let vectors = embedder.embed(&inputs).await?;
+            Ok::<_, Error>((ids, vectors))
+        });
+        let mut batches: u32 = 0;
+        let mut embedded: u32 = 0;
+        let mut batch_started = Instant::now();
+        let mut stream = futures::stream::iter(calls).buffered(concurrency);
+        while let Some(next) = control
+            .or_cancelled(async { Ok(stream.next().await) })
+            .await?
+        {
+            let (ids, vectors) = next?;
+            batches = batches.saturating_add(1);
+            embedded = embedded.saturating_add(u32::try_from(ids.len()).unwrap_or(u32::MAX));
+            db.run(move |db| {
+                db.write_transaction(|db| {
+                    for (chunk_id, vector) in ids.iter().zip(&vectors) {
+                        db.set_chunk_embedding(chunk_id, vector)?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+            (control.progress)(ChunkDone {
+                done: embedded,
+                total: stored,
+                failed: 0,
+                took: batch_started.elapsed(),
+                elapsed: started.elapsed(),
+            });
+            batch_started = Instant::now();
+        }
+
+        let elapsed = started.elapsed();
+        let seconds = elapsed.as_secs_f64();
+        let per_second = if seconds > 0.0 {
+            f64::from(stored) / seconds
+        } else {
+            0.0
+        };
+        tracing::info!(
+            document_id = %document_id,
+            chunk_count = %stored,
+            batches,
+            concurrency,
+            seconds = %format!("{seconds:.1}"),
+            chunks_per_second = %format!("{per_second:.1}"),
+            "embedded chunks"
+        );
+        Ok(elapsed)
+    }
+}
+
 /// Store `chunks`, then embed them `batch_size` at a time
 /// (`[ingestion].embedding_batch_size`, at least one per request) with up
 /// to `concurrency` requests in flight (`[ingestion].embedding_concurrency`),
 /// each batch's vectors written as one transaction as soon as it returns.
 /// Returns the chunk count and, when a model ran, how long embedding took.
-/// How `embed_and_store` sends its batches.
-struct EmbedPlan<'a> {
-    batch_size: u32,
-    concurrency: u32,
-    /// Checked while each batch is in flight: a cancel drops the requests.
-    cancel: Option<&'a CancellationToken>,
-}
-
 async fn embed_and_store<M: EmbeddingModel>(
     db: &Writer,
     document_id: &str,
@@ -734,14 +795,6 @@ async fn embed_and_store<M: EmbeddingModel>(
     embedder: Option<&Embedder<M>>,
     plan: EmbedPlan<'_>,
 ) -> Result<(u32, Option<Duration>)> {
-    use futures::StreamExt as _;
-
-    let EmbedPlan {
-        batch_size,
-        concurrency,
-        cancel,
-    } = plan;
-
     let (owned, id) = (chunks.to_vec(), document_id.to_owned());
     let chunk_ids = db
         .run(move |db| {
@@ -787,59 +840,9 @@ async fn embed_and_store<M: EmbeddingModel>(
         return Ok((stored, None));
     }
 
-    let started = Instant::now();
-    let batch_size = usize::try_from(batch_size.max(1))
-        .map_err(|_| Error::Ingestion("embedding_batch_size overflow".into()))?;
-    let concurrency = usize::try_from(concurrency.max(1)).unwrap_or(1);
-    // Batches are collected before the futures are built: a closure that
-    // takes the slice by reference would tie each future's type to that
-    // borrow and fail the `Send` check the server's handlers need.
-    let batches_input: Vec<(Vec<String>, Vec<Input>)> = chunk_ids
-        .chunks(batch_size)
-        .zip(chunks.chunks(batch_size))
-        .map(|(ids, slice)| {
-            (
-                ids.to_vec(),
-                slice.iter().map(chunker::Chunk::embedding_input).collect(),
-            )
-        })
-        .collect();
-    let calls = batches_input.into_iter().map(|(ids, inputs)| async move {
-        let vectors = embedder.embed(&inputs).await?;
-        Ok::<_, Error>((ids, vectors))
-    });
-    let mut batches: u32 = 0;
-    let mut stream = futures::stream::iter(calls).buffered(concurrency);
-    while let Some(next) = or_cancelled(cancel, async { Ok(stream.next().await) }).await? {
-        let (ids, vectors) = next?;
-        batches = batches.saturating_add(1);
-        db.run(move |db| {
-            db.write_transaction(|db| {
-                for (chunk_id, vector) in ids.iter().zip(&vectors) {
-                    db.set_chunk_embedding(chunk_id, vector)?;
-                }
-                Ok(())
-            })
-        })
+    let elapsed = plan
+        .embed(db, document_id, &chunk_ids, chunks, embedder)
         .await?;
-    }
-
-    let elapsed = started.elapsed();
-    let seconds = elapsed.as_secs_f64();
-    let per_second = if seconds > 0.0 {
-        f64::from(stored) / seconds
-    } else {
-        0.0
-    };
-    tracing::info!(
-        document_id = %document_id,
-        chunk_count = %stored,
-        batches,
-        concurrency,
-        seconds = %format!("{seconds:.1}"),
-        chunks_per_second = %format!("{per_second:.1}"),
-        "embedded chunks"
-    );
     Ok((stored, Some(elapsed)))
 }
 

@@ -12,7 +12,7 @@ use super::{Drift, NormalizedLabel, Properties};
 use crate::error::{Error, Result};
 use crate::extraction::{Extract, Extracted, Passage, RunProgress, evenly_spaced, extractions};
 use crate::ontology::{self, Ontology};
-use crate::progress::Progress;
+use crate::progress::RunControl;
 use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
 use crate::storage::writer::Writer;
 
@@ -246,17 +246,19 @@ pub async fn run(
     ontology: &Ontology,
     provisional: bool,
     concurrency: u32,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<RunSummary> {
     let version = ontology.saved_version()?;
     let mut summary = RunSummary::default();
-    let mut run = RunProgress::new(chunks.len(), progress);
+    let mut run = RunProgress::new(chunks.len(), control.progress);
     let mut calls = extractions(extractor, &chunks, concurrency);
     while let Some(Extracted {
         passage: chunk,
         outcome,
         took,
-    }) = calls.next().await
+    }) = control
+        .or_cancelled(async { Ok(calls.next().await) })
+        .await?
     {
         let extraction = match outcome {
             Ok(extraction) => extraction,

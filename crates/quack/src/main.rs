@@ -850,7 +850,10 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
         &ws_db,
         action,
         &mut out,
-        &ontology_cli::chunk_progress,
+        RunControl {
+            progress: &ontology_cli::chunk_progress,
+            cancel: None,
+        },
     )
     .await?;
     Ok(ExitCode::SUCCESS)
@@ -885,7 +888,10 @@ async fn run_ontology(cli: &Cli, action: ontology_cli::OntologyAction) -> Result
         &ws_db,
         action,
         &mut out,
-        &ontology_cli::chunk_progress,
+        RunControl {
+            progress: &ontology_cli::chunk_progress,
+            cancel: None,
+        },
     )
     .await?;
     Ok(ExitCode::SUCCESS)
@@ -919,7 +925,7 @@ async fn run_import(
         request,
         ImportPolicy::owner(),
         embedding_model.as_ref(),
-        None,
+        RunControl::unobserved(),
     )
     .await
     .context("import failed")?;

@@ -19,6 +19,7 @@ use quack_core::graph::{
 };
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
+use quack_core::progress::RunControl;
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -505,9 +506,17 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     // failed chunk is skipped, Kenya merges with the table's Kenya.
     let chunks = extract::chunks(&db, None).unwrap();
     assert_eq!(chunks.len(), 2);
-    let summary = extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})
-        .await
-        .unwrap();
+    let summary = extract::run(
+        &writer,
+        chunks,
+        &Canned,
+        &current,
+        false,
+        2,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
     // Both chunks are on record (the failed one is not), so the next run
     // sends only the failed one again.
     assert_eq!(graph_store::extracted_chunks(&db).unwrap(), 1);
@@ -774,9 +783,17 @@ async fn provenance_maps_between_entities_and_chunks() {
     let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, false).unwrap();
     let chunks = extract::chunks(&db, None).unwrap();
-    extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})
-        .await
-        .unwrap();
+    extract::run(
+        &writer,
+        chunks,
+        &Canned,
+        &current,
+        false,
+        2,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
 
     let orgenics = traverse::resolve_entry(&db, "Orgenics Ltd", None, None).unwrap();
     let ids: Vec<String> = orgenics.iter().map(|n| n.id.clone()).collect();

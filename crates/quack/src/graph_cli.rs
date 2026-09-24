@@ -14,7 +14,7 @@ use quack_core::graph::{
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
-use quack_core::progress::Progress;
+use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
@@ -91,13 +91,13 @@ pub(crate) enum GraphAction {
 ///
 /// Each database step goes to the workspace writer on its own, never
 /// spanning a model call, so the terminal's other work keeps going during
-/// an extraction; `progress` hears about every extracted chunk.
+/// an extraction; `control` hears about every extracted chunk and can stop it.
 pub(crate) async fn run(
     config: &Config,
     db: &Writer,
     action: GraphAction,
     out: &mut impl Write,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<()> {
     match action {
         search @ GraphAction::Search { .. } => run_search(config, db, out, search).await?,
@@ -126,7 +126,7 @@ pub(crate) async fn run(
                     reset,
                     yes,
                 },
-                progress,
+                control,
             )
             .await?;
         }
@@ -277,7 +277,7 @@ async fn run_extract(
     db: &Writer,
     out: &mut impl Write,
     args: ExtractArgs,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<()> {
     let ontology = db
         .run(ontology_store::current)
@@ -336,7 +336,7 @@ async fn run_extract(
                     &ontology,
                     provisional,
                     config.analysis.extraction_concurrency,
-                    progress,
+                    control,
                 )
                 .await?;
                 writeln!(
