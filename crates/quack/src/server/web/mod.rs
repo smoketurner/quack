@@ -46,9 +46,8 @@ use super::api::ontology::DecideRequest;
 use super::api::query::SqlRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
-    documents as docs_api, graph as graph_api, import as import_api, jobs as jobs_api,
-    ontology as ontology_api, query as query_api, sessions as sessions_api,
-    workspaces as workspaces_api,
+    documents as docs_api, graph as graph_api, import as import_api, ontology as ontology_api,
+    query as query_api, sessions as sessions_api, workspaces as workspaces_api,
 };
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
@@ -869,13 +868,14 @@ async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
 }
 
 fn render_jobs(app: &App, access: &Access) -> WebResult<String> {
-    let jobs: Vec<JobView> = jobs_api::visible_jobs(app, access)
+    let jobs: Vec<JobView> = access
+        .visible_jobs(app)
         .into_iter()
         .map(|j| JobView {
             id: j.id.to_string(),
             number: j.number,
             kind: j.kind.to_string(),
-            can_cancel: !j.state.is_finished() && jobs_api::may_cancel(access, &j),
+            can_cancel: !j.state.is_finished() && access.may_cancel(&j),
             label: j.label,
             state: if j.cancel_requested && !j.state.is_finished() {
                 String::from("cancelling")
@@ -929,7 +929,7 @@ async fn job_cancel(
     Path((id, job)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let cancelled = jobs_api::cancel_job(&app, &access, &job).await?;
+    let cancelled = access.cancel_job(&app, &job).await?;
     tracing::debug!(job = %cancelled.id, state = %cancelled.state, "cancel requested from the web");
     Ok(Html(render_jobs(&app, &access)?).into_response())
 }

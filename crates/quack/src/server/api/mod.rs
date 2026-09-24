@@ -9,7 +9,7 @@ pub(crate) mod documents;
 pub(crate) mod embeddings;
 pub(crate) mod graph;
 pub(crate) mod import;
-pub(crate) mod jobs;
+mod jobs;
 pub(crate) mod members;
 pub(crate) mod okf;
 pub(crate) mod ontology;
