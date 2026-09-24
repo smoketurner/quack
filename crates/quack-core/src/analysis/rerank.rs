@@ -167,12 +167,13 @@ impl Reranker for ModelReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{ChunkId, DocumentId};
 
     fn hit(n: u32) -> ChunkSearchResult {
         ChunkSearchResult {
-            id: format!("c{n}"),
+            id: ChunkId::from(format!("c{n}")),
             content: format!("passage {n}"),
-            document_id: String::from("d"),
+            document_id: DocumentId::from("d"),
             chunk_index: n,
             filename: String::from("f.md"),
             heading: None,

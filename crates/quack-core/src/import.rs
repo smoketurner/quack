@@ -22,6 +22,7 @@ use sqlx::{
 use crate::config::Config;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
+use crate::ids::DocumentId;
 use crate::ingestion::parser::{FileType, Load};
 use crate::ingestion::{self, IngestOutcome, NewFile, TableName};
 use crate::progress::RunControl;
@@ -108,7 +109,7 @@ pub struct ImportSummary {
     pub columns: Vec<String>,
     /// The source with any password removed.
     pub source: String,
-    pub document_id: String,
+    pub document_id: DocumentId,
 }
 
 /// The kind of source a URL names.

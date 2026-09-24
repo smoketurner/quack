@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
-use quack_core::ids::{UserId, WorkspaceId};
+use quack_core::ids::{DocumentId, UserId, WorkspaceId};
 use quack_core::ingestion::{NewFile, Processing};
 use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
 use quack_core::llm::Embeddings;
@@ -26,7 +26,7 @@ pub(crate) const MAX_WAITING_UPLOADS: usize = 64;
 pub(crate) const UPLOAD_RETRY_SECONDS: u32 = 30;
 
 pub(crate) struct UploadJob {
-    pub document_id: String,
+    pub document_id: DocumentId,
     pub filename: String,
     pub data: Vec<u8>,
 }
@@ -128,8 +128,8 @@ impl UploadJob {
 
     /// Record `message` as the document's error, so a client polling it
     /// sees `error` rather than `processing` without end.
-    async fn mark_error(db: &SharedDb, document_id: &str, message: &str) {
-        let (id, text) = (document_id.to_owned(), message.to_owned());
+    async fn mark_error(db: &SharedDb, document_id: &DocumentId, message: &str) {
+        let (id, text) = (document_id.clone(), message.to_owned());
         if let Err(mark) = db.run(move |db| db.mark_document_error(&id, &text)).await {
             tracing::error!(error = %mark, document = %document_id, "could not record the upload failure");
         }
@@ -138,8 +138,8 @@ impl UploadJob {
     /// [`Self::mark_error`] for a document the work left `queued` or
     /// `processing`; one it finished (ready, or failed with its own
     /// message) is left alone.
-    async fn mark_unfinished(db: &SharedDb, document_id: &str, message: &str) {
-        let (id, text) = (document_id.to_owned(), message.to_owned());
+    async fn mark_unfinished(db: &SharedDb, document_id: &DocumentId, message: &str) {
+        let (id, text) = (document_id.clone(), message.to_owned());
         let marked = db
             .run(move |db| {
                 let unfinished = db

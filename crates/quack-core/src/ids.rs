@@ -134,6 +134,16 @@ id_type!(
 );
 
 id_type!(
+    /// A document ingested into a workspace.
+    DocumentId
+);
+
+id_type!(
+    /// One chunk of a document's text.
+    ChunkId
+);
+
+id_type!(
     /// An access-audit row, shared with the workspace's `_quack_audit`
     /// detail row for the same event.
     AuditId

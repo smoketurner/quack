@@ -11,6 +11,7 @@ use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::graph::Properties;
 use quack_core::graph::store as graph_store;
 use quack_core::graph::store::NewNode;
+use quack_core::ids::DocumentId;
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
@@ -23,7 +24,7 @@ fn main() {
     db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")
         .unwrap();
     db.insert_document(
-        &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+        &NewDocument::new(&DocumentId::from("d1"), "policy.pdf", "application/pdf", 1)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();

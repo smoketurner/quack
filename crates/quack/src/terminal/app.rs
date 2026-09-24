@@ -2057,7 +2057,7 @@ impl App {
             for doc in docs {
                 let line = format!(
                     "\n  {}  {:<10}  {}  {}",
-                    short_id(&doc.id),
+                    doc.id.short(),
                     doc.status,
                     if doc.pinned { "pinned" } else { "      " },
                     doc.filename
@@ -2079,7 +2079,7 @@ impl App {
             },
             move |app, id| {
                 let done = if pinned { "Pinned" } else { "Unpinned" };
-                app.note(MessageKind::System, format!("{done} {}", short_id(&id)));
+                app.note(MessageKind::System, format!("{done} {}", id.short()));
             },
         );
     }
@@ -2440,9 +2440,6 @@ impl App {
     }
 }
 
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
-}
 #[cfg(test)]
 mod tests {
     use quack_core::storage::writer::Writer;
@@ -2451,6 +2448,7 @@ mod tests {
     use quack_core::analysis::events::ToolStep;
 
     use super::*;
+    use quack_core::ids::{ChunkId, DocumentId};
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -3001,12 +2999,12 @@ mod tests {
         app.db
             .run(|db| {
                 db.insert_document(
-                    &NewDocument::new("d", "a.md", "text/markdown", 1)
+                    &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
                         .with_status(DocumentStatus::Ready),
                 )?;
                 db.insert_chunk(&NewChunk {
-                    id: "c",
-                    document_id: "d",
+                    id: &ChunkId::from("c"),
+                    document_id: &DocumentId::from("d"),
                     chunk_index: 0,
                     content: "levee report",
                     heading: None,

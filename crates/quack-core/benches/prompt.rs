@@ -18,6 +18,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
+use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
@@ -35,7 +36,7 @@ fn workspace() -> WorkspaceDb {
         let doc_id = format!("doc-{d}");
         db.insert_document(
             &NewDocument::new(
-                &doc_id,
+                &DocumentId::from(doc_id.as_str()),
                 &format!("policy-{d}.pdf"),
                 "application/pdf",
                 10_000,
@@ -45,8 +46,8 @@ fn workspace() -> WorkspaceDb {
         .unwrap();
         for c in 0..CHUNKS_PER_DOC {
             db.insert_chunk(&NewChunk {
-                id: &format!("chunk-{d}-{c}"),
-                document_id: &doc_id,
+                id: &ChunkId::from(format!("chunk-{d}-{c}")),
+                document_id: &DocumentId::from(doc_id.as_str()),
                 chunk_index: c as u32,
                 content: "flood exclusion premium coverage claim policy audit",
                 heading: None,

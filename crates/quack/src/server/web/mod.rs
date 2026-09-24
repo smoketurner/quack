@@ -21,7 +21,7 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::citations::Citation;
-use quack_core::ids::{SessionId, UserId, WorkspaceId};
+use quack_core::ids::{DocumentId, SessionId, UserId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
@@ -249,7 +249,7 @@ struct StepView {
 struct CitationView {
     n: u64,
     label: String,
-    document_id: String,
+    document_id: DocumentId,
 }
 
 #[derive(Template)]
@@ -1082,7 +1082,7 @@ async fn enqueue_web(
 async fn pin(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, doc)): Path<(WorkspaceId, String)>,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, true).await?;
@@ -1092,7 +1092,7 @@ async fn pin(
 async fn unpin(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, doc)): Path<(WorkspaceId, String)>,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, false).await?;
@@ -1102,7 +1102,7 @@ async fn unpin(
 async fn delete_doc(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, doc)): Path<(WorkspaceId, String)>,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::delete_document(&app, &access, &doc).await?;
@@ -2128,7 +2128,6 @@ impl GraphPageData {
 impl GraphResultView {
     /// `result` for the inspector: node and edge rows with their sources.
     fn of(title: String, result: &GraphResult) -> Result<Self, ApiError> {
-        let short = |id: &str| -> String { id.chars().take(8).collect() };
         let sources_of = |subject: &str| -> String {
             let mut items: Vec<String> = result
                 .provenance
@@ -2142,7 +2141,7 @@ impl GraphResultView {
                     Origin::Chunk {
                         document_id: Some(document),
                         ..
-                    } => format!("document {}", short(document)),
+                    } => format!("document {}", document.short()),
                     Origin::Chunk {
                         document_id: None, ..
                     } => String::from("unknown"),
@@ -2157,7 +2156,7 @@ impl GraphResultView {
                 .nodes
                 .iter()
                 .find(|n| n.id == id)
-                .map_or_else(|| short(id), |n| n.label.clone())
+                .map_or_else(|| id.get(..8).unwrap_or(id).to_owned(), |n| n.label.clone())
         };
         let nodes = result
             .nodes

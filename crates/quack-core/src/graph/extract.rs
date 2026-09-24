@@ -11,6 +11,7 @@ use super::store::{self, NewNode, Source};
 use super::{Drift, NormalizedLabel, Properties};
 use crate::error::{Error, Result};
 use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, extractions};
+use crate::ids::{ChunkId, DocumentId};
 use crate::ontology::{self, Ontology, OntologyVersion};
 use crate::storage::workspace::{ChunkSearchResult, SamplePool, WorkspaceDb};
 use crate::storage::writer::Writer;
@@ -134,14 +135,14 @@ impl Extraction {
 /// A chunk to extract from.
 #[derive(Debug, Clone)]
 pub struct ChunkText {
-    pub chunk_id: String,
-    pub document_id: String,
+    pub chunk_id: ChunkId,
+    pub document_id: DocumentId,
     pub text: String,
 }
 
 impl Passage for ChunkText {
     fn id(&self) -> &str {
-        &self.chunk_id
+        self.chunk_id.as_str()
     }
 
     fn text(&self) -> &str {
@@ -164,7 +165,7 @@ pub enum ChunkPlan {
     /// Every unextracted chunk, read a page at a time by id.
     All { total: usize },
     /// The sampled chunks, by id.
-    Sample(Vec<String>),
+    Sample(Vec<ChunkId>),
 }
 
 impl ChunkPlan {
@@ -204,13 +205,11 @@ impl ChunkPlan {
         let chunks = match self {
             Self::All { .. } => {
                 let after = cursor.after.take();
-                db.run(move |db| {
-                    db.chunk_page(SamplePool::NotGraphExtracted, after.as_deref(), PAGE)
-                })
-                .await?
+                db.run(move |db| db.chunk_page(SamplePool::NotGraphExtracted, after.as_ref(), PAGE))
+                    .await?
             }
             Self::Sample(ids) => {
-                let page: Vec<String> = ids
+                let page: Vec<ChunkId> = ids
                     .iter()
                     .skip(cursor.consumed)
                     .take(usize::try_from(PAGE).unwrap_or(usize::MAX))
@@ -240,7 +239,7 @@ struct PlanCursor {
     /// Sampled ids taken so far.
     consumed: usize,
     /// The last chunk id read, for the next page of every chunk.
-    after: Option<String>,
+    after: Option<ChunkId>,
 }
 
 /// A chunk as the extractor reads it: its heading above its text.

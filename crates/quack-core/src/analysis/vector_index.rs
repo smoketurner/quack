@@ -68,7 +68,7 @@ where
                     "filename": chunk.filename,
                 });
                 let doc: T = serde_json::from_value(value)?;
-                Ok((chunk.score, chunk.id, doc))
+                Ok((chunk.score, chunk.id.into_string(), doc))
             })
             .collect()
     }
@@ -81,7 +81,7 @@ where
             .search(&req)
             .await?
             .into_iter()
-            .map(|chunk| (chunk.score, chunk.id))
+            .map(|chunk| (chunk.score, chunk.id.into_string()))
             .collect())
     }
 }

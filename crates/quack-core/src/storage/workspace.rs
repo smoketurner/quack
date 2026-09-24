@@ -10,6 +10,7 @@ use crate::embedding::{
 };
 use crate::error::{Error, Record, Result};
 use crate::graph;
+use crate::ids::{ChunkId, DocumentId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{FileType, Load};
 use crate::ontology::store::Acceptance;
@@ -1072,7 +1073,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if a delete fails.
-    pub fn discard_chunks(&self, document_id: &str) -> Result<()> {
+    pub fn discard_chunks(&self, document_id: &DocumentId) -> Result<()> {
         self.conn.execute(
             "DELETE FROM _quack_graph_extracted WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
             duckdb::params![document_id],
@@ -1213,7 +1214,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn set_document_title_if_empty(&self, id: &str, title: &str) -> Result<()> {
+    pub fn set_document_title_if_empty(&self, id: &DocumentId, title: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET title = ? WHERE id = ? AND title IS NULL",
             duckdb::params![title, id],
@@ -1227,7 +1228,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn set_document_tables(&self, id: &str, tables: &[String]) -> Result<()> {
+    pub fn set_document_tables(&self, id: &DocumentId, tables: &[String]) -> Result<()> {
         let json = serde_json::to_string(tables)?;
         self.conn.execute(
             "UPDATE _quack_documents SET tables = ? WHERE id = ?",
@@ -1241,7 +1242,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn set_document_chunk_count(&self, id: &str, count: u32) -> Result<()> {
+    pub fn set_document_chunk_count(&self, id: &DocumentId, count: u32) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET chunk_count = ? WHERE id = ?",
             duckdb::params![count, id],
@@ -1254,7 +1255,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn update_document_status(&self, id: &str, status: DocumentStatus) -> Result<()> {
+    pub fn update_document_status(&self, id: &DocumentId, status: DocumentStatus) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET status = ?, error_message = NULL WHERE id = ?",
             duckdb::params![status, id],
@@ -1267,7 +1268,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn mark_document_error(&self, id: &str, message: &str) -> Result<()> {
+    pub fn mark_document_error(&self, id: &DocumentId, message: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE _quack_documents SET status = ?, error_message = ? WHERE id = ?",
             duckdb::params![DocumentStatus::Error, message, id],
@@ -1280,7 +1281,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn document(&self, id: &str) -> Result<Option<DocumentInfo>> {
+    pub fn document(&self, id: &DocumentId) -> Result<Option<DocumentInfo>> {
         let sql = format!("{DOCUMENT_SELECT} WHERE id = ?");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![id])?;
@@ -1300,7 +1301,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if any delete fails.
-    pub fn delete_document(&self, id: &str) -> Result<bool> {
+    pub fn delete_document(&self, id: &DocumentId) -> Result<bool> {
         let Some(doc) = self.document(id)? else {
             return Ok(false);
         };
@@ -1349,7 +1350,7 @@ impl WorkspaceDb {
     /// the nodes and edges left without any provenance at all (an edge
     /// whose endpoint goes falls with it, as `graph::store::delete_nodes`
     /// does).
-    fn forget_graph_provenance(&self, document_id: &str, tables: &[String]) -> Result<()> {
+    fn forget_graph_provenance(&self, document_id: &DocumentId, tables: &[String]) -> Result<()> {
         let table_list = sql_text_list(tables);
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT subject_id FROM _quack_provenance \
@@ -1391,7 +1392,7 @@ impl WorkspaceDb {
              OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = drop_node_id);",
         )?;
         tracing::info!(
-            document_id,
+            document_id = %document_id,
             orphan_nodes,
             orphan_edges,
             "removed graph rows that only the deleted document supported"
@@ -1477,7 +1478,7 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    fn insert_terms(&self, chunk_id: &str, terms: &TermFrequencies) -> Result<()> {
+    fn insert_terms(&self, chunk_id: &ChunkId, terms: &TermFrequencies) -> Result<()> {
         if terms.0.is_empty() {
             return Ok(());
         }
@@ -1513,7 +1514,7 @@ impl WorkspaceDb {
         )?;
         // A page at a time by id, so a large workspace never holds every
         // chunk's text at once.
-        let mut after: Option<String> = None;
+        let mut after: Option<ChunkId> = None;
         loop {
             let page = stmt
                 .query_map(duckdb::params![after, after, i64::from(page)], |row| {
@@ -1541,8 +1542,8 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the vector does not fit the columns or the
     /// update fails.
-    pub fn set_chunk_embedding(&self, chunk_id: &str, embedding: &Vector) -> Result<()> {
-        self.set_vector(VectorTable::Chunks, chunk_id, embedding)
+    pub fn set_chunk_embedding(&self, chunk_id: &ChunkId, embedding: &Vector) -> Result<()> {
+        self.set_vector(VectorTable::Chunks, chunk_id.as_str(), embedding)
     }
 
     /// Store a graph node's label vector, made under the current profile.
@@ -1846,7 +1847,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn sample_chunk_ids(&self, pool: SamplePool, limit: u32) -> Result<Vec<String>> {
+    pub fn sample_chunk_ids(&self, pool: SamplePool, limit: u32) -> Result<Vec<ChunkId>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1874,7 +1875,7 @@ impl WorkspaceDb {
         let mut stmt = self.conn.prepare(&sql)?;
         let ids = stmt.query_map(
             duckdb::params![DocumentStatus::Ready, i64::from(limit), i64::from(limit)],
-            |row| row.get::<_, String>(0),
+            |row| row.get::<_, ChunkId>(0),
         )?;
         Ok(ids.collect::<duckdb::Result<_>>()?)
     }
@@ -1889,7 +1890,7 @@ impl WorkspaceDb {
     pub fn chunk_page(
         &self,
         pool: SamplePool,
-        after: Option<&str>,
+        after: Option<&ChunkId>,
         size: u32,
     ) -> Result<Vec<ChunkSearchResult>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -1912,7 +1913,7 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn chunks_by_ids(&self, ids: &[String]) -> Result<Vec<ChunkSearchResult>> {
+    pub fn chunks_by_ids(&self, ids: &[ChunkId]) -> Result<Vec<ChunkSearchResult>> {
         let mut out = Vec::with_capacity(ids.len());
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
@@ -1933,13 +1934,13 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the document does not exist or the update fails.
-    pub fn set_document_pinned(&self, document_id: &str, pinned: bool) -> Result<()> {
+    pub fn set_document_pinned(&self, document_id: &DocumentId, pinned: bool) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE _quack_documents SET pinned = ? WHERE id = ?",
             duckdb::params![pinned, document_id],
         )?;
         if changed == 0 {
-            return Err(Record::Document.missing(document_id));
+            return Err(Record::Document.missing(document_id.as_str()));
         }
         Ok(())
     }
@@ -2293,7 +2294,7 @@ text_enum_sql!(DocumentStatus);
 /// Document metadata row.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DocumentInfo {
-    pub id: String,
+    pub id: DocumentId,
     pub filename: String,
     /// Given at upload or parsed from the content (first heading, HTML
     /// title); `None` when neither exists.
@@ -2375,7 +2376,7 @@ impl DocumentSource {
 /// A document row to insert.
 #[derive(Debug, Clone, Copy)]
 pub struct NewDocument<'a> {
-    pub id: &'a str,
+    pub id: &'a DocumentId,
     pub filename: &'a str,
     pub title: Option<&'a str>,
     pub mime_type: &'a str,
@@ -2390,7 +2391,12 @@ impl<'a> NewDocument<'a> {
     /// A `queued` upload with no title, hash, or uploader; the fields are
     /// public for the rest.
     #[must_use]
-    pub fn new(id: &'a str, filename: &'a str, mime_type: &'a str, size_bytes: usize) -> Self {
+    pub fn new(
+        id: &'a DocumentId,
+        filename: &'a str,
+        mime_type: &'a str,
+        size_bytes: usize,
+    ) -> Self {
         Self {
             id,
             filename,
@@ -2444,7 +2450,7 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
 /// A chunk whose vector is missing or stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingChunk {
-    pub id: String,
+    pub id: ChunkId,
     pub heading: Option<String>,
     pub content: String,
 }
@@ -2477,8 +2483,8 @@ impl TryFrom<&duckdb::Row<'_>> for PendingChunk {
 /// A chunk to store.
 #[derive(Debug, Clone, Copy)]
 pub struct NewChunk<'a> {
-    pub id: &'a str,
-    pub document_id: &'a str,
+    pub id: &'a ChunkId,
+    pub document_id: &'a DocumentId,
     pub chunk_index: u32,
     pub content: &'a str,
     pub heading: Option<&'a str>,
@@ -2489,9 +2495,9 @@ pub struct NewChunk<'a> {
 /// A chunk returned from retrieval, with what a citation needs.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChunkSearchResult {
-    pub id: String,
+    pub id: ChunkId,
     pub content: String,
-    pub document_id: String,
+    pub document_id: DocumentId,
     pub chunk_index: u32,
     pub filename: String,
     pub heading: Option<String>,
@@ -2692,11 +2698,11 @@ impl SamplePool {
 pub struct ChunkScope {
     /// Empty means every document: `ChunkScope::for_documents` refuses an id
     /// that matches nothing, so an empty list never means "none".
-    documents: Vec<String>,
+    documents: Vec<DocumentId>,
     /// `None` means no chunk restriction at all; `Some(ids)` means exactly
     /// those chunks, and `Some(empty)` means none — an entity whose chunks
     /// came back empty must return no rows, not the whole workspace.
-    chunks: Option<Vec<String>>,
+    chunks: Option<Vec<ChunkId>>,
 }
 
 impl ChunkScope {
@@ -2708,7 +2714,7 @@ impl ChunkScope {
 
     /// Only chunks belonging to these documents.
     #[must_use]
-    pub fn documents<I: IntoIterator<Item = String>>(ids: I) -> Self {
+    pub fn documents<I: IntoIterator<Item = DocumentId>>(ids: I) -> Self {
         Self {
             documents: ids.into_iter().collect(),
             chunks: None,
@@ -2733,11 +2739,11 @@ impl ChunkScope {
             let want = want.trim();
             let found = documents
                 .iter()
-                .find(|d| d.id == want || d.filename == want)
+                .find(|d| d.id.as_str() == want || d.filename == want)
                 .or_else(|| {
                     documents
                         .iter()
-                        .find(|d| !want.is_empty() && d.id.starts_with(want))
+                        .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
                 });
             let Some(d) = found else {
                 let known: Vec<String> = documents
@@ -2757,7 +2763,7 @@ impl ChunkScope {
 
     /// Narrow further to these chunk ids, however few.
     #[must_use]
-    pub fn and_chunks<I: IntoIterator<Item = String>>(mut self, ids: I) -> Self {
+    pub fn and_chunks<I: IntoIterator<Item = ChunkId>>(mut self, ids: I) -> Self {
         self.chunks = Some(ids.into_iter().collect());
         self
     }
@@ -3390,15 +3396,25 @@ mod tests {
             db.execute_statement(sql)
                 .unwrap_or_else(|e| fail(&e.to_string()));
         }
-        db.insert_document(&NewDocument::new("d1", "sales.csv", "text/csv", 1))
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from("d1"),
+            "sales.csv",
+            "text/csv",
+            1,
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let doc = db
+            .document(&DocumentId::from("d1"))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let doc = db.document("d1").unwrap_or_else(|e| fail(&e.to_string()));
         assert!(doc.as_ref().is_some_and(|d| d.tables.is_none()));
         assert_eq!(
             doc.map(|d| d.fallback_tables()),
             Some(vec![String::from("sales")])
         );
-        assert!(db.delete_document("d1").is_ok_and(|existed| existed));
+        assert!(
+            db.delete_document(&DocumentId::from("d1"))
+                .is_ok_and(|existed| existed)
+        );
         assert!(db.table_exists("sales").is_ok_and(|exists| !exists));
         assert!(db.table_exists("sales_notes").is_ok_and(|exists| exists));
 
@@ -3406,18 +3422,38 @@ mod tests {
         // it leaves the table another document loaded.
         db.execute_statement("CREATE TABLE sales AS SELECT 3 AS n")
             .unwrap_or_else(|e| fail(&e.to_string()));
-        db.insert_document(&NewDocument::new("owner", "sales.csv", "text/csv", 1))
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from("owner"),
+            "sales.csv",
+            "text/csv",
+            1,
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        db.set_document_tables(&DocumentId::from("owner"), &[String::from("sales")])
             .unwrap_or_else(|e| fail(&e.to_string()));
-        db.set_document_tables("owner", &[String::from("sales")])
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        db.insert_document(&NewDocument::new("queued", "sales.csv", "text/csv", 1))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(db.delete_document("queued").is_ok_and(|existed| existed));
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from("queued"),
+            "sales.csv",
+            "text/csv",
+            1,
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            db.delete_document(&DocumentId::from("queued"))
+                .is_ok_and(|existed| existed)
+        );
         assert!(db.table_exists("sales").is_ok_and(|exists| exists));
 
-        db.insert_document(&NewDocument::new("d2", "notes.md", "text/markdown", 1))
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from("d2"),
+            "notes.md",
+            "text/markdown",
+            1,
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let notes = db
+            .document(&DocumentId::from("d2"))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let notes = db.document("d2").unwrap_or_else(|e| fail(&e.to_string()));
         assert!(notes.is_some_and(|d| d.fallback_tables().is_empty()));
     }
 
@@ -3427,20 +3463,27 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test")]
     fn document_sources_read_back_and_unknown_ones_are_refused() {
         let db = WorkspaceDb::open_in_memory(4).unwrap();
-        let mut doc = NewDocument::new("d1", "a.txt", "text/plain", 1);
+        let d1 = DocumentId::from("d1");
+        let mut doc = NewDocument::new(&d1, "a.txt", "text/plain", 1);
         doc.source = DocumentSource::Import;
         db.insert_document(&doc).unwrap();
-        let read = db.document("d1").unwrap().map(|d| d.source);
+        let read = db
+            .document(&DocumentId::from("d1"))
+            .unwrap()
+            .map(|d| d.source);
         assert_eq!(read, Some(DocumentSource::Import));
         db.connection()
             .execute("UPDATE _quack_documents SET source = NULL", [])
             .unwrap();
-        let read = db.document("d1").unwrap().map(|d| d.source);
+        let read = db
+            .document(&DocumentId::from("d1"))
+            .unwrap()
+            .map(|d| d.source);
         assert_eq!(read, Some(DocumentSource::Upload));
         db.connection()
             .execute("UPDATE _quack_documents SET source = 'fax'", [])
             .unwrap();
-        assert!(db.document("d1").is_err());
+        assert!(db.document(&DocumentId::from("d1")).is_err());
     }
 
     fn config_in(dir: &Path) -> Config {
@@ -4263,6 +4306,7 @@ mod tests {
                 let sampled = db
                     .sample_chunk_ids(pool, limit)
                     .unwrap_or_else(|e| fail(&e.to_string()));
+                let sampled: Vec<String> = sampled.into_iter().map(ChunkId::into_string).collect();
                 assert_eq!(sampled, expected, "{pool:?} limit {limit}");
             }
         }
@@ -4331,21 +4375,22 @@ mod tests {
             insert_text_chunk(&db, &format!("c{i}"), "d0", i, "some text");
         }
         let mut seen = Vec::new();
-        let mut after: Option<String> = None;
+        let mut after: Option<ChunkId> = None;
         loop {
             let page = db
-                .chunk_page(SamplePool::NotGraphExtracted, after.as_deref(), 3)
+                .chunk_page(SamplePool::NotGraphExtracted, after.as_ref(), 3)
                 .unwrap_or_else(|e| fail(&e.to_string()));
             let Some(last) = page.last() else { break };
             after = Some(last.id.clone());
-            seen.extend(page.into_iter().map(|c| c.id));
+            seen.extend(page.into_iter().map(|c| c.id.into_string()));
         }
         assert_eq!(seen, ["c0", "c1", "c2", "c3", "c4", "c5", "c6"]);
     }
 
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {
         db.insert_document(
-            &NewDocument::new(id, "doc.txt", "text/plain", 10).with_status(DocumentStatus::Ready),
+            &NewDocument::new(&DocumentId::from(id), "doc.txt", "text/plain", 10)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
     }
@@ -4358,8 +4403,8 @@ mod tests {
         content: &str,
     ) {
         db.insert_chunk(&NewChunk {
-            id,
-            document_id,
+            id: &ChunkId::from(id),
+            document_id: &DocumentId::from(document_id),
             chunk_index,
             content,
             heading: None,
@@ -4427,8 +4472,8 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
         insert_ready_document(&db, "doc1");
         db.insert_chunk(&NewChunk {
-            id: "c1",
-            document_id: "doc1",
+            id: &ChunkId::from("c1"),
+            document_id: &DocumentId::from("doc1"),
             chunk_index: 0,
             content: "See below for what is not covered.",
             heading: Some("Flood Exclusion"),
@@ -4491,8 +4536,8 @@ mod tests {
         insert_ready_document(&db, "doc1");
         let embedding = [0.1_f32, 0.2, 0.3, 0.4];
         db.insert_chunk(&NewChunk {
-            id: "c1",
-            document_id: "doc1",
+            id: &ChunkId::from("c1"),
+            document_id: &DocumentId::from("doc1"),
             chunk_index: 0,
             content: "Policy POL-8841 covers water damage.",
             heading: None,
@@ -4501,8 +4546,8 @@ mod tests {
         })
         .unwrap_or_else(|e| fail(&e.to_string()));
         db.insert_chunk(&NewChunk {
-            id: "c2",
-            document_id: "doc1",
+            id: &ChunkId::from("c2"),
+            document_id: &DocumentId::from("doc1"),
             chunk_index: 1,
             content: "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.",
             heading: None,
@@ -4531,8 +4576,8 @@ mod tests {
         insert_ready_document(&db, "doc1");
         let embedding = [0.1_f32, 0.2, 0.3, 0.4];
         db.insert_chunk(&NewChunk {
-            id: "c1",
-            document_id: "doc1",
+            id: &ChunkId::from("c1"),
+            document_id: &DocumentId::from("doc1"),
             chunk_index: 0,
             content: "The flood exclusion applies to basements.",
             heading: None,
@@ -4541,8 +4586,8 @@ mod tests {
         })
         .unwrap_or_else(|e| fail(&e.to_string()));
         db.insert_chunk(&NewChunk {
-            id: "c2",
-            document_id: "doc1",
+            id: &ChunkId::from("c2"),
+            document_id: &DocumentId::from("doc1"),
             chunk_index: 1,
             content: "Exclusion of flood risk is handled in a separate clause.",
             heading: None,

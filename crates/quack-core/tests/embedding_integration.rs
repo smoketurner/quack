@@ -14,6 +14,7 @@ use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::Properties;
 use quack_core::graph::store::{self as graph_store, NewNode};
+use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
@@ -102,14 +103,15 @@ fn writer_of(db: &WorkspaceDb) -> Writer {
 /// One ready document with `chunks` chunks, each with a vector of `width`.
 fn seed(db: &WorkspaceDb, chunks: u32, width: usize) {
     db.insert_document(
-        &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
+        &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     let vector = vec![1.0_f32; width];
     for i in 0..chunks {
         db.insert_chunk(&NewChunk {
-            id: &format!("c{i}"),
-            document_id: "d",
+            id: &ChunkId::from(format!("c{i}")),
+            document_id: &DocumentId::from("d"),
             chunk_index: i,
             content: &format!("storm report {i}"),
             heading: Some("Reports"),

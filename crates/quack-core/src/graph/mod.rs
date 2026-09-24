@@ -23,6 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::embedding::{Dimension, Input};
 use crate::extraction::Tally;
+use crate::ids::{ChunkId, DocumentId};
 use crate::ontology::OntologyVersion;
 
 /// A stored node.
@@ -234,8 +235,8 @@ pub enum Origin {
     /// A chunk of a document.
     Chunk {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        document_id: Option<String>,
-        chunk_id: String,
+        document_id: Option<DocumentId>,
+        chunk_id: ChunkId,
     },
     /// A row of a mapped table, by its key.
     Row { table_name: String, row_key: String },
@@ -246,8 +247,8 @@ impl Origin {
     /// stored as empty text: a row when the table is named, else a chunk.
     #[must_use]
     pub fn from_columns(
-        document_id: Option<String>,
-        chunk_id: String,
+        document_id: Option<DocumentId>,
+        chunk_id: ChunkId,
         table_name: String,
         row_key: String,
     ) -> Self {
@@ -266,7 +267,7 @@ impl Origin {
 
     /// The chunk, when this is one.
     #[must_use]
-    pub fn chunk_id(&self) -> Option<&str> {
+    pub fn chunk_id(&self) -> Option<&ChunkId> {
         match self {
             Self::Chunk { chunk_id, .. } => Some(chunk_id),
             Self::Row { .. } => None,
@@ -701,8 +702,8 @@ mod tests {
         let chunk = Provenance {
             subject_id: String::from("n"),
             origin: Origin::from_columns(
-                Some(String::from("d")),
-                String::from("c"),
+                Some(DocumentId::from("d")),
+                ChunkId::from("c"),
                 String::new(),
                 String::new(),
             ),
@@ -710,10 +711,15 @@ mod tests {
         };
         let row = Provenance {
             subject_id: String::from("n"),
-            origin: Origin::from_columns(None, String::new(), String::from("t"), String::from("k")),
+            origin: Origin::from_columns(
+                None,
+                ChunkId::from(String::new()),
+                String::from("t"),
+                String::from("k"),
+            ),
             confidence: 1.0,
         };
-        assert_eq!(chunk.origin.chunk_id(), Some("c"));
+        assert_eq!(chunk.origin.chunk_id(), Some(&ChunkId::from("c")));
         assert_eq!(row.origin.chunk_id(), None);
         assert_eq!(
             serde_json::to_value(&chunk).ok(),
@@ -769,12 +775,22 @@ mod tests {
             provenance: vec![
                 Provenance {
                     subject_id: String::from("b"),
-                    origin: Origin::from_columns(None, String::new(), String::new(), String::new()),
+                    origin: Origin::from_columns(
+                        None,
+                        ChunkId::from(String::new()),
+                        String::new(),
+                        String::new(),
+                    ),
                     confidence: 1.0,
                 },
                 Provenance {
                     subject_id: String::from("ac"),
-                    origin: Origin::from_columns(None, String::new(), String::new(), String::new()),
+                    origin: Origin::from_columns(
+                        None,
+                        ChunkId::from(String::new()),
+                        String::new(),
+                        String::new(),
+                    ),
                     confidence: 1.0,
                 },
             ],

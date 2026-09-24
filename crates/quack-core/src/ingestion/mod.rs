@@ -13,6 +13,7 @@ use rig::embeddings::EmbeddingModel;
 use crate::config::Config;
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
+use crate::ids::{ChunkId, DocumentId};
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
@@ -26,7 +27,7 @@ use parser::{FileType, Load, Reader, TextFormat};
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
 pub struct IngestResult {
-    pub document_id: String,
+    pub document_id: DocumentId,
     pub filename: String,
     pub file_type: FileType,
     pub chunks_stored: u32,
@@ -115,7 +116,7 @@ impl<'a> NewFile<'a> {
 /// existing document whose bytes are identical.
 #[derive(Debug)]
 pub enum Registration {
-    New(String),
+    New(DocumentId),
     Duplicate(Box<DocumentInfo>),
 }
 
@@ -212,7 +213,7 @@ impl Pending {
         if let Load::Table(_) = self.file_type.load() {
             TableName::of_file(&self.filename).check_free(db, None)?;
         }
-        let doc_id = uuid::Uuid::now_v7().to_string();
+        let doc_id = DocumentId::generate();
         db.insert_document(&NewDocument {
             id: &doc_id,
             filename: &self.filename,
@@ -235,7 +236,7 @@ pub struct Processing<'a, M> {
     pub config: &'a Config,
     pub db: &'a Writer,
     pub workspace_id: &'a str,
-    pub document_id: &'a str,
+    pub document_id: &'a DocumentId,
     pub file: &'a NewFile<'a>,
     pub embedder: Option<&'a Embedder<M>>,
 }
@@ -300,7 +301,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 let step = StructuredLoad {
                     config: config.clone(),
                     workspace_id: workspace_id.to_owned(),
-                    doc_id: doc_id.to_owned(),
+                    doc_id: doc_id.clone(),
                     filename: filename.to_owned(),
                     data: data.to_vec(),
                     reader,
@@ -323,7 +324,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 let sheets = parse_off_runtime(move || xlsx::sheets(&bytes)).await?;
                 let load = WorkbookLoad {
                     files_dir: config.workspace_files_dir(workspace_id),
-                    doc_id: doc_id.to_owned(),
+                    doc_id: doc_id.clone(),
                     filename: filename.to_owned(),
                     sheets,
                 };
@@ -491,7 +492,7 @@ pub fn load_stdin_table(
 struct StructuredLoad {
     config: Config,
     workspace_id: String,
-    doc_id: String,
+    doc_id: DocumentId,
     filename: String,
     data: Vec<u8>,
     reader: Reader,
@@ -526,7 +527,7 @@ impl StructuredLoad {
 /// A workbook's sheets, parsed, for the workspace writer's thread.
 struct WorkbookLoad {
     files_dir: PathBuf,
-    doc_id: String,
+    doc_id: DocumentId,
     filename: String,
     sheets: Vec<xlsx::SheetCsv>,
 }
@@ -587,8 +588,8 @@ impl EmbedPlan<'_> {
     async fn embed<M: EmbeddingModel>(
         self,
         db: &Writer,
-        document_id: &str,
-        chunk_ids: &[String],
+        document_id: &DocumentId,
+        chunk_ids: &[ChunkId],
         chunks: &[chunker::Chunk],
         embedder: &Embedder<M>,
     ) -> Result<Duration> {
@@ -607,7 +608,7 @@ impl EmbedPlan<'_> {
         // Batches are collected before the futures are built: a closure that
         // takes the slice by reference would tie each future's type to that
         // borrow and fail the `Send` check the server's handlers need.
-        let batches_input: Vec<(Vec<String>, Vec<Input>)> = chunk_ids
+        let batches_input: Vec<(Vec<ChunkId>, Vec<Input>)> = chunk_ids
             .chunks(batch_size)
             .zip(chunks.chunks(batch_size))
             .map(|(ids, slice)| {
@@ -678,18 +679,18 @@ impl EmbedPlan<'_> {
 /// Returns the chunk count and, when a model ran, how long embedding took.
 async fn embed_and_store<M: EmbeddingModel>(
     db: &Writer,
-    document_id: &str,
+    document_id: &DocumentId,
     chunks: &[chunker::Chunk],
     embedder: Option<&Embedder<M>>,
     plan: EmbedPlan<'_>,
 ) -> Result<(u32, Option<Duration>)> {
-    let (owned, id) = (chunks.to_vec(), document_id.to_owned());
+    let (owned, id) = (chunks.to_vec(), document_id.clone());
     let chunk_ids = db
         .run(move |db| {
             db.write_transaction(|db| {
                 let mut ids = Vec::with_capacity(owned.len());
                 for (i, chunk) in owned.iter().enumerate() {
-                    let chunk_id = uuid::Uuid::now_v7().to_string();
+                    let chunk_id = ChunkId::generate();
                     let idx = u32::try_from(i)
                         .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
                     db.insert_chunk(&NewChunk {
@@ -796,11 +797,11 @@ impl TableName {
 
     /// One document per table: refuse when a live document other than
     /// `owner` already loaded this one.
-    fn check_free(&self, db: &WorkspaceDb, owner: Option<&str>) -> Result<()> {
+    fn check_free(&self, db: &WorkspaceDb, owner: Option<&DocumentId>) -> Result<()> {
         match db.table_owner(&self.0)? {
-            Some(doc) if owner != Some(doc.id.as_str()) => Err(Error::TableTaken {
+            Some(doc) if owner != Some(&doc.id) => Err(Error::TableTaken {
                 table: self.0.clone(),
-                document: doc.id,
+                document: doc.id.into_string(),
                 filename: doc.filename,
             }),
             _ => Ok(()),
