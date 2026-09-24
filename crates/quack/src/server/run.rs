@@ -17,7 +17,6 @@ use serde_json::Value;
 
 use crate::server::auth::Access;
 use crate::server::error::ApiResult;
-use crate::server::queue::when_cancelled_unstarted;
 use crate::server::state::App;
 
 /// What a background run is: how it is audited, which queue it takes, and
@@ -202,13 +201,15 @@ impl BackgroundRun {
                 }
             }
         });
-        when_cancelled_unstarted(&jobs, id, move || async move {
-            unstarted
-                .finish(
-                    Outcome::Error,
-                    serde_json::json!({ "finished": true, "error": "cancelled before it started" }),
-                )
-                .await;
+        jobs.when_ended(id, move |ended| async move {
+            if ended.never_started() {
+                unstarted
+                    .finish(
+                        Outcome::Error,
+                        serde_json::json!({ "finished": true, "error": "cancelled before it started" }),
+                    )
+                    .await;
+            }
         });
         id
     }

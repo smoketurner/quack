@@ -25,8 +25,8 @@ use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{Ontology, OntologyDiff, candidates, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Scope,
-    TokenRow, UserRow, WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
+    Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
@@ -37,7 +37,7 @@ use self::flash::{Flash, UrlEncoded};
 use super::api::admin::CreateUser;
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
-use super::api::documents::Enqueued;
+use super::api::documents::{Enqueued, IncomingFile, UploadForm};
 use super::api::embeddings::RefreshStarted;
 use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
@@ -46,13 +46,9 @@ use super::api::ontology::DecideRequest;
 use super::api::query::SqlRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
-    documents as docs_api, graph as graph_api, import as import_api, jobs as jobs_api,
-    ontology as ontology_api, query as query_api, sessions as sessions_api,
-    workspaces as workspaces_api,
+    documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
 };
-use super::auth::{
-    Access, Identity, Need, Peer, access, password_login, request_id, require_admin, session_cookie,
-};
+use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
 use super::state::App;
 use quack_core::csv::CsvField;
@@ -135,26 +131,59 @@ struct Page {
 struct WsNav {
     id: String,
     name: String,
-    role: String,
+    role: Standing,
     can_write: bool,
     can_manage: bool,
 }
 
-fn page(app: &App, identity: &Identity, title: &str, access: Option<&Access>) -> Page {
-    Page {
-        title: title.to_owned(),
-        username: identity.username.clone(),
-        is_admin: identity.is_admin,
-        local: app.local,
-        workspace: access.map(|a| WsNav {
-            id: a.workspace.id.clone(),
-            name: a.workspace.name.clone(),
-            role: a
-                .role
-                .map_or_else(|| String::from("admin"), |r| r.to_string()),
-            can_write: a.permits(Need::WRITE),
-            can_manage: a.permits(Need::OWN),
-        }),
+/// Where the caller stands in a workspace, as the pages show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    Member(Role),
+    /// A server admin without membership: settings and members, never
+    /// content.
+    Admin,
+}
+
+impl Standing {
+    fn of(role: Option<Role>) -> Self {
+        role.map_or(Self::Admin, Self::Member)
+    }
+}
+
+impl fmt::Display for Standing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Member(role) => role.fmt(f),
+            Self::Admin => f.write_str("admin"),
+        }
+    }
+}
+
+impl Page {
+    /// A page outside any workspace.
+    fn new(app: &App, identity: &Identity, title: &str) -> Self {
+        Self {
+            title: title.to_owned(),
+            username: identity.username.clone(),
+            is_admin: identity.is_admin,
+            local: app.local,
+            workspace: None,
+        }
+    }
+
+    /// A page inside `access`'s workspace, with its navigation.
+    fn in_workspace(app: &App, title: &str, access: &Access) -> Self {
+        Self {
+            workspace: Some(WsNav {
+                id: access.workspace.id.clone(),
+                name: access.workspace.name.clone(),
+                role: Standing::of(access.role),
+                can_write: access.permits(Need::WRITE),
+                can_manage: access.permits(Need::OWN),
+            }),
+            ..Self::new(app, &access.identity, title)
+        }
     }
 }
 
@@ -181,7 +210,7 @@ struct WsItem {
     id: String,
     name: String,
     classification: String,
-    role: String,
+    role: Standing,
 }
 
 #[derive(Template)]
@@ -409,7 +438,8 @@ struct GraphResultView {
     edges: Vec<GraphEdgeView>,
 }
 
-#[derive(Default)]
+/// The graph page's search and path query, as its forms show it.
+#[derive(Clone, Default)]
 struct GraphQueryView {
     entity: String,
     class: String,
@@ -577,7 +607,7 @@ async fn login_submit(
     State(app): State<App>,
     peer: Peer,
     jar: CookieJar,
-    headers: axum::http::HeaderMap,
+    request_id: RequestId,
     Form(form): Form<LoginRequest>,
 ) -> WebResult<Response> {
     if app.local {
@@ -585,15 +615,7 @@ async fn login_submit(
     }
     // A wrong password is the form again with a message, not a 401; any
     // other failure is still an error page.
-    let token = match password_login(
-        &app,
-        peer,
-        request_id(&headers),
-        &form.username,
-        &form.password,
-    )
-    .await
-    {
+    let token = match password_login(&app, peer, request_id, &form.username, &form.password).await {
         Ok((_, token)) => token,
         Err(e) if e.status == StatusCode::UNAUTHORIZED => {
             return Ok(Flash::error("/login", "wrong username or password").into_response());
@@ -601,7 +623,7 @@ async fn login_submit(
         Err(e) => return Err(e.into()),
     };
     Ok((
-        jar.add(session_cookie(&app, peer, token)),
+        jar.add(SessionCookie::issue(&app, peer, token)),
         Redirect::to("/workspaces"),
     )
         .into_response())
@@ -640,11 +662,9 @@ async fn workspaces(
             .into_iter()
             .map(|w| WsItem {
                 role: if app.local {
-                    String::from("owner")
+                    Standing::Member(Role::Owner)
                 } else {
-                    mine.iter()
-                        .find(|(m, _)| m.id == w.id)
-                        .map_or_else(|| String::from("admin"), |(_, r)| r.to_string())
+                    Standing::of(mine.iter().find(|(m, _)| m.id == w.id).map(|(_, r)| *r))
                 },
                 id: w.id,
                 name: w.name,
@@ -660,13 +680,13 @@ async fn workspaces(
                 id: w.id,
                 name: w.name,
                 classification: w.classification,
-                role: r.to_string(),
+                role: Standing::Member(r),
             })
             .collect()
     };
     html(&WorkspacesPage {
         can_create: identity.is_admin,
-        page: page(&app, &identity, "Workspaces", None),
+        page: Page::new(&app, &identity, "Workspaces"),
         workspaces: items,
         error: q.error,
     })
@@ -692,93 +712,97 @@ struct ChatQuery {
     session: Option<String>,
 }
 
-fn message_view(row: &sessions::MessageRow) -> Option<MessageView> {
-    let role = match row.role {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::Tool => return None,
-    };
-    let meta = row.metadata.clone().unwrap_or(serde_json::Value::Null);
-    let steps = meta
-        .get("steps")
-        .and_then(|s| s.as_array())
-        .map(|steps| {
-            steps
-                .iter()
-                .map(|s| StepView {
-                    tool: s
-                        .get("tool")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    detail: s
-                        .get("detail")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    summary: s
-                        .get("summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    duration_ms: s
-                        .get("duration_ms")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let citations = meta
-        .get("citations")
-        .and_then(|c| c.as_array())
-        .map(|cs| {
-            cs.iter()
-                .map(|c| {
-                    let filename = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-                    let page_no = c.get("page").and_then(serde_json::Value::as_u64);
-                    let heading = c.get("heading").and_then(|v| v.as_str());
-                    let page_part = page_no.map_or(String::new(), |p| format!(", page {p}"));
-                    let heading_part =
-                        heading.map_or(String::new(), |h| format!(", under \"{h}\""));
-                    let label = format!("{filename}{page_part}{heading_part}");
-                    CitationView {
-                        n: c.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                        label,
-                        document_id: c
-                            .get("document_id")
+impl MessageView {
+    /// A stored message as the chat page shows it; tool messages are
+    /// folded into the answer after them.
+    fn of(row: &sessions::MessageRow) -> Option<Self> {
+        let role = match row.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => return None,
+        };
+        let meta = row.metadata.clone().unwrap_or(serde_json::Value::Null);
+        let steps = meta
+            .get("steps")
+            .and_then(|s| s.as_array())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|s| StepView {
+                        tool: s
+                            .get("tool")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_owned(),
-                    }
-                })
-                .collect()
+                        detail: s
+                            .get("detail")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned(),
+                        summary: s
+                            .get("summary")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned(),
+                        duration_ms: s
+                            .get("duration_ms")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let citations = meta
+            .get("citations")
+            .and_then(|c| c.as_array())
+            .map(|cs| {
+                cs.iter()
+                    .map(|c| {
+                        let filename = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                        let page_no = c.get("page").and_then(serde_json::Value::as_u64);
+                        let heading = c.get("heading").and_then(|v| v.as_str());
+                        let page_part = page_no.map_or(String::new(), |p| format!(", page {p}"));
+                        let heading_part =
+                            heading.map_or(String::new(), |h| format!(", under \"{h}\""));
+                        let label = format!("{filename}{page_part}{heading_part}");
+                        CitationView {
+                            n: c.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            label,
+                            document_id: c
+                                .get("document_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_owned(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let chart_json = meta
+            .get("chart")
+            .filter(|c| !c.is_null())
+            .map(ToString::to_string);
+        let graphs = meta
+            .get("graph")
+            .and_then(|g| g.as_array())
+            .map(|gs| gs.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        let content_html = if row.role == MessageRole::Assistant {
+            markdown::to_html(&row.content)
+        } else {
+            askama::filters::escape(&row.content, askama::filters::Html)
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        Some(MessageView {
+            role: role.to_owned(),
+            content_html,
+            steps,
+            citations,
+            chart_json,
+            graphs,
         })
-        .unwrap_or_default();
-    let chart_json = meta
-        .get("chart")
-        .filter(|c| !c.is_null())
-        .map(ToString::to_string);
-    let graphs = meta
-        .get("graph")
-        .and_then(|g| g.as_array())
-        .map(|gs| gs.iter().map(ToString::to_string).collect())
-        .unwrap_or_default();
-    let content_html = if row.role == MessageRole::Assistant {
-        markdown::to_html(&row.content)
-    } else {
-        askama::filters::escape(&row.content, askama::filters::Html)
-            .map(|e| e.to_string())
-            .unwrap_or_default()
-    };
-    Some(MessageView {
-        role: role.to_owned(),
-        content_html,
-        steps,
-        citations,
-        chart_json,
-        graphs,
-    })
+    }
 }
 
 async fn chat(
@@ -787,7 +811,7 @@ async fn chat(
     Path(id): Path<String>,
     Query(q): Query<ChatQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let user = access.identity.user_id.clone();
     let sees_all = access.sees_all_sessions();
     let wanted = q.session.clone();
@@ -825,10 +849,10 @@ async fn chat(
         (Vec::new(), Vec::new())
     };
     html(&ChatPage {
-        page: page(&app, &access.identity, "Chat", Some(&access)),
+        page: Page::in_workspace(&app, "Chat", &access),
         sessions: sessions_list,
         current,
-        messages: messages.iter().filter_map(message_view).collect(),
+        messages: messages.iter().filter_map(MessageView::of).collect(),
         tables,
         documents,
     })
@@ -839,8 +863,8 @@ async fn delete_session(
     WebUser(identity): WebUser,
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    sessions_api::delete_session(&app, &access, &sid).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.delete_session(&app, &sid).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat")).into_response())
 }
 
@@ -849,8 +873,8 @@ async fn share_session(
     WebUser(identity): WebUser,
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    sessions_api::set_shared(&app, &access, &sid, true).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.set_session_shared(&app, &sid, true).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
@@ -859,52 +883,57 @@ async fn unshare_session(
     WebUser(identity): WebUser,
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    sessions_api::set_shared(&app, &access, &sid, false).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.set_session_shared(&app, &sid, false).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
-async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
-    let documents = app
-        .read(&access.workspace.id, WorkspaceDb::list_documents)
-        .await?;
-    let pending = documents.iter().any(|d| d.status.is_in_flight());
-    Ok(DocumentRows {
-        ws_id: access.workspace.id.clone(),
-        can_write: access.permits(Need::WRITE),
-        documents,
-        pending,
+impl DocumentRows {
+    /// The workspace's documents as the caller may act on them.
+    async fn load(app: &App, access: &Access) -> WebResult<Self> {
+        let documents = app
+            .read(&access.workspace.id, WorkspaceDb::list_documents)
+            .await?;
+        let pending = documents.iter().any(|d| d.status.is_in_flight());
+        Ok(Self {
+            ws_id: access.workspace.id.clone(),
+            can_write: access.permits(Need::WRITE),
+            documents,
+            pending,
+        })
     }
-    .render()?)
 }
 
-fn render_jobs(app: &App, access: &Access) -> WebResult<String> {
-    let jobs: Vec<JobView> = jobs_api::visible_jobs(app, access)
-        .into_iter()
-        .map(|j| JobView {
-            id: j.id.to_string(),
-            number: j.number,
-            kind: j.kind.to_string(),
-            can_cancel: !j.state.is_finished() && jobs_api::may_cancel(access, &j),
-            label: j.label,
-            state: if j.cancel_requested && !j.state.is_finished() {
-                String::from("cancelling")
-            } else {
-                j.state.to_string()
-            },
-            active: !j.state.is_finished(),
-            progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
-            outcome: j.outcome.or(j.status),
-            queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
-        })
-        .collect();
-    let pending = jobs.iter().any(|j| j.active);
-    Ok(JobRows {
-        ws_id: access.workspace.id.clone(),
-        jobs,
-        pending,
+impl JobRows {
+    /// The workspace's jobs as the caller may see and cancel them.
+    fn of(app: &App, access: &Access) -> Self {
+        let jobs: Vec<JobView> = access
+            .visible_jobs(app)
+            .into_iter()
+            .map(|j| JobView {
+                id: j.id.to_string(),
+                number: j.number,
+                kind: j.kind.to_string(),
+                can_cancel: !j.state.is_finished() && access.may_cancel(&j),
+                label: j.label,
+                state: if j.cancel_requested && !j.state.is_finished() {
+                    String::from("cancelling")
+                } else {
+                    j.state.to_string()
+                },
+                active: !j.state.is_finished(),
+                progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
+                outcome: j.outcome.or(j.status),
+                queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+            })
+            .collect();
+        let pending = jobs.iter().any(|j| j.active);
+        Self {
+            ws_id: access.workspace.id.clone(),
+            jobs,
+            pending,
+        }
     }
-    .render()?)
 }
 
 async fn jobs_page(
@@ -912,11 +941,11 @@ async fn jobs_page(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "jobs").await?;
-    let rows = render_jobs(&app, &access)?;
+    let rows = JobRows::of(&app, &access).render()?;
     html(&JobsPage {
-        page: page(&app, &access.identity, "Jobs", Some(&access)),
+        page: Page::in_workspace(&app, "Jobs", &access),
         rows,
     })
 }
@@ -926,11 +955,11 @@ async fn job_rows(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "job_rows")
         .await?;
-    Ok(Html(render_jobs(&app, &access)?).into_response())
+    Ok(Html(JobRows::of(&app, &access).render()?).into_response())
 }
 
 async fn job_cancel(
@@ -938,10 +967,10 @@ async fn job_cancel(
     WebUser(identity): WebUser,
     Path((id, job)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
-    let cancelled = jobs_api::cancel_job(&app, &access, &job).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let cancelled = access.cancel_job(&app, &job).await?;
     tracing::debug!(job = %cancelled.id, state = %cancelled.state, "cancel requested from the web");
-    Ok(Html(render_jobs(&app, &access)?).into_response())
+    Ok(Html(JobRows::of(&app, &access).render()?).into_response())
 }
 
 async fn documents(
@@ -950,14 +979,14 @@ async fn documents(
     Path(id): Path<String>,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "documents")
         .await?;
-    let rows = render_rows(&app, &access).await?;
+    let rows = DocumentRows::load(&app, &access).await?.render()?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
-        page: page(&app, &access.identity, "Documents", Some(&access)),
+        page: Page::in_workspace(&app, "Documents", &access),
         rows,
         error: q.error,
         notice: q.notice,
@@ -972,7 +1001,7 @@ async fn refresh_embeddings(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let started = access.refresh_embeddings(&app).await;
     Ok(
         Flash::after(format!("/w/{id}/documents"), started, |started| {
@@ -992,11 +1021,11 @@ async fn document_rows(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "document_rows")
         .await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn upload(
@@ -1005,44 +1034,17 @@ async fn upload(
     Path(id): Path<String>,
     multipart: Multipart,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
-    let mut files = Vec::new();
-    let mut text = String::new();
-    let mut title = String::new();
-    let mut multipart = multipart;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?
-    {
-        let name = field.name().unwrap_or("").to_owned();
-        if let Some(filename) = field.file_name().map(str::to_owned) {
-            let data = field
-                .bytes()
-                .await
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            if !filename.is_empty() && !data.is_empty() {
-                files.push((filename, data.to_vec()));
-            }
-        } else {
-            let value = field
-                .text()
-                .await
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            match name.as_str() {
-                "text" => text = value,
-                "title" => title = value,
-                _ => {}
-            }
-        }
-    }
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let form = UploadForm::read(multipart).await?;
+    let text = form.fields.get("text").map_or("", String::as_str);
     let pasted = if text.trim().is_empty() {
         Vec::new()
     } else {
-        vec![docs_api::pasted_file(&text, Some(&title))?]
+        let title = form.fields.get("title").map(String::as_str);
+        vec![IncomingFile::pasted(text, title)?]
     };
     let back = format!("/w/{id}/documents");
-    let skipped = match enqueue_web(&app, &access, files, pasted).await {
+    let skipped = match enqueue_web(&app, &access, form.files, pasted).await {
         Ok(skipped) => skipped,
         Err(e) => return Ok(Flash::error(back, e.message).into_response()),
     };
@@ -1062,8 +1064,8 @@ async fn upload(
 async fn enqueue_web(
     app: &App,
     access: &Access,
-    files: Vec<(String, Vec<u8>)>,
-    pasted: Vec<(String, Vec<u8>)>,
+    files: Vec<IncomingFile>,
+    pasted: Vec<IncomingFile>,
 ) -> Result<Vec<String>, ApiError> {
     if files.is_empty() && pasted.is_empty() {
         return Err(ApiError::bad_request("no file or text in the request"));
@@ -1090,9 +1092,9 @@ async fn pin(
     WebUser(identity): WebUser,
     Path((id, doc)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, true).await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn unpin(
@@ -1100,9 +1102,9 @@ async fn unpin(
     WebUser(identity): WebUser,
     Path((id, doc)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, false).await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn delete_doc(
@@ -1110,9 +1112,9 @@ async fn delete_doc(
     WebUser(identity): WebUser,
     Path((id, doc)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::delete_document(&app, &access, &doc).await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn tables(
@@ -1121,11 +1123,11 @@ async fn tables(
     Path(id): Path<String>,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "tables").await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
-        page: page(&app, &access.identity, "Tables", Some(&access)),
+        page: Page::in_workspace(&app, "Tables", &access),
         tables: list,
         selected: None,
         error: q.error,
@@ -1138,7 +1140,7 @@ async fn import_submit(
     Path(id): Path<String>,
     Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let request = ImportRequest::from(form);
     Ok(
         match import_api::run_import(&app, &access, &request).await {
@@ -1149,11 +1151,17 @@ async fn import_submit(
     )
 }
 
-fn cell(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+/// A JSON value shown as text: a string bare, null as nothing, anything
+/// else as JSON.
+struct JsonText<'a>(&'a serde_json::Value);
+
+impl fmt::Display for JsonText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            serde_json::Value::Null => Ok(()),
+            serde_json::Value::String(s) => f.write_str(s),
+            other => write!(f, "{other}"),
+        }
     }
 }
 
@@ -1162,11 +1170,11 @@ async fn table(
     WebUser(identity): WebUser,
     Path((id, name)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let described = access.describe_table(&app, &name).await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
-        page: page(&app, &access.identity, &name, Some(&access)),
+        page: Page::in_workspace(&app, &name, &access),
         tables: list,
         error: None,
         selected: Some(TableView {
@@ -1181,7 +1189,7 @@ async fn table(
                 .sample_rows
                 .rows
                 .iter()
-                .map(|r| r.iter().map(cell).collect())
+                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
                 .collect(),
         }),
     })
@@ -1192,40 +1200,42 @@ async fn sql_page(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "sql").await?;
     html(&SqlPage {
-        page: page(&app, &access.identity, "SQL", Some(&access)),
+        page: Page::in_workspace(&app, "SQL", &access),
         sql: String::new(),
         result: String::new(),
     })
 }
 
-async fn render_sql(app: &App, access: &Access, sql: &str) -> WebResult<String> {
-    let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
-    let result = match query_api::execute_sql(app, access, sql).await {
-        Ok(outcome) => SqlResult {
-            columns: outcome.columns,
-            rows: outcome
-                .rows
-                .iter()
-                .map(|r| r.iter().map(cell).collect())
-                .collect(),
-            row_count: outcome.row_count,
-            truncated: outcome.truncated,
-            error: None,
-            csv_href,
-        },
-        Err(e) => SqlResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            row_count: 0,
-            truncated: false,
-            error: Some(e.message),
-            csv_href,
-        },
-    };
-    Ok(result.render()?)
+impl SqlResult {
+    /// Run `sql` for the caller: its rows, or why it could not run.
+    async fn run(app: &App, access: &Access, sql: &str) -> Self {
+        let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
+        match access.execute_sql(app, sql).await {
+            Ok(outcome) => Self {
+                columns: outcome.columns,
+                rows: outcome
+                    .rows
+                    .iter()
+                    .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                    .collect(),
+                row_count: outcome.row_count,
+                truncated: outcome.truncated,
+                error: None,
+                csv_href,
+            },
+            Err(e) => Self {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                truncated: false,
+                error: Some(e.message),
+                csv_href,
+            },
+        }
+    }
 }
 
 async fn sql_run(
@@ -1234,8 +1244,8 @@ async fn sql_run(
     Path(id): Path<String>,
     Form(form): Form<SqlRequest>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    Ok(Html(render_sql(&app, &access, &form.sql).await?).into_response())
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    Ok(Html(SqlResult::run(&app, &access, &form.sql).await.render()?).into_response())
 }
 
 async fn sql_csv(
@@ -1244,8 +1254,8 @@ async fn sql_csv(
     Path(id): Path<String>,
     Query(q): Query<SqlRequest>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    let outcome = query_api::execute_sql(&app, &access, &q.sql).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let outcome = access.execute_sql(&app, &q.sql).await?;
     let mut csv = String::new();
     csv.push_str(
         &outcome
@@ -1259,7 +1269,7 @@ async fn sql_csv(
     for row in &outcome.rows {
         csv.push_str(
             &row.iter()
-                .map(|v| CsvField(&cell(v)).to_string())
+                .map(|v| CsvField(&JsonText(v).to_string()).to_string())
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -1278,25 +1288,28 @@ async fn sql_csv(
         .into_response())
 }
 
-fn class_rows(ontology: &Ontology) -> Vec<ClassRow> {
-    fn walk(ontology: &Ontology, parent: &str, depth: usize, out: &mut Vec<ClassRow>) {
-        for class in ontology.classes.iter().filter(|c| c.parent == parent) {
-            out.push(ClassRow {
-                depth,
-                id: class.id.clone(),
-                key: class.key.clone(),
-                properties: ontology
-                    .class_properties(&class.id)
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            });
-            walk(ontology, &class.id, depth.saturating_add(1), out);
+impl ClassRow {
+    /// The ontology's classes depth-first from the root, each with its depth.
+    fn tree(ontology: &Ontology) -> Vec<Self> {
+        fn walk(ontology: &Ontology, parent: &str, depth: usize, out: &mut Vec<ClassRow>) {
+            for class in ontology.classes.iter().filter(|c| c.parent == parent) {
+                out.push(ClassRow {
+                    depth,
+                    id: class.id.clone(),
+                    key: class.key.clone(),
+                    properties: ontology
+                        .class_properties(&class.id)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+                walk(ontology, &class.id, depth.saturating_add(1), out);
+            }
         }
+        let mut out = Vec::new();
+        walk(ontology, ROOT_CLASS, 0, &mut out);
+        out
     }
-    let mut out = Vec::new();
-    walk(ontology, ROOT_CLASS, 0, &mut out);
-    out
 }
 
 async fn ontology_page(
@@ -1305,7 +1318,7 @@ async fn ontology_page(
     Path(id): Path<String>,
     Query(q): Query<OntologyQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "ontology")
         .await?;
@@ -1344,15 +1357,15 @@ async fn ontology_page(
                 .saturating_mul(CANDIDATES_PER_PAGE),
         )
         .take(CANDIDATES_PER_PAGE)
-        .map(candidate_view)
+        .map(CandidateView::from_row)
         .collect();
     let json = match &ontology {
         Some(o) => o.to_json()?,
         None => String::new(),
     };
     html(&OntologyPage {
-        page: page(&app, &access.identity, "Ontology", Some(&access)),
-        classes: ontology.as_ref().map(class_rows).unwrap_or_default(),
+        page: Page::in_workspace(&app, "Ontology", &access),
+        classes: ontology.as_ref().map(ClassRow::tree).unwrap_or_default(),
         ontology,
         json,
         versions,
@@ -1376,7 +1389,7 @@ async fn ontology_decide_many(
     Path(id): Path<String>,
     MultiForm(form): MultiForm<BulkDecideForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = match form.status {
         Queue::LowSupport => format!("/w/{id}/ontology?status={}", Queue::LowSupport),
         Queue::Pending => format!("/w/{id}/ontology"),
@@ -1392,143 +1405,149 @@ async fn ontology_decide_many(
     Ok(Flash::after(back, decided, |_| None).into_response())
 }
 
-/// The one-line detail of a model- or bundle-sourced proposal.
-fn proposal_detail(proposal: &Proposal) -> String {
-    match proposal {
-        Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
-        Proposal::Class(cl) => format!("parent {}", cl.parent),
-        Proposal::Property { class, property } => {
-            format!("{}: {}", class, property.kind.as_str())
+/// A review-queue row: what the candidate is and the evidence for it.
+impl CandidateView {
+    /// The one-line detail of a model- or bundle-sourced proposal.
+    fn proposal_detail(proposal: &Proposal) -> String {
+        match proposal {
+            Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
+            Proposal::Class(cl) => format!("parent {}", cl.parent),
+            Proposal::Property { class, property } => {
+                format!("{}: {}", class, property.kind.as_str())
+            }
+            Proposal::Mapping(_) => String::new(),
         }
-        Proposal::Mapping(_) => String::new(),
     }
-}
 
-/// "N bundle files, e.g. ..." for an OKF-bundle candidate.
-fn bundle_evidence(e: &serde_json::Value) -> String {
-    let examples = e
-        .get("examples")
-        .and_then(|x| x.as_array())
-        .map(|xs| {
-            xs.iter()
-                .filter_map(|x| x.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    format!(
-        "{} bundle files · e.g. {examples}",
-        e.get("files").map(ToString::to_string).unwrap_or_default()
-    )
-}
-
-/// "N mentions in M documents, e.g. ..." for a document-evidence candidate.
-fn document_evidence(e: &serde_json::Value) -> String {
-    let get = |k: &str| e.get(k).map(ToString::to_string).unwrap_or_default();
-    let examples = e
-        .get("examples")
-        .and_then(|x| x.as_array())
-        .map(|xs| {
-            xs.iter()
-                .filter_map(|x| {
-                    x.get("mention")
-                        .or_else(|| x.get("subject"))
-                        .or_else(|| x.get("value"))
-                        .and_then(|v| v.as_str())
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    format!(
-        "{} mentions in {} documents · e.g. {examples}",
-        get("occurrences"),
-        get("documents")
-    )
-}
-
-fn candidate_view(c: candidates::CandidateRow) -> CandidateView {
-    let e = &c.evidence;
-    let get = |k: &str| {
-        e.get(k)
-            .map(|v| match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
+    /// "N bundle files, e.g. ..." for an OKF-bundle candidate.
+    fn bundle_evidence(e: &serde_json::Value) -> String {
+        let examples = e
+            .get("examples")
+            .and_then(|x| x.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             })
-            .unwrap_or_default()
-    };
-    let source = e.get("source").and_then(|v| v.as_str());
-    let from_documents = source == Some("documents");
-    let from_bundle = source == Some("okf");
-    let (evidence, detail) = match c.kind {
-        _ if from_bundle => (bundle_evidence(e), proposal_detail(&c.proposal)),
-        _ if from_documents => (document_evidence(e), proposal_detail(&c.proposal)),
-        ItemKind::Class => (
-            format!(
-                "table {} · {} rows · key {}",
-                get("table"),
-                get("rows"),
-                get("key_column")
+            .unwrap_or_default();
+        format!(
+            "{} bundle files · e.g. {examples}",
+            e.get("files").map(ToString::to_string).unwrap_or_default()
+        )
+    }
+
+    /// "N mentions in M documents, e.g. ..." for a document-evidence candidate.
+    fn document_evidence(e: &serde_json::Value) -> String {
+        let get = |k: &str| e.get(k).map(ToString::to_string).unwrap_or_default();
+        let examples = e
+            .get("examples")
+            .and_then(|x| x.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| {
+                        x.get("mention")
+                            .or_else(|| x.get("subject"))
+                            .or_else(|| x.get("value"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        format!(
+            "{} mentions in {} documents · e.g. {examples}",
+            get("occurrences"),
+            get("documents")
+        )
+    }
+
+    fn from_row(c: candidates::CandidateRow) -> Self {
+        let e = &c.evidence;
+        let get = |k: &str| {
+            e.get(k)
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default()
+        };
+        let source = e.get("source").and_then(|v| v.as_str());
+        let from_documents = source == Some("documents");
+        let from_bundle = source == Some("okf");
+        let (evidence, detail) = match c.kind {
+            _ if from_bundle => (Self::bundle_evidence(e), Self::proposal_detail(&c.proposal)),
+            _ if from_documents => (
+                Self::document_evidence(e),
+                Self::proposal_detail(&c.proposal),
             ),
-            String::new(),
-        ),
-        ItemKind::Property => (
-            format!(
-                "{}.{} · {} · {} distinct of {} · e.g. {}",
-                get("table"),
-                get("column"),
-                get("duckdb_type"),
-                get("distinct"),
-                get("rows"),
-                get("samples")
-            ),
-            match &c.proposal {
-                Proposal::Property { class, property } => {
-                    let values = if property.values.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", property.values.join(", "))
-                    };
-                    format!("{}: {}{values}", class, property.kind.as_str())
-                }
-                _ => String::new(),
-            },
-        ),
-        ItemKind::Relation => (
-            format!(
-                "{}.{} matches {}.{} for {} of values",
-                get("table"),
-                get("column"),
-                get("target_table"),
-                get("target_key"),
-                get("overlap")
-            ),
-            match &c.proposal {
-                Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
-                _ => String::new(),
-            },
-        ),
-        ItemKind::Mapping => (
-            format!("table {}", get("table")),
-            match &c.proposal {
-                Proposal::Mapping(m) => format!(
-                    "{} → {} (key {}, {} relations)",
-                    m.table,
-                    m.class,
-                    m.key,
-                    m.relations.len()
+            ItemKind::Class => (
+                format!(
+                    "table {} · {} rows · key {}",
+                    get("table"),
+                    get("rows"),
+                    get("key_column")
                 ),
-                _ => String::new(),
-            },
-        ),
-    };
-    CandidateView {
-        id: c.id,
-        kind: c.kind,
-        proposal_id: c.proposal.id().to_owned(),
-        confidence: format!("{:.2}", c.confidence),
-        evidence,
-        detail,
+                String::new(),
+            ),
+            ItemKind::Property => (
+                format!(
+                    "{}.{} · {} · {} distinct of {} · e.g. {}",
+                    get("table"),
+                    get("column"),
+                    get("duckdb_type"),
+                    get("distinct"),
+                    get("rows"),
+                    get("samples")
+                ),
+                match &c.proposal {
+                    Proposal::Property { class, property } => {
+                        let values = if property.values.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", property.values.join(", "))
+                        };
+                        format!("{}: {}{values}", class, property.kind.as_str())
+                    }
+                    _ => String::new(),
+                },
+            ),
+            ItemKind::Relation => (
+                format!(
+                    "{}.{} matches {}.{} for {} of values",
+                    get("table"),
+                    get("column"),
+                    get("target_table"),
+                    get("target_key"),
+                    get("overlap")
+                ),
+                match &c.proposal {
+                    Proposal::Relation(r) => format!("{} → {}", r.domain, r.range),
+                    _ => String::new(),
+                },
+            ),
+            ItemKind::Mapping => (
+                format!("table {}", get("table")),
+                match &c.proposal {
+                    Proposal::Mapping(m) => format!(
+                        "{} → {} (key {}, {} relations)",
+                        m.table,
+                        m.class,
+                        m.key,
+                        m.relations.len()
+                    ),
+                    _ => String::new(),
+                },
+            ),
+        };
+        CandidateView {
+            id: c.id,
+            kind: c.kind,
+            proposal_id: c.proposal.id().to_owned(),
+            confidence: format!("{:.2}", c.confidence),
+            evidence,
+            detail,
+        }
     }
 }
 
@@ -1546,10 +1565,10 @@ async fn ontology_propose(
     Path(id): Path<String>,
     Form(form): Form<ProposeForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = format!("/w/{id}/ontology");
     if form.documents {
-        let started = ontology_api::start_document_run(&app, &access, &id, None).await;
+        let started = access.start_document_run(&app, None).await;
         return Ok(Flash::after(back, started, |_| {
             Some(String::from(
                 "document pass started; candidates appear here when it finishes",
@@ -1571,7 +1590,7 @@ async fn ontology_decide(
     Path((id, cid)): Path<(String, String)>,
     Form(form): Form<DecideRequest>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let decided = access
         .decide_candidate(&app, &cid, form.action, form.target.as_deref())
         .await;
@@ -1589,7 +1608,7 @@ async fn ontology_import(
     Path(id): Path<String>,
     Form(form): Form<OntologyForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access
         .replace_ontology(&app, &form.json, "edited in the web UI")
         .await;
@@ -1601,7 +1620,7 @@ async fn ontology_init(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.init_ontology(&app).await;
     Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
@@ -1611,7 +1630,7 @@ async fn ontology_restore(
     WebUser(identity): WebUser,
     Path((id, v)): Path<(String, u32)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await;
     Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
@@ -1621,7 +1640,7 @@ async fn context_page(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "context")
         .await?;
@@ -1631,7 +1650,7 @@ async fn context_page(
         })
         .await?;
     html(&ContextPage {
-        page: page(&app, &access.identity, "Context", Some(&access)),
+        page: Page::in_workspace(&app, "Context", &access),
         content: current
             .as_ref()
             .map(|c| c.content.clone())
@@ -1647,7 +1666,7 @@ async fn context_save(
     Path(id): Path<String>,
     Form(form): Form<ReplaceContext>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     access.save_context(&app, form.content).await?;
     Ok(Flash::to(format!("/w/{id}/context")).into_response())
 }
@@ -1657,36 +1676,40 @@ struct SettingsQuery {
     error: Option<String>,
 }
 
-async fn settings_view(
-    app: &App,
-    access: &Access,
-    new_token: Option<String>,
-    error: Option<String>,
-) -> WebResult<Response> {
-    let allowed = &access.workspace.allowed_providers;
-    let providers = app
-        .config
-        .providers
-        .keys()
-        .map(|name| (name.to_string(), allowed.permits(name.as_str())))
-        .collect();
-    let (members, tokens) = if access.permits(Need::OWN) {
-        (
-            app.control.list_members(&access.workspace.id).await?,
-            app.control.list_tokens(&access.workspace.id).await?,
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    html(&SettingsPage {
-        page: page(app, &access.identity, "Settings", Some(access)),
-        classification: access.workspace.classification.clone(),
-        providers,
-        members,
-        tokens,
-        new_token,
-        error,
-    })
+impl SettingsPage {
+    /// The settings page: providers, and for owners the members and tokens;
+    /// `new_token` is a token just created, shown once.
+    async fn load(
+        app: &App,
+        access: &Access,
+        new_token: Option<String>,
+        error: Option<String>,
+    ) -> WebResult<Self> {
+        let allowed = &access.workspace.allowed_providers;
+        let providers = app
+            .config
+            .providers
+            .keys()
+            .map(|name| (name.to_string(), allowed.permits(name.as_str())))
+            .collect();
+        let (members, tokens) = if access.permits(Need::OWN) {
+            (
+                app.control.list_members(&access.workspace.id).await?,
+                app.control.list_tokens(&access.workspace.id).await?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Self {
+            page: Page::in_workspace(app, "Settings", access),
+            classification: access.workspace.classification.clone(),
+            providers,
+            members,
+            tokens,
+            new_token,
+            error,
+        })
+    }
 }
 
 async fn settings(
@@ -1695,15 +1718,11 @@ async fn settings(
     Path(id): Path<String>,
     Query(q): Query<SettingsQuery>,
 ) -> WebResult<Response> {
-    let need = Need {
-        admin_ok: true,
-        ..Need::READ
-    };
-    let access = access(&app, identity, &id, need).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit_read(&app, AuditAction::Page, "settings")
         .await?;
-    settings_view(&app, &access, None, q.error).await
+    html(&SettingsPage::load(&app, &access, None, q.error).await?)
 }
 
 #[derive(Deserialize)]
@@ -1719,7 +1738,7 @@ async fn settings_save(
     Path(id): Path<String>,
     MultiForm(form): MultiForm<SettingsForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     // The form is one checkbox per configured provider, so it cannot say
     // "every provider, including ones added later" other than by ticking
     // all of them or none.
@@ -1747,7 +1766,7 @@ async fn member_add(
     Path(id): Path<String>,
     Form(form): Form<AddMember>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let added = access.add_member(&app, &form).await;
     Ok(Flash::after(format!("/w/{id}/settings"), added, |_| None).into_response())
 }
@@ -1757,7 +1776,7 @@ async fn member_remove(
     WebUser(identity): WebUser,
     Path((id, user_id)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let removed = access.remove_member(&app, &user_id).await;
     Ok(Flash::after(format!("/w/{id}/settings"), removed, |()| None).into_response())
 }
@@ -1776,7 +1795,7 @@ async fn token_create(
     Path(id): Path<String>,
     MultiForm(form): MultiForm<TokenForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     if app.local {
         return Ok(
             Flash::error(format!("/w/{id}/settings"), "local mode has no users").into_response(),
@@ -1812,7 +1831,7 @@ async fn token_create(
         .await?;
     // The secret is shown once in this response body, never in a URL where
     // browser history, proxy logs, or a Referer would keep it.
-    settings_view(&app, &access, Some(token), None).await
+    html(&SettingsPage::load(&app, &access, Some(token), None).await?)
 }
 
 async fn token_revoke(
@@ -1820,7 +1839,7 @@ async fn token_revoke(
     WebUser(identity): WebUser,
     Path((id, hash)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let owned = app
         .control
         .list_tokens(&id)
@@ -1848,9 +1867,9 @@ async fn admin_users(
     WebUser(identity): WebUser,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
-    require_admin(&identity)?;
+    identity.require_admin()?;
     html(&AdminUsersPage {
-        page: page(&app, &identity, "Users", None),
+        page: Page::new(&app, &identity, "Users"),
         users: app.control.list_users().await?,
         error: q.error,
     })
@@ -1871,6 +1890,21 @@ struct AuditQuery {
     #[serde(default, deserialize_with = "blank_as_none")]
     outcome: Option<Outcome>,
     workspace_id: Option<String>,
+}
+
+/// The page's filter form: a blank field is no filter, and the newest 200
+/// rows show.
+impl From<AuditQuery> for AuditFilter {
+    fn from(q: AuditQuery) -> Self {
+        let given = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        Self {
+            action: given(q.action),
+            outcome: q.outcome,
+            workspace_id: given(q.workspace_id),
+            limit: 200,
+            ..Self::default()
+        }
+    }
 }
 
 /// A query or form value where blank means "not given", as the filter's
@@ -1895,26 +1929,16 @@ async fn admin_audit(
     WebUser(identity): WebUser,
     Query(q): Query<AuditQuery>,
 ) -> WebResult<Response> {
-    require_admin(&identity)?;
-    let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-    let (action, outcome, workspace_id) = (clean(q.action), q.outcome, clean(q.workspace_id));
-    let rows = app
-        .control
-        .query_audit(&AuditFilter {
-            action: action.clone(),
-            outcome,
-            workspace_id: workspace_id.clone(),
-            limit: 200,
-            ..AuditFilter::default()
-        })
-        .await?;
+    identity.require_admin()?;
+    let filter = AuditFilter::from(q);
+    let rows = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
-        page: page(&app, &identity, "Audit", None),
+        page: Page::new(&app, &identity, "Audit"),
         rows,
-        action: action.unwrap_or_default(),
-        outcome,
+        action: filter.action.unwrap_or_default(),
+        outcome: filter.outcome,
         outcomes: Outcome::ALL,
-        workspace_id: workspace_id.unwrap_or_default(),
+        workspace_id: filter.workspace_id.unwrap_or_default(),
     })
 }
 
@@ -1924,9 +1948,10 @@ mod tests {
 
     #[test]
     fn cells_render_strings_bare_and_null_empty() {
-        assert_eq!(cell(&serde_json::json!("s")), "s");
-        assert_eq!(cell(&serde_json::Value::Null), "");
-        assert_eq!(cell(&serde_json::json!(4.5)), "4.5");
+        let text = |v: &serde_json::Value| JsonText(v).to_string();
+        assert_eq!(text(&serde_json::json!("s")), "s");
+        assert_eq!(text(&serde_json::Value::Null), "");
+        assert_eq!(text(&serde_json::json!(4.5)), "4.5");
     }
 }
 
@@ -1945,8 +1970,26 @@ struct GraphPageQuery {
     notice: Option<String>,
 }
 
-fn non_empty(value: Option<&String>) -> Option<String> {
-    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+impl GraphQueryView {
+    /// The page's query: blank fields are empty strings, which the form
+    /// shows as they are; hops at their defaults when not given.
+    fn from_query(q: &GraphPageQuery) -> Self {
+        let given = |value: Option<&String>| {
+            value
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_default()
+        };
+        Self {
+            entity: given(q.entity.as_ref()),
+            class: given(q.class.as_ref()),
+            relation: given(q.relation.as_ref()),
+            hops: Hops::neighborhood(q.hops).get(),
+            from: given(q.from.as_ref()),
+            to: given(q.to.as_ref()),
+            max_hops: Hops::path(q.max_hops).get(),
+        }
+    }
 }
 
 async fn graph_page(
@@ -1955,18 +1998,10 @@ async fn graph_page(
     Path(id): Path<String>,
     Query(q): Query<GraphPageQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
-    let query = GraphQueryView {
-        entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
-        class: non_empty(q.class.as_ref()).unwrap_or_default(),
-        relation: non_empty(q.relation.as_ref()).unwrap_or_default(),
-        hops: Hops::neighborhood(q.hops).get(),
-        from: non_empty(q.from.as_ref()).unwrap_or_default(),
-        to: non_empty(q.to.as_ref()).unwrap_or_default(),
-        max_hops: Hops::path(q.max_hops).get(),
-    };
+    let query = GraphQueryView::from_query(&q);
     let embedding = if query.entity.is_empty() {
         None
     } else {
@@ -1980,18 +2015,10 @@ async fn graph_page(
             graph_api::entity_embedding(&app, &query.to).await?,
         ))
     };
-    let wanted = GraphQueryView {
-        entity: query.entity.clone(),
-        class: query.class.clone(),
-        relation: query.relation.clone(),
-        hops: query.hops,
-        from: query.from.clone(),
-        to: query.to.clone(),
-        max_hops: query.max_hops,
-    };
-    let (status, has_ontology, chunk_count, merges, result) = app
+    let wanted = query.clone();
+    let data = app
         .read(&id, move |db| {
-            graph_page_data(
+            GraphPageData::read(
                 db,
                 &wanted,
                 embedding.as_deref(),
@@ -2000,10 +2027,11 @@ async fn graph_page(
             )
         })
         .await?;
-    let result = match result {
-        Some((title, found)) => Some(graph_result_view(title, &found)?),
+    let result = match data.result {
+        Some((title, found)) => Some(GraphResultView::of(title, &found)?),
         None => None,
     };
+    let status = data.status;
     let mut drift: Vec<String> = status
         .drift
         .classes
@@ -2019,12 +2047,12 @@ async fn graph_page(
         .collect();
     drift.sort();
     html(&GraphPage {
-        page: page(&app, &access.identity, "Graph", Some(&access)),
+        page: Page::in_workspace(&app, "Graph", &access),
         status,
         drift,
-        has_ontology,
-        chunk_count,
-        merges,
+        has_ontology: data.has_ontology,
+        chunk_count: data.chunk_count,
+        merges: data.merges,
         query,
         result,
         error: q.error,
@@ -2032,128 +2060,135 @@ async fn graph_page(
     })
 }
 
-type PageData = (
-    GraphStatus,
-    bool,
-    usize,
-    Vec<resolve::MergeProposal>,
-    Option<(String, GraphResult)>,
-);
-
-/// Status, ontology presence, chunk count, merge queue, and the result of
-/// whatever the query asked for.
 /// The embeddings of a path query's two ends, when a model exists.
 type EndEmbeddings = (Option<Vector>, Option<Vector>);
 
-fn graph_page_data(
-    db: &WorkspaceDb,
-    wanted: &GraphQueryView,
-    embedding: Option<&[f32]>,
-    path_embeddings: Option<&EndEmbeddings>,
-    options: GraphOptions,
-) -> CoreResult<PageData> {
-    let status = graph_store::status(db)?;
-    let ontology = ontology_store::current(db)?;
-    let chunk_count = usize::try_from(extract::pending_chunk_count(db)?).unwrap_or(0);
-    let merges = resolve::pending(db)?;
-    let result = if let Some((a, b)) = path_embeddings {
-        let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
-        let to = traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
-        let found = match (from.first(), to.first()) {
-            (Some(a), Some(b)) => traverse::path(db, a, b, Hops::new(wanted.max_hops), &options)?,
-            _ => GraphResult::default(),
+/// What the graph page reads from the workspace in one go.
+struct GraphPageData {
+    status: GraphStatus,
+    has_ontology: bool,
+    /// Chunks not yet sent to extraction.
+    chunk_count: usize,
+    merges: Vec<resolve::MergeProposal>,
+    /// The query's title and result, when it asked for anything.
+    result: Option<(String, GraphResult)>,
+}
+
+impl GraphPageData {
+    fn read(
+        db: &WorkspaceDb,
+        wanted: &GraphQueryView,
+        embedding: Option<&[f32]>,
+        path_embeddings: Option<&EndEmbeddings>,
+        options: GraphOptions,
+    ) -> CoreResult<Self> {
+        let status = graph_store::status(db)?;
+        let ontology = ontology_store::current(db)?;
+        let chunk_count = usize::try_from(extract::pending_chunk_count(db)?).unwrap_or(0);
+        let merges = resolve::pending(db)?;
+        let result = if let Some((a, b)) = path_embeddings {
+            let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
+            let to = traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
+            let found = match (from.first(), to.first()) {
+                (Some(a), Some(b)) => {
+                    traverse::path(db, a, b, Hops::new(wanted.max_hops), &options)?
+                }
+                _ => GraphResult::default(),
+            };
+            Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
+        } else if !wanted.entity.is_empty() {
+            let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
+            let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
+            let roots = traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
+            let found =
+                traverse::neighborhood(db, &roots, Hops::new(wanted.hops), relation, &options)?;
+            Some((format!("Around {}", wanted.entity), found))
+        } else if !wanted.class.is_empty() {
+            let found = traverse::by_class(
+                db,
+                ontology.as_ref(),
+                &wanted.class,
+                options.max_nodes,
+                &options,
+            )?;
+            Some((format!("Entities of class {}", wanted.class), found))
+        } else {
+            None
         };
-        Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
-    } else if !wanted.entity.is_empty() {
-        let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
-        let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
-        let roots = traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
-        let found = traverse::neighborhood(db, &roots, Hops::new(wanted.hops), relation, &options)?;
-        Some((format!("Around {}", wanted.entity), found))
-    } else if !wanted.class.is_empty() {
-        let found = traverse::by_class(
-            db,
-            ontology.as_ref(),
-            &wanted.class,
-            options.max_nodes,
-            &options,
-        )?;
-        Some((format!("Entities of class {}", wanted.class), found))
-    } else {
-        None
-    };
-    Ok((status, ontology.is_some(), chunk_count, merges, result))
-}
-
-fn graph_result_view(title: String, result: &GraphResult) -> Result<GraphResultView, ApiError> {
-    let sources_of = |subject: &str| -> String {
-        let mut items: Vec<String> = result
-            .provenance
-            .iter()
-            .filter(|p| p.subject_id == subject)
-            .map(|p| match (&p.table_name, &p.document_id) {
-                (Some(table), _) => format!("{table} row {}", p.row_key.as_deref().unwrap_or("?")),
-                (None, Some(document)) => format!("document {}", short_id(document)),
-                (None, None) => String::from("unknown"),
-            })
-            .collect();
-        items.sort();
-        items.dedup();
-        items.join(", ")
-    };
-    let label_of = |id: &str| -> String {
-        result
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .map_or_else(|| short_id(id), |n| n.label.clone())
-    };
-    let nodes = result
-        .nodes
-        .iter()
-        .map(|n| GraphNodeView {
-            id: n.id.clone(),
-            label: n.label.clone(),
-            class_id: n.class_id.clone(),
-            provisional: n.provisional,
-            properties: match &n.properties {
-                serde_json::Value::Object(map) if !map.is_empty() => map
-                    .iter()
-                    .map(|(k, v)| format!("{k}: {}", display_json(v)))
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                _ => String::new(),
-            },
-            sources: sources_of(&n.id),
+        Ok(Self {
+            status,
+            has_ontology: ontology.is_some(),
+            chunk_count,
+            merges,
+            result,
         })
-        .collect();
-    let edges = result
-        .edges
-        .iter()
-        .map(|e| GraphEdgeView {
-            source: label_of(&e.source_node_id),
-            relation: e.relation_id.clone(),
-            target: label_of(&e.target_node_id),
-            sources: sources_of(&e.id),
-        })
-        .collect();
-    Ok(GraphResultView {
-        title,
-        json: serde_json::to_string(result)?,
-        nodes,
-        edges,
-    })
-}
-
-fn display_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
     }
 }
 
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
+impl GraphResultView {
+    /// `result` for the inspector: node and edge rows with their sources.
+    fn of(title: String, result: &GraphResult) -> Result<Self, ApiError> {
+        let short = |id: &str| -> String { id.chars().take(8).collect() };
+        let sources_of = |subject: &str| -> String {
+            let mut items: Vec<String> = result
+                .provenance
+                .iter()
+                .filter(|p| p.subject_id == subject)
+                .map(|p| match (&p.table_name, &p.document_id) {
+                    (Some(table), _) => {
+                        format!("{table} row {}", p.row_key.as_deref().unwrap_or("?"))
+                    }
+                    (None, Some(document)) => format!("document {}", short(document)),
+                    (None, None) => String::from("unknown"),
+                })
+                .collect();
+            items.sort();
+            items.dedup();
+            items.join(", ")
+        };
+        let label_of = |id: &str| -> String {
+            result
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map_or_else(|| short(id), |n| n.label.clone())
+        };
+        let nodes = result
+            .nodes
+            .iter()
+            .map(|n| GraphNodeView {
+                id: n.id.clone(),
+                label: n.label.clone(),
+                class_id: n.class_id.clone(),
+                provisional: n.provisional,
+                properties: match &n.properties {
+                    serde_json::Value::Object(map) if !map.is_empty() => map
+                        .iter()
+                        .map(|(k, v)| format!("{k}: {}", JsonText(v)))
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                    _ => String::new(),
+                },
+                sources: sources_of(&n.id),
+            })
+            .collect();
+        let edges = result
+            .edges
+            .iter()
+            .map(|e| GraphEdgeView {
+                source: label_of(&e.source_node_id),
+                relation: e.relation_id.clone(),
+                target: label_of(&e.target_node_id),
+                sources: sources_of(&e.id),
+            })
+            .collect();
+        Ok(Self {
+            title,
+            json: serde_json::to_string(result)?,
+            nodes,
+            edges,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -2171,7 +2206,7 @@ async fn graph_extract(
     Path(id): Path<String>,
     Form(form): Form<ExtractForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let sample = form
         .sample
         .as_deref()
@@ -2202,7 +2237,7 @@ async fn graph_revalidate(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let revalidated = access.revalidate_graph(&app).await;
     Ok(Flash::after(format!("/w/{id}/graph"), revalidated, |r| {
         Some(format!(
@@ -2218,7 +2253,7 @@ async fn graph_review(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     access.review_graph(&app).await?;
     Ok(Flash::to(format!("/w/{id}/graph")).into_response())
 }
@@ -2234,7 +2269,7 @@ async fn graph_merge_decide(
     Path((id, mid)): Path<(String, String)>,
     Form(form): Form<MergeForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     // Parsed rather than extracted, so a bad value comes back as a notice
     // on the page instead of an error page.
     let back = format!("/w/{id}/graph");

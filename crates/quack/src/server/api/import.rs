@@ -8,7 +8,7 @@ use quack_core::llm;
 use quack_core::storage::control::{AuditAction, Outcome};
 use serde::Deserialize;
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 use quack_core::import::{self, ImportPolicy, ImportRequest, ImportSummary};
@@ -42,7 +42,7 @@ pub(crate) async fn import(
     Path(id): Path<String>,
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let summary = run_import(&app, &access, &ImportRequest::from(body)).await?;
     Ok(Json(serde_json::to_value(summary)?))
 }
@@ -81,13 +81,9 @@ pub(crate) async fn run_import(
         "source_table": request.source_table,
         "rows": outcome.as_ref().ok().map(|s| s.rows),
     });
-    let audit_outcome = if outcome.is_ok() {
-        Outcome::Allowed
-    } else {
-        Outcome::Error
-    };
+    let audit_outcome = Outcome::of(&outcome);
     access
         .audit(app, AuditAction::Import, None, audit_outcome, Some(detail))
         .await?;
-    outcome.map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+    outcome.map_err(|e| ApiError::unprocessable(e.to_string()))
 }

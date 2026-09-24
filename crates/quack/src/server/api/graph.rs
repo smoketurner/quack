@@ -20,7 +20,7 @@ use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, GraphReport, RunKind};
 use crate::server::state::{App, ExtractionSlot, with_db};
@@ -54,7 +54,7 @@ pub(crate) async fn search(
     Path(id): Path<String>,
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let entity = q
         .entity
         .as_deref()
@@ -121,7 +121,7 @@ pub(crate) async fn path(
     Path(id): Path<String>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let from = q.from.trim().to_owned();
     let to = q.to.trim().to_owned();
     if from.is_empty() || to.is_empty() {
@@ -160,7 +160,7 @@ pub(crate) async fn status(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "graph_status")
         .await?;
@@ -187,7 +187,7 @@ pub(crate) async fn extract(
     Path(id): Path<String>,
     body: Option<Json<ExtractRequest>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     let started = access
         .start_extraction(
@@ -254,10 +254,7 @@ impl Access {
         let (access, id) = (self, self.workspace.id.as_str());
         let (sample, reset) = (plan.sample, plan.reset);
         let slot = app.begin_extraction(id).ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "a graph extraction is already running for this workspace",
-            )
+            ApiError::conflict("a graph extraction is already running for this workspace")
         })?;
         let db = app.workspace_db(id).await?;
         let (ontology, provisional) = app
@@ -450,7 +447,7 @@ pub(crate) async fn revalidate(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(serde_json::to_value(
         access.revalidate_graph(&app).await?,
     )?))
@@ -461,7 +458,7 @@ pub(crate) async fn review(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(serde_json::to_value(
         access.review_graph(&app).await?,
     )?))
@@ -472,7 +469,7 @@ pub(crate) async fn merges(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "graph_merges")
         .await?;
@@ -492,7 +489,7 @@ pub(crate) async fn decide_merge(
     Path((id, mid)): Path<(String, String)>,
     Json(body): Json<DecideMerge>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let proposal = access.decide_merge(&app, &mid, body.action).await?;
     Ok(Json(serde_json::to_value(proposal)?))
 }

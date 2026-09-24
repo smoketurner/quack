@@ -15,39 +15,82 @@ use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use tokio::sync::broadcast;
 
 use super::StreamEvent;
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
 /// Shown in place of a question the caller may not read.
 const PRIVATE_QUESTION: &str = "a question in a private session";
 
-/// `job` as `access` may see it: another member's question is not shown.
-pub(crate) fn redact(access: &Access, mut job: JobInfo) -> JobInfo {
-    if job.kind == JobKind::Chat && !access.owns(job.owner.as_deref()) {
-        job.label = String::from(PRIVATE_QUESTION);
-        job.outcome = None;
-        job.status = None;
+/// What the caller may see of the workspace's jobs, and do to them.
+impl Access {
+    /// `job` as this caller may see it: another member's question is not
+    /// shown.
+    fn redact(&self, mut job: JobInfo) -> JobInfo {
+        if job.kind == JobKind::Chat && !self.owns(job.owner.as_deref()) {
+            job.label = String::from(PRIVATE_QUESTION);
+            job.outcome = None;
+            job.status = None;
+        }
+        job
     }
-    job
-}
 
-/// The workspace's jobs, newest first, as the caller may see them.
-pub(crate) fn visible_jobs(app: &App, access: &Access) -> Vec<JobInfo> {
-    let mut jobs: Vec<JobInfo> = app
-        .jobs
-        .list_workspace(&access.workspace.id)
-        .into_iter()
-        .map(|job| redact(access, job))
-        .collect();
-    jobs.reverse();
-    jobs
-}
+    /// The workspace's jobs, newest first, as the caller may see them.
+    pub(crate) fn visible_jobs(&self, app: &App) -> Vec<JobInfo> {
+        let mut jobs: Vec<JobInfo> = app
+            .jobs
+            .list_workspace(&self.workspace.id)
+            .into_iter()
+            .map(|job| self.redact(job))
+            .collect();
+        jobs.reverse();
+        jobs
+    }
 
-/// Whether the caller may cancel `job`: their own, or any as an owner or
-/// admin; and never without the write permission.
-pub(crate) fn may_cancel(access: &Access, job: &JobInfo) -> bool {
-    access.permits(Need::WRITE) && access.owns(job.owner.as_deref())
+    /// Whether the caller may cancel `job`: their own, or any as an owner
+    /// or admin; and never without the write permission.
+    pub(crate) fn may_cancel(&self, job: &JobInfo) -> bool {
+        self.permits(Need::WRITE) && self.owns(job.owner.as_deref())
+    }
+
+    /// The job, if it belongs to this workspace.
+    fn find_job(&self, app: &App, job: &str) -> ApiResult<JobInfo> {
+        job.parse::<JobId>()
+            .ok()
+            .and_then(|id| app.jobs.get(id))
+            .filter(|j| j.workspace_id.as_deref() == Some(self.workspace.id.as_str()))
+            .ok_or_else(|| ApiError::not_found(format!("job '{job}' not found")))
+    }
+
+    /// The cancel the API and the web page share, audited either way.
+    pub(crate) async fn cancel_job(&self, app: &App, job: &str) -> ApiResult<JobInfo> {
+        let found = self.find_job(app, job)?;
+        let job_id = found.id.to_string();
+        if !self.may_cancel(&found) {
+            self.audit(
+                app,
+                AuditAction::Cancel,
+                Some(ResourceKind::Job.id(&job_id)),
+                Outcome::Denied,
+                None,
+            )
+            .await?;
+            return Err(ApiError::forbidden(
+                "only the job's owner, a workspace owner, or an admin may cancel it",
+            ));
+        }
+        let active = app.jobs.cancel(found.id);
+        self.audit(
+            app,
+            AuditAction::Cancel,
+            Some(ResourceKind::Job.id(&job_id)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "kind": found.kind, "was_active": active })),
+        )
+        .await?;
+        let current = app.jobs.get(found.id).unwrap_or(found);
+        Ok(self.redact(current))
+    }
 }
 
 pub(crate) async fn list(
@@ -55,9 +98,9 @@ pub(crate) async fn list(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::List, "jobs").await?;
-    let jobs = visible_jobs(&app, &access);
+    let jobs = access.visible_jobs(&app);
     let counts = app.jobs.counts(Some(&id));
     Ok(Json(serde_json::json!({
         "jobs": jobs,
@@ -66,24 +109,15 @@ pub(crate) async fn list(
     })))
 }
 
-/// The job, if it belongs to this workspace.
-fn find(app: &App, workspace_id: &str, job: &str) -> ApiResult<JobInfo> {
-    job.parse::<JobId>()
-        .ok()
-        .and_then(|id| app.jobs.get(id))
-        .filter(|j| j.workspace_id.as_deref() == Some(workspace_id))
-        .ok_or_else(|| ApiError::not_found(format!("job '{job}' not found")))
-}
-
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path((id, job)): Path<(String, String)>,
 ) -> ApiResult<Json<JobInfo>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Show, "job").await?;
-    let job = find(&app, &id, &job)?;
-    Ok(Json(redact(&access, job)))
+    let job = access.find_job(&app, &job)?;
+    Ok(Json(access.redact(job)))
 }
 
 /// Ask a job to stop: a queued one never starts, a running one stops at
@@ -93,40 +127,8 @@ pub(crate) async fn cancel(
     identity: Identity,
     Path((id, job)): Path<(String, String)>,
 ) -> ApiResult<Json<JobInfo>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
-    Ok(Json(cancel_job(&app, &access, &job).await?))
-}
-
-/// The cancel the API and the web page share, audited either way.
-pub(crate) async fn cancel_job(app: &App, access: &Access, job: &str) -> ApiResult<JobInfo> {
-    let found = find(app, &access.workspace.id, job)?;
-    let job_id = found.id.to_string();
-    if !may_cancel(access, &found) {
-        access
-            .audit(
-                app,
-                AuditAction::Cancel,
-                Some(ResourceKind::Job.id(&job_id)),
-                Outcome::Denied,
-                None,
-            )
-            .await?;
-        return Err(ApiError::forbidden(
-            "only the job's owner, a workspace owner, or an admin may cancel it",
-        ));
-    }
-    let active = app.jobs.cancel(found.id);
-    access
-        .audit(
-            app,
-            AuditAction::Cancel,
-            Some(ResourceKind::Job.id(&job_id)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "kind": found.kind, "was_active": active })),
-        )
-        .await?;
-    let current = app.jobs.get(found.id).unwrap_or(found);
-    Ok(redact(access, current))
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    Ok(Json(access.cancel_job(&app, &job).await?))
 }
 
 /// Every change to the workspace's jobs as SSE `job` events (a `JobInfo`
@@ -137,12 +139,12 @@ pub(crate) async fn stream(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Stream, "jobs").await?;
     let receiver = app.jobs.subscribe();
     let first = StreamEvent::Jobs
         .event()
-        .json_data(visible_jobs(&app, &access))
+        .json_data(access.visible_jobs(&app))
         .unwrap_or_default();
     let state = (receiver, app, access, Some(first));
     let stream = futures::stream::unfold(state, |(mut receiver, app, access, first)| async move {
@@ -154,7 +156,7 @@ pub(crate) async fn stream(
                 Ok(job) if job.workspace_id.as_deref() == Some(&access.workspace.id) => {
                     let event = StreamEvent::Job
                         .event()
-                        .json_data(redact(&access, job))
+                        .json_data(access.redact(job))
                         .unwrap_or_default();
                     return Some((Ok(event), (receiver, app, access, None)));
                 }
@@ -162,7 +164,7 @@ pub(crate) async fn stream(
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let event = StreamEvent::Jobs
                         .event()
-                        .json_data(visible_jobs(&app, &access))
+                        .json_data(access.visible_jobs(&app))
                         .unwrap_or_default();
                     return Some((Ok(event), (receiver, app, access, None)));
                 }

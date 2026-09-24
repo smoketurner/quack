@@ -14,7 +14,7 @@ use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{AuditAction, Outcome};
 use quack_core::storage::workspace::WorkspaceDb;
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::ApiResult;
 use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::App;
@@ -27,7 +27,7 @@ pub(crate) async fn show(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let status = app.read(&id, WorkspaceDb::embedding_status).await?;
     access
         .audit_read(&app, AuditAction::EmbeddingsStatus, "embedding status")
@@ -47,7 +47,7 @@ pub(crate) async fn refresh(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let started = access.refresh_embeddings(&app).await?;
     Ok((started.status_code(), Json(serde_json::to_value(started)?)))
 }

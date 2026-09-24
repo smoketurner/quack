@@ -11,7 +11,7 @@
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::storage::control::{
@@ -22,7 +22,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
-use super::state::{App, SessionLookup};
+use super::state::{App, SessionLookup, SessionToken};
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -51,20 +51,17 @@ pub(crate) struct Identity {
     pub credential: Credential,
     pub client_addr: Option<String>,
     pub request_id: Option<String>,
-    /// Set for requests that arrived over the MCP transport, so audit rows
-    /// name that channel rather than the credential's.
-    pub via_mcp: bool,
+    /// Set for requests that arrived over a transport of their own (MCP),
+    /// so audit rows name that channel rather than the credential's.
+    pub channel: Option<Channel>,
 }
 
 impl Identity {
     pub(crate) fn channel(&self) -> Channel {
-        if self.via_mcp {
-            return Channel::Mcp;
-        }
-        match self.credential {
+        self.channel.unwrap_or(match self.credential {
             Credential::Token(_) => Channel::Api,
             Credential::Local | Credential::Session(_) => Channel::Web,
-        }
+        })
     }
 
     fn token_hash(&self) -> Option<String> {
@@ -107,16 +104,20 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
         parts: &mut Parts,
         _: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> {
-        std::future::ready(Ok(Self(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| info.0),
-        )))
+        std::future::ready(Ok(Self::of(parts)))
     }
 }
 
 impl Peer {
+    fn of(parts: &Parts) -> Self {
+        Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0),
+        )
+    }
+
     /// Whether a cookie set on this response must carry `Secure`. Anything
     /// that did not come from loopback may have crossed a network, including
     /// the hop in front of a TLS-terminating proxy, so the cookie must never
@@ -131,21 +132,65 @@ impl Peer {
     }
 }
 
-/// The session cookie for a freshly opened session. `Max-Age` matches the
-/// session's absolute lifetime, so the browser drops it when the server
-/// would rather than holding a token that can only be refused.
-pub(crate) fn session_cookie(app: &App, peer: Peer, token: String) -> Cookie<'static> {
-    let cookie = Cookie::build((SESSION_COOKIE, token))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .secure(peer.needs_secure());
-    match app.config.server.session_max_age().try_into() {
-        Ok(max_age) => cookie.max_age(max_age).build(),
-        // Out of range only for a lifetime no operator can configure. A
-        // cookie without `Max-Age` still dies with the browser session, and
-        // the server expires the session itself regardless.
-        Err(_) => cookie.build(),
+/// The id the request-id layer put on the request, for audit rows: the
+/// login paths have no [`Identity`] yet to carry it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequestId(pub Option<String>);
+
+impl RequestId {
+    fn of(headers: &HeaderMap) -> Self {
+        Self(
+            headers
+                .get(REQUEST_ID_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        )
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for RequestId {
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> {
+        std::future::ready(Ok(Self::of(&parts.headers)))
+    }
+}
+
+/// The browser's login session cookie, `quack_session`.
+pub(crate) struct SessionCookie;
+
+impl SessionCookie {
+    /// The cookie for a freshly opened session. `Max-Age` matches the
+    /// session's absolute lifetime, so the browser drops it when the server
+    /// would rather than holding a token that can only be refused.
+    pub(crate) fn issue(app: &App, peer: Peer, token: SessionToken) -> Cookie<'static> {
+        let cookie = Cookie::build((SESSION_COOKIE, token.into_string()))
+            .path("/")
+            .http_only(true)
+            .same_site(SameSite::Lax)
+            .secure(peer.needs_secure());
+        match app.config.server.session_max_age().try_into() {
+            Ok(max_age) => cookie.max_age(max_age).build(),
+            // Out of range only for a lifetime no operator can configure. A
+            // cookie without `Max-Age` still dies with the browser session,
+            // and the server expires the session itself regardless.
+            Err(_) => cookie.build(),
+        }
+    }
+
+    /// The cookie that removes it, at logout.
+    pub(crate) fn clear() -> Cookie<'static> {
+        Cookie::build(SESSION_COOKIE).path("/").build()
+    }
+
+    /// The session token a request carries in it.
+    fn read(headers: &HeaderMap) -> Option<String> {
+        CookieJar::from_headers(headers)
+            .get(SESSION_COOKIE)
+            .map(|c| c.value().to_owned())
     }
 }
 
@@ -156,10 +201,10 @@ pub(crate) fn session_cookie(app: &App, peer: Peer, token: String) -> Cookie<'st
 pub(crate) async fn password_login(
     app: &App,
     peer: Peer,
-    request_id: Option<String>,
+    RequestId(request_id): RequestId,
     username: &str,
     password: &str,
-) -> ApiResult<(UserRow, String)> {
+) -> ApiResult<(UserRow, SessionToken)> {
     let verified = app.control.verify_password(username, password).await?;
     let mut entry = AuditEntry::new(
         LOGIN_ACTION,
@@ -186,42 +231,16 @@ pub(crate) async fn password_login(
     let Some(user) = verified else {
         return Err(ApiError::unauthorized("wrong username or password"));
     };
-    let token = app.open_web_session(&user.id)?;
+    let token = app.sessions.open(&user.id)?;
     Ok((user, token))
-}
-
-fn bearer(parts: &Parts) -> Option<String> {
-    parts
-        .headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(|t| t.trim().to_owned())
-}
-
-/// The id the request-id layer set, for an audit row written where there is
-/// no [`Identity`] to carry it — the login paths have no caller yet.
-pub(crate) fn request_id(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-}
-
-fn request_meta(parts: &Parts) -> (Option<String>, Option<String>) {
-    let addr = parts
-        .extensions
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip().to_string());
-    (addr, request_id(&parts.headers))
 }
 
 impl FromRequestParts<App> for Identity {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        let (client_addr, request_id) = request_meta(parts);
+        let client_addr = Peer::of(parts).ip();
+        let RequestId(request_id) = RequestId::of(&parts.headers);
         if app.local {
             return Ok(Self {
                 user_id: String::from(LOCAL_USER_ID),
@@ -230,21 +249,22 @@ impl FromRequestParts<App> for Identity {
                 credential: Credential::Local,
                 client_addr,
                 request_id,
-                via_mcp: false,
+                channel: None,
             });
         }
 
-        let presented = match bearer(parts) {
-            Some(token) => Some(token),
-            None => CookieJar::from_headers(&parts.headers)
-                .get(SESSION_COOKIE)
-                .map(|c| c.value().to_owned()),
-        };
+        let bearer = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t.trim().to_owned());
+        let presented = bearer.or_else(|| SessionCookie::read(&parts.headers));
         let Some(presented) = presented else {
             return Err(ApiError::unauthorized("log in or send a bearer token"));
         };
 
-        match app.web_session_user(&presented) {
+        match app.sessions.lookup(&presented) {
             SessionLookup::Active(user_id) => {
                 let user = app
                     .control
@@ -258,7 +278,7 @@ impl FromRequestParts<App> for Identity {
                     credential: Credential::Session(presented),
                     client_addr,
                     request_id,
-                    via_mcp: false,
+                    channel: None,
                 });
             }
             // Saying so, rather than falling through to "unknown token",
@@ -308,7 +328,7 @@ impl FromRequestParts<App> for Identity {
             credential: Credential::Token(token),
             client_addr,
             request_id,
-            via_mcp: false,
+            channel: None,
         })
     }
 }
@@ -328,6 +348,12 @@ impl Need {
         role: Role::Viewer,
         scope: Scope::Read,
         admin_ok: false,
+    };
+    /// Reading, or a server admin without membership: settings and
+    /// members, never content.
+    pub(crate) const READ_OR_ADMIN: Self = Self {
+        admin_ok: true,
+        ..Self::READ
     };
     pub(crate) const WRITE: Self = Self {
         role: Role::Member,
@@ -428,72 +454,68 @@ impl Access {
     }
 }
 
-/// Resolve the workspace and check the caller against `need`, writing a
-/// denied audit row and returning 403/404 when they fall short.
-pub(crate) async fn access(
-    app: &App,
-    identity: Identity,
-    workspace_id: &str,
-    need: Need,
-) -> ApiResult<Access> {
-    let Some(workspace) = app.control.get_workspace(workspace_id).await? else {
-        let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
-        entry.workspace_id = Some(workspace_id.to_owned());
-        app.control.record_audit(&entry).await?;
-        return Err(ApiError::not_found("no such workspace"));
-    };
-    let role = if app.local {
-        Some(Role::Owner)
-    } else {
-        app.control
-            .member_role(&workspace.id, &identity.user_id)
-            .await?
-    };
-    if let Credential::Token(token) = &identity.credential
-        && token.workspace_id != workspace.id
-    {
-        deny(
-            app,
-            &identity,
-            &workspace,
-            "token is scoped to another workspace",
-        )
-        .await?;
-    }
-    let access = Access {
-        identity,
-        workspace,
-        role,
-    };
-    if !access.permits(need) {
-        let reason = match access.role {
-            None if access.identity.is_admin => "admins read workspace content only as members",
-            None => "not a member of this workspace",
-            Some(_) if access.identity.lacks_scope(need.scope) => "token lacks the scope",
-            Some(_) => "role does not allow this",
+impl Access {
+    /// Resolve the workspace and check the caller against `need`, writing a
+    /// denied audit row and returning 403/404 when they fall short.
+    pub(crate) async fn resolve(
+        app: &App,
+        identity: Identity,
+        workspace_id: &str,
+        need: Need,
+    ) -> ApiResult<Self> {
+        let Some(workspace) = app.control.get_workspace(workspace_id).await? else {
+            let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
+            entry.workspace_id = Some(workspace_id.to_owned());
+            app.control.record_audit(&entry).await?;
+            return Err(ApiError::not_found("no such workspace"));
         };
-        deny(app, &access.identity, &access.workspace, reason).await?;
+        let role = if app.local {
+            Some(Role::Owner)
+        } else {
+            app.control
+                .member_role(&workspace.id, &identity.user_id)
+                .await?
+        };
+        if let Credential::Token(token) = &identity.credential
+            && token.workspace_id != workspace.id
+        {
+            identity
+                .deny(app, &workspace, "token is scoped to another workspace")
+                .await?;
+        }
+        let access = Self {
+            identity,
+            workspace,
+            role,
+        };
+        if !access.permits(need) {
+            let reason = match access.role {
+                None if access.identity.is_admin => "admins read workspace content only as members",
+                None => "not a member of this workspace",
+                Some(_) if access.identity.lacks_scope(need.scope) => "token lacks the scope",
+                Some(_) => "role does not allow this",
+            };
+            access.identity.deny(app, &access.workspace, reason).await?;
+        }
+        Ok(access)
     }
-    Ok(access)
 }
 
-async fn deny(
-    app: &App,
-    identity: &Identity,
-    workspace: &WorkspaceRow,
-    reason: &str,
-) -> ApiResult<()> {
-    let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
-    entry.workspace_id = Some(workspace.id.clone());
-    app.control.record_audit(&entry).await?;
-    Err(ApiError::forbidden(reason))
-}
+impl Identity {
+    /// Record a refused attempt on `workspace` and return 403 with `reason`.
+    async fn deny(&self, app: &App, workspace: &WorkspaceRow, reason: &str) -> ApiResult<()> {
+        let mut entry = self.audit(AuditAction::Open, Outcome::Denied);
+        entry.workspace_id = Some(workspace.id.clone());
+        app.control.record_audit(&entry).await?;
+        Err(ApiError::forbidden(reason))
+    }
 
-/// Server admins only; everything else is 403.
-pub(crate) fn require_admin(identity: &Identity) -> ApiResult<()> {
-    if identity.is_admin {
-        Ok(())
-    } else {
-        Err(ApiError::new(StatusCode::FORBIDDEN, "admin only"))
+    /// Server admins only; everything else is 403.
+    pub(crate) fn require_admin(&self) -> ApiResult<()> {
+        if self.is_admin {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden("admin only"))
+        }
     }
 }

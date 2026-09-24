@@ -383,6 +383,17 @@ text_enum!(Outcome, "outcome", {
     Error => "error",
 });
 
+impl Outcome {
+    /// `Allowed` for work that succeeded, `Error` for work that failed.
+    #[must_use]
+    pub fn of<T, E>(result: &std::result::Result<T, E>) -> Self {
+        match result {
+            Ok(_) => Self::Allowed,
+            Err(_) => Self::Error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {

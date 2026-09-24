@@ -1443,7 +1443,7 @@ Same tool set over two transports (`rmcp`, the official Rust SDK): `quack mcp [-
 needed, unaudited like the CLI), and `/mcp/v1/{workspace}` under `quack serve` over MCP's
 streamable HTTP transport (the successor of the HTTP+SSE pair; responses stream as SSE),
 authenticated with the same bearer as the REST API. Over HTTP every request passes
-`access()`, each caller gets a transport keyed by workspace, user, and write permission
+`Access::resolve`, each caller gets a transport keyed by workspace, user, and write permission
 (the member role with the write scope), and every tool call is audited with channel
 `mcp`. Each `query` call starts a new session (owned by the server user, `mode` `chat` or
 `query`) and returns its `session_id`; passing that id back continues the session, and a

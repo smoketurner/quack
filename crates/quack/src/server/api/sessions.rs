@@ -10,7 +10,7 @@ use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 
@@ -30,7 +30,7 @@ pub(crate) async fn list(
     Path(id): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "sessions")
         .await?;
@@ -45,22 +45,25 @@ pub(crate) async fn list(
     Ok(Json(serde_json::json!({ "sessions": rows })))
 }
 
-async fn visible_session(
-    app: &App,
-    access: &Access,
-    workspace_id: &str,
-    session_id: &str,
-) -> ApiResult<sessions::SessionRow> {
-    let sid = session_id.to_owned();
-    let user = access.identity.user_id.clone();
-    let sees_all = access.sees_all_sessions();
-    let found = app
-        .read(workspace_id, move |db| {
-            Ok(sessions::get_session(db, &sid)?
-                .filter(|s| sessions::visible_to(s, &user, sees_all)))
-        })
-        .await?;
-    found.ok_or_else(|| Record::Session.missing(session_id).into())
+impl Access {
+    /// The session, if the caller may see it; one they may not reads as
+    /// missing.
+    async fn visible_session(
+        &self,
+        app: &App,
+        session_id: &str,
+    ) -> ApiResult<sessions::SessionRow> {
+        let sid = session_id.to_owned();
+        let user = self.identity.user_id.clone();
+        let sees_all = self.sees_all_sessions();
+        let found = app
+            .read(&self.workspace.id, move |db| {
+                Ok(sessions::get_session(db, &sid)?
+                    .filter(|s| sessions::visible_to(s, &user, sees_all)))
+            })
+            .await?;
+        found.ok_or_else(|| Record::Session.missing(session_id).into())
+    }
 }
 
 pub(crate) async fn show(
@@ -68,8 +71,8 @@ pub(crate) async fn show(
     identity: Identity,
     Path((id, sid)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    let session = visible_session(&app, &access, &id, &sid).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let session = access.visible_session(&app, &sid).await?;
     let session_id = session.id.clone();
     let messages = app
         .read(&id, move |db| sessions::messages(db, &session_id))
@@ -103,103 +106,19 @@ pub(crate) async fn update(
     Path((id, sid)): Path<(String, String)>,
     Json(body): Json<UpdateSession>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     if body.shared.is_none() && body.mode.is_none() {
         return Err(ApiError::bad_request("give shared or mode"));
     }
     let mut session = None;
     if let Some(shared) = body.shared {
-        session = Some(set_shared(&app, &access, &sid, shared).await?);
+        session = Some(access.set_session_shared(&app, &sid, shared).await?);
     }
     if let Some(mode) = body.mode {
-        session = Some(set_mode(&app, &access, &sid, mode).await?);
+        session = Some(access.set_session_mode(&app, &sid, mode).await?);
     }
     let session = session.ok_or_else(|| ApiError::from(Record::Session.missing(sid.as_str())))?;
     Ok(Json(serde_json::to_value(session)?))
-}
-
-/// Change a session's mode: its creator, or an owner, may.
-pub(crate) async fn set_mode(
-    app: &App,
-    access: &Access,
-    sid: &str,
-    mode: ChatMode,
-) -> ApiResult<sessions::SessionRow> {
-    let session = visible_session(app, access, &access.workspace.id, sid).await?;
-    if !access.owns(session.created_by.as_deref()) {
-        access
-            .audit(
-                app,
-                AuditAction::Mode,
-                Some(ResourceKind::Session.id(sid)),
-                Outcome::Denied,
-                None,
-            )
-            .await?;
-        return Err(ApiError::forbidden(
-            "only the session's creator or an owner may change its mode",
-        ));
-    }
-    let db = app.workspace_db(&access.workspace.id).await?;
-    let session_id = session.id.clone();
-    let updated = with_db(db, move |db| {
-        sessions::set_session_mode(db, &session_id, mode)?;
-        sessions::get_session(db, &session_id)?
-            .ok_or_else(|| Record::Session.missing(session_id.as_str()))
-    })
-    .await?;
-    access
-        .audit(
-            app,
-            AuditAction::Mode,
-            Some(ResourceKind::Session.id(sid)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "mode": mode.as_str() })),
-        )
-        .await?;
-    Ok(updated)
-}
-
-/// The shared toggle behind the API and the web button.
-pub(crate) async fn set_shared(
-    app: &App,
-    access: &Access,
-    sid: &str,
-    shared: bool,
-) -> ApiResult<sessions::SessionRow> {
-    let session = visible_session(app, access, &access.workspace.id, sid).await?;
-    if !access.owns(session.created_by.as_deref()) {
-        access
-            .audit(
-                app,
-                AuditAction::Share,
-                Some(ResourceKind::Session.id(sid)),
-                Outcome::Denied,
-                None,
-            )
-            .await?;
-        return Err(ApiError::forbidden(
-            "only the session's creator or an owner may share it",
-        ));
-    }
-    let db = app.workspace_db(&access.workspace.id).await?;
-    let session_id = session.id.clone();
-    let updated = with_db(db, move |db| {
-        sessions::set_session_shared(db, &session_id, shared)?;
-        sessions::get_session(db, &session_id)?
-            .ok_or_else(|| Record::Session.missing(session_id.as_str()))
-    })
-    .await?;
-    access
-        .audit(
-            app,
-            AuditAction::Share,
-            Some(ResourceKind::Session.id(sid)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "shared": shared })),
-        )
-        .await?;
-    Ok(updated)
 }
 
 /// Delete a session: its creator, or an owner, may. Audited as `delete`.
@@ -208,33 +127,120 @@ pub(crate) async fn remove(
     identity: Identity,
     Path((id, sid)): Path<(String, String)>,
 ) -> ApiResult<axum::http::StatusCode> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    delete_session(&app, &access, &sid).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.delete_session(&app, &sid).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// The shared delete behind the API and the web button.
-pub(crate) async fn delete_session(app: &App, access: &Access, sid: &str) -> ApiResult<()> {
-    let session = visible_session(app, access, &access.workspace.id, sid).await?;
-    if !access.owns(session.created_by.as_deref()) {
-        access
-            .audit(
+/// What a session's creator, or an owner or admin, may do to it; the API
+/// and the web console share these.
+impl Access {
+    /// The session, when the caller may change it; otherwise the refusal
+    /// is audited as `action` and answered 403 with `refusal`.
+    async fn own_session(
+        &self,
+        app: &App,
+        sid: &str,
+        action: AuditAction,
+        refusal: &'static str,
+    ) -> ApiResult<sessions::SessionRow> {
+        let session = self.visible_session(app, sid).await?;
+        if !self.owns(session.created_by.as_deref()) {
+            self.audit(
                 app,
-                AuditAction::Delete,
+                action,
                 Some(ResourceKind::Session.id(sid)),
                 Outcome::Denied,
                 None,
             )
             .await?;
-        return Err(ApiError::forbidden(
-            "only the session's creator or an owner may delete it",
-        ));
+            return Err(ApiError::forbidden(refusal));
+        }
+        Ok(session)
     }
-    let db = app.workspace_db(&access.workspace.id).await?;
-    let session_id = session.id.clone();
-    with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
-    access
-        .audit(
+
+    /// Change a session's mode.
+    pub(crate) async fn set_session_mode(
+        &self,
+        app: &App,
+        sid: &str,
+        mode: ChatMode,
+    ) -> ApiResult<sessions::SessionRow> {
+        let session = self
+            .own_session(
+                app,
+                sid,
+                AuditAction::Mode,
+                "only the session's creator or an owner may change its mode",
+            )
+            .await?;
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let session_id = session.id;
+        let updated = with_db(db, move |db| {
+            sessions::set_session_mode(db, &session_id, mode)?;
+            sessions::get_session(db, &session_id)?
+                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Mode,
+            Some(ResourceKind::Session.id(sid)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "mode": mode.as_str() })),
+        )
+        .await?;
+        Ok(updated)
+    }
+
+    /// Share a session with every member, or take it back.
+    pub(crate) async fn set_session_shared(
+        &self,
+        app: &App,
+        sid: &str,
+        shared: bool,
+    ) -> ApiResult<sessions::SessionRow> {
+        let session = self
+            .own_session(
+                app,
+                sid,
+                AuditAction::Share,
+                "only the session's creator or an owner may share it",
+            )
+            .await?;
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let session_id = session.id;
+        let updated = with_db(db, move |db| {
+            sessions::set_session_shared(db, &session_id, shared)?;
+            sessions::get_session(db, &session_id)?
+                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Share,
+            Some(ResourceKind::Session.id(sid)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "shared": shared })),
+        )
+        .await?;
+        Ok(updated)
+    }
+
+    /// Delete a session, audited as `delete`.
+    pub(crate) async fn delete_session(&self, app: &App, sid: &str) -> ApiResult<()> {
+        let session = self
+            .own_session(
+                app,
+                sid,
+                AuditAction::Delete,
+                "only the session's creator or an owner may delete it",
+            )
+            .await?;
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let session_id = session.id;
+        with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
+        self.audit(
             app,
             AuditAction::Delete,
             Some(ResourceKind::Session.id(sid)),
@@ -242,9 +248,9 @@ pub(crate) async fn delete_session(app: &App, access: &Access, sid: &str) -> Api
             None,
         )
         .await?;
-    Ok(())
+        Ok(())
+    }
 }
-
 #[derive(Deserialize)]
 pub(crate) struct ExportQuery {
     #[serde(default)]
@@ -267,8 +273,8 @@ pub(crate) async fn export(
     Path((id, sid)): Path<(String, String)>,
     Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
-    let session = visible_session(&app, &access, &id, &sid).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let session = access.visible_session(&app, &sid).await?;
     let as_sql = match q.format {
         ExportFormat::Sql => true,
         ExportFormat::Markdown => false,

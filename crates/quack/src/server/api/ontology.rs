@@ -9,7 +9,7 @@ use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
@@ -22,7 +22,7 @@ pub(crate) async fn show(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology")
         .await?;
@@ -38,7 +38,7 @@ pub(crate) async fn replace(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access
         .replace_ontology(&app, &body.to_string(), "imported")
         .await?;
@@ -51,7 +51,7 @@ pub(crate) async fn init(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.init_ontology(&app).await?;
     Ok(Json(serde_json::to_value(stored)?))
 }
@@ -102,7 +102,7 @@ impl Access {
             .map(Some)
         })
         .await?
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "an ontology already exists"))?;
+        .ok_or_else(|| ApiError::conflict("an ontology already exists"))?;
         self.audit(
             app,
             AuditAction::Ontology,
@@ -147,7 +147,7 @@ pub(crate) async fn versions(
     Path(id): Path<String>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology_versions")
         .await?;
@@ -168,7 +168,7 @@ pub(crate) async fn version(
     Path((id, v)): Path<(String, u32)>,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit(
             &app,
@@ -202,7 +202,7 @@ pub(crate) async fn restore(
     identity: Identity,
     Path((id, v)): Path<(String, u32)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await?;
     Ok(Json(serde_json::to_value(stored)?))
 }
@@ -235,7 +235,7 @@ pub(crate) async fn propose(
     Path(id): Path<String>,
     body: Option<Json<ProposeRequest>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     if let Some(mode) = request.mode.as_deref()
         && mode != "extend"
@@ -245,7 +245,7 @@ pub(crate) async fn propose(
         )));
     }
     if request.documents {
-        let started = start_document_run(&app, &access, &id, request.sample).await?;
+        let started = access.start_document_run(&app, request.sample).await?;
         return Ok((StatusCode::ACCEPTED, started));
     }
     let proposed = access
@@ -429,7 +429,7 @@ pub(crate) async fn list_candidates(
     Path(id): Path<String>,
     Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology_candidates")
         .await?;
@@ -458,7 +458,7 @@ pub(crate) async fn decide_many(
     Path(id): Path<String>,
     Json(body): Json<DecideManyRequest>,
 ) -> ApiResult<Json<CandidatesDecided>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(
         access
             .decide_candidates(&app, body.accept, body.reject)
@@ -480,7 +480,7 @@ pub(crate) async fn decide(
     Path((id, cid)): Path<(String, String)>,
     Json(body): Json<DecideRequest>,
 ) -> ApiResult<Json<CandidateDecided>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(
         access
             .decide_candidate(&app, &cid, body.action, body.target.as_deref())
@@ -491,73 +491,78 @@ pub(crate) async fn decide(
 /// The document pass: answer 202 with the cost, then sample, extract, and
 /// queue the candidates in a background task. The end of the run is
 /// audited under the same run id.
-pub(crate) async fn start_document_run(
-    app: &App,
-    access: &Access,
-    id: &str,
-    sample: Option<u32>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let mut options = app.config.ontology.document_evidence();
-    if let Some(n) = sample {
-        options.sample_chunks = n;
-    }
-    // Fail now, not in the background, when no model can be built.
-    let extractor = llm::chat_extractor(&app.config).await?;
-    let embeddings = llm::optional_embedding_model(&app.config).await?;
-    let (cost, chunks, current) = app
-        .read(id, move |db| {
-            let cost = documents::estimate(db, &options)?;
-            let chunks = documents::sample_chunks(db, options.sample_chunks)?;
-            Ok((cost, chunks, store::current(db)?))
-        })
-        .await?;
-    if chunks.is_empty() {
-        return Err(ApiError::bad_request("no ready documents to sample"));
-    }
-    let db = app.workspace_db(id).await?;
-    let run = BackgroundRun::start(
-        app,
-        access,
-        RunKind::Ontology,
-        serde_json::json!({ "documents": true, "cost": cost }),
-    )
-    .await?;
-    let run_id = run.id().to_owned();
-    let concurrency = app.config.analysis.extraction_concurrency;
-    let progress_run = run_id.clone();
-    let job = run.submit(move |ctx| async move {
-        let run_id = progress_run;
-        let progress = |done: ChunkDone| {
-            ctx.progress(done.done, done.total);
-            tracing::info!(
-                run = %run_id,
-                done = done.done,
-                total = done.total,
-                failed = done.failed,
-                "document evidence progress"
-            );
-        };
-        let outcome = documents::run(
-            chunks,
-            extractor.as_ref(),
-            current.as_ref(),
-            &options,
-            embeddings.as_ref(),
-            concurrency,
-            &progress,
-        )
-        .await;
-        match outcome {
-            Ok((found, summary)) => with_db(db, move |db| {
-                candidates::store_run(db, &found)?;
-                Ok(summary)
-            })
-            .await
-            .map_err(|e| e.message),
-            Err(e) => Err(e.to_string()),
+impl Access {
+    /// The document pass the API and the web console share: answer with
+    /// the cost, then sample, extract, and queue the candidates as a
+    /// background run.
+    pub(crate) async fn start_document_run(
+        &self,
+        app: &App,
+        sample: Option<u32>,
+    ) -> ApiResult<Json<serde_json::Value>> {
+        let (access, id) = (self, self.workspace.id.as_str());
+        let mut options = app.config.ontology.document_evidence();
+        if let Some(n) = sample {
+            options.sample_chunks = n;
         }
-    });
-    Ok(Json(
-        serde_json::json!({ "run": run_id, "cost": cost, "job": job, "status": "running" }),
-    ))
+        // Fail now, not in the background, when no model can be built.
+        let extractor = llm::chat_extractor(&app.config).await?;
+        let embeddings = llm::optional_embedding_model(&app.config).await?;
+        let (cost, chunks, current) = app
+            .read(id, move |db| {
+                let cost = documents::estimate(db, &options)?;
+                let chunks = documents::sample_chunks(db, options.sample_chunks)?;
+                Ok((cost, chunks, store::current(db)?))
+            })
+            .await?;
+        if chunks.is_empty() {
+            return Err(ApiError::bad_request("no ready documents to sample"));
+        }
+        let db = app.workspace_db(id).await?;
+        let run = BackgroundRun::start(
+            app,
+            access,
+            RunKind::Ontology,
+            serde_json::json!({ "documents": true, "cost": cost }),
+        )
+        .await?;
+        let run_id = run.id().to_owned();
+        let concurrency = app.config.analysis.extraction_concurrency;
+        let progress_run = run_id.clone();
+        let job = run.submit(move |ctx| async move {
+            let run_id = progress_run;
+            let progress = |done: ChunkDone| {
+                ctx.progress(done.done, done.total);
+                tracing::info!(
+                    run = %run_id,
+                    done = done.done,
+                    total = done.total,
+                    failed = done.failed,
+                    "document evidence progress"
+                );
+            };
+            let outcome = documents::run(
+                chunks,
+                extractor.as_ref(),
+                current.as_ref(),
+                &options,
+                embeddings.as_ref(),
+                concurrency,
+                &progress,
+            )
+            .await;
+            match outcome {
+                Ok((found, summary)) => with_db(db, move |db| {
+                    candidates::store_run(db, &found)?;
+                    Ok(summary)
+                })
+                .await
+                .map_err(|e| e.message),
+                Err(e) => Err(e.to_string()),
+            }
+        });
+        Ok(Json(
+            serde_json::json!({ "run": run_id, "cost": cost, "job": job, "status": "running" }),
+        ))
+    }
 }
