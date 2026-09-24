@@ -636,7 +636,7 @@ impl DirectSql {
         max_rows: u32,
         ctx: &JobContext,
     ) -> BackgroundResult {
-        let canceller = QueryCanceller::new();
+        let canceller = QueryCanceller::default();
         let watch = {
             let canceller = canceller.clone();
             let token = ctx.cancel_token();

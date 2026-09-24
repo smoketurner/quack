@@ -18,7 +18,9 @@ use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
-use quack_core::storage::workspace::{ChunkScope, TEMP_OBJECT_REFUSED, creates_temp_object};
+use quack_core::storage::workspace::{
+    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, creates_temp_object,
+};
 use serde::{Deserialize, Serialize};
 
 use super::StreamEvent;
@@ -463,7 +465,9 @@ pub(crate) async fn search(
         .with_db(move |db| {
             let scope = ChunkScope::all();
             match embedding.as_deref() {
-                Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &scope),
+                Some(vector) => {
+                    db.search_hybrid_chunks(&text, vector, HybridLimits { top_k, rrf_k }, &scope)
+                }
                 None => db.search_keyword_chunks(&text, top_k, &scope),
             }
         })

@@ -17,7 +17,7 @@ use quack_core::graph::store::{self as graph_store, NewNode};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentStatus, MetaKey, NewChunk, NewDocument, WorkspaceDb,
+    ChunkScope, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -184,7 +184,15 @@ fn vectors_made_before_prefixes_are_stale_for_a_prefixed_model() {
     // Stale vectors are not searched; keyword search still finds the chunks.
     assert_eq!(vector_hits(&db, 4), 0);
     let hybrid = db
-        .search_hybrid_chunks("storm", &[1.0; 4], 10, 60, &ChunkScope::all())
+        .search_hybrid_chunks(
+            "storm",
+            &[1.0; 4],
+            HybridLimits {
+                top_k: 10,
+                rrf_k: 60,
+            },
+            &ChunkScope::all(),
+        )
         .unwrap();
     assert_eq!(hybrid.len(), 3);
 }

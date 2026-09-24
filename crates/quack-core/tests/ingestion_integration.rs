@@ -18,8 +18,8 @@ use quack_core::ingestion::parser::FileType;
 use quack_core::llm::CancellationToken;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentSource, DocumentStatus, MetaKey, NewChunk, NewDocument, StatementKind,
-    WorkspaceDb,
+    ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
+    StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::{import, ingestion};
@@ -1452,7 +1452,15 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
         "the closer chunk b1 is outside the scope"
     );
     let hybrid = db
-        .search_hybrid_chunks("claims", &[0.0, 0.0, 1.0, 0.0], 5, 60, &only_a0)
+        .search_hybrid_chunks(
+            "claims",
+            &[0.0, 0.0, 1.0, 0.0],
+            HybridLimits {
+                top_k: 5,
+                rrf_k: 60,
+            },
+            &only_a0,
+        )
         .unwrap();
     assert!(hybrid.iter().all(|h| h.id == "a0"), "{hybrid:?}");
 
@@ -1610,7 +1618,15 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     let db = seeded_for_search(&config, "ws-hybrid");
     // Vector nearest is a0 (flood); the keyword "POL-8841" only matches b0.
     let hits = db
-        .search_hybrid_chunks("POL-8841", &[1.0, 0.0, 0.0, 0.0], 3, 60, &ChunkScope::all())
+        .search_hybrid_chunks(
+            "POL-8841",
+            &[1.0, 0.0, 0.0, 0.0],
+            HybridLimits {
+                top_k: 3,
+                rrf_k: 60,
+            },
+            &ChunkScope::all(),
+        )
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids.len(), 3);
@@ -1621,7 +1637,15 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     assert!(hits.iter().all(|h| h.score <= top_score));
 
     let limited = db
-        .search_hybrid_chunks("flood", &[1.0, 0.0, 0.0, 0.0], 1, 60, &ChunkScope::all())
+        .search_hybrid_chunks(
+            "flood",
+            &[1.0, 0.0, 0.0, 0.0],
+            HybridLimits {
+                top_k: 1,
+                rrf_k: 60,
+            },
+            &ChunkScope::all(),
+        )
         .unwrap();
     assert_eq!(limited.len(), 1);
     assert_eq!(limited.first().unwrap().id, "a0");

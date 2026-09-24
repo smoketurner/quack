@@ -86,19 +86,17 @@ pub fn list(db: &WorkspaceDb, limit: u32) -> Result<Vec<AuditDetailRow>> {
         "SELECT id, CAST(timestamp AS VARCHAR), user_id, action, CAST(detail AS VARCHAR) \
          FROM _quack_audit ORDER BY id DESC LIMIT ?",
     )?;
-    let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
+    let rows = stmt.query_map(duckdb::params![i64::from(limit)], |row| {
         let detail: Option<String> = row.get(4)?;
-        out.push(AuditDetailRow {
+        Ok(AuditDetailRow {
             id: row.get(0)?,
             timestamp: row.get(1)?,
             user_id: row.get(2)?,
             action: row.get(3)?,
             detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
-        });
-    }
-    Ok(out)
+        })
+    })?;
+    Ok(rows.collect::<duckdb::Result<_>>()?)
 }
 
 #[cfg(test)]

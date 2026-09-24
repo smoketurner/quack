@@ -28,7 +28,7 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
-    ChunkScope, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -450,7 +450,12 @@ impl McpServer {
             .reader_db(move |db| {
                 let scope = ChunkScope::all();
                 match embedding.as_deref() {
-                    Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &scope),
+                    Some(vector) => db.search_hybrid_chunks(
+                        &text,
+                        vector,
+                        HybridLimits { top_k, rrf_k },
+                        &scope,
+                    ),
                     None => db.search_keyword_chunks(&text, top_k, &scope),
                 }
             })

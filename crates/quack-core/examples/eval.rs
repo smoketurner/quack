@@ -37,7 +37,7 @@ use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::ontology::store::{self as ontology_store, Revision};
-use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, WorkspaceDb};
+use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, HybridLimits, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use serde::{Deserialize, Serialize};
@@ -531,8 +531,7 @@ async fn evaluate_retrieval(
         let hybrid_ids = ids_of(db.search_hybrid_chunks(
             &q.question,
             &query_vec,
-            top_k,
-            rrf_k,
+            HybridLimits { top_k, rrf_k },
             &ChunkScope::all(),
         )?);
 

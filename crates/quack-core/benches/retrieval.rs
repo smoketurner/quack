@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentStatus, NewChunk, NewDocument, WorkspaceDb,
+    ChunkScope, DocumentStatus, HybridLimits, NewChunk, NewDocument, WorkspaceDb,
 };
 
 const SIZES: [usize; 3] = [10_000, 100_000, 1_000_000];
@@ -132,8 +132,10 @@ fn retrieval(c: &mut Criterion) {
                     .search_hybrid_chunks(
                         black_box(QUERY_TEXT),
                         black_box(&query_vec),
-                        TOP_K,
-                        RRF_K,
+                        HybridLimits {
+                            top_k: TOP_K,
+                            rrf_k: RRF_K,
+                        },
                         &scope,
                     )
                     .unwrap();
