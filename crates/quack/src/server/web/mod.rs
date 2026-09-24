@@ -31,8 +31,9 @@ use quack_core::ontology::{
 };
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, Expiry, IssuedToken, MemberRow, Membership, Outcome,
-    ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
+    AuditAction, AuditCursor, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow,
+    Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserRow,
+    WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, SamplePool};
@@ -491,6 +492,9 @@ struct AdminUsersPage {
 struct AdminAuditPage {
     page: Page,
     rows: Vec<AuditRow>,
+    /// This page follows an earlier one.
+    continued: bool,
+    next_cursor: Option<String>,
     action: String,
     outcome: Option<Outcome>,
     outcomes: &'static [Outcome],
@@ -1849,10 +1853,11 @@ struct AuditQuery {
     #[serde(default, deserialize_with = "blank_as_none")]
     outcome: Option<Outcome>,
     workspace_id: Option<String>,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    cursor: Option<AuditCursor>,
 }
 
-/// The page's filter form: a blank field is no filter, and the newest 200
-/// rows show.
+/// The page's filter form: a blank field is no filter; 200 rows a page.
 impl From<AuditQuery> for AuditFilter {
     fn from(q: AuditQuery) -> Self {
         let given = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
@@ -1861,6 +1866,7 @@ impl From<AuditQuery> for AuditFilter {
             outcome: q.outcome,
             workspace_id: given(q.workspace_id).map(WorkspaceId::from),
             limit: 200,
+            after: q.cursor,
             ..Self::default()
         }
     }
@@ -1890,10 +1896,12 @@ async fn admin_audit(
 ) -> WebResult<Response> {
     identity.require_admin()?;
     let filter = AuditFilter::from(q);
-    let rows = app.control.query_audit(&filter).await?;
+    let AuditPage { rows, next } = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
         page: Page::new(&app, &identity, "Audit"),
         rows,
+        continued: filter.after.is_some(),
+        next_cursor: next.map(|c| c.to_string()),
         action: filter.action.unwrap_or_default(),
         outcome: filter.outcome,
         outcomes: Outcome::ALL,

@@ -601,8 +601,11 @@ which session it belonged to; only a member of that workspace can see the query 
 which lives in `_quack_audit`. There is no retention or pruning path, which is what
 append-only means here: rows are kept until an operator retires the file. `quack audit`
 filters by user, workspace, action, outcome, and time range and exports as NDJSON
-(`--json`) or CSV (`--csv`); `GET /api/v1/admin/audit` takes the same filters, caps `limit`
-at 1000, and answers JSON only.
+(`--json`) or CSV (`--csv`), following pages itself (`--limit 0` reads the whole log);
+`GET /api/v1/admin/audit` takes the same filters, caps `limit` at 1000 a page, and answers
+JSON with a `next_cursor` that continues the same filter (`null` on the last page). Pages
+are keyset on `(timestamp, id)`, newest first, so rows appended while a reader pages never
+shift what it has left to read.
 
 Workspace names themselves are treated as unclassified; if a deployment needs opaque
 names, the `name` column is the directory name and a display name lives in `_quack_meta`.

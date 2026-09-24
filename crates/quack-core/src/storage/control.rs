@@ -8,7 +8,7 @@
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use sea_query::{Expr, ExprTrait, Order, Query};
+use sea_query::{Cond, Expr, ExprTrait, Order, Query};
 use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{FromRow, Row, SqlitePool};
@@ -634,6 +634,82 @@ pub struct AuditFilter {
     /// Exclusive upper bound on `timestamp`.
     pub until: Option<String>,
     pub limit: u32,
+    pub after: Option<AuditCursor>,
+}
+
+/// A page of the audit log, newest first; `next` is `None` on the last page.
+#[derive(Debug, Clone)]
+pub struct AuditPage {
+    pub rows: Vec<AuditRow>,
+    pub next: Option<AuditCursor>,
+}
+
+/// Where a page ended: the last row's timestamp and id (the id breaks ties
+/// between rows in the same second), and a digest of the filter it was
+/// read under. Opaque to callers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub struct AuditCursor {
+    timestamp: String,
+    id: AuditId,
+    filter: String,
+}
+
+impl AuditCursor {
+    const SEPARATOR: char = '\n';
+}
+
+impl fmt::Display for AuditCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let raw = format!(
+            "{}{sep}{}{sep}{}",
+            self.timestamp,
+            self.id,
+            self.filter,
+            sep = Self::SEPARATOR
+        );
+        f.write_str(&base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            raw,
+        ))
+    }
+}
+
+impl FromStr for AuditCursor {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let not_a_cursor = || Error::Config(String::from("not an audit cursor"));
+        let raw = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            text.trim(),
+        )
+        .map_err(|_| not_a_cursor())?;
+        let raw = String::from_utf8(raw).map_err(|_| not_a_cursor())?;
+        let mut parts = raw.split(Self::SEPARATOR);
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(timestamp), Some(id), Some(filter), None) => Ok(Self {
+                timestamp: timestamp.to_owned(),
+                id: AuditId::from(id),
+                filter: filter.to_owned(),
+            }),
+            _ => Err(not_a_cursor()),
+        }
+    }
+}
+
+impl From<AuditCursor> for String {
+    fn from(cursor: AuditCursor) -> Self {
+        cursor.to_string()
+    }
+}
+
+impl TryFrom<String> for AuditCursor {
+    type Error = Error;
+
+    fn try_from(text: String) -> Result<Self> {
+        text.parse()
+    }
 }
 
 /// Lowercase hex SHA-256, the form tokens are stored in.
@@ -1374,14 +1450,54 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditRow>> {
-        Ok(filter.select()?.query_as().fetch_all(&self.pool).await?)
+    pub async fn query_audit(&self, filter: &AuditFilter) -> Result<AuditPage> {
+        let digest = filter.digest();
+        if let Some(after) = &filter.after
+            && after.filter != digest
+        {
+            return Err(Error::Config(String::from(
+                "the audit cursor belongs to a different filter; ask again without it",
+            )));
+        }
+        let limit = usize::try_from(filter.page_size()).unwrap_or(usize::MAX);
+        let mut rows: Vec<AuditRow> = filter.select()?.query_as().fetch_all(&self.pool).await?;
+        let next = if rows.len() > limit {
+            rows.truncate(limit);
+            rows.last().map(|last| AuditCursor {
+                timestamp: last.timestamp.clone(),
+                id: last.id.clone(),
+                filter: digest,
+            })
+        } else {
+            None
+        };
+        Ok(AuditPage { rows, next })
     }
 }
 
 impl AuditFilter {
+    fn page_size(&self) -> u32 {
+        Ord::max(self.limit, 1)
+    }
+
+    /// Identifies the filter so a cursor only continues the same query.
+    fn digest(&self) -> String {
+        let fields = [
+            self.user_id.as_ref().map(UserId::as_str),
+            self.workspace_id.as_ref().map(WorkspaceId::as_str),
+            self.action.as_deref(),
+            self.outcome.map(Outcome::as_str),
+            self.since.as_deref(),
+            self.until.as_deref(),
+        ];
+        let canonical = serde_json::json!(fields).to_string();
+        let mut hex = sha256_hex(canonical.as_bytes());
+        hex.truncate(16);
+        hex
+    }
+
     /// The filtered audit select, built and bound in one scope so no builder
-    /// lives across an await.
+    /// lives across an await. One extra row says whether a next page exists.
     fn select(&self) -> sqlx::Result<Bound> {
         let filter = self;
         let mut select = Query::select();
@@ -1403,7 +1519,18 @@ impl AuditFilter {
             .from(AuditLog::Table)
             .order_by(AuditLog::Timestamp, Order::Desc)
             .order_by(AuditLog::Id, Order::Desc)
-            .limit(u64::from(Ord::max(filter.limit, 1)));
+            .limit(u64::from(filter.page_size()).saturating_add(1));
+        if let Some(after) = &filter.after {
+            select.cond_where(
+                Cond::any()
+                    .add(Expr::col(AuditLog::Timestamp).lt(after.timestamp.as_str()))
+                    .add(
+                        Cond::all()
+                            .add(Expr::col(AuditLog::Timestamp).eq(after.timestamp.as_str()))
+                            .add(Expr::col(AuditLog::Id).lt(after.id.as_str())),
+                    ),
+            );
+        }
         if let Some(v) = &filter.user_id {
             select.and_where(Expr::col(AuditLog::UserId).eq(v.as_str()));
         }
@@ -1531,7 +1658,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
 
-        assert!(cp.schema_version().await.is_ok_and(|v| v == 3));
+        assert!(cp.schema_version().await.is_ok_and(|v| v == 4));
         // Replaying v2 would have dropped and recreated audit_log.
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
             .fetch_one(&cp.pool)
@@ -1589,9 +1716,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_reach_v3_and_rerun_idempotently() {
+    async fn migrations_reach_v4_and_rerun_idempotently() {
         let (dir, cp) = open().await;
-        assert!(cp.schema_version().await.is_ok_and(|v| v == 3));
+        assert!(cp.schema_version().await.is_ok_and(|v| v == 4));
         drop(cp);
         let mut config = Config::default();
         config.general.data_dir = dir.path().to_path_buf();
@@ -1822,7 +1949,8 @@ mod tests {
                 limit: 10,
                 ..AuditFilter::default()
             })
-            .await;
+            .await
+            .map(|page| page.rows);
         assert!(all.is_ok_and(|r| r.len() == 3 && r.first().is_some_and(|r| r.action == "login")));
         let denied_only = cp
             .query_audit(&AuditFilter {
@@ -1830,7 +1958,8 @@ mod tests {
                 limit: 10,
                 ..AuditFilter::default()
             })
-            .await;
+            .await
+            .map(|page| page.rows);
         assert!(denied_only.is_ok_and(|r| {
             r.len() == 1
                 && r.first()
@@ -1843,7 +1972,8 @@ mod tests {
                 limit: 10,
                 ..AuditFilter::default()
             })
-            .await;
+            .await
+            .map(|page| page.rows);
         assert!(
             for_ws.is_ok_and(|r| r.len() == 1 && r.first().is_some_and(|r| r.id == allowed.id))
         );
@@ -1853,8 +1983,71 @@ mod tests {
                 limit: 10,
                 ..AuditFilter::default()
             })
-            .await;
+            .await
+            .map(|page| page.rows);
         assert!(none.is_ok_and(|r| r.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn audit_pages_walk_the_log_once_in_order() {
+        let (_dir, cp) = open().await;
+        let mut written = Vec::new();
+        for _ in 0..7 {
+            let entry = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api)
+                .in_workspace(&WorkspaceId::from("w1"));
+            assert!(cp.record_audit(&entry).await.is_ok());
+            written.push(entry.id);
+        }
+        let other = AuditEntry::new(AuditAction::Login, Outcome::Error, Channel::Web);
+        assert!(cp.record_audit(&other).await.is_ok());
+
+        let filter = AuditFilter {
+            workspace_id: Some(WorkspaceId::from("w1")),
+            limit: 3,
+            ..AuditFilter::default()
+        };
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        let mut after = None;
+        loop {
+            let page = cp
+                .query_audit(&AuditFilter {
+                    after,
+                    ..filter.clone()
+                })
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            pages += 1;
+            seen.extend(page.rows.into_iter().map(|r| r.id));
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        written.reverse();
+        assert_eq!(seen, written, "every row once, newest first");
+        assert_eq!(pages, 3, "3 + 3 + 1");
+
+        let first = cp
+            .query_audit(&filter)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let cursor = first.next.unwrap_or_else(|| fail("a second page"));
+        let round_trip: AuditCursor = cursor
+            .to_string()
+            .parse()
+            .unwrap_or_else(|e: Error| fail(&e.to_string()));
+        assert_eq!(round_trip, cursor);
+        let elsewhere = cp
+            .query_audit(&AuditFilter {
+                action: Some(String::from("open")),
+                after: Some(cursor),
+                ..filter.clone()
+            })
+            .await;
+        assert!(elsewhere.is_err_and(|e| e.to_string().contains("different filter")));
+        assert!("not a cursor".parse::<AuditCursor>().is_err());
+        assert!("bm90IGEgY3Vyc29y".parse::<AuditCursor>().is_err());
     }
 
     #[test]
