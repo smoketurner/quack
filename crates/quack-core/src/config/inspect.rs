@@ -21,7 +21,7 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    AuthMode, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, ModelSpec,
+    AuthMode, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant, ModelSpec,
     OAuthConfig, Overrides, config_file_path,
 };
 
@@ -409,7 +409,7 @@ const OAUTH_KEYS: &[&str] = &[
     "client_id",
     "scopes",
     "redirect_uri",
-    "device_code",
+    "grant",
     "client_secret_env",
 ];
 
@@ -508,7 +508,12 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             OAuthConfig::DEFAULT_REDIRECT_URI,
             None,
         );
-        s.literal("device_code", oauth.device_code, false);
+        s.text(
+            "grant",
+            oauth.grant.as_str(),
+            Grant::default().as_str(),
+            None,
+        );
         s.optional_text(
             "client_secret_env",
             oauth.client_secret_env.as_deref(),
@@ -1101,6 +1106,9 @@ top_k = 3
         assert_eq!(inspection.file_state, FileState::Loaded);
         let scopes = setting(&inspection, "providers.azure.oauth.scopes");
         assert_eq!(scopes.value.as_deref(), Some("[\"a\", \"b\"]"));
+        let grant = setting(&inspection, "providers.azure.oauth.grant");
+        assert_eq!(grant.origin, Origin::Default);
+        assert_eq!(grant.value, Some(quoted("authorization-code")));
         let redirect = setting(&inspection, "providers.azure.oauth.redirect_uri");
         assert_eq!(redirect.origin, Origin::Default);
         assert_eq!(

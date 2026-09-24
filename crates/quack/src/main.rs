@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::config::Config;
 use quack_core::config::inspect::SettingFilter;
+use quack_core::config::{Config, Grant};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
@@ -367,7 +367,8 @@ enum OkfAction {
 #[derive(Subcommand)]
 enum AuthAction {
     /// Obtain a token: browser sign-in with PKCE, or a device code when no
-    /// browser can open here
+    /// browser can open here; a client-credentials provider requests one
+    /// with its secret
     Login {
         /// Provider name from [providers.NAME] with auth = "oauth"
         provider: String,
@@ -1012,16 +1013,23 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             };
             let token = manager.login(flow, &show_login_prompt).await?;
             let mut out = stdout.lock();
-            writeln!(
-                out,
-                "Logged in to '{provider}'; the token expires at {}{}.",
-                token.expires_at,
-                if token.refresh_token.is_some() {
-                    " and will refresh itself"
-                } else {
-                    ""
-                }
-            )?;
+            match manager.grant() {
+                Grant::ClientCredentials => writeln!(
+                    out,
+                    "The client credentials for '{provider}' were accepted; the token expires at {} and a new one is requested when it runs out.",
+                    token.expires_at
+                )?,
+                Grant::AuthorizationCode | Grant::DeviceCode => writeln!(
+                    out,
+                    "Logged in to '{provider}'; the token expires at {}{}.",
+                    token.expires_at,
+                    if token.refresh_token.is_some() {
+                        " and will refresh itself"
+                    } else {
+                        ""
+                    }
+                )?,
+            }
             out.flush()?;
         }
         AuthAction::Status { provider } => {
@@ -1042,13 +1050,22 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
                 writeln!(out, "No providers use auth = \"oauth\".")?;
             }
             for name in names {
-                let status = TokenManager::for_provider(config, name)?.status().await?;
-                let state = match status.token {
-                    Some(token) => format!(
+                let manager = TokenManager::for_provider(config, name)?;
+                let status = manager.status().await?;
+                let state = match (status.token, manager.grant()) {
+                    (Some(token), Grant::ClientCredentials) => {
+                        format!("token expires {}, {}", token.expires_at, token.renewal)
+                    }
+                    (Some(token), Grant::AuthorizationCode | Grant::DeviceCode) => format!(
                         "logged in, token expires {}, {}",
                         token.expires_at, token.renewal
                     ),
-                    None => format!("not logged in; run `quack auth login {name}`"),
+                    (None, Grant::ClientCredentials) => {
+                        String::from("no token yet; one is requested on first use")
+                    }
+                    (None, Grant::AuthorizationCode | Grant::DeviceCode) => {
+                        format!("not logged in; run `quack auth login {name}`")
+                    }
                 };
                 writeln!(out, "{name}: {state} (key in {})", status.key_location)?;
             }

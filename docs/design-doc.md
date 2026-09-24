@@ -1251,9 +1251,13 @@ stale rather than wrong: they are not searched, their chunks are found by keywor
 ### 10.2 Authentication
 
 Each provider has an `auth` mode: `none`, `api-key` (from the env var named by
-`api_key_env`), or `oauth` (Authorization Code with PKCE against an enterprise IdP, the
-access token used as the bearer for the provider endpoint; how Azure OpenAI and internal
-gateways are reached where static keys are forbidden).
+`api_key_env`), or `oauth` (an access token from an enterprise IdP used as the bearer for
+the provider endpoint; how Azure OpenAI and internal gateways are reached where static keys
+are forbidden). The oauth section's `grant` says how the token is obtained:
+`authorization-code` (the default; a person signs in through the browser with PKCE),
+`device-code` (a person enters a code on another device), or `client-credentials` (quack
+authenticates as itself with `client_id` and the secret in `client_secret_env`, which that
+grant requires; nobody signs in, and the grant runs again whenever the token runs out).
 
 ```rust
 pub struct OAuthConfig {
@@ -1261,7 +1265,7 @@ pub struct OAuthConfig {
     pub client_id: String,
     pub scopes: Vec<String>,         // ["https://cognitiveservices.azure.com/.default"]
     pub redirect_uri: String,        // default http://127.0.0.1:19876/callback
-    pub device_code: bool,           // force device-code flow (headless, SSH, server)
+    pub grant: Grant,                // authorization-code (default), device-code, client-credentials
     pub client_secret_env: Option<String>,   // confidential client, secret from the env
 }
 
@@ -1283,11 +1287,15 @@ pub struct CachedToken {
 ```
 
 Lifecycle: acquire via `quack auth login PROVIDER` (browser PKCE, or device code when
-`device_code = true`, no browser, or `SSH_CONNECTION` is set; endpoints from
+`grant = "device-code"`, no browser, or `SSH_CONNECTION` is set; endpoints from
 `{issuer_url}/.well-known/openid-configuration`; verifier from aws-lc-rs randomness);
 reuse while more than 60 s remain; refresh silently under `refresh_lock`; restart on
 refresh failure; in print, ingest, and server modes, where no flow can run, fail with exit
-4 / HTTP 503 naming the command to run. The cache and key files are named after the provider,
+4 / HTTP 503 naming the command to run. A `client-credentials` provider needs no login:
+the first request runs the grant, a token with 60 s or less left is replaced by running it
+again under the same lock (a refresh token is never used), and a refused secret is an error
+naming the grant rather than a login prompt. `quack auth login` on such a provider runs the
+grant once to check the credentials. The cache and key files are named after the provider,
 so a `[providers.NAME]` key is checked when the config is read (`config::ProviderName`: ASCII
 letters, digits, `_`, `-`, `.`, not starting with `.`, at most 64) and cannot point outside
 `<data_dir>/tokens/`. Cache encrypted (AES-256-GCM, the provider name as
@@ -1720,8 +1728,8 @@ issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
 scopes = ["https://cognitiveservices.azure.com/.default", "offline_access"]
 redirect_uri = "http://127.0.0.1:19876/callback"
-# client_secret_env = "AZURE_CLIENT_SECRET"   # server as confidential client
-# device_code = false
+# grant = "authorization-code"                # or "device-code", "client-credentials"
+# client_secret_env = "AZURE_CLIENT_SECRET"   # confidential client; client-credentials needs it
 
 [embedding]              # input prefixes per role; unset keeps the model family's built-in one
 # query_prefix = "task: search result | query: "
