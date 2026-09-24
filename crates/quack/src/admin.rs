@@ -11,8 +11,8 @@ use quack_core::error::Record;
 use quack_core::ids::WorkspaceId;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Expiry, IssuedToken, Outcome,
-    ResourceKind, Role, Scope, UserKind, WorkspaceRow,
+    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, IssuedToken,
+    Outcome, ResourceKind, Role, Scope, UserKind, WorkspaceRow,
 };
 
 use crate::text_or_json::TextOrJson;
@@ -129,6 +129,7 @@ pub(crate) struct AuditArgs {
     /// Rows before this time
     #[arg(long)]
     until: Option<String>,
+    /// Rows to show, newest first; 0 for the whole log
     #[arg(long, default_value_t = 100)]
     limit: u32,
     /// One JSON object per row
@@ -400,65 +401,104 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         ),
         None => None,
     };
-    let rows = control
-        .query_audit(&AuditFilter {
-            user_id,
-            workspace_id,
-            action: args.action,
-            outcome: args.outcome,
-            since: args.since,
-            until: args.until,
-            limit: args.limit,
-        })
-        .await?;
+    let mut filter = AuditFilter {
+        user_id,
+        workspace_id,
+        action: args.action,
+        outcome: args.outcome,
+        since: args.since,
+        until: args.until,
+        limit: AUDIT_PAGE,
+        after: None,
+    };
+    let mut remaining = (args.limit != 0).then_some(args.limit);
     let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    match format {
-        AuditFormat::Csv => {
-            // The header is written even for no rows; each row serializes in
-            // the same column order.
-            let mut writer = csv::WriterBuilder::new()
-                .has_headers(false)
-                .from_writer(&mut out);
-            writer.write_record([
-                "id",
-                "timestamp",
-                "user_id",
-                "token_hash",
-                "workspace_id",
-                "action",
-                "resource_type",
-                "resource_id",
-                "outcome",
-                "channel",
-                "client_addr",
-                "request_id",
-            ])?;
-            for r in &rows {
-                writer.serialize(r)?;
-            }
-            writer.flush()?;
-        }
-        AuditFormat::Rows(format) => {
-            format.write_rows(&mut out, &rows, "No audit rows match.", |out, r| {
-                writeln!(
-                    out,
-                    "{}  {:<7} {:<5} {:<12} {:<10} {:<36} {}",
-                    r.timestamp,
-                    r.outcome,
-                    r.channel,
-                    r.action,
-                    r.user_id
-                        .as_ref()
-                        .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
-                    r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
-                    r.resource_id.as_deref().unwrap_or("")
-                )
-            })?;
+    let mut output = AuditOutput::start(format, std::io::BufWriter::new(stdout.lock()))?;
+    loop {
+        filter.limit = remaining.map_or(AUDIT_PAGE, |left| left.min(AUDIT_PAGE));
+        let page = control.query_audit(&filter).await?;
+        output.page(&page.rows)?;
+        remaining = remaining
+            .map(|left| left.saturating_sub(u32::try_from(page.rows.len()).unwrap_or(u32::MAX)));
+        match (page.next, remaining) {
+            (Some(next), None) => filter.after = Some(next),
+            (Some(next), Some(left)) if left > 0 => filter.after = Some(next),
+            (Some(_) | None, _) => break,
         }
     }
-    out.flush()?;
-    Ok(())
+    output.finish()
+}
+
+const AUDIT_PAGE: u32 = 1_000;
+
+/// `quack audit` output, written a page at a time.
+enum AuditOutput<W: Write> {
+    Csv(Box<csv::Writer<W>>),
+    Rows(TextOrJson, W),
+}
+
+impl<W: Write> AuditOutput<W> {
+    fn start(format: AuditFormat, out: W) -> Result<Self> {
+        Ok(match format {
+            AuditFormat::Csv => {
+                let mut writer = csv::WriterBuilder::new()
+                    .has_headers(false)
+                    .from_writer(out);
+                writer.write_record([
+                    "id",
+                    "timestamp",
+                    "user_id",
+                    "token_hash",
+                    "workspace_id",
+                    "action",
+                    "resource_type",
+                    "resource_id",
+                    "outcome",
+                    "channel",
+                    "client_addr",
+                    "request_id",
+                ])?;
+                Self::Csv(Box::new(writer))
+            }
+            AuditFormat::Rows(format) => Self::Rows(format, out),
+        })
+    }
+
+    fn page(&mut self, rows: &[AuditRow]) -> Result<()> {
+        match self {
+            Self::Csv(writer) => {
+                for r in rows {
+                    writer.serialize(r)?;
+                }
+            }
+            Self::Rows(format, out) => {
+                format.write_rows(out, rows, "No audit rows match.", |out, r| {
+                    writeln!(
+                        out,
+                        "{}  {:<7} {:<5} {:<12} {:<10} {:<36} {}",
+                        r.timestamp,
+                        r.outcome,
+                        r.channel,
+                        r.action,
+                        r.user_id
+                            .as_ref()
+                            .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
+                        r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
+                        r.resource_id.as_deref().unwrap_or("")
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Csv(mut writer) => writer.flush()?,
+            Self::Rows(_, mut out) => out.flush()?,
+        }
+        Ok(())
+    }
 }
 
 /// The named workspace, or the default one, which must already exist: an

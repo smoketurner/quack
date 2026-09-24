@@ -168,6 +168,7 @@ impl Harness {
             })
             .await
             .unwrap_or_else(|e| fail(&e.to_string()))
+            .rows
     }
 
     async fn wait_ready(&self, ws: &WorkspaceId, doc: &str, bearer: &str) -> serde_json::Value {
@@ -1810,6 +1811,39 @@ async fn admin_endpoints_manage_users_and_read_the_audit() {
     assert_eq!(body["audit"][0]["resource_type"], "user");
     let (status, _) = h.get("/api/v1/admin/audit", &bob).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // One row a page: following next_cursor reaches every login row, and
+    // the last page's cursor is null.
+    let (_, all) = h.get("/api/v1/admin/audit?action=login", &root).await;
+    let total = all["audit"].as_array().map_or(0, Vec::len);
+    assert!(total >= 2, "{all}");
+    let mut path = String::from("/api/v1/admin/audit?action=login&limit=1");
+    let mut walked = Vec::new();
+    loop {
+        let (status, page) = h.get(&path, &root).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        walked.extend(page["audit"].as_array().cloned().unwrap_or_default());
+        match page["next_cursor"].as_str() {
+            Some(cursor) => {
+                path = format!("/api/v1/admin/audit?action=login&limit=1&cursor={cursor}");
+            }
+            None => break,
+        }
+    }
+    assert_eq!(walked, all["audit"].as_array().cloned().unwrap_or_default());
+    let (_, first) = h
+        .get("/api/v1/admin/audit?action=login&limit=1", &root)
+        .await;
+    let cursor = first["next_cursor"].as_str().unwrap_or_default();
+    let (status, _) = h
+        .get(
+            &format!("/api/v1/admin/audit?action=admin&cursor={cursor}"),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a cursor keeps its filter");
+    let (status, _) = h.get("/api/v1/admin/audit?cursor=nonsense", &root).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3044,6 +3078,24 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             && paths.contains(&"log.md"),
         "{paths:?}"
     );
+    // The export streams, so it is audited when the stream ends.
+    let mut exported = false;
+    for _ in 0..100 {
+        exported = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(String::from("export")),
+                ..AuditFilter::default()
+            })
+            .await
+            .iter()
+            .any(|r| r.outcome == Outcome::Allowed);
+        if exported {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(exported, "the finished export is audited as allowed");
     assert!(
         paths.contains(&"ontology/classes/organization.md"),
         "{paths:?}"

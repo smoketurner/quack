@@ -1340,10 +1340,10 @@ async fn control_db_migrates_to_the_latest_version_and_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let control = ControlPlane::open(&config).await.unwrap();
-    assert_eq!(control.schema_version().await.unwrap(), 3);
+    assert_eq!(control.schema_version().await.unwrap(), 4);
     // Reopening is a no-op.
     let again = ControlPlane::open(&config).await.unwrap();
-    assert_eq!(again.schema_version().await.unwrap(), 3);
+    assert_eq!(again.schema_version().await.unwrap(), 4);
 }
 
 // ---------------------------------------------------------------------------
