@@ -37,8 +37,10 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, MessageRole, Transcript};
-use quack_core::storage::workspace::{QueryCanceller, StatementKind, WorkspaceDb};
+use quack_core::storage::sessions::{
+    self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
+};
+use quack_core::storage::workspace::{Pinning, QueryCanceller, StatementKind, WorkspaceDb};
 
 use crate::ModeArg;
 use crate::embeddings_cli::{self, EmbeddingsAction};
@@ -1610,8 +1612,8 @@ impl App {
             SlashCommand::Context {
                 action: Some(ContextAction::Export { file }),
             } => self.run_job(CliJob::ContextExport(file)),
-            SlashCommand::Pin { id } => self.set_pinned(id, true),
-            SlashCommand::Unpin { id } => self.set_pinned(id, false),
+            SlashCommand::Pin { id } => self.set_pinned(id, Pinning::Pinned),
+            SlashCommand::Unpin { id } => self.set_pinned(id, Pinning::Unpinned),
             SlashCommand::Tables => self.show_tables(),
             SlashCommand::Schema { table } => self.show_schema(table),
             SlashCommand::Ingest { path } => match Input::file(&path) {
@@ -1655,8 +1657,8 @@ impl App {
                 statement: Some(sql),
             } => self.run_direct_sql(sql),
             SlashCommand::Sql { statement: None } => self.edit_last_sql(),
-            SlashCommand::Share => self.set_shared(true),
-            SlashCommand::Unshare => self.set_shared(false),
+            SlashCommand::Share => self.set_sharing(Sharing::Shared),
+            SlashCommand::Unshare => self.set_sharing(Sharing::Private),
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
             SlashCommand::Embeddings { action } => self.run_job(CliJob::embeddings(&action)),
@@ -1918,18 +1920,19 @@ impl App {
         );
     }
 
-    fn set_shared(&mut self, shared: bool) {
+    fn set_sharing(&mut self, sharing: Sharing) {
         let session = self.session_id.clone();
         self.on_db_ok(
             Side::Write,
-            move |db| sessions::set_session_shared(db, &session, shared),
+            move |db| sessions::set_session_sharing(db, &session, sharing),
             move |app, ()| {
                 app.note(
                     MessageKind::System,
-                    if shared {
-                        "This session is shared with every member of the workspace."
-                    } else {
-                        "This session is yours alone again."
+                    match sharing {
+                        Sharing::Shared => {
+                            "This session is shared with every member of the workspace."
+                        }
+                        Sharing::Private => "This session is yours alone again.",
                     },
                 );
             },
@@ -2055,16 +2058,19 @@ impl App {
         });
     }
 
-    fn set_pinned(&mut self, prefix: String, pinned: bool) {
+    fn set_pinned(&mut self, prefix: String, pinning: Pinning) {
         self.on_db_ok(
             Side::Write,
             move |db| {
                 let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
                     .one(Record::Document, &prefix)?;
-                db.set_document_pinned(&doc.id, pinned).map(|()| doc.id)
+                db.set_document_pinning(&doc.id, pinning).map(|()| doc.id)
             },
             move |app, id| {
-                let done = if pinned { "Pinned" } else { "Unpinned" };
+                let done = match pinning {
+                    Pinning::Pinned => "Pinned",
+                    Pinning::Unpinned => "Unpinned",
+                };
                 app.note(MessageKind::System, format!("{done} {}", id.short()));
             },
         );

@@ -2,6 +2,35 @@
 //! typed at a prompt, or sent over the API: `as_str`, `Display`, `FromStr`,
 //! and `ALL`, generated from a single list so the four cannot disagree.
 
+/// The conversions a two-valued enum needs where it meets a boolean: a
+/// column or a JSON field that stores the flag, or a command-line switch.
+/// `From` in both directions (so serde's `from`/`into` can carry it) and
+/// `duckdb::ToSql` as the boolean.
+macro_rules! flag_enum {
+    ($name:ident, false => $off:ident, true => $on:ident) => {
+        impl From<bool> for $name {
+            fn from(flag: bool) -> Self {
+                if flag { Self::$on } else { Self::$off }
+            }
+        }
+
+        impl From<$name> for bool {
+            fn from(value: $name) -> Self {
+                match value {
+                    $name::$off => false,
+                    $name::$on => true,
+                }
+            }
+        }
+
+        impl ::duckdb::ToSql for $name {
+            fn to_sql(&self) -> ::duckdb::Result<::duckdb::types::ToSqlOutput<'_>> {
+                Ok(::duckdb::types::ToSqlOutput::from(bool::from(*self)))
+            }
+        }
+    };
+}
+
 /// Store a [`text_enum!`] enum in a `DuckDB` column as its text form: bound
 /// as a parameter, and read back through `FromStr`, so an unknown stored
 /// value is a conversion error rather than a guess.

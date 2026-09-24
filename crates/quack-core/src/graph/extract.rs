@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use super::store::{self, NewNode, Source};
-use super::{Drift, NormalizedLabel, Properties};
+use super::{Drift, NormalizedLabel, Properties, Standing};
 use crate::error::{Error, Result};
 use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, extractions};
 use crate::ids::{ChunkId, ClassId, DocumentId, NodeId};
@@ -284,7 +284,7 @@ pub async fn run(
     db: &Writer,
     plan: &ChunkPlan,
     ontology: &Ontology,
-    provisional: bool,
+    standing: Standing,
     extraction: ExtractionRun<'_, Extraction>,
 ) -> Result<RunSummary> {
     let ExtractionRun {
@@ -295,7 +295,7 @@ pub async fn run(
     let mut pass = Pass {
         db,
         ontology,
-        provisional,
+        standing,
         version: ontology.saved_version()?,
         summary: RunSummary::default(),
     };
@@ -332,7 +332,7 @@ pub async fn run(
 struct Pass<'a> {
     db: &'a Writer,
     ontology: &'a Ontology,
-    provisional: bool,
+    standing: Standing,
     version: OntologyVersion,
     summary: RunSummary,
 }
@@ -361,7 +361,7 @@ impl Pass<'_> {
             .saturating_add(validated.invalid_edges);
         self.summary.drift.absorb(&validated.drift);
         let (document_id, chunk_id) = (chunk.document_id.clone(), chunk.chunk_id.clone());
-        let (provisional, version) = (self.provisional, self.version);
+        let (standing, version) = (self.standing, self.version);
         let (nodes, edges) = self
             .db
             .run(move |db| {
@@ -370,7 +370,7 @@ impl Pass<'_> {
                         db,
                         &validated,
                         &Source::chunk(&document_id, &chunk_id, MODEL_CONFIDENCE),
-                        provisional,
+                        standing,
                     )?;
                     store::record_extracted(db, &chunk_id, version, counts)?;
                     Ok(counts)
@@ -396,7 +396,7 @@ pub fn store_validated(
     db: &WorkspaceDb,
     validated: &Validated,
     source: &Source,
-    provisional: bool,
+    standing: Standing,
 ) -> Result<(u32, u32)> {
     let mut ids: BTreeMap<NormalizedLabel, NodeId> = BTreeMap::new();
     let mut nodes = 0u32;
@@ -407,7 +407,7 @@ pub fn store_validated(
                 label: node.label.clone(),
                 class_id: ClassId::from(node.class.clone()),
                 properties: node.properties.clone(),
-                provisional,
+                standing,
             },
         )?;
         store::add_provenance(db, &id, source)?;
@@ -422,7 +422,7 @@ pub fn store_validated(
         ) else {
             continue;
         };
-        let id = store::upsert_edge(db, s, t, &edge.relation, &edge.properties, provisional)?;
+        let id = store::upsert_edge(db, s, t, &edge.relation, &edge.properties, standing)?;
         store::add_provenance(db, &id, source)?;
         edges = edges.saturating_add(1);
     }

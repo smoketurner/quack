@@ -19,8 +19,7 @@ use crate::config::{
     BaseUrl, Config, ModelRef, OAuthConfig, ProviderAuth, ProviderName, ProviderType,
 };
 use crate::crypto::CryptoModule;
-use crate::embedding::Dimension;
-use crate::embedding::{PromptSource, ResolvedPrompts};
+use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::OllamaRunningModels;
 use crate::llm::oauth::TokenManager;
@@ -815,7 +814,7 @@ async fn oauth_token(
     let manager =
         TokenManager::shared(&config.tokens_dir(), name, oauth).map_err(|e| e.to_string())?;
     let status = manager.status().await.map_err(|e| e.to_string())?;
-    if !status.logged_in {
+    if status.token.is_none() {
         return Err(format!("provider '{name}' uses OAuth and is not logged in"));
     }
     manager

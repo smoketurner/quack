@@ -362,6 +362,17 @@ impl Vectors {
     }
 }
 
+/// Whether a document is sent to the model in full on every turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "bool")]
+pub enum Pinning {
+    Unpinned,
+    /// Injected whole, within `[retrieval].pinned_token_budget`.
+    Pinned,
+}
+
+flag_enum!(Pinning, false => Unpinned, true => Pinned);
+
 /// Wraps a `DuckDB` connection for a single workspace.
 pub struct WorkspaceDb {
     conn: duckdb::Connection,
@@ -1934,10 +1945,10 @@ impl WorkspaceDb {
     /// # Errors
     ///
     /// Returns an error if the document does not exist or the update fails.
-    pub fn set_document_pinned(&self, document_id: &DocumentId, pinned: bool) -> Result<()> {
+    pub fn set_document_pinning(&self, document_id: &DocumentId, pinning: Pinning) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE _quack_documents SET pinned = ? WHERE id = ?",
-            duckdb::params![pinned, document_id],
+            duckdb::params![pinning, document_id],
         )?;
         if changed == 0 {
             return Err(Record::Document.missing(document_id.as_str()));

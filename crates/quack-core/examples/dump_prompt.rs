@@ -8,9 +8,8 @@
 
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
-use quack_core::graph::Properties;
-use quack_core::graph::store as graph_store;
 use quack_core::graph::store::NewNode;
+use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ClassId, DocumentId};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
@@ -40,7 +39,7 @@ fn main() {
             label: String::from("Acme"),
             class_id: ClassId::from("organization"),
             properties: Properties::default(),
-            provisional: false,
+            standing: Standing::Reviewed,
         },
     )
     .unwrap();

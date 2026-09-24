@@ -12,9 +12,8 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::graph::Origin;
 use crate::graph::store::EdgeScope;
-use crate::graph::{self, store as graph_store};
+use crate::graph::{self, Origin, store as graph_store};
 use crate::ids::{ClassId, DocumentId, NodeId, RelationId};
 use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::store::Revision;
@@ -1158,7 +1157,7 @@ fn type_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::Properties;
+    use crate::graph::{Properties, Standing};
     use crate::ontology::induction::ItemKind;
     use crate::ontology::store::Revision;
     use crate::storage::audit;
@@ -1267,7 +1266,7 @@ mod tests {
             label: label.to_owned(),
             class_id: ClassId::from("harbour"),
             properties: Properties::default(),
-            provisional: false,
+            standing: Standing::Reviewed,
         };
         // Two labels, one slug: the second file gets a suffix and the
         // link from the first must point at it.
@@ -1279,8 +1278,15 @@ mod tests {
             graph_store::add_provenance(&db, id, &graph_store::Source::row("t", "k"))
                 .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         }
-        let edge = graph_store::upsert_edge(&db, &a, &b, "near", &Properties::default(), false)
-            .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let edge = graph_store::upsert_edge(
+            &db,
+            &a,
+            &b,
+            "near",
+            &Properties::default(),
+            Standing::Reviewed,
+        )
+        .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         graph_store::add_provenance(&db, &edge, &graph_store::Source::row("t", "k"))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
 

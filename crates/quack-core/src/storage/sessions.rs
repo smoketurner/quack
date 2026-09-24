@@ -55,6 +55,17 @@ text_enum!(MessageRole, "message role", {
     Tool => "tool",
 });
 
+/// Who besides its creator may read a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "bool")]
+pub enum Sharing {
+    Private,
+    /// Every member of the workspace.
+    Shared,
+}
+
+flag_enum!(Sharing, false => Private, true => Shared);
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionRow {
     pub id: SessionId,
@@ -379,10 +390,14 @@ pub fn list_sessions_for(
 /// # Errors
 ///
 /// Returns an error if the update fails or the session does not exist.
-pub fn set_session_shared(db: &WorkspaceDb, session_id: &SessionId, shared: bool) -> Result<()> {
+pub fn set_session_sharing(
+    db: &WorkspaceDb,
+    session_id: &SessionId,
+    sharing: Sharing,
+) -> Result<()> {
     let changed = db.connection().execute(
         "UPDATE _quack_sessions SET shared = ? WHERE id = ?",
-        duckdb::params![shared, session_id],
+        duckdb::params![sharing, session_id],
     )?;
     if changed == 0 {
         return Err(Record::Session.missing(session_id.as_str()));
@@ -702,6 +717,19 @@ pub fn delete_if_empty(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool>
 mod tests {
     use super::*;
 
+    /// A flag enum reads the JSON boolean an API body carries and gives
+    /// the same boolean back.
+    #[test]
+    fn sharing_reads_and_gives_back_the_json_flag() {
+        let parsed: Vec<Sharing> = ["true", "false"]
+            .iter()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect();
+        assert_eq!(parsed, [Sharing::Shared, Sharing::Private]);
+        assert!(bool::from(Sharing::Shared) && !bool::from(Sharing::Private));
+        assert!(serde_json::from_str::<Sharing>("\"shared\"").is_err());
+    }
+
     fn db() -> WorkspaceDb {
         WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
     }
@@ -778,7 +806,8 @@ mod tests {
         assert!(!mine.shared);
 
         // Sharing opens the session to other members; unsharing closes it.
-        set_session_shared(&db, &theirs.id, true).unwrap_or_else(|e| fail(&e.to_string()));
+        set_session_sharing(&db, &theirs.id, Sharing::Shared)
+            .unwrap_or_else(|e| fail(&e.to_string()));
         let theirs = get_session(&db, &theirs.id)
             .ok()
             .flatten()
@@ -788,12 +817,13 @@ mod tests {
             list_sessions_for(&db, 10, &SessionViewer::User(UserId::from("u1")))
                 .is_ok_and(|v| v.len() == 3)
         );
-        set_session_shared(&db, &theirs.id, false).unwrap_or_else(|e| fail(&e.to_string()));
+        set_session_sharing(&db, &theirs.id, Sharing::Private)
+            .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(
             list_sessions_for(&db, 10, &SessionViewer::User(UserId::from("u1")))
                 .is_ok_and(|v| v.len() == 2)
         );
-        assert!(set_session_shared(&db, &SessionId::from("missing"), true).is_err());
+        assert!(set_session_sharing(&db, &SessionId::from("missing"), Sharing::Shared).is_err());
     }
 
     #[expect(clippy::panic, reason = "test failure path")]

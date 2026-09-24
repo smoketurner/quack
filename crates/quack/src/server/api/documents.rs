@@ -23,7 +23,7 @@ use crate::server::queue::{MAX_WAITING_UPLOADS, UPLOAD_RETRY_SECONDS, UploadJob}
 use crate::server::state::{App, with_db};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource, WorkspaceDb};
+use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, WorkspaceDb};
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -371,7 +371,7 @@ pub(crate) enum Enqueued {
 
 #[derive(Deserialize)]
 pub(crate) struct UpdateDocument {
-    pub pinned: bool,
+    pub pinned: Pinning,
 }
 
 pub(crate) async fn update(
@@ -390,12 +390,12 @@ pub(crate) async fn set_pinned(
     app: &App,
     access: &Access,
     doc: &DocumentId,
-    pinned: bool,
+    pinning: Pinning,
 ) -> ApiResult<DocumentInfo> {
     let db = app.workspace_db(&access.workspace.id).await?;
     let doc_id = doc.clone();
     let document = with_db(db, move |db| {
-        db.set_document_pinned(&doc_id, pinned)?;
+        db.set_document_pinning(&doc_id, pinning)?;
         db.document(&doc_id)?
             .ok_or_else(|| Record::Document.missing(doc_id.as_str()))
     })
@@ -406,7 +406,7 @@ pub(crate) async fn set_pinned(
             AuditAction::Context,
             Some(ResourceKind::Document.id(doc)),
             Outcome::Allowed,
-            Some(serde_json::json!({ "pinned": pinned })),
+            Some(serde_json::json!({ "pinned": bool::from(pinning) })),
         )
         .await?;
     Ok(document)

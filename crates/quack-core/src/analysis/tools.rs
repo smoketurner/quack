@@ -21,10 +21,12 @@ use super::citations::{ChunkLocation, Markers};
 use super::events::{self, ToolName, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, ModelReranker, Reranker};
+use super::text_to_sql::Modeled;
 use crate::config::{RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, Input, Vector};
 use crate::error::Error;
 use crate::ontology::{Ontology, store as ontology_store};
+use crate::storage::sessions::ChatMode;
 use crate::text::NonBlankText;
 
 /// A workspace's writer: its one write connection, on a thread of its own
@@ -626,11 +628,12 @@ pub struct SearchDocumentsTool<M> {
     rrf_k: u32,
     rerank: Option<Rerank>,
     recorder: TurnRecorder,
-    /// The graph has nodes, so the `entity` argument can resolve. Without
-    /// one the argument is left out of the tool's schema and description:
-    /// a model shown it tries it, is refused, and spends a second round
-    /// trip (and twice the tokens, measured live) reaching the same answer.
-    graph_enabled: bool,
+    /// Whether the graph has nodes, so the `entity` argument can resolve.
+    /// Without one the argument is left out of the tool's schema and
+    /// description: a model shown it tries it, is refused, and spends a
+    /// second round trip (and twice the tokens, measured live) reaching the
+    /// same answer.
+    modeled: Modeled,
 }
 
 impl<M> SearchDocumentsTool<M> {
@@ -648,7 +651,7 @@ impl<M> SearchDocumentsTool<M> {
             rrf_k: retrieval.rrf_k,
             rerank: None,
             recorder,
-            graph_enabled: false,
+            modeled: Modeled::Nothing,
         }
     }
 
@@ -671,10 +674,10 @@ impl<M> SearchDocumentsTool<M> {
         }
     }
 
-    /// Offer the `entity` argument: only when the graph has nodes.
+    /// Offer the `entity` argument when `modeled` has a graph.
     #[must_use]
-    pub fn with_graph(mut self, graph_enabled: bool) -> Self {
-        self.graph_enabled = graph_enabled;
+    pub fn with_model(mut self, modeled: Modeled) -> Self {
+        self.modeled = modeled;
         self
     }
 
@@ -717,7 +720,7 @@ where
              text chunks, each numbered [n] with its source file, page, and heading, for citing \
              in the answer",
         );
-        if self.graph_enabled {
+        if self.modeled.has_graph() {
             text.push_str(
                 ", and names the graph entities each chunk was the source of. Pass entity to \
                  search only the passages one entity was extracted from",
@@ -729,7 +732,7 @@ where
 
     fn parameters(&self) -> serde_json::Value {
         let mut schema = SearchDocumentsArgs::schema();
-        if !self.graph_enabled
+        if !self.modeled.has_graph()
             && let Some(properties) = schema
                 .get_mut("properties")
                 .and_then(serde_json::Value::as_object_mut)
@@ -1269,10 +1272,9 @@ mod tests {
     use crate::analysis::chart::ChartKind;
     use crate::analysis::events::{self, AgentEvent};
     use crate::embedding::{Dimension, Profile, Prompts};
-    use crate::graph::Properties;
     use crate::graph::store::NewNode;
-    use crate::ids::ClassId;
-    use crate::ids::DocumentId;
+    use crate::graph::{Properties, Standing};
+    use crate::ids::{ClassId, DocumentId};
     use crate::llm::EmbedModel;
     use crate::ontology::Mapping;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
@@ -1410,7 +1412,7 @@ mod tests {
             label: String::from(label),
             class_id: ClassId::from("organization"),
             properties: Properties::default(),
-            provisional: false,
+            standing: Standing::Reviewed,
         };
         let acme = graph::store::upsert_node(&db, &node("Acme"))
             .unwrap_or_else(|e| fail_test(&e.to_string()));
@@ -1582,14 +1584,15 @@ mod tests {
 
     #[test]
     fn an_empty_result_says_which_kind_of_empty_it_is() {
-        let nothing = empty_graph_text(false, &[]).unwrap_or_default();
+        let nothing = EmptyLookup::NoMatch(&[]).text().unwrap_or_default();
         assert!(
             nothing.contains("the graph has nothing on this"),
             "{nothing}"
         );
 
-        let suggested =
-            empty_graph_text(false, &[String::from("Acme (organization)")]).unwrap_or_default();
+        let suggested = EmptyLookup::NoMatch(&[String::from("Acme (organization)")])
+            .text()
+            .unwrap_or_default();
         assert!(
             suggested.contains("Acme (organization)") && suggested.contains("Search again"),
             "{suggested}"
@@ -1597,7 +1600,7 @@ mod tests {
 
         // Provisional matches were found and then stripped: the workspace
         // has the entity, query mode just will not answer from it.
-        let stripped = empty_graph_text(true, &[]).unwrap_or_default();
+        let stripped = EmptyLookup::AllProvisional.text().unwrap_or_default();
         assert!(
             stripped.contains("provisional") && stripped.contains("quack graph review"),
             "{stripped}"
@@ -2043,7 +2046,7 @@ mod tests {
         assert!(tool.parameters().pointer("/properties/query").is_some());
         assert!(!tool.description().contains("entity"));
 
-        let tool = tool.with_graph(true);
+        let tool = tool.with_model(Modeled::Graph);
         assert!(has_entity(&tool));
         assert!(tool.description().contains("Pass entity"));
     }
@@ -2382,8 +2385,8 @@ pub struct GraphTools<M> {
     /// `None` resolves entities by exact label and alias only.
     pub embedding_model: Option<Embedder<M>>,
     pub options: graph::GraphOptions,
-    /// Query mode: provisional nodes are not answered from.
-    pub exclude_provisional: bool,
+    /// Query mode does not answer from provisional nodes.
+    pub mode: ChatMode,
     pub results: GraphResults,
     pub recorder: TurnRecorder,
 }
@@ -2399,10 +2402,9 @@ impl<M> GraphTools<M> {
     /// `result` without provisional nodes when the mode excludes them.
     fn shown(&self, result: GraphResult) -> Shown {
         let had_matches = !result.nodes.is_empty();
-        let result = if self.exclude_provisional {
-            result.without_provisional()
-        } else {
-            result
+        let result = match self.mode {
+            ChatMode::Query => result.without_provisional(),
+            ChatMode::Chat => result,
         };
         Shown {
             all_provisional: had_matches && result.nodes.is_empty(),
@@ -2508,23 +2510,29 @@ where
         };
         let Shown {
             result,
-            all_provisional: stripped,
+            all_provisional,
         } = tools.shown(result);
-        step.finish(if stripped {
-            String::from("matches are provisional")
-        } else {
-            let of = match result.total_nodes.filter(|_| result.truncated) {
-                Some(total) => format!(" of {total}"),
-                None => String::new(),
+        if result.nodes.is_empty() {
+            let empty = if all_provisional {
+                EmptyLookup::AllProvisional
+            } else {
+                EmptyLookup::NoMatch(&suggestions)
             };
-            format!(
-                "{}{of} nodes, {} edges",
-                result.nodes.len(),
-                result.edges.len()
-            )
-        });
-        let text = format_graph_result(&result, &tools.recorder, &tools.db, stripped, &suggestions)
-            .await?;
+            step.finish(empty.summary());
+            let text = empty.text()?;
+            tools.keep(result);
+            return Ok(text);
+        }
+        let of = match result.total_nodes.filter(|_| result.truncated) {
+            Some(total) => format!(" of {total}"),
+            None => String::new(),
+        };
+        step.finish(format!(
+            "{}{of} nodes, {} edges",
+            result.nodes.len(),
+            result.edges.len()
+        ));
+        let text = format_graph_result(&result, &tools.recorder, &tools.db).await?;
         tools.keep(result);
         Ok(text)
     }
@@ -2617,39 +2625,56 @@ where
             ));
         }
         step.finish(format!("{} hops", result.edges.len()));
-        let text = format_graph_result(&result, &tools.recorder, &tools.db, false, &[]).await?;
+        let text = format_graph_result(&result, &tools.recorder, &tools.db).await?;
         tools.keep(result);
         Ok(text)
     }
 }
 
-/// What the model is told when a lookup came back empty: that the graph
-/// has nothing, that it has only unreviewed matches, or which labels to
-/// try instead.
-fn empty_graph_text(
-    stripped_provisional: bool,
-    suggestions: &[String],
-) -> Result<String, ToolError> {
-    if stripped_provisional {
-        return Ok(String::from(
-            "The graph has matches, but all of them are provisional: they were built from an \
-             ontology version nobody has reviewed, and query mode does not answer from those. \
-             Tell the user the graph has unreviewed matches and that `quack graph review` \
-             accepts them.",
-        ));
+/// Why a graph lookup has nothing to show.
+enum EmptyLookup<'a> {
+    /// There were matches, and query mode dropped every one as provisional.
+    AllProvisional,
+    /// Nothing matched; the closest labels, when there are any.
+    NoMatch(&'a [String]),
+}
+
+impl EmptyLookup<'_> {
+    /// The step's one-line result.
+    fn summary(&self) -> &'static str {
+        match self {
+            Self::AllProvisional => "matches are provisional",
+            Self::NoMatch(_) => "0 nodes, 0 edges",
+        }
     }
-    let mut out = String::from("No matching entities in the graph.");
-    if suggestions.is_empty() {
-        out.push_str(" Tell the user the graph has nothing on this.");
-        return Ok(out);
+
+    /// What the model is told: that the graph has only unreviewed matches,
+    /// that it has nothing, or which labels to try instead.
+    fn text(&self) -> Result<String, ToolError> {
+        let suggestions = match self {
+            Self::AllProvisional => {
+                return Ok(String::from(
+                    "The graph has matches, but all of them are provisional: they were built from \
+                     an ontology version nobody has reviewed, and query mode does not answer from \
+                     those. Tell the user the graph has unreviewed matches and that `quack graph \
+                     review` accepts them.",
+                ));
+            }
+            Self::NoMatch(suggestions) => suggestions,
+        };
+        let mut out = String::from("No matching entities in the graph.");
+        if suggestions.is_empty() {
+            out.push_str(" Tell the user the graph has nothing on this.");
+            return Ok(out);
+        }
+        write!(
+            out,
+            " The closest labels in the graph are: {}. Search again with one of them if that is \
+             what the user meant; otherwise tell the user the graph has nothing on this.",
+            suggestions.join(", ")
+        )?;
+        Ok(out)
     }
-    write!(
-        out,
-        " The closest labels in the graph are: {}. Search again with one of them if that is what \
-         the user meant; otherwise tell the user the graph has nothing on this.",
-        suggestions.join(", ")
-    )?;
-    Ok(out)
 }
 
 /// The most characters one graph result may put into a turn. A listing of
@@ -2688,17 +2713,13 @@ fn trim_graph_text(text: &str, budget: usize) -> String {
 
 /// Render a graph result for the model: the tree, then the sources each
 /// node and edge came from, registered as citable `[n]` markers (chunks)
-/// or named as table rows. Bounded as a whole, not just per node.
+/// or named as table rows. Bounded as a whole, not just per node. The
+/// callers answer an empty result themselves.
 async fn format_graph_result(
     result: &GraphResult,
     recorder: &TurnRecorder,
     db: &ReaderDb,
-    stripped_provisional: bool,
-    suggestions: &[String],
 ) -> Result<String, ToolError> {
-    if result.nodes.is_empty() {
-        return empty_graph_text(stripped_provisional, suggestions);
-    }
     let tree = result.to_string();
     let mut out = if tree.chars().count() > MAX_GRAPH_TEXT_CHARS {
         trim_graph_text(&tree, MAX_GRAPH_TEXT_CHARS)

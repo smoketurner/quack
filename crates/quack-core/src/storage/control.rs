@@ -138,6 +138,19 @@ pub enum ProviderAllowList {
     Only(BTreeSet<String>),
 }
 
+/// Whether a new server user administers the server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "bool")]
+pub enum UserKind {
+    #[default]
+    Standard,
+    /// Manages users and every workspace; reads workspace content only as
+    /// a member.
+    Admin,
+}
+
+flag_enum!(UserKind, false => Standard, true => Admin);
+
 /// A server user. The password hash never leaves this module.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserRow {
@@ -914,7 +927,7 @@ impl ControlPlane {
         &self,
         username: &str,
         password: &str,
-        is_admin: bool,
+        kind: UserKind,
     ) -> Result<UserRow> {
         let username = username.trim();
         if username.is_empty() {
@@ -941,7 +954,7 @@ impl ControlPlane {
                     (&id).into(),
                     username.into(),
                     hash.0.as_str().into(),
-                    i64::from(is_admin).into(),
+                    i64::from(bool::from(kind)).into(),
                 ])?,
         )?;
         bound
@@ -954,7 +967,7 @@ impl ControlPlane {
                 }
                 _ => e.into(),
             })?;
-        tracing::info!(username, is_admin, "created user");
+        tracing::info!(username, ?kind, "created user");
         self.get_user(&id)
             .await?
             .ok_or_else(|| Error::Config(String::from("user vanished after insert")))
@@ -1596,7 +1609,7 @@ mod tests {
     #[tokio::test]
     async fn users_hash_verify_and_reject_duplicates() {
         let (_dir, cp) = open().await;
-        let alice = cp.create_user("alice", "hunter42", true).await;
+        let alice = cp.create_user("alice", "hunter42", UserKind::Admin).await;
         assert!(
             alice
                 .as_ref()
@@ -1617,10 +1630,10 @@ mod tests {
                 .await
                 .is_ok_and(|u| u.is_none())
         );
-        let dup = cp.create_user("alice", "x", false).await.err();
+        let dup = cp.create_user("alice", "x", UserKind::Standard).await.err();
         assert!(dup.is_some_and(|e| e.to_string().contains("already exists")));
-        assert!(cp.create_user("", "x", false).await.is_err());
-        assert!(cp.create_user("bob", "", false).await.is_err());
+        assert!(cp.create_user("", "x", UserKind::Standard).await.is_err());
+        assert!(cp.create_user("bob", "", UserKind::Standard).await.is_err());
         assert!(cp.list_users().await.is_ok_and(|u| u.len() == 1));
         assert!(
             cp.find_user_by_username(" alice ")
@@ -1637,7 +1650,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
-            .create_user("bob", "pw", false)
+            .create_user("bob", "pw", UserKind::Standard)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(
@@ -1689,7 +1702,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
-            .create_user("bob", "pw", false)
+            .create_user("bob", "pw", UserKind::Standard)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let minted = cp

@@ -5,7 +5,9 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use quack_core::ids::{UserId, WorkspaceId};
-use quack_core::storage::control::{AuditAction, AuditFilter, Outcome, ResourceKind, UserRow};
+use quack_core::storage::control::{
+    AuditAction, AuditFilter, Outcome, ResourceKind, UserKind, UserRow,
+};
 use serde::Deserialize;
 
 use crate::server::auth::Identity;
@@ -25,8 +27,8 @@ pub(crate) async fn users(
 pub(crate) struct CreateUser {
     pub username: String,
     pub password: String,
-    #[serde(default)]
-    pub is_admin: bool,
+    #[serde(default, rename = "is_admin")]
+    pub kind: UserKind,
 }
 
 pub(crate) async fn create_user(
@@ -48,7 +50,7 @@ impl Identity {
         }
         let created = app
             .control
-            .create_user(&user.username, &user.password, user.is_admin)
+            .create_user(&user.username, &user.password, user.kind)
             .await?;
         let mut entry = self.audit(AuditAction::Admin, Outcome::Allowed);
         entry = entry.on(ResourceKind::User.id(created.id.as_str()));

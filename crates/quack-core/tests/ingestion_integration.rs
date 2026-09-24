@@ -11,8 +11,7 @@ use quack_core::config::{
 use quack_core::embedding::refresh::{Plan, Retype};
 use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
-use quack_core::graph::Properties;
-use quack_core::graph::store as graph_store;
+use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
@@ -21,7 +20,7 @@ use quack_core::progress::RunControl;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
     ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
-    StatementKind, WorkspaceDb,
+    Pinning, StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::{import, ingestion};
@@ -1246,7 +1245,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
                 label: String::from("Kenya"),
                 class_id: ClassId::from("country"),
                 properties: Properties::default(),
-                provisional: false,
+                standing: Standing::Reviewed,
             },
         )
         .unwrap();
@@ -1734,7 +1733,7 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
 
     let doc = db.list_documents().unwrap().into_iter().next().unwrap();
     assert!(!doc.pinned);
-    db.set_document_pinned(&doc.id, true).unwrap();
+    db.set_document_pinning(&doc.id, Pinning::Pinned).unwrap();
     let pinned = db.pinned_documents().unwrap();
     assert_eq!(pinned.len(), 1);
     assert!(pinned.first().unwrap().1.contains("Flood is excluded."));

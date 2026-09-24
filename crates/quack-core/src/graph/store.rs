@@ -7,7 +7,9 @@ use duckdb::OptionalExt as _;
 use duckdb::types::ToSqlOutput;
 
 use super::resolve::MergeStatus;
-use super::{Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance};
+use super::{
+    Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance, Standing,
+};
 use crate::error::{Error, Result};
 use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId};
 use crate::ontology::{self, OntologyVersion, store as ontology_store};
@@ -20,7 +22,7 @@ pub struct NewNode {
     pub label: String,
     pub class_id: ClassId,
     pub properties: Properties,
-    pub provisional: bool,
+    pub standing: Standing,
 }
 
 /// A source to attach to a node or edge.
@@ -82,7 +84,11 @@ pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<NodeId> {
         merged.fill_from(&node.properties);
         conn.execute(
             "UPDATE _quack_graph_nodes SET properties = ?, provisional = ? WHERE id = ?",
-            duckdb::params![merged.to_json(), provisional && node.provisional, id],
+            duckdb::params![
+                merged.to_json(),
+                provisional && node.standing == Standing::Provisional,
+                id
+            ],
         )?;
         return Ok(id);
     }
@@ -96,7 +102,7 @@ pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<NodeId> {
             normalized,
             node.class_id,
             node.properties.to_json(),
-            node.provisional
+            node.standing
         ],
     )?;
     Ok(id)
@@ -113,7 +119,7 @@ pub fn upsert_edge(
     target: &NodeId,
     relation_id: &str,
     properties: &Properties,
-    provisional: bool,
+    standing: Standing,
 ) -> Result<EdgeId> {
     let conn = db.connection();
     let existing: Option<EdgeId> = conn
@@ -125,7 +131,7 @@ pub fn upsert_edge(
         )
         .optional()?;
     if let Some(id) = existing {
-        if !provisional {
+        if standing == Standing::Reviewed {
             conn.execute(
                 "UPDATE _quack_graph_edges SET provisional = false WHERE id = ?",
                 duckdb::params![id],
@@ -143,7 +149,7 @@ pub fn upsert_edge(
             target,
             relation_id,
             properties.to_json(),
-            provisional
+            standing
         ],
     )?;
     Ok(id)

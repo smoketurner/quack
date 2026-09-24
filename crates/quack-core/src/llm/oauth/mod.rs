@@ -87,23 +87,51 @@ pub enum LoginPrompt {
     },
 }
 
-/// How `login` chooses its flow.
+/// Which flow `login` runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LoginOptions {
-    /// Use the device-code flow even when the config does not force it
-    /// (no browser, an SSH session).
-    pub device_code: bool,
+pub enum LoginFlow {
+    /// The provider's `device_code` setting decides: the device-code flow
+    /// when it is set, else the browser.
+    #[default]
+    Configured,
+    /// The device-code flow whatever the config says (no browser, an SSH
+    /// session).
+    DeviceCode,
 }
 
 /// What `quack auth status` reports for one provider.
 #[derive(Debug, Clone)]
 pub struct AuthStatus {
     pub provider: String,
-    pub logged_in: bool,
-    pub expires_at: Option<Timestamp>,
-    pub has_refresh_token: bool,
+    /// The cached token, `None` when not logged in.
+    pub token: Option<TokenStatus>,
     pub key_location: KeyLocation,
     pub cache_path: PathBuf,
+}
+
+/// A cached token's lifetime, as `quack auth status` shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenStatus {
+    pub expires_at: Timestamp,
+    pub renewal: Renewal,
+}
+
+/// What happens when a cached token expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renewal {
+    /// A refresh token renews it silently.
+    Refreshable,
+    /// There is no refresh token: `quack auth login` again.
+    Relogin,
+}
+
+impl std::fmt::Display for Renewal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Refreshable => "refreshable",
+            Self::Relogin => "no refresh token",
+        })
+    }
 }
 
 /// One provider's OAuth state: the config, the cache, and the in-memory token.
@@ -312,14 +340,15 @@ impl TokenManager {
     /// browser flow times out or returns an error, or the exchange fails.
     pub async fn login(
         &self,
-        options: LoginOptions,
+        flow: LoginFlow,
         notify: &(dyn Fn(LoginPrompt) + Sync),
     ) -> Result<CachedToken> {
         let _logging_in = self.refresh_lock.lock().await;
-        let token = if options.device_code || self.config.device_code {
-            self.login_device_code(notify).await?
-        } else {
-            self.login_browser(notify).await?
+        let token = match (flow, self.config.device_code) {
+            (LoginFlow::DeviceCode, _) | (LoginFlow::Configured, true) => {
+                self.login_device_code(notify).await?
+            }
+            (LoginFlow::Configured, false) => self.login_browser(notify).await?,
         };
         self.cache.store(&token).await?;
         *self.current.write().await = Some(token.clone());
@@ -420,9 +449,14 @@ impl TokenManager {
         let cached = self.cache.load().await?;
         Ok(AuthStatus {
             provider: self.provider.to_string(),
-            logged_in: cached.is_some(),
-            expires_at: cached.as_ref().map(|t| t.expires_at),
-            has_refresh_token: cached.is_some_and(|t| t.refresh_token.is_some()),
+            token: cached.map(|t| TokenStatus {
+                expires_at: t.expires_at,
+                renewal: if t.refresh_token.is_some() {
+                    Renewal::Refreshable
+                } else {
+                    Renewal::Relogin
+                },
+            }),
             key_location: self.cache.key_location(),
             cache_path: self.cache.path().to_path_buf(),
         })

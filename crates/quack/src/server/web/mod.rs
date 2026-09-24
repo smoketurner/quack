@@ -34,8 +34,8 @@ use quack_core::storage::control::{
     AuditAction, AuditFilter, AuditRow, Expiry, MemberRow, Outcome, ProviderAllowList,
     ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
 };
-use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow};
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource, SamplePool};
+use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
+use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, SamplePool};
 use rust_embed::Embed;
 use serde::Deserialize;
 
@@ -837,7 +837,9 @@ async fn share_session(
     Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.set_session_shared(&app, &sid, true).await?;
+    access
+        .set_session_sharing(&app, &sid, Sharing::Shared)
+        .await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
@@ -847,7 +849,9 @@ async fn unshare_session(
     Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.set_session_shared(&app, &sid, false).await?;
+    access
+        .set_session_sharing(&app, &sid, Sharing::Private)
+        .await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
@@ -1056,7 +1060,7 @@ async fn pin(
     Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    docs_api::set_pinned(&app, &access, &doc, true).await?;
+    docs_api::set_pinned(&app, &access, &doc, Pinning::Pinned).await?;
     Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
@@ -1066,7 +1070,7 @@ async fn unpin(
     Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    docs_api::set_pinned(&app, &access, &doc, false).await?;
+    docs_api::set_pinned(&app, &access, &doc, Pinning::Unpinned).await?;
     Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 

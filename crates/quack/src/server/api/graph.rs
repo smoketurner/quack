@@ -13,7 +13,8 @@ use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphStatus, extract, resolve, store as graph_store, tables,
+    ExtractSource, GraphOptions, GraphStatus, Standing, extract, resolve, store as graph_store,
+    tables,
 };
 use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
@@ -208,11 +209,11 @@ impl Access {
             ApiError::conflict("a graph extraction is already running for this workspace")
         })?;
         let db = app.workspace_db(id).await?;
-        let (ontology, provisional) = app
+        let (ontology, standing) = app
             .read(id, |db| {
                 Ok((
                     ontology_store::current(db)?,
-                    ontology_store::current_is_auto_accepted(db)?,
+                    ontology_store::current_standing(db)?,
                 ))
             })
             .await?;
@@ -224,7 +225,7 @@ impl Access {
             with_db(Arc::clone(&db), graph_store::clear).await?;
         }
         let table_summaries = if plan.source.includes_tables() {
-            extract_tables_in_batches(&db, &ontology, provisional).await?
+            extract_tables_in_batches(&db, &ontology, standing).await?
         } else {
             Vec::new()
         };
@@ -273,7 +274,7 @@ impl Access {
             extractor,
             ontology,
             version,
-            provisional,
+            standing,
             embeddings,
             slot,
             options,
@@ -293,7 +294,7 @@ impl Access {
 async fn extract_tables_in_batches(
     db: &SharedDb,
     ontology: &Ontology,
-    provisional: bool,
+    standing: Standing,
 ) -> ApiResult<Vec<tables::MappingSummary>> {
     let mut summaries = Vec::with_capacity(ontology.mappings.len());
     for mapping in &ontology.mappings {
@@ -305,7 +306,7 @@ async fn extract_tables_in_batches(
         loop {
             let mapping = mapping.clone();
             let (batch, more) = with_db(Arc::clone(db), move |db| {
-                tables::extract_batch(db, &mapping, provisional, offset)
+                tables::extract_batch(db, &mapping, standing, offset)
             })
             .await?;
             total.absorb(&batch);
@@ -328,7 +329,7 @@ struct DocumentJob {
     /// The ontology's saved version, which the graph records when the pass
     /// ends.
     version: OntologyVersion,
-    provisional: bool,
+    standing: Standing,
     embeddings: Option<Embeddings>,
     /// Freed when the pass ends.
     slot: ExtractionSlot,
@@ -348,7 +349,7 @@ impl DocumentJob {
                 extractor,
                 ontology,
                 version,
-                provisional,
+                standing,
                 embeddings,
                 options,
                 slot,
@@ -372,7 +373,7 @@ impl DocumentJob {
                 &db,
                 &chunks,
                 &ontology,
-                provisional,
+                standing,
                 ExtractionRun {
                     extractor: extractor.as_ref(),
                     concurrency: app.config.analysis.extraction_concurrency,

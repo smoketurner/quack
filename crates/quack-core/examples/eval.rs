@@ -29,11 +29,10 @@ use quack_core::config::{
 };
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
-use quack_core::extraction::ExtractionRun;
-use quack_core::extraction::{Extract, ExtractFuture};
+use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
-use quack_core::graph::{self, store};
+use quack_core::graph::{self, Standing, store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
@@ -771,7 +770,7 @@ async fn evaluate_graph(
         &writer,
         &ChunkPlan::Sample(chunk_ids),
         &ontology,
-        false,
+        Standing::Reviewed,
         ExtractionRun {
             extractor: &extractor,
             concurrency: 4,

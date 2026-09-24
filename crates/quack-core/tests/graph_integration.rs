@@ -8,15 +8,14 @@ use std::collections::BTreeMap;
 
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
-use quack_core::extraction::ExtractionRun;
-use quack_core::extraction::{Extract, ExtractFuture};
+use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    GraphOptions, GraphResult, Node, Origin, Properties, extract, resolve, store as graph_store,
-    tables, traverse,
+    GraphOptions, GraphResult, Node, Origin, Properties, Standing, extract, resolve,
+    store as graph_store, tables, traverse,
 };
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ontology::store::Revision;
@@ -256,7 +255,7 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
     )
     .unwrap();
     let current = store::current(&db).unwrap().unwrap();
-    let summaries = tables::extract(&db, &current, false).unwrap();
+    let summaries = tables::extract(&db, &current, Standing::Reviewed).unwrap();
     let first = summaries.first().unwrap();
     assert_eq!(
         (first.rows, first.nodes, first.edges),
@@ -265,7 +264,7 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
     let status = graph_store::status(&db).unwrap();
     assert_eq!(status.nodes, u64::from(rows) + 3 + 2);
     // Re-running stays idempotent across batches.
-    tables::extract(&db, &current, false).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
     assert_eq!(
         graph_store::status(&db).unwrap().nodes,
         u64::from(rows) + 3 + 2
@@ -332,12 +331,12 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     let db = workspace();
     let writer = writer_of(&db);
     let current = store::current(&db).unwrap().unwrap();
-    tables::extract(&db, &current, false).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
     let node = |label: &str| NewNode {
         label: label.to_owned(),
         class_id: ClassId::from("country"),
         properties: Properties::default(),
-        provisional: false,
+        standing: Standing::Reviewed,
     };
     // "Kenya" (from the table) and "Kenya Coast" embed identically under
     // LetterEmbedding (same first letter, same length mod 3) and share a
@@ -404,7 +403,7 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
 fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     let db = workspace();
     let current = store::current(&db).unwrap().unwrap();
-    tables::extract(&db, &current, false).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
     assert_eq!(graph_store::status(&db).unwrap().nodes, 7);
 
     // A second document adds one node of its own, one edge of its own,
@@ -428,7 +427,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         label: label.to_owned(),
         class_id: ClassId::from(class.to_owned()),
         properties: Properties::default(),
-        provisional: false,
+        standing: Standing::Reviewed,
     };
     let source = graph_store::Source::chunk(&DocumentId::from("doc-2"), &ChunkId::from("c3"), 0.9);
     let orgenics = graph_store::upsert_node(&db, &node("Orgenics", "vendor")).unwrap();
@@ -441,7 +440,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         &nowhere,
         "ships_to",
         &Properties::default(),
-        false,
+        Standing::Reviewed,
     )
     .unwrap();
     graph_store::add_provenance(&db, &edge, &source).unwrap();
@@ -485,7 +484,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         .unwrap();
     assert_eq!(orphans, 0);
 
-    let summaries = tables::extract(&db, &current, false).unwrap();
+    let summaries = tables::extract(&db, &current, Standing::Reviewed).unwrap();
     assert_eq!(summaries.len(), 1);
     assert!(summaries.first().unwrap().skipped.is_some());
     assert!(
@@ -506,7 +505,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 
     // Table mapping: three keyed rows become shipments with edges to
     // vendors and countries; the NULL-keyed row is skipped.
-    let summaries = tables::extract(&db, &current, false).unwrap();
+    let summaries = tables::extract(&db, &current, Standing::Reviewed).unwrap();
     assert_eq!(summaries.len(), 1);
     let first = summaries.first().unwrap();
     assert_eq!((first.rows, first.nodes, first.edges), (3, 3, 6));
@@ -515,7 +514,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     assert_eq!(status.edges, 6);
     assert!(status.enabled() && !status.provisional());
     // Re-running is idempotent.
-    tables::extract(&db, &current, false).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
     assert_eq!(graph_store::status(&db).unwrap().nodes, 7);
 
     // Constrained extraction: the vessel and docked_at are drift, the
@@ -526,7 +525,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
         &writer,
         &plan,
         &current,
-        false,
+        Standing::Reviewed,
         ExtractionRun {
             extractor: &Canned,
             concurrency: 2,
@@ -680,7 +679,7 @@ fn paths_merges_and_listing(
 async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     let db = workspace();
     let current = store::current(&db).unwrap().unwrap();
-    tables::extract(&db, &current, true).unwrap();
+    tables::extract(&db, &current, Standing::Provisional).unwrap();
     graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(status.provisional() && !status.stale);
@@ -735,7 +734,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
 fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
     let db = workspace();
     let current = store::current(&db).unwrap().unwrap();
-    tables::extract(&db, &current, false).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
     let before = graph_store::status(&db).unwrap();
 
     // An edge between two nodes that do not exist, with provenance.
@@ -745,7 +744,7 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
         &NodeId::from("no-such-target"),
         "mentions",
         &Properties::default(),
-        false,
+        Standing::Reviewed,
     )
     .unwrap();
     graph_store::add_provenance(&db, &dangling, &graph_store::Source::row("shipments", "x"))
@@ -789,21 +788,21 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
 #[test]
 fn auto_accepted_ontologies_are_provisional_until_reviewed() {
     let db = WorkspaceDb::open_in_memory(4).unwrap();
-    assert!(!store::current_is_auto_accepted(&db).unwrap());
+    assert_eq!(store::current_standing(&db).unwrap(), Standing::Reviewed);
     store::save(
         &db,
         &Ontology::builtin_default(),
         Revision::auto(None, Some("auto-accepted 3 candidate(s)")),
     )
     .unwrap();
-    assert!(store::current_is_auto_accepted(&db).unwrap());
+    assert_eq!(store::current_standing(&db).unwrap(), Standing::Provisional);
     store::save(
         &db,
         &Ontology::builtin_default(),
         Revision::reviewed(None, Some("reviewed")),
     )
     .unwrap();
-    assert!(!store::current_is_auto_accepted(&db).unwrap());
+    assert_eq!(store::current_standing(&db).unwrap(), Standing::Reviewed);
 }
 
 /// A class listing says how many nodes it left behind, and the census
@@ -819,7 +818,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
                 label: format!("Country {i:02}"),
                 class_id: ClassId::from("country"),
                 properties: Properties::default(),
-                provisional: false,
+                standing: Standing::Reviewed,
             },
         )
         .unwrap();
@@ -890,7 +889,7 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
         &writer,
         &plan,
         &current,
-        false,
+        Standing::Reviewed,
         ExtractionRun {
             extractor: &Canned,
             concurrency: 4,
@@ -912,7 +911,7 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
         &writer,
         &plan,
         &current,
-        false,
+        Standing::Reviewed,
         ExtractionRun {
             extractor: &Canned,
             concurrency: 4,
@@ -935,13 +934,13 @@ async fn provenance_maps_between_entities_and_chunks() {
     let db = workspace();
     let writer = writer_of(&db);
     let current = store::current(&db).unwrap().unwrap();
-    tables::extract(&db, &current, false).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
     let plan = ChunkPlan::new(&db, None).unwrap();
     extract::run(
         &writer,
         &plan,
         &current,
-        false,
+        Standing::Reviewed,
         ExtractionRun {
             extractor: &Canned,
             concurrency: 2,
@@ -1014,7 +1013,7 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
                 label: String::from(label),
                 class_id: ClassId::from(String::from(class_id)),
                 properties: Properties::default(),
-                provisional: false,
+                standing: Standing::Reviewed,
             },
         )
         .unwrap();

@@ -13,6 +13,7 @@ use super::{
     Relation,
 };
 use crate::error::{Error, Record, Result};
+use crate::graph::Standing;
 use crate::ids::ClassId;
 use crate::storage::workspace::WorkspaceDb;
 
@@ -85,17 +86,23 @@ pub fn latest_version(db: &WorkspaceDb) -> Result<Option<OntologyVersion>> {
     )?)
 }
 
-/// Whether the newest version was written by `--auto-accept` and nobody
-/// has saved a reviewed version since: a graph built from it is
-/// provisional.
+/// What a graph built from the newest version stands on: provisional when
+/// `--auto-accept` wrote it and nobody has saved a reviewed version since.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn current_is_auto_accepted(db: &WorkspaceDb) -> Result<bool> {
-    Ok(versions(db, 1)?
-        .first()
-        .is_some_and(|v| v.acceptance == Acceptance::Auto))
+pub fn current_standing(db: &WorkspaceDb) -> Result<Standing> {
+    Ok(
+        if versions(db, 1)?
+            .first()
+            .is_some_and(|v| v.acceptance == Acceptance::Auto)
+        {
+            Standing::Provisional
+        } else {
+            Standing::Reviewed
+        },
+    )
 }
 
 /// The live ontology, or `None` when no version has been saved.

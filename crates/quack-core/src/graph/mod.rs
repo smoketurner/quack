@@ -26,6 +26,18 @@ use crate::extraction::Tally;
 use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId, RelationId};
 use crate::ontology::OntologyVersion;
 
+/// Whether a graph write rests on a reviewed ontology, or on one that was
+/// auto-accepted and so is provisional until someone reviews it. Binds
+/// as the `provisional` column's boolean.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Standing {
+    #[default]
+    Reviewed,
+    Provisional,
+}
+
+flag_enum!(Standing, false => Reviewed, true => Provisional);
+
 /// A stored node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
