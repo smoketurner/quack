@@ -50,7 +50,7 @@ use super::api::{
     ontology as ontology_api, query as query_api, sessions as sessions_api,
     workspaces as workspaces_api,
 };
-use super::auth::{Access, Identity, Need, Peer, password_login, request_id, session_cookie};
+use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
 use super::state::App;
 use quack_core::csv::CsvField;
@@ -575,7 +575,7 @@ async fn login_submit(
     State(app): State<App>,
     peer: Peer,
     jar: CookieJar,
-    headers: axum::http::HeaderMap,
+    request_id: RequestId,
     Form(form): Form<LoginRequest>,
 ) -> WebResult<Response> {
     if app.local {
@@ -583,15 +583,7 @@ async fn login_submit(
     }
     // A wrong password is the form again with a message, not a 401; any
     // other failure is still an error page.
-    let token = match password_login(
-        &app,
-        peer,
-        request_id(&headers),
-        &form.username,
-        &form.password,
-    )
-    .await
-    {
+    let token = match password_login(&app, peer, request_id, &form.username, &form.password).await {
         Ok((_, token)) => token,
         Err(e) if e.status == StatusCode::UNAUTHORIZED => {
             return Ok(Flash::error("/login", "wrong username or password").into_response());
@@ -599,7 +591,7 @@ async fn login_submit(
         Err(e) => return Err(e.into()),
     };
     Ok((
-        jar.add(session_cookie(&app, peer, token)),
+        jar.add(SessionCookie::issue(&app, peer, token)),
         Redirect::to("/workspaces"),
     )
         .into_response())

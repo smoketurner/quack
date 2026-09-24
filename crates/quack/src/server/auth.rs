@@ -10,8 +10,8 @@
 //! JSON API and the browser form (issue #73).
 
 use axum::extract::{ConnectInfo, FromRequestParts};
-use axum::http::header;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::storage::control::{
@@ -107,16 +107,20 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
         parts: &mut Parts,
         _: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> {
-        std::future::ready(Ok(Self(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| info.0),
-        )))
+        std::future::ready(Ok(Self::of(parts)))
     }
 }
 
 impl Peer {
+    fn of(parts: &Parts) -> Self {
+        Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0),
+        )
+    }
+
     /// Whether a cookie set on this response must carry `Secure`. Anything
     /// that did not come from loopback may have crossed a network, including
     /// the hop in front of a TLS-terminating proxy, so the cookie must never
@@ -131,21 +135,65 @@ impl Peer {
     }
 }
 
-/// The session cookie for a freshly opened session. `Max-Age` matches the
-/// session's absolute lifetime, so the browser drops it when the server
-/// would rather than holding a token that can only be refused.
-pub(crate) fn session_cookie(app: &App, peer: Peer, token: String) -> Cookie<'static> {
-    let cookie = Cookie::build((SESSION_COOKIE, token))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .secure(peer.needs_secure());
-    match app.config.server.session_max_age().try_into() {
-        Ok(max_age) => cookie.max_age(max_age).build(),
-        // Out of range only for a lifetime no operator can configure. A
-        // cookie without `Max-Age` still dies with the browser session, and
-        // the server expires the session itself regardless.
-        Err(_) => cookie.build(),
+/// The id the request-id layer put on the request, for audit rows: the
+/// login paths have no [`Identity`] yet to carry it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequestId(pub Option<String>);
+
+impl RequestId {
+    fn of(headers: &HeaderMap) -> Self {
+        Self(
+            headers
+                .get(REQUEST_ID_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        )
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for RequestId {
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> {
+        std::future::ready(Ok(Self::of(&parts.headers)))
+    }
+}
+
+/// The browser's login session cookie, `quack_session`.
+pub(crate) struct SessionCookie;
+
+impl SessionCookie {
+    /// The cookie for a freshly opened session. `Max-Age` matches the
+    /// session's absolute lifetime, so the browser drops it when the server
+    /// would rather than holding a token that can only be refused.
+    pub(crate) fn issue(app: &App, peer: Peer, token: String) -> Cookie<'static> {
+        let cookie = Cookie::build((SESSION_COOKIE, token))
+            .path("/")
+            .http_only(true)
+            .same_site(SameSite::Lax)
+            .secure(peer.needs_secure());
+        match app.config.server.session_max_age().try_into() {
+            Ok(max_age) => cookie.max_age(max_age).build(),
+            // Out of range only for a lifetime no operator can configure. A
+            // cookie without `Max-Age` still dies with the browser session,
+            // and the server expires the session itself regardless.
+            Err(_) => cookie.build(),
+        }
+    }
+
+    /// The cookie that removes it, at logout.
+    pub(crate) fn clear() -> Cookie<'static> {
+        Cookie::build(SESSION_COOKIE).path("/").build()
+    }
+
+    /// The session token a request carries in it.
+    fn read(headers: &HeaderMap) -> Option<String> {
+        CookieJar::from_headers(headers)
+            .get(SESSION_COOKIE)
+            .map(|c| c.value().to_owned())
     }
 }
 
@@ -156,7 +204,7 @@ pub(crate) fn session_cookie(app: &App, peer: Peer, token: String) -> Cookie<'st
 pub(crate) async fn password_login(
     app: &App,
     peer: Peer,
-    request_id: Option<String>,
+    RequestId(request_id): RequestId,
     username: &str,
     password: &str,
 ) -> ApiResult<(UserRow, String)> {
@@ -190,38 +238,12 @@ pub(crate) async fn password_login(
     Ok((user, token))
 }
 
-fn bearer(parts: &Parts) -> Option<String> {
-    parts
-        .headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(|t| t.trim().to_owned())
-}
-
-/// The id the request-id layer set, for an audit row written where there is
-/// no [`Identity`] to carry it — the login paths have no caller yet.
-pub(crate) fn request_id(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-}
-
-fn request_meta(parts: &Parts) -> (Option<String>, Option<String>) {
-    let addr = parts
-        .extensions
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip().to_string());
-    (addr, request_id(&parts.headers))
-}
-
 impl FromRequestParts<App> for Identity {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        let (client_addr, request_id) = request_meta(parts);
+        let client_addr = Peer::of(parts).ip();
+        let RequestId(request_id) = RequestId::of(&parts.headers);
         if app.local {
             return Ok(Self {
                 user_id: String::from(LOCAL_USER_ID),
@@ -234,12 +256,13 @@ impl FromRequestParts<App> for Identity {
             });
         }
 
-        let presented = match bearer(parts) {
-            Some(token) => Some(token),
-            None => CookieJar::from_headers(&parts.headers)
-                .get(SESSION_COOKIE)
-                .map(|c| c.value().to_owned()),
-        };
+        let bearer = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t.trim().to_owned());
+        let presented = bearer.or_else(|| SessionCookie::read(&parts.headers));
         let Some(presented) = presented else {
             return Err(ApiError::unauthorized("log in or send a bearer token"));
         };

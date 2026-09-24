@@ -6,13 +6,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum_extra::extract::CookieJar;
-use axum_extra::extract::cookie::Cookie;
 use quack_core::storage::control::{AuditAction, Outcome};
 use serde::Deserialize;
 
-use crate::server::auth::{
-    Credential, Identity, Peer, SESSION_COOKIE, password_login, request_id, session_cookie,
-};
+use crate::server::auth::{Credential, Identity, Peer, RequestId, SessionCookie, password_login};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
@@ -26,22 +23,16 @@ pub(crate) async fn login(
     State(app): State<App>,
     peer: Peer,
     jar: CookieJar,
-    headers: axum::http::HeaderMap,
+    request_id: RequestId,
     Json(body): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
     if app.local {
         return Err(ApiError::bad_request("local mode has no login"));
     }
-    let (user, token) = password_login(
-        &app,
-        peer,
-        request_id(&headers),
-        &body.username,
-        &body.password,
-    )
-    .await?;
+    let (user, token) =
+        password_login(&app, peer, request_id, &body.username, &body.password).await?;
     Ok((
-        jar.add(session_cookie(&app, peer, token.clone())),
+        jar.add(SessionCookie::issue(&app, peer, token.clone())),
         Json(serde_json::json!({ "token": token, "user": user })),
     ))
 }
@@ -64,7 +55,7 @@ impl Identity {
         }
         let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
         app.control.record_audit(&entry).await?;
-        Ok(jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()))
+        Ok(jar.remove(SessionCookie::clear()))
     }
 }
 
