@@ -25,7 +25,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
-use super::state::{App, SessionLookup, SessionToken};
+use super::state::{App, ServeMode, SessionLookup, SessionToken};
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -244,7 +244,7 @@ impl FromRequestParts<App> for Identity {
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
         let client_addr = Peer::of(parts).ip();
         let RequestId(request_id) = RequestId::of(&parts.headers);
-        if app.local {
+        if app.mode == ServeMode::Local {
             return Ok(Self {
                 user_id: UserId::from(LOCAL_USER_ID),
                 username: String::from(LOCAL_USER_ID),
@@ -478,7 +478,7 @@ impl Access {
             app.control.record_audit(&entry).await?;
             return Err(ApiError::not_found("no such workspace"));
         };
-        let role = if app.local {
+        let role = if app.mode == ServeMode::Local {
             Some(Role::Owner)
         } else {
             app.control

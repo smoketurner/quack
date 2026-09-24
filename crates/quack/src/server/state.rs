@@ -32,11 +32,20 @@ struct WorkspaceHandle {
     audit: Arc<AuditLog>,
 }
 
+/// How the server knows who is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServeMode {
+    /// Users log in with a password or send an API token.
+    Login,
+    /// `--local` or `[server].local`: no authentication, one implicit owner
+    /// of everything; loopback only.
+    Local,
+}
+
 pub(crate) struct AppState {
     pub config: Config,
     pub control: ControlPlane,
-    /// `--local`: no authentication, one implicit owner of everything.
-    pub local: bool,
+    pub mode: ServeMode,
     /// A workspace file is opened once per process; every request shares it.
     /// The cell is what enforces "once": `DuckDB`'s file lock is advisory
     /// and per-process, so two concurrent opens of one file both succeed
@@ -113,7 +122,7 @@ pub(crate) struct McpEntry {
 pub(crate) type App = Arc<AppState>;
 
 impl AppState {
-    pub(crate) fn new(config: Config, control: ControlPlane, local: bool) -> Self {
+    pub(crate) fn new(config: Config, control: ControlPlane, mode: ServeMode) -> Self {
         let sessions = WebSessions::new(
             config.server.session_max_age(),
             config.server.session_idle(),
@@ -122,7 +131,7 @@ impl AppState {
             jobs: JobQueue::from_config(&config.jobs),
             config,
             control,
-            local,
+            mode,
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
             sessions,
             mcp: tokio::sync::Mutex::new(HashMap::new()),

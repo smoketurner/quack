@@ -34,7 +34,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
 use quack_core::storage::control::{ControlPlane, sha256_hex};
-use state::{App, AppState};
+use state::{App, AppState, ServeMode};
 
 /// How long one request may take. Agent turns can be slow.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -212,7 +212,7 @@ async fn no_store(mut response: axum::response::Response) -> axum::response::Res
 struct Banner<'a> {
     config: &'a Config,
     addr: SocketAddr,
-    local: bool,
+    mode: ServeMode,
     users: usize,
     workspaces: usize,
 }
@@ -222,7 +222,7 @@ impl fmt::Display for Banner<'_> {
         let Self {
             config,
             addr,
-            local,
+            mode,
             users,
             workspaces,
         } = self;
@@ -244,10 +244,9 @@ impl fmt::Display for Banner<'_> {
         } else {
             providers.join(", ")
         };
-        let mode = if *local {
-            String::from("local: no login, one implicit owner")
-        } else {
-            format!("password and token login, {users} user(s)")
+        let mode = match mode {
+            ServeMode::Local => String::from("local: no login, one implicit owner"),
+            ServeMode::Login => format!("password and token login, {users} user(s)"),
         };
         write!(
             f,
@@ -277,13 +276,21 @@ impl fmt::Display for Banner<'_> {
 }
 
 /// Bind and serve until Ctrl-C.
-pub(crate) async fn serve(config: Config, bind: Option<String>, local: bool) -> anyhow::Result<()> {
-    let local = local || config.server.local;
+pub(crate) async fn serve(
+    config: Config,
+    bind: Option<String>,
+    mode: ServeMode,
+) -> anyhow::Result<()> {
+    let mode = if config.server.local {
+        ServeMode::Local
+    } else {
+        mode
+    };
     let bind = bind.unwrap_or_else(|| config.server.bind.clone());
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("'{bind}' is not a socket address"))?;
-    if local && !addr.ip().is_loopback() {
+    if mode == ServeMode::Local && !addr.ip().is_loopback() {
         anyhow::bail!(
             "--local serves without authentication and must bind a loopback address, not {addr}"
         );
@@ -293,7 +300,7 @@ pub(crate) async fn serve(config: Config, bind: Option<String>, local: bool) -> 
         .context("failed to open control plane")?;
     let users = control.list_users().await?.len();
     let workspaces = control.list_workspaces().await?.len();
-    if !local && users == 0 {
+    if mode == ServeMode::Login && users == 0 {
         tracing::warn!(
             "no users exist; nobody can log in until `quack user add NAME --admin` runs"
         );
@@ -304,18 +311,18 @@ pub(crate) async fn serve(config: Config, bind: Option<String>, local: bool) -> 
         let banner = Banner {
             config: &config,
             addr,
-            local,
+            mode,
             users,
             workspaces,
         };
         write!(out, "{banner}")?;
         out.flush()?;
     }
-    let app = Arc::new(AppState::new(config, control, local));
+    let app = Arc::new(AppState::new(config, control, mode));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
-    tracing::info!(%addr, local, "quack serve listening");
+    tracing::info!(%addr, ?mode, "quack serve listening");
     axum::serve(
         listener,
         router(app).into_make_service_with_connect_info::<SocketAddr>(),

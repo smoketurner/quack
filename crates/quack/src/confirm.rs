@@ -17,9 +17,10 @@ pub(crate) enum Confirm {
 }
 
 impl Confirm {
-    /// `Assume` when the command's `--yes` was given.
-    pub(crate) fn from_yes(yes: bool) -> Self {
-        if yes { Self::Assume } else { Self::Ask }
+    /// `Assume` when the command's `--yes` was given, else this: the
+    /// command line passes `Ask`, a terminal-session job `Assume`.
+    pub(crate) const fn or_yes(self, yes: bool) -> Self {
+        if yes { Self::Assume } else { self }
     }
 
     /// Put `question` and read the answer. Without a terminal on stdin the
@@ -75,11 +76,13 @@ mod tests {
     fn assume_goes_ahead_without_asking() {
         let mut out = Vec::new();
         assert!(
-            Confirm::from_yes(true)
+            Confirm::Ask
+                .or_yes(true)
                 .ask(&mut out, "Proceed?", Some("--yes"))
                 .is_ok_and(|yes| yes)
         );
         assert!(out.is_empty());
-        assert_eq!(Confirm::from_yes(false), Confirm::Ask);
+        assert_eq!(Confirm::Ask.or_yes(false), Confirm::Ask);
+        assert_eq!(Confirm::Assume.or_yes(false), Confirm::Assume);
     }
 }

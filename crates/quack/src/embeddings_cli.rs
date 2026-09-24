@@ -38,12 +38,13 @@ pub(crate) async fn run(
     config: &Config,
     db: &Writer,
     action: EmbeddingsAction,
+    confirm: Confirm,
     out: &mut impl Write,
     control: RunControl<'_>,
 ) -> Result<()> {
     match action {
         EmbeddingsAction::Refresh { yes } => {
-            refresh(config, db, Confirm::from_yes(yes), out, control).await
+            refresh(config, db, confirm.or_yes(yes), out, control).await
         }
     }
 }

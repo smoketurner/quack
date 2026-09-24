@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::server::auth::{Credential, Identity, Peer, RequestId, SessionCookie, password_login};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::state::App;
+use crate::server::state::{App, ServeMode};
 
 #[derive(Deserialize)]
 pub(crate) struct LoginRequest {
@@ -26,7 +26,7 @@ pub(crate) async fn login(
     request_id: RequestId,
     Json(body): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    if app.local {
+    if app.mode == ServeMode::Local {
         return Err(ApiError::bad_request("local mode has no login"));
     }
     let (user, token) =

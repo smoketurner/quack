@@ -43,6 +43,7 @@ use quack_core::storage::sessions::{
 use quack_core::storage::workspace::{Pinning, QueryCanceller, StatementKind, WorkspaceDb};
 
 use crate::ModeArg;
+use crate::confirm::Confirm;
 use crate::embeddings_cli::{self, EmbeddingsAction};
 use crate::graph_cli::{self, GraphAction};
 use crate::ontology_cli::{self, OntologyAction};
@@ -293,10 +294,35 @@ struct Turn {
     streaming: Option<usize>,
     /// Index into `messages` of the step line being filled in.
     open_step: Option<usize>,
-    /// The turn reported its end (`TurnComplete` or `Failed`).
-    ended: bool,
-    /// Its event stream closed; it stays until its job's end is known.
-    closed: bool,
+    progress: TurnProgress,
+}
+
+/// Where a turn is. Its end (`TurnComplete` or `Failed`) and the close of
+/// its event stream arrive in either order; a turn whose stream closed
+/// without an end stays until its job's end is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnProgress {
+    Streaming,
+    Ended,
+    Closed,
+    /// Ended and closed: nothing more will arrive.
+    Done,
+}
+
+impl TurnProgress {
+    const fn ended(self) -> Self {
+        match self {
+            Self::Streaming | Self::Ended => Self::Ended,
+            Self::Closed | Self::Done => Self::Done,
+        }
+    }
+
+    const fn closed(self) -> Self {
+        match self {
+            Self::Streaming | Self::Closed => Self::Closed,
+            Self::Ended | Self::Done => Self::Done,
+        }
+    }
 }
 
 impl Turn {
@@ -423,31 +449,6 @@ enum CliJob {
 }
 
 impl CliJob {
-    /// `/ontology VERB`. The terminal owns stdin, so nothing may prompt.
-    fn ontology(mut action: OntologyAction) -> Self {
-        if let OntologyAction::Propose(args) = &mut action {
-            args.yes = true;
-        }
-        Self::Ontology(action)
-    }
-
-    /// `/graph VERB`, never prompting.
-    fn graph(mut action: GraphAction) -> Self {
-        if let GraphAction::Extract(args) = &mut action {
-            args.yes = true;
-        }
-        Self::Graph(action)
-    }
-
-    /// `/embeddings VERB`, never prompting.
-    const fn embeddings(action: &EmbeddingsAction) -> Self {
-        match action {
-            EmbeddingsAction::Refresh { .. } => {
-                Self::Embeddings(EmbeddingsAction::Refresh { yes: true })
-            }
-        }
-    }
-
     const fn kind(&self) -> JobKind {
         match self {
             Self::Ontology(_) => JobKind::Ontology,
@@ -503,13 +504,37 @@ impl CliJob {
         let mut out: Vec<u8> = Vec::new();
         match self {
             Self::Ontology(action) => {
-                ontology_cli::run(&env.config, &env.db, action, &mut out, control).await?;
+                ontology_cli::run(
+                    &env.config,
+                    &env.db,
+                    action,
+                    Confirm::Assume,
+                    &mut out,
+                    control,
+                )
+                .await?;
             }
             Self::Graph(action) => {
-                graph_cli::run(&env.config, &env.db, action, &mut out, control).await?;
+                graph_cli::run(
+                    &env.config,
+                    &env.db,
+                    action,
+                    Confirm::Assume,
+                    &mut out,
+                    control,
+                )
+                .await?;
             }
             Self::Embeddings(action) => {
-                embeddings_cli::run(&env.config, &env.db, action, &mut out, control).await?;
+                embeddings_cli::run(
+                    &env.config,
+                    &env.db,
+                    action,
+                    Confirm::Assume,
+                    &mut out,
+                    control,
+                )
+                .await?;
             }
             Self::Okf(dir) => {
                 let name = env.workspace_name.clone();
@@ -699,7 +724,7 @@ pub(crate) struct App {
     pub(crate) scroll: Scroll,
     /// How far back the transcript could scroll when last drawn.
     pub(crate) scroll_limit: Cell<usize>,
-    pub(crate) should_quit: bool,
+    pub(crate) quit: Quit,
     pub(crate) spinner: Spinner,
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
@@ -714,8 +739,6 @@ pub(crate) struct App {
     job_events: broadcast::Receiver<JobInfo>,
     /// Jobs still queued or running, for the strip above the input.
     pub(crate) active_jobs: Vec<JobInfo>,
-    /// Ctrl+C was pressed once while jobs were running; a second quits.
-    quit_armed: bool,
     /// The session's database worker: every command's database step runs
     /// there, in the order typed, never on the event loop's thread.
     db_steps: Option<mpsc::UnboundedSender<DbStep>>,
@@ -744,6 +767,16 @@ pub(crate) struct App {
     msg_tx: mpsc::UnboundedSender<AppMsg>,
 }
 
+/// Whether the session is ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Quit {
+    Stay,
+    /// Ctrl+C was pressed once while jobs were running; a second quits,
+    /// any other key disarms it.
+    Armed,
+    Now,
+}
+
 impl App {
     pub(crate) fn new(setup: SessionSetup) -> Self {
         let SessionSetup {
@@ -753,7 +786,7 @@ impl App {
             db,
             reader_db,
             session_id,
-            allow_write,
+            writes,
         } = setup;
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let jobs = JobQueue::from_config(&config.jobs);
@@ -763,7 +796,7 @@ impl App {
             textarea: TextArea::default(),
             scroll: Scroll::Latest,
             scroll_limit: Cell::new(0),
-            should_quit: false,
+            quit: Quit::Stay,
             spinner: Spinner::default(),
             workspace_name,
             provider_display: config.chat_model_label(),
@@ -774,7 +807,6 @@ impl App {
             jobs,
             job_events,
             active_jobs: Vec::new(),
-            quit_armed: false,
             db_steps: None,
             pending_db: 0,
             switching: None,
@@ -785,7 +817,7 @@ impl App {
             workspace_id,
             db,
             reader_db,
-            allow_write: Arc::new(AtomicBool::new(allow_write)),
+            allow_write: Arc::new(AtomicBool::new(writes == WritePolicy::Allow)),
             expand_steps: false,
             wrap_cache: RefCell::new(Vec::new()),
             msg_rx,
@@ -897,7 +929,7 @@ impl App {
         spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut dirty = true;
 
-        while !self.should_quit {
+        while self.quit != Quit::Now {
             if dirty {
                 terminal.draw(|frame| ui::draw(frame, &self))?;
             }
@@ -1020,7 +1052,7 @@ impl App {
                 self.prompts
                     .retain(|p| !matches!(p, Prompt::Agent { job: owner, .. } if owner.id == job));
                 if let Some(turn) = self.turns.iter_mut().find(|t| t.job.id == job) {
-                    turn.closed = true;
+                    turn.progress = turn.progress.closed();
                 }
                 self.settle_turns();
             }
@@ -1067,11 +1099,10 @@ impl App {
     fn settle_turns(&mut self) {
         let mut turns = std::mem::take(&mut self.turns);
         turns.retain(|turn| {
-            if !turn.closed {
-                return true;
-            }
-            if turn.ended {
-                return false;
+            match turn.progress {
+                TurnProgress::Streaming | TurnProgress::Ended => return true,
+                TurnProgress::Done => return false,
+                TurnProgress::Closed => {}
             }
             match self.jobs.get(turn.job.id) {
                 Some(job) if !job.state.is_finished() => true,
@@ -1132,11 +1163,11 @@ impl App {
                 self.ask_for_turn(turn, visible, request);
             }
             AgentEvent::TurnComplete(response) if visible => {
-                turn.ended = true;
+                turn.progress = turn.progress.ended();
                 self.handle_turn_complete(turn, response);
             }
             AgentEvent::TurnComplete(response) => {
-                turn.ended = true;
+                turn.progress = turn.progress.ended();
                 let ended = if response.cancelled {
                     "was cancelled"
                 } else {
@@ -1152,7 +1183,7 @@ impl App {
                 );
             }
             AgentEvent::Failed(err) => {
-                turn.ended = true;
+                turn.progress = turn.progress.ended();
                 let text = if visible {
                     err.message
                 } else {
@@ -1338,8 +1369,8 @@ impl App {
 
     fn handle_key_event(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         let ctrl_c = (code, modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL);
-        if !ctrl_c {
-            self.quit_armed = false;
+        if !ctrl_c && self.quit == Quit::Armed {
+            self.quit = Quit::Stay;
         }
         if ctrl_c {
             // The prompt on screen first, then this session's newest turn.
@@ -1371,8 +1402,8 @@ impl App {
         match (code, modifiers) {
             (KeyCode::Char('c' | 'q'), KeyModifiers::CONTROL) => {
                 let running = self.jobs.counts(None).active();
-                if running > 0 && !self.quit_armed {
-                    self.quit_armed = true;
+                if running > 0 && self.quit == Quit::Stay {
+                    self.quit = Quit::Armed;
                     self.note(
                         MessageKind::System,
                         format!(
@@ -1382,7 +1413,7 @@ impl App {
                         ),
                     );
                 } else {
-                    self.should_quit = true;
+                    self.quit = Quit::Now;
                 }
             }
             (KeyCode::Esc, _) => {
@@ -1590,7 +1621,7 @@ impl App {
             }
         };
         match command {
-            SlashCommand::Quit => self.should_quit = true,
+            SlashCommand::Quit => self.quit = Quit::Now,
             SlashCommand::Clear => {
                 self.clear_transcript();
                 self.note(MessageKind::System, WELCOME_TEXT);
@@ -1626,7 +1657,7 @@ impl App {
             SlashCommand::Graph {
                 action: Some(action),
                 ..
-            } => self.run_job(CliJob::graph(action)),
+            } => self.run_job(CliJob::Graph(action)),
             SlashCommand::Graph {
                 action: None,
                 walk: Some(walk),
@@ -1638,7 +1669,7 @@ impl App {
                 MessageKind::System,
                 "Usage: /graph ENTITY [HOPS], or /graph --class CLASS",
             ),
-            SlashCommand::Ontology { action } => self.run_job(CliJob::ontology(action)),
+            SlashCommand::Ontology { action } => self.run_job(CliJob::Ontology(action)),
             SlashCommand::Delete { id } => self.delete_document(id),
             SlashCommand::Import {
                 url,
@@ -1661,7 +1692,7 @@ impl App {
             SlashCommand::Unshare => self.set_sharing(Sharing::Private),
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
-            SlashCommand::Embeddings { action } => self.run_job(CliJob::embeddings(&action)),
+            SlashCommand::Embeddings { action } => self.run_job(CliJob::Embeddings(action)),
             SlashCommand::Chart { n } => self.show_chart(n),
             SlashCommand::Steps => self.toggle_steps(),
             SlashCommand::Model => self.show_models(),
@@ -2332,11 +2363,7 @@ impl App {
         let job = Ticket::from(&self.jobs.submit(spec, move |ctx| async move {
             // Read when the turn starts, so an `a` answered while it
             // waited applies to it.
-            let policy = if allow_write.load(Ordering::Relaxed) {
-                WritePolicy::Allow
-            } else {
-                WritePolicy::Ask
-            };
+            let policy = WritePolicy::Ask.allowed_if(allow_write.load(Ordering::Relaxed));
             // The turn emits TurnComplete or Failed itself; the returned
             // value is the same response, and the job keeps its outline.
             match (llm::TurnRequest {
@@ -2377,8 +2404,7 @@ impl App {
             session_id: self.session_id.clone(),
             streaming: None,
             open_step: None,
-            ended: false,
-            closed: false,
+            progress: TurnProgress::Streaming,
         });
         if let Some(previous) = behind {
             self.note(
@@ -2448,6 +2474,18 @@ mod tests {
         panic!("{msg}")
     }
 
+    /// A turn's end and its stream's close arrive in either order, and only
+    /// both together finish it.
+    #[test]
+    fn a_turn_is_done_once_it_has_ended_and_closed() {
+        let start = TurnProgress::Streaming;
+        assert_eq!(start.ended(), TurnProgress::Ended);
+        assert_eq!(start.closed(), TurnProgress::Closed);
+        assert_eq!(start.ended().closed(), TurnProgress::Done);
+        assert_eq!(start.closed().ended(), TurnProgress::Done);
+        assert_eq!(start.ended().ended(), TurnProgress::Ended);
+    }
+
     /// An app over a real workspace file (the background jobs open it
     /// again by id), driven without a terminal.
     fn app(dir: &std::path::Path) -> App {
@@ -2469,7 +2507,7 @@ mod tests {
             db,
             reader_db,
             session_id: session.id,
-            allow_write: false,
+            writes: WritePolicy::Ask,
         })
     }
 
@@ -2521,8 +2559,7 @@ mod tests {
             session_id: app.session_id.clone(),
             streaming: None,
             open_step: None,
-            ended: false,
-            closed: false,
+            progress: TurnProgress::Streaming,
         }
     }
 
@@ -2727,7 +2764,7 @@ mod tests {
         assert_eq!(finished.state, JobState::Cancelled);
         app.turns.clear();
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.should_quit, "Ctrl+C with nothing running quits");
+        assert_eq!(app.quit, Quit::Now, "Ctrl+C with nothing running quits");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2791,10 +2828,10 @@ mod tests {
         pump_until(&mut app, |app| !app.active_jobs.is_empty()).await;
         assert!(!ui::job_strip(&app).is_empty(), "the strip shows it");
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(!app.should_quit);
+        assert_eq!(app.quit, Quit::Armed);
         assert!(last(&app).content.contains("still running"));
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.should_quit);
+        assert_eq!(app.quit, Quit::Now);
         assert!(sql_sink.send(()).is_ok());
         pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
         assert!(ui::job_strip(&app).is_empty());

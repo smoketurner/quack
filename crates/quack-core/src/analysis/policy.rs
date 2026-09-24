@@ -19,6 +19,14 @@ pub enum WritePolicy {
 }
 
 impl WritePolicy {
+    /// `Allow` when writes were permitted up front (`--allow-write`,
+    /// `allow_write` in a request, a token with the write scope), else this
+    /// policy: `Deny` where nobody can be asked, `Ask` where someone can.
+    #[must_use]
+    pub const fn allowed_if(self, allowed: bool) -> Self {
+        if allowed { Self::Allow } else { self }
+    }
+
     /// The system prompt's permissions paragraph for this policy.
     #[must_use]
     pub const fn prompt_paragraph(self) -> &'static str {
@@ -64,6 +72,15 @@ impl RefusalFlag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write permitted up front is allowed; otherwise each interface keeps
+    /// its own fallback.
+    #[test]
+    fn allowed_if_overrides_the_fallback_only_when_permitted() {
+        assert_eq!(WritePolicy::Deny.allowed_if(true), WritePolicy::Allow);
+        assert_eq!(WritePolicy::Deny.allowed_if(false), WritePolicy::Deny);
+        assert_eq!(WritePolicy::Ask.allowed_if(false), WritePolicy::Ask);
+    }
 
     #[test]
     fn refusal_flag_is_shared_across_clones() {

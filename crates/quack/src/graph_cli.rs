@@ -150,13 +150,16 @@ pub(crate) async fn run(
     config: &Config,
     db: &Writer,
     action: GraphAction,
+    confirm: Confirm,
     out: &mut impl Write,
     control: RunControl<'_>,
 ) -> Result<()> {
     match action {
         GraphAction::Search(args) => run_search(config, db, out, args).await?,
         GraphAction::Path(args) => run_path(config, db, out, args).await?,
-        GraphAction::Extract(args) => run_extract(config, db, out, &args, control).await?,
+        GraphAction::Extract(args) => {
+            run_extract(config, db, out, &args, confirm.or_yes(args.yes), control).await?;
+        }
         GraphAction::Status { json } => {
             db.render(out, move |db, out| {
                 TextOrJson::of(json).write(out, &graph_store::status(db)?)
@@ -293,6 +296,7 @@ async fn run_extract(
     db: &Writer,
     out: &mut impl Write,
     args: &ExtractArgs,
+    confirm: Confirm,
     control: RunControl<'_>,
 ) -> Result<()> {
     let ontology = db
@@ -344,7 +348,7 @@ async fn run_extract(
                 plan.len()
             )?;
             out.flush()?;
-            if Confirm::from_yes(args.yes).ask(out, "Proceed?", Some("--yes"))? {
+            if confirm.ask(out, "Proceed?", Some("--yes"))? {
                 let extractor = llm::graph_extractor(config, &ontology).await?;
                 let summary = extract::run(
                     db,

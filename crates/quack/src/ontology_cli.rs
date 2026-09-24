@@ -12,6 +12,7 @@ use quack_core::extraction::ExtractionRun;
 use crate::confirm::Confirm;
 use crate::graph_cli::RenderOnWriter;
 use crate::stdio::StdioPath;
+use crate::text_or_json::TextOrJson;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::candidates::Queue;
@@ -138,12 +139,18 @@ pub(crate) async fn run(
     config: &Config,
     db: &Writer,
     action: OntologyAction,
+    confirm: Confirm,
     out: &mut impl Write,
     control: RunControl<'_>,
 ) -> Result<()> {
     match action {
-        OntologyAction::Propose(args) => run_propose(config, db, args, out, control).await?,
-        OntologyAction::Show { json } => db.render(out, move |db, out| show(db, json, out)).await?,
+        OntologyAction::Propose(args) => {
+            run_propose(config, db, args, confirm, out, control).await?;
+        }
+        OntologyAction::Show { json } => {
+            let format = TextOrJson::of(json);
+            db.render(out, move |db, out| show(db, format, out)).await?;
+        }
         OntologyAction::Init => db.render(out, init).await?,
         OntologyAction::Export { file } => {
             db.render(out, move |db, out| export(db, &file, out))
@@ -204,14 +211,14 @@ pub(crate) async fn run(
     Ok(())
 }
 
-fn show(db: &WorkspaceDb, json: bool, out: &mut impl Write) -> Result<()> {
-    match store::current(db)? {
-        None => writeln!(
+fn show(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) -> Result<()> {
+    match (store::current(db)?, format) {
+        (None, TextOrJson::Text | TextOrJson::Json) => writeln!(
             out,
             "No ontology yet. Run `quack ontology init` for the built-in one or `quack ontology import FILE`."
         )?,
-        Some(ontology) if json => writeln!(out, "{}", ontology.to_json()?)?,
-        Some(ontology) => write!(out, "{}", ontology.render_summary())?,
+        (Some(ontology), TextOrJson::Json) => writeln!(out, "{}", ontology.to_json()?)?,
+        (Some(ontology), TextOrJson::Text) => write!(out, "{}", ontology.render_summary())?,
     }
     Ok(())
 }
@@ -304,6 +311,7 @@ async fn run_propose(
     config: &Config,
     db: &Writer,
     args: ProposeArgs,
+    confirm: Confirm,
     out: &mut impl Write,
     control: RunControl<'_>,
 ) -> Result<()> {
@@ -318,7 +326,7 @@ async fn run_propose(
         .await?;
     let pass = documents.then_some(DocumentPass {
         sample,
-        assume_yes: yes,
+        confirm: confirm.or_yes(yes),
     });
     propose(config, db, auto_accept, pass, out, control).await
 }
@@ -362,7 +370,7 @@ fn review(db: &WorkspaceDb, low_support: bool, out: &mut impl Write) -> Result<(
 /// The document pass, when asked for.
 struct DocumentPass {
     sample: Option<u32>,
-    assume_yes: bool,
+    confirm: Confirm,
 }
 
 /// `--from FILE`: store the file as a new version so the proposal only
@@ -423,7 +431,7 @@ async fn propose(
         out.flush()?;
         if cost.chunks == 0 {
             writeln!(out, "No ready documents to sample.")?;
-        } else if !Confirm::from_yes(pass.assume_yes).ask(out, "Proceed?", Some("--yes"))? {
+        } else if !pass.confirm.ask(out, "Proceed?", Some("--yes"))? {
             writeln!(out, "Skipped the document pass.")?;
         } else {
             let from_documents =
