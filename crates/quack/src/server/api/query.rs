@@ -142,29 +142,32 @@ impl PreparedTurn {
             .workspace(access.workspace.id.clone())
             .owner(Some(access.identity.user_id.clone()))
             .lane(Lane::serial(&lane));
-        let job = app.jobs.submit(spec, move |ctx| async move {
-            // run_turn emits TurnComplete or Failed itself.
-            match llm::run_turn(
-                &config,
-                db,
-                reader,
-                &session,
-                policy,
-                &text,
-                sink,
-                ctx.cancel_token(),
-            )
-            .await
-            {
-                Ok(response) if response.cancelled => Err(String::from("cancelled")),
-                Ok(response) => Ok(format!(
-                    "answered: {} steps, {} sources",
-                    response.steps.len(),
-                    response.citations.len()
-                )),
-                Err(e) => Err(e.to_string()),
-            }
-        });
+        let job = app
+            .jobs
+            .submit(spec, move |ctx| async move {
+                // run_turn emits TurnComplete or Failed itself.
+                match llm::run_turn(
+                    &config,
+                    db,
+                    reader,
+                    &session,
+                    policy,
+                    &text,
+                    sink,
+                    ctx.cancel_token(),
+                )
+                .await
+                {
+                    Ok(response) if response.cancelled => Err(String::from("cancelled")),
+                    Ok(response) => Ok(format!(
+                        "answered: {} steps, {} sources",
+                        response.steps.len(),
+                        response.citations.len()
+                    )),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+            .id;
         Turn {
             events,
             guard: CancelOnDrop {

@@ -71,6 +71,34 @@ impl Serialize for JobId {
     }
 }
 
+/// A job's short number, counting from 1 per queue, for people to type
+/// (`/cancel 3`): v7 ids submitted together share their first digits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct JobNumber(u64);
+
+impl JobNumber {
+    const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+impl fmt::Display for JobNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Reads `3` or `#3`, the way a job list shows it.
+impl std::str::FromStr for JobNumber {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        text.strip_prefix('#').unwrap_or(text).parse().map(Self)
+    }
+}
+
 /// What a job does, for display and filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,9 +341,7 @@ impl fmt::Display for JobProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobInfo {
     pub id: JobId,
-    /// A short number, counting from 1 per queue, for people to type
-    /// (`/cancel 3`): v7 ids submitted together share their first digits.
-    pub number: u64,
+    pub number: JobNumber,
     pub kind: JobKind,
     pub label: String,
     pub workspace_id: Option<String>,
@@ -397,7 +423,8 @@ struct Registry {
     /// Submission order.
     order: VecDeque<JobId>,
     jobs: HashMap<JobId, Entry>,
-    next_number: u64,
+    /// The number the latest job was given.
+    last_number: JobNumber,
 }
 
 struct Inner {
@@ -589,7 +616,7 @@ impl JobQueue {
     /// one.
     ///
     /// Must be called inside a Tokio runtime.
-    pub fn submit<F, Fut>(&self, spec: JobSpec, work: F) -> JobId
+    pub fn submit<F, Fut>(&self, spec: JobSpec, work: F) -> JobInfo
     where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: Future<Output = JobResult> + Send + 'static,
@@ -599,10 +626,10 @@ impl JobQueue {
         let cancel = CancellationToken::new();
         let snapshot = {
             let mut registry = self.inner.registry();
-            registry.next_number = registry.next_number.saturating_add(1);
+            registry.last_number = registry.last_number.next();
             let info = JobInfo {
                 id,
-                number: registry.next_number,
+                number: registry.last_number,
                 kind: spec.kind,
                 label: spec.label,
                 workspace_id: spec.workspace_id,
@@ -627,7 +654,7 @@ impl JobQueue {
             );
             info
         };
-        drop(self.inner.events.send(snapshot));
+        drop(self.inner.events.send(snapshot.clone()));
 
         // The lane place is taken now, so the lane runs in submission order.
         let ticket = spec.lane.as_ref().map(|lane| self.inner.enter_lane(lane));
@@ -640,7 +667,7 @@ impl JobQueue {
             };
             run(&inner, ticket, ctx, kind, work).await;
         });
-        id
+        snapshot
     }
 
     /// Every job remembered, in submission order.
@@ -670,7 +697,7 @@ impl JobQueue {
 
     /// The job shown as `number`.
     #[must_use]
-    pub fn by_number(&self, number: u64) -> Option<JobInfo> {
+    pub fn by_number(&self, number: JobNumber) -> Option<JobInfo> {
         self.inner
             .registry()
             .jobs
@@ -918,17 +945,21 @@ mod tests {
     async fn jobs_run_report_and_finish() {
         let queue = JobQueue::new(10);
         let mut events = queue.subscribe();
-        let ok = queue.submit(
-            JobSpec::new(JobKind::Sql, "select").workspace("ws"),
-            |ctx| async move {
-                ctx.progress(1, 2);
-                ctx.status("halfway");
-                Ok(String::from("2 rows"))
-            },
-        );
-        let err = queue.submit(JobSpec::new(JobKind::Ingest, "bad.pdf"), |_| async {
-            Err(String::from("not a pdf"))
-        });
+        let ok = queue
+            .submit(
+                JobSpec::new(JobKind::Sql, "select").workspace("ws"),
+                |ctx| async move {
+                    ctx.progress(1, 2);
+                    ctx.status("halfway");
+                    Ok(String::from("2 rows"))
+                },
+            )
+            .id;
+        let err = queue
+            .submit(JobSpec::new(JobKind::Ingest, "bad.pdf"), |_| async {
+                Err(String::from("not a pdf"))
+            })
+            .id;
         let ok = finished(&queue, ok).await;
         assert_eq!(ok.state, JobState::Succeeded);
         assert_eq!(ok.outcome.as_deref(), Some("2 rows"));
@@ -938,14 +969,14 @@ mod tests {
         let err = finished(&queue, err).await;
         assert_eq!(err.state, JobState::Failed);
         assert_eq!(err.outcome.as_deref(), Some("not a pdf"));
-        assert_eq!(err.number, 2);
+        assert_eq!(err.number, JobNumber(2));
 
         // The first event is the queued snapshot.
         let first = events.recv().await.unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(first.state, JobState::Queued);
         assert_eq!(queue.list_workspace("ws").len(), 1);
         assert_eq!(queue.counts(None).active(), 0);
-        assert_eq!(queue.by_number(2).map(|j| j.id), Some(err.id));
+        assert_eq!(queue.by_number(JobNumber(2)).map(|j| j.id), Some(err.id));
     }
 
     #[tokio::test]
@@ -958,25 +989,29 @@ mod tests {
             let log = Arc::clone(&log);
             let gate = Arc::clone(&gate);
             ids.push(
-                queue.submit(
-                    JobSpec::new(JobKind::Chat, format!("turn {n}"))
-                        .lane(Lane::serial(&LaneKey::Session(String::from("a")))),
-                    move |_| async move {
-                        if n == 0 {
-                            gate.notified().await;
-                        }
-                        log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
-                        Ok(String::new())
-                    },
-                ),
+                queue
+                    .submit(
+                        JobSpec::new(JobKind::Chat, format!("turn {n}"))
+                            .lane(Lane::serial(&LaneKey::Session(String::from("a")))),
+                        move |_| async move {
+                            if n == 0 {
+                                gate.notified().await;
+                            }
+                            log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
+                            Ok(String::new())
+                        },
+                    )
+                    .id,
             );
         }
         // Another lane is not held up by the first.
-        let other = queue.submit(
-            JobSpec::new(JobKind::Sql, "other")
-                .lane(Lane::serial(&LaneKey::Session(String::from("b")))),
-            |_| async { Ok(String::from("done")) },
-        );
+        let other = queue
+            .submit(
+                JobSpec::new(JobKind::Sql, "other")
+                    .lane(Lane::serial(&LaneKey::Session(String::from("b")))),
+                |_| async { Ok(String::from("done")) },
+            )
+            .id;
         assert_eq!(finished(&queue, other).await.state, JobState::Succeeded);
         let counts = queue.counts(None);
         assert_eq!((counts.running, counts.queued), (1, 2));
@@ -1012,12 +1047,15 @@ mod tests {
                         gate.notified().await;
                         Ok(String::new())
                     },
-                ),
+                )
+                .id,
             );
         }
-        let free = wide.submit(JobSpec::new(JobKind::Sql, "select"), |_| async {
-            Ok(String::new())
-        });
+        let free = wide
+            .submit(JobSpec::new(JobKind::Sql, "select"), |_| async {
+                Ok(String::new())
+            })
+            .id;
         assert_eq!(finished(&wide, free).await.state, JobState::Succeeded);
         tokio::time::sleep(Duration::from_millis(50)).await;
         let counts = wide.counts(None);
@@ -1041,14 +1079,16 @@ mod tests {
         for n in 0..50_u32 {
             let log = Arc::clone(&log);
             ids.push(
-                queue.submit(
-                    JobSpec::new(JobKind::Chat, format!("{n}"))
-                        .lane(Lane::serial(&LaneKey::Session(String::from("x")))),
-                    move |_| async move {
-                        log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
-                        Ok(String::new())
-                    },
-                ),
+                queue
+                    .submit(
+                        JobSpec::new(JobKind::Chat, format!("{n}"))
+                            .lane(Lane::serial(&LaneKey::Session(String::from("x")))),
+                        move |_| async move {
+                            log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
+                            Ok(String::new())
+                        },
+                    )
+                    .id,
             );
         }
         // One cancelled while queued is skipped, not waited on.
@@ -1068,19 +1108,23 @@ mod tests {
     #[tokio::test]
     async fn cancel_stops_queued_and_running_jobs_and_panics_fail() {
         let queue = JobQueue::new(10);
-        let running = queue.submit(
-            JobSpec::new(JobKind::Chat, "long")
-                .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
-            |ctx| async move {
-                ctx.cancel_token().cancelled().await;
-                Err(String::from("stopped"))
-            },
-        );
-        let queued = queue.submit(
-            JobSpec::new(JobKind::Chat, "never")
-                .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
-            |_| async { Ok(String::from("ran")) },
-        );
+        let running = queue
+            .submit(
+                JobSpec::new(JobKind::Chat, "long")
+                    .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
+                |ctx| async move {
+                    ctx.cancel_token().cancelled().await;
+                    Err(String::from("stopped"))
+                },
+            )
+            .id;
+        let queued = queue
+            .submit(
+                JobSpec::new(JobKind::Chat, "never")
+                    .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
+                |_| async { Ok(String::from("ran")) },
+            )
+            .id;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(queue.cancel(queued));
         let queued = finished(&queue, queued).await;
@@ -1096,15 +1140,19 @@ mod tests {
         );
 
         #[expect(clippy::panic, reason = "the panic under test")]
-        let panicked = queue.submit(JobSpec::new(JobKind::Graph, "boom"), |_| async {
-            panic!("boom")
-        });
+        let panicked = queue
+            .submit(JobSpec::new(JobKind::Graph, "boom"), |_| async {
+                panic!("boom")
+            })
+            .id;
         let panicked = finished(&queue, panicked).await;
         assert_eq!(panicked.state, JobState::Failed);
         // The worker slot came back.
-        let after = queue.submit(JobSpec::new(JobKind::Sql, "after"), |_| async {
-            Ok(String::new())
-        });
+        let after = queue
+            .submit(JobSpec::new(JobKind::Sql, "after"), |_| async {
+                Ok(String::new())
+            })
+            .id;
         assert_eq!(finished(&queue, after).await.state, JobState::Succeeded);
     }
 
@@ -1113,9 +1161,11 @@ mod tests {
         let queue = JobQueue::new(2);
         let mut last = None;
         for n in 0..5 {
-            let id = queue.submit(JobSpec::new(JobKind::Sql, format!("{n}")), |_| async {
-                Ok(String::new())
-            });
+            let id = queue
+                .submit(JobSpec::new(JobKind::Sql, format!("{n}")), |_| async {
+                    Ok(String::new())
+                })
+                .id;
             finished(&queue, id).await;
             last = Some(id);
         }

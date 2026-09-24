@@ -1,30 +1,36 @@
 //! The slash commands as a clap parser: the terminal dispatches on it, and
 //! `/help` and the input popup are rendered from the same definition.
 
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::LazyLock;
 
-use clap::{Arg, Command, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
+use quack_core::graph::traverse::Hops;
+use quack_core::ingestion::parser::{self, FileType};
+use quack_core::jobs::JobNumber;
+use quack_core::storage::workspace::looks_like_direct_sql;
 
 use crate::embeddings_cli::EmbeddingsAction;
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
+use crate::{ExportFlags, ModeArg};
+
+/// The argument id of a command that takes the rest of the line as typed
+/// (a statement, a path, an entity name), so quotes and spacing survive.
+const VERBATIM: &str = "verbatim";
 
 /// One slash command line, parsed from its words.
 #[derive(Parser)]
 #[command(name = "quack", no_binary_name = true, disable_help_subcommand = true)]
-pub(crate) struct SlashLine {
+struct SlashLine {
     #[command(subcommand)]
-    pub(crate) command: SlashCommand,
+    command: SlashCommand,
 }
 
-/// The commands. Most take free text that the handlers read from the line
-/// as typed, so quoting and spacing survive; the fields here give `/help`
-/// and the popup their arguments and let clap refuse a missing one.
+/// The commands.
 #[derive(Subcommand)]
-#[expect(
-    dead_code,
-    reason = "free-text fields exist for clap's usage and required checks; handlers read the raw line"
-)]
 pub(crate) enum SlashCommand {
     /// Show this help message
     #[command(name = "/help", visible_alias = "/?")]
@@ -32,8 +38,8 @@ pub(crate) enum SlashCommand {
     /// Run SQL directly; with no argument, edit the last query
     #[command(name = "/sql", disable_help_flag = true)]
     Sql {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        statement: Vec<String>,
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "STATEMENT")]
+        statement: Option<String>,
     },
     /// List tables in the workspace
     #[command(name = "/tables")]
@@ -41,14 +47,14 @@ pub(crate) enum SlashCommand {
     /// Columns, types, and sample rows of a table
     #[command(name = "/schema", disable_help_flag = true)]
     Schema {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        table: Vec<String>,
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TABLE")]
+        table: String,
     },
     /// Load a file (a bare path typed at the prompt does the same)
     #[command(name = "/ingest", visible_alias = "/attach", disable_help_flag = true)]
     Ingest {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        path: Vec<String>,
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "PATH")]
+        path: String,
     },
     /// Pull rows from Postgres, SQLite, or a URL
     #[command(name = "/import", disable_help_flag = true)]
@@ -88,23 +94,18 @@ pub(crate) enum SlashCommand {
         #[command(subcommand)]
         action: Option<GraphAction>,
         #[arg(
+            id = VERBATIM,
             required = true,
-            trailing_var_arg = true,
             allow_hyphen_values = true,
             value_name = "ENTITY [HOPS] | --class CLASS"
         )]
-        walk: Vec<String>,
+        walk: Option<GraphWalk>,
     },
     /// Shortest relation chain between two entities
     #[command(name = "/path", disable_help_flag = true)]
     Path {
-        #[arg(
-            required = true,
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "FROM -> TO"
-        )]
-        route: Vec<String>,
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "FROM -> TO")]
+        route: Route,
     },
     /// Show, replace, or save the workspace context
     #[command(name = "/context")]
@@ -115,8 +116,8 @@ pub(crate) enum SlashCommand {
     /// Export the workspace as an Open Knowledge Format bundle
     #[command(name = "/okf", disable_help_flag = true)]
     Okf {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        dir: Vec<String>,
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "DIR")]
+        dir: String,
     },
     /// Refresh what the embedding model, width, or prefixes left stale
     #[command(name = "/embeddings")]
@@ -135,7 +136,7 @@ pub(crate) enum SlashCommand {
     New,
     /// Show or set the answer mode
     #[command(name = "/mode")]
-    Mode { mode: Option<ModeName> },
+    Mode { mode: Option<ModeArg> },
     /// Share this session with every member
     #[command(name = "/share")]
     Share,
@@ -145,14 +146,9 @@ pub(crate) enum SlashCommand {
     /// Save this session
     #[command(name = "/export")]
     Export {
-        /// As SQL statements
-        #[arg(long, conflicts_with = "markdown")]
-        sql: bool,
-        /// As Markdown (the default)
-        #[arg(long)]
-        markdown: bool,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        file: Vec<String>,
+        #[command(flatten)]
+        flags: ExportFlags,
+        file: Option<String>,
     },
     /// List running, queued, and recent jobs
     #[command(name = "/jobs")]
@@ -160,14 +156,16 @@ pub(crate) enum SlashCommand {
     /// Cancel job N from /jobs (queued or running)
     #[command(name = "/cancel", disable_help_flag = true)]
     Cancel {
-        #[arg(allow_hyphen_values = true, value_name = "N")]
-        job: String,
+        // As typed: a shell split would read `#3`, the way /jobs shows a
+        // number, as a comment.
+        #[arg(id = VERBATIM, value_name = "N")]
+        job: JobNumber,
     },
     /// Show the chart of the Nth chart-bearing answer (default: the last)
     #[command(name = "/chart", disable_help_flag = true)]
     Chart {
-        #[arg(allow_hyphen_values = true, value_name = "N")]
-        n: Option<String>,
+        #[arg(value_name = "N")]
+        n: Option<usize>,
     },
     /// Expand or collapse the tool call details
     #[command(name = "/steps")]
@@ -187,30 +185,163 @@ pub(crate) enum SlashCommand {
 }
 
 #[derive(Subcommand)]
-#[expect(
-    dead_code,
-    reason = "the file is read from the raw line so spaces survive"
-)]
 pub(crate) enum ContextAction {
     /// Replace the workspace context with a file
     Import {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        file: Vec<String>,
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "FILE")]
+        file: String,
     },
     /// Save the workspace context to a file
     Export {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        file: Vec<String>,
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "FILE")]
+        file: String,
     },
 }
 
-/// `/mode`'s argument, for its completion and check; `ChatMode` parses it.
-#[derive(Clone, Copy, ValueEnum)]
-pub(crate) enum ModeName {
-    /// General knowledge allowed; cite when a source was used
-    Chat,
-    /// Every claim must come from a retrieved source
-    Query,
+/// `/graph`'s walk: an entity's neighbourhood, or a class's entities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GraphWalk {
+    /// `ENTITY [HOPS]`: a trailing number is the hop count.
+    Entity { name: String, hops: Hops },
+    /// `--class CLASS`.
+    Class(String),
+}
+
+impl FromStr for GraphWalk {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        if let Some(class) = text.strip_prefix("--class") {
+            let class = class.trim();
+            return if class.is_empty() {
+                Err(String::from("--class needs a class name"))
+            } else {
+                Ok(Self::Class(class.to_owned()))
+            };
+        }
+        let (name, hops) = text
+            .rsplit_once(char::is_whitespace)
+            .and_then(|(name, hops)| Some((name.trim(), Hops::new(hops.parse().ok()?))))
+            .unwrap_or((text, Hops::NEIGHBORHOOD));
+        Ok(Self::Entity {
+            name: name.to_owned(),
+            hops,
+        })
+    }
+}
+
+/// `/path`'s `FROM -> TO`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Route {
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+impl FromStr for Route {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        text.split_once("->")
+            .map(|(from, to)| (from.trim(), to.trim()))
+            .filter(|(from, to)| !from.is_empty() && !to.is_empty())
+            .map(|(from, to)| Self {
+                from: from.to_owned(),
+                to: to.to_owned(),
+            })
+            .ok_or_else(|| String::from("expected FROM -> TO"))
+    }
+}
+
+impl SlashCommand {
+    /// Parse a typed `/` line. Words naming a command or one of its verbs
+    /// are read first; after them, a command taking free text gets the rest
+    /// of the line as typed, and any other has it split like a shell line.
+    pub(crate) fn parse(line: &str) -> Result<Self, clap::Error> {
+        let mut words: Vec<String> = Vec::new();
+        let mut command: &Command = &TREE;
+        let mut rest = line.trim();
+        while let Some((word, after)) = next_word(rest)
+            && let Some(sub) = command.find_subcommand(word)
+        {
+            words.push(word.to_owned());
+            command = sub;
+            rest = after;
+        }
+        if words.is_empty() {
+            // Not a command: clap names the first word as unknown.
+            words.extend(rest.split_whitespace().map(str::to_owned));
+        } else if takes_verbatim(command) {
+            words.extend((!rest.is_empty()).then(|| rest.to_owned()));
+        } else {
+            let split = shlex::split(rest).ok_or_else(|| {
+                SlashLine::command().error(ErrorKind::ValueValidation, "a quote is not closed")
+            })?;
+            words.extend(split);
+        }
+        SlashLine::try_parse_from(words).map(|line| line.command)
+    }
+}
+
+/// The first word of `text` and what follows it, trimmed.
+fn next_word(text: &str) -> Option<(&str, &str)> {
+    if text.is_empty() {
+        return None;
+    }
+    Some(
+        text.split_once(char::is_whitespace)
+            .map_or((text, ""), |(word, after)| (word, after.trim_start())),
+    )
+}
+
+/// Whether `command` reads the rest of the line as typed.
+fn takes_verbatim(command: &Command) -> bool {
+    command.get_arguments().any(|arg| arg.get_id() == VERBATIM)
+}
+
+/// What a submitted line is.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Input {
+    /// A `/` command.
+    Command(String),
+    /// A path to a file quack can load.
+    File(PathBuf),
+    /// A statement to run as typed.
+    Sql(String),
+    /// A question for the agent.
+    Question(String),
+}
+
+impl Input {
+    pub(crate) fn classify(line: String) -> Self {
+        if line.starts_with('/') {
+            Self::Command(line)
+        } else if let Some(path) = Self::file(&line) {
+            Self::File(path)
+        } else if looks_like_direct_sql(&line) {
+            Self::Sql(line)
+        } else {
+            Self::Question(line)
+        }
+    }
+
+    /// The file `text` names, when it is one quack can load: quoted or
+    /// not, `~/` for the home directory, relative to the working directory
+    /// otherwise.
+    pub(crate) fn file(text: &str) -> Option<PathBuf> {
+        let cleaned = text.trim().trim_matches('\'').trim_matches('"');
+        if cleaned.is_empty() || cleaned.contains('\n') {
+            return None;
+        }
+        if parser::detect_file_type(cleaned) == FileType::Unknown {
+            return None;
+        }
+        let path = match cleaned.strip_prefix("~/") {
+            Some(under_home) => dirs::home_dir()?.join(under_home),
+            None => PathBuf::from(cleaned),
+        };
+        path.is_file().then_some(path)
+    }
 }
 
 /// The parser's command tree, built once.
@@ -519,7 +650,14 @@ impl Completion {
 
 #[cfg(test)]
 mod tests {
+    use quack_core::storage::sessions::ExportFormat;
+
     use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
 
     fn words(line: &str) -> Vec<String> {
         Completion::for_line(line)
@@ -528,7 +666,7 @@ mod tests {
     }
 
     fn parses(line: &str) -> bool {
-        SlashLine::try_parse_from(line.split_whitespace()).is_ok()
+        SlashCommand::parse(line).is_ok()
     }
 
     #[test]
@@ -669,8 +807,8 @@ mod tests {
         assert!(parses("/? "));
         assert!(parses("/sql SELECT '-h' --help"), "free text keeps -h");
         assert!(matches!(
-            SlashLine::try_parse_from(["/ontology", "--help"]).map_err(|e| e.kind()),
-            Err(clap::error::ErrorKind::DisplayHelp)
+            SlashCommand::parse("/ontology --help").map_err(|e| e.kind()),
+            Err(ErrorKind::DisplayHelp)
         ));
         assert!(!parses("/schema"));
         assert!(!parses("/graph"));
@@ -682,11 +820,119 @@ mod tests {
             "propose has one behavior: what the ontology lacks"
         );
         assert!(matches!(
-            SlashLine::try_parse_from(["/graph", "merges"]).map(|l| l.command),
+            SlashCommand::parse("/graph merges"),
             Ok(SlashCommand::Graph {
                 action: Some(GraphAction::Merges),
-                ..
+                walk: None,
             })
         ));
+    }
+
+    #[test]
+    fn free_text_arrives_as_typed_and_the_rest_splits_like_a_shell_line() {
+        assert!(matches!(
+            SlashCommand::parse("/sql SELECT 'a  b' AS \"x\""),
+            Ok(SlashCommand::Sql { statement: Some(s) }) if s == "SELECT 'a  b' AS \"x\""
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/sql"),
+            Ok(SlashCommand::Sql { statement: None })
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/context import my notes.md"),
+            Ok(SlashCommand::Context { action: Some(ContextAction::Import { file }) })
+                if file == "my notes.md"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/import sqlite:/tmp/a.db t --query \"SELECT * FROM x WHERE y = 'z'\""),
+            Ok(SlashCommand::Import { url, table, source_table: None, query: Some(q) })
+                if url == "sqlite:/tmp/a.db" && table == "t" && q == "SELECT * FROM x WHERE y = 'z'"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/export --sql 'the session.sql'"),
+            Ok(SlashCommand::Export { flags, file: Some(f) })
+                if flags.format() == ExportFormat::Sql && f == "the session.sql"
+        ));
+        let unclosed = SlashCommand::parse("/export 'open");
+        assert!(
+            unclosed
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("quote is not closed")),
+            "{:?}",
+            unclosed.map(|_| ())
+        );
+        assert!(matches!(
+            SlashCommand::parse("/cancel #3"),
+            Ok(SlashCommand::Cancel { job }) if job.to_string() == "3"
+        ));
+        assert!(!parses("/cancel x"));
+        assert!(matches!(
+            SlashCommand::parse("/chart 2"),
+            Ok(SlashCommand::Chart { n: Some(2) })
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/unknown 'quote"),
+            Err(e) if e.kind() == ErrorKind::InvalidSubcommand
+        ));
+    }
+
+    #[test]
+    fn a_graph_walk_is_an_entity_with_optional_hops_or_a_class() {
+        let walk = |text: &str| text.parse::<GraphWalk>();
+        assert_eq!(
+            walk("O'Brien Ltd 3"),
+            Ok(GraphWalk::Entity {
+                name: String::from("O'Brien Ltd"),
+                hops: Hops::new(3)
+            })
+        );
+        assert_eq!(
+            walk("Alice"),
+            Ok(GraphWalk::Entity {
+                name: String::from("Alice"),
+                hops: Hops::NEIGHBORHOOD
+            })
+        );
+        assert_eq!(
+            walk("--class  Person"),
+            Ok(GraphWalk::Class(String::from("Person")))
+        );
+        assert!(walk("--class").is_err());
+        assert!(matches!(
+            SlashCommand::parse("/graph O'Brien 2"),
+            Ok(SlashCommand::Graph { action: None, walk: Some(GraphWalk::Entity { name, .. }) })
+                if name == "O'Brien"
+        ));
+        assert_eq!(
+            "Alice -> Bob Jones".parse::<Route>(),
+            Ok(Route {
+                from: String::from("Alice"),
+                to: String::from("Bob Jones")
+            })
+        );
+        assert!("Alice ->".parse::<Route>().is_err());
+        assert!("Alice".parse::<Route>().is_err());
+    }
+
+    #[test]
+    fn a_line_is_a_command_a_file_sql_or_a_question() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "# hi").unwrap_or_else(|e| fail(&e.to_string()));
+        let path = file.display().to_string();
+        assert_eq!(
+            Input::classify(String::from("/tables")),
+            Input::Command(String::from("/tables"))
+        );
+        assert_eq!(Input::classify(format!("'{path}'")), Input::File(file));
+        assert_eq!(
+            Input::classify(String::from("SELECT 1")),
+            Input::Sql(String::from("SELECT 1"))
+        );
+        assert_eq!(
+            Input::classify(String::from("what is in notes.md")),
+            Input::Question(String::from("what is in notes.md"))
+        );
+        assert!(Input::file("/nowhere/notes.md").is_none());
     }
 }

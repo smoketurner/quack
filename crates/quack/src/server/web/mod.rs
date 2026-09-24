@@ -61,6 +61,7 @@ use quack_core::graph::{
     traverse,
 };
 use quack_core::import::ImportRequest;
+use quack_core::jobs::JobNumber;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
 
@@ -279,7 +280,7 @@ struct JobsPage {
 /// One job as the Jobs page shows it.
 struct JobView {
     id: String,
-    number: u64,
+    number: JobNumber,
     kind: String,
     label: String,
     /// `queued`, `running`, `cancelling`, or a final state.
