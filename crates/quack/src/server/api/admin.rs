@@ -7,7 +7,7 @@ use axum::response::IntoResponse;
 use quack_core::storage::control::{AuditAction, AuditFilter, Outcome, ResourceKind, UserRow};
 use serde::Deserialize;
 
-use crate::server::auth::{Identity, require_admin};
+use crate::server::auth::Identity;
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
@@ -15,7 +15,7 @@ pub(crate) async fn users(
     State(app): State<App>,
     identity: Identity,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin(&identity)?;
+    identity.require_admin()?;
     let users = app.control.list_users().await?;
     Ok(Json(serde_json::json!({ "users": users })))
 }
@@ -41,7 +41,7 @@ impl Identity {
     /// Add a server user, from the API or the web console: admins only,
     /// and not in local mode, which has no logins.
     pub(crate) async fn create_user(&self, app: &App, user: &CreateUser) -> ApiResult<UserRow> {
-        require_admin(self)?;
+        self.require_admin()?;
         if app.local {
             return Err(ApiError::bad_request("local mode has no users"));
         }
@@ -77,7 +77,7 @@ pub(crate) async fn audit(
     identity: Identity,
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin(&identity)?;
+    identity.require_admin()?;
     let rows = app
         .control
         .query_audit(&AuditFilter {

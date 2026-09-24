@@ -15,7 +15,7 @@ use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use tokio::sync::broadcast;
 
 use super::StreamEvent;
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
@@ -55,7 +55,7 @@ pub(crate) async fn list(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::List, "jobs").await?;
     let jobs = visible_jobs(&app, &access);
     let counts = app.jobs.counts(Some(&id));
@@ -80,7 +80,7 @@ pub(crate) async fn show(
     identity: Identity,
     Path((id, job)): Path<(String, String)>,
 ) -> ApiResult<Json<JobInfo>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Show, "job").await?;
     let job = find(&app, &id, &job)?;
     Ok(Json(redact(&access, job)))
@@ -93,7 +93,7 @@ pub(crate) async fn cancel(
     identity: Identity,
     Path((id, job)): Path<(String, String)>,
 ) -> ApiResult<Json<JobInfo>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(cancel_job(&app, &access, &job).await?))
 }
 
@@ -137,7 +137,7 @@ pub(crate) async fn stream(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Stream, "jobs").await?;
     let receiver = app.jobs.subscribe();
     let first = StreamEvent::Jobs

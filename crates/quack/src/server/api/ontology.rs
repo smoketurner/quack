@@ -9,7 +9,7 @@ use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
@@ -22,7 +22,7 @@ pub(crate) async fn show(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology")
         .await?;
@@ -38,7 +38,7 @@ pub(crate) async fn replace(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access
         .replace_ontology(&app, &body.to_string(), "imported")
         .await?;
@@ -51,7 +51,7 @@ pub(crate) async fn init(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.init_ontology(&app).await?;
     Ok(Json(serde_json::to_value(stored)?))
 }
@@ -147,7 +147,7 @@ pub(crate) async fn versions(
     Path(id): Path<String>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology_versions")
         .await?;
@@ -168,7 +168,7 @@ pub(crate) async fn version(
     Path((id, v)): Path<(String, u32)>,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit(
             &app,
@@ -202,7 +202,7 @@ pub(crate) async fn restore(
     identity: Identity,
     Path((id, v)): Path<(String, u32)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await?;
     Ok(Json(serde_json::to_value(stored)?))
 }
@@ -235,7 +235,7 @@ pub(crate) async fn propose(
     Path(id): Path<String>,
     body: Option<Json<ProposeRequest>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     if let Some(mode) = request.mode.as_deref()
         && mode != "extend"
@@ -429,7 +429,7 @@ pub(crate) async fn list_candidates(
     Path(id): Path<String>,
     Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology_candidates")
         .await?;
@@ -458,7 +458,7 @@ pub(crate) async fn decide_many(
     Path(id): Path<String>,
     Json(body): Json<DecideManyRequest>,
 ) -> ApiResult<Json<CandidatesDecided>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(
         access
             .decide_candidates(&app, body.accept, body.reject)
@@ -480,7 +480,7 @@ pub(crate) async fn decide(
     Path((id, cid)): Path<(String, String)>,
     Json(body): Json<DecideRequest>,
 ) -> ApiResult<Json<CandidateDecided>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(
         access
             .decide_candidate(&app, &cid, body.action, body.target.as_deref())

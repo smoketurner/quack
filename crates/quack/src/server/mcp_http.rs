@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use quack_core::analysis::policy::WritePolicy;
 use tower::ServiceExt;
 
-use super::auth::{Identity, Need, access};
+use super::auth::{Access, Identity, Need};
 use super::error::ApiResult;
 use super::state::App;
 use crate::mcp::{Auditor, McpServer, ServerAuditor};
@@ -22,7 +22,7 @@ pub(crate) async fn handle(
     request: Request,
 ) -> ApiResult<Response> {
     identity.via_mcp = true;
-    let access = access(&app, identity, &workspace, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &workspace, Need::READ).await?;
     let can_write = access.permits(Need::WRITE);
     let key = format!(
         "{}:{}:{}",

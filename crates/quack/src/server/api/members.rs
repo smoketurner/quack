@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind, Role};
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
@@ -19,7 +19,7 @@ pub(crate) async fn list(
         admin_ok: true,
         ..Need::READ
     };
-    let access = access(&app, identity, &id, need).await?;
+    let access = Access::resolve(&app, identity, &id, need).await?;
     access
         .audit_read(&app, AuditAction::List, "members")
         .await?;
@@ -44,7 +44,7 @@ pub(crate) async fn add(
     Path(id): Path<String>,
     Json(body): Json<AddMember>,
 ) -> ApiResult<Json<NewMember>> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     Ok(Json(access.add_member(&app, &body).await?))
 }
 
@@ -53,7 +53,7 @@ pub(crate) async fn remove(
     identity: Identity,
     Path((id, user_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     access.remove_member(&app, &user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -50,9 +50,7 @@ use super::api::{
     ontology as ontology_api, query as query_api, sessions as sessions_api,
     workspaces as workspaces_api,
 };
-use super::auth::{
-    Access, Identity, Need, Peer, access, password_login, request_id, require_admin, session_cookie,
-};
+use super::auth::{Access, Identity, Need, Peer, password_login, request_id, session_cookie};
 use super::error::ApiError;
 use super::state::App;
 use quack_core::csv::CsvField;
@@ -787,7 +785,7 @@ async fn chat(
     Path(id): Path<String>,
     Query(q): Query<ChatQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let user = access.identity.user_id.clone();
     let sees_all = access.sees_all_sessions();
     let wanted = q.session.clone();
@@ -839,7 +837,7 @@ async fn delete_session(
     WebUser(identity): WebUser,
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     sessions_api::delete_session(&app, &access, &sid).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat")).into_response())
 }
@@ -849,7 +847,7 @@ async fn share_session(
     WebUser(identity): WebUser,
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     sessions_api::set_shared(&app, &access, &sid, true).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
@@ -859,7 +857,7 @@ async fn unshare_session(
     WebUser(identity): WebUser,
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     sessions_api::set_shared(&app, &access, &sid, false).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
@@ -912,7 +910,7 @@ async fn jobs_page(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "jobs").await?;
     let rows = render_jobs(&app, &access)?;
     html(&JobsPage {
@@ -926,7 +924,7 @@ async fn job_rows(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "job_rows")
         .await?;
@@ -938,7 +936,7 @@ async fn job_cancel(
     WebUser(identity): WebUser,
     Path((id, job)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let cancelled = jobs_api::cancel_job(&app, &access, &job).await?;
     tracing::debug!(job = %cancelled.id, state = %cancelled.state, "cancel requested from the web");
     Ok(Html(render_jobs(&app, &access)?).into_response())
@@ -950,7 +948,7 @@ async fn documents(
     Path(id): Path<String>,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "documents")
         .await?;
@@ -972,7 +970,7 @@ async fn refresh_embeddings(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let started = access.refresh_embeddings(&app).await;
     Ok(
         Flash::after(format!("/w/{id}/documents"), started, |started| {
@@ -992,7 +990,7 @@ async fn document_rows(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "document_rows")
         .await?;
@@ -1005,7 +1003,7 @@ async fn upload(
     Path(id): Path<String>,
     multipart: Multipart,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let mut files = Vec::new();
     let mut text = String::new();
     let mut title = String::new();
@@ -1090,7 +1088,7 @@ async fn pin(
     WebUser(identity): WebUser,
     Path((id, doc)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, true).await?;
     Ok(Html(render_rows(&app, &access).await?).into_response())
 }
@@ -1100,7 +1098,7 @@ async fn unpin(
     WebUser(identity): WebUser,
     Path((id, doc)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, false).await?;
     Ok(Html(render_rows(&app, &access).await?).into_response())
 }
@@ -1110,7 +1108,7 @@ async fn delete_doc(
     WebUser(identity): WebUser,
     Path((id, doc)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::delete_document(&app, &access, &doc).await?;
     Ok(Html(render_rows(&app, &access).await?).into_response())
 }
@@ -1121,7 +1119,7 @@ async fn tables(
     Path(id): Path<String>,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "tables").await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
@@ -1138,7 +1136,7 @@ async fn import_submit(
     Path(id): Path<String>,
     Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let request = ImportRequest::from(form);
     Ok(
         match import_api::run_import(&app, &access, &request).await {
@@ -1162,7 +1160,7 @@ async fn table(
     WebUser(identity): WebUser,
     Path((id, name)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let described = access.describe_table(&app, &name).await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
@@ -1192,7 +1190,7 @@ async fn sql_page(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "sql").await?;
     html(&SqlPage {
         page: page(&app, &access.identity, "SQL", Some(&access)),
@@ -1234,7 +1232,7 @@ async fn sql_run(
     Path(id): Path<String>,
     Form(form): Form<SqlRequest>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     Ok(Html(render_sql(&app, &access, &form.sql).await?).into_response())
 }
 
@@ -1244,7 +1242,7 @@ async fn sql_csv(
     Path(id): Path<String>,
     Query(q): Query<SqlRequest>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let outcome = query_api::execute_sql(&app, &access, &q.sql).await?;
     let mut csv = String::new();
     csv.push_str(
@@ -1305,7 +1303,7 @@ async fn ontology_page(
     Path(id): Path<String>,
     Query(q): Query<OntologyQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "ontology")
         .await?;
@@ -1376,7 +1374,7 @@ async fn ontology_decide_many(
     Path(id): Path<String>,
     MultiForm(form): MultiForm<BulkDecideForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = match form.status {
         Queue::LowSupport => format!("/w/{id}/ontology?status={}", Queue::LowSupport),
         Queue::Pending => format!("/w/{id}/ontology"),
@@ -1546,7 +1544,7 @@ async fn ontology_propose(
     Path(id): Path<String>,
     Form(form): Form<ProposeForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = format!("/w/{id}/ontology");
     if form.documents {
         let started = ontology_api::start_document_run(&app, &access, &id, None).await;
@@ -1571,7 +1569,7 @@ async fn ontology_decide(
     Path((id, cid)): Path<(String, String)>,
     Form(form): Form<DecideRequest>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let decided = access
         .decide_candidate(&app, &cid, form.action, form.target.as_deref())
         .await;
@@ -1589,7 +1587,7 @@ async fn ontology_import(
     Path(id): Path<String>,
     Form(form): Form<OntologyForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access
         .replace_ontology(&app, &form.json, "edited in the web UI")
         .await;
@@ -1601,7 +1599,7 @@ async fn ontology_init(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.init_ontology(&app).await;
     Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
@@ -1611,7 +1609,7 @@ async fn ontology_restore(
     WebUser(identity): WebUser,
     Path((id, v)): Path<(String, u32)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await;
     Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
@@ -1621,7 +1619,7 @@ async fn context_page(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "context")
         .await?;
@@ -1647,7 +1645,7 @@ async fn context_save(
     Path(id): Path<String>,
     Form(form): Form<ReplaceContext>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     access.save_context(&app, form.content).await?;
     Ok(Flash::to(format!("/w/{id}/context")).into_response())
 }
@@ -1699,7 +1697,7 @@ async fn settings(
         admin_ok: true,
         ..Need::READ
     };
-    let access = access(&app, identity, &id, need).await?;
+    let access = Access::resolve(&app, identity, &id, need).await?;
     access
         .audit_read(&app, AuditAction::Page, "settings")
         .await?;
@@ -1719,7 +1717,7 @@ async fn settings_save(
     Path(id): Path<String>,
     MultiForm(form): MultiForm<SettingsForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     // The form is one checkbox per configured provider, so it cannot say
     // "every provider, including ones added later" other than by ticking
     // all of them or none.
@@ -1747,7 +1745,7 @@ async fn member_add(
     Path(id): Path<String>,
     Form(form): Form<AddMember>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let added = access.add_member(&app, &form).await;
     Ok(Flash::after(format!("/w/{id}/settings"), added, |_| None).into_response())
 }
@@ -1757,7 +1755,7 @@ async fn member_remove(
     WebUser(identity): WebUser,
     Path((id, user_id)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let removed = access.remove_member(&app, &user_id).await;
     Ok(Flash::after(format!("/w/{id}/settings"), removed, |()| None).into_response())
 }
@@ -1776,7 +1774,7 @@ async fn token_create(
     Path(id): Path<String>,
     MultiForm(form): MultiForm<TokenForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     if app.local {
         return Ok(
             Flash::error(format!("/w/{id}/settings"), "local mode has no users").into_response(),
@@ -1820,7 +1818,7 @@ async fn token_revoke(
     WebUser(identity): WebUser,
     Path((id, hash)): Path<(String, String)>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let owned = app
         .control
         .list_tokens(&id)
@@ -1848,7 +1846,7 @@ async fn admin_users(
     WebUser(identity): WebUser,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
-    require_admin(&identity)?;
+    identity.require_admin()?;
     html(&AdminUsersPage {
         page: page(&app, &identity, "Users", None),
         users: app.control.list_users().await?,
@@ -1895,7 +1893,7 @@ async fn admin_audit(
     WebUser(identity): WebUser,
     Query(q): Query<AuditQuery>,
 ) -> WebResult<Response> {
-    require_admin(&identity)?;
+    identity.require_admin()?;
     let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
     let (action, outcome, workspace_id) = (clean(q.action), q.outcome, clean(q.workspace_id));
     let rows = app
@@ -1955,7 +1953,7 @@ async fn graph_page(
     Path(id): Path<String>,
     Query(q): Query<GraphPageQuery>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
     let query = GraphQueryView {
@@ -2171,7 +2169,7 @@ async fn graph_extract(
     Path(id): Path<String>,
     Form(form): Form<ExtractForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let sample = form
         .sample
         .as_deref()
@@ -2202,7 +2200,7 @@ async fn graph_revalidate(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let revalidated = access.revalidate_graph(&app).await;
     Ok(Flash::after(format!("/w/{id}/graph"), revalidated, |r| {
         Some(format!(
@@ -2218,7 +2216,7 @@ async fn graph_review(
     WebUser(identity): WebUser,
     Path(id): Path<String>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     access.review_graph(&app).await?;
     Ok(Flash::to(format!("/w/{id}/graph")).into_response())
 }
@@ -2234,7 +2232,7 @@ async fn graph_merge_decide(
     Path((id, mid)): Path<(String, String)>,
     Form(form): Form<MergeForm>,
 ) -> WebResult<Response> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     // Parsed rather than extracted, so a bad value comes back as a notice
     // on the page instead of an error page.
     let back = format!("/w/{id}/graph");

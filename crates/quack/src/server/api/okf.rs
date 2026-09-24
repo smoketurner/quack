@@ -8,7 +8,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 
-use crate::server::auth::{Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::ApiResult;
 use crate::server::state::App;
 use quack_core::okf;
@@ -18,7 +18,7 @@ pub(crate) async fn export(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let name = access.workspace.name.clone();
     let (bytes, files) = app
         .read(&id, move |db| {

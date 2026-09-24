@@ -13,7 +13,7 @@ use quack_core::jobs::{JobId, LaneKey};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::{MAX_WAITING_UPLOADS, UPLOAD_RETRY_SECONDS, UploadJob, submit_upload};
 use crate::server::state::{App, with_db};
@@ -26,7 +26,7 @@ pub(crate) async fn list(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "documents")
         .await?;
@@ -39,7 +39,7 @@ pub(crate) async fn show(
     identity: Identity,
     Path((id, doc)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit(
             &app,
@@ -72,7 +72,7 @@ pub(crate) async fn upload(
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> ApiResult<impl IntoResponse> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -349,7 +349,7 @@ pub(crate) async fn update(
     Path((id, doc)): Path<(String, String)>,
     Json(body): Json<UpdateDocument>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let document = set_pinned(&app, &access, &doc, body.pinned).await?;
     Ok(Json(serde_json::to_value(document)?))
 }
@@ -386,7 +386,7 @@ pub(crate) async fn remove(
     identity: Identity,
     Path((id, doc)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     delete_document(&app, &access, &doc).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -13,7 +13,7 @@ use quack_core::storage::control::{
 };
 use serde::Deserialize;
 
-use crate::server::auth::{Access, Credential, Identity, Need, access, require_admin};
+use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
@@ -87,7 +87,7 @@ impl Identity {
     /// name without slashes or dots that is not taken; the creator becomes
     /// its owner (in local mode everyone already is).
     pub(crate) async fn create_workspace(&self, app: &App, name: &str) -> ApiResult<WorkspaceRow> {
-        require_admin(self)?;
+        self.require_admin()?;
         let name = name.trim();
         if name.is_empty() || name.contains(['/', '\\', '.']) {
             return Err(ApiError::bad_request(
@@ -120,7 +120,7 @@ pub(crate) async fn show(
         admin_ok: true,
         ..Need::READ
     };
-    let access = access(&app, identity, &id, need).await?;
+    let access = Access::resolve(&app, identity, &id, need).await?;
     access
         .audit(&app, AuditAction::Open, None, Outcome::Allowed, None)
         .await?;
@@ -140,7 +140,7 @@ pub(crate) async fn update(
     Path(id): Path<String>,
     Json(body): Json<UpdateWorkspace>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::OWN).await?;
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let changes = WorkspaceChanges {
         classification: body.classification,
         allowed_providers: match body.allowed_providers {
@@ -207,7 +207,7 @@ pub(crate) async fn audit_detail(
     Path(id): Path<String>,
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let limit = q.limit;
     let rows = app.read(&id, move |db| audit::list(db, limit)).await?;
     access

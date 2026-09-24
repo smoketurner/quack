@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use quack_core::storage::control::{AuditAction, Outcome};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 use quack_core::storage::workspace::{INTERNAL_PREFIX, TableDescription, WorkspaceDb};
@@ -14,7 +14,7 @@ pub(crate) async fn list(
     identity: Identity,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::List, "tables").await?;
     let tables = app.read(&id, WorkspaceDb::list_tables).await?;
     Ok(Json(serde_json::json!({ "tables": tables })))
@@ -25,7 +25,7 @@ pub(crate) async fn describe(
     identity: Identity,
     Path((id, name)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let described = access.describe_table(&app, &name).await?;
     let columns: Vec<serde_json::Value> = described
         .columns

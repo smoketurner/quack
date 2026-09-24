@@ -8,7 +8,7 @@ use quack_core::storage::context::{self, ContextVersion};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::ApiResult;
 use crate::server::state::{App, with_db};
 
@@ -18,7 +18,7 @@ pub(crate) async fn show(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "context")
         .await?;
@@ -49,7 +49,7 @@ pub(crate) async fn replace(
     Path(id): Path<String>,
     Json(body): Json<ReplaceContext>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.save_context(&app, body.content).await?;
     Ok(Json(serde_json::json!({ "context": stored })))
 }
@@ -93,7 +93,7 @@ pub(crate) async fn versions(
     Path(id): Path<String>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "context_versions")
         .await?;

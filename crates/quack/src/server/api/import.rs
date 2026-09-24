@@ -8,7 +8,7 @@ use quack_core::llm;
 use quack_core::storage::control::{AuditAction, Outcome};
 use serde::Deserialize;
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 use quack_core::import::{self, ImportPolicy, ImportRequest, ImportSummary};
@@ -42,7 +42,7 @@ pub(crate) async fn import(
     Path(id): Path<String>,
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::WRITE).await?;
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let summary = run_import(&app, &access, &ImportRequest::from(body)).await?;
     Ok(Json(serde_json::to_value(summary)?))
 }

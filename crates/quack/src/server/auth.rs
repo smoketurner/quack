@@ -10,8 +10,8 @@
 //! JSON API and the browser form (issue #73).
 
 use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::http::header;
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::storage::control::{
@@ -428,72 +428,68 @@ impl Access {
     }
 }
 
-/// Resolve the workspace and check the caller against `need`, writing a
-/// denied audit row and returning 403/404 when they fall short.
-pub(crate) async fn access(
-    app: &App,
-    identity: Identity,
-    workspace_id: &str,
-    need: Need,
-) -> ApiResult<Access> {
-    let Some(workspace) = app.control.get_workspace(workspace_id).await? else {
-        let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
-        entry.workspace_id = Some(workspace_id.to_owned());
-        app.control.record_audit(&entry).await?;
-        return Err(ApiError::not_found("no such workspace"));
-    };
-    let role = if app.local {
-        Some(Role::Owner)
-    } else {
-        app.control
-            .member_role(&workspace.id, &identity.user_id)
-            .await?
-    };
-    if let Credential::Token(token) = &identity.credential
-        && token.workspace_id != workspace.id
-    {
-        deny(
-            app,
-            &identity,
-            &workspace,
-            "token is scoped to another workspace",
-        )
-        .await?;
-    }
-    let access = Access {
-        identity,
-        workspace,
-        role,
-    };
-    if !access.permits(need) {
-        let reason = match access.role {
-            None if access.identity.is_admin => "admins read workspace content only as members",
-            None => "not a member of this workspace",
-            Some(_) if access.identity.lacks_scope(need.scope) => "token lacks the scope",
-            Some(_) => "role does not allow this",
+impl Access {
+    /// Resolve the workspace and check the caller against `need`, writing a
+    /// denied audit row and returning 403/404 when they fall short.
+    pub(crate) async fn resolve(
+        app: &App,
+        identity: Identity,
+        workspace_id: &str,
+        need: Need,
+    ) -> ApiResult<Self> {
+        let Some(workspace) = app.control.get_workspace(workspace_id).await? else {
+            let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
+            entry.workspace_id = Some(workspace_id.to_owned());
+            app.control.record_audit(&entry).await?;
+            return Err(ApiError::not_found("no such workspace"));
         };
-        deny(app, &access.identity, &access.workspace, reason).await?;
+        let role = if app.local {
+            Some(Role::Owner)
+        } else {
+            app.control
+                .member_role(&workspace.id, &identity.user_id)
+                .await?
+        };
+        if let Credential::Token(token) = &identity.credential
+            && token.workspace_id != workspace.id
+        {
+            identity
+                .deny(app, &workspace, "token is scoped to another workspace")
+                .await?;
+        }
+        let access = Self {
+            identity,
+            workspace,
+            role,
+        };
+        if !access.permits(need) {
+            let reason = match access.role {
+                None if access.identity.is_admin => "admins read workspace content only as members",
+                None => "not a member of this workspace",
+                Some(_) if access.identity.lacks_scope(need.scope) => "token lacks the scope",
+                Some(_) => "role does not allow this",
+            };
+            access.identity.deny(app, &access.workspace, reason).await?;
+        }
+        Ok(access)
     }
-    Ok(access)
 }
 
-async fn deny(
-    app: &App,
-    identity: &Identity,
-    workspace: &WorkspaceRow,
-    reason: &str,
-) -> ApiResult<()> {
-    let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
-    entry.workspace_id = Some(workspace.id.clone());
-    app.control.record_audit(&entry).await?;
-    Err(ApiError::forbidden(reason))
-}
+impl Identity {
+    /// Record a refused attempt on `workspace` and return 403 with `reason`.
+    async fn deny(&self, app: &App, workspace: &WorkspaceRow, reason: &str) -> ApiResult<()> {
+        let mut entry = self.audit(AuditAction::Open, Outcome::Denied);
+        entry.workspace_id = Some(workspace.id.clone());
+        app.control.record_audit(&entry).await?;
+        Err(ApiError::forbidden(reason))
+    }
 
-/// Server admins only; everything else is 403.
-pub(crate) fn require_admin(identity: &Identity) -> ApiResult<()> {
-    if identity.is_admin {
-        Ok(())
-    } else {
-        Err(ApiError::new(StatusCode::FORBIDDEN, "admin only"))
+    /// Server admins only; everything else is 403.
+    pub(crate) fn require_admin(&self) -> ApiResult<()> {
+        if self.is_admin {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden("admin only"))
+        }
     }
 }

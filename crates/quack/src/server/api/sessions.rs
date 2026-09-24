@@ -10,7 +10,7 @@ use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 
@@ -30,7 +30,7 @@ pub(crate) async fn list(
     Path(id): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "sessions")
         .await?;
@@ -68,7 +68,7 @@ pub(crate) async fn show(
     identity: Identity,
     Path((id, sid)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = visible_session(&app, &access, &id, &sid).await?;
     let session_id = session.id.clone();
     let messages = app
@@ -103,7 +103,7 @@ pub(crate) async fn update(
     Path((id, sid)): Path<(String, String)>,
     Json(body): Json<UpdateSession>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     if body.shared.is_none() && body.mode.is_none() {
         return Err(ApiError::bad_request("give shared or mode"));
     }
@@ -208,7 +208,7 @@ pub(crate) async fn remove(
     identity: Identity,
     Path((id, sid)): Path<(String, String)>,
 ) -> ApiResult<axum::http::StatusCode> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     delete_session(&app, &access, &sid).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -267,7 +267,7 @@ pub(crate) async fn export(
     Path((id, sid)): Path<(String, String)>,
     Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = visible_session(&app, &access, &id, &sid).await?;
     let as_sql = match q.format {
         ExportFormat::Sql => true,

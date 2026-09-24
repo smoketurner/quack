@@ -23,7 +23,7 @@ use quack_core::storage::workspace::{ChunkScope, StatementKind};
 use serde::Deserialize;
 
 use super::StreamEvent;
-use crate::server::auth::{Access, Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 use crate::server::web::markdown::to_html;
@@ -52,7 +52,7 @@ async fn prepare(
     workspace_id: &str,
     body: &QueryRequest,
 ) -> ApiResult<(Access, SharedDb, ReaderDb, String, WritePolicy)> {
-    let access = access(app, identity, workspace_id, Need::READ).await?;
+    let access = Access::resolve(app, identity, workspace_id, Need::READ).await?;
     if body.allow_write && !access.permits(Need::WRITE) {
         access
             .audit(app, AuditAction::Query, None, Outcome::Denied, None)
@@ -367,7 +367,7 @@ pub(crate) async fn sql(
     Path(id): Path<String>,
     Json(body): Json<SqlRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let outcome = execute_sql(&app, &access, &body.sql).await?;
     Ok(Json(serde_json::json!({
         "columns": outcome.columns,
@@ -463,7 +463,7 @@ pub(crate) async fn search(
     Path(id): Path<String>,
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let access = access(&app, identity, &id, Need::READ).await?;
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = q.query.trim().to_owned();
     if query.is_empty() {
         return Err(ApiError::bad_request("query must not be empty"));
