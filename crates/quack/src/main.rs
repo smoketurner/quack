@@ -929,15 +929,16 @@ async fn run_import(
     let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
     let ws_db = spawn_writer(&config, &workspace.id)?;
     let embedding_model = Embeddings::from_config(&config).await?;
-    let summary = import::import(
-        &config,
-        &ws_db,
-        &workspace.id,
+    let summary = import::Importing {
+        config: &config,
+        db: &ws_db,
+        workspace_id: &workspace.id,
         request,
-        ImportPolicy::owner(),
-        embedding_model.as_ref(),
-        RunControl::unobserved(),
-    )
+        policy: ImportPolicy::owner(),
+        embedder: embedding_model.as_ref(),
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await
     .context("import failed")?;
     let stdout = std::io::stdout();

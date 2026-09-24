@@ -152,71 +152,60 @@ impl AgentResponse {
     }
 }
 
-/// Run the rig agent with all analysis tools for a single user question,
-/// emitting `AgentEvent`s on `sink` as the turn progresses. `history` is
-/// the prior conversation to replay to the model (see
-/// `storage::sessions::history_for_model`). `reader_db` is the workspace
-/// handle's reader, built once for its whole lifetime by
-/// [`ReaderDb::open`] — acquiring one here would mean every turn
-/// waits on the writer mutex before it can even start, exactly when a slow
-/// write is most likely to be holding it.
-///
-/// Text streams as `TextDelta`; every tool call is bracketed by
-/// `ToolStarted`/`ToolFinished`; a write under `WritePolicy::Ask` pauses on
-/// `PermissionRequired` until the interface answers. The final
-/// `TurnComplete` (or `Failed`) is also the function's return value.
-///
-/// # Errors
-///
-/// Returns an error if system prompt generation, agent building, or the
-/// model call fails.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one entry point per turn; the interfaces call llm::run_turn, which packs config"
-)]
-pub async fn run_analysis<M>(
-    db: SharedDb,
-    reader_db: ReaderDb,
-    completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: Option<Embedder<M>>,
-    analysis_config: &AnalysisConfig,
-    retrieval_config: &RetrievalConfig,
-    graph_options: GraphOptions,
-    write_policy: WritePolicy,
-    prompt: PromptOptions,
-    history: Vec<rig::message::Message>,
-    user_message: &str,
-    sink: EventSink,
-) -> Result<AgentResponse>
+/// One question for the agent: the workspace handles, the embedding model
+/// (none for keyword-only search), the analysis settings, the write
+/// policy, the prompt options, the history to replay (see
+/// `storage::sessions::history_for_model`), and the message. `reader_db`
+/// is the workspace handle's reader, built once for its whole lifetime by
+/// [`ReaderDb::open`]: acquiring one per turn would make every turn wait
+/// on the writer before it can start, exactly when a slow write is most
+/// likely to be holding it.
+pub struct Analysis<'a, M> {
+    pub db: SharedDb,
+    pub reader_db: ReaderDb,
+    pub embedder: Option<Embedder<M>>,
+    pub config: &'a AnalysisConfig,
+    pub retrieval_config: &'a RetrievalConfig,
+    pub graph_options: GraphOptions,
+    pub write_policy: WritePolicy,
+    pub prompt: PromptOptions,
+    pub history: Vec<rig::message::Message>,
+    pub message: &'a str,
+}
+
+impl<M> Analysis<'_, M>
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    let max_turns = usize::try_from(analysis_config.max_turns)
-        .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
-    let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
-    match run_inner(
-        db,
-        reader_db,
-        completion_model,
-        embedding_model,
-        analysis_config,
-        retrieval_config,
-        graph_options,
-        write_policy,
-        prompt,
-        history,
-        user_message,
-        &recorder,
-    )
-    .await
-    {
-        Ok(response) => {
-            recorder.emit(AgentEvent::TurnComplete(response.clone()));
-            Ok(response)
-        }
-        Err(e) => {
-            recorder.emit(AgentEvent::Failed(TurnFailure::from(&e)));
-            Err(e)
+    /// Run the rig agent with all analysis tools, emitting `AgentEvent`s
+    /// on `sink` as the turn progresses.
+    ///
+    /// Text streams as `TextDelta`; every tool call is bracketed by
+    /// `ToolStarted`/`ToolFinished`; a write under `WritePolicy::Ask`
+    /// pauses on `PermissionRequired` until the interface answers. The
+    /// final `TurnComplete` (or `Failed`) is also the return value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if system prompt generation, agent building, or
+    /// the model call fails.
+    pub async fn run(
+        self,
+        completion_model: impl rig::completion::CompletionModel + Clone + 'static,
+        sink: EventSink,
+    ) -> Result<AgentResponse> {
+        let max_turns = usize::try_from(self.config.max_turns)
+            .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
+        let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
+        match self.run_inner(completion_model, &recorder).await {
+            Ok(response) => {
+                recorder.emit(AgentEvent::TurnComplete(response.clone()));
+                Ok(response)
+            }
+            Err(e) => {
+                recorder.emit(AgentEvent::Failed(TurnFailure::from(&e)));
+                Err(e)
+            }
         }
     }
 }
@@ -256,108 +245,112 @@ enum Window {
     Ollama(u32),
 }
 
-#[expect(clippy::too_many_arguments, reason = "mirrors run_analysis")]
-async fn run_inner<M>(
-    shared_db: SharedDb,
-    reader_db: ReaderDb,
-    completion_model: impl rig::completion::CompletionModel + Clone + 'static,
-    embedding_model: Option<Embedder<M>>,
-    analysis_config: &AnalysisConfig,
-    retrieval_config: &RetrievalConfig,
-    graph_options: GraphOptions,
-    write_policy: WritePolicy,
-    prompt: PromptOptions,
-    history: Vec<rig::message::Message>,
-    user_message: &str,
-    recorder: &TurnRecorder,
-) -> Result<AgentResponse>
+impl<M> Analysis<'_, M>
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    let PromptAndModel {
-        system_prompt,
-        graph_enabled,
-        ontology_present,
-    } = PromptAndModel::read(&reader_db, &prompt).await?;
-    let outputs = TurnOutputs::new(recorder.clone());
-    let window = prompt.ollama_context_cap.map_or(Window::Provider, |cap| {
-        Window::Ollama(ollama_window(cap, &system_prompt, &history, user_message))
-    });
-    let agent = BuildContext {
-        shared_db: Arc::clone(&shared_db),
-        reader_db,
-        analysis_config,
-        retrieval_config,
-        graph_options,
-        graph_enabled,
-        ontology_present,
-        // Query mode never answers from an unreviewed graph.
-        exclude_provisional: prompt.mode == ChatMode::Query,
-        write_policy,
-        window,
-        outputs: outputs.clone(),
-    }
-    .build_agent(completion_model, embedding_model, &system_prompt)?;
-    let max_turns = usize::try_from(analysis_config.max_turns)
-        .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
-
-    let mut stream = agent
-        .stream_chat(user_message, history)
-        .max_turns(max_turns)
-        .await;
-
-    let mut streamed = String::new();
-    let mut final_text: Option<String> = None;
-    let mut stopped: Option<String> = None;
-    // The final response carries rig's aggregate for the whole run; the
-    // per-call counts are the fallback for a turn that derails before it,
-    // which is exactly the turn whose cost is worth knowing.
-    let mut aggregate: Option<TokenUsage> = None;
-    let mut per_call = TokenUsage::default();
-
-    while let Some(item) = stream.next().await {
-        let item = match item {
-            Ok(item) => item,
-            Err(e) => {
-                // A turn the model derailed (an unknown tool, the turn
-                // limit) or that failed after text was streamed is still
-                // a turn: keep the text, say what happened, record it. A
-                // model that could not be reached at all stays an error.
-                let stop = StreamStop(&e);
-                if streamed.trim().is_empty() && !stop.by_agent_loop() {
-                    return Err(Error::Analysis(e.to_string()));
-                }
-                tracing::warn!(error = %e, "agent turn stopped early");
-                stopped = Some(stop.explain(analysis_config.max_turns, window));
-                break;
-            }
-        };
-        match item {
-            rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::Text(text),
-            ) => {
-                streamed.push_str(&text.text);
-                recorder.emit(AgentEvent::TextDelta(text.text));
-            }
-            rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
-                if response.usage.has_values() {
-                    aggregate = Some(response.usage.into());
-                }
-                final_text = Some(response.output);
-            }
-            rig::agent::MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
-            rig::agent::MultiTurnStreamItem::StreamAssistantItem(_)
-            | rig::agent::MultiTurnStreamItem::StreamUserItem(_)
-            | rig::agent::MultiTurnStreamItem::ToolExecutionCommitted { .. }
-            | rig::agent::MultiTurnStreamItem::ModelTurnRetried { .. } => {}
+    async fn run_inner(
+        self,
+        completion_model: impl rig::completion::CompletionModel + Clone + 'static,
+        recorder: &TurnRecorder,
+    ) -> Result<AgentResponse> {
+        let Self {
+            db: shared_db,
+            reader_db,
+            embedder: embedding_model,
+            config: analysis_config,
+            retrieval_config,
+            graph_options,
+            write_policy,
+            prompt,
+            history,
+            message: user_message,
+        } = self;
+        let PromptAndModel {
+            system_prompt,
+            graph_enabled,
+            ontology_present,
+        } = PromptAndModel::read(&reader_db, &prompt).await?;
+        let outputs = TurnOutputs::new(recorder.clone());
+        let window = prompt.ollama_context_cap.map_or(Window::Provider, |cap| {
+            Window::Ollama(ollama_window(cap, &system_prompt, &history, user_message))
+        });
+        let agent = BuildContext {
+            shared_db: Arc::clone(&shared_db),
+            reader_db,
+            analysis_config,
+            retrieval_config,
+            graph_options,
+            graph_enabled,
+            ontology_present,
+            // Query mode never answers from an unreviewed graph.
+            exclude_provisional: prompt.mode == ChatMode::Query,
+            write_policy,
+            window,
+            outputs: outputs.clone(),
         }
-    }
+        .build_agent(completion_model, embedding_model, &system_prompt)?;
+        let max_turns = usize::try_from(analysis_config.max_turns)
+            .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
 
-    let raw = turn_text(streamed, final_text, stopped, window);
-    Ok(outputs.finish(
-        recorder.citations().validate(&raw),
-        aggregate.or_else(|| per_call.reported()),
-    ))
+        let mut stream = agent
+            .stream_chat(user_message, history)
+            .max_turns(max_turns)
+            .await;
+
+        let mut streamed = String::new();
+        let mut final_text: Option<String> = None;
+        let mut stopped: Option<String> = None;
+        // The final response carries rig's aggregate for the whole run; the
+        // per-call counts are the fallback for a turn that derails before it,
+        // which is exactly the turn whose cost is worth knowing.
+        let mut aggregate: Option<TokenUsage> = None;
+        let mut per_call = TokenUsage::default();
+
+        while let Some(item) = stream.next().await {
+            let item = match item {
+                Ok(item) => item,
+                Err(e) => {
+                    // A turn the model derailed (an unknown tool, the turn
+                    // limit) or that failed after text was streamed is still
+                    // a turn: keep the text, say what happened, record it. A
+                    // model that could not be reached at all stays an error.
+                    let stop = StreamStop(&e);
+                    if streamed.trim().is_empty() && !stop.by_agent_loop() {
+                        return Err(Error::Analysis(e.to_string()));
+                    }
+                    tracing::warn!(error = %e, "agent turn stopped early");
+                    stopped = Some(stop.explain(analysis_config.max_turns, window));
+                    break;
+                }
+            };
+            match item {
+                rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Text(text),
+                ) => {
+                    streamed.push_str(&text.text);
+                    recorder.emit(AgentEvent::TextDelta(text.text));
+                }
+                rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
+                    if response.usage.has_values() {
+                        aggregate = Some(response.usage.into());
+                    }
+                    final_text = Some(response.output);
+                }
+                rig::agent::MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
+                rig::agent::MultiTurnStreamItem::StreamAssistantItem(_)
+                | rig::agent::MultiTurnStreamItem::StreamUserItem(_)
+                | rig::agent::MultiTurnStreamItem::ToolExecutionCommitted { .. }
+                | rig::agent::MultiTurnStreamItem::ModelTurnRetried { .. } => {}
+            }
+        }
+
+        let raw = turn_text(streamed, final_text, stopped, window);
+        Ok(outputs.finish(
+            recorder.citations().validate(&raw),
+            aggregate.or_else(|| per_call.reported()),
+        ))
+    }
 }
 
 /// The `num_ctx` for this turn (issue #40): Ollama loads a model with a

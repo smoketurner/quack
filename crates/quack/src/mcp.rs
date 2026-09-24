@@ -360,16 +360,16 @@ impl McpServer {
         // Nothing renders the stream here; drain it so the turn never
         // blocks on a full channel.
         let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        let outcome = llm::run_turn(
-            &self.inner.config,
-            Arc::clone(&self.inner.db),
-            self.inner.reader.clone(),
-            &session_id,
-            self.inner.policy,
-            &question,
+        let outcome = llm::TurnRequest {
+            db: Arc::clone(&self.inner.db),
+            reader_db: self.inner.reader.clone(),
+            session_id: &session_id,
+            policy: self.inner.policy,
+            message: &question,
             sink,
-            llm::CancellationToken::new(),
-        )
+            cancel: llm::CancellationToken::new(),
+        }
+        .run(&self.inner.config)
         .await;
         drop(drain);
         let detail = serde_json::json!({ "prompt": question, "session_id": session_id });

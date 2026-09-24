@@ -145,17 +145,17 @@ impl PreparedTurn {
         let job = app
             .jobs
             .submit(spec, move |ctx| async move {
-                // run_turn emits TurnComplete or Failed itself.
-                match llm::run_turn(
-                    &config,
+                // The turn emits TurnComplete or Failed itself.
+                match (llm::TurnRequest {
                     db,
-                    reader,
-                    &session,
+                    reader_db: reader,
+                    session_id: &session,
                     policy,
-                    &text,
+                    message: &text,
                     sink,
-                    ctx.cancel_token(),
-                )
+                    cancel: ctx.cancel_token(),
+                })
+                .run(&config)
                 .await
                 {
                     Ok(response) if response.cancelled => Err(String::from("cancelled")),

@@ -7,6 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::extraction::ExtractionRun;
 
 use crate::confirm::Confirm;
 use crate::graph_cli::rendered;
@@ -498,12 +499,14 @@ async fn run_documents(
     let embeddings = Embeddings::from_config(config).await?;
     let (candidates, summary) = documents::run(
         sample,
-        extractor.as_ref(),
         current,
         options,
         embeddings.as_ref(),
-        config.analysis.extraction_concurrency,
-        control,
+        ExtractionRun {
+            extractor: extractor.as_ref(),
+            concurrency: config.analysis.extraction_concurrency,
+            control,
+        },
     )
     .await?;
     writeln!(

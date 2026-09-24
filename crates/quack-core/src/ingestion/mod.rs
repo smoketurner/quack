@@ -140,16 +140,15 @@ pub async fn ingest_file<M: EmbeddingModel>(
         Registration::New(id) => id,
         Registration::Duplicate(existing) => return Ok(IngestOutcome::Duplicate(existing)),
     };
-    let result = process_document(
+    let result = Processing {
         config,
         db,
         workspace_id,
-        &doc_id,
-        file.filename,
-        file.data,
+        document_id: &doc_id,
+        file,
         embedder,
-        file.control,
-    )
+    }
+    .run()
     .await?;
     Ok(IngestOutcome::Ingested(result))
 }
@@ -229,176 +228,161 @@ impl Pending {
     }
 }
 
-/// Parse, store, and embed a registered document, moving its status from
-/// `processing` to `ready`, or to `error` with the message when it fails
-/// (`cancelled` when `control` was cancelled: the chunks stored so far are
-/// discarded, as for any failure).
-///
-/// # Errors
-///
-/// Returns the failure after recording it on the document row.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the document's identity, its bytes, the model, and the run control"
-)]
-pub async fn process_document<M: EmbeddingModel>(
-    config: &Config,
-    db: &Writer,
-    workspace_id: &str,
-    doc_id: &str,
-    filename: &str,
-    data: &[u8],
-    embedder: Option<&Embedder<M>>,
-    control: RunControl<'_>,
-) -> Result<IngestResult> {
-    let id = doc_id.to_owned();
-    db.run(move |db| db.update_document_status(&id, DocumentStatus::Processing))
-        .await?;
-    let outcome = match control.check() {
-        Ok(()) => {
-            process_inner(
-                config,
-                db,
-                workspace_id,
-                doc_id,
-                filename,
-                data,
-                embedder,
-                control,
-            )
-            .await
-        }
-        Err(e) => Err(e),
-    };
-    let id = doc_id.to_owned();
-    match &outcome {
-        Ok(result) => {
-            let (chunks, tables) = (result.chunks_stored, result.tables.clone());
-            db.run(move |db| {
-                db.set_document_chunk_count(&id, chunks)?;
-                db.set_document_tables(&id, &tables)?;
-                db.update_document_status(&id, DocumentStatus::Ready)
-            })
-            .await?;
-        }
-        Err(e) => {
-            let message = e.to_string();
-            db.run(move |db| {
-                db.discard_chunks(&id)?;
-                db.mark_document_error(&id, &message)
-            })
-            .await?;
-        }
-    }
-    outcome
+/// A registered document on its way to `ready`: where it is stored, its
+/// id, the file it was registered from, and the embedding model (none
+/// stores the chunks without vectors).
+pub struct Processing<'a, M> {
+    pub config: &'a Config,
+    pub db: &'a Writer,
+    pub workspace_id: &'a str,
+    pub document_id: &'a str,
+    pub file: &'a NewFile<'a>,
+    pub embedder: Option<&'a Embedder<M>>,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "process_document's arguments, passed through"
-)]
-async fn process_inner<M: EmbeddingModel>(
-    config: &Config,
-    db: &Writer,
-    workspace_id: &str,
-    doc_id: &str,
-    filename: &str,
-    data: &[u8],
-    embedder: Option<&Embedder<M>>,
-    control: RunControl<'_>,
-) -> Result<IngestResult> {
-    let Some(file_type) = FileType::of(filename) else {
-        return Err(Error::UnsupportedFileType(filename.to_owned()));
-    };
-    match file_type.load() {
-        Load::Table(reader) => {
-            // One step on the writer: check the table is free, write the
-            // bytes under `files/`, load them.
-            let step = StructuredLoad {
-                config: config.clone(),
-                workspace_id: workspace_id.to_owned(),
-                doc_id: doc_id.to_owned(),
-                filename: filename.to_owned(),
-                data: data.to_vec(),
-                reader,
-            };
-            let table_name = db.run(move |db| step.load(db)).await?;
-            Ok(IngestResult {
-                document_id: doc_id.to_owned(),
-                filename: filename.to_owned(),
-                file_type,
-                chunks_stored: 0,
-                tables: vec![table_name],
-                pages_skipped: 0,
-                embedding_time: None,
-            })
-        }
-        Load::Workbook => {
-            // Parsing the workbook is the slow part: off the runtime's
-            // workers, and not on the writer.
-            let bytes = data.to_vec();
-            let sheets = parse_off_runtime(move || xlsx::sheets(&bytes)).await?;
-            let load = WorkbookLoad {
-                files_dir: config.workspace_files_dir(workspace_id),
-                doc_id: doc_id.to_owned(),
-                filename: filename.to_owned(),
-                sheets,
-            };
-            let tables = db.run(move |db| load.load(db)).await?;
-            Ok(IngestResult {
-                document_id: doc_id.to_owned(),
-                filename: filename.to_owned(),
-                file_type,
-                chunks_stored: 0,
-                tables,
-                pages_skipped: 0,
-                embedding_time: None,
-            })
-        }
-        Load::Chunks => {
-            // Parsing and chunking are the slow, CPU-bound part: off the
-            // runtime's workers, and not on the writer.
-            let parsing = Parsing::new(config, file_type, filename, data);
-            let Parsed {
-                title,
-                pages_skipped,
-                chunks,
-            } = parse_off_runtime(move || parsing.run()).await?;
-            if let Some(title) = title {
-                let id = doc_id.to_owned();
-                db.run(move |db| db.set_document_title_if_empty(&id, &title))
-                    .await?;
-            }
-            if pages_skipped > 0 {
-                tracing::warn!(
-                    document = %doc_id,
-                    file = %filename,
-                    pages_skipped,
-                    "ingested with unreadable pages skipped"
-                );
-            }
-            control.check()?;
-            let (chunk_count, embedding_time) = embed_and_store(
-                db,
-                doc_id,
-                &chunks,
-                embedder,
-                EmbedPlan {
-                    batch_size: config.ingestion.embedding_batch_size,
-                    concurrency: config.ingestion.embedding_concurrency,
-                    control,
-                },
-            )
+impl<M: EmbeddingModel> Processing<'_, M> {
+    /// Parse, store, and embed the document, moving its status from
+    /// `processing` to `ready`, or to `error` with the message when it fails
+    /// (`cancelled` when the file's control was cancelled: the chunks stored
+    /// so far are discarded, as for any failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure after recording it on the document row.
+    pub async fn run(self) -> Result<IngestResult> {
+        let (db, doc_id) = (self.db, self.document_id);
+        let id = doc_id.to_owned();
+        db.run(move |db| db.update_document_status(&id, DocumentStatus::Processing))
             .await?;
-            Ok(IngestResult {
-                document_id: doc_id.to_owned(),
-                filename: filename.to_owned(),
-                file_type,
-                chunks_stored: chunk_count,
-                tables: Vec::new(),
-                pages_skipped,
-                embedding_time,
-            })
+        let outcome = match self.file.control.check() {
+            Ok(()) => self.run_inner().await,
+            Err(e) => Err(e),
+        };
+        let id = doc_id.to_owned();
+        match &outcome {
+            Ok(result) => {
+                let (chunks, tables) = (result.chunks_stored, result.tables.clone());
+                db.run(move |db| {
+                    db.set_document_chunk_count(&id, chunks)?;
+                    db.set_document_tables(&id, &tables)?;
+                    db.update_document_status(&id, DocumentStatus::Ready)
+                })
+                .await?;
+            }
+            Err(e) => {
+                let message = e.to_string();
+                db.run(move |db| {
+                    db.discard_chunks(&id)?;
+                    db.mark_document_error(&id, &message)
+                })
+                .await?;
+            }
+        }
+        outcome
+    }
+
+    async fn run_inner(&self) -> Result<IngestResult> {
+        let (config, db, workspace_id, doc_id, embedder) = (
+            self.config,
+            self.db,
+            self.workspace_id,
+            self.document_id,
+            self.embedder,
+        );
+        let (filename, data, control) = (self.file.filename, self.file.data, self.file.control);
+        let Some(file_type) = FileType::of(filename) else {
+            return Err(Error::UnsupportedFileType(filename.to_owned()));
+        };
+        match file_type.load() {
+            Load::Table(reader) => {
+                // One step on the writer: check the table is free, write the
+                // bytes under `files/`, load them.
+                let step = StructuredLoad {
+                    config: config.clone(),
+                    workspace_id: workspace_id.to_owned(),
+                    doc_id: doc_id.to_owned(),
+                    filename: filename.to_owned(),
+                    data: data.to_vec(),
+                    reader,
+                };
+                let table_name = db.run(move |db| step.load(db)).await?;
+                Ok(IngestResult {
+                    document_id: doc_id.to_owned(),
+                    filename: filename.to_owned(),
+                    file_type,
+                    chunks_stored: 0,
+                    tables: vec![table_name],
+                    pages_skipped: 0,
+                    embedding_time: None,
+                })
+            }
+            Load::Workbook => {
+                // Parsing the workbook is the slow part: off the runtime's
+                // workers, and not on the writer.
+                let bytes = data.to_vec();
+                let sheets = parse_off_runtime(move || xlsx::sheets(&bytes)).await?;
+                let load = WorkbookLoad {
+                    files_dir: config.workspace_files_dir(workspace_id),
+                    doc_id: doc_id.to_owned(),
+                    filename: filename.to_owned(),
+                    sheets,
+                };
+                let tables = db.run(move |db| load.load(db)).await?;
+                Ok(IngestResult {
+                    document_id: doc_id.to_owned(),
+                    filename: filename.to_owned(),
+                    file_type,
+                    chunks_stored: 0,
+                    tables,
+                    pages_skipped: 0,
+                    embedding_time: None,
+                })
+            }
+            Load::Chunks => {
+                // Parsing and chunking are the slow, CPU-bound part: off the
+                // runtime's workers, and not on the writer.
+                let parsing = Parsing::new(config, file_type, filename, data);
+                let Parsed {
+                    title,
+                    pages_skipped,
+                    chunks,
+                } = parse_off_runtime(move || parsing.run()).await?;
+                if let Some(title) = title {
+                    let id = doc_id.to_owned();
+                    db.run(move |db| db.set_document_title_if_empty(&id, &title))
+                        .await?;
+                }
+                if pages_skipped > 0 {
+                    tracing::warn!(
+                        document = %doc_id,
+                        file = %filename,
+                        pages_skipped,
+                        "ingested with unreadable pages skipped"
+                    );
+                }
+                control.check()?;
+                let (chunk_count, embedding_time) = embed_and_store(
+                    db,
+                    doc_id,
+                    &chunks,
+                    embedder,
+                    EmbedPlan {
+                        batch_size: config.ingestion.embedding_batch_size,
+                        concurrency: config.ingestion.embedding_concurrency,
+                        control,
+                    },
+                )
+                .await?;
+                Ok(IngestResult {
+                    document_id: doc_id.to_owned(),
+                    filename: filename.to_owned(),
+                    file_type,
+                    chunks_stored: chunk_count,
+                    tables: Vec::new(),
+                    pages_skipped,
+                    embedding_time,
+                })
+            }
         }
     }
 }

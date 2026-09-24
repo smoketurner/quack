@@ -143,7 +143,7 @@ Every interface calls the same core entry points:
 
 | Operation | Core | Web | REST | MCP | TUI / print |
 |-----------|------|-----|------|-----|-------------|
-| Ask | `llm::run_turn` (event stream) | SSE fragments | SSE or JSON | `query` tool | inline / stdout+stderr |
+| Ask | `llm::TurnRequest::run` (event stream) | SSE fragments | SSE or JSON | `query` tool | inline / stdout+stderr |
 | Retrieve | `WorkspaceDb::search_hybrid_chunks`, `analysis::rerank` | via agent, `/search` page | `GET .../search` | `search` tool | via agent |
 | SQL | `WorkspaceDb::execute_query{,_capped}` | SQL page | `POST .../sql` | `sql` tool | `/sql`, `-q` |
 | Ingest | `ingestion::ingest_file` | upload | `POST .../documents` | - | `/ingest`, `quack ingest` |
@@ -184,7 +184,7 @@ and each is limited where it is used:
 
 A turn therefore holds nothing while it waits for the user's answer to a write prompt or
 runs a tool, and a quick `SELECT` never waits behind chat. Requests carry a priority
-(`quack_core::priority`, a Tokio task-local): `run_turn` and `Embedder::embed_interactive` run interactive,
+(`quack_core::priority`, a Tokio task-local): `TurnRequest::run` and `Embedder::embed_interactive` run interactive,
 everything else (ingest embeddings, extraction, proposals) background, and a freed permit
 goes to the oldest interactive waiter before any background one, so a question never
 queues behind a whole ingest. rig's streaming loop drains a
@@ -989,7 +989,7 @@ review, extract, observe drift, propose again.
 The turn races a `CancellationToken`: a cancelled turn keeps the text streamed so far,
 appends a note, reports `cancelled: true`, and is still recorded.
 
-`llm::run_turn` yields these events on a channel. The web UI turns them into HTML
+`llm::TurnRequest::run` yields these events on a channel. The web UI turns them into HTML
 fragments over SSE, REST forwards them as typed SSE events or collects them into one JSON
 response, MCP collects them into the tool result, the TUI renders them inline, print mode
 writes them to stderr. `max_turns` 15, temperature 0.1. Before the first model call an
@@ -1513,7 +1513,7 @@ Keys: `Enter` send,
 this session's newest turn, running or queued (recorded with whatever streamed and a
 cancelled note), `Ctrl+C` with no turn quits (twice when other jobs are still running,
 which stop with the session), `Ctrl+L` clear. The web chat has a Stop button and print mode cancels on
-`Ctrl+C`; every interface passes a cancellation token to `run_turn`.
+`Ctrl+C`; every interface passes a cancellation token in its `TurnRequest`.
 
 Works on a named workspace (`-w`), resolved through the control plane like every other
 interface.

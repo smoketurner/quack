@@ -87,6 +87,19 @@ impl ImportPolicy {
     }
 }
 
+/// One import: the configuration, the workspace's writer and id, what to
+/// import, which sources the caller may reach, the embedding model (none
+/// stores no vectors), and the control that can stop it.
+pub struct Importing<'a, M> {
+    pub config: &'a Config,
+    pub db: &'a Writer,
+    pub workspace_id: &'a str,
+    pub request: &'a ImportRequest,
+    pub policy: ImportPolicy,
+    pub embedder: Option<&'a Embedder<M>>,
+    pub control: RunControl<'a>,
+}
+
 /// What an import did.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ImportSummary {
@@ -210,119 +223,136 @@ impl SourceUrl {
     }
 }
 
-/// Pull the rows and load them as `request.table`. The source's rows go
-/// through `files/<table>.csv` and `read_csv_auto`, so the table is
-/// registered as a document (source `import`) and can be deleted like
-/// any other.
-///
-/// # Errors
-///
-/// Returns an error when the URL is unsupported, the source cannot be
-/// reached or queried, or the load fails; [`Error::Cancelled`] when
-/// `control` is cancelled first (a download or query in flight is
-/// abandoned).
-pub async fn import<M: EmbeddingModel>(
-    config: &Config,
-    db: &Writer,
-    workspace_id: &str,
-    request: &ImportRequest,
-    policy: ImportPolicy,
-    embedder: Option<&Embedder<M>>,
-    control: RunControl<'_>,
-) -> Result<ImportSummary> {
-    let table = TableName::given(&request.table)?;
-    let limit = request
-        .limit
-        .unwrap_or(config.import.max_rows)
-        .min(config.import.max_rows)
-        .max(1);
-    let timeout = config.import.timeout();
-    let source = request.url.redacted();
-    let (filename, bytes, columns, rows) = match request.url.kind()? {
-        SourceKind::Http => {
-            let download = Download {
-                timeout,
-                max_mb: config.import.max_download_mb,
-                hosts: policy.hosts,
-            };
-            let (filename, bytes) = control
-                .or_cancelled(download.fetch(&request.url, table.as_str()))
-                .await?;
-            (filename, bytes, Vec::new(), None)
-        }
-        SourceKind::Sqlite if !policy.local_files => {
-            return Err(Error::Ingestion(String::from(
+/// What a source yielded, ready to load: the staging file's name and
+/// bytes, and, for a query source, its columns and row count.
+struct Pulled {
+    filename: String,
+    bytes: Vec<u8>,
+    /// Empty for a downloaded file, which is described after the load.
+    columns: Vec<String>,
+    /// `None` for a downloaded file, whose rows are capped after the load.
+    rows: Option<u64>,
+}
+
+impl<M: EmbeddingModel> Importing<'_, M> {
+    /// Pull the rows and load them as the request's table. The source's
+    /// rows go through `files/<table>.csv` and `read_csv_auto`, so the
+    /// table is registered as a document (source `import`) and can be
+    /// deleted like any other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the URL is unsupported, the source cannot be
+    /// reached or queried, or the load fails; [`Error::Cancelled`] when
+    /// the control is cancelled first (a download or query in flight is
+    /// abandoned).
+    pub async fn run(self) -> Result<ImportSummary> {
+        let (config, db, request) = (self.config, self.db, self.request);
+        let table = TableName::given(&request.table)?;
+        let limit = request
+            .limit
+            .unwrap_or(config.import.max_rows)
+            .min(config.import.max_rows)
+            .max(1);
+        let source = request.url.redacted();
+        let pulled = self.pull(&table, limit).await?;
+        let outcome = ingestion::ingest_file(
+            config,
+            db,
+            self.workspace_id,
+            &NewFile::new(&pulled.filename, &pulled.bytes)
+                .source(DocumentSource::Import)
+                .title(Some(&source))
+                .control(self.control),
+            self.embedder,
+        )
+        .await?;
+        let result = match outcome {
+            IngestOutcome::Ingested(result) => result,
+            IngestOutcome::Duplicate(existing) => {
+                return Err(Error::Ingestion(format!(
+                    "the source's rows are identical to document {} ({}); delete it first to reload",
+                    existing.id, existing.filename
+                )));
+            }
+        };
+        let loaded = result
+            .tables
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::Ingestion(String::from("the import produced no table")))?;
+        let (columns, rows) = if let Some(rows) = pulled.rows {
+            (pulled.columns, rows)
+        } else {
+            let table = loaded.clone();
+            db.run(move |db| cap_loaded_table(db, &table, limit))
+                .await?
+        };
+        tracing::info!(table = %loaded, rows, source = %source, "imported external data");
+        Ok(ImportSummary {
+            table: loaded,
+            rows,
+            columns,
+            source,
+            document_id: result.document_id,
+        })
+    }
+
+    /// Fetch the source as a staging file for `table`: a download, or at
+    /// most `limit` rows of a query written as CSV.
+    async fn pull(&self, table: &TableName, limit: u64) -> Result<Pulled> {
+        let (config, request, policy, control) =
+            (self.config, self.request, self.policy, self.control);
+        let timeout = config.import.timeout();
+        match request.url.kind()? {
+            SourceKind::Http => {
+                let download = Download {
+                    timeout,
+                    max_mb: config.import.max_download_mb,
+                    hosts: policy.hosts,
+                };
+                let (filename, bytes) = control
+                    .or_cancelled(download.fetch(&request.url, table.as_str()))
+                    .await?;
+                Ok(Pulled {
+                    filename,
+                    bytes,
+                    columns: Vec::new(),
+                    rows: None,
+                })
+            }
+            SourceKind::Sqlite if !policy.local_files => Err(Error::Ingestion(String::from(
                 "files on the server's disk cannot be imported through the server; \
                  run `quack import` on the host, or set [import].allow_local_files",
-            )));
+            ))),
+            SourceKind::Sqlite if request.url.is_under(&config.general.data_dir) => {
+                Err(Error::Ingestion(String::from(
+                    "quack's own data directory (control.db and the workspace files) \
+                     cannot be imported into a workspace",
+                )))
+            }
+            SourceKind::Postgres | SourceKind::Sqlite => {
+                let sql = request.source_query()?;
+                let fetch = async {
+                    tokio::time::timeout(timeout, fetch_rows(request.url.expose(), &sql, limit))
+                        .await
+                        .map_err(|_| {
+                            Error::Ingestion(format!(
+                                "the source did not answer within {} s",
+                                timeout.as_secs()
+                            ))
+                        })?
+                };
+                let fetched = control.or_cancelled(fetch).await?;
+                Ok(Pulled {
+                    filename: format!("{table}.csv"),
+                    bytes: fetched.csv,
+                    columns: fetched.columns,
+                    rows: Some(fetched.rows),
+                })
+            }
         }
-        SourceKind::Sqlite if request.url.is_under(&config.general.data_dir) => {
-            return Err(Error::Ingestion(String::from(
-                "quack's own data directory (control.db and the workspace files) \
-                 cannot be imported into a workspace",
-            )));
-        }
-        SourceKind::Postgres | SourceKind::Sqlite => {
-            let sql = request.source_query()?;
-            let fetch = async {
-                tokio::time::timeout(timeout, fetch_rows(request.url.expose(), &sql, limit))
-                    .await
-                    .map_err(|_| {
-                        Error::Ingestion(format!(
-                            "the source did not answer within {} s",
-                            timeout.as_secs()
-                        ))
-                    })?
-            };
-            let fetched = control.or_cancelled(fetch).await?;
-            (
-                format!("{table}.csv"),
-                fetched.csv,
-                fetched.columns,
-                Some(fetched.rows),
-            )
-        }
-    };
-    let outcome = ingestion::ingest_file(
-        config,
-        db,
-        workspace_id,
-        &NewFile::new(&filename, &bytes)
-            .source(DocumentSource::Import)
-            .title(Some(&source))
-            .control(control),
-        embedder,
-    )
-    .await?;
-    let result = match outcome {
-        IngestOutcome::Ingested(result) => result,
-        IngestOutcome::Duplicate(existing) => {
-            return Err(Error::Ingestion(format!(
-                "the source's rows are identical to document {} ({}); delete it first to reload",
-                existing.id, existing.filename
-            )));
-        }
-    };
-    let loaded = result
-        .tables
-        .first()
-        .cloned()
-        .ok_or_else(|| Error::Ingestion(String::from("the import produced no table")))?;
-    let (columns, rows) = if let Some(rows) = rows {
-        (columns, rows)
-    } else {
-        let table = loaded.clone();
-        db.run(move |db| cap_loaded_table(db, &table, limit))
-            .await?
-    };
-    tracing::info!(table = %loaded, rows, source = %source, "imported external data");
-    Ok(ImportSummary {
-        table: loaded,
-        rows,
-        columns,
-        source,
-        document_id: result.document_id,
-    })
+    }
 }
 
 /// A file came in whole, so the row cap applies after the load, as
@@ -857,15 +887,16 @@ mod tests {
             source_table: None,
             limit: Some(2),
         };
-        let summary = import(
-            &config,
-            &db,
-            "ws",
-            &request,
-            ImportPolicy::owner(),
-            None::<&Embeddings>,
-            RunControl::unobserved(),
-        )
+        let summary = Importing {
+            config: &config,
+            db: &db,
+            workspace_id: "ws",
+            request: &request,
+            policy: ImportPolicy::owner(),
+            embedder: None::<&Embeddings>,
+            control: RunControl::unobserved(),
+        }
+        .run()
         .await
         .unwrap_or_else(|e| no_import(&e.to_string()));
         assert_eq!(summary.table, "rows");
@@ -934,15 +965,16 @@ mod tests {
                 source_table: Some(String::from("users")),
                 limit: None,
             };
-            let err = import(
-                &config,
-                &db,
-                "ws",
-                &request,
-                ImportPolicy::owner(),
-                None::<&Embeddings>,
-                RunControl::unobserved(),
-            )
+            let err = Importing {
+                config: &config,
+                db: &db,
+                workspace_id: "ws",
+                request: &request,
+                policy: ImportPolicy::owner(),
+                embedder: None::<&Embeddings>,
+                control: RunControl::unobserved(),
+            }
+            .run()
             .await
             .err()
             .map(|e| e.to_string())

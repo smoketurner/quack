@@ -125,7 +125,7 @@ resources are limited where they are used. Every rig client is built over
 `llm::LimitedHttp`, which holds one permit of the process-wide gate for the provider and
 the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
-requests (`run_turn`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
+requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
 background ones. The registry is in memory only (labels can be workspace content).
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
@@ -251,7 +251,7 @@ membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 has
 half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace under the
 same UUID v7. Ingestion is `register_document` (status `queued`, or `Registration::Duplicate` when the
 bytes' SHA-256 already belong to a non-failed document whose table or chunks still exist;
-`Error::TableTaken` when the file's table belongs to another live document) plus `process_document`
+`Error::TableTaken` when the file's table belongs to another live document) plus `Processing::run`
 (`processing` to `ready` or `error`, recording `chunk_count` and the parsed title);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
 title and uploader, and its `RunControl`).

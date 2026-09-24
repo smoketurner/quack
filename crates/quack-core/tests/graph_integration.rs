@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
+use quack_core::extraction::ExtractionRun;
 use quack_core::extraction::{Extract, ExtractFuture};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::resolve::MergeDecision;
@@ -521,11 +522,13 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     let summary = extract::run(
         &writer,
         &plan,
-        &Canned,
         &current,
         false,
-        2,
-        RunControl::unobserved(),
+        ExtractionRun {
+            extractor: &Canned,
+            concurrency: 2,
+            control: RunControl::unobserved(),
+        },
     )
     .await
     .unwrap();
@@ -880,9 +883,19 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
         progress: &progress,
         cancel: None,
     };
-    let summary = extract::run(&writer, &plan, &Canned, &current, false, 4, control)
-        .await
-        .unwrap();
+    let summary = extract::run(
+        &writer,
+        &plan,
+        &current,
+        false,
+        ExtractionRun {
+            extractor: &Canned,
+            concurrency: 4,
+            control,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!((summary.chunks, summary.failed_chunks), (152, 1));
     assert_eq!(graph_store::extracted_chunks(&db).unwrap(), 151);
     assert_eq!(seen.into_inner().unwrap(), (1..=152).collect::<Vec<u32>>());
@@ -895,11 +908,13 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
     let summary = extract::run(
         &writer,
         &plan,
-        &Canned,
         &current,
         false,
-        4,
-        RunControl::unobserved(),
+        ExtractionRun {
+            extractor: &Canned,
+            concurrency: 4,
+            control: RunControl::unobserved(),
+        },
     )
     .await
     .unwrap();
@@ -922,11 +937,13 @@ async fn provenance_maps_between_entities_and_chunks() {
     extract::run(
         &writer,
         &plan,
-        &Canned,
         &current,
         false,
-        2,
-        RunControl::unobserved(),
+        ExtractionRun {
+            extractor: &Canned,
+            concurrency: 2,
+            control: RunControl::unobserved(),
+        },
     )
     .await
     .unwrap();

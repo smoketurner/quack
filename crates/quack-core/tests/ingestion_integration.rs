@@ -2082,15 +2082,16 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         source_table: Some(String::from("orders")),
         limit: None,
     };
-    let summary = import::import(
-        &config,
-        &writer,
-        "ws-import",
-        &request,
-        ImportPolicy::owner(),
-        None::<&Embedder<MockEmbeddingModel>>,
-        RunControl::unobserved(),
-    )
+    let summary = import::Importing {
+        config: &config,
+        db: &writer,
+        workspace_id: "ws-import",
+        request: &request,
+        policy: ImportPolicy::owner(),
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await
     .unwrap();
     assert_eq!(summary.table, "Orders_Import");
@@ -2138,15 +2139,16 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         source_table: None,
         limit: Some(2),
     };
-    let summary = import::import(
-        &config,
-        &writer,
-        "ws-import",
-        &request,
-        ImportPolicy::owner(),
-        None::<&Embedder<MockEmbeddingModel>>,
-        RunControl::unobserved(),
-    )
+    let summary = import::Importing {
+        config: &config,
+        db: &writer,
+        workspace_id: "ws-import",
+        request: &request,
+        policy: ImportPolicy::owner(),
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await
     .unwrap();
     assert_eq!((summary.rows, summary.columns.len()), (2, 2));
@@ -2372,21 +2374,22 @@ async fn server_policy_refuses_local_sqlite_files() {
     let server_policy = ImportPolicy::server(&config);
     assert!(!server_policy.local_files);
     assert_eq!(server_policy.hosts, HostReach::PublicOnly);
-    let local_file = import::import(
-        &config,
-        &writer,
-        "ws-import-policy",
-        &ImportRequest {
+    let local_file = import::Importing {
+        config: &config,
+        db: &writer,
+        workspace_id: "ws-import-policy",
+        request: &ImportRequest {
             url: format!("sqlite://{}", dir.path().join("control.db").display()).into(),
             table: String::from("x"),
             query: None,
             source_table: Some(String::from("users")),
             limit: None,
         },
-        server_policy,
-        None::<&Embedder<MockEmbeddingModel>>,
-        RunControl::unobserved(),
-    )
+        policy: server_policy,
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await;
     assert!(local_file.is_err_and(|e| e.to_string().contains("allow_local_files")));
     assert!(db.list_tables().unwrap().is_empty());
@@ -2419,68 +2422,72 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         source_table: Some(String::from("orders")),
         limit: None,
     };
-    let summary = import::import(
-        &config,
-        &writer,
-        "ws-import-errors",
-        &first,
-        ImportPolicy::owner(),
-        None::<&Embedder<MockEmbeddingModel>>,
-        RunControl::unobserved(),
-    )
+    let summary = import::Importing {
+        config: &config,
+        db: &writer,
+        workspace_id: "ws-import-errors",
+        request: &first,
+        policy: ImportPolicy::owner(),
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await
     .unwrap();
     assert_eq!(summary.rows, 1);
     // The same rows again are a duplicate; a bad query and a bad URL are errors.
-    let again = import::import(
-        &config,
-        &writer,
-        "ws-import-errors",
-        &ImportRequest {
+    let again = import::Importing {
+        config: &config,
+        db: &writer,
+        workspace_id: "ws-import-errors",
+        request: &ImportRequest {
             url: url.clone().into(),
             table: String::from("Orders Import"),
             query: None,
             source_table: Some(String::from("orders")),
             limit: None,
         },
-        ImportPolicy::owner(),
-        None::<&Embedder<MockEmbeddingModel>>,
-        RunControl::unobserved(),
-    )
+        policy: ImportPolicy::owner(),
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await;
     assert!(again.is_err_and(|e| e.to_string().contains("identical")));
-    let bad = import::import(
-        &config,
-        &writer,
-        "ws-import-errors",
-        &ImportRequest {
+    let bad = import::Importing {
+        config: &config,
+        db: &writer,
+        workspace_id: "ws-import-errors",
+        request: &ImportRequest {
             url: url.into(),
             table: String::from("x"),
             query: Some(String::from("SELECT * FROM nope")),
             source_table: None,
             limit: None,
         },
-        ImportPolicy::owner(),
-        None::<&Embedder<MockEmbeddingModel>>,
-        RunControl::unobserved(),
-    )
+        policy: ImportPolicy::owner(),
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await;
     assert!(bad.is_err_and(|e| e.to_string().contains("rejected the query")));
-    let unsupported = import::import(
-        &config,
-        &writer,
-        "ws-import-errors",
-        &ImportRequest {
+    let unsupported = import::Importing {
+        config: &config,
+        db: &writer,
+        workspace_id: "ws-import-errors",
+        request: &ImportRequest {
             url: String::from("mysql://h/db").into(),
             table: String::from("x"),
             query: None,
             source_table: Some(String::from("t")),
             limit: None,
         },
-        ImportPolicy::owner(),
-        None::<&Embedder<MockEmbeddingModel>>,
-        RunControl::unobserved(),
-    )
+        policy: ImportPolicy::owner(),
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await;
     assert!(unsupported.is_err());
     // Delete through the document row drops the imported table.

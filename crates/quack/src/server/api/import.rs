@@ -70,15 +70,16 @@ pub(crate) async fn run_import(
     } else {
         ImportPolicy::server(&app.config)
     };
-    let outcome = import::import(
-        &app.config,
-        &db,
-        &access.workspace.id,
+    let outcome = import::Importing {
+        config: &app.config,
+        db: &db,
+        workspace_id: &access.workspace.id,
         request,
         policy,
-        embeddings.as_ref(),
-        RunControl::unobserved(),
-    )
+        embedder: embeddings.as_ref(),
+        control: RunControl::unobserved(),
+    }
+    .run()
     .await;
     let detail = serde_json::json!({
         "source": source,

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rig::prelude::*;
 
-use crate::analysis::agent::{self, AgentResponse};
+use crate::analysis::agent::{AgentResponse, Analysis};
 use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
@@ -643,115 +643,128 @@ async fn build_anthropic_client(
     })
 }
 
-/// Run one agent turn in `session_id` with the configured chat and
-/// embedding models, replaying the session's history to the model and
-/// recording the turn when it completes.
-///
-/// This is the single dispatch point over provider types; interfaces call it
-/// rather than matching on `provider_type` themselves. `reader_db` is the
-/// workspace handle's reader (`ReaderDb::open`), built once
-/// for the handle's whole lifetime by whoever opened it — not here, so
-/// starting a turn never waits on `db`'s mutex to acquire one.
-///
-/// # Errors
-///
-/// Returns an error if no chat model is configured, a provider cannot be
-/// built, the session does not exist, or the agent turn fails.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one entry point per turn; interfaces call this directly"
-)]
-pub async fn run_turn(
-    config: &Config,
-    db: SharedDb,
-    reader_db: ReaderDb,
-    session_id: &str,
-    policy: WritePolicy,
-    message: &str,
-    sink: EventSink,
-    cancel: CancellationToken,
-) -> Result<AgentResponse> {
-    // A failure before the turn begins is the turn's failure too, so an
-    // interface that only reads the events still sees why.
-    let StartedTurn {
-        chat,
-        embedding_model,
-        prompt,
-        history,
-    } = match start_turn(config, &db, session_id, policy).await {
-        Ok(started) => started,
-        Err(e) => {
-            drop(sink.send(AgentEvent::Failed(TurnFailure::from(&e))));
-            return Err(e);
-        }
-    };
+/// One agent turn an interface asks for: the workspace's writer and
+/// reader, the session, the write policy, the message, where the events
+/// go, and the token that cancels it. `reader_db` is the workspace
+/// handle's reader (`ReaderDb::open`), built once for the handle's whole
+/// lifetime by whoever opened it, so starting a turn never waits on the
+/// writer to acquire one.
+pub struct TurnRequest<'a> {
+    pub db: SharedDb,
+    pub reader_db: ReaderDb,
+    pub session_id: &'a str,
+    pub policy: WritePolicy,
+    pub message: &'a str,
+    pub sink: EventSink,
+    pub cancel: CancellationToken,
+}
 
-    tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
+impl TurnRequest<'_> {
+    /// Run the turn with the configured chat and embedding models, replaying
+    /// the session's history to the model and recording the turn when it
+    /// completes.
+    ///
+    /// This is the single dispatch point over provider types; interfaces call
+    /// it rather than matching on `provider_type` themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no chat model is configured, a provider cannot be
+    /// built, the session does not exist, or the agent turn fails.
+    pub async fn run(self, config: &Config) -> Result<AgentResponse> {
+        let Self {
+            db,
+            reader_db,
+            session_id,
+            policy,
+            message,
+            sink,
+            cancel,
+        } = self;
+        // A failure before the turn begins is the turn's failure too, so an
+        // interface that only reads the events still sees why.
+        let StartedTurn {
+            chat,
+            embedding_model,
+            prompt,
+            history,
+        } = match start_turn(config, &db, session_id, policy).await {
+            Ok(started) => started,
+            Err(e) => {
+                drop(sink.send(AgentEvent::Failed(TurnFailure::from(&e))));
+                return Err(e);
+            }
+        };
 
-    // Events pass through here on their way out so the text streamed so
-    // far is known if the turn is cancelled (issue #45).
-    let (inner_sink, mut inner_events) = events::channel();
-    let streamed: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let forward = tokio::spawn({
-        let streamed = Arc::clone(&streamed);
-        let outer = sink.clone();
-        async move {
-            while let Some(event) = inner_events.recv().await {
-                if let AgentEvent::TextDelta(text) = &event
-                    && let Ok(mut so_far) = streamed.lock()
-                {
-                    so_far.push_str(text);
-                }
-                if outer.send(event).is_err() {
-                    break;
+        tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
+
+        // Events pass through here on their way out so the text streamed so
+        // far is known if the turn is cancelled (issue #45).
+        let (inner_sink, mut inner_events) = events::channel();
+        let streamed: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let forward = tokio::spawn({
+            let streamed = Arc::clone(&streamed);
+            let outer = sink.clone();
+            async move {
+                while let Some(event) = inner_events.recv().await {
+                    if let AgentEvent::TextDelta(text) = &event
+                        && let Ok(mut so_far) = streamed.lock()
+                    {
+                        so_far.push_str(text);
+                    }
+                    if outer.send(event).is_err() {
+                        break;
+                    }
                 }
             }
-        }
-    });
-    // Someone is watching this turn: its model calls, and the tools' calls
-    // inside it, go ahead of background work at the provider (design 4.1).
-    let turn = Priority::Interactive.scope(dispatch(
-        config,
-        Arc::clone(&db),
-        reader_db,
-        chat,
-        embedding_model,
-        policy,
-        prompt,
-        history,
-        message,
-        inner_sink,
-    ));
-    let outcome = tokio::select! {
-        biased;
-        () = cancel.cancelled() => None,
-        outcome = turn => Some(outcome),
-    };
-    // Dropping the turn dropped its sink; the forwarder ends with it.
-    drop(forward.await);
-
-    let response = if let Some(outcome) = outcome {
-        outcome?
-    } else {
-        let mut content = streamed.lock().map(|s| s.clone()).unwrap_or_default();
-        if !content.trim().is_empty() {
-            content.push_str("\n\n");
-        }
-        content.push_str(CANCELLED_NOTE);
-        let response = AgentResponse {
-            content,
-            cancelled: true,
-            ..AgentResponse::default()
+        });
+        // Someone is watching this turn: its model calls, and the tools' calls
+        // inside it, go ahead of background work at the provider (design 4.1).
+        let analysis = Analysis {
+            db: Arc::clone(&db),
+            reader_db,
+            embedder: embedding_model,
+            config: &config.analysis,
+            retrieval_config: &config.retrieval,
+            graph_options: config.graph.options(),
+            write_policy: policy,
+            prompt,
+            history,
+            message,
         };
-        tracing::info!(session = session_id, "agent turn cancelled");
-        drop(sink.send(AgentEvent::TurnComplete(response.clone())));
-        response
-    };
+        let turn = Priority::Interactive.scope(dispatch(config, chat, analysis, inner_sink));
+        let outcome = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            outcome = turn => Some(outcome),
+        };
+        // Dropping the turn dropped its sink; the forwarder ends with it.
+        drop(forward.await);
 
-    let (session, text, recorded) = (session_id.to_owned(), message.to_owned(), response.clone());
-    db.run(move |guard| sessions::record_turn(guard, &session, &text, &recorded))
-        .await?;
-    Ok(response)
+        let response = if let Some(outcome) = outcome {
+            outcome?
+        } else {
+            let mut content = streamed.lock().map(|s| s.clone()).unwrap_or_default();
+            if !content.trim().is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str(CANCELLED_NOTE);
+            let response = AgentResponse {
+                content,
+                cancelled: true,
+                ..AgentResponse::default()
+            };
+            tracing::info!(session = session_id, "agent turn cancelled");
+            drop(sink.send(AgentEvent::TurnComplete(response.clone())));
+            response
+        };
+
+        let (session, text, recorded) =
+            (session_id.to_owned(), message.to_owned(), response.clone());
+        db.run(move |guard| sessions::record_turn(guard, &session, &text, &recorded))
+            .await?;
+        Ok(response)
+    }
 }
 
 /// What a turn needs before the model is called.
@@ -811,20 +824,11 @@ async fn start_turn<'c>(
 /// What a cancelled turn's recorded answer ends with.
 pub const CANCELLED_NOTE: &str = "(Cancelled by the user before the answer was complete.)";
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "internal dispatch over provider types"
-)]
+/// Run `analysis` on the chat model's provider.
 async fn dispatch(
     config: &Config,
-    db: SharedDb,
-    reader_db: ReaderDb,
     chat: ModelRef<'_>,
-    embedding_model: Option<Embeddings>,
-    policy: WritePolicy,
-    prompt: PromptOptions,
-    history: Vec<Message>,
-    message: &str,
+    analysis: Analysis<'_, EmbedModel>,
     sink: EventSink,
 ) -> Result<AgentResponse> {
     match ChatClient::build(config, &chat).await? {
@@ -848,55 +852,19 @@ async fn dispatch(
                     chat.model
                 ))));
             }
-            agent::run_analysis(
-                db,
-                reader_db,
-                client.completion_model(chat.model),
-                embedding_model,
-                &config.analysis,
-                &config.retrieval,
-                config.graph.options(),
-                policy,
-                prompt,
-                history,
-                message,
-                sink,
-            )
-            .await
+            analysis
+                .run(client.completion_model(chat.model), sink)
+                .await
         }
         ChatClient::OpenAi(client) => {
-            agent::run_analysis(
-                db,
-                reader_db,
-                client.completion_model(chat.model),
-                embedding_model,
-                &config.analysis,
-                &config.retrieval,
-                config.graph.options(),
-                policy,
-                prompt,
-                history,
-                message,
-                sink,
-            )
-            .await
+            analysis
+                .run(client.completion_model(chat.model), sink)
+                .await
         }
         ChatClient::Anthropic(client) => {
-            agent::run_analysis(
-                db,
-                reader_db,
-                client.completion_model(chat.model),
-                embedding_model,
-                &config.analysis,
-                &config.retrieval,
-                config.graph.options(),
-                policy,
-                prompt,
-                history,
-                message,
-                sink,
-            )
-            .await
+            analysis
+                .run(client.completion_model(chat.model), sink)
+                .await
         }
     }
 }
@@ -1050,16 +1018,16 @@ mod tests {
         let (sink, mut events) = events::channel();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let response = run_turn(
-            &config,
-            Arc::clone(&db),
+        let response = TurnRequest {
+            db: Arc::clone(&db),
             reader_db,
-            &session.id,
-            WritePolicy::Deny,
-            "how many storms?",
+            session_id: &session.id,
+            policy: WritePolicy::Deny,
+            message: "how many storms?",
             sink,
             cancel,
-        )
+        }
+        .run(&config)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(response.cancelled);

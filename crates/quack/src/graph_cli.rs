@@ -7,6 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::extraction::ExtractionRun;
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
 use quack_core::graph::traverse::Hops;
@@ -333,11 +334,13 @@ async fn run_extract(
                 let summary = extract::run(
                     db,
                     &plan,
-                    extractor.as_ref(),
                     &ontology,
                     provisional,
-                    config.analysis.extraction_concurrency,
-                    control,
+                    ExtractionRun {
+                        extractor: extractor.as_ref(),
+                        concurrency: config.analysis.extraction_concurrency,
+                        control,
+                    },
                 )
                 .await?;
                 writeln!(

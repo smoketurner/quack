@@ -62,16 +62,16 @@ pub(crate) async fn run_prompt(
         let prompt = prompt.to_owned();
         let session_id = session_id.to_owned();
         async move {
-            llm::run_turn(
-                &config,
+            llm::TurnRequest {
                 db,
                 reader_db,
-                &session_id,
+                session_id: &session_id,
                 policy,
-                &prompt,
+                message: &prompt,
                 sink,
                 cancel,
-            )
+            }
+            .run(&config)
             .await
         }
     });
