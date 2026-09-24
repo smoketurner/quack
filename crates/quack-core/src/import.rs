@@ -194,7 +194,7 @@ pub async fn import<M: EmbeddingModel>(
         .unwrap_or(config.import.max_rows)
         .min(config.import.max_rows)
         .max(1);
-    let timeout = Duration::from_secs(config.import.timeout_seconds.max(1));
+    let timeout = config.import.timeout();
     let source = redact(&request.url);
     let (filename, bytes, columns, rows) = match source_kind(&request.url)? {
         SourceKind::Http => {

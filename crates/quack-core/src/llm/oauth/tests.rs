@@ -7,7 +7,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::config::{AuthMode, ProviderType};
 
 /// What the mock issuer does and what it saw.
 #[derive(Default)]
@@ -497,25 +496,14 @@ async fn discovery_failure_is_reported_with_the_url() {
 }
 
 #[test]
-fn shared_manager_is_one_per_provider_and_needs_the_oauth_section() {
+fn shared_manager_is_one_per_provider() {
     let dir = temp();
-    let provider = ProviderConfig {
-        provider_type: ProviderType::Openai,
-        auth: AuthMode::Oauth,
-        base_url: None,
-        api_key_env: None,
-        embedding_dimension: None,
-        max_concurrent_requests: None,
-        oauth: Some(oauth_config("http://127.0.0.1:9", false)),
-    };
-    let a = shared_manager(dir.path(), &name("shared"), &provider);
-    let b = shared_manager(dir.path(), &name("shared"), &provider);
+    let oauth = oauth_config("http://127.0.0.1:9", false);
+    let a = shared_manager(dir.path(), &name("shared"), &oauth);
+    let b = shared_manager(dir.path(), &name("shared"), &oauth);
     assert!(matches!((&a, &b), (Ok(a), Ok(b)) if Arc::ptr_eq(a, b)));
-    let none = ProviderConfig {
-        oauth: None,
-        ..provider
-    };
-    assert!(shared_manager(dir.path(), &name("other"), &none).is_err());
+    let other = shared_manager(dir.path(), &name("other"), &oauth);
+    assert!(matches!((&a, &other), (Ok(a), Ok(o)) if !Arc::ptr_eq(a, o)));
 }
 
 #[test]

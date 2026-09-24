@@ -2953,7 +2953,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
-        use quack_core::config::{AuthMode, ProviderConfig, ProviderName, ProviderType};
+        use quack_core::config::{BaseUrl, ProviderConfig, ProviderName, ProviderType};
+        use quack_core::embedding::Dimension;
         use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
         // Without an embedding model the job says what is missing.
@@ -2972,19 +2973,22 @@ mod tests {
         // session opens.
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = Config::default();
-        config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
+        config.general.embedding_model = Some(
+            "ollama/embeddinggemma"
+                .parse()
+                .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
+        );
         config.providers.insert(
             "ollama"
                 .parse::<ProviderName>()
                 .unwrap_or_else(|e| fail(&e.to_string())),
             ProviderConfig {
-                provider_type: ProviderType::Ollama,
-                auth: AuthMode::None,
-                base_url: Some(String::from("http://127.0.0.1:9")),
-                api_key_env: None,
-                embedding_dimension: Some(4),
-                max_concurrent_requests: None,
-                oauth: None,
+                base_url: Some(
+                    BaseUrl::try_from(String::from("http://127.0.0.1:9"))
+                        .unwrap_or_else(|e| fail(&e.to_string())),
+                ),
+                embedding_dimension: Some(Dimension::new(4)),
+                ..ProviderConfig::new(ProviderType::Ollama)
             },
         );
         let mut app = app_with(dir.path(), config);

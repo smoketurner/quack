@@ -23,7 +23,7 @@ use std::process::ExitCode;
 
 use quack_core::analysis::citations::CitationRegistry;
 use quack_core::config::{
-    AnalysisConfig, AuthMode, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
+    AnalysisConfig, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
     ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
     RetrievalConfig, ServerConfig,
 };
@@ -139,13 +139,8 @@ fn eval_config(data_dir: &Path) -> Result<Config> {
     providers.insert(
         "eval".parse()?,
         ProviderConfig {
-            provider_type: ProviderType::Ollama,
-            auth: AuthMode::None,
-            base_url: None,
-            api_key_env: None,
-            embedding_dimension: Some(HASH_DIM_U32),
-            max_concurrent_requests: None,
-            oauth: None,
+            embedding_dimension: Some(Dimension::new(HASH_DIM_U32)),
+            ..ProviderConfig::new(ProviderType::Ollama)
         },
     );
     Ok(Config {
@@ -153,7 +148,7 @@ fn eval_config(data_dir: &Path) -> Result<Config> {
             data_dir: data_dir.to_path_buf(),
             default_workspace: String::from("eval"),
             chat_model: None,
-            embedding_model: Some(String::from("eval/hash-embedder")),
+            embedding_model: Some("eval/hash-embedder".parse()?),
         },
         providers,
         ingestion: IngestionConfig::default(),

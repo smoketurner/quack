@@ -21,7 +21,8 @@ use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
-    AuthMode, Config, ModelRef, ProviderConfig, ProviderName, ProviderType, config_file_path,
+    BaseUrl, Config, ModelRef, ProviderAuth, ProviderConfig, ProviderName, ProviderType,
+    config_file_path,
 };
 use crate::embedding::{Embedder, Input, Profile};
 use crate::error::{Error, Record, Result};
@@ -171,7 +172,7 @@ pub enum EmbedModel {
     /// with whatever token the manager holds then.
     OpenAiOAuth {
         manager: Arc<oauth::TokenManager>,
-        base_url: Option<String>,
+        base_url: Option<BaseUrl>,
         model: String,
         ndims: usize,
         /// The provider's limited client, reused by every rebuild.
@@ -236,10 +237,16 @@ impl EmbeddingModel for EmbedModel {
                 ndims,
                 http,
             } => {
-                Self::oauth_model(manager, base_url.as_deref(), model, *ndims, http)
-                    .await?
-                    .embed_texts(texts)
-                    .await
+                Self::oauth_model(
+                    manager,
+                    base_url.as_ref().map(BaseUrl::as_str),
+                    model,
+                    *ndims,
+                    http,
+                )
+                .await?
+                .embed_texts(texts)
+                .await
             }
         }
     }
@@ -378,12 +385,6 @@ impl<T: DeserializeOwned + Send> Extract<T> for OneShotAgent {
     }
 }
 
-/// `[analysis].extraction_timeout_seconds` as a duration, at least one
-/// second.
-fn extraction_timeout(config: &Config) -> Duration {
-    Duration::from_secs(config.analysis.extraction_timeout_seconds.max(1))
-}
-
 /// The configured chat model as a constrained extractor for the graph: its
 /// preamble carries the ontology.
 ///
@@ -399,7 +400,7 @@ pub async fn graph_extractor(
     Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
         chat.model,
         &ontology.extraction_prompt(),
-        extraction_timeout(config),
+        config.analysis.extraction_timeout(),
         "graph extraction",
     )))
 }
@@ -415,7 +416,7 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
     Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
         chat.model,
         documents::EXTRACTION_PROMPT,
-        extraction_timeout(config),
+        config.analysis.extraction_timeout(),
         "extraction",
     )))
 }
@@ -469,32 +470,29 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
-/// The bearer credential for a provider, according to its `auth` mode: none,
-/// the static key from the environment, or the current OAuth access token.
-async fn credential(
-    config: &Config,
-    name: &ProviderName,
-    provider: &ProviderConfig,
-) -> Result<Option<String>> {
-    match provider.auth {
-        AuthMode::None => Ok(None),
-        AuthMode::ApiKey => {
-            let var = provider.api_key_env.as_deref().ok_or_else(|| {
-                Error::Config(format!(
-                    "provider '{name}' has auth = \"api-key\" but no api_key_env"
-                ))
-            })?;
-            let key = std::env::var(var).map_err(|_| {
-                Error::Config(format!(
-                    "provider '{name}' needs the API key in environment variable {var}, which is not set"
-                ))
-            })?;
-            Ok(Some(key))
-        }
-        AuthMode::Oauth => {
-            let manager = oauth::shared_manager(&config.tokens_dir(), name, provider)?;
-            let token = manager.access_token().await?;
-            Ok(Some(token.expose_secret().to_owned()))
+impl ProviderAuth {
+    /// The bearer credential provider `name` is called with: none, the key
+    /// from the environment, or the current OAuth access token. A key
+    /// variable that is unset or blank is an error, not an empty key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Config` error for a missing key, and
+    /// [`Error::AuthRequired`] when an OAuth provider has no login.
+    pub async fn credential(&self, config: &Config, name: &ProviderName) -> Result<Option<String>> {
+        match self {
+            Self::None => Ok(None),
+            Self::ApiKey { env } => match std::env::var(env) {
+                Ok(key) if !key.trim().is_empty() => Ok(Some(key)),
+                Ok(_) | Err(_) => Err(Error::Config(format!(
+                    "provider '{name}' reads its API key from {env}, which is not set"
+                ))),
+            },
+            Self::Oauth(oauth) => {
+                let manager = oauth::shared_manager(&config.tokens_dir(), name, oauth)?;
+                let token = manager.access_token().await?;
+                Ok(Some(token.expose_secret().to_owned()))
+            }
         }
     }
 }
@@ -560,7 +558,9 @@ async fn build_ollama_client(
     name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<OllamaClient> {
-    let key = credential(config, name, provider)
+    let key = provider
+        .auth
+        .credential(config, name)
         .await?
         .map(rig::providers::ollama::OllamaApiKey::from)
         .unwrap_or_default();
@@ -570,8 +570,7 @@ async fn build_ollama_client(
         .http_client(LimitedHttp::for_provider(name, provider));
 
     if let Some(base_url) = &provider.base_url {
-        let url = base_url.trim_end_matches("/v1");
-        builder = builder.base_url(url);
+        builder = builder.base_url(base_url.root());
     }
 
     builder
@@ -584,14 +583,18 @@ async fn build_openai_client(
     name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<OpenAiClient> {
-    let key = credential(config, name, provider).await?.ok_or_else(|| {
-        Error::Config(format!(
-            "provider '{name}' (openai) requires auth = \"api-key\" or \"oauth\""
-        ))
-    })?;
+    let key = provider
+        .auth
+        .credential(config, name)
+        .await?
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "provider '{name}' (openai) requires auth = \"api-key\" or \"oauth\""
+            ))
+        })?;
     openai_client_with_key(
         name,
-        provider.base_url.as_deref(),
+        provider.base_url.as_ref().map(BaseUrl::as_str),
         &key,
         LimitedHttp::for_provider(name, provider),
     )
@@ -621,18 +624,22 @@ async fn build_anthropic_client(
     name: &ProviderName,
     provider: &ProviderConfig,
 ) -> Result<AnthropicClient> {
-    let key = credential(config, name, provider).await?.ok_or_else(|| {
-        Error::Config(format!(
-            "provider '{name}' (anthropic) requires auth = \"api-key\" or \"oauth\""
-        ))
-    })?;
+    let key = provider
+        .auth
+        .credential(config, name)
+        .await?
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "provider '{name}' (anthropic) requires auth = \"api-key\" or \"oauth\""
+            ))
+        })?;
 
     let mut builder = rig::providers::anthropic::Client::builder()
         .api_key(&key)
         .http_client(LimitedHttp::for_provider(name, provider));
 
     if let Some(base_url) = &provider.base_url {
-        builder = builder.base_url(base_url);
+        builder = builder.base_url(base_url.as_str());
     }
 
     builder.build().map_err(|e| {
@@ -643,13 +650,7 @@ async fn build_anthropic_client(
 }
 
 async fn build_embed_model(config: &Config, model: ModelRef<'_>) -> Result<EmbedModel> {
-    let ndims = model.provider.embedding_dimension.ok_or_else(|| {
-        Error::Config(format!(
-            "provider '{}' is used for embeddings but has no embedding_dimension",
-            model.provider_name
-        ))
-    })?;
-    let ndims = usize::try_from(ndims)
+    let ndims = usize::try_from(model.dimension()?.get())
         .map_err(|e| Error::Config(format!("embedding_dimension overflow: {e}")))?;
 
     match model.provider.provider_type {
@@ -662,9 +663,8 @@ async fn build_embed_model(config: &Config, model: ModelRef<'_>) -> Result<Embed
                 num_ctx: OllamaEmbedder::context_window(config.ingestion.chunk_size_tokens),
             }))
         }
-        ProviderType::Openai if model.provider.auth == AuthMode::Oauth => {
-            let manager =
-                oauth::shared_manager(&config.tokens_dir(), model.provider_name, model.provider)?;
+        ProviderType::Openai if let Some(oauth) = model.provider.auth.oauth() => {
+            let manager = oauth::shared_manager(&config.tokens_dir(), model.provider_name, oauth)?;
             // Fail here, typed, when no login exists; later batches refresh
             // on their own.
             drop(manager.access_token().await?);

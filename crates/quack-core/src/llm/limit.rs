@@ -33,7 +33,7 @@ use rig::http_client::{
 };
 use tokio::sync::oneshot;
 
-use crate::config::{ProviderConfig, ProviderName};
+use crate::config::{BaseUrl, ProviderConfig, ProviderName, RequestLimit};
 
 use crate::priority::{Priority, current_priority};
 
@@ -160,29 +160,19 @@ fn model_of(body: &[u8]) -> String {
 /// request's model before each request. `Default` (required by rig's
 /// provider bounds) is unlimited; quack always builds one with
 /// [`LimitedHttp::for_provider`].
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct LimitedHttp {
     inner: reqwest::Client,
-    /// `name\0base_url`, or `None` for the unlimited default.
-    provider: Option<Arc<str>>,
-    limit: usize,
+    /// The provider's gate key (`name\0base_url`) and its limit, or `None`
+    /// for the unlimited default.
+    provider: Option<(Arc<str>, RequestLimit)>,
 }
 
 impl std::fmt::Debug for LimitedHttp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LimitedHttp")
-            .field("limit", &self.limit)
+            .field("limit", &self.provider.as_ref().map(|(_, limit)| *limit))
             .finish_non_exhaustive()
-    }
-}
-
-impl Default for LimitedHttp {
-    fn default() -> Self {
-        Self {
-            inner: reqwest::Client::default(),
-            provider: None,
-            limit: usize::MAX,
-        }
     }
 }
 
@@ -192,23 +182,25 @@ impl LimitedHttp {
     pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
             inner: reqwest::Client::default(),
-            provider: Some(Arc::from(format!(
-                "{name}\u{0}{}",
-                provider.base_url.as_deref().unwrap_or("")
-            ))),
-            limit: usize::try_from(provider.request_limit()).unwrap_or(1),
+            provider: Some((
+                Arc::from(format!(
+                    "{name}\u{0}{}",
+                    provider.base_url.as_ref().map_or("", BaseUrl::as_str)
+                )),
+                provider.request_limit(),
+            )),
         }
     }
 
     /// The gate for `model`, created with this client's limit on first use;
     /// a later config for the same provider in one process keeps the first.
     fn gate(&self, model: &str) -> Option<Arc<Gate>> {
-        let provider = self.provider.as_deref()?;
+        let (provider, limit) = self.provider.as_ref()?;
         let key = format!("{provider}\u{0}{model}");
         let mut map = registry().lock().unwrap_or_else(PoisonError::into_inner);
-        Some(Arc::clone(
-            map.entry(key).or_insert_with(|| Gate::new(self.limit)),
-        ))
+        Some(Arc::clone(map.entry(key).or_insert_with(|| {
+            Gate::new(usize::try_from(limit.get()).unwrap_or(1))
+        })))
     }
 
     /// Wait for a permit for `model` at the calling task's priority.
@@ -325,7 +317,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::{AuthMode, ProviderType};
+    use crate::config::{BaseUrl, ProviderType, RequestLimit};
     use crate::error::Error;
 
     fn name(text: &str) -> ProviderName {
@@ -339,13 +331,11 @@ mod tests {
 
     fn provider(kind: ProviderType, limit: Option<u32>, url: &str) -> ProviderConfig {
         ProviderConfig {
-            provider_type: kind,
-            auth: AuthMode::default(),
-            base_url: Some(url.to_owned()),
-            api_key_env: None,
-            embedding_dimension: None,
-            max_concurrent_requests: limit,
-            oauth: None,
+            base_url: Some(
+                BaseUrl::try_from(url.to_owned()).unwrap_or_else(|e| fail(&e.to_string())),
+            ),
+            max_concurrent_requests: limit.and_then(RequestLimit::new),
+            ..ProviderConfig::new(kind)
         }
     }
 
@@ -435,16 +425,16 @@ mod tests {
 
         // Ollama defaults to one at a time, hosted APIs to eight.
         assert_eq!(
-            provider(ProviderType::Ollama, None, &url).request_limit(),
+            provider(ProviderType::Ollama, None, &url)
+                .request_limit()
+                .get(),
             1
         );
         assert_eq!(
-            provider(ProviderType::Anthropic, None, &url).request_limit(),
+            provider(ProviderType::Anthropic, None, &url)
+                .request_limit()
+                .get(),
             8
-        );
-        assert_eq!(
-            provider(ProviderType::Ollama, Some(0), &url).request_limit(),
-            1
         );
     }
 

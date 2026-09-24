@@ -1,10 +1,12 @@
 use serde::Deserialize;
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::embedding::Dimension;
 use crate::error::{Error, Result};
 use crate::graph::GraphOptions;
 use crate::ontology::documents::DocumentEvidenceOptions;
@@ -47,10 +49,65 @@ pub struct GeneralConfig {
     pub data_dir: PathBuf,
     pub default_workspace: String,
     /// `PROVIDER/MODEL` used for chat and tool calling. Override: `QUACK_MODEL`.
-    pub chat_model: Option<String>,
+    pub chat_model: Option<ModelSpec>,
     /// `PROVIDER/MODEL` used for embeddings. Unset means documents are stored
     /// without vectors and `search_documents` is unavailable.
-    pub embedding_model: Option<String>,
+    pub embedding_model: Option<ModelSpec>,
+}
+
+/// A `PROVIDER/MODEL` reference, split once when the config is read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ModelSpec {
+    provider: ProviderName,
+    model: String,
+}
+
+impl ModelSpec {
+    #[must_use]
+    pub fn provider(&self) -> &ProviderName {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl TryFrom<String> for ModelSpec {
+    type Error = Error;
+
+    fn try_from(spec: String) -> Result<Self> {
+        let Some((provider, model)) = spec.split_once('/') else {
+            return Err(Error::Config(format!(
+                "\"{spec}\" must be PROVIDER/MODEL, e.g. \"ollama/llama3.1:8b\""
+            )));
+        };
+        if model.is_empty() {
+            return Err(Error::Config(format!(
+                "\"{spec}\" is missing the model after the slash"
+            )));
+        }
+        Ok(Self {
+            provider: provider.parse()?,
+            model: model.to_owned(),
+        })
+    }
+}
+
+impl FromStr for ModelSpec {
+    type Err = Error;
+
+    fn from_str(spec: &str) -> Result<Self> {
+        Self::try_from(spec.to_owned())
+    }
+}
+
+impl std::fmt::Display for ModelSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider, self.model)
+    }
 }
 
 impl Default for GeneralConfig {
@@ -143,13 +200,22 @@ pub enum ProviderType {
     Anthropic,
 }
 
-impl std::fmt::Display for ProviderType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Ollama => "ollama",
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-        })
+text_enum!(ProviderType, "provider type", {
+    Ollama => "ollama",
+    Openai => "openai",
+    Anthropic => "anthropic",
+});
+
+impl ProviderType {
+    /// Where the provider's API is when `base_url` is unset: the same
+    /// defaults rig's clients use.
+    #[must_use]
+    pub const fn default_base_url(self) -> BaseUrl {
+        BaseUrl(Cow::Borrowed(match self {
+            Self::Ollama => "http://localhost:11434",
+            Self::Openai => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com",
+        }))
     }
 }
 
@@ -167,15 +233,11 @@ pub enum AuthMode {
     Oauth,
 }
 
-impl std::fmt::Display for AuthMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::None => "none",
-            Self::ApiKey => "api-key",
-            Self::Oauth => "oauth",
-        })
-    }
-}
+text_enum!(AuthMode, "auth mode", {
+    None => "none",
+    ApiKey => "api-key",
+    Oauth => "oauth",
+});
 
 /// `[providers.NAME.oauth]`: Authorization Code with PKCE, or the device-code
 /// flow, against an `OpenID` Connect issuer.
@@ -193,7 +255,7 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub scopes: Vec<String>,
     /// Loopback redirect for the browser flow.
-    #[serde(default = "default_redirect_uri")]
+    #[serde(default = "OAuthConfig::default_redirect_uri")]
     pub redirect_uri: String,
     /// Always use the device-code flow (headless hosts, SSH, servers).
     #[serde(default)]
@@ -203,46 +265,261 @@ pub struct OAuthConfig {
     pub client_secret_env: Option<String>,
 }
 
-fn default_redirect_uri() -> String {
-    String::from("http://127.0.0.1:19876/callback")
+impl OAuthConfig {
+    /// The loopback redirect the browser flow listens on by default.
+    pub const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:19876/callback";
+
+    fn default_redirect_uri() -> String {
+        String::from(Self::DEFAULT_REDIRECT_URI)
+    }
 }
 
+/// How a provider endpoint is authenticated, with what each way needs: a
+/// combination the file cannot express correctly is refused when it is
+/// read, so nothing downstream checks it again.
+#[derive(Debug, Clone, Default)]
+pub enum ProviderAuth {
+    /// No credentials (local Ollama, unauthenticated gateways).
+    #[default]
+    None,
+    /// A static key from the environment variable `env`.
+    ApiKey { env: String },
+    /// OAuth 2.0 against an identity provider (design doc 10.2).
+    Oauth(OAuthConfig),
+}
+
+impl ProviderAuth {
+    /// The `auth` mode the file names.
+    #[must_use]
+    pub const fn mode(&self) -> AuthMode {
+        match self {
+            Self::None => AuthMode::None,
+            Self::ApiKey { .. } => AuthMode::ApiKey,
+            Self::Oauth(_) => AuthMode::Oauth,
+        }
+    }
+
+    /// The environment variable holding the key, for `auth = "api-key"`.
+    #[must_use]
+    pub fn api_key_env(&self) -> Option<&str> {
+        match self {
+            Self::ApiKey { env } => Some(env),
+            Self::None | Self::Oauth(_) => None,
+        }
+    }
+
+    /// The `[providers.NAME.oauth]` table, for `auth = "oauth"`.
+    #[must_use]
+    pub const fn oauth(&self) -> Option<&OAuthConfig> {
+        match self {
+            Self::Oauth(oauth) => Some(oauth),
+            Self::None | Self::ApiKey { .. } => None,
+        }
+    }
+}
+
+/// A provider's `base_url`: an absolute `http` or `https` URL, checked
+/// when the config is read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct BaseUrl(Cow<'static, str>);
+
+impl BaseUrl {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Without a trailing `/`, to append a path to.
+    #[must_use]
+    pub fn trimmed(&self) -> &str {
+        self.0.trim_end_matches('/')
+    }
+
+    /// The server root, without a trailing `/` or `/v1`: Ollama's native
+    /// API sits there, beside its OpenAI-compatible `/v1`.
+    #[must_use]
+    pub fn root(&self) -> &str {
+        self.trimmed().trim_end_matches("/v1")
+    }
+
+    /// Whether a credential sent here would cross the network unencrypted:
+    /// plain HTTP to anything but this machine.
+    #[must_use]
+    pub fn sends_in_cleartext(&self) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.0) else {
+            return false;
+        };
+        if url.scheme() != "http" {
+            return false;
+        }
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => !ip.is_loopback(),
+            Err(_) => host != "localhost",
+        }
+    }
+}
+
+impl TryFrom<String> for BaseUrl {
+    type Error = Error;
+
+    fn try_from(url: String) -> Result<Self> {
+        match reqwest::Url::parse(&url) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(Self(Cow::Owned(url))),
+            Ok(_) | Err(_) => Err(Error::Config(format!(
+                "base_url \"{url}\" must be an absolute http:// or https:// URL"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for BaseUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Model requests a provider may have in flight at once: at least one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct RequestLimit(NonZeroU32);
+
+impl RequestLimit {
+    /// `None` for 0, which would admit no request.
+    #[must_use]
+    pub const fn new(limit: u32) -> Option<Self> {
+        match NonZeroU32::new(limit) {
+            Some(limit) => Some(Self(limit)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for RequestLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// One `[providers.NAME]` entry, as read and checked.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawProviderConfig")]
 pub struct ProviderConfig {
-    #[serde(rename = "type")]
     pub provider_type: ProviderType,
-    #[serde(default)]
-    pub auth: AuthMode,
-    pub base_url: Option<String>,
-    pub api_key_env: Option<String>,
+    pub auth: ProviderAuth,
+    pub base_url: Option<BaseUrl>,
     /// Width of the vectors this provider's embedding models produce.
-    pub embedding_dimension: Option<u32>,
+    pub embedding_dimension: Option<Dimension>,
     /// Model requests in flight to this provider at once, across the whole
     /// process; the rest wait their turn (design doc 4.1). Unset: 1 for
     /// Ollama, which serves one request per model unless
     /// `OLLAMA_NUM_PARALLEL` says otherwise, 8 for hosted APIs.
-    pub max_concurrent_requests: Option<u32>,
-    /// Required when `auth = "oauth"`, forbidden otherwise.
-    pub oauth: Option<OAuthConfig>,
+    pub max_concurrent_requests: Option<RequestLimit>,
+}
+
+/// `[providers.NAME]` as the file writes it, before `auth` and the keys it
+/// needs are checked against each other.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProviderConfig {
+    #[serde(rename = "type")]
+    provider_type: ProviderType,
+    #[serde(default)]
+    auth: AuthMode,
+    base_url: Option<BaseUrl>,
+    api_key_env: Option<String>,
+    embedding_dimension: Option<Dimension>,
+    max_concurrent_requests: Option<RequestLimit>,
+    oauth: Option<OAuthConfig>,
+}
+
+impl TryFrom<RawProviderConfig> for ProviderConfig {
+    type Error = Error;
+
+    fn try_from(raw: RawProviderConfig) -> Result<Self> {
+        let auth = match (raw.auth, raw.api_key_env, raw.oauth) {
+            (AuthMode::None, None, None) => ProviderAuth::None,
+            (AuthMode::ApiKey, Some(env), None) => ProviderAuth::ApiKey { env },
+            (AuthMode::Oauth, None, Some(oauth)) => {
+                if oauth.issuer_url.is_empty() || oauth.client_id.is_empty() {
+                    return Err(Error::Config(String::from(
+                        "the oauth section needs issuer_url and client_id",
+                    )));
+                }
+                ProviderAuth::Oauth(oauth)
+            }
+            (AuthMode::None, Some(_), _) => {
+                return Err(Error::Config(String::from(
+                    "auth = \"none\" but api_key_env is set; use auth = \"api-key\" or remove the key",
+                )));
+            }
+            (AuthMode::ApiKey, None, _) => {
+                return Err(Error::Config(String::from(
+                    "auth = \"api-key\" but no api_key_env",
+                )));
+            }
+            (AuthMode::Oauth, Some(_), _) => {
+                return Err(Error::Config(String::from(
+                    "auth = \"oauth\" but sets api_key_env",
+                )));
+            }
+            (AuthMode::Oauth, None, None) => {
+                return Err(Error::Config(String::from(
+                    "auth = \"oauth\" but has no oauth section",
+                )));
+            }
+            (AuthMode::None | AuthMode::ApiKey, _, Some(_)) => {
+                return Err(Error::Config(String::from(
+                    "an oauth section is set but auth is not \"oauth\"",
+                )));
+            }
+        };
+        Ok(Self {
+            provider_type: raw.provider_type,
+            auth,
+            base_url: raw.base_url,
+            embedding_dimension: raw.embedding_dimension,
+            max_concurrent_requests: raw.max_concurrent_requests,
+        })
+    }
 }
 
 impl ProviderConfig {
-    /// The request limit when `max_concurrent_requests` is unset.
+    /// A provider of `provider_type` with nothing else set.
     #[must_use]
-    pub const fn default_request_limit(&self) -> u32 {
-        match self.provider_type {
-            ProviderType::Ollama => 1,
-            ProviderType::Openai | ProviderType::Anthropic => 8,
+    pub fn new(provider_type: ProviderType) -> Self {
+        Self {
+            provider_type,
+            auth: ProviderAuth::None,
+            base_url: None,
+            embedding_dimension: None,
+            max_concurrent_requests: None,
         }
     }
 
-    /// Model requests this provider may have in flight at once (at least 1).
+    /// The request limit when `max_concurrent_requests` is unset.
     #[must_use]
-    pub fn request_limit(&self) -> u32 {
+    pub const fn default_request_limit(&self) -> RequestLimit {
+        RequestLimit(match self.provider_type {
+            ProviderType::Ollama => NonZeroU32::MIN,
+            ProviderType::Openai | ProviderType::Anthropic => NonZeroU32::MIN.saturating_add(7),
+        })
+    }
+
+    /// Model requests this provider may have in flight at once.
+    #[must_use]
+    pub fn request_limit(&self) -> RequestLimit {
         self.max_concurrent_requests
             .unwrap_or_else(|| self.default_request_limit())
-            .max(1)
     }
 }
 
@@ -257,6 +534,23 @@ pub struct ModelRef<'a> {
 impl std::fmt::Display for ModelRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.provider_name, self.model)
+    }
+}
+
+impl ModelRef<'_> {
+    /// The width its provider's embeddings have: `validate` requires it of
+    /// an embedding model's provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider declares no `embedding_dimension`.
+    pub fn dimension(&self) -> Result<Dimension> {
+        self.provider.embedding_dimension.ok_or_else(|| {
+            Error::Config(format!(
+                "provider '{}' is used for embeddings but has no embedding_dimension",
+                self.provider_name
+            ))
+        })
     }
 }
 
@@ -348,7 +642,7 @@ pub struct ImportConfig {
     /// Bytes an HTTP(S) download may reach at most.
     pub max_download_mb: u64,
     /// How long a source may take to connect and answer.
-    pub timeout_seconds: u64,
+    pub timeout_seconds: u32,
     /// Whether `quack serve` (with logins) may import `sqlite:` files
     /// from the server's disk. The CLI, the terminal, and `--local` always
     /// may: they run as the owner.
@@ -357,6 +651,14 @@ pub struct ImportConfig {
     /// private, and link-local addresses, including cloud metadata
     /// endpoints. The CLI, the terminal, and `--local` always may.
     pub allow_private_hosts: bool,
+}
+
+impl ImportConfig {
+    /// How long a source may take, at least one second.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.timeout_seconds.max(1)))
+    }
 }
 
 impl Default for ImportConfig {
@@ -550,14 +852,10 @@ pub enum RerankMode {
     Model,
 }
 
-impl std::fmt::Display for RerankMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::None => "none",
-            Self::Model => "model",
-        })
-    }
-}
+text_enum!(RerankMode, "rerank mode", {
+    None => "none",
+    Model => "model",
+});
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -577,7 +875,7 @@ pub struct AnalysisConfig {
     pub max_context_tokens: u32,
     /// How long one extraction call (ontology document evidence, graph
     /// extraction) may run before the chunk is skipped.
-    pub extraction_timeout_seconds: u64,
+    pub extraction_timeout_seconds: u32,
     /// Chunks extracted at once. Ollama serves one request at a time
     /// unless `OLLAMA_NUM_PARALLEL` is raised, so more only queues there.
     pub extraction_concurrency: u32,
@@ -585,6 +883,20 @@ pub struct AnalysisConfig {
     /// concurrent reads run in parallel instead of queuing behind each
     /// other on one shared connection.
     pub reader_pool_size: u32,
+}
+
+impl AnalysisConfig {
+    /// How long one statement may run, at least one second.
+    #[must_use]
+    pub fn query_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.query_timeout_seconds.max(1)))
+    }
+
+    /// How long one extraction call may run, at least one second.
+    #[must_use]
+    pub fn extraction_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.extraction_timeout_seconds.max(1)))
+    }
 }
 
 impl Default for AnalysisConfig {
@@ -615,17 +927,18 @@ pub fn config_file_path() -> PathBuf {
 }
 
 fn default_config_dir() -> PathBuf {
-    dirs::home_dir().map_or_else(
-        || PathBuf::from(".config").join(APP_NAME),
-        |d| d.join(".config").join(APP_NAME),
-    )
+    home_subdir(".config")
 }
 
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir().map_or_else(
-        || PathBuf::from(".local/share").join(APP_NAME),
-        |d| d.join(".local/share").join(APP_NAME),
-    )
+    home_subdir(".local/share")
+}
+
+/// `~/<under>/quack`, or `<under>/quack` relative to here without a home.
+fn home_subdir(under: &str) -> PathBuf {
+    dirs::home_dir()
+        .map_or_else(|| PathBuf::from(under), |home| home.join(under))
+        .join(APP_NAME)
 }
 
 /// The values the environment puts in force over the config file:
@@ -651,16 +964,24 @@ impl Overrides {
     /// Put each set value in force over `config`, after the file and before
     /// validation. `quack config` replays this to report which values the
     /// environment, rather than the file, put in force.
-    pub fn apply(&self, config: &mut Config) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `QUACK_MODEL` is not `PROVIDER/MODEL`.
+    pub fn apply(&self, config: &mut Config) -> Result<()> {
         if let Some(data_dir) = &self.data_dir {
             config.general.data_dir.clone_from(data_dir);
         }
         if let Some(model) = &self.chat_model {
-            config.general.chat_model = Some(model.clone());
+            let spec = model
+                .parse()
+                .map_err(|e| Error::Config(format!("{ENV_MODEL}: {e}")))?;
+            config.general.chat_model = Some(spec);
         }
         if let Some(bind) = &self.bind {
             config.server.bind.clone_from(bind);
         }
+        Ok(())
     }
 }
 
@@ -702,7 +1023,7 @@ impl Config {
             Some(text) => toml::from_str(text)?,
             None => Self::default(),
         };
-        overrides.apply(&mut config);
+        overrides.apply(&mut config)?;
         config.validate()?;
         Ok(config)
     }
@@ -727,47 +1048,6 @@ impl Config {
     ///
     /// Returns a `Config` error describing the first violation found.
     pub fn validate(&self) -> Result<()> {
-        for (name, provider) in &self.providers {
-            if provider.auth != AuthMode::Oauth && provider.oauth.is_some() {
-                return Err(Error::Config(format!(
-                    "provider '{name}' has an [providers.{name}.oauth] section but auth is not \"oauth\""
-                )));
-            }
-            match provider.auth {
-                AuthMode::None => {
-                    if provider.api_key_env.is_some() {
-                        return Err(Error::Config(format!(
-                            "provider '{name}' has auth = \"none\" but sets api_key_env; \
-                             use auth = \"api-key\" or remove the key"
-                        )));
-                    }
-                }
-                AuthMode::ApiKey => {
-                    if provider.api_key_env.is_none() {
-                        return Err(Error::Config(format!(
-                            "provider '{name}' has auth = \"api-key\" but no api_key_env"
-                        )));
-                    }
-                }
-                AuthMode::Oauth => {
-                    if provider.api_key_env.is_some() {
-                        return Err(Error::Config(format!(
-                            "provider '{name}' has auth = \"oauth\" but sets api_key_env"
-                        )));
-                    }
-                    let Some(oauth) = &provider.oauth else {
-                        return Err(Error::Config(format!(
-                            "provider '{name}' has auth = \"oauth\" but no [providers.{name}.oauth] section"
-                        )));
-                    };
-                    if oauth.issuer_url.is_empty() || oauth.client_id.is_empty() {
-                        return Err(Error::Config(format!(
-                            "provider '{name}': [providers.{name}.oauth] needs issuer_url and client_id"
-                        )));
-                    }
-                }
-            }
-        }
         if self.general.chat_model.is_some() {
             self.chat_model_ref()?;
         }
@@ -777,12 +1057,7 @@ impl Config {
                     "embedding_model '{embed}': anthropic does not serve embeddings"
                 )));
             }
-            if embed.provider.embedding_dimension.is_none() {
-                return Err(Error::Config(format!(
-                    "provider '{}' is used for embeddings but has no embedding_dimension",
-                    embed.provider_name
-                )));
-            }
+            embed.dimension()?;
         }
         // Unlike the other [analysis] numbers, this one allocates OS-level
         // DuckDB connections at workspace open, one spawn_blocking round
@@ -797,28 +1072,23 @@ impl Config {
         Ok(())
     }
 
-    fn resolve_model<'a>(&'a self, setting: &str, spec: &'a str) -> Result<ModelRef<'a>> {
-        let Some((provider_name, model)) = spec.split_once('/') else {
-            return Err(Error::Config(format!(
-                "{setting} = \"{spec}\" must be PROVIDER/MODEL, e.g. \"ollama/llama3.1:8b\""
-            )));
-        };
-        if model.is_empty() {
-            return Err(Error::Config(format!(
-                "{setting} = \"{spec}\" is missing the model after the slash"
-            )));
-        }
-        let (provider_name, provider) = self.providers.get_key_value(provider_name).ok_or_else(|| {
-            Error::Config(format!(
-                "{setting} = \"{spec}\" names provider '{provider_name}', which is not configured; \
-                 add a [providers.{provider_name}] section in {}",
-                config_file_path().display()
-            ))
-        })?;
+    fn resolve_model<'a>(&'a self, setting: &str, spec: &'a ModelSpec) -> Result<ModelRef<'a>> {
+        let (provider_name, provider) =
+            self.providers
+                .get_key_value(spec.provider())
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "{setting} = \"{spec}\" names provider '{}', which is not configured; \
+                     add a [providers.{}] section in {}",
+                        spec.provider(),
+                        spec.provider(),
+                        config_file_path().display()
+                    ))
+                })?;
         Ok(ModelRef {
             provider_name,
             provider,
-            model,
+            model: spec.model(),
         })
     }
 
@@ -831,7 +1101,7 @@ impl Config {
         let spec = self
             .general
             .chat_model
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| Error::NoChatModel {
                 config_file: config_file_path(),
             })?;
@@ -846,7 +1116,7 @@ impl Config {
     pub fn embedding_model_ref(&self) -> Result<Option<ModelRef<'_>>> {
         self.general
             .embedding_model
-            .as_deref()
+            .as_ref()
             .map(|spec| self.resolve_model("embedding_model", spec))
             .transpose()
     }
@@ -979,17 +1249,138 @@ rerank = "model"
         assert_eq!(chat.provider_name, "ollama");
         assert_eq!(chat.model, "llama3.1:8b");
         assert_eq!(chat.provider.provider_type, ProviderType::Ollama);
-        assert_eq!(chat.provider.auth, AuthMode::None);
+        assert_eq!(chat.provider.auth.mode(), AuthMode::None);
         assert_eq!(chat.to_string(), "ollama/llama3.1:8b");
         let embed = config.embedding_model_ref().unwrap().unwrap();
         assert_eq!(embed.model, "nomic-embed-text");
-        assert_eq!(embed.provider.embedding_dimension, Some(768));
+        assert_eq!(
+            embed.provider.embedding_dimension,
+            Some(Dimension::new(768))
+        );
         assert_eq!(config.retrieval.top_k, 3);
         assert_eq!(config.retrieval.rerank, RerankMode::Model);
         let anthropic = config.providers.get("anthropic");
         assert!(anthropic.is_some_and(|p| {
-            p.provider_type == ProviderType::Anthropic && p.auth == AuthMode::ApiKey
+            p.provider_type == ProviderType::Anthropic
+                && p.auth.api_key_env() == Some("ANTHROPIC_API_KEY")
         }));
+    }
+
+    #[test]
+    fn model_specs_split_once_when_read() {
+        let spec: ModelSpec = "ollama/llama3.1:8b"
+            .parse()
+            .unwrap_or_else(|e| panic_on(&e));
+        assert_eq!(spec.provider(), "ollama");
+        assert_eq!(spec.model(), "llama3.1:8b");
+        assert_eq!(spec.to_string(), "ollama/llama3.1:8b");
+        // The model may itself contain a slash; only the first one splits.
+        let nested: ModelSpec = "hf/org/model".parse().unwrap_or_else(|e| panic_on(&e));
+        assert_eq!(
+            (nested.provider().as_str(), nested.model()),
+            ("hf", "org/model")
+        );
+        for bad in ["llama3", "ollama/", "/m", "bad name/m"] {
+            assert!(bad.parse::<ModelSpec>().is_err(), "{bad}");
+        }
+        assert!(err_of("[general]\nchat_model = \"llama3\"\n").contains("PROVIDER/MODEL"));
+    }
+
+    #[test]
+    fn base_urls_are_checked_and_trimmed() {
+        let url =
+            |text: &str| BaseUrl::try_from(String::from(text)).unwrap_or_else(|e| panic_on(&e));
+        let ollama = url("http://gpu-box:11434/v1/");
+        assert_eq!(ollama.trimmed(), "http://gpu-box:11434/v1");
+        assert_eq!(ollama.root(), "http://gpu-box:11434");
+        assert_eq!(
+            url("https://api.openai.com/v1").root(),
+            "https://api.openai.com"
+        );
+        for bad in ["localhost:11434", "ftp://h/", "not a url", ""] {
+            assert!(BaseUrl::try_from(String::from(bad)).is_err(), "{bad}");
+        }
+        assert!(
+            err_of("[providers.o]\ntype = \"ollama\"\nbase_url = \"localhost:1\"\n")
+                .contains("http:// or https://")
+        );
+        assert_eq!(
+            ProviderType::Ollama.default_base_url().as_str(),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn cleartext_is_plain_http_off_this_machine() {
+        let url =
+            |text: &str| BaseUrl::try_from(String::from(text)).unwrap_or_else(|e| panic_on(&e));
+        assert!(url("http://gpu-box:11434").sends_in_cleartext());
+        assert!(url("http://10.0.0.5/v1").sends_in_cleartext());
+        assert!(!url("http://localhost:11434").sends_in_cleartext());
+        assert!(!url("http://127.0.0.1:11434").sends_in_cleartext());
+        assert!(!url("http://[::1]:11434").sends_in_cleartext());
+        assert!(!url("https://api.openai.com/v1").sends_in_cleartext());
+    }
+
+    #[test]
+    fn request_limits_are_at_least_one() {
+        assert!(
+            err_of("[providers.o]\ntype = \"ollama\"\nmax_concurrent_requests = 0\n")
+                .contains("nonzero")
+        );
+        let ollama = ProviderConfig::new(ProviderType::Ollama);
+        assert_eq!(ollama.request_limit().get(), 1);
+        assert_eq!(
+            ProviderConfig::new(ProviderType::Openai)
+                .request_limit()
+                .get(),
+            8
+        );
+    }
+
+    /// Every combination of `auth`, `api_key_env`, and an oauth table: the
+    /// three that make sense read as their `ProviderAuth`, the rest are
+    /// refused when read.
+    #[test]
+    fn provider_auth_is_one_of_three_shapes() {
+        let oauth = "[providers.p.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n";
+        let case = |auth: &str, key: bool, table: bool| {
+            let mut text = format!("[providers.p]\ntype = \"openai\"\nauth = \"{auth}\"\n");
+            if key {
+                text.push_str("api_key_env = \"K\"\n");
+            }
+            if table {
+                text.push_str(oauth);
+            }
+            Config::parse(&text).map(|c| {
+                c.providers
+                    .get("p")
+                    .map(|p| p.auth.mode())
+                    .unwrap_or_default()
+            })
+        };
+        assert!(case("none", false, false).is_ok_and(|m| m == AuthMode::None));
+        assert!(case("api-key", true, false).is_ok_and(|m| m == AuthMode::ApiKey));
+        assert!(case("oauth", false, true).is_ok_and(|m| m == AuthMode::Oauth));
+        for (auth, key, table) in [
+            ("none", true, false),
+            ("none", false, true),
+            ("api-key", false, false),
+            ("api-key", true, true),
+            ("oauth", false, false),
+            ("oauth", true, true),
+        ] {
+            assert!(case(auth, key, table).is_err(), "{auth} {key} {table}");
+        }
+        assert!(
+            err_of("[providers.p]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.p.oauth]\nissuer_url = \"\"\nclient_id = \"c\"\n")
+                .contains("issuer_url and client_id")
+        );
+    }
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn panic_on(e: &Error) -> ! {
+        panic!("{e}")
     }
 
     #[test]
@@ -1004,9 +1395,11 @@ rerank = "model"
             ..Overrides::default()
         };
         let config = Config::from_contents(Some(file), &rescued);
-        assert!(
-            config.is_ok_and(|c| c.general.chat_model.as_deref() == Some("ollama/gpt-oss:20b"))
-        );
+        assert!(config.is_ok_and(|c| {
+            c.general
+                .chat_model
+                .is_some_and(|m| m.to_string() == "ollama/gpt-oss:20b")
+        }));
         // An override is still validated: it cannot name a missing provider.
         let bad = Overrides {
             chat_model: Some(String::from("nowhere/x")),
@@ -1112,7 +1505,7 @@ rerank = "model"
         );
         assert!(
             err_of("[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n")
-                .contains("no [providers.o.oauth] section")
+                .contains("has no oauth section")
         );
     }
 
@@ -1135,7 +1528,7 @@ rerank = "model"
         let Ok(config) = config else {
             return assert!(config.is_ok(), "{config:?}");
         };
-        let oauth = config.providers.get("azure").and_then(|p| p.oauth.as_ref());
+        let oauth = config.providers.get("azure").and_then(|p| p.auth.oauth());
         assert!(oauth.is_some_and(|o| {
             o.redirect_uri == "http://127.0.0.1:19876/callback"
                 && !o.device_code
