@@ -33,6 +33,7 @@ use rig::http_client::{
 };
 use tokio::sync::oneshot;
 
+use super::bedrock::Signer;
 use crate::config::{BaseUrl, ProviderConfig, ProviderName, RequestLimit};
 
 use crate::priority::Priority;
@@ -243,6 +244,9 @@ impl ProviderGates {
 pub struct LimitedHttp {
     inner: reqwest::Client,
     gates: ProviderGates,
+    /// Signs each request with `SigV4` once it has its permit (Bedrock's
+    /// OpenAI-compatible APIs), replacing the bearer rig set.
+    signer: Option<Arc<Signer>>,
 }
 
 impl LimitedHttp {
@@ -252,6 +256,25 @@ impl LimitedHttp {
         Self {
             inner: reqwest::Client::default(),
             gates: ProviderGates::for_provider(name, provider),
+            signer: None,
+        }
+    }
+
+    /// This client, signing every request with `signer`.
+    #[must_use]
+    pub(crate) fn signed(mut self, signer: Arc<Signer>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    /// `request`, signed when this client signs.
+    async fn prepare(
+        signer: Option<Arc<Signer>>,
+        request: Request<Bytes>,
+    ) -> http_client::Result<Request<Bytes>> {
+        match signer {
+            Some(signer) => signer.sign(request).await,
+            None => Ok(request),
         }
     }
 }
@@ -304,9 +327,11 @@ impl HttpClientExt for LimitedHttp {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let permit = self.gates.permit(GateKey::model_of(&body));
+        let signer = self.signer.clone();
         async move {
             let permit = permit.await;
-            let response = inner.send(Request::from_parts(parts, body)).await?;
+            let request = Self::prepare(signer, Request::from_parts(parts, body)).await?;
+            let response = inner.send(request).await?;
             Ok(body_holding(response, permit))
         }
     }
@@ -320,7 +345,14 @@ impl HttpClientExt for LimitedHttp {
     {
         let inner = self.inner.clone();
         let permit = self.gates.permit(None);
+        let signed = self.signer.is_some();
         async move {
+            if signed {
+                // SigV4 signs the body, and a multipart body is not built yet.
+                return Err(http_client::Error::Instance(
+                    "multipart requests cannot be SigV4-signed".into(),
+                ));
+            }
             let permit = permit.await;
             let response = inner.send_multipart(req).await?;
             Ok(body_holding(response, permit))
@@ -338,11 +370,11 @@ impl HttpClientExt for LimitedHttp {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let permit = self.gates.permit(GateKey::model_of(&body));
+        let signer = self.signer.clone();
         async move {
             let permit = permit.await;
-            let response = inner
-                .send_streaming(Request::from_parts(parts, body))
-                .await?;
+            let request = Self::prepare(signer, Request::from_parts(parts, body)).await?;
+            let response = inner.send_streaming(request).await?;
             Ok(response.map(|stream| -> BoxedStream {
                 Box::pin(Holding {
                     inner: stream,

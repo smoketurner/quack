@@ -1240,7 +1240,7 @@ rendering.
 | `ollama` | yes | yes | Offline default. `base_url` defaults to `http://localhost:11434` |
 | `openai` | yes | yes | Also OpenAI-compatible endpoints via `base_url` (vLLM, LiteLLM, Azure OpenAI) |
 | `anthropic` | yes | no | Native Messages API with tool use |
-| `bedrock` | yes | yes | Amazon Bedrock's Converse API (rig-bedrock); embeddings take Titan Text Embeddings V2's request shape. `region` and `aws_profile` optional |
+| `bedrock` | yes | runtime only | Amazon Bedrock. `endpoint = "runtime"` (default): `api = "converse"` (rig-bedrock over the AWS SDK), `"chat-completions"`, or `"responses"` (OpenAI-compatible, `/openai/v1`); `endpoint = "mantle"`: `"responses"` (default) or `"chat-completions"` (`/v1`). Embeddings are the runtime's InvokeModel in Titan Text Embeddings V2's request shape. `region`, `aws_profile`, `base_url` (VPC endpoint) optional |
 
 `[general].chat_model` and `[general].embedding_model` name `PROVIDER/MODEL` each; a
 workspace's `allowed_providers` filters the choice; the session records the model it used.
@@ -1267,14 +1267,44 @@ the profile named by `aws_profile` (else `AWS_PROFILE`, else `default`) in
 `~/.aws/config` and `~/.aws/credentials` with its `source_profile`/`role_arn`,
 `credential_process`, and IAM Identity Center (`aws sso login`) settings, web identity
 tokens (EKS), and the ECS and EC2 instance roles. quack stores nothing: the SDK's own
-caches and refreshes apply. The region is `region`, else the SDK's chain (`AWS_REGION`, the
-profile's `region`, instance metadata); `base_url`, when set, overrides only the Bedrock
-runtime endpoint (a VPC endpoint, a gateway), never the SSO or STS ones. The first client
-built for a provider resolves credentials once, so a missing or expired login fails there
-with the SDK's reason, and is then reused for the life of the process. The SDK's HTTPS
-client is rustls on aws-lc-rs (FIPS on Linux), wrapped so each model call (a
-`/model/{id}/...` path) takes a permit of `max_concurrent_requests`; the SDK's credential
-requests are not limited.
+caches and refreshes apply.
+
+Bedrock serves inference on two endpoints with different models and APIs: `bedrock-runtime`
+(Converse and InvokeModel through the SDK, Chat Completions and Responses under
+`/openai/v1`, cross-region inference profiles, a FIPS endpoint, embeddings) and
+`bedrock-mantle` (`bedrock-mantle.{region}.api.aws`, Chat Completions and Responses under
+`/v1`, and the models and Responses features only it has, such as Responses for GPT OSS).
+A provider entry names one `endpoint` and one `api`; a model on the other endpoint is
+reached through a second entry sharing the profile, and the model reference picks it
+(`bedrock/us.anthropic.claude-sonnet-5`, `mantle/openai.gpt-oss-120b`), as LiteLLM's
+separate `bedrock` and `bedrock_mantle` providers do. An API the endpoint does not serve
+(`converse` on mantle) and embeddings on mantle are refused when the config is read.
+
+The endpoint's root is `base_url` when set, else the one AWS publishes for the region: the
+runtime's from the SDK's own endpoint resolver, so `use_fips_endpoint` /
+`AWS_USE_FIPS_ENDPOINT` and dual-stack apply, and mantle's `bedrock-mantle.{region}.api.aws`
+(FIPS asked of mantle is refused: it has no FIPS endpoint). `base_url` is how an interface VPC
+endpoint without private DNS is reached (`https://vpce-….bedrock-mantle.us-east-1.vpce.amazonaws.com`;
+with private DNS nothing changes), or a proxy: it is the root, without `/v1` or
+`/openai/v1`, which quack adds per endpoint. When its host is an AWS one it must name the
+provider's endpoint (`bedrock-runtime` or `bedrock-runtime-fips`, or `bedrock-mantle`), its
+region becomes the signing region unless `region` says otherwise, and a disagreeing `region`
+is refused; with FIPS required, a non-FIPS AWS host is refused. `base_url` replaces only the
+Bedrock endpoint, never the SSO or STS ones.
+
+The region is `region`, else `base_url`'s, else the SDK's chain (`AWS_REGION`, the profile's
+`region`, instance metadata). The first use of a provider builds its `llm::bedrock::Session`
+(root, signer, and on the runtime the SDK client) and resolves credentials once, so a
+missing or expired login fails there with the SDK's reason; the session is then reused for
+the life of the process. Converse and embeddings go through the SDK, whose HTTPS client is
+rustls on aws-lc-rs (FIPS on Linux), wrapped so each model call (a `/model/{id}/...` path)
+takes a permit of `max_concurrent_requests`. The OpenAI-compatible APIs go through rig's
+OpenAI clients over `LimitedHttp`, which signs each request with SigV4 for the endpoint's
+service (`bedrock`, `bedrock-mantle`) once it has its permit, with credentials cached until
+five minutes before they expire. Every Responses request carries `store: false`: Bedrock
+otherwise keeps each response for 30 days, which would put workspace content outside the
+workspace file (section 5); quack replays history itself. `quack doctor` resolves the
+session, and on mantle lists its models (`GET /v1/models`) to check the model is there.
 
 ```rust
 pub struct OAuthConfig {
@@ -1737,9 +1767,17 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 [providers.bedrock]
 type = "bedrock"                       # auth = "aws" (the default): the AWS SDK's credential chain
+# endpoint = "runtime"                 # the default; or "mantle"
+# api = "converse"                     # runtime: converse (default), chat-completions, responses
 # aws_profile = "my-sso-profile"       # else AWS_PROFILE, else default
-# region = "us-east-1"                 # else AWS_REGION or the profile's region
-# embedding_dimension = 1024           # for amazon.titan-embed-text-v2:0
+# region = "us-east-1"                 # else base_url's, AWS_REGION, or the profile's region
+# embedding_dimension = 1024           # for amazon.titan-embed-text-v2:0 (runtime only)
+
+[providers.mantle]
+type = "bedrock"
+endpoint = "mantle"                    # api = "responses" (default) or "chat-completions"
+# aws_profile = "my-sso-profile"
+# base_url = "https://vpce-0123456789abcdef0.bedrock-mantle.us-east-1.vpce.amazonaws.com"  # VPC endpoint without private DNS
 
 [providers.azure]
 type = "openai"

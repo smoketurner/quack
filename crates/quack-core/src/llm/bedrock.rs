@@ -1,27 +1,42 @@
-//! Amazon Bedrock: rig's Bedrock client over an AWS SDK configuration
-//! loaded the way the AWS CLI loads one, so every credential source the
-//! SDK knows works unchanged: `AWS_ACCESS_KEY_ID` and friends, a named
-//! profile of `~/.aws/config` and `~/.aws/credentials` (`aws_profile`, or
-//! `AWS_PROFILE`), IAM Identity Center (`aws sso login`), `credential_process`,
-//! assumed roles, web identity (EKS), and the ECS and EC2 instance roles.
+//! Amazon Bedrock, on either of its inference endpoints (`config::bedrock`),
+//! with credentials the AWS SDK loads the way the AWS CLI does, so every
+//! source it knows works unchanged: `AWS_ACCESS_KEY_ID` and friends, a
+//! named profile of `~/.aws/config` and `~/.aws/credentials` (`aws_profile`,
+//! or `AWS_PROFILE`), IAM Identity Center (`aws sso login`),
+//! `credential_process`, assumed roles, web identity (EKS), and the ECS and
+//! EC2 instance roles.
 //!
-//! The SDK sends through its own HTTPS client (rustls on aws-lc-rs), which
-//! is wrapped here so a model call takes a permit of the provider's
-//! `max_concurrent_requests` like every other provider's (design doc 4.1).
-//! Only model calls wait: the SDK's own credential and SSO requests pass
-//! straight through.
+//! Two transports, one [`Session`] per provider:
+//!
+//! - `api = "converse"` (runtime only) is rig-bedrock over the AWS SDK's
+//!   own client. Its HTTPS client is wrapped here so a model call takes a
+//!   permit of the provider's `max_concurrent_requests` (design doc 4.1);
+//!   the SDK's credential and SSO requests pass straight through.
+//! - `api = "chat-completions"` and `"responses"` are rig's `OpenAI` clients
+//!   over [`LimitedHttp`], which signs each request with `SigV4` for the
+//!   endpoint's service (`bedrock` or `bedrock-mantle`) after it has its
+//!   permit, so a queued request never carries a stale signature.
+//!
+//! The root both send to is `base_url` when set (a VPC endpoint, a proxy),
+//! else the one AWS publishes for the region: the runtime's from the AWS
+//! SDK's own resolver, which honours `use_fips_endpoint` and
+//! `use_dualstack_endpoint`, the mantle's `bedrock-mantle.{region}.api.aws`.
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime};
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
-use aws_sdk_bedrockruntime::config::ProvideCredentials;
+use aws_credential_types::Credentials;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use aws_sdk_bedrockruntime::config::endpoint::{Params, ResolveEndpoint};
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
     SharedHttpConnector,
 };
+use aws_smithy_runtime_api::client::identity::Identity;
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::body::SdkBody;
@@ -29,93 +44,297 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 
+use super::LimitedHttp;
 use super::limit::{GatePermit, ProviderGates};
-use crate::config::{BaseUrl, ProviderConfig, ProviderName};
+use crate::config::bedrock::is_fips_host;
+use crate::config::{
+    BaseUrl, BedrockApi, BedrockConfig, BedrockEndpoint, ProviderConfig, ProviderName,
+};
 use crate::error::{Error, Result};
 
 /// rig's Bedrock client: completions over the Converse API, embeddings
 /// over `InvokeModel` (Titan Text Embeddings V2's request shape).
 pub type BedrockClient = rig::bedrock::client::Client;
 
-/// What makes one Bedrock client different from another: two provider
-/// entries that agree on all of it share a client, and so its cached
-/// credentials.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ClientKey {
-    name: ProviderName,
-    profile: Option<String>,
-    region: Option<String>,
-    endpoint: Option<BaseUrl>,
+/// A Bedrock provider, resolved: where it sends, what signs its requests,
+/// and, on the runtime endpoint, the AWS SDK client for Converse and
+/// embeddings. Built once per provider and process ([`session`]).
+pub(crate) struct Session {
+    bedrock: BedrockConfig,
+    /// The region requests are signed for.
+    region: String,
+    /// The endpoint's root, without a trailing `/`.
+    root: String,
+    signer: Arc<Signer>,
+    /// `None` on the mantle endpoint, which has no SDK API.
+    converse: Option<BedrockClient>,
 }
 
-impl ClientKey {
+impl Session {
+    /// The API the chat model is called through.
+    pub(crate) const fn api(&self) -> BedrockApi {
+        self.bedrock.api
+    }
+
+    pub(crate) fn region(&self) -> &str {
+        &self.region
+    }
+
+    /// The endpoint's root requests go to.
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// Where the OpenAI-compatible APIs are: the root plus `/openai/v1`
+    /// (runtime) or `/v1` (mantle).
+    pub(crate) fn openai_base(&self) -> String {
+        format!("{}{}", self.root, self.bedrock.endpoint.openai_path())
+    }
+
+    /// The limited HTTP client for provider `name`, signing every request
+    /// for this endpoint's service.
+    pub(crate) fn http(&self, name: &ProviderName, provider: &ProviderConfig) -> LimitedHttp {
+        LimitedHttp::for_provider(name, provider).signed(Arc::clone(&self.signer))
+    }
+
+    /// The AWS SDK client for Converse and `InvokeModel`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Config` error on the mantle endpoint, which serves
+    /// neither.
+    pub(crate) fn converse(&self, name: &ProviderName) -> Result<BedrockClient> {
+        self.converse.clone().ok_or_else(|| {
+            Error::Config(format!(
+                "provider '{name}' is on the bedrock-mantle endpoint, which serves neither \
+                 Converse nor InvokeModel (embeddings); use a provider with endpoint = \"runtime\""
+            ))
+        })
+    }
+}
+
+impl Session {
+    /// A session sending to `root`, signing with fixed example credentials.
+    #[cfg(test)]
+    pub(crate) fn for_test(bedrock: BedrockConfig, root: &str, region: &str) -> Self {
+        let service = bedrock.endpoint.signing_name();
+        Self {
+            bedrock,
+            region: region.to_owned(),
+            root: root.to_owned(),
+            signer: Arc::new(Signer::new(
+                SharedCredentialsProvider::new(Credentials::new(
+                    "AKIDEXAMPLE",
+                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                    None,
+                    None,
+                    "test",
+                )),
+                region.to_owned(),
+                service,
+            )),
+            converse: None,
+        }
+    }
+
+    /// The model ids the endpoint lists (`GET {openai_base}/models`, which
+    /// bedrock-mantle serves and bedrock-runtime does not), signed and
+    /// under the provider's limit like any request.
+    ///
+    /// # Errors
+    ///
+    /// Returns rig's HTTP error: a non-success status, or a transport,
+    /// signing, or decoding failure.
+    pub(crate) async fn models(
+        &self,
+        name: &ProviderName,
+        provider: &ProviderConfig,
+    ) -> std::result::Result<Vec<String>, rig::http_client::Error> {
+        use rig::http_client::HttpClientExt;
+
+        #[derive(serde::Deserialize)]
+        struct Listed {
+            #[serde(default)]
+            data: Vec<Entry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            id: String,
+        }
+        let request =
+            http::Request::get(format!("{}/models", self.openai_base())).body(Bytes::new())?;
+        let response = self
+            .http(name, provider)
+            .send::<_, Vec<u8>>(request)
+            .await?;
+        let body = response.into_body().await?;
+        serde_json::from_slice::<Listed>(&body)
+            .map(|listed| listed.data.into_iter().map(|e| e.id).collect())
+            .map_err(|e| rig::http_client::Error::Instance(e.into()))
+    }
+}
+
+/// What makes one Bedrock session different from another: two provider
+/// entries that agree on all of it share one, and so its credentials.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SessionKey {
+    name: ProviderName,
+    profile: Option<String>,
+    bedrock: Option<BedrockConfig>,
+    base_url: Option<BaseUrl>,
+}
+
+impl SessionKey {
     fn of(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
             name: name.clone(),
             profile: provider.auth.aws_profile().map(str::to_owned),
-            region: provider.region.clone(),
-            endpoint: provider.base_url.clone(),
+            bedrock: provider.bedrock.clone(),
+            base_url: provider.base_url.clone(),
         }
     }
 
-    /// The clients built so far, process-wide. The SDK client caches and
-    /// refreshes its credentials itself, so reusing it spares every turn
-    /// a new SSO or STS round trip.
-    fn registry() -> &'static Mutex<HashMap<Self, BedrockClient>> {
-        static REGISTRY: OnceLock<Mutex<HashMap<ClientKey, BedrockClient>>> = OnceLock::new();
+    /// The sessions built so far, process-wide: reusing one spares every
+    /// turn a new SSO or STS round trip.
+    fn registry() -> &'static Mutex<HashMap<Self, Arc<Session>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<SessionKey, Arc<Session>>>> = OnceLock::new();
         REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
     }
 }
 
-/// The Bedrock client for provider `name`: built once per process, after
+/// The session of Bedrock provider `name`: built once per process, after
 /// checking that the SDK's chain yields a region and credentials, so a
 /// missing login fails here with the SDK's reason instead of at the first
 /// model call.
 ///
 /// # Errors
 ///
-/// Returns a `Config` error when no region is configured anywhere the SDK
-/// looks, or when no credential source yields credentials.
-pub(crate) async fn client(
+/// Returns a `Config` error when the provider is not a Bedrock one, no
+/// region is configured anywhere the SDK looks, FIPS is asked of an
+/// endpoint without it, or no credential source yields credentials.
+pub(crate) async fn session(
     name: &ProviderName,
     provider: &ProviderConfig,
-) -> Result<BedrockClient> {
-    let key = ClientKey::of(name, provider);
-    if let Some(client) = ClientKey::registry()
+) -> Result<Arc<Session>> {
+    let key = SessionKey::of(name, provider);
+    if let Some(session) = SessionKey::registry()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&key)
     {
-        return Ok(client.clone());
+        return Ok(Arc::clone(session));
     }
     // Boxed: loading the SDK config and resolving credentials is a future of
     // tens of kilobytes, which every caller's would otherwise carry.
-    let sdk = Box::pin(sdk_config(name, provider)).await?;
-    Box::pin(check_credentials(name, provider, &sdk)).await?;
-    let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk);
-    if let Some(endpoint) = &provider.base_url {
-        // On the Bedrock client only: SSO and STS keep their own endpoints.
-        conf = conf.endpoint_url(endpoint.as_str());
-    }
-    let client = BedrockClient::from(aws_sdk_bedrockruntime::Client::from_conf(conf.build()));
-    ClientKey::registry()
+    let session = Arc::new(Box::pin(build(name, provider)).await?);
+    SessionKey::registry()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, client.clone());
-    Ok(client)
+        .insert(key, Arc::clone(&session));
+    Ok(session)
+}
+
+async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session> {
+    let Some(bedrock) = provider.bedrock.clone() else {
+        return Err(Error::Config(format!(
+            "provider '{name}' ({}) is not a Bedrock provider",
+            provider.provider_type
+        )));
+    };
+    let sdk = sdk_config(name, provider).await;
+    let region = sdk.region().map(ToString::to_string).ok_or_else(|| {
+        Error::Config(format!(
+            "provider '{name}' (bedrock) has no AWS region: set region = \"us-east-1\" (or \
+                 another) under [providers.{name}], export AWS_REGION, or give the profile a region"
+        ))
+    })?;
+    let root = root(name, provider, &bedrock, &sdk, &region).await?;
+    let Some(credentials) = sdk.credentials_provider() else {
+        return Err(no_credentials(
+            name,
+            provider,
+            "the SDK has no credential provider",
+        ));
+    };
+    let signer = Arc::new(Signer::new(
+        credentials,
+        region.clone(),
+        bedrock.endpoint.signing_name(),
+    ));
+    signer
+        .credentials()
+        .await
+        .map_err(|e| no_credentials(name, provider, &e))?;
+    let converse = (bedrock.endpoint == BedrockEndpoint::Runtime).then(|| {
+        let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk);
+        if let Some(base_url) = &provider.base_url {
+            // On the Bedrock client only: SSO and STS keep their own endpoints.
+            conf = conf.endpoint_url(base_url.trimmed());
+        }
+        BedrockClient::from(aws_sdk_bedrockruntime::Client::from_conf(conf.build()))
+    });
+    tracing::info!(provider = %name, endpoint = %bedrock.endpoint, api = %bedrock.api, %region, %root, "Bedrock provider ready");
+    Ok(Session {
+        bedrock,
+        region,
+        root,
+        signer,
+        converse,
+    })
+}
+
+/// The endpoint's root: `base_url`, else the one AWS publishes for
+/// `region`, FIPS and dual-stack as the SDK's settings ask
+/// (`AWS_USE_FIPS_ENDPOINT`, `use_fips_endpoint` in the profile).
+async fn root(
+    name: &ProviderName,
+    provider: &ProviderConfig,
+    bedrock: &BedrockConfig,
+    sdk: &SdkConfig,
+    region: &str,
+) -> Result<String> {
+    let fips = sdk.use_fips().unwrap_or(false);
+    if let Some(base_url) = &provider.base_url {
+        if fips && is_fips_host(base_url) == Some(false) {
+            return Err(Error::Config(format!(
+                "provider '{name}': FIPS endpoints are required (use_fips_endpoint), but \
+                 base_url {base_url} is not one; use a bedrock-runtime-fips endpoint"
+            )));
+        }
+        return Ok(base_url.trimmed().to_owned());
+    }
+    match bedrock.endpoint {
+        BedrockEndpoint::Mantle if fips => Err(Error::Config(format!(
+            "provider '{name}': FIPS endpoints are required (use_fips_endpoint), and \
+             bedrock-mantle has none; use endpoint = \"runtime\""
+        ))),
+        BedrockEndpoint::Mantle => Ok(BedrockEndpoint::mantle_root(
+            &crate::config::AwsRegion::try_from(region.to_owned())?,
+        )),
+        BedrockEndpoint::Runtime => {
+            let params = Params::builder()
+                .region(region)
+                .use_fips(fips)
+                .use_dual_stack(sdk.use_dual_stack().unwrap_or(false))
+                .build()
+                .map_err(|e| Error::Config(format!("provider '{name}': {e}")))?;
+            let resolver = aws_sdk_bedrockruntime::config::endpoint::DefaultResolver::new();
+            let endpoint = ResolveEndpoint::resolve_endpoint(&resolver, &params)
+                .await
+                .map_err(|e| {
+                    Error::Config(format!(
+                        "provider '{name}': no bedrock-runtime endpoint for {region}: {e}"
+                    ))
+                })?;
+            Ok(endpoint.url().trim_end_matches('/').to_owned())
+        }
+    }
 }
 
 /// The SDK configuration the AWS CLI would use for this provider: its
 /// profile and region when the file names them, the SDK's defaults
 /// otherwise, and the provider's request limit on model calls.
-///
-/// # Errors
-///
-/// Returns a `Config` error when no region is found.
-pub(crate) async fn sdk_config(
-    name: &ProviderName,
-    provider: &ProviderConfig,
-) -> Result<SdkConfig> {
+async fn sdk_config(name: &ProviderName, provider: &ProviderConfig) -> SdkConfig {
     use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
     // The same module `crypto::install_default_provider` installs: FIPS on
     // Linux, where the feature is on (docs/crypto.md).
@@ -132,38 +351,10 @@ pub(crate) async fn sdk_config(
     if let Some(profile) = provider.auth.aws_profile() {
         loader = loader.profile_name(profile);
     }
-    if let Some(region) = &provider.region {
-        loader = loader.region(Region::new(region.clone()));
+    if let Some(region) = provider.bedrock.as_ref().and_then(|b| b.region.as_ref()) {
+        loader = loader.region(Region::new(region.as_str().to_owned()));
     }
-    let sdk = loader.load().await;
-    if sdk.region().is_none() {
-        return Err(Error::Config(format!(
-            "provider '{name}' (bedrock) has no AWS region: set region = \"us-east-1\" (or \
-             another) under [providers.{name}], export AWS_REGION, or give the profile a region"
-        )));
-    }
-    Ok(sdk)
-}
-
-/// Ask the SDK's credential chain once, so a provider without credentials
-/// says why (the SDK names each source it tried) and how to fix it.
-async fn check_credentials(
-    name: &ProviderName,
-    provider: &ProviderConfig,
-    sdk: &SdkConfig,
-) -> Result<()> {
-    let Some(credentials) = sdk.credentials_provider() else {
-        return Err(no_credentials(
-            name,
-            provider,
-            "the SDK has no credential provider",
-        ));
-    };
-    credentials
-        .provide_credentials()
-        .await
-        .map(drop)
-        .map_err(|e| no_credentials(name, provider, &DisplayErrorContext(&e).to_string()))
+    loader.load().await
 }
 
 fn no_credentials(name: &ProviderName, provider: &ProviderConfig, reason: &str) -> Error {
@@ -176,6 +367,101 @@ fn no_credentials(name: &ProviderName, provider: &ProviderConfig, reason: &str) 
          {login} for an IAM Identity Center profile, or configure credentials as the AWS CLI \
          reads them (`aws configure`, AWS_PROFILE, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)"
     ))
+}
+
+/// Signs requests with `SigV4` for one service and region, with credentials
+/// from the SDK's chain, held until five minutes before they expire and
+/// fetched again by one caller while the others wait.
+pub(crate) struct Signer {
+    provider: SharedCredentialsProvider,
+    cached: tokio::sync::Mutex<Option<Credentials>>,
+    region: String,
+    service: &'static str,
+}
+
+impl std::fmt::Debug for Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Signer")
+            .field("region", &self.region)
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Signer {
+    /// How long before expiry credentials are fetched again.
+    const REFRESH_AHEAD: Duration = Duration::from_secs(300);
+
+    fn new(provider: SharedCredentialsProvider, region: String, service: &'static str) -> Self {
+        Self {
+            provider,
+            cached: tokio::sync::Mutex::new(None),
+            region,
+            service,
+        }
+    }
+
+    /// Current credentials, the SDK's reason when there are none.
+    async fn credentials(&self) -> std::result::Result<Credentials, String> {
+        let mut cached = self.cached.lock().await;
+        let fresh_until = SystemTime::now().checked_add(Self::REFRESH_AHEAD);
+        if let Some(credentials) = cached.as_ref()
+            && credentials
+                .expiry()
+                .is_none_or(|expiry| fresh_until.is_some_and(|until| expiry > until))
+        {
+            return Ok(credentials.clone());
+        }
+        let credentials = self
+            .provider
+            .provide_credentials()
+            .await
+            .map_err(|e| DisplayErrorContext(&e).to_string())?;
+        *cached = Some(credentials.clone());
+        Ok(credentials)
+    }
+
+    /// `request`, signed: any `Authorization` it carried (rig's clients
+    /// always set a bearer) is replaced by the `SigV4` one.
+    pub(crate) async fn sign(
+        &self,
+        mut request: http::Request<Bytes>,
+    ) -> std::result::Result<http::Request<Bytes>, rig::http_client::Error> {
+        use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
+        use aws_sigv4::sign::v4;
+
+        let failed = |e: String| rig::http_client::Error::Instance(e.into());
+        request.headers_mut().remove(http::header::AUTHORIZATION);
+        let identity: Identity = self.credentials().await.map_err(failed)?.into();
+        let params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.region)
+            .name(self.service)
+            .time(SystemTime::now())
+            .settings(SigningSettings::default())
+            .build()
+            .map_err(|e| failed(e.to_string()))?
+            .into();
+        let headers = request
+            .headers()
+            .iter()
+            .map(|(name, value)| value.to_str().map(|value| (name.as_str(), value)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| failed(format!("a header cannot be signed: {e}")))?;
+        let uri = request.uri().to_string();
+        let signable = SignableRequest::new(
+            request.method().as_str(),
+            uri.as_str(),
+            headers.into_iter(),
+            SignableBody::Bytes(request.body()),
+        )
+        .map_err(|e| failed(e.to_string()))?;
+        let (instructions, _) = sign(signable, &params)
+            .map_err(|e| failed(e.to_string()))?
+            .into_parts();
+        instructions.apply_to_request_http1x(&mut request);
+        Ok(request)
+    }
 }
 
 /// The SDK's HTTPS client, with a permit of the provider's limit taken
@@ -373,6 +659,137 @@ mod tests {
         assert_eq!(peak_of(&connector, &peak, model).await, 2);
         let sso = "https://portal.sso.us-east-1.amazonaws.com/federation/credentials";
         assert_eq!(peak_of(&connector, &peak, sso).await, 5);
+    }
+
+    fn static_signer(service: &'static str) -> Signer {
+        Signer::new(
+            SharedCredentialsProvider::new(Credentials::new(
+                "AKIDEXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                None,
+                None,
+                "test",
+            )),
+            String::from("eu-west-1"),
+            service,
+        )
+    }
+
+    #[tokio::test]
+    async fn requests_are_signed_for_the_endpoint_service_and_region() {
+        let request = http::Request::post("https://bedrock-mantle.eu-west-1.api.aws/v1/responses")
+            .header(http::header::AUTHORIZATION, "Bearer sigv4")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Bytes::from_static(br#"{"model":"openai.gpt-oss-120b"}"#))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let signed = static_signer("bedrock-mantle")
+            .sign(request)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let header = |name: &str| {
+            signed
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let authorization = header("authorization");
+        assert!(
+            authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+            "{authorization}"
+        );
+        assert!(
+            authorization.contains("/eu-west-1/bedrock-mantle/aws4_request"),
+            "{authorization}"
+        );
+        assert!(
+            authorization.contains("SignedHeaders=content-type;host;x-amz-date"),
+            "{authorization}"
+        );
+        assert!(!authorization.contains("Bearer"));
+        assert!(!header("x-amz-date").is_empty());
+        // The body is what was signed, unchanged.
+        assert_eq!(
+            signed.body().as_ref(),
+            br#"{"model":"openai.gpt-oss-120b"}"#
+        );
+    }
+
+    fn provider_with(bedrock: BedrockConfig, base_url: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            base_url: base_url
+                .map(|u| BaseUrl::try_from(u.to_owned()).unwrap_or_else(|e| fail(&e.to_string()))),
+            bedrock: Some(bedrock),
+            ..ProviderConfig::new(ProviderType::Bedrock)
+        }
+    }
+
+    async fn root_of(
+        endpoint: BedrockEndpoint,
+        fips: bool,
+        base_url: Option<&str>,
+    ) -> Result<String> {
+        let bedrock = BedrockConfig {
+            endpoint,
+            api: endpoint.default_api(),
+            region: None,
+        };
+        let provider = provider_with(bedrock.clone(), base_url);
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .use_fips(fips)
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let name: ProviderName = "root-test"
+            .parse()
+            .unwrap_or_else(|e: Error| fail(&e.to_string()));
+        root(&name, &provider, &bedrock, &sdk, "us-west-2").await
+    }
+
+    #[tokio::test]
+    async fn each_endpoint_resolves_its_root_fips_included() {
+        assert_eq!(
+            root_of(BedrockEndpoint::Runtime, false, None)
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://bedrock-runtime.us-west-2.amazonaws.com")
+        );
+        assert_eq!(
+            root_of(BedrockEndpoint::Runtime, true, None)
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://bedrock-runtime-fips.us-west-2.amazonaws.com")
+        );
+        assert_eq!(
+            root_of(BedrockEndpoint::Mantle, false, None)
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://bedrock-mantle.us-west-2.api.aws")
+        );
+        let mantle_fips = root_of(BedrockEndpoint::Mantle, true, None).await;
+        assert!(mantle_fips.is_err_and(|e| e.to_string().contains("bedrock-mantle has none")));
+        // A VPC endpoint is the root, as given.
+        let vpce = "https://vpce-0abc.bedrock-mantle.us-west-2.vpce.amazonaws.com/";
+        assert_eq!(
+            root_of(BedrockEndpoint::Mantle, false, Some(vpce))
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://vpce-0abc.bedrock-mantle.us-west-2.vpce.amazonaws.com")
+        );
+        let plain = "https://vpce-0abc.bedrock-runtime.us-west-2.vpce.amazonaws.com";
+        let refused = root_of(BedrockEndpoint::Runtime, true, Some(plain)).await;
+        assert!(refused.is_err_and(|e| e.to_string().contains("not one")));
+        let fips_vpce = "https://vpce-0abc.bedrock-runtime-fips.us-west-2.vpce.amazonaws.com";
+        assert!(
+            root_of(BedrockEndpoint::Runtime, true, Some(fips_vpce))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

@@ -12,8 +12,10 @@ workspace = true
 [dependencies]
 argon2        = { workspace = true, features = ["alloc", "password-hash", "getrandom"] }
 aws-config    = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest", "sso"] }
+aws-credential-types = { workspace = true }
 aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
 aws-sdk-bedrockruntime = { workspace = true, features = ["rt-tokio", "default-https-client"] }
+aws-sigv4     = { workspace = true, features = ["sign-http", "http1"] }
 aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x"] }
 aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }

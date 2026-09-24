@@ -90,12 +90,18 @@ auth, an API key, or OAuth, and for Bedrock whatever the AWS CLI would use (envi
 
 ```toml
 [general]
-chat_model = "bedrock/us.anthropic.claude-sonnet-5"
+chat_model = "bedrock/us.anthropic.claude-sonnet-5"   # or "mantle/openai.gpt-oss-120b"
 
-[providers.bedrock]
+[providers.bedrock]              # bedrock-runtime: Converse (default), chat-completions, or responses
 type = "bedrock"
 aws_profile = "my-sso-profile"   # optional
 region = "us-east-1"             # optional
+
+[providers.mantle]               # bedrock-mantle: responses (default) or chat-completions
+type = "bedrock"
+endpoint = "mantle"
+aws_profile = "my-sso-profile"
+# base_url = "https://vpce-0123456789abcdef0.bedrock-mantle.us-east-1.vpce.amazonaws.com"   # a VPC endpoint without private DNS
 ```
 
  `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data directories.

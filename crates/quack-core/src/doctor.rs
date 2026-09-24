@@ -16,7 +16,8 @@ use std::time::Duration;
 use crate::config;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{
-    BaseUrl, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName, ProviderType,
+    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName,
+    ProviderType,
 };
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
@@ -697,44 +698,80 @@ async fn check_model(
 }
 
 /// Whether the AWS SDK finds a region and credentials for a Bedrock
-/// provider. Whether the account may invoke the model is not probed: that
-/// takes a model call.
+/// provider, where its endpoint is, and, on bedrock-mantle (the endpoint
+/// that lists its models), whether the model is there. On bedrock-runtime
+/// the model's access is only known from a model call.
 async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
+    let (name, provider) = (model.provider_name, model.provider);
+    let Some(bedrock) = provider.bedrock.as_ref() else {
+        return Check::new(
+            area,
+            Status::Fail,
+            format!("{model}: not a Bedrock provider"),
+        );
+    };
+    let surface = format!("bedrock-{}, api {}", bedrock.endpoint, bedrock.api);
     if !probe {
         return Check::new(
             area,
             Status::Ok,
-            format!("{model}: configured (not probed: --offline)"),
+            format!("{model}: {surface} (not probed: --offline)"),
         );
     }
-    let (name, provider) = (model.provider_name, model.provider);
-    match crate::llm::bedrock::client(name, provider).await {
-        Ok(_) => {
-            let region = match Box::pin(crate::llm::bedrock::sdk_config(name, provider)).await {
-                Ok(sdk) => sdk.region().map(ToString::to_string).unwrap_or_default(),
-                Err(_) => String::new(),
-            };
-            Check::new(
-                area,
-                Status::Ok,
-                format!(
-                    "{model}: AWS credentials found, region {region} (model access is checked on                      the first call)"
-                ),
-            )
+    let session = match crate::llm::bedrock::session(name, provider).await {
+        Ok(session) => session,
+        Err(e) => {
+            return Check::new(area, Status::Fail, format!("{model}: {e}")).fix(
+                match provider.auth.aws_profile() {
+                    Some(profile) => format!(
+                        "aws sso login --profile {profile}, or check [profile {profile}] in \
+                         ~/.aws/config"
+                    ),
+                    None => format!(
+                        "set aws_profile (and region) under [providers.{name}], or export \
+                         AWS_PROFILE, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+                    ),
+                },
+            );
         }
-        Err(e) => Check::new(area, Status::Fail, format!("{model}: {e}")).fix(match provider
-            .auth
-            .aws_profile()
-        {
-            Some(profile) => format!(
-                "aws sso login --profile {profile}, or check [profile {profile}] in ~/.aws/config"
+    };
+    let found = format!(
+        "{model}: AWS credentials found; {surface} at {} ({})",
+        session.root(),
+        session.region()
+    );
+    if bedrock.endpoint == BedrockEndpoint::Runtime {
+        return Check::new(
+            area,
+            Status::Ok,
+            format!(
+                "{found}; bedrock-runtime lists no models, so access is checked on the first call"
             ),
-            None => format!(
-                "set aws_profile (and region) under [providers.{name}], or export AWS_PROFILE \
-                 or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-            ),
-        }),
+        );
     }
+    let Ok(base) = BaseUrl::try_from(session.root().to_owned()) else {
+        return Check::new(area, Status::Ok, found);
+    };
+    let listing = session
+        .models(name, provider)
+        .await
+        .map(Listing::Ids)
+        .map_err(|e| match e {
+            rig::http_client::Error::InvalidStatusCode(status)
+            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
+            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. }
+                if matches!(status.as_u16(), 401 | 403) =>
+            {
+                Probe::Rejected(status.as_u16())
+            }
+            rig::http_client::Error::InvalidStatusCode(status)
+            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
+            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. } => {
+                Probe::Unexpected(format!("HTTP {}", status.as_u16()))
+            }
+            other => Probe::Unreachable(ErrorChain(&other).to_string()),
+        });
+    listing_check(area, model, &base, listing)
 }
 
 /// The credential a model's provider is called with, or the failed check
@@ -816,7 +853,21 @@ fn listing_check(
         )
         .fix(match provider.auth {
             ProviderAuth::Oauth(_) => format!("quack auth login {name}"),
-            ProviderAuth::None | ProviderAuth::ApiKey { .. } | ProviderAuth::Aws { .. } => {
+            // 401: the credentials themselves; 403: what they may do.
+            ProviderAuth::Aws { .. } if status == 403 => String::from(
+                "grant the credentials' IAM principal bedrock-mantle:CreateInference (and allow \
+                 it in the VPC endpoint's policy, when base_url is one)",
+            ),
+            ProviderAuth::Aws { .. } => match provider.auth.aws_profile() {
+                Some(profile) => format!(
+                    "check the credentials with `aws sts get-caller-identity --profile {profile}`, \
+                     or sign in again (`aws sso login --profile {profile}`)"
+                ),
+                None => String::from(
+                    "check the credentials with `aws sts get-caller-identity`, or sign in again",
+                ),
+            },
+            ProviderAuth::None | ProviderAuth::ApiKey { .. } => {
                 String::from("check the key in the environment variable")
             }
         }),

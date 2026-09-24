@@ -34,7 +34,15 @@ build, and no ambiguity about which backend rustls picks at runtime.
   Postgres import), and the AWS SDK behind the Bedrock provider (`aws-config` and
   `aws-sdk-bedrockruntime` with `default-https-client`) on `aws-smithy-http-client`'s
   `rustls-aws-lc`, plus `rustls-aws-lc-fips` on Linux, where `llm::bedrock` selects
-  `CryptoMode::AwsLcFips`. SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
+  `CryptoMode::AwsLcFips`. Bedrock's OpenAI-compatible APIs go through `reqwest` like every
+  other provider.
+- **Exception: SigV4.** Bedrock requests are authenticated with AWS SigV4, an HMAC-SHA256
+  over the request. Both the AWS SDK (Converse, embeddings) and quack's own signer
+  (`llm::bedrock::Signer`, the OpenAI-compatible APIs) compute it with `aws-sigv4`, which
+  uses the RustCrypto `hmac` and `sha2` crates rather than aws-lc-rs, so that MAC is not
+  computed inside the FIPS-validated module even on Linux. The TLS connection it travels
+  over is. Neither crate is `ring` or OpenSSL, so the gates pass; a deployment that must keep
+  every primitive inside the validated module should not configure a Bedrock provider. SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
   AES-256-GCM for the OAuth token cache from `aws_lc_rs::aead`.
 - `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
   (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`

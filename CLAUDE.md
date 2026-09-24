@@ -126,10 +126,14 @@ resources are limited where they are used. Every rig client is built over
 the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
-background ones. Bedrock (`llm::bedrock`) is the exception to the rig HTTP client: rig-bedrock
-calls the AWS SDK, whose HTTPS client is wrapped to take the same gates for `/model/{id}/`
-requests, and whose config comes from `aws_config::defaults` (env, `aws_profile`, SSO,
-instance roles; `auth = "aws"`, the type's default), one cached client per provider. The registry is in memory only (labels can be workspace content).
+background ones. Bedrock (`llm::bedrock`, settings in `config::bedrock`) names an `endpoint`
+(`runtime` or `mantle`, which host different models) and an `api` (`converse`, runtime only,
+through rig-bedrock and the AWS SDK, whose HTTPS client is wrapped to take the same gates for
+`/model/{id}/` requests; `chat-completions` and `responses` through rig's OpenAI clients over a
+`LimitedHttp` that SigV4-signs each request after its permit; Responses always sends
+`store: false`). Credentials come from `aws_config::defaults` (env, `aws_profile`, SSO,
+instance roles; `auth = "aws"`, the type's default); `base_url` is the endpoint root (a VPC
+endpoint), checked against `endpoint`; one cached `Session` per provider. The registry is in memory only (labels can be workspace content).
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
