@@ -199,7 +199,10 @@ classes and relations as drift in `_quack_meta.graph_drift`; `graph::resolve` em
 node labels, merges near-identical labels of one class, and queues the rest as merge
 proposals; `graph::traverse` resolves an entry point (exact label, alias, then embedding)
 and walks neighborhoods, shortest paths, and classes with subclass expansion, bounded by
-`[graph]`. `graph::store::status` reports size, `provisional` (the newest ontology version
+`[graph]`. Every interface asks through `graph::query::{GraphQuery, PathQuery}`: `new`
+trims and defaults the caller's fields, `run` checks class and relation ids against the
+ontology and resolves the entry points, and an unresolved path end is an `UnknownEntity`
+naming the closest labels. `graph::store::status` reports size, `provisional` (the newest ontology version
 was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,
 and drift; `revalidate` drops what the current ontology no longer allows. The agent
 registers `search_graph` and `find_path` only when the graph has nodes, query mode drops

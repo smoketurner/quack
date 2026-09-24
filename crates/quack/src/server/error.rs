@@ -93,6 +93,7 @@ impl From<CoreError> for ApiError {
             }
             CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
             CoreError::Config(_)
+            | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }
             | CoreError::UnsupportedFileType(_)
             | CoreError::Ontology(_) => StatusCode::BAD_REQUEST,

@@ -20,13 +20,14 @@ use axum_extra::extract::CookieJar;
 // Multi-valued fields (checkboxes) need serde_html_form, which axum's own
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
+use quack_core::analysis::citations::Citation;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{Ontology, OntologyDiff, candidates, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
-    Scope, TokenRow, UserRow, WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, Expiry, MemberRow, Outcome, ProviderAllowList,
+    ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
@@ -54,16 +55,18 @@ use super::state::App;
 use quack_core::csv::CsvField;
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, store as graph_store,
-    traverse,
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
+use quack_core::llm;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
+use quack_core::text::NonBlankText;
 
 #[derive(Embed)]
 #[folder = "static/"]
@@ -758,23 +761,11 @@ impl MessageView {
             .and_then(|c| c.as_array())
             .map(|cs| {
                 cs.iter()
-                    .map(|c| {
-                        let filename = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-                        let page_no = c.get("page").and_then(serde_json::Value::as_u64);
-                        let heading = c.get("heading").and_then(|v| v.as_str());
-                        let page_part = page_no.map_or(String::new(), |p| format!(", page {p}"));
-                        let heading_part =
-                            heading.map_or(String::new(), |h| format!(", under \"{h}\""));
-                        let label = format!("{filename}{page_part}{heading_part}");
-                        CitationView {
-                            n: c.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                            label,
-                            document_id: c
-                                .get("document_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                        }
+                    .filter_map(|c| serde_json::from_value::<Citation>(c.clone()).ok())
+                    .map(|c| CitationView {
+                        n: u64::from(c.n),
+                        label: c.label(),
+                        document_id: c.document_id,
                     })
                     .collect()
             })
@@ -1803,14 +1794,11 @@ async fn token_create(
         );
     }
     let scopes = form.scopes;
-    let expires_at = form.expires_days.filter(|d| *d > 0).and_then(|days| {
-        jiff::Timestamp::now()
-            .checked_add(jiff::SignedDuration::from_hours(
-                i64::from(days).saturating_mul(24),
-            ))
-            .ok()
-            .map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string())
-    });
+    let expires_at = form
+        .expires_days
+        .filter(|d| *d > 0)
+        .map(Expiry::after_days)
+        .transpose()?;
     let (token, row) = app
         .control
         .create_token(
@@ -1818,7 +1806,7 @@ async fn token_create(
             &access.identity.user_id,
             form.name.trim(),
             &scopes,
-            expires_at.as_deref(),
+            expires_at,
         )
         .await?;
     access
@@ -1977,9 +1965,9 @@ impl GraphQueryView {
     fn from_query(q: &GraphPageQuery) -> Self {
         let given = |value: Option<&String>| {
             value
-                .map(|v| v.trim().to_owned())
-                .filter(|v| !v.is_empty())
+                .and_then(|v| v.non_blank())
                 .unwrap_or_default()
+                .to_owned()
         };
         Self {
             entity: given(q.entity.as_ref()),
@@ -2003,33 +1991,18 @@ async fn graph_page(
     access.audit_read(&app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
     let query = GraphQueryView::from_query(&q);
-    let embedding = if query.entity.is_empty() {
-        None
-    } else {
-        graph_api::entity_embedding(&app, &query.entity).await?
-    };
-    let path_embeddings: Option<EndEmbeddings> = if query.from.is_empty() || query.to.is_empty() {
-        None
-    } else {
-        Some((
-            graph_api::entity_embedding(&app, &query.from).await?,
-            graph_api::entity_embedding(&app, &query.to).await?,
-        ))
-    };
-    let wanted = query.clone();
+    let ask = GraphAsk::of(&q, &app).await?;
     let data = app
-        .read(&id, move |db| {
-            GraphPageData::read(
-                db,
-                &wanted,
-                embedding.as_deref(),
-                path_embeddings.as_ref(),
-                options,
-            )
-        })
+        .read(&id, move |db| GraphPageData::read(db, &ask, &options))
         .await?;
+    // An unknown class or entity is shown on the page, not as a failed page.
+    let mut error = q.error;
     let result = match data.result {
-        Some((title, found)) => Some(GraphResultView::of(title, &found)?),
+        Some((title, Ok(found))) => Some(GraphResultView::of(title, &found)?),
+        Some((_, Err(e))) => {
+            error = Some(e.to_string());
+            None
+        }
         None => None,
     };
     let status = data.status;
@@ -2056,13 +2029,74 @@ async fn graph_page(
         merges: data.merges,
         query,
         result,
-        error: q.error,
+        error,
         notice: q.notice,
     })
 }
 
-/// The embeddings of a path query's two ends, when a model exists.
-type EndEmbeddings = (Option<Vector>, Option<Vector>);
+/// What the graph page was asked, with the embeddings its entry points
+/// need.
+enum GraphAsk {
+    Nothing,
+    Search(GraphQuery, Option<Vector>),
+    Path(PathQuery, PathEnds),
+}
+
+impl GraphAsk {
+    /// A path when both ends are given, else a search when an entity or a
+    /// class is.
+    async fn of(q: &GraphPageQuery, app: &App) -> WebResult<Self> {
+        let path = PathQuery::new(
+            q.from.as_deref().unwrap_or_default(),
+            q.to.as_deref().unwrap_or_default(),
+            q.max_hops,
+        );
+        let search = GraphQuery::new(
+            q.entity.as_deref(),
+            q.class.as_deref(),
+            q.relation.as_deref(),
+            q.hops,
+        );
+        if path.is_err() && search.is_err() {
+            return Ok(Self::Nothing);
+        }
+        let model = llm::optional_embedding_model(&app.config).await?;
+        Ok(match (path, search) {
+            (Ok(path), _) => {
+                let ends = path.embeddings(model.as_ref()).await?;
+                Self::Path(path, ends)
+            }
+            (Err(_), Ok(search)) => {
+                let embedding = search.embedding(model.as_ref()).await?;
+                Self::Search(search, embedding)
+            }
+            (Err(_), Err(_)) => Self::Nothing,
+        })
+    }
+
+    /// Its title and result, or why it could not run.
+    fn run(
+        &self,
+        db: &WorkspaceDb,
+        options: &GraphOptions,
+    ) -> Option<(String, CoreResult<GraphResult>)> {
+        match self {
+            Self::Nothing => None,
+            Self::Path(path, ends) => Some((
+                format!("Path from {} to {}", path.from, path.to),
+                path.run(db, ends, options),
+            )),
+            Self::Search(search, embedding) => {
+                let title = match (&search.entity, &search.class) {
+                    (Some(entity), _) => format!("Around {entity}"),
+                    (None, Some(class)) => format!("Entities of class {class}"),
+                    (None, None) => String::new(),
+                };
+                Some((title, search.run(db, embedding.as_deref(), options)))
+            }
+        }
+    }
+}
 
 /// What the graph page reads from the workspace in one go.
 struct GraphPageData {
@@ -2072,50 +2106,16 @@ struct GraphPageData {
     chunk_count: usize,
     merges: Vec<resolve::MergeProposal>,
     /// The query's title and result, when it asked for anything.
-    result: Option<(String, GraphResult)>,
+    result: Option<(String, CoreResult<GraphResult>)>,
 }
 
 impl GraphPageData {
-    fn read(
-        db: &WorkspaceDb,
-        wanted: &GraphQueryView,
-        embedding: Option<&[f32]>,
-        path_embeddings: Option<&EndEmbeddings>,
-        options: GraphOptions,
-    ) -> CoreResult<Self> {
+    fn read(db: &WorkspaceDb, ask: &GraphAsk, options: &GraphOptions) -> CoreResult<Self> {
         let status = graph_store::status(db)?;
         let ontology = ontology_store::current(db)?;
         let chunk_count = usize::try_from(extract::pending_chunk_count(db)?).unwrap_or(0);
         let merges = resolve::pending(db)?;
-        let result = if let Some((a, b)) = path_embeddings {
-            let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
-            let to = traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
-            let found = match (from.first(), to.first()) {
-                (Some(a), Some(b)) => {
-                    traverse::path(db, a, b, Hops::new(wanted.max_hops), &options)?
-                }
-                _ => GraphResult::default(),
-            };
-            Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
-        } else if !wanted.entity.is_empty() {
-            let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
-            let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
-            let roots = traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
-            let found =
-                traverse::neighborhood(db, &roots, Hops::new(wanted.hops), relation, &options)?;
-            Some((format!("Around {}", wanted.entity), found))
-        } else if !wanted.class.is_empty() {
-            let found = traverse::by_class(
-                db,
-                ontology.as_ref(),
-                &wanted.class,
-                options.max_nodes,
-                &options,
-            )?;
-            Some((format!("Entities of class {}", wanted.class), found))
-        } else {
-            None
-        };
+        let result = ask.run(db, options);
         Ok(Self {
             status,
             has_ontology: ontology.is_some(),

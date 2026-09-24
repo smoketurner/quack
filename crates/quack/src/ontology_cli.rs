@@ -2,7 +2,7 @@
 //! list versions, diff, restore, and propose and review candidates. The
 //! ontology lives in the workspace file; a file on disk is only ever a copy.
 
-use std::io::{Read, Write};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -10,6 +10,7 @@ use quack_core::config::Config;
 
 use crate::confirm::Confirm;
 use crate::graph_cli::rendered;
+use crate::stdio::StdioPath;
 use quack_core::llm;
 use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
@@ -29,9 +30,9 @@ pub(crate) enum OntologyAction {
     /// Install the built-in general ontology as version 1
     Init,
     /// Write the current ontology as JSON to a file (- for stdout)
-    Export { file: String },
+    Export { file: StdioPath },
     /// Validate a JSON ontology and store it as a new version (- for stdin)
-    Import { file: String },
+    Import { file: StdioPath },
     /// List versions, newest first
     Versions {
         #[arg(long, default_value_t = 20)]
@@ -153,22 +154,17 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
         OntologyAction::Export { file } => {
             let ontology = store::current(db)?.context("no ontology to export")?;
             let json = ontology.to_json()?;
-            if file == "-" {
-                writeln!(out, "{json}")?;
-            } else {
-                std::fs::write(&file, format!("{json}\n"))
-                    .with_context(|| format!("failed to write {file}"))?;
-                writeln!(out, "wrote version {} to {file}", ontology.version)?;
+            match &file {
+                StdioPath::Stdio => writeln!(out, "{json}")?,
+                StdioPath::Path(path) => {
+                    std::fs::write(path, format!("{json}\n"))
+                        .with_context(|| format!("failed to write {file}"))?;
+                    writeln!(out, "wrote version {} to {file}", ontology.version)?;
+                }
             }
         }
         OntologyAction::Import { file } => {
-            let text = if file == "-" {
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf)?;
-                buf
-            } else {
-                std::fs::read_to_string(&file).with_context(|| format!("failed to read {file}"))?
-            };
+            let text = file.read_to_string()?;
             let ontology = Ontology::from_json(&text)?;
             let stored = store::save(db, &ontology, None, Some(&format!("imported from {file}")))?;
             writeln!(out, "ontology is now version {}", stored.version)?;

@@ -7,7 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
-use quack_core::embedding::{Input, Vector};
+use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphResult, GraphStatus, extract, resolve, store as graph_store, tables,
@@ -221,35 +221,27 @@ async fn run_search(
         return Ok(());
     };
     let options = config.graph.options();
-    let entity = entity.as_deref().map(str::trim).filter(|e| !e.is_empty());
-    let class = class.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    let result = match (entity, class) {
-        (None, None) => anyhow::bail!("give an entity, --class CLASS, or both"),
-        (Some(entity), class) => {
-            let embedding = entity_embedding(config, entity).await?;
-            let (name, class_id) = (entity.to_owned(), class.map(str::to_owned));
-            let roots = db
-                .run(move |db| {
-                    traverse::resolve_entry(db, &name, class_id.as_deref(), embedding.as_deref())
-                })
-                .await?;
-            if roots.is_empty() {
-                anyhow::bail!("no entity matches '{entity}'");
+    let query = GraphQuery::new(
+        entity.as_deref(),
+        class.as_deref(),
+        relation.as_deref(),
+        Some(hops),
+    )?;
+    let model = llm::optional_embedding_model(config).await?;
+    let embedding = query.embedding(model.as_ref()).await?;
+    let result = db
+        .run(move |db| {
+            let result = query.run(db, embedding.as_deref(), &options)?;
+            // A walk from an entity always holds that entity, so an empty
+            // one means the name resolved to nothing.
+            match query.entity.as_deref() {
+                Some(entity) if result.nodes.is_empty() => {
+                    Err(UnknownEntity::find(db, entity, embedding.as_deref()).into())
+                }
+                Some(_) | None => Ok(result),
             }
-            db.run(move |db| {
-                traverse::neighborhood(db, &roots, Hops::new(hops), relation.as_deref(), &options)
-            })
-            .await?
-        }
-        (None, Some(class)) => {
-            let class = class.to_owned();
-            db.run(move |db| {
-                let ontology = ontology_store::current(db)?;
-                traverse::by_class(db, ontology.as_ref(), &class, options.max_nodes, &options)
-            })
-            .await?
-        }
-    };
+        })
+        .await?;
     print_result(out, &result, json)
 }
 
@@ -269,26 +261,11 @@ async fn run_path(
         return Ok(());
     };
     let options = config.graph.options();
-    let a = entity_embedding(config, &from).await?;
-    let b = entity_embedding(config, &to).await?;
-    let (from_name, to_name) = (from.clone(), to.clone());
-    let from_nodes = db
-        .run(move |db| traverse::resolve_entry(db, &from_name, None, a.as_deref()))
-        .await?;
-    let to_nodes = db
-        .run(move |db| traverse::resolve_entry(db, &to_name, None, b.as_deref()))
-        .await?;
-    let (Some(a), Some(b)) = (from_nodes.first(), to_nodes.first()) else {
-        anyhow::bail!(
-            "no entity matches '{}'",
-            if from_nodes.is_empty() { &from } else { &to }
-        );
-    };
-    let (a, b) = (a.clone(), b.clone());
-    let max_hops = Hops::new(max_hops);
-    let result = db
-        .run(move |db| traverse::path(db, &a, &b, max_hops, &options))
-        .await?;
+    let query = PathQuery::new(&from, &to, Some(max_hops))?;
+    let model = llm::optional_embedding_model(config).await?;
+    let ends = query.embeddings(model.as_ref()).await?;
+    let max_hops = query.max_hops;
+    let result = db.run(move |db| query.run(db, &ends, &options)).await?;
     if result.is_empty() && !json {
         writeln!(out, "No path within {max_hops} hops.")?;
         return Ok(());
@@ -409,16 +386,6 @@ pub(crate) fn rendered(
     let mut buf = Vec::new();
     write(&mut buf).map_err(|e| format!("{e:#}"))?;
     Ok(buf)
-}
-
-/// `None` without an embedding model; a failing model is an error, not a
-/// silent fall-back to exact matches.
-async fn entity_embedding(config: &Config, text: &str) -> Result<Option<Vector>> {
-    let Some(model) = llm::optional_embedding_model(config).await? else {
-        return Ok(None);
-    };
-    let input = Input::Similarity(text.to_owned());
-    Ok(Some(model.embed_interactive(&input).await?))
 }
 
 fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Result<()> {

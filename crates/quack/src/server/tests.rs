@@ -957,7 +957,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
             &owner,
             "old",
             &[Scope::Read],
-            Some("2000-01-01 00:00:00"),
+            "2000-01-01 00:00:00".parse().ok(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));

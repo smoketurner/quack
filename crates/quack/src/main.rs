@@ -11,6 +11,7 @@ mod mcp;
 mod ontology_cli;
 mod print;
 mod server;
+mod stdio;
 mod terminal;
 
 use anyhow::{Context, Result};
@@ -19,12 +20,13 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::{AuthMode, Config};
 use quack_core::doctor::Options;
-use quack_core::error::Error as CoreError;
+use quack_core::error::{Error as CoreError, Record};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::oauth::{self, LoginOptions, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::{Ontology, candidates, store as ontology_store};
+use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
@@ -39,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::confirm::Confirm;
+use crate::stdio::StdioPath;
 use crate::terminal::SessionSetup;
 
 /// Exit status for a usage error (bad flags, no terminal for the session).
@@ -156,7 +159,7 @@ enum Commands {
     /// Ingest a file into a workspace
     Ingest {
         /// File path to ingest (use - for stdin)
-        file: String,
+        file: StdioPath,
 
         /// Override the filename (required when reading from stdin)
         #[arg(long)]
@@ -326,7 +329,7 @@ enum OkfAction {
     /// graph node, and log.md
     Export {
         /// Directory to write (created), or - for a tar archive on stdout
-        dir: String,
+        dir: StdioPath,
     },
 }
 
@@ -368,12 +371,12 @@ enum ContextAction {
     /// Write the current context to a Markdown file
     Export {
         /// Destination path (- for stdout)
-        file: String,
+        file: StdioPath,
     },
     /// Replace the context with the contents of a Markdown file
     Import {
         /// Source path (- for stdin)
-        file: String,
+        file: StdioPath,
     },
 }
 
@@ -655,7 +658,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
             return Ok(ExitCode::from(EXIT_USAGE));
         }
     };
-    let (config, workspace, workspace_name) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, workspace_name) = load_workspace(cli.workspace.as_deref()).await?;
     // Checked before the workspace opens, so a missing model is one line
     // on stderr rather than a failed turn, and leaves no session behind.
     if let Err(e) = config.chat_model_ref() {
@@ -777,7 +780,7 @@ async fn stdin_has_data() -> Result<bool> {
 /// Logging, then the workspace database for the workspace-local subcommands.
 async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
     init_logging();
-    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
     WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")
 }
 
@@ -786,7 +789,7 @@ async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
 /// commands) send it their steps exactly as the server and the terminal do.
 async fn open_writer(cli: &Cli) -> Result<Writer> {
     init_logging();
-    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
     spawn_writer(&config, &workspace.id)
 }
 
@@ -905,7 +908,7 @@ async fn run_import(
         source_table: from,
         limit,
     };
-    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
     let ws_db = spawn_writer(&config, &workspace.id)?;
     let embedding_model = llm::optional_embedding_model(&config).await?;
     let summary = import::import(
@@ -935,21 +938,24 @@ async fn run_import(
 
 /// `quack okf export DIR`: the workspace as an Open Knowledge Format
 /// bundle, a directory of Markdown files or a tar on stdout.
-async fn run_okf_export(cli: &Cli, dir: &str) -> Result<ExitCode> {
+async fn run_okf_export(cli: &Cli, dir: &StdioPath) -> Result<ExitCode> {
     init_logging();
-    let (config, workspace, name) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, name) = load_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     let bundle = okf::export(&ws_db, &name)?;
-    if dir == "-" {
-        let mut out = std::io::stdout().lock();
-        out.write_all(&bundle.to_tar()?)?;
-        out.flush()?;
-    } else {
-        bundle.write_to(&PathBuf::from(dir))?;
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        writeln!(out, "wrote {} files to {dir}", bundle.files.len())?;
+    match dir {
+        StdioPath::Stdio => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(&bundle.to_tar()?)?;
+            out.flush()?;
+        }
+        StdioPath::Path(path) => {
+            bundle.write_to(path)?;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            writeln!(out, "wrote {} files to {dir}", bundle.files.len())?;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -957,7 +963,7 @@ async fn run_okf_export(cli: &Cli, dir: &str) -> Result<ExitCode> {
 /// `quack mcp`: the workspace as an MCP server on stdin and stdout.
 async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     init_logging();
-    let (config, workspace, _) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     let db: SharedDb =
@@ -1150,7 +1156,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         );
         return Ok(ExitCode::from(EXIT_USAGE));
     }
-    let (config, workspace, ws_name) = resolve_workspace(cli.workspace.as_deref()).await?;
+    let (config, workspace, ws_name) = load_workspace(cli.workspace.as_deref()).await?;
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     let session_id = resolve_session(
@@ -1247,22 +1253,17 @@ fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
         }
         ContextAction::Export { file } => {
             let content = context::current(db)?.map_or(String::new(), |c| c.content);
-            if file == "-" {
-                writeln!(out, "{content}")?;
-            } else {
-                std::fs::write(&file, format!("{content}\n"))
-                    .with_context(|| format!("failed to write {file}"))?;
-                writeln!(out, "wrote {file}")?;
+            match &file {
+                StdioPath::Stdio => writeln!(out, "{content}")?,
+                StdioPath::Path(path) => {
+                    std::fs::write(path, format!("{content}\n"))
+                        .with_context(|| format!("failed to write {file}"))?;
+                    writeln!(out, "wrote {file}")?;
+                }
             }
         }
         ContextAction::Import { file } => {
-            let content = if file == "-" {
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf)?;
-                buf
-            } else {
-                std::fs::read_to_string(&file).with_context(|| format!("failed to read {file}"))?
-            };
+            let content = file.read_to_string()?;
             let stored = context::set(db, &content, None)?;
             writeln!(out, "context is now version {}", stored.version)?;
         }
@@ -1320,17 +1321,9 @@ fn run_docs(
 
 /// Resolve a full document id or a unique prefix.
 fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<String> {
-    let matches: Vec<String> = db
-        .list_documents()?
-        .into_iter()
-        .filter(|d| d.id.starts_with(prefix))
-        .map(|d| d.id)
-        .collect();
-    match matches.len() {
-        0 => anyhow::bail!("no document matches '{prefix}'; run `quack docs`"),
-        1 => matches.into_iter().next().context("document vanished"),
-        n => anyhow::bail!("'{prefix}' matches {n} documents; use more of the id"),
-    }
+    let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
+        .one(Record::Document, prefix)?;
+    Ok(document.id)
 }
 
 fn list_documents(db: &WorkspaceDb, json: bool, out: &mut impl Write) -> Result<()> {
@@ -1368,15 +1361,12 @@ fn find_session(db: &WorkspaceDb, prefix: &str) -> Result<sessions::SessionRow> 
     if let Some(exact) = sessions::get_session(db, prefix)? {
         return Ok(exact);
     }
-    let matches: Vec<sessions::SessionRow> = sessions::list_sessions(db, 1000)?
-        .into_iter()
-        .filter(|s| s.id.starts_with(prefix))
-        .collect();
-    match matches.len() {
-        0 => anyhow::bail!("no session matches '{prefix}'; run `quack sessions`"),
-        1 => matches.into_iter().next().context("session vanished"),
-        n => anyhow::bail!("'{prefix}' matches {n} sessions; use more of the id"),
-    }
+    Ok(
+        PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
+            s.id.as_str()
+        })
+        .one(Record::Session, prefix)?,
+    )
 }
 
 fn list_sessions(db: &WorkspaceDb, json: bool, limit: u32) -> Result<()> {
@@ -1438,7 +1428,9 @@ fn init_logging_at(default: &str) {
     crypto::log_provider();
 }
 
-async fn resolve_workspace(workspace_name: Option<&str>) -> Result<(Config, WorkspaceRow, String)> {
+/// The configuration and the workspace this command runs in: the named one,
+/// or the default, created on first use.
+async fn load_workspace(workspace_name: Option<&str>) -> Result<(Config, WorkspaceRow, String)> {
     let config = Config::load().context("failed to load configuration")?;
 
     let control = ControlPlane::open(&config)
@@ -1461,7 +1453,7 @@ async fn run_query(
     format: OutputFormat,
     wait_for_stdin: bool,
 ) -> Result<()> {
-    let (config, workspace, _) = resolve_workspace(workspace_name).await?;
+    let (config, workspace, _) = load_workspace(workspace_name).await?;
 
     let ws_db =
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
@@ -1485,17 +1477,19 @@ async fn run_query(
 }
 
 async fn run_ingest(
-    file: &str,
+    file: &StdioPath,
     workspace_name: Option<&str>,
     filename_override: Option<&str>,
     title: Option<&str>,
     no_embed: bool,
     pin: bool,
 ) -> Result<()> {
-    let (config, workspace, _) = resolve_workspace(workspace_name).await?;
+    let (config, workspace, _) = load_workspace(workspace_name).await?;
 
-    if file != "-" && PathBuf::from(file).is_dir() {
-        return ingest_bundle(&config, &workspace.id, file, no_embed).await;
+    if let StdioPath::Path(dir) = file
+        && dir.is_dir()
+    {
+        return ingest_bundle(&config, &workspace.id, &dir.display().to_string(), no_embed).await;
     }
     let (data, effective_filename) = read_input(file, filename_override)?;
 
@@ -1509,10 +1503,9 @@ async fn run_ingest(
             .context("failed to build embedding model")?
     };
 
-    let source = if file == "-" {
-        DocumentSource::Stdin
-    } else {
-        DocumentSource::Path
+    let source = match file {
+        StdioPath::Stdio => DocumentSource::Stdin,
+        StdioPath::Path(_) => DocumentSource::Path,
     };
     let outcome = ingestion::ingest_file(
         &config,
@@ -1726,28 +1719,26 @@ fn restore_bundle_ontology(
     Ok(Some(restored))
 }
 
-fn read_input(file: &str, filename_override: Option<&str>) -> Result<(Vec<u8>, String)> {
-    if file == "-" {
-        let filename = filename_override
-            .ok_or_else(|| anyhow::anyhow!("--filename is required when reading from stdin"))?
-            .to_owned();
-
-        let mut data = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut data)
-            .context("failed to read from stdin")?;
-
-        Ok((data, filename))
-    } else {
-        let path = PathBuf::from(file);
-        let data = std::fs::read(&path).context("failed to read input file")?;
-
-        let filename = filename_override
-            .map(String::from)
-            .or_else(|| path.file_name().and_then(|n| n.to_str()).map(String::from))
-            .unwrap_or_else(|| String::from("unknown"));
-
-        Ok((data, filename))
+fn read_input(file: &StdioPath, filename_override: Option<&str>) -> Result<(Vec<u8>, String)> {
+    match file {
+        StdioPath::Stdio => {
+            let filename = filename_override
+                .ok_or_else(|| anyhow::anyhow!("--filename is required when reading from stdin"))?
+                .to_owned();
+            let mut data = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut data)
+                .context("failed to read from stdin")?;
+            Ok((data, filename))
+        }
+        StdioPath::Path(path) => {
+            let data = std::fs::read(path).context("failed to read input file")?;
+            let filename = filename_override
+                .map(String::from)
+                .or_else(|| path.file_name().and_then(|n| n.to_str()).map(String::from))
+                .unwrap_or_else(|| String::from("unknown"));
+            Ok((data, filename))
+        }
     }
 }
 

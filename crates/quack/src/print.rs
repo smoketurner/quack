@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use quack_core::analysis::agent::AgentResponse;
+use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events::{self, AgentEvent, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
@@ -197,10 +198,7 @@ fn write_text_answer(out: &mut impl Write, streamed: &str, response: &AgentRespo
     }
     if !response.citations.is_empty() {
         writeln!(out)?;
-        writeln!(out, "Sources:")?;
-        for citation in &response.citations {
-            writeln!(out, "  [{}] {}", citation.n, citation.label())?;
-        }
+        writeln!(out, "{}", Sources(&response.citations))?;
     }
     Ok(())
 }

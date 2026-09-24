@@ -7,13 +7,11 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use quack_core::embedding::{Input, Vector};
+use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::Revalidation;
-use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, store as graph_store,
-    tables, traverse,
+    ExtractSource, GraphOptions, GraphStatus, extract, resolve, store as graph_store, tables,
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
@@ -37,17 +35,6 @@ pub(crate) struct SearchQuery {
     pub hops: Option<u32>,
 }
 
-/// A label's embedding for fuzzy entity resolution, when a model exists.
-/// The text's embedding for fuzzy entry: `None` when no embedding model
-/// is configured, an error when the model fails.
-pub(crate) async fn entity_embedding(app: &App, text: &str) -> ApiResult<Option<Vector>> {
-    let Some(model) = llm::optional_embedding_model(&app.config).await? else {
-        return Ok(None);
-    };
-    let input = Input::Similarity(text.to_owned());
-    Ok(Some(model.embed_interactive(&input).await?))
-}
-
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
@@ -55,46 +42,19 @@ pub(crate) async fn search(
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let entity = q
-        .entity
-        .as_deref()
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-        .map(str::to_owned);
-    let class = q
-        .class
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(str::to_owned);
-    if entity.is_none() && class.is_none() {
-        return Err(ApiError::bad_request("give entity, class, or both"));
-    }
-    let embedding = match &entity {
-        Some(e) => entity_embedding(&app, e).await?,
-        None => None,
-    };
-    let hops = Hops::neighborhood(q.hops);
-    let relation = q.relation.clone();
+    let query = GraphQuery::new(
+        q.entity.as_deref(),
+        q.class.as_deref(),
+        q.relation.as_deref(),
+        q.hops,
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let model = llm::optional_embedding_model(&app.config).await?;
+    let embedding = query.embedding(model.as_ref()).await?;
     let options = app.config.graph.options();
-    let detail =
-        serde_json::json!({ "entity": entity, "class": class, "relation": relation, "hops": hops });
+    let detail = serde_json::to_value(&query)?;
     let result = app
-        .read(&id, move |db| {
-            if let Some(entity) = entity {
-                let roots =
-                    traverse::resolve_entry(db, &entity, class.as_deref(), embedding.as_deref())?;
-                return traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options);
-            }
-            let ontology = ontology_store::current(db)?;
-            traverse::by_class(
-                db,
-                ontology.as_ref(),
-                class.as_deref().unwrap_or_default(),
-                options.max_nodes,
-                &options,
-            )
-        })
+        .read(&id, move |db| query.run(db, embedding.as_deref(), &options))
         .await?;
     access
         .audit(
@@ -109,7 +69,7 @@ pub(crate) async fn search(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct PathQuery {
+pub(crate) struct PathParams {
     pub from: String,
     pub to: String,
     pub max_hops: Option<u32>,
@@ -119,29 +79,17 @@ pub(crate) async fn path(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<String>,
-    Query(q): Query<PathQuery>,
+    Query(q): Query<PathParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let from = q.from.trim().to_owned();
-    let to = q.to.trim().to_owned();
-    if from.is_empty() || to.is_empty() {
-        return Err(ApiError::bad_request("from and to are both needed"));
-    }
-    let a = entity_embedding(&app, &from).await?;
-    let b = entity_embedding(&app, &to).await?;
-    let max_hops = Hops::path(q.max_hops);
+    let query = PathQuery::new(&q.from, &q.to, q.max_hops)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let model = llm::optional_embedding_model(&app.config).await?;
+    let ends = query.embeddings(model.as_ref()).await?;
     let options = app.config.graph.options();
-    let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
-    let (from_label, to_label) = (from.clone(), to.clone());
+    let detail = serde_json::to_value(&query)?;
     let result = app
-        .read(&id, move |db| {
-            let from_nodes = traverse::resolve_entry(db, &from_label, None, a.as_deref())?;
-            let to_nodes = traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
-            match (from_nodes.first(), to_nodes.first()) {
-                (Some(a), Some(b)) => traverse::path(db, a, b, max_hops, &options),
-                _ => Ok(GraphResult::default()),
-            }
-        })
+        .read(&id, move |db| query.run(db, &ends, &options))
         .await?;
     access
         .audit(

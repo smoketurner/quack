@@ -13,6 +13,7 @@ use std::io::Write;
 
 use anyhow::Result;
 use quack_core::config::inspect::{EnvVar, FileState, Inspection, Origin, Setting, UnknownKey};
+use quack_core::text::Count;
 use serde_json::{Value, json};
 
 /// Print the report. Returns whether the configuration is one the binary
@@ -92,7 +93,7 @@ fn write_text(out: &mut impl Write, inspection: &Inspection, changed: bool) -> R
         writeln!(
             out,
             "\nkeys this binary does not recognize ({} — a section refuses any key it does not know):",
-            plural(inspection.unknown.len(), "key", "keys")
+            Count(inspection.unknown.len(), "key")
         )?;
         let width = inspection
             .unknown
@@ -172,11 +173,6 @@ fn indented(message: &str) -> String {
         .map(|line| format!("             {line}"))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn plural(count: usize, one: &str, many: &str) -> String {
-    let word = if count == 1 { one } else { many };
-    format!("{count} {word}")
 }
 
 fn as_json(inspection: &Inspection, changed: bool) -> Value {

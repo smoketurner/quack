@@ -17,6 +17,7 @@ use crate::storage::workspace::{
     DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument, WorkspaceDb, quote_ident,
 };
 use crate::storage::writer::Writer;
+use crate::text::NonBlankText;
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -211,11 +212,7 @@ impl Pending {
         }
         Ok(Self {
             filename: file.filename.to_owned(),
-            title: file
-                .title
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned),
+            title: file.title.and_then(str::non_blank).map(str::to_owned),
             ingested_by: file.ingested_by.map(str::to_owned),
             source: file.source,
             size_bytes: file.data.len(),

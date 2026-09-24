@@ -1,6 +1,7 @@
 //! Citations: the chunks a turn retrieved, numbered `[n]`, and the check
 //! that the answer only cites chunks it actually saw.
 
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::storage::workspace::ChunkSearchResult;
@@ -35,14 +36,56 @@ impl Citation {
     /// `filename, page 12, under "Exclusions"` for footers and status lines.
     #[must_use]
     pub fn label(&self) -> String {
-        let page = self
-            .page
-            .map_or_else(String::new, |p| format!(", page {p}"));
-        let heading = self
-            .heading
-            .as_deref()
-            .map_or_else(String::new, |h| format!(", under \"{h}\""));
-        format!("{}{page}{heading}", self.filename)
+        ChunkLocation {
+            filename: &self.filename,
+            page: self.page,
+            heading: self.heading.as_deref(),
+        }
+        .to_string()
+    }
+}
+
+/// Where a chunk sits: `policy.pdf, page 12, under "Exclusions"`.
+pub struct ChunkLocation<'a> {
+    pub filename: &'a str,
+    pub page: Option<u32>,
+    pub heading: Option<&'a str>,
+}
+
+impl<'a> From<&'a ChunkSearchResult> for ChunkLocation<'a> {
+    fn from(chunk: &'a ChunkSearchResult) -> Self {
+        Self {
+            filename: &chunk.filename,
+            page: chunk.page,
+            heading: chunk.heading.as_deref(),
+        }
+    }
+}
+
+impl fmt::Display for ChunkLocation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.filename)?;
+        if let Some(page) = self.page {
+            write!(f, ", page {page}")?;
+        }
+        if let Some(heading) = self.heading {
+            write!(f, ", under \"{heading}\"")?;
+        }
+        Ok(())
+    }
+}
+
+/// The footer an answer's citations are listed in: `Sources:`, then one
+/// `  [n] location` line per citation.
+pub struct Sources<'a>(pub &'a [Citation]);
+
+impl fmt::Display for Sources<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Sources:")?;
+        for citation in self.0 {
+            write!(f, "\n  [{}] {}", citation.n, citation.label())?;
+        }
+        Ok(())
     }
 }
 

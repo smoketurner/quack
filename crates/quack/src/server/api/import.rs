@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use quack_core::llm;
 use quack_core::storage::control::{AuditAction, Outcome};
+use quack_core::text::NonBlankText;
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
@@ -25,7 +26,8 @@ pub(crate) struct ImportBody {
 /// A blank query or source table (an empty form field) is none.
 impl From<ImportBody> for ImportRequest {
     fn from(body: ImportBody) -> Self {
-        let given = |field: Option<String>| field.filter(|value| !value.trim().is_empty());
+        let given =
+            |field: Option<String>| field.as_deref().and_then(str::non_blank).map(str::to_owned);
         Self {
             url: body.url,
             table: body.table,

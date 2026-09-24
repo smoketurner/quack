@@ -4,7 +4,9 @@
 use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
 use super::{Class, Ontology, ROOT_CLASS, store};
 use crate::error::{Error, Record, Result};
+use crate::prefix::PrefixMatch;
 use crate::storage::workspace::WorkspaceDb;
+use crate::text::NonBlankText;
 
 /// A stored candidate.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -112,8 +114,7 @@ impl CandidateAction {
     pub fn decision(self, target: Option<&str>) -> Result<Option<Decision>> {
         let target = || {
             target
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
+                .and_then(str::non_blank)
                 .map(str::to_owned)
                 .ok_or_else(|| Error::Ontology(format!("{self} needs a target")))
         };
@@ -245,16 +246,7 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<CandidateRow> {
         .query_map(duckdb::params![prefix, prefix], row_from)?
         .flatten()
         .collect();
-    match rows.len() {
-        1 => rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Ontology(String::from("candidate vanished"))),
-        0 => Err(Record::Candidate.missing(prefix)),
-        n => Err(Error::Ontology(format!(
-            "'{prefix}' matches {n} candidates; use more of the id"
-        ))),
-    }
+    PrefixMatch::of(rows, prefix, |r| r.id.as_str()).one(Record::Candidate, prefix)
 }
 
 /// Reject candidates: nothing changes in the ontology.

@@ -20,6 +20,7 @@ use crate::error::Error;
 use crate::llm::{OllamaRunningModels, oauth};
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
+use crate::text::Count;
 use crate::{config, crypto};
 use secrecy::ExposeSecret;
 
@@ -329,7 +330,7 @@ async fn check_control(report: &mut Report, config: &Config) -> Option<ControlPl
                 format!(
                     "{} opens and is migrated; {}",
                     path.display(),
-                    plural(workspaces, "workspace")
+                    Count(workspaces, "workspace")
                 ),
             ));
             Some(control)
@@ -397,8 +398,8 @@ async fn check_workspace(
                 Status::Ok,
                 format!(
                     "'{name}' opens: {}, {}",
-                    plural(tables, "table"),
-                    plural(documents, "document")
+                    Count(tables, "table"),
+                    Count(documents, "document")
                 ),
             ));
             if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
@@ -865,7 +866,7 @@ async fn check_server(report: &mut Report, config: &Config, control: Option<&Con
             let check = Check::new(
                 Area::Server,
                 Status::Ok,
-                format!("`quack serve` binds {addr}, this machine only; {}", plural(users, "user")),
+                format!("`quack serve` binds {addr}, this machine only; {}", Count(users, "user")),
             );
             report.push(if users == 0 {
                 check.fix("`quack user add NAME` before `quack serve`, or `quack serve --local` for yourself alone")
@@ -1008,14 +1009,6 @@ fn error_chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     text
-}
-
-fn plural(n: usize, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
-    }
 }
 
 #[cfg(test)]
