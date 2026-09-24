@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::config::{AuthMode, Config};
+use quack_core::config::Config;
 use quack_core::doctor::Options;
 use quack_core::error::{Error as CoreError, Record};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
@@ -1030,7 +1030,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             let mut names: Vec<&str> = config
                 .providers
                 .iter()
-                .filter(|(_, p)| p.auth == AuthMode::Oauth)
+                .filter(|(_, p)| p.auth.oauth().is_some())
                 .map(|(name, _)| name.as_str())
                 .collect();
             if let Some(only) = provider.as_deref() {
@@ -1076,10 +1076,10 @@ fn oauth_manager(config: &Config, name: &str) -> Result<Arc<TokenManager>> {
             "provider '{name}' is not configured; add [providers.{name}] with auth = \"oauth\""
         )
     })?;
-    if provider.auth != AuthMode::Oauth {
+    let Some(oauth) = provider.auth.oauth() else {
         anyhow::bail!("provider '{name}' does not use auth = \"oauth\"");
-    }
-    oauth::shared_manager(&config.tokens_dir(), name, provider)
+    };
+    oauth::shared_manager(&config.tokens_dir(), name, oauth)
         .context("failed to prepare the OAuth token manager")
 }
 

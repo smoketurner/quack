@@ -478,7 +478,7 @@ impl WorkspaceDb {
         let db = Self {
             conn,
             vectors: Vectors::new(column_dimension, profile),
-            query_timeout: Duration::from_secs(u64::from(config.analysis.query_timeout_seconds)),
+            query_timeout: config.analysis.query_timeout(),
             files_dir: Some(files_dir),
         };
         db.apply_resource_limits(config)?;

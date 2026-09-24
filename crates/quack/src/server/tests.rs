@@ -15,7 +15,8 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use quack_core::config::{AuthMode, Config, ProviderConfig, ProviderName, ProviderType};
+use quack_core::config::{BaseUrl, Config, ProviderConfig, ProviderName, ProviderType};
+use quack_core::embedding::Dimension;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -2294,20 +2295,16 @@ async fn local_mode_web_skips_login() {
 #[test]
 fn banner_names_the_address_mode_and_models() {
     let mut config = Config::default();
-    config.general.chat_model = Some(String::from("ollama/llama3"));
+    config.general.chat_model = Some(
+        "ollama/llama3"
+            .parse()
+            .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
+    );
     config.providers.insert(
         "ollama"
             .parse::<ProviderName>()
             .unwrap_or_else(|e| fail(&e.to_string())),
-        ProviderConfig {
-            provider_type: ProviderType::Ollama,
-            auth: AuthMode::None,
-            base_url: None,
-            api_key_env: None,
-            embedding_dimension: None,
-            max_concurrent_requests: None,
-            oauth: None,
-        },
+        ProviderConfig::new(ProviderType::Ollama),
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
     let banner = |local, users, workspaces| {
@@ -3765,19 +3762,22 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
     // An embedding model the job cannot reach: the refresh starts, then
     // fails in the background with the provider's error.
     let mut config = Config::default();
-    config.general.embedding_model = Some(String::from("ollama/embeddinggemma"));
+    config.general.embedding_model = Some(
+        "ollama/embeddinggemma"
+            .parse()
+            .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
+    );
     config.providers.insert(
         "ollama"
             .parse::<ProviderName>()
             .unwrap_or_else(|e| fail(&e.to_string())),
         ProviderConfig {
-            provider_type: ProviderType::Ollama,
-            auth: AuthMode::None,
-            base_url: Some(String::from("http://127.0.0.1:9")),
-            api_key_env: None,
-            embedding_dimension: Some(4),
-            max_concurrent_requests: None,
-            oauth: None,
+            base_url: Some(
+                BaseUrl::try_from(String::from("http://127.0.0.1:9"))
+                    .unwrap_or_else(|e| fail(&e.to_string())),
+            ),
+            embedding_dimension: Some(Dimension::new(4)),
+            ..ProviderConfig::new(ProviderType::Ollama)
         },
     );
     let h = harness_with(false, config).await;

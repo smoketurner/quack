@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use quack_core::config::{
-    AnalysisConfig, AuthMode, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
+    AnalysisConfig, BaseUrl, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
     ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
     RetrievalConfig, ServerConfig,
 };
@@ -152,13 +152,9 @@ fn test_config(data_dir: &Path) -> Config {
     providers.insert(
         "mock".parse().unwrap(),
         ProviderConfig {
-            provider_type: ProviderType::Ollama,
-            auth: AuthMode::None,
-            base_url: Some("http://localhost:9999".into()),
-            api_key_env: None,
-            embedding_dimension: Some(TEST_DIM_U32),
-            max_concurrent_requests: None,
-            oauth: None,
+            base_url: Some(BaseUrl::try_from(String::from("http://localhost:9999")).unwrap()),
+            embedding_dimension: Some(Dimension::new(TEST_DIM_U32)),
+            ..ProviderConfig::new(ProviderType::Ollama)
         },
     );
     Config {
@@ -166,7 +162,7 @@ fn test_config(data_dir: &Path) -> Config {
             data_dir: data_dir.to_path_buf(),
             default_workspace: "test".into(),
             chat_model: None,
-            embedding_model: Some("mock/mock-model".into()),
+            embedding_model: Some("mock/mock-model".parse().unwrap()),
         },
         providers,
         ingestion: IngestionConfig {
@@ -1148,9 +1144,9 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
     }
     let mut changed = test_config(dir.path());
     if let Some(p) = changed.providers.get_mut("mock") {
-        p.embedding_dimension = Some(8);
+        p.embedding_dimension = Some(Dimension::new(8));
     }
-    changed.general.embedding_model = Some("mock/other-model".into());
+    changed.general.embedding_model = Some("mock/other-model".parse().unwrap());
     // Opening still works: the old vectors stay, at their width, unsearched.
     let db = WorkspaceDb::open(&changed, "ws-mismatch").unwrap();
     assert_eq!(db.embedding_dimension(), Dimension::new(4));
@@ -1245,7 +1241,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     }
     let mut changed = test_config(dir.path());
     if let Some(p) = changed.providers.get_mut("mock") {
-        p.embedding_dimension = Some(8);
+        p.embedding_dimension = Some(Dimension::new(8));
     }
     let db = WorkspaceDb::open(&changed, "ws-adopt").unwrap();
     assert_eq!(db.embedding_dimension(), Dimension::new(8));

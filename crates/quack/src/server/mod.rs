@@ -237,7 +237,7 @@ impl fmt::Display for Banner<'_> {
         let providers: Vec<String> = config
             .providers
             .iter()
-            .map(|(name, p)| format!("{name} ({}, auth {})", p.provider_type, p.auth))
+            .map(|(name, p)| format!("{name} ({}, auth {})", p.provider_type, p.auth.mode()))
             .collect();
         let providers = if providers.is_empty() {
             String::from("none configured")

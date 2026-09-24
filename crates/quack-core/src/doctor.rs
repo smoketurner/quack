@@ -14,7 +14,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::inspect::{FileState, Inspection};
-use crate::config::{AuthMode, Config, ModelRef, ProviderConfig, ProviderName, ProviderType};
+use crate::config::{
+    BaseUrl, Config, ModelRef, OAuthConfig, ProviderAuth, ProviderName, ProviderType,
+};
+use crate::embedding::Dimension;
 use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::{OllamaRunningModels, oauth};
@@ -23,11 +26,6 @@ use crate::storage::workspace::WorkspaceDb;
 use crate::text::Count;
 use crate::{config, crypto};
 use secrecy::ExposeSecret;
-
-/// Where Ollama listens when nothing says otherwise.
-const OLLAMA_DEFAULT_URL: &str = "http://localhost:11434";
-const OPENAI_DEFAULT_URL: &str = "https://api.openai.com/v1";
-const ANTHROPIC_DEFAULT_URL: &str = "https://api.anthropic.com";
 
 /// How one check came out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -433,7 +431,7 @@ async fn check_workspace(
 }
 
 async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&reqwest::Client>) {
-    let Some(spec) = config.general.chat_model.as_deref() else {
+    let Some(spec) = config.general.chat_model.as_ref() else {
         let suggestion = suggest_chat_model(http).await;
         report.push(
             Check::new(
@@ -487,7 +485,7 @@ async fn check_embedding_model(
                     .provider
                     .base_url
                     .clone()
-                    .unwrap_or_else(|| OLLAMA_DEFAULT_URL.to_owned());
+                    .unwrap_or_else(|| ProviderType::Ollama.default_base_url());
                 let show = OllamaShow::fetch(http, &base, model.model).await;
                 if let Some(check) = width_check(model, configured, show) {
                     report.push(check);
@@ -547,13 +545,10 @@ struct OllamaShow {
 impl OllamaShow {
     async fn fetch(
         http: &reqwest::Client,
-        base: &str,
+        base: &BaseUrl,
         model: &str,
     ) -> std::result::Result<Self, Probe> {
-        let url = format!(
-            "{}/api/show",
-            base.trim_end_matches('/').trim_end_matches("/v1")
-        );
+        let url = format!("{}/api/show", base.root());
         let response = http
             .post(url)
             .json(&serde_json::json!({ "model": model }))
@@ -585,11 +580,11 @@ impl OllamaShow {
 /// unreachable provider or a missing model.
 fn width_check(
     model: ModelRef<'_>,
-    configured: u32,
+    configured: Dimension,
     show: std::result::Result<OllamaShow, Probe>,
 ) -> Option<Check> {
     let reported = show.ok()?.embedding_length()?;
-    Some(if reported == configured {
+    Some(if reported == configured.get() {
         Check::new(
             Area::Embeddings,
             Status::Ok,
@@ -624,7 +619,7 @@ async fn check_model(
     let base = provider
         .base_url
         .clone()
-        .unwrap_or_else(|| default_base_url(provider.provider_type).to_owned());
+        .unwrap_or_else(|| provider.provider_type.default_base_url());
 
     let credential = match model_credential(area, config, model).await {
         Ok(credential) => credential,
@@ -634,7 +629,7 @@ async fn check_model(
         }
     };
 
-    if credential.is_some() && sends_in_cleartext(&base) {
+    if credential.is_some() && base.sends_in_cleartext() {
         report.push(
             Check::new(
                 area,
@@ -666,8 +661,8 @@ async fn model_credential(
 ) -> std::result::Result<Option<String>, Box<Check>> {
     let provider = model.provider;
     let name = model.provider_name;
-    Ok(match provider.auth {
-        AuthMode::None => {
+    Ok(match &provider.auth {
+        ProviderAuth::None => {
             if provider.provider_type != ProviderType::Ollama {
                 return Err(Box::new(
                     Check::new(
@@ -685,23 +680,17 @@ async fn model_credential(
             }
             None
         }
-        AuthMode::ApiKey => {
-            let var = provider.api_key_env.as_deref().unwrap_or_default();
-            match std::env::var(var) {
-                Ok(key) if !key.trim().is_empty() => Some(key),
-                _ => {
-                    return Err(Box::new(
-                        Check::new(
-                            area,
-                            Status::Fail,
-                            format!("{model}: provider '{name}' reads its key from {var}, which is not set"),
-                        )
-                        .fix(format!("export {var}=... in the environment quack runs in")),
-                    ));
-                }
+        ProviderAuth::ApiKey { env } => match provider.auth.credential(config, name).await {
+            Ok(key) => key,
+            Err(e) => {
+                return Err(Box::new(
+                    Check::new(area, Status::Fail, format!("{model}: {e}"))
+                        .fix(format!("export {env}=... in the environment quack runs in")),
+                ));
             }
-        }
-        AuthMode::Oauth => match oauth_token(config, name, provider).await {
+        },
+        // Status first: asking for a token without a login would start one.
+        ProviderAuth::Oauth(oauth) => match oauth_token(config, name, oauth).await {
             Ok(token) => Some(token),
             Err(message) => {
                 return Err(Box::new(
@@ -717,7 +706,7 @@ async fn model_credential(
 fn listing_check(
     area: Area,
     model: ModelRef<'_>,
-    base: &str,
+    base: &BaseUrl,
     listing: std::result::Result<Listing, Probe>,
 ) -> Check {
     let provider = model.provider;
@@ -739,8 +728,10 @@ fn listing_check(
             format!("{model}: {base} refused the credential (HTTP {status})"),
         )
         .fix(match provider.auth {
-            AuthMode::Oauth => format!("quack auth login {name}"),
-            _ => String::from("check the key in the environment variable"),
+            ProviderAuth::Oauth(_) => format!("quack auth login {name}"),
+            ProviderAuth::None | ProviderAuth::ApiKey { .. } => {
+                String::from("check the key in the environment variable")
+            }
         }),
         Err(Probe::Unexpected(detail)) => Check::new(
             area,
@@ -778,10 +769,10 @@ fn listing_check(
 async fn oauth_token(
     config: &Config,
     name: &ProviderName,
-    provider: &ProviderConfig,
+    oauth: &OAuthConfig,
 ) -> std::result::Result<String, String> {
     let manager =
-        oauth::shared_manager(&config.tokens_dir(), name, provider).map_err(|e| e.to_string())?;
+        oauth::shared_manager(&config.tokens_dir(), name, oauth).map_err(|e| e.to_string())?;
     let status = manager.status().await.map_err(|e| e.to_string())?;
     if !status.logged_in {
         return Err(format!("provider '{name}' uses OAuth and is not logged in"));
@@ -797,7 +788,13 @@ async fn oauth_token(
 /// answers, otherwise the general shape.
 async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
     let pulled = match http {
-        Some(http) => match list_models(http, ProviderType::Ollama, OLLAMA_DEFAULT_URL, None).await
+        Some(http) => match list_models(
+            http,
+            ProviderType::Ollama,
+            &ProviderType::Ollama.default_base_url(),
+            None,
+        )
+        .await
         {
             Ok(Listing::Ollama(models)) => models
                 .models
@@ -816,7 +813,8 @@ async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
     };
     match pulled.first() {
         Some(first) => format!(
-            "Ollama is running at {OLLAMA_DEFAULT_URL} with {}; {}",
+            "Ollama is running at {} with {}; {}",
+            ProviderType::Ollama.default_base_url(),
             pulled.join(", "),
             snippet(first)
         ),
@@ -916,20 +914,19 @@ fn probe_client(options: &Options) -> Option<reqwest::Client> {
 async fn list_models(
     http: &reqwest::Client,
     provider: ProviderType,
-    base: &str,
+    base: &BaseUrl,
     credential: Option<&str>,
 ) -> std::result::Result<Listing, Probe> {
-    let base = base.trim_end_matches('/');
     let request = match provider {
         ProviderType::Ollama => {
-            let request = http.get(format!("{}/api/tags", base.trim_end_matches("/v1")));
+            let request = http.get(format!("{}/api/tags", base.root()));
             match credential {
                 Some(key) => request.bearer_auth(key),
                 None => request,
             }
         }
         ProviderType::Openai => {
-            let request = http.get(format!("{base}/models"));
+            let request = http.get(format!("{}/models", base.trimmed()));
             match credential {
                 Some(key) => request.bearer_auth(key),
                 None => request,
@@ -937,7 +934,7 @@ async fn list_models(
         }
         ProviderType::Anthropic => {
             let request = http
-                .get(format!("{base}/v1/models?limit=1000"))
+                .get(format!("{}/v1/models?limit=1000", base.trimmed()))
                 .header("anthropic-version", "2023-06-01");
             match credential {
                 Some(key) => request.header("x-api-key", key),
@@ -967,33 +964,6 @@ async fn list_models(
         ProviderType::Openai | ProviderType::Anthropic => serde_json::from_slice::<IdList>(&bytes)
             .map(|list| Listing::Ids(list.data.into_iter().map(|e| e.id).collect()))
             .map_err(|e| Probe::Unexpected(e.to_string())),
-    }
-}
-
-fn default_base_url(provider: ProviderType) -> &'static str {
-    match provider {
-        ProviderType::Ollama => OLLAMA_DEFAULT_URL,
-        ProviderType::Openai => OPENAI_DEFAULT_URL,
-        ProviderType::Anthropic => ANTHROPIC_DEFAULT_URL,
-    }
-}
-
-/// Whether a credential sent to `base` would cross the network unencrypted:
-/// plain HTTP to anything but this machine.
-fn sends_in_cleartext(base: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base) else {
-        return false;
-    };
-    if url.scheme() != "http" {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => !ip.is_loopback(),
-        Err(_) => host != "localhost",
     }
 }
 
@@ -1039,7 +1009,7 @@ mod tests {
         };
         assert_eq!(gemma().embedding_length(), Some(768));
 
-        let wrong = width_check(model, 1024, Ok(gemma())).unwrap();
+        let wrong = width_check(model, Dimension::new(1024), Ok(gemma())).unwrap();
         assert_eq!(wrong.status, Status::Fail);
         assert!(
             wrong.summary.contains("768-dimensional"),
@@ -1051,11 +1021,13 @@ mod tests {
             Some("set embedding_dimension = 768 under [providers.o]")
         );
         assert_eq!(
-            width_check(model, 768, Ok(gemma())).unwrap().status,
+            width_check(model, Dimension::new(768), Ok(gemma()))
+                .unwrap()
+                .status,
             Status::Ok
         );
-        assert!(width_check(model, 768, Ok(show(serde_json::json!({})))).is_none());
-        assert!(width_check(model, 768, Err(Probe::Rejected(401))).is_none());
+        assert!(width_check(model, Dimension::new(768), Ok(show(serde_json::json!({})))).is_none());
+        assert!(width_check(model, Dimension::new(768), Err(Probe::Rejected(401))).is_none());
     }
 
     #[test]
@@ -1227,15 +1199,5 @@ mod tests {
             find(&local, Area::Server).first().unwrap().status,
             Status::Fail
         );
-    }
-
-    #[test]
-    fn cleartext_is_plain_http_off_this_machine() {
-        assert!(sends_in_cleartext("http://gpu-box:11434"));
-        assert!(sends_in_cleartext("http://10.0.0.5/v1"));
-        assert!(!sends_in_cleartext("http://localhost:11434"));
-        assert!(!sends_in_cleartext("http://127.0.0.1:11434"));
-        assert!(!sends_in_cleartext("http://[::1]:11434"));
-        assert!(!sends_in_cleartext("https://api.openai.com/v1"));
     }
 }

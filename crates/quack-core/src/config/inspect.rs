@@ -20,8 +20,8 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    AuthMode, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Overrides,
-    config_file_path, default_redirect_uri,
+    AuthMode, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, ModelSpec,
+    OAuthConfig, Overrides, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -187,7 +187,10 @@ impl Inspection {
             ),
             Err(e) => {
                 let mut fallback = Config::default();
-                overrides.apply(&mut fallback);
+                // An override that does not parse is what the rejection names.
+                if let Err(e) = overrides.apply(&mut fallback) {
+                    tracing::debug!(error = %e, "an environment override does not parse");
+                }
                 (fallback, FileState::Rejected(e.to_string()))
             }
         };
@@ -380,8 +383,10 @@ fn general(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         &general.default_workspace,
         &default.default_workspace,
     );
-    s.optional_text("chat_model", general.chat_model.as_deref(), Some(ENV_MODEL));
-    s.optional_text("embedding_model", general.embedding_model.as_deref(), None);
+    let chat_model = general.chat_model.as_ref().map(ModelSpec::to_string);
+    s.optional_text("chat_model", chat_model.as_deref(), Some(ENV_MODEL));
+    let embedding_model = general.embedding_model.as_ref().map(ModelSpec::to_string);
+    s.optional_text("embedding_model", embedding_model.as_deref(), None);
 }
 
 /// One section per configured provider, and one more for its `oauth`
@@ -395,11 +400,15 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             s.required_text("type", &provider.provider_type.to_string());
             s.text(
                 "auth",
-                &provider.auth.to_string(),
+                &provider.auth.mode().to_string(),
                 &AuthMode::default().to_string(),
             );
-            s.optional_text("base_url", provider.base_url.as_deref(), None);
-            s.optional_text("api_key_env", provider.api_key_env.as_deref(), None);
+            s.optional_text(
+                "base_url",
+                provider.base_url.as_ref().map(BaseUrl::as_str),
+                None,
+            );
+            s.optional_text("api_key_env", provider.auth.api_key_env(), None);
             s.optional(
                 "embedding_dimension",
                 provider.embedding_dimension.map(|d| d.to_string()),
@@ -411,7 +420,7 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 Some(provider.default_request_limit().to_string()),
             );
         }
-        let Some(oauth) = &provider.oauth else {
+        let Some(oauth) = provider.auth.oauth() else {
             continue;
         };
         let mut s = inventory.section(format!("{section}.oauth"));
@@ -422,7 +431,11 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             Some(render_list(&oauth.scopes)),
             Some(String::from("[]")),
         );
-        s.text("redirect_uri", &oauth.redirect_uri, &default_redirect_uri());
+        s.text(
+            "redirect_uri",
+            &oauth.redirect_uri,
+            OAuthConfig::DEFAULT_REDIRECT_URI,
+        );
         s.flag("device_code", oauth.device_code, false);
         s.optional_text(
             "client_secret_env",
@@ -473,9 +486,8 @@ fn embedding(inventory: &mut Inventory<'_>, config: &Config) {
     let model = config
         .general
         .embedding_model
-        .as_deref()
-        .and_then(|spec| spec.split_once('/'))
-        .map_or("", |(_, model)| model);
+        .as_ref()
+        .map_or("", ModelSpec::model);
     let prompts = ResolvedPrompts::for_model(config, model).prompts;
     let builtin = Family::of(model).map(Family::prompts);
     let mut s = inventory.section("embedding");
@@ -694,12 +706,12 @@ fn environment(config: &Config) -> Vec<EnvVar> {
         var(ENV_BIND, "overrides [server].bind"),
     ];
     for (name, provider) in &config.providers {
-        if let Some(key) = &provider.api_key_env {
+        if let Some(key) = provider.auth.api_key_env() {
             vars.push(var(key, &format!("[providers.{name}].api_key_env")));
         }
         if let Some(secret) = provider
-            .oauth
-            .as_ref()
+            .auth
+            .oauth()
             .and_then(|o| o.client_secret_env.as_ref())
         {
             vars.push(var(
@@ -1024,7 +1036,10 @@ top_k = 3
         assert_eq!(scopes.value.as_deref(), Some("[\"a\", \"b\"]"));
         let redirect = setting(&inspection, "providers.azure.oauth.redirect_uri");
         assert_eq!(redirect.origin, Origin::Default);
-        assert_eq!(redirect.value, Some(quoted(&default_redirect_uri())));
+        assert_eq!(
+            redirect.value,
+            Some(quoted(OAuthConfig::DEFAULT_REDIRECT_URI))
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub use cache::{CachedToken, KeySource, TokenCache};
 
-use crate::config::{OAuthConfig, ProviderConfig, ProviderName};
+use crate::config::{OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
 
 /// Tokens with less than this left are refreshed before use.
@@ -587,14 +587,9 @@ async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
 pub fn shared_manager(
     tokens_dir: &Path,
     name: &ProviderName,
-    provider: &ProviderConfig,
+    oauth: &OAuthConfig,
 ) -> Result<Arc<TokenManager>> {
     static MANAGERS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokenManager>>>> = OnceLock::new();
-    let oauth = provider.oauth.clone().ok_or_else(|| {
-        Error::Config(format!(
-            "provider '{name}' has auth = \"oauth\" but no [providers.{name}.oauth] section"
-        ))
-    })?;
     let key = tokens_dir.join(name.as_str());
     let mut managers = MANAGERS
         .get_or_init(|| StdMutex::new(HashMap::new()))
@@ -606,7 +601,7 @@ pub fn shared_manager(
     let manager = Arc::new(TokenManager::new(
         tokens_dir,
         name,
-        oauth,
+        oauth.clone(),
         KeySource::Keychain,
     )?);
     managers.insert(key, Arc::clone(&manager));

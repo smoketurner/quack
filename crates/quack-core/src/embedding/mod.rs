@@ -168,18 +168,9 @@ impl Profile {
         let Some(model) = config.embedding_model_ref()? else {
             return Ok(None);
         };
-        let Some(dimension) = model.provider.embedding_dimension else {
-            return Err(Error::Config(format!(
-                "provider '{}' is used for embeddings but has no embedding_dimension",
-                model.provider_name
-            )));
-        };
+        let dimension = model.dimension()?;
         let resolved = ResolvedPrompts::for_model(config, model.model);
-        Ok(Some(Self::new(
-            model.model,
-            Dimension::new(dimension),
-            resolved.prompts,
-        )))
+        Ok(Some(Self::new(model.model, dimension, resolved.prompts)))
     }
 
     /// The identity recorded beside each stored vector: the SHA-256 of
