@@ -19,7 +19,7 @@ use quack_core::llm;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{ChunkScope, StatementKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::StreamEvent;
 use crate::server::auth::{Access, Identity, Need};
@@ -343,6 +343,7 @@ pub(crate) struct SqlRequest {
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
 /// A capped result set for the API and the web grid.
+#[derive(Debug, Serialize)]
 pub(crate) struct SqlOutcome {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -357,83 +358,77 @@ pub(crate) async fn sql(
     identity: Identity,
     Path(id): Path<String>,
     Json(body): Json<SqlRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SqlOutcome>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let outcome = execute_sql(&app, &access, &body.sql).await?;
-    Ok(Json(serde_json::json!({
-        "columns": outcome.columns,
-        "rows": outcome.rows,
-        "row_count": outcome.row_count,
-        "truncated": outcome.truncated,
-    })))
+    Ok(Json(access.execute_sql(&app, &body.sql).await?))
 }
 
-/// Classify, authorize, run, and audit one statement for an `Access`.
-pub(crate) async fn execute_sql(
-    app: &App,
-    access: &Access,
-    statement: &str,
-) -> ApiResult<SqlOutcome> {
-    let sql = statement.to_owned();
-    // Classifying parses the statement: a read, never in the writer's line.
-    let kind = app
-        .read(&access.workspace.id, move |db| {
-            db.classify_user_statement(&sql)
-        })
-        .await
-        .map_err(|e| ApiError::forbidden(e.message))?;
-    let is_write = match kind {
-        StatementKind::Read => false,
-        StatementKind::Write => true,
-        StatementKind::Invalid(message) => return Err(ApiError::bad_request(message)),
-    };
-    let detail = serde_json::json!({ "sql": statement });
-    if is_write && tools::creates_temp_object(statement) {
-        access
-            .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
-            .await?;
-        return Err(ApiError::bad_request(TEMP_OBJECT_REFUSED));
-    }
-    if is_write && !access.permits(Need::WRITE) {
-        access
-            .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
-            .await?;
-        return Err(ApiError::forbidden(
-            "writes need the member role and the write scope",
-        ));
-    }
-    let reader_db = app.reader_db(&access.workspace.id).await?;
-    let sql = statement.to_owned();
-    let max_rows = app.config.analysis.max_query_rows;
-    let result = if is_write {
-        let db = app.workspace_db(&access.workspace.id).await?;
-        let result = with_db(db, move |db| db.execute_query_capped(&sql, max_rows)).await;
-        // Whatever ran might have created a temp object the check above
-        // did not catch (a leading comment, a multi-statement batch);
-        // check the writer's catalog regardless of whether the statement
-        // itself errored, since an earlier statement in a batch can have
-        // already run.
-        reader_db.observe_write().await;
-        result
-    } else {
-        // A read never queues behind a write: run it on the workspace's
-        // reader connection instead of the writer.
-        reader_db
-            .with_db(move |db| db.execute_query_capped(&sql, max_rows))
+impl Access {
+    /// Classify, authorize, run, and audit one statement: the SQL the API
+    /// and the web grid share.
+    pub(crate) async fn execute_sql(&self, app: &App, statement: &str) -> ApiResult<SqlOutcome> {
+        let access = self;
+        let sql = statement.to_owned();
+        // Classifying parses the statement: a read, never in the writer's line.
+        let kind = app
+            .read(&access.workspace.id, move |db| {
+                db.classify_user_statement(&sql)
+            })
             .await
-            .map_err(ApiError::from)
-    };
-    let outcome = Outcome::of(&result);
-    access
-        .audit(app, AuditAction::Sql, None, outcome, Some(detail))
-        .await?;
-    let capped = result.map_err(|e| ApiError::unprocessable(e.message))?;
-    Ok(SqlOutcome {
-        truncated: capped.truncated(),
-        columns: capped.results.columns,
-        rows: capped.results.rows,
-        row_count: capped.total_rows,
-    })
+            .map_err(|e| ApiError::forbidden(e.message))?;
+        let is_write = match kind {
+            StatementKind::Read => false,
+            StatementKind::Write => true,
+            StatementKind::Invalid(message) => return Err(ApiError::bad_request(message)),
+        };
+        let detail = serde_json::json!({ "sql": statement });
+        if is_write && tools::creates_temp_object(statement) {
+            access
+                .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
+                .await?;
+            return Err(ApiError::bad_request(TEMP_OBJECT_REFUSED));
+        }
+        if is_write && !access.permits(Need::WRITE) {
+            access
+                .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
+                .await?;
+            return Err(ApiError::forbidden(
+                "writes need the member role and the write scope",
+            ));
+        }
+        let reader_db = app.reader_db(&access.workspace.id).await?;
+        let sql = statement.to_owned();
+        let max_rows = app.config.analysis.max_query_rows;
+        let result = if is_write {
+            let db = app.workspace_db(&access.workspace.id).await?;
+            let result = with_db(db, move |db| db.execute_query_capped(&sql, max_rows)).await;
+            // Whatever ran might have created a temp object the check above
+            // did not catch (a leading comment, a multi-statement batch);
+            // check the writer's catalog regardless of whether the statement
+            // itself errored, since an earlier statement in a batch can have
+            // already run.
+            reader_db.observe_write().await;
+            result
+        } else {
+            // A read never queues behind a write: run it on the workspace's
+            // reader connection instead of the writer.
+            reader_db
+                .with_db(move |db| db.execute_query_capped(&sql, max_rows))
+                .await
+                .map_err(ApiError::from)
+        };
+        let outcome = Outcome::of(&result);
+        access
+            .audit(app, AuditAction::Sql, None, outcome, Some(detail))
+            .await?;
+        let capped = result.map_err(|e| ApiError::unprocessable(e.message))?;
+        Ok(SqlOutcome {
+            truncated: capped.truncated(),
+            columns: capped.results.columns,
+            rows: capped.results.rows,
+            row_count: capped.total_rows,
+        })
+    }
 }
 
 #[derive(Deserialize)]

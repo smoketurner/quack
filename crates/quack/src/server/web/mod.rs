@@ -46,8 +46,7 @@ use super::api::ontology::DecideRequest;
 use super::api::query::SqlRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
-    documents as docs_api, graph as graph_api, import as import_api, query as query_api,
-    workspaces as workspaces_api,
+    documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
 };
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
@@ -1193,7 +1192,7 @@ async fn sql_page(
 
 async fn render_sql(app: &App, access: &Access, sql: &str) -> WebResult<String> {
     let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
-    let result = match query_api::execute_sql(app, access, sql).await {
+    let result = match access.execute_sql(app, sql).await {
         Ok(outcome) => SqlResult {
             columns: outcome.columns,
             rows: outcome
@@ -1235,7 +1234,7 @@ async fn sql_csv(
     Query(q): Query<SqlRequest>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let outcome = query_api::execute_sql(&app, &access, &q.sql).await?;
+    let outcome = access.execute_sql(&app, &q.sql).await?;
     let mut csv = String::new();
     csv.push_str(
         &outcome
@@ -1859,6 +1858,21 @@ struct AuditQuery {
     workspace_id: Option<String>,
 }
 
+/// The page's filter form: a blank field is no filter, and the newest 200
+/// rows show.
+impl From<AuditQuery> for AuditFilter {
+    fn from(q: AuditQuery) -> Self {
+        let given = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        Self {
+            action: given(q.action),
+            outcome: q.outcome,
+            workspace_id: given(q.workspace_id),
+            limit: 200,
+            ..Self::default()
+        }
+    }
+}
+
 /// A query or form value where blank means "not given", as the filter's
 /// "any" option sends it; anything else must parse.
 fn blank_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -1882,25 +1896,15 @@ async fn admin_audit(
     Query(q): Query<AuditQuery>,
 ) -> WebResult<Response> {
     identity.require_admin()?;
-    let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-    let (action, outcome, workspace_id) = (clean(q.action), q.outcome, clean(q.workspace_id));
-    let rows = app
-        .control
-        .query_audit(&AuditFilter {
-            action: action.clone(),
-            outcome,
-            workspace_id: workspace_id.clone(),
-            limit: 200,
-            ..AuditFilter::default()
-        })
-        .await?;
+    let filter = AuditFilter::from(q);
+    let rows = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
         page: page(&app, &identity, "Audit", None),
         rows,
-        action: action.unwrap_or_default(),
-        outcome,
+        action: filter.action.unwrap_or_default(),
+        outcome: filter.outcome,
         outcomes: Outcome::ALL,
-        workspace_id: workspace_id.unwrap_or_default(),
+        workspace_id: filter.workspace_id.unwrap_or_default(),
     })
 }
 

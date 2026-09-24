@@ -11,20 +11,24 @@ use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, WorkspaceChanges, WorkspaceRow,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
-fn workspace_json(ws: &WorkspaceRow, role: Option<Role>) -> serde_json::Value {
-    serde_json::json!({
-        "id": ws.id,
-        "name": ws.name,
-        "classification": ws.classification,
-        "allowed_providers": ws.allowed_providers,
-        "role": role,
-    })
+/// A workspace as the API shows it: its row, and the caller's role in it.
+#[derive(Debug, Serialize)]
+pub(crate) struct WorkspaceView {
+    #[serde(flatten)]
+    workspace: WorkspaceRow,
+    role: Option<Role>,
+}
+
+impl WorkspaceView {
+    fn new(workspace: WorkspaceRow, role: Option<Role>) -> Self {
+        Self { workspace, role }
+    }
 }
 
 pub(crate) async fn list(
@@ -36,7 +40,7 @@ pub(crate) async fn list(
             .list_workspaces()
             .await?
             .into_iter()
-            .map(|w| workspace_json(&w, Some(Role::Owner)))
+            .map(|w| WorkspaceView::new(w, Some(Role::Owner)))
             .collect::<Vec<_>>()
     } else if let Credential::Token(token) = &identity.credential {
         let ws = app.control.get_workspace(&token.workspace_id).await?;
@@ -44,14 +48,16 @@ pub(crate) async fn list(
             .control
             .member_role(&token.workspace_id, &identity.user_id)
             .await?;
-        ws.into_iter().map(|w| workspace_json(&w, role)).collect()
+        ws.into_iter()
+            .map(|w| WorkspaceView::new(w, role))
+            .collect()
     } else if identity.is_admin {
         let mine = app.control.workspaces_for_user(&identity.user_id).await?;
         let all = app.control.list_workspaces().await?;
         all.into_iter()
             .map(|w| {
                 let role = mine.iter().find(|(m, _)| m.id == w.id).map(|(_, r)| *r);
-                workspace_json(&w, role)
+                WorkspaceView::new(w, role)
             })
             .collect()
     } else {
@@ -59,7 +65,7 @@ pub(crate) async fn list(
             .workspaces_for_user(&identity.user_id)
             .await?
             .into_iter()
-            .map(|(w, r)| workspace_json(&w, Some(r)))
+            .map(|(w, r)| WorkspaceView::new(w, Some(r)))
             .collect()
     };
     Ok(Json(serde_json::json!({ "workspaces": rows })))
@@ -78,7 +84,7 @@ pub(crate) async fn create(
     let ws = identity.create_workspace(&app, &body.name).await?;
     Ok((
         StatusCode::CREATED,
-        Json(workspace_json(&ws, Some(Role::Owner))),
+        Json(WorkspaceView::new(ws, Some(Role::Owner))),
     ))
 }
 
@@ -115,12 +121,12 @@ pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<WorkspaceView>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit(&app, AuditAction::Open, None, Outcome::Allowed, None)
         .await?;
-    Ok(Json(workspace_json(&access.workspace, access.role)))
+    Ok(Json(WorkspaceView::new(access.workspace, access.role)))
 }
 
 #[derive(Deserialize)]
@@ -135,7 +141,7 @@ pub(crate) async fn update(
     identity: Identity,
     Path(id): Path<String>,
     Json(body): Json<UpdateWorkspace>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<WorkspaceView>> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let changes = WorkspaceChanges {
         classification: body.classification,
@@ -146,7 +152,7 @@ pub(crate) async fn update(
         },
     };
     let ws = update_settings(&app, &access, changes).await?;
-    Ok(Json(workspace_json(&ws, access.role)))
+    Ok(Json(WorkspaceView::new(ws, access.role)))
 }
 
 /// Change a workspace's settings for its owner, from the API or the web

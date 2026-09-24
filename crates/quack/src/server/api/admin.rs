@@ -72,15 +72,10 @@ fn default_limit() -> u32 {
     100
 }
 
-pub(crate) async fn audit(
-    State(app): State<App>,
-    identity: Identity,
-    Query(q): Query<AuditQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
-    identity.require_admin()?;
-    let rows = app
-        .control
-        .query_audit(&AuditFilter {
+/// At most 1000 rows per request.
+impl From<AuditQuery> for AuditFilter {
+    fn from(q: AuditQuery) -> Self {
+        Self {
             user_id: q.user_id,
             workspace_id: q.workspace_id,
             action: q.action,
@@ -88,7 +83,16 @@ pub(crate) async fn audit(
             since: q.since,
             until: q.until,
             limit: q.limit.min(1000),
-        })
-        .await?;
+        }
+    }
+}
+
+pub(crate) async fn audit(
+    State(app): State<App>,
+    identity: Identity,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    identity.require_admin()?;
+    let rows = app.control.query_audit(&AuditFilter::from(q)).await?;
     Ok(Json(serde_json::json!({ "audit": rows })))
 }
