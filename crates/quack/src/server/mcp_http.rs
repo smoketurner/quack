@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use super::auth::{Access, Identity, Need};
 use super::error::ApiResult;
-use super::state::App;
+use super::state::{App, McpEntry, McpKey};
 use crate::mcp::{Auditor, McpServer, ServerAuditor};
 
 pub(crate) async fn handle(
@@ -24,27 +24,26 @@ pub(crate) async fn handle(
 ) -> ApiResult<Response> {
     identity.channel = Some(Channel::Mcp);
     let access = Access::resolve(&app, identity, &workspace, Need::READ).await?;
-    let can_write = access.permits(Need::WRITE);
-    let key = format!(
-        "{}:{}:{}",
-        access.workspace.id,
-        access.identity.user_id,
-        if can_write { "rw" } else { "ro" }
-    );
+    let policy = if access.permits(Need::WRITE) {
+        WritePolicy::Allow
+    } else {
+        WritePolicy::Deny
+    };
+    let key = McpKey {
+        workspace_id: access.workspace.id.clone(),
+        user_id: access.identity.user_id.clone(),
+        policy,
+    };
     let db = app.workspace_db(&access.workspace.id).await?;
     let reader = app.reader_db(&access.workspace.id).await?;
-    let (transport, server) = app
-        .mcp_transport(&key, || {
+    let McpEntry { transport, server } = app
+        .mcp_transport(key, || {
             McpServer::new(
                 app.config.clone(),
                 db,
                 reader,
                 access.workspace.clone(),
-                if can_write {
-                    WritePolicy::Allow
-                } else {
-                    WritePolicy::Deny
-                },
+                policy,
                 Some(access.identity.user_id.clone()),
                 Auditor::Server(Box::new(ServerAuditor {
                     app: std::sync::Arc::clone(&app),

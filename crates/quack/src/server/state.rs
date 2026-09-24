@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb, open_reader};
 use quack_core::config::Config;
 use quack_core::jobs::JobQueue;
@@ -48,7 +49,7 @@ pub(crate) struct AppState {
     pub jobs: JobQueue,
     /// One MCP transport per workspace, user, and write permission; each
     /// carries its own MCP sessions. See `server::mcp_http`.
-    mcp: tokio::sync::Mutex<HashMap<String, (McpTransport, McpServer)>>,
+    mcp: tokio::sync::Mutex<HashMap<McpKey, McpEntry>>,
     /// Workspaces with a graph extraction in flight: one at a time each,
     /// so a reset cannot clear a run part way (issue #48).
     extractions: Mutex<HashSet<String>>,
@@ -91,6 +92,22 @@ impl Drop for ExtractionSlot {
 
 pub(crate) type McpTransport = StreamableHttpService<McpServer, LocalSessionManager>;
 
+/// Which MCP transport a request belongs to: one per workspace, user, and
+/// write permission, so its audit rows and its writes are that caller's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct McpKey {
+    pub workspace_id: String,
+    pub user_id: String,
+    pub policy: WritePolicy,
+}
+
+/// An MCP transport and the server behind it.
+#[derive(Clone)]
+pub(crate) struct McpEntry {
+    pub transport: McpTransport,
+    pub server: McpServer,
+}
+
 pub(crate) type App = Arc<AppState>;
 
 impl AppState {
@@ -127,11 +144,11 @@ impl AppState {
     /// The MCP transport for `key`, built with `make` on first use.
     pub(crate) async fn mcp_transport(
         &self,
-        key: &str,
+        key: McpKey,
         make: impl FnOnce() -> McpServer,
-    ) -> (McpTransport, McpServer) {
+    ) -> McpEntry {
         let mut open = self.mcp.lock().await;
-        if let Some(entry) = open.get(key) {
+        if let Some(entry) = open.get(&key) {
             return entry.clone();
         }
         let server = make();
@@ -145,8 +162,9 @@ impl AppState {
                 .with_allowed_hosts(Vec::<String>::new())
                 .with_json_response(true),
         );
-        open.insert(key.to_owned(), (transport.clone(), server.clone()));
-        (transport, server)
+        let entry = McpEntry { transport, server };
+        open.insert(key, entry.clone());
+        entry
     }
 
     /// The writer and reader for a workspace, opening the file and building
