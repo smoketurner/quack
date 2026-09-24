@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rig::embeddings::EmbeddingModel;
 use rig::tool::{Tool, ToolContext};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -234,15 +235,95 @@ impl From<std::fmt::Error> for ToolError {
     }
 }
 
-/// Map a core DB error onto the `ToolError` shown to the model, keeping
-/// its own category instead of always wrapping it as a query error — an
-/// `Error::Analysis` already reads as `"analysis error: ..."`, so wrapping
-/// it again in `ToolError::Query` would show the model
-/// `"query error: analysis error: ..."`.
-fn tool_error(e: Error) -> ToolError {
-    match e {
-        Error::Analysis(msg) => ToolError::Analysis(msg),
-        other => ToolError::Query(other.to_string()),
+/// A core error as the model sees it, keeping its own category instead of
+/// always wrapping it as a query error — an `Error::Analysis` already reads
+/// as `"analysis error: ..."`, so wrapping it again in `ToolError::Query`
+/// would show the model `"query error: analysis error: ..."`.
+impl From<Error> for ToolError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Analysis(msg) => Self::Analysis(msg),
+            other => Self::Query(other.to_string()),
+        }
+    }
+}
+
+/// What a read-only tool is built from: the workspace's reader, and the
+/// turn it records its steps in.
+#[derive(Clone)]
+pub struct ToolDeps {
+    pub db: ReaderDb,
+    pub recorder: TurnRecorder,
+}
+
+/// A tool's arguments, whose JSON schema is what the model is shown.
+pub trait ToolArgs: JsonSchema {
+    /// The schema, or a bare object should it fail to serialize.
+    #[must_use]
+    fn schema() -> serde_json::Value
+    where
+        Self: Sized,
+    {
+        serde_json::to_value(schemars::schema_for!(Self))
+            .unwrap_or_else(|_| json!({"type": "object"}))
+    }
+}
+
+impl<T: JsonSchema> ToolArgs for T {}
+
+/// The arguments of a tool that takes none; whatever the model sends is
+/// ignored.
+pub struct NoArgs;
+
+impl<'de> Deserialize<'de> for NoArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| Self)
+    }
+}
+
+impl JsonSchema for NoArgs {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("NoArgs")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "object", "properties": {} })
+    }
+}
+
+/// An optional text argument, trimmed, and absent when blank: a model that
+/// sends `""` for an argument it meant to leave out has left it out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NonBlank(Option<String>);
+
+impl NonBlank {
+    #[must_use]
+    pub fn get(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl<'de> Deserialize<'de> for NonBlank {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = Option::<String>::deserialize(deserializer)?;
+        Ok(Self(
+            text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
+        ))
+    }
+}
+
+/// Shown to the model as the optional string it is.
+impl JsonSchema for NonBlank {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Option::<String>::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        Option::<String>::json_schema(generator)
     }
 }
 
@@ -336,8 +417,7 @@ async fn gate_statement(
             }
             db.classify_statement(&sql_owned).map(Some)
         })
-        .await
-        .map_err(tool_error)?;
+        .await?;
     let Some(kind) = kind else {
         return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
     };
@@ -463,8 +543,7 @@ impl Tool for RunSqlTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(RunSqlArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}))
+        RunSqlArgs::schema()
     }
 
     async fn call(
@@ -505,8 +584,7 @@ impl Tool for RunSqlTool {
                     };
                     Ok((results, shape))
                 })
-                .await
-                .map_err(tool_error)?;
+                .await?;
                 if !read_only {
                     // Whatever ran might have created a temp object
                     // `creates_temp_object` did not catch (a leading
@@ -519,8 +597,7 @@ impl Tool for RunSqlTool {
                 match results {
                     Ok(results) => {
                         step.finish(format!("{} rows", results.total_rows));
-                        let mut text =
-                            text_to_sql::format_query_result(&results).map_err(tool_error)?;
+                        let mut text = text_to_sql::format_query_result(&results)?;
                         if let Some(earlier) = self.repeated_shape(&args.query, shape) {
                             text.push('\n');
                             text.push_str(&per_group_note(&earlier));
@@ -534,10 +611,7 @@ impl Tool for RunSqlTool {
                     // hides a tool error's message from the model, but DuckDB's
                     // text (candidate bindings, the missing table) is exactly
                     // what it needs to fix the statement and retry.
-                    Err(e) => {
-                        step.finish(format!("error: {e}"));
-                        Ok(format!("{SQL_ERROR_PREFIX}{e}"))
-                    }
+                    Err(e) => Ok(format!("{SQL_ERROR_PREFIX}{}", step.fail(e))),
                 }
             }
         }
@@ -624,7 +698,8 @@ pub struct SearchDocumentsArgs {
     pub document_ids: Vec<String>,
     /// Restrict the search to passages this entity was extracted from,
     /// named as it appears in the knowledge graph
-    pub entity: Option<String>,
+    #[serde(default)]
+    pub entity: NonBlank,
 }
 
 /// Map what the model passed (an id, an id prefix, or a file name) to
@@ -689,8 +764,7 @@ where
     }
 
     fn parameters(&self) -> serde_json::Value {
-        let mut schema = serde_json::to_value(schemars::schema_for!(SearchDocumentsArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}));
+        let mut schema = SearchDocumentsArgs::schema();
         if !self.graph_enabled
             && let Some(properties) = schema
                 .get_mut("properties")
@@ -706,11 +780,7 @@ where
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let entity = args
-            .entity
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty());
+        let entity = args.entity.get();
         let detail = match (args.document_ids.is_empty(), entity) {
             (true, None) => args.query.clone(),
             (true, Some(entity)) => format!("{} (about {entity})", args.query),
@@ -727,10 +797,7 @@ where
             Some(model) => {
                 match cached_embed(model, &self.recorder, Input::Query(args.query.clone())).await {
                     Ok(vector) => Some(vector),
-                    Err(e) => {
-                        step.finish(format!("error: {e}"));
-                        return Err(ToolError::Embedding(e.to_string()));
-                    }
+                    Err(e) => return Err(ToolError::Embedding(step.fail(e).to_string())),
                 }
             }
         };
@@ -775,11 +842,7 @@ where
             .await;
         let results = match results {
             Ok(results) => results,
-            Err(e) => {
-                let e = tool_error(e);
-                step.finish(format!("error: {e}"));
-                return Err(e);
-            }
+            Err(e) => return Err(step.fail(e.into())),
         };
         let (results, note) = match &self.reranker {
             Some(reranker) => {
@@ -896,17 +959,7 @@ pub fn format_search_results(
 // describe_table
 // ---------------------------------------------------------------------------
 
-pub struct DescribeTableTool {
-    db: ReaderDb,
-    recorder: TurnRecorder,
-}
-
-impl DescribeTableTool {
-    #[must_use]
-    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
-        Self { db, recorder }
-    }
-}
+pub struct DescribeTableTool(pub ToolDeps);
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DescribeTableArgs {
@@ -925,8 +978,7 @@ impl Tool for DescribeTableTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(DescribeTableArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}))
+        DescribeTableArgs::schema()
     }
 
     async fn call(
@@ -934,9 +986,10 @@ impl Tool for DescribeTableTool {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.recorder.start(Self::NAME, &args.table_name);
+        let step = self.0.recorder.start(Self::NAME, &args.table_name);
         let table_name = args.table_name.clone();
         let outcome = self
+            .0
             .db
             .with_db(move |db| {
                 Ok(match db.describe_table(&table_name) {
@@ -947,12 +1000,11 @@ impl Tool for DescribeTableTool {
                     }
                 })
             })
-            .await
-            .map_err(tool_error)?;
+            .await?;
         let desc = match outcome {
             Ok(d) => d,
             Err((message, tables)) => {
-                step.finish(format!("error: {message}"));
+                let message = step.fail(message);
                 return Ok(format!(
                     "{SQL_ERROR_PREFIX}{message}\nTables in this workspace: {}",
                     if tables.is_empty() {
@@ -991,22 +1043,12 @@ impl Tool for DescribeTableTool {
 // list_tables
 // ---------------------------------------------------------------------------
 
-pub struct ListTablesTool {
-    db: ReaderDb,
-    recorder: TurnRecorder,
-}
-
-impl ListTablesTool {
-    #[must_use]
-    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
-        Self { db, recorder }
-    }
-}
+pub struct ListTablesTool(pub ToolDeps);
 
 impl Tool for ListTablesTool {
     const NAME: &'static str = "list_tables";
     type Error = ToolError;
-    type Args = serde_json::Value;
+    type Args = NoArgs;
     type Output = String;
 
     fn description(&self) -> String {
@@ -1014,10 +1056,7 @@ impl Tool for ListTablesTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {}
-        })
+        NoArgs::schema()
     }
 
     async fn call(
@@ -1025,12 +1064,13 @@ impl Tool for ListTablesTool {
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.recorder.start(Self::NAME, "");
+        let step = self.0.recorder.start(Self::NAME, "");
         // One reader round trip for the listing and every table's row
         // count, rather than one per table; each count is its own
         // timeout-guarded statement, so one huge table cannot pin the
         // transaction indefinitely.
         let tables: Vec<(String, Option<i64>)> = self
+            .0
             .db
             .with_db(|db| {
                 let tables = db.list_tables()?;
@@ -1042,8 +1082,7 @@ impl Tool for ListTablesTool {
                     })
                     .collect())
             })
-            .await
-            .map_err(tool_error)?;
+            .await?;
         step.finish(format!("{} tables", tables.len()));
         if tables.is_empty() {
             return Ok(String::from("No tables found in this workspace."));
@@ -1063,22 +1102,12 @@ impl Tool for ListTablesTool {
 // list_documents
 // ---------------------------------------------------------------------------
 
-pub struct ListDocumentsTool {
-    db: ReaderDb,
-    recorder: TurnRecorder,
-}
-
-impl ListDocumentsTool {
-    #[must_use]
-    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
-        Self { db, recorder }
-    }
-}
+pub struct ListDocumentsTool(pub ToolDeps);
 
 impl Tool for ListDocumentsTool {
     const NAME: &'static str = "list_documents";
     type Error = ToolError;
-    type Args = serde_json::Value;
+    type Args = NoArgs;
     type Output = String;
 
     fn description(&self) -> String {
@@ -1086,10 +1115,7 @@ impl Tool for ListDocumentsTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {}
-        })
+        NoArgs::schema()
     }
 
     async fn call(
@@ -1097,12 +1123,8 @@ impl Tool for ListDocumentsTool {
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.recorder.start(Self::NAME, "");
-        let docs = self
-            .db
-            .with_db(WorkspaceDb::list_documents)
-            .await
-            .map_err(tool_error)?;
+        let step = self.0.recorder.start(Self::NAME, "");
+        let docs = self.0.db.with_db(WorkspaceDb::list_documents).await?;
         step.finish(format!("{} documents", docs.len()));
         if docs.is_empty() {
             return Ok(String::from("No documents found in this workspace."));
@@ -1182,8 +1204,7 @@ impl Tool for CreateChartTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(CreateChartArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}))
+        CreateChartArgs::schema()
     }
 
     async fn call(
@@ -1210,11 +1231,7 @@ impl Tool for CreateChartTool {
         let results = self.db.with_db(move |db| db.execute_query(&sql)).await;
         let results = match results {
             Ok(r) => r,
-            Err(e) => {
-                let e = tool_error(e);
-                step.finish(format!("error: {e}"));
-                return Err(e);
-            }
+            Err(e) => return Err(step.fail(e.into())),
         };
 
         if results.rows.is_empty() {
@@ -1227,10 +1244,7 @@ impl Tool for CreateChartTool {
         let spec =
             match chart::generate_chart_spec(&results, &args.kind, &args.x, &args.y, &args.title) {
                 Ok(spec) => spec,
-                Err(e) => {
-                    step.finish(format!("error: {e}"));
-                    return Ok(format!("Chart not created: {e}"));
-                }
+                Err(e) => return Ok(format!("Chart not created: {}", step.fail(e))),
             };
 
         let summary = format!(
@@ -1960,7 +1974,7 @@ mod tests {
                     query: String::from("hail"),
                     top_k: None,
                     document_ids: Vec::new(),
-                    entity: None,
+                    entity: NonBlank::default(),
                 },
             )
             .await
@@ -1988,7 +2002,7 @@ mod tests {
                     query: String::from("hail"),
                     top_k: None,
                     document_ids: Vec::new(),
-                    entity: None,
+                    entity: NonBlank::default(),
                 },
             )
             .await
@@ -2071,7 +2085,7 @@ mod tests {
                     // in full.
                     top_k: Some(1_000_000),
                     document_ids: Vec::new(),
-                    entity: None,
+                    entity: NonBlank::default(),
                 },
             )
             .await
@@ -2212,7 +2226,10 @@ mod tests {
         );
 
         // A missing table names the tables that do exist.
-        let describe = DescribeTableTool::new(ReaderDb::new(Arc::clone(&db)), recorder.clone());
+        let describe = DescribeTableTool(ToolDeps {
+            db: ReaderDb::new(Arc::clone(&db)),
+            recorder: recorder.clone(),
+        });
         let out = describe
             .call(
                 &mut ToolContext::new(),
@@ -2302,13 +2319,52 @@ mod tests {
         assert!(!refused.was_refused());
     }
 
+    /// A blank optional argument reads as absent; its schema is still the
+    /// optional string the model has always been shown.
+    #[test]
+    fn optional_text_arguments_trim_and_treat_blank_as_absent() {
+        let args = |value: serde_json::Value| {
+            serde_json::from_value::<SearchGraphArgs>(value)
+                .unwrap_or_else(|e| fail_test(&e.to_string()))
+        };
+        let given = args(json!({ "entity": "  Alice ", "class": "", "relation": null }));
+        assert_eq!(given.entity.get(), Some("Alice"));
+        assert_eq!(given.class.get(), None);
+        assert_eq!(given.relation.get(), None);
+        assert_eq!(args(json!({})).entity, NonBlank::default());
+
+        let schema = SearchGraphArgs::schema();
+        assert_eq!(
+            schema.pointer("/properties/entity/type"),
+            Some(&json!(["string", "null"]))
+        );
+        assert!(
+            schema
+                .pointer("/properties/entity/description")
+                .is_some_and(|d| d.as_str().is_some_and(|d| d.contains("entity to start"))),
+            "{schema}"
+        );
+        let required = schema.get("required").cloned().unwrap_or_default();
+        assert!(!required.to_string().contains("entity"), "{schema}");
+    }
+
+    /// A tool with no arguments shows an empty object and takes whatever
+    /// the model sends.
+    #[test]
+    fn no_args_is_an_empty_object_that_accepts_anything() {
+        let schema = NoArgs::schema();
+        assert_eq!(schema.get("type"), Some(&json!("object")));
+        assert_eq!(schema.get("properties"), Some(&json!({})));
+        for sent in [json!({}), json!(null), json!({ "table": "x" }), json!("")] {
+            assert!(serde_json::from_value::<NoArgs>(sent).is_ok());
+        }
+    }
+
     /// The model sees the chart kinds in the tool's schema, not only in
     /// prose.
     #[test]
     fn the_chart_schema_lists_every_kind() {
-        let schema = serde_json::to_value(schemars::schema_for!(CreateChartArgs))
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        let schema = CreateChartArgs::schema().to_string();
         for kind in ChartKind::ALL {
             assert!(schema.contains(&format!("\"{kind}\"")), "{kind}: {schema}");
         }
@@ -2327,44 +2383,63 @@ use crate::ontology::Relation;
 /// The graph results a turn produced, kept for the response.
 pub type GraphResults = Arc<Mutex<Vec<GraphResult>>>;
 
-pub struct SearchGraphTool<M> {
-    db: ReaderDb,
-    embedding_model: Option<Embedder<M>>,
-    options: graph::GraphOptions,
-    exclude_provisional: bool,
-    results: GraphResults,
-    recorder: TurnRecorder,
+/// What the graph tools are built from.
+#[derive(Clone)]
+pub struct GraphTools<M> {
+    pub db: ReaderDb,
+    /// `None` resolves entities by exact label and alias only.
+    pub embedding_model: Option<Embedder<M>>,
+    pub options: graph::GraphOptions,
+    /// Query mode: provisional nodes are not answered from.
+    pub exclude_provisional: bool,
+    pub results: GraphResults,
+    pub recorder: TurnRecorder,
 }
 
-impl<M> SearchGraphTool<M> {
-    pub fn new(
-        db: ReaderDb,
-        embedding_model: Option<Embedder<M>>,
-        options: graph::GraphOptions,
-        exclude_provisional: bool,
-        results: GraphResults,
-        recorder: TurnRecorder,
-    ) -> Self {
-        Self {
-            db,
-            embedding_model,
-            options,
-            exclude_provisional,
-            results,
-            recorder,
+/// A graph result as the turn's mode may show it.
+struct Shown {
+    result: GraphResult,
+    /// There were matches, and every one was provisional.
+    all_provisional: bool,
+}
+
+impl<M> GraphTools<M> {
+    /// `result` without provisional nodes when the mode excludes them.
+    fn shown(&self, result: GraphResult) -> Shown {
+        let had_matches = !result.nodes.is_empty();
+        let result = if self.exclude_provisional {
+            result.without_provisional()
+        } else {
+            result
+        };
+        Shown {
+            all_provisional: had_matches && result.nodes.is_empty(),
+            result,
+        }
+    }
+
+    /// Keep `result` for the turn's response.
+    fn keep(&self, result: GraphResult) {
+        if let Ok(mut results) = self.results.lock() {
+            results.push(result);
         }
     }
 }
+
+pub struct SearchGraphTool<M>(pub GraphTools<M>);
 
 #[derive(Deserialize, JsonSchema)]
 pub struct SearchGraphArgs {
     /// The entity to start from (its name as it appears in the data); omit
     /// to list every entity of `class`
-    pub entity: Option<String>,
+    #[serde(default)]
+    pub entity: NonBlank,
     /// Restrict the entry point, or the listing, to this ontology class id
-    pub class: Option<String>,
+    #[serde(default)]
+    pub class: NonBlank,
     /// Follow only this relation id
-    pub relation: Option<String>,
+    #[serde(default)]
+    pub relation: NonBlank,
     /// How many hops out from the entity (default 2)
     pub hops: Option<u32>,
 }
@@ -2547,8 +2622,7 @@ where
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(SearchGraphArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}))
+        SearchGraphArgs::schema()
     }
 
     async fn call(
@@ -2556,65 +2630,45 @@ where
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let entity = args
-            .entity
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty());
-        let class = args
-            .class
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty());
+        let tools = &self.0;
+        let entity = args.entity.get();
+        let class = args.class.get();
         let detail = match (entity, class) {
             (Some(e), Some(c)) => format!("{e} ({c})"),
             (Some(e), None) => e.to_owned(),
             (None, Some(c)) => format!("class {c}"),
             (None, None) => String::new(),
         };
-        let step = self.recorder.start(Self::NAME, &detail);
+        let step = tools.recorder.start(Self::NAME, &detail);
         if entity.is_none() && class.is_none() {
-            step.finish("error: nothing to search");
-            return Err(ToolError::Analysis(String::from(
+            return Err(step.fail(ToolError::Analysis(String::from(
                 "give an entity to start from, a class to list, or both",
-            )));
+            ))));
         }
         let embedding = match entity {
-            Some(e) => label_embedding(self.embedding_model.as_ref(), &self.recorder, e).await?,
+            Some(e) => label_embedding(tools.embedding_model.as_ref(), &tools.recorder, e).await?,
             None => None,
         };
         let query = GraphQuery {
             entity: entity.map(str::to_owned),
             class: class.map(str::to_owned),
-            relation: args
-                .relation
-                .as_deref()
-                .map(str::trim)
-                .filter(|r| !r.is_empty())
-                .map(str::to_owned),
+            relation: args.relation.get().map(str::to_owned),
             hops: Hops::neighborhood(args.hops),
             embedding,
         };
-        let options = self.options;
-        let lookup = self
+        let options = tools.options;
+        let lookup = tools
             .db
             .with_db(move |db| lookup_graph(db, &query, &options))
             .await;
         let lookup = match lookup {
             Ok(lookup) => lookup,
-            Err(e) => {
-                let e = tool_error(e);
-                step.finish(format!("error: {e}"));
-                return Err(e);
-            }
+            Err(e) => return Err(step.fail(e.into())),
         };
-        let had_matches = !lookup.result.nodes.is_empty();
-        let result = if self.exclude_provisional {
-            lookup.result.without_provisional()
-        } else {
-            lookup.result
-        };
-        let stripped = had_matches && result.nodes.is_empty();
+        let Shown {
+            result,
+            all_provisional: stripped,
+        } = tools.shown(lookup.result);
         step.finish(if stripped {
             String::from("matches are provisional")
         } else {
@@ -2630,47 +2684,18 @@ where
         });
         let text = format_graph_result(
             &result,
-            &self.recorder,
-            &self.db,
+            &tools.recorder,
+            &tools.db,
             stripped,
             &lookup.suggestions,
         )
         .await?;
-        if let Ok(mut results) = self.results.lock() {
-            results.push(result);
-        }
+        tools.keep(result);
         Ok(text)
     }
 }
 
-pub struct FindPathTool<M> {
-    db: ReaderDb,
-    embedding_model: Option<Embedder<M>>,
-    options: graph::GraphOptions,
-    exclude_provisional: bool,
-    results: GraphResults,
-    recorder: TurnRecorder,
-}
-
-impl<M> FindPathTool<M> {
-    pub fn new(
-        db: ReaderDb,
-        embedding_model: Option<Embedder<M>>,
-        options: graph::GraphOptions,
-        exclude_provisional: bool,
-        results: GraphResults,
-        recorder: TurnRecorder,
-    ) -> Self {
-        Self {
-            db,
-            embedding_model,
-            options,
-            exclude_provisional,
-            results,
-            recorder,
-        }
-    }
-}
+pub struct FindPathTool<M>(pub GraphTools<M>);
 
 #[derive(Deserialize, JsonSchema)]
 pub struct FindPathArgs {
@@ -2699,8 +2724,7 @@ where
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(FindPathArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}))
+        FindPathArgs::schema()
     }
 
     async fn call(
@@ -2708,22 +2732,22 @@ where
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let tools = &self.0;
         let from = args.from.trim();
         let to = args.to.trim();
-        let step = self.recorder.start(Self::NAME, &format!("{from} -> {to}"));
+        let step = tools.recorder.start(Self::NAME, &format!("{from} -> {to}"));
         if from.is_empty() || to.is_empty() {
-            step.finish("error: both ends are needed");
-            return Err(ToolError::Analysis(String::from("give both entities")));
+            return Err(step.fail(ToolError::Analysis(String::from("give both entities"))));
         }
         let from_embedding =
-            label_embedding(self.embedding_model.as_ref(), &self.recorder, from).await?;
+            label_embedding(tools.embedding_model.as_ref(), &tools.recorder, from).await?;
         let to_embedding =
-            label_embedding(self.embedding_model.as_ref(), &self.recorder, to).await?;
+            label_embedding(tools.embedding_model.as_ref(), &tools.recorder, to).await?;
         let max_hops = Hops::path(args.max_hops);
         let from_owned = from.to_owned();
         let to_owned = to.to_owned();
-        let options = self.options;
-        let result = self
+        let options = tools.options;
+        let result = tools
             .db
             .with_db(move |db| {
                 let a = graph::traverse::resolve_entry(
@@ -2747,21 +2771,14 @@ where
             .await;
         let result = match result {
             Ok(result) => result,
-            Err(e) => {
-                let e = tool_error(e);
-                step.finish(format!("error: {e}"));
-                return Err(e);
-            }
+            Err(e) => return Err(step.fail(e.into())),
         };
-        let had_matches = !result.nodes.is_empty();
-        let result = if self.exclude_provisional {
-            result.without_provisional()
-        } else {
-            result
-        };
-        let stripped = had_matches && result.nodes.is_empty();
+        let Shown {
+            result,
+            all_provisional,
+        } = tools.shown(result);
         if result.nodes.is_empty() {
-            if stripped {
+            if all_provisional {
                 step.finish("path is provisional");
                 return Ok(format!(
                     "A path connects {from} and {to}, but it runs through provisional entities: \
@@ -2776,10 +2793,8 @@ where
             ));
         }
         step.finish(format!("{} hops", result.edges.len()));
-        let text = format_graph_result(&result, &self.recorder, &self.db, false, &[]).await?;
-        if let Ok(mut results) = self.results.lock() {
-            results.push(result);
-        }
+        let text = format_graph_result(&result, &tools.recorder, &tools.db, false, &[]).await?;
+        tools.keep(result);
         Ok(text)
     }
 }
@@ -2894,8 +2909,7 @@ async fn format_graph_result(
             let chunks = db.chunks_by_ids(&chunk_ids)?;
             Ok((chunks, ontology_store::current(db)?))
         })
-        .await
-        .map_err(tool_error)?;
+        .await?;
     if !chunks.is_empty() {
         let first = recorder.citations().register(&chunks);
         writeln!(out, "\nSources (cite with the [n] marker):")?;
@@ -2945,17 +2959,7 @@ async fn format_graph_result(
 /// Sample entity labels `describe_class` shows for a class.
 const CLASS_SAMPLES: u32 = 10;
 
-pub struct DescribeClassTool {
-    db: ReaderDb,
-    recorder: TurnRecorder,
-}
-
-impl DescribeClassTool {
-    #[must_use]
-    pub fn new(db: ReaderDb, recorder: TurnRecorder) -> Self {
-        Self { db, recorder }
-    }
-}
+pub struct DescribeClassTool(pub ToolDeps);
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DescribeClassArgs {
@@ -2980,8 +2984,7 @@ impl Tool for DescribeClassTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!(DescribeClassArgs))
-            .unwrap_or_else(|_| json!({"type": "object"}))
+        DescribeClassArgs::schema()
     }
 
     async fn call(
@@ -2990,8 +2993,9 @@ impl Tool for DescribeClassTool {
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let class_id = args.class_id.trim().to_owned();
-        let step = self.recorder.start(Self::NAME, &class_id);
+        let step = self.0.recorder.start(Self::NAME, &class_id);
         let text = self
+            .0
             .db
             .with_db(move |db| {
                 let ontology = ontology_store::current(db)?;
@@ -3011,11 +3015,7 @@ impl Tool for DescribeClassTool {
                 step.finish(format!("{} lines", text.lines().count()));
                 Ok(text)
             }
-            Err(e) => {
-                let e = tool_error(e);
-                step.finish(format!("error: {e}"));
-                Err(e)
-            }
+            Err(e) => Err(step.fail(e.into())),
         }
     }
 }

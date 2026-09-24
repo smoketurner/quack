@@ -319,6 +319,13 @@ impl StepInProgress {
         }
         self.recorder.emit(AgentEvent::ToolFinished(step));
     }
+
+    /// Finish as `error: ...` and hand the error back, for the caller to
+    /// return or show the model.
+    pub fn fail<E: std::fmt::Display>(self, error: E) -> E {
+        self.finish(format!("error: {error}"));
+        error
+    }
 }
 
 #[cfg(test)]
