@@ -636,7 +636,12 @@ the context, a schema-and-samples stub per table, a metadata stub per document, 
 ontology as Markdown files plus an exact JSON snapshot (`ontology/ontology.md`), one entity
 file per graph node (with its id, links that resolve to the target's file, and provenance),
 and `log.md` from the ontology versions only: the audit detail never leaves the workspace,
-and neither table data nor document text is in the bundle. Importing a bundle (`quack
+and neither table data nor document text is in the bundle. The export streams: each file
+goes to a directory or into the tar as it is made (`okf::BundleSink`), graph nodes come from
+one query that computes every entity file's path in `DuckDB` (the label slug, with an id
+suffix when two labels of a class share one), and the API sends the tar as it is written,
+auditing the export when the stream ends. Memory holds one node and the index, which is
+written last. Importing a bundle (`quack
 ingest DIR`, `POST .../documents` with a tar) ingests every concept file that carries text
 as a document (a foreign bundle's files; quack's own stubs are marked `generator: quack`
 and skipped), restores the ontology snapshot when the workspace has none, proposes the

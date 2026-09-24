@@ -30,7 +30,7 @@ use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
 use quack_core::llm::oauth::{LoginFlow, LoginPrompt, TokenManager};
-use quack_core::okf::{self, Bundle};
+use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
@@ -951,18 +951,18 @@ async fn run_import(cli: &Cli, args: ImportArgs) -> Result<ExitCode> {
 async fn run_okf_export(cli: &Cli, dir: &StdioPath) -> Result<ExitCode> {
     init_logging();
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
-    let bundle = okf::export(&opened.open_db()?, &opened.name)?;
+    let db = opened.open_db()?;
     match dir {
         StdioPath::Stdio => {
-            let mut out = std::io::stdout().lock();
-            out.write_all(&bundle.to_tar()?)?;
-            out.flush()?;
+            let mut sink = TarSink::new(std::io::BufWriter::new(std::io::stdout().lock()));
+            okf::export(&db, &opened.name, &mut sink)?;
+            sink.finish()?.flush()?;
         }
         StdioPath::Path(path) => {
-            bundle.write_to(path)?;
+            let summary = okf::export(&db, &opened.name, &mut DirSink::new(path))?;
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            writeln!(out, "wrote {} files to {dir}", bundle.files.len())?;
+            writeln!(out, "wrote {} files to {dir}", summary.files)?;
         }
     }
     Ok(ExitCode::SUCCESS)
