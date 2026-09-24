@@ -33,7 +33,7 @@ pub(crate) async fn login(
         password_login(&app, peer, request_id, &body.username, &body.password).await?;
     Ok((
         jar.add(SessionCookie::issue(&app, peer, token.clone())),
-        Json(serde_json::json!({ "token": token, "user": user })),
+        Json(serde_json::json!({ "token": token.as_str(), "user": user })),
     ))
 }
 
@@ -51,7 +51,7 @@ impl Identity {
     /// closed, the logout audited, and the session cookie cleared.
     pub(crate) async fn log_out(&self, app: &App, jar: CookieJar) -> ApiResult<CookieJar> {
         if let Credential::Session(token) = &self.credential {
-            app.close_web_session(token);
+            app.sessions.close(token);
         }
         let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
         app.control.record_audit(&entry).await?;

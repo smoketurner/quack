@@ -22,7 +22,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
-use super::state::{App, SessionLookup};
+use super::state::{App, SessionLookup, SessionToken};
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -169,8 +169,8 @@ impl SessionCookie {
     /// The cookie for a freshly opened session. `Max-Age` matches the
     /// session's absolute lifetime, so the browser drops it when the server
     /// would rather than holding a token that can only be refused.
-    pub(crate) fn issue(app: &App, peer: Peer, token: String) -> Cookie<'static> {
-        let cookie = Cookie::build((SESSION_COOKIE, token))
+    pub(crate) fn issue(app: &App, peer: Peer, token: SessionToken) -> Cookie<'static> {
+        let cookie = Cookie::build((SESSION_COOKIE, token.into_string()))
             .path("/")
             .http_only(true)
             .same_site(SameSite::Lax)
@@ -207,7 +207,7 @@ pub(crate) async fn password_login(
     RequestId(request_id): RequestId,
     username: &str,
     password: &str,
-) -> ApiResult<(UserRow, String)> {
+) -> ApiResult<(UserRow, SessionToken)> {
     let verified = app.control.verify_password(username, password).await?;
     let mut entry = AuditEntry::new(
         LOGIN_ACTION,
@@ -234,7 +234,7 @@ pub(crate) async fn password_login(
     let Some(user) = verified else {
         return Err(ApiError::unauthorized("wrong username or password"));
     };
-    let token = app.open_web_session(&user.id)?;
+    let token = app.sessions.open(&user.id)?;
     Ok((user, token))
 }
 
@@ -267,7 +267,7 @@ impl FromRequestParts<App> for Identity {
             return Err(ApiError::unauthorized("log in or send a bearer token"));
         };
 
-        match app.web_session_user(&presented) {
+        match app.sessions.lookup(&presented) {
             SessionLookup::Active(user_id) => {
                 let user = app
                     .control

@@ -4,7 +4,7 @@
 use quack_core::storage::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use quack_core::analysis::tools::{ReaderDb, SharedDb, open_reader};
 use quack_core::config::Config;
@@ -40,9 +40,8 @@ pub(crate) struct AppState {
     /// and per-process, so two concurrent opens of one file both succeed
     /// and yield independent databases whose writes overwrite each other.
     workspaces: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<WorkspaceHandle>>>>,
-    /// Browser and API-login sessions, by token. Cleared on restart, and
-    /// individually once either `[server]` lifetime runs out.
-    web_sessions: Mutex<HashMap<String, WebSession>>,
+    /// Browser and API-login sessions.
+    pub sessions: WebSessions,
     /// Every background job: uploads, extraction and proposal runs, agent
     /// turns. Its registry is in memory, so workspace content in a job's
     /// label never reaches `control.db`.
@@ -96,13 +95,17 @@ pub(crate) type App = Arc<AppState>;
 
 impl AppState {
     pub(crate) fn new(config: Config, control: ControlPlane, local: bool) -> Self {
+        let sessions = WebSessions::new(
+            config.server.session_max_age(),
+            config.server.session_idle(),
+        );
         Self {
             jobs: JobQueue::from_config(&config.jobs),
             config,
             control,
             local,
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
-            web_sessions: Mutex::new(HashMap::new()),
+            sessions,
             mcp: tokio::sync::Mutex::new(HashMap::new()),
             extractions: Mutex::new(HashSet::new()),
         }
@@ -231,26 +234,65 @@ impl AppState {
             .await
             .map_err(ApiError::from)
     }
+}
 
-    /// Start a browser session for the user and return its token.
-    pub(crate) fn open_web_session(&self, user_id: &str) -> ApiResult<String> {
+/// A login session's token: `qs_` and 32 random bytes, base64url.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionToken(String);
+
+impl SessionToken {
+    /// A fresh token from the control plane's random source (aws-lc-rs).
+    fn generate() -> ApiResult<Self> {
         let mut bytes = [0u8; 32];
-        aws_lc_rs_fill(&mut bytes)?;
-        let token = format!(
+        random_bytes(&mut bytes).map_err(|e| ApiError::internal(e.to_string()))?;
+        Ok(Self(format!(
             "qs_{}",
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
-        );
+        )))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// Browser and API-login sessions, by token. Cleared on restart, and one
+/// by one once either `[server]` lifetime runs out.
+pub(crate) struct WebSessions {
+    /// `session_max_age`: from opening.
+    max_age: Duration,
+    /// `session_idle`: since the last request that presented it.
+    idle: Duration,
+    live: Mutex<HashMap<String, WebSession>>,
+}
+
+impl WebSessions {
+    fn new(max_age: Duration, idle: Duration) -> Self {
+        Self {
+            max_age,
+            idle,
+            live: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Start a session for the user and return its token.
+    pub(crate) fn open(&self, user_id: &str) -> ApiResult<SessionToken> {
+        let token = SessionToken::generate()?;
         let now = Instant::now();
-        let mut sessions = self
-            .web_sessions
+        let mut live = self
+            .live
             .lock()
             .map_err(|e| ApiError::internal(format!("session store poisoned: {e}")))?;
         // A login is the natural moment to drop whatever died since the last
         // one: nothing else walks the map, and a session nobody presents
         // again would otherwise sit here until the process ends.
-        sessions.retain(|_, session| !self.session_expired(session, now));
-        sessions.insert(
-            token.clone(),
+        live.retain(|_, session| !self.expired(session, now));
+        live.insert(
+            token.as_str().to_owned(),
             WebSession {
                 user_id: user_id.to_owned(),
                 started: now,
@@ -261,46 +303,41 @@ impl AppState {
     }
 
     /// Whether `session` has outlived either bound as of `now`.
-    fn session_expired(&self, session: &WebSession, now: Instant) -> bool {
-        let server = &self.config.server;
-        now.duration_since(session.started) >= server.session_max_age()
-            || now.duration_since(session.last_seen) >= server.session_idle()
+    fn expired(&self, session: &WebSession, now: Instant) -> bool {
+        now.duration_since(session.started) >= self.max_age
+            || now.duration_since(session.last_seen) >= self.idle
     }
 
-    /// Resolve a session token, dropping it if it has expired and marking it
-    /// used if it has not.
-    pub(crate) fn web_session_user(&self, token: &str) -> SessionLookup {
-        let Ok(mut sessions) = self.web_sessions.lock() else {
+    /// Resolve a presented token, dropping it if it has expired and marking
+    /// it used if it has not.
+    pub(crate) fn lookup(&self, token: &str) -> SessionLookup {
+        let Ok(mut live) = self.live.lock() else {
             return SessionLookup::Unknown;
         };
         let now = Instant::now();
         // Read the bounds first and let that borrow end, so the expired
         // branch is free to take the mutable one `remove` needs.
-        let expired = match sessions.get(token) {
-            Some(session) => self.session_expired(session, now),
+        let expired = match live.get(token) {
+            Some(session) => self.expired(session, now),
             None => return SessionLookup::Unknown,
         };
         if expired {
-            sessions.remove(token);
+            live.remove(token);
             return SessionLookup::Expired;
         }
-        let Some(session) = sessions.get_mut(token) else {
+        let Some(session) = live.get_mut(token) else {
             return SessionLookup::Unknown;
         };
         session.last_seen = now;
         SessionLookup::Active(session.user_id.clone())
     }
 
-    pub(crate) fn close_web_session(&self, token: &str) {
-        if let Ok(mut sessions) = self.web_sessions.lock() {
-            sessions.remove(token);
+    /// End a session; an unknown token is already ended.
+    pub(crate) fn close(&self, token: &str) {
+        if let Ok(mut live) = self.live.lock() {
+            live.remove(token);
         }
     }
-}
-
-fn aws_lc_rs_fill(bytes: &mut [u8]) -> ApiResult<()> {
-    // The control plane exposes the random source it uses for tokens.
-    random_bytes(bytes).map_err(|e| ApiError::internal(e.to_string()))
 }
 
 /// Run a closure on the workspace's writer, at the calling task's priority,
