@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rig::embeddings::EmbeddingModel;
 use rig::tool::{Tool, ToolContext};
+use schemars::generate::SchemaSettings;
+use schemars::transform::{Transform, transform_subschemas};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
@@ -276,18 +278,55 @@ pub struct ToolDeps {
 
 /// A tool's arguments, whose JSON schema is what the model is shown.
 pub trait ToolArgs: JsonSchema {
-    /// The schema, or a bare object should it fail to serialize.
+    /// The schema, or a bare object should it fail to serialize. Subschemas
+    /// are inlined and optional arguments carry no `null` type, since some
+    /// OpenAI-compatible servers reject a whole request over a `$ref` or a
+    /// type array; leaving an argument out of `required` already makes it
+    /// optional.
     #[must_use]
     fn schema() -> serde_json::Value
     where
         Self: Sized,
     {
-        serde_json::to_value(schemars::schema_for!(Self))
+        let generator = SchemaSettings::draft2020_12()
+            .with(|settings| settings.inline_subschemas = true)
+            .with_transform(NonNullable)
+            .into_generator();
+        serde_json::to_value(generator.into_root_schema_for::<Self>())
             .unwrap_or_else(|_| json!({"type": "object"}))
     }
 }
 
 impl<T: JsonSchema> ToolArgs for T {}
+
+/// Drops `null` from every `type` array, and the null branch from every
+/// `anyOf`, leaving the one type an optional argument has when it is sent.
+#[derive(Clone)]
+struct NonNullable;
+
+impl Transform for NonNullable {
+    fn transform(&mut self, schema: &mut Schema) {
+        if let Some(serde_json::Value::Array(types)) = schema.get_mut("type") {
+            types.retain(|t| t != "null");
+            if let [only] = types.as_slice() {
+                let only = only.clone();
+                schema.insert("type".to_owned(), only);
+            }
+        }
+        if let Some(serde_json::Value::Array(branches)) = schema.get_mut("anyOf") {
+            branches.retain(|branch| branch != &json!({"type": "null"}));
+            if let [only] = branches.as_slice()
+                && let Some(only) = only.as_object().cloned()
+            {
+                schema.remove("anyOf");
+                for (key, value) in only {
+                    schema.insert(key, value);
+                }
+            }
+        }
+        transform_subschemas(self, schema);
+    }
+}
 
 /// The arguments of a tool that takes none; whatever the model sends is
 /// ignored.
@@ -2339,7 +2378,7 @@ mod tests {
         let schema = SearchGraphArgs::schema();
         assert_eq!(
             schema.pointer("/properties/entity/type"),
-            Some(&json!(["string", "null"]))
+            Some(&json!("string"))
         );
         assert!(
             schema
@@ -2367,10 +2406,42 @@ mod tests {
     /// prose.
     #[test]
     fn the_chart_schema_lists_every_kind() {
-        let schema = CreateChartArgs::schema().to_string();
-        for kind in ChartKind::ALL {
-            assert!(schema.contains(&format!("\"{kind}\"")), "{kind}: {schema}");
+        let schema = CreateChartArgs::schema();
+        assert_eq!(
+            schema.pointer("/properties/kind/enum"),
+            Some(&json!(
+                ChartKind::ALL
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ))
+        );
+    }
+
+    /// Every tool schema is self-contained and names one type per argument,
+    /// which servers that reject `$ref` or type arrays (Apple's `fm serve`)
+    /// require.
+    #[test]
+    fn tool_schemas_have_no_references_or_null_types() {
+        for schema in [
+            RunSqlArgs::schema(),
+            SearchDocumentsArgs::schema(),
+            DescribeTableArgs::schema(),
+            CreateChartArgs::schema(),
+            SearchGraphArgs::schema(),
+            FindPathArgs::schema(),
+            DescribeClassArgs::schema(),
+            NoArgs::schema(),
+        ] {
+            let text = schema.to_string();
+            for banned in ["$ref", "$defs", "\"null\""] {
+                assert!(!text.contains(banned), "{banned} in {text}");
+            }
         }
+        assert_eq!(
+            SearchDocumentsArgs::schema().pointer("/properties/top_k/type"),
+            Some(&json!("integer"))
+        );
     }
 }
 
