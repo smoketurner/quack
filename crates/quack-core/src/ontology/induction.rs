@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Class, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation};
+use super::{Class, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation, SnakeId};
 use crate::error::{Error, Result};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
@@ -172,50 +172,11 @@ fn profile_table(db: &WorkspaceDb, table: &str) -> Result<TableProfile> {
     })
 }
 
-/// `snake_case` from a table or column name.
-#[must_use]
-pub fn snake_id(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_underscore = true;
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            prev_underscore = false;
-        } else if !prev_underscore {
-            out.push('_');
-            prev_underscore = true;
-        }
-    }
-    let trimmed = out.trim_end_matches('_').to_owned();
-    if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        format!("t_{trimmed}")
-    } else if trimmed.is_empty() {
-        String::from("unnamed")
-    } else {
-        trimmed
-    }
-}
-
-/// A class name from a table name: `shipments` becomes `shipment`.
-#[must_use]
-pub fn class_id_for_table(table: &str) -> String {
-    let id = snake_id(table);
-    if let Some(stem) = id.strip_suffix("ies") {
-        format!("{stem}y")
-    } else if id.ends_with("ss") || id.len() < 4 {
-        id
-    } else if let Some(stem) = id.strip_suffix('s') {
-        stem.to_owned()
-    } else {
-        id
-    }
-}
-
 /// A relation name from a foreign-key-like column: `policy_id` becomes
 /// `has_policy`.
 #[must_use]
 pub fn relation_id_for_column(column: &str) -> String {
-    let id = snake_id(column);
+    let id = SnakeId::from_name(column).into_string();
     let stem = id.strip_suffix("_id").unwrap_or(&id);
     format!("has_{stem}")
 }
@@ -356,7 +317,7 @@ impl Known<'_> {
 fn class_for_table(known: &Known<'_>, table: &str) -> String {
     known
         .mapped_class(table)
-        .unwrap_or_else(|| class_id_for_table(table))
+        .unwrap_or_else(|| SnakeId::singular_from(table).into_string())
 }
 
 fn propose_table(
@@ -369,13 +330,12 @@ fn propose_table(
 ) -> Result<()> {
     let known = Known(current);
     let class_id = class_for_table(&known, &profile.name);
-    let key_property = profile.key.as_deref().map(snake_id);
     let mut property_ids = Vec::new();
     let mut property_map = BTreeMap::new();
     let mut relations = Vec::new();
 
     for column in &profile.columns {
-        let property_id = snake_id(&column.name);
+        let property_id = SnakeId::from_name(&column.name).into_string();
         let kind = property_type(column, options);
         let values = if kind == PropertyType::Enum {
             enum_values(db, &profile.name, &column.name)?
@@ -437,7 +397,10 @@ fn propose_table(
                 parent: String::from(super::ROOT_CLASS),
                 label: None,
                 description: Some(format!("Rows of table {}", profile.name)),
-                key: key_property,
+                key: profile
+                    .key
+                    .as_deref()
+                    .map(|key| SnakeId::from_name(key).into_string()),
                 properties: property_ids,
             }),
             evidence: serde_json::json!({
@@ -500,7 +463,7 @@ fn propose_relations(
             relation: relation_id.clone(),
             column: column.name.clone(),
             target_class: target_class.clone(),
-            target_key: snake_id(other_key),
+            target_key: SnakeId::from_name(other_key).into_string(),
         });
         if !defined {
             candidates.push(Candidate {
@@ -784,13 +747,13 @@ mod tests {
 
     #[test]
     fn names_are_snake_case_singular_and_prefixed() {
-        assert_eq!(snake_id("Ship Mode"), "ship_mode");
-        assert_eq!(snake_id("po / so #"), "po_so");
-        assert_eq!(snake_id("2024"), "t_2024");
-        assert_eq!(class_id_for_table("shipments"), "shipment");
-        assert_eq!(class_id_for_table("policies"), "policy");
-        assert_eq!(class_id_for_table("address"), "address");
-        assert_eq!(class_id_for_table("bus"), "bus");
+        assert_eq!(SnakeId::from_name("Ship Mode").as_str(), "ship_mode");
+        assert_eq!(SnakeId::from_name("po / so #").as_str(), "po_so");
+        assert_eq!(SnakeId::from_name("2024").as_str(), "t_2024");
+        assert_eq!(SnakeId::singular_from("shipments").as_str(), "shipment");
+        assert_eq!(SnakeId::singular_from("policies").as_str(), "policy");
+        assert_eq!(SnakeId::singular_from("address").as_str(), "address");
+        assert_eq!(SnakeId::singular_from("bus").as_str(), "bus");
         assert_eq!(relation_id_for_column("policy_id"), "has_policy");
         assert_eq!(relation_id_for_column("policy_number"), "has_policy_number");
     }

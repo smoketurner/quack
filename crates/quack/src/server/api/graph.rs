@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use quack_core::extraction::Extract;
 use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::Revalidation;
@@ -319,7 +320,7 @@ async fn extract_tables_in_batches(
 struct DocumentJob {
     db: SharedDb,
     chunks: Vec<extract::ChunkText>,
-    extractor: Box<dyn extract::GraphExtractor>,
+    extractor: Box<dyn Extract<extract::Extraction>>,
     ontology: Ontology,
     provisional: bool,
     embeddings: Option<llm::Embeddings>,

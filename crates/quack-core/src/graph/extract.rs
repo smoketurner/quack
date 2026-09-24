@@ -3,17 +3,16 @@
 //! outside the ontology is dropped and counted as drift (design doc 6.4).
 
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use super::Drift;
 use super::store::{self, NewNode, Source};
 use crate::error::{Error, Result};
+use crate::extraction::{Extract, Extracted, Passage, RunProgress, evenly_spaced, extractions};
 use crate::ontology::{self, Ontology};
-use crate::progress::{ChunkDone, Progress};
+use crate::progress::Progress;
 use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
 use crate::storage::writer::Writer;
 
@@ -43,15 +42,6 @@ pub struct ExtractedEdge {
     pub properties: serde_json::Value,
 }
 
-/// Boxed future so implementations can be trait objects.
-pub type ExtractFuture<'a> = Pin<Box<dyn Future<Output = Result<Extraction>> + Send + 'a>>;
-
-/// Constrained extraction over one passage; the prompt already carries the
-/// ontology.
-pub trait GraphExtractor: Send + Sync {
-    fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a>;
-}
-
 /// The preamble for the chat model, with the ontology rendered into it.
 #[must_use]
 pub fn prompt_for(ontology: &Ontology) -> String {
@@ -69,24 +59,6 @@ pub fn prompt_for(ontology: &Ontology) -> String {
     );
     prompt.push_str(&ontology.render_for_prompt());
     prompt
-}
-
-/// Parse the model's answer leniently: the first `{` to the last `}`.
-///
-/// # Errors
-///
-/// Returns an error when no JSON object of the right shape parses.
-pub fn parse_extraction(answer: &str) -> Result<Extraction> {
-    let start = answer.find('{');
-    let end = answer.rfind('}');
-    let (Some(start), Some(end)) = (start, end) else {
-        return Err(Error::Ontology(String::from(
-            "the model returned no JSON object",
-        )));
-    };
-    let slice = answer.get(start..=end).unwrap_or(answer);
-    serde_json::from_str(slice)
-        .map_err(|e| Error::Ontology(format!("the model's JSON does not parse: {e}")))
 }
 
 /// An extraction filtered against the ontology: what to store, and what
@@ -115,7 +87,7 @@ pub fn validate(ontology: &Ontology, extraction: Extraction) -> Validated {
         }
         let class = node.class.trim().to_lowercase();
         if class != ontology::ROOT_CLASS && ontology.class(&class).is_none() {
-            out.drift.note_class(&class);
+            out.drift.classes.bump(&class);
             continue;
         }
         let key = super::normalize_label(label);
@@ -136,7 +108,7 @@ pub fn validate(ontology: &Ontology, extraction: Extraction) -> Validated {
     for edge in extraction.edges {
         let relation = edge.relation.trim().to_lowercase();
         if relation != ontology::MENTIONS_RELATION && ontology.relation(&relation).is_none() {
-            out.drift.note_relation(&relation);
+            out.drift.relations.bump(&relation);
             continue;
         }
         let (Some(source_class), Some(target_class)) = (
@@ -170,6 +142,16 @@ pub struct ChunkText {
     pub chunk_id: String,
     pub document_id: String,
     pub text: String,
+}
+
+impl Passage for ChunkText {
+    fn id(&self) -> &str {
+        &self.chunk_id
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 /// How many chunks [`chunks`] would return, without loading their content:
@@ -232,50 +214,11 @@ pub fn chunks(db: &WorkspaceDb, limit: Option<u32>) -> Result<Vec<ChunkText>> {
                 },
             });
     }
-    let Some(limit) = limit else {
-        return Ok(order
-            .into_iter()
-            .filter_map(|id| by_document.remove(&id))
-            .flatten()
-            .collect());
-    };
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    if limit == 0 || order.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Every document gets an equal quota, spaced evenly through it.
-    let quota = limit.div_ceil(order.len()).max(1);
-    let mut chosen = Vec::with_capacity(limit);
-    for id in &order {
-        let Some(mut chunks) = by_document.remove(id) else {
-            continue;
-        };
-        let take = quota.min(chunks.len());
-        let mut positions: Vec<usize> = (0..take)
-            .map(|k| {
-                k.saturating_mul(chunks.len())
-                    .checked_div(take)
-                    .unwrap_or(0)
-                    .min(chunks.len().saturating_sub(1))
-            })
-            .collect();
-        positions.dedup();
-        // Highest first, so removing by index leaves the lower ones valid.
-        for position in positions.into_iter().rev() {
-            if position < chunks.len() {
-                chosen.push(chunks.remove(position));
-            }
-        }
-    }
-    chosen.sort_by(|a, b| {
-        order
-            .iter()
-            .position(|d| d == &a.document_id)
-            .cmp(&order.iter().position(|d| d == &b.document_id))
-            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
-    });
-    chosen.truncate(limit);
-    Ok(chosen)
+    let documents = order.into_iter().filter_map(|id| by_document.remove(&id));
+    Ok(match limit {
+        None => documents.flatten().collect(),
+        Some(limit) => evenly_spaced(documents, usize::try_from(limit).unwrap_or(usize::MAX)),
+    })
 }
 
 /// What an extraction run did.
@@ -303,41 +246,26 @@ const MODEL_CONFIDENCE: f64 = 0.8;
 pub async fn run(
     db: &Writer,
     chunks: Vec<ChunkText>,
-    extractor: &dyn GraphExtractor,
+    extractor: &dyn Extract<Extraction>,
     ontology: &Ontology,
     provisional: bool,
     concurrency: u32,
     progress: Progress<'_>,
 ) -> Result<RunSummary> {
-    use futures::StreamExt as _;
-    let started = Instant::now();
-    let mut summary = RunSummary {
-        chunks: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
-        ..RunSummary::default()
-    };
-    // Collected first: an iterator closure held across the awaits fails
-    // the Send check when the run is inside a spawned task.
-    let calls: Vec<_> = chunks.iter().map(|chunk| timed(extractor, chunk)).collect();
-    let mut calls =
-        futures::stream::iter(calls).buffered(usize::try_from(concurrency.max(1)).unwrap_or(1));
-    let mut done: u32 = 0;
-    while let Some((chunk, outcome, took)) = calls.next().await {
-        done = done.saturating_add(1);
-        let report = |summary: &RunSummary| {
-            progress(ChunkDone {
-                done,
-                total: summary.chunks,
-                failed: summary.failed_chunks,
-                took,
-                elapsed: started.elapsed(),
-            });
-        };
+    let mut summary = RunSummary::default();
+    let mut run = RunProgress::new(chunks.len(), progress);
+    let mut calls = extractions(extractor, &chunks, concurrency);
+    while let Some(Extracted {
+        passage: chunk,
+        outcome,
+        took,
+    }) = calls.next().await
+    {
         let extraction = match outcome {
             Ok(extraction) => extraction,
             Err(e) => {
                 tracing::warn!(chunk = %chunk.chunk_id, error = %e, "extraction failed; skipping chunk");
-                summary.failed_chunks = summary.failed_chunks.saturating_add(1);
-                report(&summary);
+                run.finished(took, false);
                 continue;
             }
         };
@@ -376,10 +304,12 @@ pub async fn run(
         }
         summary.nodes = summary.nodes.saturating_add(nodes);
         summary.edges = summary.edges.saturating_add(edges);
-        report(&summary);
+        run.finished(took, true);
     }
     drop(calls);
-    if summary.chunks > 0 && summary.failed_chunks == summary.chunks {
+    summary.chunks = run.total();
+    summary.failed_chunks = run.failed();
+    if run.all_failed() {
         return Err(Error::Llm(String::from(
             "every chunk failed extraction; check the model and provider",
         )));
@@ -387,16 +317,6 @@ pub async fn run(
     let drift = summary.drift.clone();
     db.run(move |db| store::record_drift(db, &drift)).await?;
     Ok(summary)
-}
-
-/// One chunk's extraction with how long it took.
-async fn timed<'a>(
-    extractor: &'a dyn GraphExtractor,
-    chunk: &'a ChunkText,
-) -> (&'a ChunkText, Result<Extraction>, Duration) {
-    let began = Instant::now();
-    let outcome = extractor.extract(&chunk.text).await;
-    (chunk, outcome, began.elapsed())
 }
 
 /// Store one validated extraction with `source` as provenance; returns the
@@ -445,6 +365,7 @@ pub fn store_validated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extraction::parse_answer;
     use crate::ontology::{Class, Relation};
 
     fn ontology() -> Ontology {
@@ -485,7 +406,7 @@ mod tests {
 
     #[test]
     fn validate_keeps_what_fits_and_counts_the_rest() {
-        let extraction = parse_extraction(
+        let extraction = parse_answer::<Extraction>(
             r#"Here you go: {"nodes": [
                 {"label": "Orgenics", "class": "Vendor"},
                 {"label": "Kenya", "class": "country", "properties": {"region": "East Africa"}},
@@ -520,16 +441,19 @@ mod tests {
             v.invalid_edges, 2,
             "range mismatch and an unlisted endpoint"
         );
-        assert_eq!(v.drift.classes.get("vessel"), Some(&1));
-        assert_eq!(v.drift.relations.get("docked_at"), Some(&1));
+        assert_eq!(v.drift.classes.get("vessel"), 1);
+        assert_eq!(v.drift.relations.get("docked_at"), 1);
         assert!(v.edges.iter().all(|e| e.properties.is_object()));
     }
 
     #[test]
     fn parse_rejects_prose_and_the_wrong_shape() {
-        assert!(parse_extraction("no json here").is_err());
-        assert!(parse_extraction(r#"{"nodes": "nope"}"#).is_err());
-        assert_eq!(parse_extraction("{}").map_or(9, |e| e.nodes.len()), 0);
+        assert!(parse_answer::<Extraction>("no json here").is_err());
+        assert!(parse_answer::<Extraction>(r#"{"nodes": "nope"}"#).is_err());
+        assert_eq!(
+            parse_answer::<Extraction>("{}").map_or(9, |e| e.nodes.len()),
+            0
+        );
     }
 
     #[test]

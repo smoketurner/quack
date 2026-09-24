@@ -43,4 +43,4 @@ dataset `examples/storms/` uses.
 Ingestion goes through the normal `ingestion::ingest_file` path into a temporary
 workspace. There is no Ollama dependency: chunk embeddings come from a deterministic
 hashing "embedding" (see the `HashEmbedder` doc comment in `examples/eval.rs`), and the
-graph section uses a canned `GraphExtractor` instead of a chat model.
+graph section uses a canned `Extract<Extraction>` instead of a chat model.

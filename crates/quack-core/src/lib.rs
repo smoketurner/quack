@@ -8,6 +8,7 @@ pub mod csv;
 pub mod doctor;
 pub mod embedding;
 pub mod error;
+pub mod extraction;
 pub mod graph;
 pub mod import;
 pub mod ingestion;

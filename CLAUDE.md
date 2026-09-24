@@ -182,7 +182,7 @@ non-null column as key, a relation where a column's values overlap another table
 and a mapping; proposals sit in `_quack_ontology_candidates` (`ontology::candidates`)
 until accepted, renamed, merged, reparented, or rejected, and accepting writes a new
 version. Document evidence (`ontology::documents`) samples chunks evenly across ready
-documents, runs open extraction through an `Extractor` (the chat model via
+documents, runs open extraction through `extraction::Extract` (the chat model via
 `llm::chat_extractor`; tests use a canned one), normalizes type and relation names
 (snake_case, singular, near-synonyms clustered by embedding cosine when an embedding model
 exists), infers hierarchy from co-labelled mentions and domain and range from endpoints,

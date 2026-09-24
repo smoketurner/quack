@@ -29,7 +29,8 @@ use quack_core::config::{
 };
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
-use quack_core::graph::extract::{ChunkText, ExtractFuture, Extraction, GraphExtractor};
+use quack_core::extraction::{Extract, ExtractFuture};
+use quack_core::graph::extract::{ChunkText, Extraction};
 use quack_core::graph::{self, store};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
@@ -674,7 +675,7 @@ fn evaluate_induction(db: &WorkspaceDb, expected_path: &Path) -> Result<Inductio
 }
 
 // ---------------------------------------------------------------------------
-// Graph extraction: a canned `GraphExtractor` so the harness measures
+// Graph extraction: a canned `Extract<Extraction>` so the harness measures
 // validation, resolution, and storage, not the model.
 // ---------------------------------------------------------------------------
 
@@ -711,8 +712,8 @@ struct FixtureExtractor {
     answers: BTreeMap<String, Extraction>,
 }
 
-impl GraphExtractor for FixtureExtractor {
-    fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a> {
+impl Extract<Extraction> for FixtureExtractor {
+    fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a, Extraction> {
         Box::pin(async move {
             for (anchor, extraction) in &self.answers {
                 if text.contains(anchor.as_str()) {

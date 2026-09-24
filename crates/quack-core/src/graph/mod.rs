@@ -19,6 +19,7 @@ pub mod traverse;
 use serde::{Deserialize, Serialize};
 
 use crate::embedding::{Dimension, Input};
+use crate::extraction::Tally;
 
 /// A stored node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,9 +130,9 @@ impl GraphResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drift {
     #[serde(default)]
-    pub classes: std::collections::BTreeMap<String, u32>,
+    pub classes: Tally,
     #[serde(default)]
-    pub relations: std::collections::BTreeMap<String, u32>,
+    pub relations: Tally,
 }
 
 impl Drift {
@@ -141,25 +142,9 @@ impl Drift {
         self.classes.len().saturating_add(self.relations.len())
     }
 
-    pub fn note_class(&mut self, class: &str) {
-        let entry = self.classes.entry(class.to_owned()).or_default();
-        *entry = entry.saturating_add(1);
-    }
-
-    pub fn note_relation(&mut self, relation: &str) {
-        let entry = self.relations.entry(relation.to_owned()).or_default();
-        *entry = entry.saturating_add(1);
-    }
-
     pub fn absorb(&mut self, other: &Self) {
-        for (k, v) in &other.classes {
-            let entry = self.classes.entry(k.clone()).or_default();
-            *entry = entry.saturating_add(*v);
-        }
-        for (k, v) in &other.relations {
-            let entry = self.relations.entry(k.clone()).or_default();
-            *entry = entry.saturating_add(*v);
-        }
+        self.classes.absorb(&other.classes);
+        self.relations.absorb(&other.relations);
     }
 }
 
@@ -398,13 +383,13 @@ mod tests {
     #[test]
     fn drift_accumulates_and_counts_distinct_names() {
         let mut drift = Drift::default();
-        drift.note_class("vessel");
-        drift.note_class("vessel");
-        drift.note_relation("docked_at");
+        drift.classes.bump("vessel");
+        drift.classes.bump("vessel");
+        drift.relations.bump("docked_at");
         let mut total = Drift::default();
         total.absorb(&drift);
         total.absorb(&drift);
-        assert_eq!(total.classes.get("vessel"), Some(&4));
+        assert_eq!(total.classes.get("vessel"), 4);
         assert_eq!(total.total(), 2);
     }
 }

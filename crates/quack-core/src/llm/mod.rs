@@ -9,7 +9,9 @@ pub mod oauth;
 use rig::client::EmbeddingsClient;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use secrecy::ExposeSecret;
+use serde::de::DeserializeOwned;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rig::prelude::*;
 
@@ -23,8 +25,10 @@ use crate::config::{
 };
 use crate::embedding::{Embedder, Input, Profile};
 use crate::error::{Error, Record, Result};
-use crate::graph::extract as graph_extract;
-use crate::ontology::{Ontology, documents};
+use crate::extraction::{Extract, ExtractFuture, parse_answer};
+use crate::graph::extract::{self as graph_extract, Extraction};
+use crate::ontology::Ontology;
+use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::{Priority, with_priority};
 use crate::storage::{context, sessions};
 pub use tokio_util::sync::CancellationToken;
@@ -241,127 +245,147 @@ impl EmbeddingModel for EmbedModel {
     }
 }
 
-/// Open extraction through a rig agent: one streamed prompt per chunk,
-/// the text collected and parsed as JSON. Streaming is the path the chat
-/// agent uses and the one Ollama answers reliably; a chunk that produces
-/// nothing within `timeout` (`[analysis].extraction_timeout_seconds`) is
-/// an error the run skips.
-struct RigExtractor {
+/// The chat provider's rig client, one variant per provider type, so a
+/// caller builds it once and matches only where the model type matters.
+enum ChatClient {
+    Ollama(OllamaClient),
+    OpenAi(OpenAiClient),
+    Anthropic(AnthropicClient),
+}
+
+impl ChatClient {
+    async fn build(config: &Config, chat: &ModelRef<'_>) -> Result<Self> {
+        let (name, provider) = (chat.provider_name, chat.provider);
+        Ok(match provider.provider_type {
+            ProviderType::Ollama => {
+                Self::Ollama(build_ollama_client(config, name, provider).await?)
+            }
+            ProviderType::Openai => {
+                Self::OpenAi(build_openai_client(config, name, provider).await?)
+            }
+            ProviderType::Anthropic => {
+                Self::Anthropic(build_anthropic_client(config, name, provider).await?)
+            }
+        })
+    }
+
+    fn one_shot(
+        &self,
+        model: &str,
+        preamble: &str,
+        timeout: Duration,
+        label: &'static str,
+    ) -> OneShotAgent {
+        match self {
+            Self::Ollama(client) => {
+                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
+            }
+            Self::OpenAi(client) => {
+                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
+            }
+            Self::Anthropic(client) => {
+                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
+            }
+        }
+    }
+}
+
+/// A tool-less agent at temperature 0 that answers one prompt at a time,
+/// streamed and collected. Streaming is the path the chat agent uses and
+/// the one Ollama answers reliably, and it keeps long generations from
+/// tripping the HTTP client's read timeout. Extraction and reranking are
+/// both one of these with their own preamble.
+pub struct OneShotAgent {
     agent: rig::agent::Agent,
-    timeout: std::time::Duration,
+    timeout: Duration,
+    label: &'static str,
+}
+
+impl OneShotAgent {
+    /// `label` names the call in errors and logs.
+    pub fn new<M>(model: M, preamble: &str, timeout: Duration, label: &'static str) -> Self
+    where
+        M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
+    {
+        Self {
+            agent: rig::agent::AgentBuilder::new(model)
+                .preamble(preamble)
+                .temperature(0.0)
+                .build(),
+            timeout,
+            label,
+        }
+    }
+
+    /// The model's answer to `text`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call fails or produces nothing within the
+    /// timeout.
+    pub async fn answer(&self, text: &str) -> Result<String> {
+        use futures::StreamExt;
+        use rig::streaming::StreamedAssistantContent;
+        let what = self.label;
+        let collect = async {
+            let mut stream = self.agent.stream_chat(text, Vec::<Message>::new()).await;
+            let mut answer = String::new();
+            let mut final_text: Option<String> = None;
+            while let Some(item) = stream.next().await {
+                match item.map_err(|e| Error::Llm(format!("{what} call failed: {e}")))? {
+                    rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::Text(t),
+                    ) => answer.push_str(&t.text),
+                    rig::agent::MultiTurnStreamItem::FinalResponse(r) => {
+                        if r.usage.has_values() {
+                            tracing::debug!(
+                                call = what,
+                                input_tokens = r.usage.input_tokens,
+                                output_tokens = r.usage.output_tokens,
+                                "provider token usage"
+                            );
+                        }
+                        final_text = Some(r.output);
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<String, Error>(match final_text {
+                Some(t) if answer.trim().is_empty() => t,
+                _ => answer,
+            })
+        };
+        tokio::time::timeout(self.timeout, collect)
+            .await
+            .map_err(|_| {
+                Error::Llm(format!(
+                    "{what} call produced nothing within {} s",
+                    self.timeout.as_secs()
+                ))
+            })?
+    }
+}
+
+/// A chunk that produces nothing within the timeout is an error the run
+/// skips.
+impl<T: DeserializeOwned + Send> Extract<T> for OneShotAgent {
+    fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a, T> {
+        Box::pin(async move {
+            let answer = self.answer(text).await?;
+            tracing::debug!(call = self.label, answer = %answer, "extraction answer");
+            parse_answer(&answer)
+        })
+    }
 }
 
 /// `[analysis].extraction_timeout_seconds` as a duration, at least one
 /// second.
-fn extraction_timeout(config: &Config) -> std::time::Duration {
-    std::time::Duration::from_secs(config.analysis.extraction_timeout_seconds.max(1))
+fn extraction_timeout(config: &Config) -> Duration {
+    Duration::from_secs(config.analysis.extraction_timeout_seconds.max(1))
 }
 
-impl documents::Extractor for RigExtractor {
-    fn extract<'a>(&'a self, text: &'a str) -> documents::ExtractFuture<'a> {
-        Box::pin(async move {
-            let answer = stream_answer(&self.agent, text, self.timeout, "extraction").await?;
-            documents::parse_extraction(&answer)
-        })
-    }
-}
-
-/// One streamed, tool-less call to `agent` with `text`, collected into the
-/// answer text. Streaming keeps long generations from tripping the HTTP
-/// client's read timeout; `what` names the call in errors.
-///
-/// # Errors
-///
-/// Returns an error when the call fails or produces nothing within
-/// `timeout`.
-pub async fn stream_answer(
-    agent: &rig::agent::Agent,
-    text: &str,
-    timeout: std::time::Duration,
-    what: &str,
-) -> Result<String> {
-    use futures::StreamExt;
-    use rig::streaming::StreamedAssistantContent;
-    let collect = async {
-        let mut stream = agent.stream_chat(text, Vec::<Message>::new()).await;
-        let mut answer = String::new();
-        let mut final_text: Option<String> = None;
-        while let Some(item) = stream.next().await {
-            match item.map_err(|e| Error::Llm(format!("{what} call failed: {e}")))? {
-                rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::Text(t),
-                ) => answer.push_str(&t.text),
-                rig::agent::MultiTurnStreamItem::FinalResponse(r) => {
-                    if r.usage.has_values() {
-                        tracing::debug!(
-                            call = what,
-                            input_tokens = r.usage.input_tokens,
-                            output_tokens = r.usage.output_tokens,
-                            "provider token usage"
-                        );
-                    }
-                    final_text = Some(r.output);
-                }
-                _ => {}
-            }
-        }
-        Ok::<String, Error>(match final_text {
-            Some(t) if answer.trim().is_empty() => t,
-            _ => answer,
-        })
-    };
-    tokio::time::timeout(timeout, collect).await.map_err(|_| {
-        Error::Llm(format!(
-            "{what} call produced nothing within {} s",
-            timeout.as_secs()
-        ))
-    })?
-}
-
-fn extraction_agent<M>(model: M, timeout: std::time::Duration) -> RigExtractor
-where
-    M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
-{
-    RigExtractor {
-        agent: rig::agent::AgentBuilder::new(model)
-            .preamble(documents::EXTRACTION_PROMPT)
-            .temperature(0.0)
-            .build(),
-        timeout,
-    }
-}
-
-/// The chat model as a constrained graph extractor: one tool-less agent
-/// whose preamble carries the ontology.
-struct RigGraphExtractor {
-    agent: rig::agent::Agent,
-    timeout: std::time::Duration,
-}
-
-impl graph_extract::GraphExtractor for RigGraphExtractor {
-    fn extract<'a>(&'a self, text: &'a str) -> graph_extract::ExtractFuture<'a> {
-        Box::pin(async move {
-            let answer = stream_answer(&self.agent, text, self.timeout, "graph extraction").await?;
-            tracing::debug!(answer = %answer, "graph extraction answer");
-            graph_extract::parse_extraction(&answer)
-        })
-    }
-}
-
-fn graph_agent<M>(model: M, ontology: &Ontology, timeout: std::time::Duration) -> RigGraphExtractor
-where
-    M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
-{
-    RigGraphExtractor {
-        agent: rig::agent::AgentBuilder::new(model)
-            .preamble(&graph_extract::prompt_for(ontology))
-            .temperature(0.0)
-            .build(),
-        timeout,
-    }
-}
-
-/// The configured chat model as a constrained extractor for the graph.
+/// The configured chat model as a constrained extractor for the graph: its
+/// preamble carries the ontology.
 ///
 /// # Errors
 ///
@@ -370,61 +394,30 @@ where
 pub async fn graph_extractor(
     config: &Config,
     ontology: &Ontology,
-) -> Result<Box<dyn graph_extract::GraphExtractor>> {
+) -> Result<Box<dyn Extract<Extraction>>> {
     let chat = config.chat_model_ref()?;
-    Ok(match chat.provider.provider_type {
-        ProviderType::Ollama => Box::new(graph_agent(
-            build_ollama_client(config, chat.provider_name, chat.provider)
-                .await?
-                .completion_model(chat.model),
-            ontology,
-            extraction_timeout(config),
-        )),
-        ProviderType::Openai => Box::new(graph_agent(
-            build_openai_client(config, chat.provider_name, chat.provider)
-                .await?
-                .completion_model(chat.model),
-            ontology,
-            extraction_timeout(config),
-        )),
-        ProviderType::Anthropic => Box::new(graph_agent(
-            build_anthropic_client(config, chat.provider_name, chat.provider)
-                .await?
-                .completion_model(chat.model),
-            ontology,
-            extraction_timeout(config),
-        )),
-    })
+    Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
+        chat.model,
+        &graph_extract::prompt_for(ontology),
+        extraction_timeout(config),
+        "graph extraction",
+    )))
 }
 
-/// The configured chat model as an extractor for ontology induction.
+/// The configured chat model as an open extractor for ontology induction.
 ///
 /// # Errors
 ///
 /// Returns an error when no chat model is configured or the provider
 /// cannot be built (a missing key, a needed login).
-pub async fn chat_extractor(config: &Config) -> Result<Box<dyn documents::Extractor>> {
+pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtraction>>> {
     let chat = config.chat_model_ref()?;
-    Ok(match chat.provider.provider_type {
-        ProviderType::Ollama => Box::new(extraction_agent(
-            build_ollama_client(config, chat.provider_name, chat.provider)
-                .await?
-                .completion_model(chat.model),
-            extraction_timeout(config),
-        )),
-        ProviderType::Openai => Box::new(extraction_agent(
-            build_openai_client(config, chat.provider_name, chat.provider)
-                .await?
-                .completion_model(chat.model),
-            extraction_timeout(config),
-        )),
-        ProviderType::Anthropic => Box::new(extraction_agent(
-            build_anthropic_client(config, chat.provider_name, chat.provider)
-                .await?
-                .completion_model(chat.model),
-            extraction_timeout(config),
-        )),
-    })
+    Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
+        chat.model,
+        documents::EXTRACTION_PROMPT,
+        extraction_timeout(config),
+        "extraction",
+    )))
 }
 
 /// A similarity check over the embedding model for clustering type and
@@ -924,9 +917,8 @@ async fn dispatch(
     message: &str,
     sink: EventSink,
 ) -> Result<AgentResponse> {
-    match chat.provider.provider_type {
-        ProviderType::Ollama => {
-            let client = build_ollama_client(config, chat.provider_name, chat.provider).await?;
+    match ChatClient::build(config, &chat).await? {
+        ChatClient::Ollama(client) => {
             if !ollama_model_resident(&client, chat.model).await {
                 drop(sink.send(AgentEvent::Status(format!(
                     "loading {}, then thinking; Ollama loads a model on its first request and keeps it \
@@ -950,8 +942,7 @@ async fn dispatch(
             )
             .await
         }
-        ProviderType::Openai => {
-            let client = build_openai_client(config, chat.provider_name, chat.provider).await?;
+        ChatClient::OpenAi(client) => {
             agent::run_analysis(
                 db,
                 reader_db,
@@ -968,8 +959,7 @@ async fn dispatch(
             )
             .await
         }
-        ProviderType::Anthropic => {
-            let client = build_anthropic_client(config, chat.provider_name, chat.provider).await?;
+        ChatClient::Anthropic(client) => {
             agent::run_analysis(
                 db,
                 reader_db,

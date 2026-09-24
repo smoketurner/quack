@@ -1879,7 +1879,7 @@ because the system being replaced runs on Postgres.
 4. **Storage backend seam — not built.** The intent was that retrieval, `graph/`, and
    `ontology/` sit behind small traits so a Postgres + pgvector backend could be added
    without touching the agent or the interfaces. In the code they take `&WorkspaceDb`
-   directly; the only traits are `Reranker`, `Extractor`, and `GraphExtractor`,
+   directly; the only traits are `Reranker` and `extraction::Extract`,
    none of them a storage seam. Adding another backend today means changing graph and
    ontology code.
 5. **Migration from the current deployment.** Documents are re-uploaded and re-embedded
@@ -1952,7 +1952,7 @@ and MRR, per question kind (`identifier`, `phrase`, `semantic`) and per backend
 (`search_keyword_chunks`, `search_similar_chunks`, `search_hybrid_chunks`), over a 21-question
 gold set; precision and recall of `ontology::induction::propose_from_tables` against a
 hand-written expected ontology; node and edge precision and recall of `graph::extract::run`
-over ten hand-labelled chunks through a canned `GraphExtractor`, so the numbers measure
+over ten hand-labelled chunks through a canned `Extract<Extraction>`, so the numbers measure
 validation, resolution, and storage rather than a model; and how many of a fixed set of
 recorded answers keep every `[n]` marker through `analysis::citations::validate`. Vector
 search uses a deterministic hashing embedder (a bag-of-words projection, not a semantic one)
