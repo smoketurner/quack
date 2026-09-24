@@ -482,7 +482,7 @@ CREATE TABLE _quack_messages (
     seq        INTEGER NOT NULL,
     role       TEXT NOT NULL,                -- user | assistant | tool
     content    TEXT NOT NULL,
-    metadata   JSON,                         -- tool, sql, rows, duration_ms, citations, chart
+    metadata   JSON,                         -- tool: ToolMeta (tool, detail, duration_ms, rows); assistant: AssistantMeta (chart, citations, write_refused, graph, usage)
     created_at TIMESTAMP DEFAULT now(),
     UNIQUE (session_id, seq)
 );
@@ -1350,7 +1350,7 @@ mode emits:
   "answer": "...",
   "citations": [{"n": 1, "document_id": "...", "filename": "Policy-2024.pdf", "page": 12, "heading": "Exclusions", "chunk_id": "...", "chunk_index": 3, "label": "Policy-2024.pdf p.12"}],
   "queries": [{"sql": "...", "rows": 4, "duration_ms": 9}],
-  "steps": [{"tool": "run_sql", "summary": "4 rows", "duration_ms": 9, "detail": "..."}],
+  "steps": [{"tool": "run_sql", "summary": "4 rows", "rows": 4, "duration_ms": 9, "detail": "..."}],
   "graph": {"nodes": [...], "edges": [...]},
   "chart": {...},
   "write_refused": false,

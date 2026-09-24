@@ -7,8 +7,12 @@
 
 use std::fmt::Write as _;
 
-use crate::analysis::agent::AgentResponse;
+use crate::analysis::agent::{AgentResponse, TokenUsage};
+use crate::analysis::chart::ChartSpec;
+use crate::analysis::citations::Citation;
+use crate::analysis::events::{ToolName, ToolStep};
 use crate::error::{Error, Record, Result};
+use crate::graph::GraphResult;
 use crate::ids::{MessageId, SessionId, UserId};
 
 use super::workspace::WorkspaceDb;
@@ -111,6 +115,101 @@ pub enum SessionViewer {
     User(UserId),
 }
 
+/// What a tool message stores beside its summary, which is the message's
+/// content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolMeta {
+    pub tool: ToolName,
+    pub detail: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+}
+
+impl ToolMeta {
+    /// The step again, with the summary the message stored as its content.
+    #[must_use]
+    pub fn step(&self, summary: String) -> ToolStep {
+        ToolStep {
+            tool: self.tool,
+            detail: self.detail.clone(),
+            summary,
+            rows: self.rows,
+            duration_ms: self.duration_ms,
+        }
+    }
+}
+
+impl From<&ToolStep> for ToolMeta {
+    fn from(step: &ToolStep) -> Self {
+        Self {
+            tool: step.tool,
+            detail: step.detail.clone(),
+            duration_ms: step.duration_ms,
+            rows: step.rows,
+        }
+    }
+}
+
+/// What an assistant message stores beside its answer. Empty parts are
+/// left out of the stored JSON.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AssistantMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<ChartSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<Citation>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write_refused: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph: Vec<GraphResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+}
+
+impl AssistantMeta {
+    /// The parts of `response` the transcript keeps, or `None` when it has
+    /// none of them.
+    #[must_use]
+    pub fn of(response: &AgentResponse) -> Option<Self> {
+        let meta = Self {
+            chart: response.chart.clone(),
+            citations: response.citations.clone(),
+            write_refused: response.write_refused,
+            graph: response.graph.clone(),
+            usage: response.usage,
+        };
+        (meta != Self::default()).then_some(meta)
+    }
+}
+
+/// A message's metadata, by its role. Serialized untagged, so the stored
+/// JSON and every API body are the fields themselves.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum MessageMeta {
+    Tool(ToolMeta),
+    Assistant(AssistantMeta),
+}
+
+impl MessageMeta {
+    /// Decode a stored metadata column for a message of `role`. A column
+    /// that does not decode is dropped with a warning rather than making
+    /// the whole session unreadable.
+    fn decode(id: &MessageId, role: MessageRole, text: &str) -> Option<Self> {
+        let decoded = match role {
+            MessageRole::User => return None,
+            MessageRole::Tool => serde_json::from_str(text).map(Self::Tool),
+            MessageRole::Assistant => serde_json::from_str(text).map(Self::Assistant),
+        };
+        decoded
+            .inspect_err(
+                |error| tracing::warn!(message = %id, %error, "unreadable message metadata"),
+            )
+            .ok()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageRow {
     pub id: MessageId,
@@ -118,8 +217,28 @@ pub struct MessageRow {
     pub seq: i64,
     pub role: MessageRole,
     pub content: String,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata: Option<MessageMeta>,
     pub created_at: String,
+}
+
+impl MessageRow {
+    /// The tool call a tool message records.
+    #[must_use]
+    pub fn tool(&self) -> Option<&ToolMeta> {
+        match &self.metadata {
+            Some(MessageMeta::Tool(meta)) => Some(meta),
+            Some(MessageMeta::Assistant(_)) | None => None,
+        }
+    }
+
+    /// The chart, citations, graph results, and usage an answer carried.
+    #[must_use]
+    pub fn assistant(&self) -> Option<&AssistantMeta> {
+        match &self.metadata {
+            Some(MessageMeta::Assistant(meta)) => Some(meta),
+            Some(MessageMeta::Tool(_)) | None => None,
+        }
+    }
 }
 
 /// A row of `id, session_id, seq, role, content, metadata, created_at`.
@@ -127,15 +246,18 @@ impl TryFrom<&duckdb::Row<'_>> for MessageRow {
     type Error = Error;
 
     fn try_from(row: &duckdb::Row<'_>) -> Result<Self> {
-        let role: String = row.get(3)?;
+        let id: MessageId = row.get(0)?;
+        let role: MessageRole = row.get::<_, String>(3)?.parse()?;
         let metadata: Option<String> = row.get(5)?;
         Ok(Self {
-            id: row.get(0)?,
+            metadata: metadata
+                .as_deref()
+                .and_then(|text| MessageMeta::decode(&id, role, text)),
+            id,
             session_id: row.get(1)?,
             seq: row.get(2)?,
-            role: role.parse()?,
+            role,
             content: row.get(4)?,
-            metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
             created_at: row.get(6)?,
         })
     }
@@ -278,7 +400,7 @@ pub fn append_message(
     session_id: &SessionId,
     role: MessageRole,
     content: &str,
-    metadata: Option<&serde_json::Value>,
+    metadata: Option<&MessageMeta>,
 ) -> Result<i64> {
     if get_session(db, session_id)?.is_none() {
         return Err(Record::Session.missing(session_id.as_str()));
@@ -349,47 +471,16 @@ pub fn record_turn(
     append_message(db, session_id, MessageRole::User, user_message, None)?;
 
     for step in &response.steps {
-        let metadata = serde_json::json!({
-            "tool": step.tool,
-            "detail": step.detail,
-            "duration_ms": step.duration_ms,
-        });
         append_message(
             db,
             session_id,
             MessageRole::Tool,
             &step.summary,
-            Some(&metadata),
+            Some(&MessageMeta::Tool(ToolMeta::from(step))),
         )?;
     }
 
-    let mut metadata = serde_json::Map::new();
-    if let Some(chart) = &response.chart {
-        metadata.insert(String::from("chart"), serde_json::to_value(chart)?);
-    }
-    if !response.citations.is_empty() {
-        metadata.insert(
-            String::from("citations"),
-            serde_json::to_value(&response.citations)?,
-        );
-    }
-    if response.write_refused {
-        metadata.insert(String::from("write_refused"), serde_json::Value::Bool(true));
-    }
-    if !response.graph.is_empty() {
-        metadata.insert(
-            String::from("graph"),
-            serde_json::to_value(&response.graph)?,
-        );
-    }
-    if let Some(usage) = response.usage {
-        metadata.insert(String::from("usage"), serde_json::to_value(usage)?);
-    }
-    let metadata = if metadata.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(metadata))
-    };
+    let metadata = AssistantMeta::of(response).map(MessageMeta::Assistant);
     append_message(
         db,
         session_id,
@@ -505,14 +596,10 @@ impl Transcript {
             match row.role {
                 MessageRole::User => question = Some(row.content.as_str()),
                 MessageRole::Tool => {
-                    let Some(meta) = &row.metadata else { continue };
-                    let tool = meta.get("tool").and_then(serde_json::Value::as_str);
-                    if !matches!(tool, Some("run_sql" | "create_chart")) {
-                        continue;
-                    }
-                    let Some(sql) = meta.get("detail").and_then(serde_json::Value::as_str) else {
+                    let Some(meta) = row.tool().filter(|m| m.tool.takes_sql()) else {
                         continue;
                     };
+                    let sql = &meta.detail;
                     if let Some(q) = question.take() {
                         for line in q.lines() {
                             writeln!(out, "-- {line}")?;
@@ -545,37 +632,23 @@ impl Transcript {
                     writeln!(out, "## {}\n", row.content.trim())?;
                 }
                 MessageRole::Tool => {
-                    let tool = row
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("tool"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("tool");
-                    let detail = row
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("detail"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let ms = row
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("duration_ms"))
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    writeln!(out, "**{tool}** — {}, {ms} ms\n", row.content)?;
-                    if !detail.is_empty() {
-                        let lang = if matches!(tool, "run_sql" | "create_chart") {
-                            "sql"
-                        } else {
-                            "text"
-                        };
-                        writeln!(out, "```{lang}\n{}\n```\n", detail.trim())?;
+                    let Some(meta) = row.tool() else {
+                        writeln!(out, "**tool** — {}\n", row.content)?;
+                        continue;
+                    };
+                    writeln!(
+                        out,
+                        "**{}** — {}, {} ms\n",
+                        meta.tool, row.content, meta.duration_ms
+                    )?;
+                    if !meta.detail.is_empty() {
+                        let lang = if meta.tool.takes_sql() { "sql" } else { "text" };
+                        writeln!(out, "```{lang}\n{}\n```\n", meta.detail.trim())?;
                     }
                 }
                 MessageRole::Assistant => {
                     writeln!(out, "{}\n", row.content.trim())?;
-                    if row.metadata.as_ref().and_then(|m| m.get("chart")).is_some() {
+                    if row.assistant().is_some_and(|m| m.chart.is_some()) {
                         writeln!(out, "_(chart attached)_\n")?;
                     }
                 }
@@ -628,8 +701,6 @@ pub fn delete_if_empty(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::agent::TokenUsage;
-    use crate::analysis::events::ToolStep;
 
     fn db() -> WorkspaceDb {
         WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
@@ -653,11 +724,12 @@ mod tests {
         }
     }
 
-    fn step(tool: &str, detail: &str, summary: &str) -> ToolStep {
+    fn step(tool: ToolName, detail: &str, summary: &str) -> ToolStep {
         ToolStep {
-            tool: tool.to_owned(),
+            tool,
             detail: detail.to_owned(),
             summary: summary.to_owned(),
+            rows: None,
             duration_ms: 7,
         }
     }
@@ -750,7 +822,11 @@ mod tests {
             "  how many   claims are open?  ",
             &response(
                 "There are 4 open claims.",
-                vec![step("run_sql", "SELECT count(*) FROM claims", "1 rows")],
+                vec![step(
+                    ToolName::RunSql,
+                    "SELECT count(*) FROM claims",
+                    "1 rows",
+                )],
             ),
         )
         .unwrap();
@@ -767,13 +843,7 @@ mod tests {
         );
         let tool = rows.iter().find(|r| r.role == MessageRole::Tool).unwrap();
         assert_eq!(tool.content, "1 rows");
-        assert_eq!(
-            tool.metadata
-                .as_ref()
-                .and_then(|m| m.get("tool"))
-                .and_then(|v| v.as_str()),
-            Some("run_sql")
-        );
+        assert_eq!(tool.tool().map(|m| m.tool), Some(ToolName::RunSql));
 
         let session = get_session(&db, &session.id).unwrap().unwrap();
         assert_eq!(session.title.as_deref(), Some("how many claims are open?"));
@@ -798,15 +868,83 @@ mod tests {
             .iter()
             .find(|r| r.role == MessageRole::Assistant)
             .unwrap();
-        let usage = assistant
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("usage"))
+        assert_eq!(
+            assistant.assistant().and_then(|m| m.usage),
+            Some(TokenUsage {
+                input_tokens: 1_204,
+                output_tokens: 57,
+                total_tokens: 1_261,
+            })
+        );
+    }
+
+    /// The typed metadata writes the same JSON keys the column always held,
+    /// leaving out what a message did not have, and reads it back.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn metadata_is_stored_under_its_field_names_and_read_back() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        let mut sql = step(ToolName::RunSql, "SELECT 1", "1 rows");
+        sql.rows = Some(1);
+        let mut answer = response("One.", vec![sql]);
+        answer.write_refused = true;
+        record_turn(&db, &session.id, "one?", &answer).unwrap();
+
+        let stored: Vec<String> = {
+            let conn = db.connection();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT CAST(metadata AS VARCHAR) FROM _quack_messages \
+                     WHERE metadata IS NOT NULL ORDER BY seq",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<duckdb::Result<_>>()
+                .unwrap()
+        };
+        let json: Vec<serde_json::Value> = stored
+            .iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(
+            json,
+            vec![
+                serde_json::json!({"tool": "run_sql", "detail": "SELECT 1", "duration_ms": 7, "rows": 1}),
+                serde_json::json!({"write_refused": true}),
+            ]
+        );
+
+        let rows = messages(&db, &session.id).unwrap();
+        let tool = rows.iter().find_map(MessageRow::tool).unwrap();
+        assert_eq!(tool.step(String::from("1 rows")).rows, Some(1));
+        let assistant = rows.iter().find_map(MessageRow::assistant).unwrap();
+        assert!(assistant.write_refused && assistant.chart.is_none());
+    }
+
+    /// A stored column that no longer decodes (a tool this build does not
+    /// know) loses its metadata, not the session.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn metadata_that_does_not_decode_is_dropped_not_fatal() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO _quack_messages (id, session_id, seq, role, content, metadata) \
+                 VALUES ('m1', ?, 1, 'tool', 'done', '{\"tool\": \"retired_tool\"}')",
+                duckdb::params![session.id],
+            )
             .unwrap();
-        let count = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
-        assert_eq!(count("input_tokens"), Some(1_204));
-        assert_eq!(count("output_tokens"), Some(57));
-        assert_eq!(count("total_tokens"), Some(1_261));
+        let rows = messages(&db, &session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.first().is_some_and(|r| r.metadata.is_none()));
+        let markdown = Transcript::load(&db, get_session(&db, &session.id).unwrap().unwrap())
+            .unwrap()
+            .render(ExportFormat::Markdown)
+            .unwrap();
+        assert!(markdown.contains("**tool** — done"), "{markdown}");
     }
 
     #[test]
@@ -860,7 +998,10 @@ mod tests {
             &db,
             &session.id,
             "first question",
-            &response("first answer", vec![step("run_sql", "SELECT 1", "1 rows")]),
+            &response(
+                "first answer",
+                vec![step(ToolName::RunSql, "SELECT 1", "1 rows")],
+            ),
         )
         .unwrap();
         record_turn(
@@ -894,9 +1035,9 @@ mod tests {
             &response(
                 "4",
                 vec![
-                    step("list_tables", "", "2 tables"),
+                    step(ToolName::ListTables, "", "2 tables"),
                     step(
-                        "run_sql",
+                        ToolName::RunSql,
                         "SELECT count(*) FROM claims WHERE open;",
                         "1 rows",
                     ),
@@ -937,7 +1078,7 @@ mod tests {
             &db,
             &session.id,
             "open claims?",
-            &response("Four.", vec![step("run_sql", "SELECT 1", "1 rows")]),
+            &response("Four.", vec![step(ToolName::RunSql, "SELECT 1", "1 rows")]),
         )
         .unwrap();
         let session = get_session(&db, &session.id).unwrap().unwrap();

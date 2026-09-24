@@ -11,7 +11,7 @@ use crate::ids::SessionId;
 
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
-use super::events::{AgentEvent, EventSink, ToolStep, TurnFailure, TurnRecorder};
+use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::text_to_sql::{self, PromptOptions, SystemPrompt};
 use super::tools::{
@@ -29,7 +29,7 @@ use crate::storage::sessions::ChatMode;
 /// itself — the history trim, Ollama's `num_ctx` — is a four-characters-
 /// per-token estimate; this is the measured count the provider reported,
 /// for the response object and the transcript.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[expect(
     clippy::struct_field_names,
     reason = "these are the field names of rig's Usage and of every provider's API, and they are the response object's JSON keys"
@@ -109,14 +109,10 @@ impl AgentResponse {
     pub fn queries(&self) -> Vec<QueryRun> {
         self.steps
             .iter()
-            .filter(|s| s.tool == "run_sql")
+            .filter(|s| s.tool == ToolName::RunSql)
             .map(|s| QueryRun {
                 sql: s.detail.clone(),
-                rows: s
-                    .summary
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse::<u64>().ok()),
+                rows: s.rows,
                 duration_ms: s.duration_ms,
             })
             .collect()
@@ -660,15 +656,17 @@ mod tests {
             content: String::from("12 storms [1]"),
             steps: vec![
                 ToolStep {
-                    tool: String::from("run_sql"),
+                    tool: ToolName::RunSql,
                     detail: String::from("SELECT count(*) FROM events"),
-                    summary: String::from("1 rows"),
+                    summary: String::from("the summary is not parsed"),
+                    rows: Some(1),
                     duration_ms: 7,
                 },
                 ToolStep {
-                    tool: String::from("search_documents"),
+                    tool: ToolName::SearchDocuments,
                     detail: String::from("storms"),
                     summary: String::from("3 chunks"),
+                    rows: None,
                     duration_ms: 4,
                 },
             ],

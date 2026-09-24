@@ -38,7 +38,7 @@ macro_rules! text_enum {
 
             /// The text form, as `Display` writes it and `FromStr` reads it.
             #[must_use]
-            pub fn as_str(self) -> &'static str {
+            pub const fn as_str(self) -> &'static str {
                 match self {
                     $(Self::$variant => $text),+
                 }
