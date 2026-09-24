@@ -14,6 +14,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
@@ -40,14 +41,14 @@ const LOGIN_ACTION: AuditAction = AuditAction::Login;
 pub(crate) enum Credential {
     Local,
     /// A browser or API-login session.
-    Session(String),
+    Session(SessionToken),
     /// An API token; the row carries its workspace and scopes.
     Token(TokenRow),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Identity {
-    pub user_id: String,
+    pub user_id: UserId,
     pub username: String,
     pub is_admin: bool,
     pub credential: Credential,
@@ -245,7 +246,7 @@ impl FromRequestParts<App> for Identity {
         let RequestId(request_id) = RequestId::of(&parts.headers);
         if app.local {
             return Ok(Self {
-                user_id: String::from(LOCAL_USER_ID),
+                user_id: UserId::from(LOCAL_USER_ID),
                 username: String::from(LOCAL_USER_ID),
                 is_admin: true,
                 credential: Credential::Local,
@@ -277,7 +278,7 @@ impl FromRequestParts<App> for Identity {
                     user_id: user.id,
                     username: user.username,
                     is_admin: user.is_admin,
-                    credential: Credential::Session(presented),
+                    credential: Credential::Session(SessionToken::presented(presented)),
                     client_addr,
                     request_id,
                     channel: None,
@@ -378,8 +379,8 @@ pub(crate) struct Access {
 impl Access {
     /// Whether the caller may act on something `owner` created: their own,
     /// or anyone's as a workspace owner or an admin.
-    pub(crate) fn owns(&self, owner: Option<&str>) -> bool {
-        owner == Some(self.identity.user_id.as_str()) || self.sees_all_sessions()
+    pub(crate) fn owns(&self, owner: Option<&UserId>) -> bool {
+        owner == Some(&self.identity.user_id) || self.sees_all_sessions()
     }
 
     /// Owners and admins see every session; others see their own.
@@ -420,7 +421,7 @@ impl Access {
         resource: Option<AuditResource<'_>>,
         outcome: Outcome,
         detail: Option<serde_json::Value>,
-    ) -> ApiResult<String> {
+    ) -> ApiResult<AuditId> {
         let mut entry = self.identity.audit(action, outcome);
         entry = entry.in_workspace(&self.workspace.id);
         if let Some(resource) = resource {
@@ -468,7 +469,7 @@ impl Access {
     pub(crate) async fn resolve(
         app: &App,
         identity: Identity,
-        workspace_id: &str,
+        workspace_id: &WorkspaceId,
         need: Need,
     ) -> ApiResult<Self> {
         let Some(workspace) = app.control.get_workspace(workspace_id).await? else {

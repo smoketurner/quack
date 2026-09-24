@@ -6,6 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
+use quack_core::ids::WorkspaceId;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
 use serde::Deserialize;
@@ -27,7 +28,7 @@ fn default_limit() -> u32 {
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -66,7 +67,7 @@ impl Access {
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(String, String)>,
+    Path((id, sid)): Path<(WorkspaceId, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = access.visible_session(&app, &sid).await?;
@@ -100,7 +101,7 @@ pub(crate) struct UpdateSession {
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(String, String)>,
+    Path((id, sid)): Path<(WorkspaceId, String)>,
     Json(body): Json<UpdateSession>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -122,7 +123,7 @@ pub(crate) async fn update(
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(String, String)>,
+    Path((id, sid)): Path<(WorkspaceId, String)>,
 ) -> ApiResult<axum::http::StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.delete_session(&app, &sid).await?;
@@ -142,7 +143,7 @@ impl Access {
         refusal: &'static str,
     ) -> ApiResult<sessions::SessionRow> {
         let session = self.visible_session(app, sid).await?;
-        if !self.owns(session.created_by.as_deref()) {
+        if !self.owns(session.created_by.as_ref()) {
             self.audit(
                 app,
                 action,
@@ -257,7 +258,7 @@ pub(crate) struct ExportQuery {
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(String, String)>,
+    Path((id, sid)): Path<(WorkspaceId, String)>,
     Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;

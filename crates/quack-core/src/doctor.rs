@@ -420,7 +420,7 @@ async fn check_workspace(
         ));
         return;
     };
-    if !config.workspace_db_path(&row.id).exists() {
+    if !config.workspace_db_path(row.id.as_str()).exists() {
         report.push(Check::new(
             Area::Workspace,
             Status::Ok,
@@ -428,7 +428,7 @@ async fn check_workspace(
         ));
         return;
     }
-    match WorkspaceDb::open(config, &row.id) {
+    match WorkspaceDb::open(config, row.id.as_str()) {
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());
             let documents = db.list_documents().map_or(0, |d| d.len());

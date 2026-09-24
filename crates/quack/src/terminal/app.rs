@@ -25,6 +25,7 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
+use quack_core::ids::WorkspaceId;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::jobs::{
@@ -404,7 +405,7 @@ impl InputHistory {
 struct JobEnv {
     config: Arc<Config>,
     db: SharedDb,
-    workspace_id: String,
+    workspace_id: WorkspaceId,
     workspace_name: String,
 }
 
@@ -553,7 +554,7 @@ impl CliJob {
         let summary = import::Importing {
             config: &env.config,
             db: &env.db,
-            workspace_id: &env.workspace_id,
+            workspace_id: env.workspace_id.as_str(),
             request,
             policy: ImportPolicy::owner(),
             embedder: embedding_model.as_ref(),
@@ -585,7 +586,7 @@ impl CliJob {
         let outcome = ingestion::ingest_file(
             &env.config,
             &env.db,
-            &env.workspace_id,
+            env.workspace_id.as_str(),
             &NewFile::new(&filename, &data).control(control),
             embedding_model.as_ref(),
         )
@@ -726,7 +727,7 @@ pub(crate) struct App {
     history: InputHistory,
     popup: Popup,
     config: Arc<Config>,
-    workspace_id: String,
+    workspace_id: WorkspaceId,
     db: SharedDb,
     reader_db: ReaderDb,
     /// Writes allowed for the session (`--allow-write`, or `a` at a
@@ -2473,7 +2474,7 @@ mod tests {
         App::new(SessionSetup {
             config,
             workspace_name: String::from("ws"),
-            workspace_id: String::from("ws"),
+            workspace_id: WorkspaceId::from("ws"),
             db,
             reader_db,
             session_id: session.id,

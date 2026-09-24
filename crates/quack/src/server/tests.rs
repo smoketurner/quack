@@ -17,6 +17,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{BaseUrl, Config, ProviderConfig, ProviderName, ProviderType};
 use quack_core::embedding::Dimension;
+use quack_core::ids::{UserId, WorkspaceId};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -121,7 +122,7 @@ impl Harness {
             .await
     }
 
-    async fn user(&self, name: &str, admin: bool) -> String {
+    async fn user(&self, name: &str, admin: bool) -> UserId {
         self.app
             .control
             .create_user(name, "pw", admin)
@@ -143,7 +144,7 @@ impl Harness {
         body["token"].as_str().unwrap_or_default().to_owned()
     }
 
-    async fn workspace(&self, name: &str, owner: &str) -> String {
+    async fn workspace(&self, name: &str, owner: &UserId) -> WorkspaceId {
         let ws = self
             .app
             .control
@@ -169,7 +170,7 @@ impl Harness {
             .unwrap_or_else(|e| fail(&e.to_string()))
     }
 
-    async fn wait_ready(&self, ws: &str, doc: &str, bearer: &str) -> serde_json::Value {
+    async fn wait_ready(&self, ws: &WorkspaceId, doc: &str, bearer: &str) -> serde_json::Value {
         for _ in 0..100 {
             let (status, body) = self
                 .get(&format!("/api/v1/workspaces/{ws}/documents/{doc}"), bearer)
@@ -256,11 +257,7 @@ async fn login_sets_a_cookie_and_audits_both_outcomes() {
         .await;
     let outcomes: Vec<&str> = logins.iter().map(|r| r.outcome.as_str()).collect();
     assert_eq!(outcomes, ["allowed", "denied"]);
-    assert!(
-        logins
-            .iter()
-            .all(|r| r.user_id.as_deref() == Some(alice.as_str()))
-    );
+    assert!(logins.iter().all(|r| r.user_id.as_ref() == Some(&alice)));
     let (status, _) = h
         .call(Method::POST, "/api/v1/auth/logout", Some(&token), None)
         .await;
@@ -295,7 +292,7 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     assert_eq!(body["role"], "owner");
     let (status, _) = h
         .post(
@@ -327,7 +324,7 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
     assert!(
         denied
             .iter()
-            .any(|r| r.workspace_id.as_deref() == Some(ws.as_str()) && r.channel == Channel::Web)
+            .any(|r| r.workspace_id.as_ref() == Some(&ws) && r.channel == Channel::Web)
     );
     let (status, _) = h.get("/api/v1/workspaces/nope", &bob_token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -591,7 +588,7 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert!(
         access_rows
             .iter()
-            .any(|r| r.outcome == Outcome::Denied && r.user_id.as_deref() == Some(viewer.as_str()))
+            .any(|r| r.outcome == Outcome::Denied && r.user_id.as_ref() == Some(&viewer))
     );
     assert!(access_rows.iter().any(|r| r.outcome == Outcome::Error));
     assert!(access_rows.iter().all(|r| r.request_id.is_some()));
@@ -973,11 +970,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
             ..AuditFilter::default()
         })
         .await;
-    assert!(
-        denied
-            .iter()
-            .any(|r| r.user_id.as_deref() == Some(owner.as_str()))
-    );
+    assert!(denied.iter().any(|r| r.user_id.as_ref() == Some(&owner)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1069,7 +1062,7 @@ async fn a_failed_first_turn_leaves_no_empty_session_behind() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     let (status, body) = h
         .call(
             Method::POST,
@@ -1523,7 +1516,7 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
             Some(serde_json::json!({ "name": "p" })),
         )
         .await;
-    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     for sql in [
         "CREATE TABLE vendors (vendor_id INTEGER, name TEXT)",
         "INSERT INTO vendors SELECT i, 'V' || i FROM range(30) t(i)",
@@ -1832,7 +1825,7 @@ async fn local_mode_needs_no_login_and_owns_everything() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     let (status, body) = h
         .call(
             Method::POST,
@@ -1851,7 +1844,10 @@ async fn local_mode_needs_no_login_and_owns_everything() {
             ..AuditFilter::default()
         })
         .await;
-    assert!(rows.iter().all(|r| r.user_id.as_deref() == Some("local")));
+    assert!(
+        rows.iter()
+            .all(|r| r.user_id == Some(UserId::from("local")))
+    );
 }
 
 #[tokio::test]
@@ -2042,10 +2038,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let chat_url = location(&headers);
     assert!(chat_url.ends_with("/chat"), "{chat_url}");
-    let ws = chat_url
-        .trim_start_matches("/w/")
-        .trim_end_matches("/chat")
-        .to_owned();
+    let ws = WorkspaceId::from(chat_url.trim_start_matches("/w/").trim_end_matches("/chat"));
 
     let (status, html, _) = h.page("/workspaces", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
@@ -2332,7 +2325,7 @@ fn banner_names_the_address_mode_and_models() {
 /// parsed body, and the `Mcp-Session-Id` the server assigned.
 async fn mcp_call(
     h: &Harness,
-    ws: &str,
+    ws: &WorkspaceId,
     token: Option<&str>,
     session: Option<&str>,
     body: serde_json::Value,
@@ -2375,7 +2368,7 @@ fn rpc(id: u32, method: &str, params: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
 }
 
-async fn mcp_session(h: &Harness, ws: &str, token: &str) -> String {
+async fn mcp_session(h: &Harness, ws: &WorkspaceId, token: &str) -> String {
     let (status, body, session) = mcp_call(
         h,
         ws,
@@ -2725,12 +2718,12 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
 #[tokio::test]
 async fn extraction_slots_are_exclusive_per_workspace() {
     let h = harness(true).await;
-    let first = h.app.begin_extraction("ws-a");
+    let first = h.app.begin_extraction(&WorkspaceId::from("ws-a"));
     assert!(first.is_some());
-    assert!(h.app.begin_extraction("ws-a").is_none());
-    assert!(h.app.begin_extraction("ws-b").is_some());
+    assert!(h.app.begin_extraction(&WorkspaceId::from("ws-a")).is_none());
+    assert!(h.app.begin_extraction(&WorkspaceId::from("ws-b")).is_some());
     drop(first);
-    assert!(h.app.begin_extraction("ws-a").is_some());
+    assert!(h.app.begin_extraction(&WorkspaceId::from("ws-a")).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2744,7 +2737,7 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
             Some(serde_json::json!({ "name": "g" })),
         )
         .await;
-    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     for sql in [
         "CREATE TABLE shipments (po TEXT, vendor TEXT, country TEXT)",
         "INSERT INTO shipments VALUES ('PO-1', 'Orgenics', 'Kenya'), ('PO-2', 'Orgenics', 'Uganda'), ('PO-3', 'Aurobindo', 'Kenya')",
@@ -2976,7 +2969,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             Some(serde_json::json!({ "name": "okf" })),
         )
         .await;
-    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     let (status, _) = h
         .call(
             Method::POST,
@@ -3092,7 +3085,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             Some(serde_json::json!({ "name": "okf3" })),
         )
         .await;
-    let ws3 = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws3 = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     let request = Request::builder()
         .method(Method::POST)
         .uri(format!("/api/v1/workspaces/{ws3}/documents"))
@@ -3128,7 +3121,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             Some(serde_json::json!({ "name": "okf2" })),
         )
         .await;
-    let ws2 = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws2 = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     let mut incoming = Bundle::default();
     incoming.files.push(BundleFile {
         path: String::from("index.md"),
@@ -3209,7 +3202,7 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
             Some(serde_json::json!({ "name": "imp" })),
         )
         .await;
-    let ws = body["id"].as_str().unwrap_or_default().to_owned();
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
     // Outside the data directory: quack's own files are refused (below).
     let source_dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let source_path = source_dir.path().join("source.db");
@@ -3648,7 +3641,7 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
     let ws = h.workspace("busy", &owner).await;
     let token = h.login("owner").await;
     let release = CancellationToken::new();
-    let lane = LaneKey::Ingest(ws.clone());
+    let lane = LaneKey::Ingest(ws.to_string());
     for n in 0..MAX_WAITING_UPLOADS {
         let release = release.clone();
         h.app.jobs.submit(
@@ -3741,7 +3734,7 @@ async fn the_jobs_page_follows_the_job_stream_with_the_session_cookie() {
 }
 
 /// Poll a job until it reaches a final state.
-async fn wait_for_job(h: &Harness, ws: &str, job: &str, token: &str) -> serde_json::Value {
+async fn wait_for_job(h: &Harness, ws: &WorkspaceId, job: &str, token: &str) -> serde_json::Value {
     for _ in 0..200 {
         let (_, body) = h
             .get(&format!("/api/v1/workspaces/{ws}/jobs/{job}"), token)

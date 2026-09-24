@@ -5,6 +5,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::extraction::ExtractionRun;
+use quack_core::ids::WorkspaceId;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -23,7 +24,7 @@ use quack_core::progress::{ChunkDone, RunControl};
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -38,7 +39,7 @@ pub(crate) async fn show(
 pub(crate) async fn replace(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -52,7 +53,7 @@ pub(crate) async fn replace(
 pub(crate) async fn init(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.init_ontology(&app).await?;
@@ -150,7 +151,7 @@ fn default_limit() -> u32 {
 pub(crate) async fn versions(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -171,7 +172,7 @@ pub(crate) struct DiffQuery {
 pub(crate) async fn version(
     State(app): State<App>,
     identity: Identity,
-    Path((id, v)): Path<(String, OntologyVersion)>,
+    Path((id, v)): Path<(WorkspaceId, OntologyVersion)>,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -205,7 +206,7 @@ pub(crate) async fn version(
 pub(crate) async fn restore(
     State(app): State<App>,
     identity: Identity,
-    Path((id, v)): Path<(String, OntologyVersion)>,
+    Path((id, v)): Path<(WorkspaceId, OntologyVersion)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await?;
@@ -237,7 +238,7 @@ pub(crate) struct ProposeRequest {
 pub(crate) async fn propose(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     body: Option<Json<ProposeRequest>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -431,7 +432,7 @@ pub(crate) struct CandidatesQuery {
 pub(crate) async fn list_candidates(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -460,7 +461,7 @@ pub(crate) struct DecideManyRequest {
 pub(crate) async fn decide_many(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<DecideManyRequest>,
 ) -> ApiResult<Json<CandidatesDecided>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -482,7 +483,7 @@ pub(crate) struct DecideRequest {
 pub(crate) async fn decide(
     State(app): State<App>,
     identity: Identity,
-    Path((id, cid)): Path<(String, String)>,
+    Path((id, cid)): Path<(WorkspaceId, String)>,
     Json(body): Json<DecideRequest>,
 ) -> ApiResult<Json<CandidateDecided>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -505,7 +506,7 @@ impl Access {
         app: &App,
         sample: Option<u32>,
     ) -> ApiResult<Json<serde_json::Value>> {
-        let (access, id) = (self, self.workspace.id.as_str());
+        let (access, id) = (self, &self.workspace.id);
         let mut options = app.config.ontology.document_evidence();
         if let Some(n) = sample {
             options.sample_chunks = n;

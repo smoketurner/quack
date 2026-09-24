@@ -12,7 +12,7 @@
 </form>
 <div class="mt-4 overflow-x-auto rounded border border-slate-200 bg-white">
 <table class="min-w-full text-xs"><thead><tr class="border-b border-slate-300 text-left uppercase text-slate-500"><th class="px-2 py-2">Time</th><th>Outcome</th><th>Channel</th><th>Action</th><th>User</th><th>Workspace</th><th>Resource</th><th>Client</th></tr></thead><tbody>
-  {% for r in rows %}<tr class="border-b border-slate-100 {% if r.outcome == Outcome::Denied %}bg-red-50{% endif %}"><td class="px-2 py-1 whitespace-nowrap">{{ r.timestamp }}</td><td>{{ r.outcome }}</td><td>{{ r.channel }}</td><td>{{ r.action }}</td><td class="font-mono">{{ r.user_id.as_deref().unwrap_or("-") }}</td><td class="font-mono">{{ r.workspace_id.as_deref().unwrap_or("-") }}</td><td class="font-mono">{{ r.resource_type.as_deref().unwrap_or("") }} {{ r.resource_id.as_deref().unwrap_or("") }}</td><td>{{ r.client_addr.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
+  {% for r in rows %}<tr class="border-b border-slate-100 {% if r.outcome == Outcome::Denied %}bg-red-50{% endif %}"><td class="px-2 py-1 whitespace-nowrap">{{ r.timestamp }}</td><td>{{ r.outcome }}</td><td>{{ r.channel }}</td><td>{{ r.action }}</td><td class="font-mono">{% if let Some(u) = r.user_id %}{{ u }}{% else %}-{% endif %}</td><td class="font-mono">{% if let Some(w) = r.workspace_id %}{{ w }}{% else %}-{% endif %}</td><td class="font-mono">{{ r.resource_type.as_deref().unwrap_or("") }} {{ r.resource_id.as_deref().unwrap_or("") }}</td><td>{{ r.client_addr.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
 </tbody></table>
 </div>
 <p class="mt-2 text-xs text-slate-500">This is the access record: who touched which resource by id. The content detail is inside each workspace, visible to its members.</p>

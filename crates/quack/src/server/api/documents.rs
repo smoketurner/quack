@@ -10,6 +10,7 @@ use axum::extract::{FromRequest, Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use quack_core::error::Record;
+use quack_core::ids::WorkspaceId;
 use quack_core::ingestion;
 use quack_core::jobs::{JobId, LaneKey};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -27,7 +28,7 @@ use quack_core::storage::workspace::{DocumentInfo, DocumentSource, WorkspaceDb};
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -40,7 +41,7 @@ pub(crate) async fn list(
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path((id, doc)): Path<(String, String)>,
+    Path((id, doc)): Path<(WorkspaceId, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -72,7 +73,7 @@ pub(crate) struct PastedText {
 pub(crate) async fn upload(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     request: axum::extract::Request,
 ) -> ApiResult<impl IntoResponse> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -254,7 +255,7 @@ pub(crate) async fn enqueue(
     let id = access.workspace.id.clone();
     // Backpressure: every queued upload holds its bytes in memory, so a
     // workspace with a deep line of them turns more away until it drains.
-    let waiting = app.jobs.lane_active(&LaneKey::Ingest(id.clone()));
+    let waiting = app.jobs.lane_active(&LaneKey::Ingest(id.to_string()));
     if waiting.saturating_add(files.len()) > MAX_WAITING_UPLOADS {
         return Err(ApiError::busy(
             format!("{waiting} uploads are already waiting in this workspace; try again shortly"),
@@ -292,7 +293,7 @@ pub(crate) async fn enqueue(
                 &ingestion::NewFile::new(&name, &data)
                     .source(source)
                     .title(title.as_deref())
-                    .ingested_by(Some(&user)),
+                    .ingested_by(Some(user.as_str())),
             )
             .map(|r| (r, data))
         })
@@ -376,7 +377,7 @@ pub(crate) struct UpdateDocument {
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
-    Path((id, doc)): Path<(String, String)>,
+    Path((id, doc)): Path<(WorkspaceId, String)>,
     Json(body): Json<UpdateDocument>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -414,7 +415,7 @@ pub(crate) async fn set_pinned(
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
-    Path((id, doc)): Path<(String, String)>,
+    Path((id, doc)): Path<(WorkspaceId, String)>,
 ) -> ApiResult<StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     delete_document(&app, &access, &doc).await?;

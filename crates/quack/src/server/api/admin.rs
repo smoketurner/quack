@@ -4,6 +4,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, AuditFilter, Outcome, ResourceKind, UserRow};
 use serde::Deserialize;
 
@@ -50,7 +51,7 @@ impl Identity {
             .create_user(&user.username, &user.password, user.is_admin)
             .await?;
         let mut entry = self.audit(AuditAction::Admin, Outcome::Allowed);
-        entry = entry.on(ResourceKind::User.id(&created.id));
+        entry = entry.on(ResourceKind::User.id(created.id.as_str()));
         app.control.record_audit(&entry).await?;
         Ok(created)
     }
@@ -58,8 +59,8 @@ impl Identity {
 
 #[derive(Deserialize)]
 pub(crate) struct AuditQuery {
-    pub user_id: Option<String>,
-    pub workspace_id: Option<String>,
+    pub user_id: Option<UserId>,
+    pub workspace_id: Option<WorkspaceId>,
     pub action: Option<String>,
     pub outcome: Option<Outcome>,
     pub since: Option<String>,

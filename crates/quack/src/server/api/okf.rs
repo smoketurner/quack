@@ -6,6 +6,7 @@
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use quack_core::ids::WorkspaceId;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 
 use crate::server::auth::{Access, Identity, Need};
@@ -16,7 +17,7 @@ use quack_core::okf;
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let name = access.workspace.name.clone();
@@ -30,7 +31,7 @@ pub(crate) async fn export(
         .audit(
             &app,
             AuditAction::Export,
-            Some(ResourceKind::Workspace.id(&id)),
+            Some(ResourceKind::Workspace.id(id.as_str())),
             Outcome::Allowed,
             Some(serde_json::json!({ "format": "okf", "files": files })),
         )

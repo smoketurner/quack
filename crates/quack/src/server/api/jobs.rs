@@ -10,6 +10,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
+use quack_core::ids::WorkspaceId;
 use quack_core::jobs::{JobId, JobInfo, JobKind};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use tokio::sync::broadcast;
@@ -27,7 +28,7 @@ impl Access {
     /// `job` as this caller may see it: another member's question is not
     /// shown.
     fn redact(&self, mut job: JobInfo) -> JobInfo {
-        if job.kind == JobKind::Chat && !self.owns(job.owner.as_deref()) {
+        if job.kind == JobKind::Chat && !self.owns(job.owner.as_ref()) {
             job.label = String::from(PRIVATE_QUESTION);
             job.outcome = None;
             job.status = None;
@@ -50,7 +51,7 @@ impl Access {
     /// Whether the caller may cancel `job`: their own, or any as an owner
     /// or admin; and never without the write permission.
     pub(crate) fn may_cancel(&self, job: &JobInfo) -> bool {
-        self.permits(Need::WRITE) && self.owns(job.owner.as_deref())
+        self.permits(Need::WRITE) && self.owns(job.owner.as_ref())
     }
 
     /// The job, if it belongs to this workspace.
@@ -58,7 +59,7 @@ impl Access {
         job.parse::<JobId>()
             .ok()
             .and_then(|id| app.jobs.get(id))
-            .filter(|j| j.workspace_id.as_deref() == Some(self.workspace.id.as_str()))
+            .filter(|j| j.workspace_id.as_ref() == Some(&self.workspace.id))
             .ok_or_else(|| ApiError::not_found(format!("job '{job}' not found")))
     }
 
@@ -96,7 +97,7 @@ impl Access {
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::List, "jobs").await?;
@@ -112,7 +113,7 @@ pub(crate) async fn list(
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path((id, job)): Path<(String, String)>,
+    Path((id, job)): Path<(WorkspaceId, String)>,
 ) -> ApiResult<Json<JobInfo>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Show, "job").await?;
@@ -125,7 +126,7 @@ pub(crate) async fn show(
 pub(crate) async fn cancel(
     State(app): State<App>,
     identity: Identity,
-    Path((id, job)): Path<(String, String)>,
+    Path((id, job)): Path<(WorkspaceId, String)>,
 ) -> ApiResult<Json<JobInfo>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(access.cancel_job(&app, &job).await?))
@@ -137,7 +138,7 @@ pub(crate) async fn cancel(
 pub(crate) async fn stream(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Stream, "jobs").await?;
@@ -153,7 +154,7 @@ pub(crate) async fn stream(
         }
         loop {
             match receiver.recv().await {
-                Ok(job) if job.workspace_id.as_deref() == Some(&access.workspace.id) => {
+                Ok(job) if job.workspace_id.as_ref() == Some(&access.workspace.id) => {
                     let event = StreamEvent::Job
                         .event()
                         .json_data(access.redact(job))

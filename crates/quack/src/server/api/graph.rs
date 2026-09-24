@@ -15,6 +15,7 @@ use quack_core::graph::store::Revalidation;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphStatus, extract, resolve, store as graph_store, tables,
 };
+use quack_core::ids::WorkspaceId;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -40,7 +41,7 @@ pub(crate) struct SearchQuery {
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -80,7 +81,7 @@ pub(crate) struct PathParams {
 pub(crate) async fn path(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<PathParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -108,7 +109,7 @@ pub(crate) async fn path(
 pub(crate) async fn status(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -134,7 +135,7 @@ pub(crate) struct ExtractRequest {
 pub(crate) async fn extract(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     body: Option<Json<ExtractRequest>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -201,7 +202,7 @@ impl Access {
         app: &App,
         plan: &ExtractionPlan,
     ) -> ApiResult<ExtractionStarted> {
-        let (access, id) = (self, self.workspace.id.as_str());
+        let (access, id) = (self, &self.workspace.id);
         let (sample, reset) = (plan.sample, plan.reset);
         let slot = app.begin_extraction(id).ok_or_else(|| {
             ApiError::conflict("a graph extraction is already running for this workspace")
@@ -406,7 +407,7 @@ impl DocumentJob {
 pub(crate) async fn revalidate(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(serde_json::to_value(
@@ -417,7 +418,7 @@ pub(crate) async fn revalidate(
 pub(crate) async fn review(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(serde_json::to_value(
@@ -428,7 +429,7 @@ pub(crate) async fn review(
 pub(crate) async fn merges(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -447,7 +448,7 @@ pub(crate) struct DecideMerge {
 pub(crate) async fn decide_merge(
     State(app): State<App>,
     identity: Identity,
-    Path((id, mid)): Path<(String, String)>,
+    Path((id, mid)): Path<(WorkspaceId, String)>,
     Json(body): Json<DecideMerge>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;

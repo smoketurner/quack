@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::JobsConfig;
+use crate::ids::{UserId, WorkspaceId};
 use crate::priority::Priority;
 
 /// Snapshots the broadcast channel holds for a slow subscriber before it
@@ -267,8 +268,8 @@ impl Lane {
 pub struct JobSpec {
     kind: JobKind,
     label: String,
-    workspace_id: Option<String>,
-    owner: Option<String>,
+    workspace_id: Option<WorkspaceId>,
+    owner: Option<UserId>,
     lane: Option<Lane>,
 }
 
@@ -288,15 +289,15 @@ impl JobSpec {
     /// The workspace the job touches; the web console lists a workspace's
     /// jobs by it.
     #[must_use]
-    pub fn workspace(mut self, workspace_id: impl Into<String>) -> Self {
-        self.workspace_id = Some(workspace_id.into());
+    pub fn workspace(mut self, workspace_id: WorkspaceId) -> Self {
+        self.workspace_id = Some(workspace_id);
         self
     }
 
     /// The user who submitted it (server mode).
     #[must_use]
-    pub fn owner(mut self, user_id: Option<impl Into<String>>) -> Self {
-        self.owner = user_id.map(Into::into);
+    pub fn owner(mut self, user_id: Option<UserId>) -> Self {
+        self.owner = user_id;
         self
     }
 
@@ -344,8 +345,8 @@ pub struct JobInfo {
     pub number: JobNumber,
     pub kind: JobKind,
     pub label: String,
-    pub workspace_id: Option<String>,
-    pub owner: Option<String>,
+    pub workspace_id: Option<WorkspaceId>,
+    pub owner: Option<UserId>,
     pub lane: Option<String>,
     pub state: JobState,
     pub progress: Option<JobProgress>,
@@ -686,10 +687,10 @@ impl JobQueue {
 
     /// The jobs of one workspace, in submission order.
     #[must_use]
-    pub fn list_workspace(&self, workspace_id: &str) -> Vec<JobInfo> {
+    pub fn list_workspace(&self, workspace_id: &WorkspaceId) -> Vec<JobInfo> {
         self.list()
             .into_iter()
-            .filter(|j| j.workspace_id.as_deref() == Some(workspace_id))
+            .filter(|j| j.workspace_id.as_ref() == Some(workspace_id))
             .collect()
     }
 
@@ -731,11 +732,11 @@ impl JobQueue {
 
     /// Queued and running counts, optionally for one workspace.
     #[must_use]
-    pub fn counts(&self, workspace_id: Option<&str>) -> JobCounts {
+    pub fn counts(&self, workspace_id: Option<&WorkspaceId>) -> JobCounts {
         let registry = self.inner.registry();
         let mut counts = JobCounts::default();
         for entry in registry.jobs.values() {
-            if workspace_id.is_some_and(|ws| entry.info.workspace_id.as_deref() != Some(ws)) {
+            if workspace_id.is_some_and(|ws| entry.info.workspace_id.as_ref() != Some(ws)) {
                 continue;
             }
             match entry.info.state {
@@ -952,7 +953,7 @@ mod tests {
         let mut events = queue.subscribe();
         let ok = queue
             .submit(
-                JobSpec::new(JobKind::Sql, "select").workspace("ws"),
+                JobSpec::new(JobKind::Sql, "select").workspace(WorkspaceId::from("ws")),
                 |ctx| async move {
                     ctx.progress(1, 2);
                     ctx.status("halfway");
@@ -979,7 +980,7 @@ mod tests {
         // The first event is the queued snapshot.
         let first = events.recv().await.unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(first.state, JobState::Queued);
-        assert_eq!(queue.list_workspace("ws").len(), 1);
+        assert_eq!(queue.list_workspace(&WorkspaceId::from("ws")).len(), 1);
         assert_eq!(queue.counts(None).active(), 0);
         assert_eq!(queue.by_number(JobNumber(2)).map(|j| j.id), Some(err.id));
     }

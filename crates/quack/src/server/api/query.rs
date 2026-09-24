@@ -14,6 +14,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
 use quack_core::error::Record;
+use quack_core::ids::WorkspaceId;
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -54,7 +55,7 @@ impl PreparedTurn {
     async fn prepare(
         app: &App,
         identity: Identity,
-        workspace_id: &str,
+        workspace_id: &WorkspaceId,
         body: &QueryRequest,
     ) -> ApiResult<Self> {
         let access = Access::resolve(app, identity, workspace_id, Need::READ).await?;
@@ -251,7 +252,7 @@ impl Turn {
 pub(crate) async fn query(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     // A client that disconnects drops this future, and the turn's guard
@@ -288,7 +289,7 @@ pub(crate) async fn query(
 pub(crate) async fn stream(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let turn = PreparedTurn::prepare(&app, identity, &id, &body)
@@ -359,7 +360,7 @@ pub(crate) struct SqlOutcome {
 pub(crate) async fn sql(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<SqlRequest>,
 ) -> ApiResult<Json<SqlOutcome>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -441,7 +442,7 @@ pub(crate) struct SearchQuery {
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;

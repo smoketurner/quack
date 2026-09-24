@@ -4,6 +4,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use quack_core::ids::WorkspaceId;
 use quack_core::llm::Embeddings;
 use quack_core::progress::RunControl;
 use quack_core::storage::control::{AuditAction, Outcome};
@@ -42,7 +43,7 @@ impl From<ImportBody> for ImportRequest {
 pub(crate) async fn import(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -73,7 +74,7 @@ pub(crate) async fn run_import(
     let outcome = import::Importing {
         config: &app.config,
         db: &db,
-        workspace_id: &access.workspace.id,
+        workspace_id: access.workspace.id.as_str(),
         request,
         policy,
         embedder: embeddings.as_ref(),

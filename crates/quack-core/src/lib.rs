@@ -9,6 +9,7 @@ pub mod embedding;
 pub mod error;
 pub mod extraction;
 pub mod graph;
+pub mod ids;
 pub mod import;
 pub mod ingestion;
 pub mod jobs;

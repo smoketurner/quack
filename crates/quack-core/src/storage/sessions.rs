@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 
 use crate::analysis::agent::AgentResponse;
 use crate::error::{Error, Record, Result};
+use crate::ids::UserId;
 
 use super::workspace::WorkspaceDb;
 
@@ -57,7 +58,7 @@ pub struct SessionRow {
     pub mode: ChatMode,
     pub model: String,
     /// The server user who started it; `None` from the CLI and TUI.
-    pub created_by: Option<String>,
+    pub created_by: Option<UserId>,
     /// Visible to every member of the workspace, not only the creator.
     pub shared: bool,
     pub created_at: String,
@@ -94,7 +95,7 @@ impl SessionRow {
         match viewer {
             SessionViewer::All => true,
             SessionViewer::User(user_id) => {
-                self.shared || self.created_by.as_deref().is_none_or(|c| c == user_id)
+                self.shared || self.created_by.as_ref().is_none_or(|c| c == user_id)
             }
         }
     }
@@ -107,7 +108,7 @@ pub enum SessionViewer {
     All,
     /// A server user: their own sessions, shared ones, and ownerless ones
     /// (started from the CLI or the terminal).
-    User(String),
+    User(UserId),
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -158,7 +159,7 @@ pub fn create_session(
     db: &WorkspaceDb,
     model: &str,
     mode: ChatMode,
-    created_by: Option<&str>,
+    created_by: Option<&UserId>,
 ) -> Result<SessionRow> {
     let id = uuid::Uuid::now_v7().to_string();
     db.connection().execute(
@@ -680,13 +681,13 @@ mod tests {
     #[test]
     fn created_by_filters_the_listing_unless_the_viewer_sees_all() {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
-        let mine = create_session(&db, "m", ChatMode::Chat, Some("u1"))
+        let mine = create_session(&db, "m", ChatMode::Chat, Some(&UserId::from("u1")))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let theirs = create_session(&db, "m", ChatMode::Chat, Some("u2"))
+        let theirs = create_session(&db, "m", ChatMode::Chat, Some(&UserId::from("u2")))
             .unwrap_or_else(|e| fail(&e.to_string()));
         let cli =
             create_session(&db, "m", ChatMode::Chat, None).unwrap_or_else(|e| fail(&e.to_string()));
-        let visible = list_sessions_for(&db, 10, &SessionViewer::User(String::from("u1")));
+        let visible = list_sessions_for(&db, 10, &SessionViewer::User(UserId::from("u1")));
         assert!(visible.is_ok_and(|v| {
             v.iter()
                 .map(|s| s.id.as_str())
@@ -694,14 +695,14 @@ mod tests {
         }));
         assert!(list_sessions_for(&db, 10, &SessionViewer::All).is_ok_and(|v| v.len() == 3));
         assert!(
-            mine.visible_to(&SessionViewer::User(String::from("u1")))
-                && !theirs.visible_to(&SessionViewer::User(String::from("u1")))
+            mine.visible_to(&SessionViewer::User(UserId::from("u1")))
+                && !theirs.visible_to(&SessionViewer::User(UserId::from("u1")))
         );
         assert!(
             theirs.visible_to(&SessionViewer::All)
-                && cli.visible_to(&SessionViewer::User(String::from("u1")))
+                && cli.visible_to(&SessionViewer::User(UserId::from("u1")))
         );
-        assert_eq!(mine.created_by.as_deref(), Some("u1"));
+        assert_eq!(mine.created_by, Some(UserId::from("u1")));
         assert!(!mine.shared);
 
         // Sharing opens the session to other members; unsharing closes it.
@@ -710,14 +711,14 @@ mod tests {
             .ok()
             .flatten()
             .unwrap_or_else(|| fail("session vanished"));
-        assert!(theirs.shared && theirs.visible_to(&SessionViewer::User(String::from("u1"))));
+        assert!(theirs.shared && theirs.visible_to(&SessionViewer::User(UserId::from("u1"))));
         assert!(
-            list_sessions_for(&db, 10, &SessionViewer::User(String::from("u1")))
+            list_sessions_for(&db, 10, &SessionViewer::User(UserId::from("u1")))
                 .is_ok_and(|v| v.len() == 3)
         );
         set_session_shared(&db, &theirs.id, false).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(
-            list_sessions_for(&db, 10, &SessionViewer::User(String::from("u1")))
+            list_sessions_for(&db, 10, &SessionViewer::User(UserId::from("u1")))
                 .is_ok_and(|v| v.len() == 2)
         );
         assert!(set_session_shared(&db, "missing", true).is_err());

@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use quack_core::config::Config;
 use quack_core::error::Record;
+use quack_core::ids::WorkspaceId;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Expiry, Outcome, ResourceKind,
@@ -144,7 +145,7 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
             let password = read_password(&format!("Password for {username}: "))?;
             let user = control.create_user(&username, &password, admin).await?;
             let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
-                .on(ResourceKind::User.id(&user.id));
+                .on(ResourceKind::User.id(user.id.as_str()));
             control.record_audit(&entry).await?;
             let mut out = stdout.lock();
             writeln!(
@@ -310,7 +311,9 @@ pub(crate) async fn run_member(
                 .await?
                 .with_context(|| format!("no user named '{username}'"))?;
             control.set_member(&ws.id, &user.id, role).await?;
-            control.record_audit(&member_entry(&ws, &user.id)).await?;
+            control
+                .record_audit(&member_entry(&ws, user.id.as_str()))
+                .await?;
             let mut out = stdout.lock();
             writeln!(out, "{} is now {role} of '{}'.", user.username, ws.name)?;
             out.flush()?;
@@ -321,7 +324,9 @@ pub(crate) async fn run_member(
                 .await?
                 .with_context(|| format!("no user named '{username}'"))?;
             let removed = control.remove_member(&ws.id, &user.id).await?;
-            control.record_audit(&member_entry(&ws, &user.id)).await?;
+            control
+                .record_audit(&member_entry(&ws, user.id.as_str()))
+                .await?;
             let mut out = stdout.lock();
             if removed {
                 writeln!(out, "Removed {} from '{}'.", user.username, ws.name)?;
@@ -403,7 +408,11 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
             writeln!(out)?;
         }
     } else if args.csv {
-        let mut writer = csv::Writer::from_writer(&mut out);
+        // The header is written even for no rows; each row serializes in
+        // the same column order.
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(&mut out);
         writer.write_record([
             "id",
             "timestamp",
@@ -419,21 +428,7 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
             "request_id",
         ])?;
         for r in &rows {
-            let fields = [
-                r.id.as_str(),
-                r.timestamp.as_str(),
-                r.user_id.as_deref().unwrap_or(""),
-                r.token_hash.as_deref().unwrap_or(""),
-                r.workspace_id.as_deref().unwrap_or(""),
-                r.action.as_str(),
-                r.resource_type.as_deref().unwrap_or(""),
-                r.resource_id.as_deref().unwrap_or(""),
-                r.outcome.as_str(),
-                r.channel.as_str(),
-                r.client_addr.as_deref().unwrap_or(""),
-                r.request_id.as_deref().unwrap_or(""),
-            ];
-            writer.write_record(fields)?;
+            writer.serialize(r)?;
         }
         writer.flush()?;
     } else if rows.is_empty() {
@@ -448,9 +443,9 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
                 r.channel,
                 r.action,
                 r.user_id
-                    .as_deref()
-                    .map_or("-", |u| u.get(..8).unwrap_or(u)),
-                r.workspace_id.as_deref().unwrap_or("-"),
+                    .as_ref()
+                    .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
+                r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
                 r.resource_id.as_deref().unwrap_or("")
             )?;
         }

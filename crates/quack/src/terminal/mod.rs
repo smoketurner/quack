@@ -8,13 +8,14 @@ mod ui;
 use anyhow::{Context, Result};
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::ids::WorkspaceId;
 
 /// Everything a terminal session starts from: the resolved workspace, its
 /// writer and reader pool, and the session to open.
 pub(crate) struct SessionSetup {
     pub(crate) config: Config,
     pub(crate) workspace_name: String,
-    pub(crate) workspace_id: String,
+    pub(crate) workspace_id: WorkspaceId,
     pub(crate) db: SharedDb,
     pub(crate) reader_db: ReaderDb,
     pub(crate) session_id: String,

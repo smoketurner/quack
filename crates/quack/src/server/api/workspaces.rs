@@ -7,6 +7,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use quack_core::ids::WorkspaceId;
 use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, WorkspaceChanges, WorkspaceRow,
@@ -111,7 +112,7 @@ impl Identity {
         }
         let mut entry = self.audit(AuditAction::Workspace, Outcome::Allowed);
         entry = entry.in_workspace(&ws.id);
-        entry = entry.on(ResourceKind::Workspace.id(&ws.id));
+        entry = entry.on(ResourceKind::Workspace.id(ws.id.as_str()));
         app.control.record_audit(&entry).await?;
         Ok(ws)
     }
@@ -120,7 +121,7 @@ impl Identity {
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<WorkspaceView>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
@@ -139,7 +140,7 @@ pub(crate) struct UpdateWorkspace {
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<UpdateWorkspace>,
 ) -> ApiResult<Json<WorkspaceView>> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
@@ -184,7 +185,7 @@ pub(crate) async fn update_settings(
         .audit(
             app,
             AuditAction::Workspace,
-            Some(ResourceKind::Workspace.id(&ws.id)),
+            Some(ResourceKind::Workspace.id(ws.id.as_str())),
             Outcome::Allowed,
             None,
         )
@@ -206,7 +207,7 @@ fn default_limit() -> u32 {
 pub(crate) async fn audit_detail(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;

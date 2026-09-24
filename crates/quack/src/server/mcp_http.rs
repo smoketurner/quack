@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use quack_core::analysis::policy::WritePolicy;
+use quack_core::ids::WorkspaceId;
 use quack_core::storage::control::Channel;
 use tower::ServiceExt;
 
@@ -19,7 +20,7 @@ use crate::mcp::{Auditor, McpServer, McpSetup, ServerAuditor};
 pub(crate) async fn handle(
     State(app): State<App>,
     mut identity: Identity,
-    Path(workspace): Path<String>,
+    Path(workspace): Path<WorkspaceId>,
     request: Request,
 ) -> ApiResult<Response> {
     identity.channel = Some(Channel::Mcp);
