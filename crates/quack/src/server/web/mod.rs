@@ -438,7 +438,8 @@ struct GraphResultView {
     edges: Vec<GraphEdgeView>,
 }
 
-#[derive(Default)]
+/// The graph page's search and path query, as its forms show it.
+#[derive(Clone, Default)]
 struct GraphQueryView {
     entity: String,
     class: String,
@@ -711,93 +712,97 @@ struct ChatQuery {
     session: Option<String>,
 }
 
-fn message_view(row: &sessions::MessageRow) -> Option<MessageView> {
-    let role = match row.role {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::Tool => return None,
-    };
-    let meta = row.metadata.clone().unwrap_or(serde_json::Value::Null);
-    let steps = meta
-        .get("steps")
-        .and_then(|s| s.as_array())
-        .map(|steps| {
-            steps
-                .iter()
-                .map(|s| StepView {
-                    tool: s
-                        .get("tool")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    detail: s
-                        .get("detail")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    summary: s
-                        .get("summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    duration_ms: s
-                        .get("duration_ms")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let citations = meta
-        .get("citations")
-        .and_then(|c| c.as_array())
-        .map(|cs| {
-            cs.iter()
-                .map(|c| {
-                    let filename = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-                    let page_no = c.get("page").and_then(serde_json::Value::as_u64);
-                    let heading = c.get("heading").and_then(|v| v.as_str());
-                    let page_part = page_no.map_or(String::new(), |p| format!(", page {p}"));
-                    let heading_part =
-                        heading.map_or(String::new(), |h| format!(", under \"{h}\""));
-                    let label = format!("{filename}{page_part}{heading_part}");
-                    CitationView {
-                        n: c.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                        label,
-                        document_id: c
-                            .get("document_id")
+impl MessageView {
+    /// A stored message as the chat page shows it; tool messages are
+    /// folded into the answer after them.
+    fn of(row: &sessions::MessageRow) -> Option<Self> {
+        let role = match row.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => return None,
+        };
+        let meta = row.metadata.clone().unwrap_or(serde_json::Value::Null);
+        let steps = meta
+            .get("steps")
+            .and_then(|s| s.as_array())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|s| StepView {
+                        tool: s
+                            .get("tool")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_owned(),
-                    }
-                })
-                .collect()
+                        detail: s
+                            .get("detail")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned(),
+                        summary: s
+                            .get("summary")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned(),
+                        duration_ms: s
+                            .get("duration_ms")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let citations = meta
+            .get("citations")
+            .and_then(|c| c.as_array())
+            .map(|cs| {
+                cs.iter()
+                    .map(|c| {
+                        let filename = c.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                        let page_no = c.get("page").and_then(serde_json::Value::as_u64);
+                        let heading = c.get("heading").and_then(|v| v.as_str());
+                        let page_part = page_no.map_or(String::new(), |p| format!(", page {p}"));
+                        let heading_part =
+                            heading.map_or(String::new(), |h| format!(", under \"{h}\""));
+                        let label = format!("{filename}{page_part}{heading_part}");
+                        CitationView {
+                            n: c.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            label,
+                            document_id: c
+                                .get("document_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_owned(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let chart_json = meta
+            .get("chart")
+            .filter(|c| !c.is_null())
+            .map(ToString::to_string);
+        let graphs = meta
+            .get("graph")
+            .and_then(|g| g.as_array())
+            .map(|gs| gs.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        let content_html = if row.role == MessageRole::Assistant {
+            markdown::to_html(&row.content)
+        } else {
+            askama::filters::escape(&row.content, askama::filters::Html)
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        Some(MessageView {
+            role: role.to_owned(),
+            content_html,
+            steps,
+            citations,
+            chart_json,
+            graphs,
         })
-        .unwrap_or_default();
-    let chart_json = meta
-        .get("chart")
-        .filter(|c| !c.is_null())
-        .map(ToString::to_string);
-    let graphs = meta
-        .get("graph")
-        .and_then(|g| g.as_array())
-        .map(|gs| gs.iter().map(ToString::to_string).collect())
-        .unwrap_or_default();
-    let content_html = if row.role == MessageRole::Assistant {
-        markdown::to_html(&row.content)
-    } else {
-        askama::filters::escape(&row.content, askama::filters::Html)
-            .map(|e| e.to_string())
-            .unwrap_or_default()
-    };
-    Some(MessageView {
-        role: role.to_owned(),
-        content_html,
-        steps,
-        citations,
-        chart_json,
-        graphs,
-    })
+    }
 }
 
 async fn chat(
@@ -847,7 +852,7 @@ async fn chat(
         page: Page::in_workspace(&app, "Chat", &access),
         sessions: sessions_list,
         current,
-        messages: messages.iter().filter_map(message_view).collect(),
+        messages: messages.iter().filter_map(MessageView::of).collect(),
         tables,
         documents,
     })
@@ -883,48 +888,52 @@ async fn unshare_session(
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
-async fn render_rows(app: &App, access: &Access) -> WebResult<String> {
-    let documents = app
-        .read(&access.workspace.id, WorkspaceDb::list_documents)
-        .await?;
-    let pending = documents.iter().any(|d| d.status.is_in_flight());
-    Ok(DocumentRows {
-        ws_id: access.workspace.id.clone(),
-        can_write: access.permits(Need::WRITE),
-        documents,
-        pending,
+impl DocumentRows {
+    /// The workspace's documents as the caller may act on them.
+    async fn load(app: &App, access: &Access) -> WebResult<Self> {
+        let documents = app
+            .read(&access.workspace.id, WorkspaceDb::list_documents)
+            .await?;
+        let pending = documents.iter().any(|d| d.status.is_in_flight());
+        Ok(Self {
+            ws_id: access.workspace.id.clone(),
+            can_write: access.permits(Need::WRITE),
+            documents,
+            pending,
+        })
     }
-    .render()?)
 }
 
-fn render_jobs(app: &App, access: &Access) -> WebResult<String> {
-    let jobs: Vec<JobView> = access
-        .visible_jobs(app)
-        .into_iter()
-        .map(|j| JobView {
-            id: j.id.to_string(),
-            number: j.number,
-            kind: j.kind.to_string(),
-            can_cancel: !j.state.is_finished() && access.may_cancel(&j),
-            label: j.label,
-            state: if j.cancel_requested && !j.state.is_finished() {
-                String::from("cancelling")
-            } else {
-                j.state.to_string()
-            },
-            active: !j.state.is_finished(),
-            progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
-            outcome: j.outcome.or(j.status),
-            queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
-        })
-        .collect();
-    let pending = jobs.iter().any(|j| j.active);
-    Ok(JobRows {
-        ws_id: access.workspace.id.clone(),
-        jobs,
-        pending,
+impl JobRows {
+    /// The workspace's jobs as the caller may see and cancel them.
+    fn of(app: &App, access: &Access) -> Self {
+        let jobs: Vec<JobView> = access
+            .visible_jobs(app)
+            .into_iter()
+            .map(|j| JobView {
+                id: j.id.to_string(),
+                number: j.number,
+                kind: j.kind.to_string(),
+                can_cancel: !j.state.is_finished() && access.may_cancel(&j),
+                label: j.label,
+                state: if j.cancel_requested && !j.state.is_finished() {
+                    String::from("cancelling")
+                } else {
+                    j.state.to_string()
+                },
+                active: !j.state.is_finished(),
+                progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
+                outcome: j.outcome.or(j.status),
+                queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+            })
+            .collect();
+        let pending = jobs.iter().any(|j| j.active);
+        Self {
+            ws_id: access.workspace.id.clone(),
+            jobs,
+            pending,
+        }
     }
-    .render()?)
 }
 
 async fn jobs_page(
@@ -934,7 +943,7 @@ async fn jobs_page(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "jobs").await?;
-    let rows = render_jobs(&app, &access)?;
+    let rows = JobRows::of(&app, &access).render()?;
     html(&JobsPage {
         page: Page::in_workspace(&app, "Jobs", &access),
         rows,
@@ -950,7 +959,7 @@ async fn job_rows(
     access
         .audit_read(&app, AuditAction::Page, "job_rows")
         .await?;
-    Ok(Html(render_jobs(&app, &access)?).into_response())
+    Ok(Html(JobRows::of(&app, &access).render()?).into_response())
 }
 
 async fn job_cancel(
@@ -961,7 +970,7 @@ async fn job_cancel(
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let cancelled = access.cancel_job(&app, &job).await?;
     tracing::debug!(job = %cancelled.id, state = %cancelled.state, "cancel requested from the web");
-    Ok(Html(render_jobs(&app, &access)?).into_response())
+    Ok(Html(JobRows::of(&app, &access).render()?).into_response())
 }
 
 async fn documents(
@@ -974,7 +983,7 @@ async fn documents(
     access
         .audit_read(&app, AuditAction::Page, "documents")
         .await?;
-    let rows = render_rows(&app, &access).await?;
+    let rows = DocumentRows::load(&app, &access).await?.render()?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
         page: Page::in_workspace(&app, "Documents", &access),
@@ -1016,7 +1025,7 @@ async fn document_rows(
     access
         .audit_read(&app, AuditAction::Page, "document_rows")
         .await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn upload(
@@ -1085,7 +1094,7 @@ async fn pin(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, true).await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn unpin(
@@ -1095,7 +1104,7 @@ async fn unpin(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, false).await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn delete_doc(
@@ -1105,7 +1114,7 @@ async fn delete_doc(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::delete_document(&app, &access, &doc).await?;
-    Ok(Html(render_rows(&app, &access).await?).into_response())
+    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
 }
 
 async fn tables(
@@ -1142,11 +1151,17 @@ async fn import_submit(
     )
 }
 
-fn cell(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+/// A JSON value shown as text: a string bare, null as nothing, anything
+/// else as JSON.
+struct JsonText<'a>(&'a serde_json::Value);
+
+impl fmt::Display for JsonText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            serde_json::Value::Null => Ok(()),
+            serde_json::Value::String(s) => f.write_str(s),
+            other => write!(f, "{other}"),
+        }
     }
 }
 
@@ -1174,7 +1189,7 @@ async fn table(
                 .sample_rows
                 .rows
                 .iter()
-                .map(|r| r.iter().map(cell).collect())
+                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
                 .collect(),
         }),
     })
@@ -1194,31 +1209,33 @@ async fn sql_page(
     })
 }
 
-async fn render_sql(app: &App, access: &Access, sql: &str) -> WebResult<String> {
-    let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
-    let result = match access.execute_sql(app, sql).await {
-        Ok(outcome) => SqlResult {
-            columns: outcome.columns,
-            rows: outcome
-                .rows
-                .iter()
-                .map(|r| r.iter().map(cell).collect())
-                .collect(),
-            row_count: outcome.row_count,
-            truncated: outcome.truncated,
-            error: None,
-            csv_href,
-        },
-        Err(e) => SqlResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            row_count: 0,
-            truncated: false,
-            error: Some(e.message),
-            csv_href,
-        },
-    };
-    Ok(result.render()?)
+impl SqlResult {
+    /// Run `sql` for the caller: its rows, or why it could not run.
+    async fn run(app: &App, access: &Access, sql: &str) -> Self {
+        let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
+        match access.execute_sql(app, sql).await {
+            Ok(outcome) => Self {
+                columns: outcome.columns,
+                rows: outcome
+                    .rows
+                    .iter()
+                    .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                    .collect(),
+                row_count: outcome.row_count,
+                truncated: outcome.truncated,
+                error: None,
+                csv_href,
+            },
+            Err(e) => Self {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                truncated: false,
+                error: Some(e.message),
+                csv_href,
+            },
+        }
+    }
 }
 
 async fn sql_run(
@@ -1228,7 +1245,7 @@ async fn sql_run(
     Form(form): Form<SqlRequest>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    Ok(Html(render_sql(&app, &access, &form.sql).await?).into_response())
+    Ok(Html(SqlResult::run(&app, &access, &form.sql).await.render()?).into_response())
 }
 
 async fn sql_csv(
@@ -1252,7 +1269,7 @@ async fn sql_csv(
     for row in &outcome.rows {
         csv.push_str(
             &row.iter()
-                .map(|v| CsvField(&cell(v)).to_string())
+                .map(|v| CsvField(&JsonText(v).to_string()).to_string())
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -1918,9 +1935,10 @@ mod tests {
 
     #[test]
     fn cells_render_strings_bare_and_null_empty() {
-        assert_eq!(cell(&serde_json::json!("s")), "s");
-        assert_eq!(cell(&serde_json::Value::Null), "");
-        assert_eq!(cell(&serde_json::json!(4.5)), "4.5");
+        let text = |v: &serde_json::Value| JsonText(v).to_string();
+        assert_eq!(text(&serde_json::json!("s")), "s");
+        assert_eq!(text(&serde_json::Value::Null), "");
+        assert_eq!(text(&serde_json::json!(4.5)), "4.5");
     }
 }
 
@@ -1939,8 +1957,26 @@ struct GraphPageQuery {
     notice: Option<String>,
 }
 
-fn non_empty(value: Option<&String>) -> Option<String> {
-    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+impl GraphQueryView {
+    /// The page's query: blank fields are empty strings, which the form
+    /// shows as they are; hops at their defaults when not given.
+    fn from_query(q: &GraphPageQuery) -> Self {
+        let given = |value: Option<&String>| {
+            value
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_default()
+        };
+        Self {
+            entity: given(q.entity.as_ref()),
+            class: given(q.class.as_ref()),
+            relation: given(q.relation.as_ref()),
+            hops: Hops::neighborhood(q.hops).get(),
+            from: given(q.from.as_ref()),
+            to: given(q.to.as_ref()),
+            max_hops: Hops::path(q.max_hops).get(),
+        }
+    }
 }
 
 async fn graph_page(
@@ -1952,15 +1988,7 @@ async fn graph_page(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
-    let query = GraphQueryView {
-        entity: non_empty(q.entity.as_ref()).unwrap_or_default(),
-        class: non_empty(q.class.as_ref()).unwrap_or_default(),
-        relation: non_empty(q.relation.as_ref()).unwrap_or_default(),
-        hops: Hops::neighborhood(q.hops).get(),
-        from: non_empty(q.from.as_ref()).unwrap_or_default(),
-        to: non_empty(q.to.as_ref()).unwrap_or_default(),
-        max_hops: Hops::path(q.max_hops).get(),
-    };
+    let query = GraphQueryView::from_query(&q);
     let embedding = if query.entity.is_empty() {
         None
     } else {
@@ -1974,18 +2002,10 @@ async fn graph_page(
             graph_api::entity_embedding(&app, &query.to).await?,
         ))
     };
-    let wanted = GraphQueryView {
-        entity: query.entity.clone(),
-        class: query.class.clone(),
-        relation: query.relation.clone(),
-        hops: query.hops,
-        from: query.from.clone(),
-        to: query.to.clone(),
-        max_hops: query.max_hops,
-    };
-    let (status, has_ontology, chunk_count, merges, result) = app
+    let wanted = query.clone();
+    let data = app
         .read(&id, move |db| {
-            graph_page_data(
+            GraphPageData::read(
                 db,
                 &wanted,
                 embedding.as_deref(),
@@ -1994,10 +2014,11 @@ async fn graph_page(
             )
         })
         .await?;
-    let result = match result {
-        Some((title, found)) => Some(graph_result_view(title, &found)?),
+    let result = match data.result {
+        Some((title, found)) => Some(GraphResultView::of(title, &found)?),
         None => None,
     };
+    let status = data.status;
     let mut drift: Vec<String> = status
         .drift
         .classes
@@ -2016,9 +2037,9 @@ async fn graph_page(
         page: Page::in_workspace(&app, "Graph", &access),
         status,
         drift,
-        has_ontology,
-        chunk_count,
-        merges,
+        has_ontology: data.has_ontology,
+        chunk_count: data.chunk_count,
+        merges: data.merges,
         query,
         result,
         error: q.error,
@@ -2026,128 +2047,135 @@ async fn graph_page(
     })
 }
 
-type PageData = (
-    GraphStatus,
-    bool,
-    usize,
-    Vec<resolve::MergeProposal>,
-    Option<(String, GraphResult)>,
-);
-
-/// Status, ontology presence, chunk count, merge queue, and the result of
-/// whatever the query asked for.
 /// The embeddings of a path query's two ends, when a model exists.
 type EndEmbeddings = (Option<Vector>, Option<Vector>);
 
-fn graph_page_data(
-    db: &WorkspaceDb,
-    wanted: &GraphQueryView,
-    embedding: Option<&[f32]>,
-    path_embeddings: Option<&EndEmbeddings>,
-    options: GraphOptions,
-) -> CoreResult<PageData> {
-    let status = graph_store::status(db)?;
-    let ontology = ontology_store::current(db)?;
-    let chunk_count = usize::try_from(extract::pending_chunk_count(db)?).unwrap_or(0);
-    let merges = resolve::pending(db)?;
-    let result = if let Some((a, b)) = path_embeddings {
-        let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
-        let to = traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
-        let found = match (from.first(), to.first()) {
-            (Some(a), Some(b)) => traverse::path(db, a, b, Hops::new(wanted.max_hops), &options)?,
-            _ => GraphResult::default(),
+/// What the graph page reads from the workspace in one go.
+struct GraphPageData {
+    status: GraphStatus,
+    has_ontology: bool,
+    /// Chunks not yet sent to extraction.
+    chunk_count: usize,
+    merges: Vec<resolve::MergeProposal>,
+    /// The query's title and result, when it asked for anything.
+    result: Option<(String, GraphResult)>,
+}
+
+impl GraphPageData {
+    fn read(
+        db: &WorkspaceDb,
+        wanted: &GraphQueryView,
+        embedding: Option<&[f32]>,
+        path_embeddings: Option<&EndEmbeddings>,
+        options: GraphOptions,
+    ) -> CoreResult<Self> {
+        let status = graph_store::status(db)?;
+        let ontology = ontology_store::current(db)?;
+        let chunk_count = usize::try_from(extract::pending_chunk_count(db)?).unwrap_or(0);
+        let merges = resolve::pending(db)?;
+        let result = if let Some((a, b)) = path_embeddings {
+            let from = traverse::resolve_entry(db, &wanted.from, None, a.as_deref())?;
+            let to = traverse::resolve_entry(db, &wanted.to, None, b.as_deref())?;
+            let found = match (from.first(), to.first()) {
+                (Some(a), Some(b)) => {
+                    traverse::path(db, a, b, Hops::new(wanted.max_hops), &options)?
+                }
+                _ => GraphResult::default(),
+            };
+            Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
+        } else if !wanted.entity.is_empty() {
+            let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
+            let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
+            let roots = traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
+            let found =
+                traverse::neighborhood(db, &roots, Hops::new(wanted.hops), relation, &options)?;
+            Some((format!("Around {}", wanted.entity), found))
+        } else if !wanted.class.is_empty() {
+            let found = traverse::by_class(
+                db,
+                ontology.as_ref(),
+                &wanted.class,
+                options.max_nodes,
+                &options,
+            )?;
+            Some((format!("Entities of class {}", wanted.class), found))
+        } else {
+            None
         };
-        Some((format!("Path from {} to {}", wanted.from, wanted.to), found))
-    } else if !wanted.entity.is_empty() {
-        let class = (!wanted.class.is_empty()).then_some(wanted.class.as_str());
-        let relation = (!wanted.relation.is_empty()).then_some(wanted.relation.as_str());
-        let roots = traverse::resolve_entry(db, &wanted.entity, class, embedding)?;
-        let found = traverse::neighborhood(db, &roots, Hops::new(wanted.hops), relation, &options)?;
-        Some((format!("Around {}", wanted.entity), found))
-    } else if !wanted.class.is_empty() {
-        let found = traverse::by_class(
-            db,
-            ontology.as_ref(),
-            &wanted.class,
-            options.max_nodes,
-            &options,
-        )?;
-        Some((format!("Entities of class {}", wanted.class), found))
-    } else {
-        None
-    };
-    Ok((status, ontology.is_some(), chunk_count, merges, result))
-}
-
-fn graph_result_view(title: String, result: &GraphResult) -> Result<GraphResultView, ApiError> {
-    let sources_of = |subject: &str| -> String {
-        let mut items: Vec<String> = result
-            .provenance
-            .iter()
-            .filter(|p| p.subject_id == subject)
-            .map(|p| match (&p.table_name, &p.document_id) {
-                (Some(table), _) => format!("{table} row {}", p.row_key.as_deref().unwrap_or("?")),
-                (None, Some(document)) => format!("document {}", short_id(document)),
-                (None, None) => String::from("unknown"),
-            })
-            .collect();
-        items.sort();
-        items.dedup();
-        items.join(", ")
-    };
-    let label_of = |id: &str| -> String {
-        result
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .map_or_else(|| short_id(id), |n| n.label.clone())
-    };
-    let nodes = result
-        .nodes
-        .iter()
-        .map(|n| GraphNodeView {
-            id: n.id.clone(),
-            label: n.label.clone(),
-            class_id: n.class_id.clone(),
-            provisional: n.provisional,
-            properties: match &n.properties {
-                serde_json::Value::Object(map) if !map.is_empty() => map
-                    .iter()
-                    .map(|(k, v)| format!("{k}: {}", display_json(v)))
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                _ => String::new(),
-            },
-            sources: sources_of(&n.id),
+        Ok(Self {
+            status,
+            has_ontology: ontology.is_some(),
+            chunk_count,
+            merges,
+            result,
         })
-        .collect();
-    let edges = result
-        .edges
-        .iter()
-        .map(|e| GraphEdgeView {
-            source: label_of(&e.source_node_id),
-            relation: e.relation_id.clone(),
-            target: label_of(&e.target_node_id),
-            sources: sources_of(&e.id),
-        })
-        .collect();
-    Ok(GraphResultView {
-        title,
-        json: serde_json::to_string(result)?,
-        nodes,
-        edges,
-    })
-}
-
-fn display_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
     }
 }
 
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
+impl GraphResultView {
+    /// `result` for the inspector: node and edge rows with their sources.
+    fn of(title: String, result: &GraphResult) -> Result<Self, ApiError> {
+        let short = |id: &str| -> String { id.chars().take(8).collect() };
+        let sources_of = |subject: &str| -> String {
+            let mut items: Vec<String> = result
+                .provenance
+                .iter()
+                .filter(|p| p.subject_id == subject)
+                .map(|p| match (&p.table_name, &p.document_id) {
+                    (Some(table), _) => {
+                        format!("{table} row {}", p.row_key.as_deref().unwrap_or("?"))
+                    }
+                    (None, Some(document)) => format!("document {}", short(document)),
+                    (None, None) => String::from("unknown"),
+                })
+                .collect();
+            items.sort();
+            items.dedup();
+            items.join(", ")
+        };
+        let label_of = |id: &str| -> String {
+            result
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map_or_else(|| short(id), |n| n.label.clone())
+        };
+        let nodes = result
+            .nodes
+            .iter()
+            .map(|n| GraphNodeView {
+                id: n.id.clone(),
+                label: n.label.clone(),
+                class_id: n.class_id.clone(),
+                provisional: n.provisional,
+                properties: match &n.properties {
+                    serde_json::Value::Object(map) if !map.is_empty() => map
+                        .iter()
+                        .map(|(k, v)| format!("{k}: {}", JsonText(v)))
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                    _ => String::new(),
+                },
+                sources: sources_of(&n.id),
+            })
+            .collect();
+        let edges = result
+            .edges
+            .iter()
+            .map(|e| GraphEdgeView {
+                source: label_of(&e.source_node_id),
+                relation: e.relation_id.clone(),
+                target: label_of(&e.target_node_id),
+                sources: sources_of(&e.id),
+            })
+            .collect();
+        Ok(Self {
+            title,
+            json: serde_json::to_string(result)?,
+            nodes,
+            edges,
+        })
+    }
 }
 
 #[derive(Deserialize)]
