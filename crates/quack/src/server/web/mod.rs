@@ -2009,13 +2009,13 @@ async fn graph_page(
     let mut drift: Vec<String> = status
         .drift
         .classes
-        .keys()
+        .names()
         .map(|c| format!("class {c}"))
         .chain(
             status
                 .drift
                 .relations
-                .keys()
+                .names()
                 .map(|r| format!("relation {r}")),
         )
         .collect();

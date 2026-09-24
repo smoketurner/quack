@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::llm::stream_answer;
+use crate::llm::OneShotAgent;
 use crate::storage::workspace::ChunkSearchResult;
 
 /// Boxed future so implementations can be trait objects.
@@ -95,7 +95,7 @@ const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// query and numbered passages, answered with the passage numbers in
 /// order.
 pub struct ModelReranker {
-    agent: rig::agent::Agent,
+    agent: OneShotAgent,
 }
 
 impl ModelReranker {
@@ -104,10 +104,7 @@ impl ModelReranker {
         M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
     {
         Self {
-            agent: rig::agent::AgentBuilder::new(model)
-                .preamble(RERANK_PROMPT)
-                .temperature(0.0)
-                .build(),
+            agent: OneShotAgent::new(model, RERANK_PROMPT, RERANK_TIMEOUT, "rerank"),
         }
     }
 
@@ -157,7 +154,7 @@ impl Reranker for ModelReranker {
     fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
         Box::pin(async move {
             let request = Self::request(query, candidates, PASSAGE_CHARS);
-            let answer = stream_answer(&self.agent, &request, RERANK_TIMEOUT, "rerank").await?;
+            let answer = self.agent.answer(&request).await?;
             Self::ranking(&answer, candidates.len())
         })
     }

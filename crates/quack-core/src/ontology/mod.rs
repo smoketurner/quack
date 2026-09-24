@@ -20,6 +20,73 @@ use crate::error::{Error, Result};
 
 /// The implicit root class every class descends from.
 pub const ROOT_CLASS: &str = "entity";
+
+/// An ontology id made from a name: lowercase ASCII letters, digits, and
+/// underscores.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnakeId(String);
+
+impl SnakeId {
+    /// `name` in `snake_case`: letters and digits lowercased, every other
+    /// run collapsed to one `_`, a leading digit prefixed with `t_`, and
+    /// `unnamed` for a name with nothing usable in it.
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        let mut out = String::with_capacity(name.len());
+        let mut prev_underscore = true;
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+                prev_underscore = false;
+            } else if !prev_underscore {
+                out.push('_');
+                prev_underscore = true;
+            }
+        }
+        let trimmed = out.trim_end_matches('_').to_owned();
+        Self(
+            if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                format!("t_{trimmed}")
+            } else if trimmed.is_empty() {
+                String::from("unnamed")
+            } else {
+                trimmed
+            },
+        )
+    }
+
+    /// The same, made singular: `shipments` becomes `shipment`, `policies`
+    /// `policy`; `address` and short words stay as they are.
+    #[must_use]
+    pub fn singular_from(name: &str) -> Self {
+        let Self(id) = Self::from_name(name);
+        Self(if let Some(stem) = id.strip_suffix("ies") {
+            format!("{stem}y")
+        } else if id.ends_with("ss") || id.len() < 4 {
+            id
+        } else if let Some(stem) = id.strip_suffix('s') {
+            stem.to_owned()
+        } else {
+            id
+        })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SnakeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 /// The implicit relation from any entity to any entity.
 pub const MENTIONS_RELATION: &str = "mentions";
 

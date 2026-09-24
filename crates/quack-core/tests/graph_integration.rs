@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
-use quack_core::graph::extract::{Extraction, GraphExtractor};
+use quack_core::extraction::{Extract, ExtractFuture};
+use quack_core::graph::extract::Extraction;
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::traverse::Hops;
@@ -201,8 +202,8 @@ fn workspace() -> WorkspaceDb {
 
 struct Canned;
 
-impl GraphExtractor for Canned {
-    fn extract<'a>(&'a self, text: &'a str) -> extract::ExtractFuture<'a> {
+impl Extract<Extraction> for Canned {
+    fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a, Extraction> {
         Box::pin(async move {
             if text.contains("FAIL") {
                 return Err(Error::Llm(String::from("boom")));
@@ -497,8 +498,8 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
         ),
         (2, 1, 2, 1)
     );
-    assert_eq!(summary.drift.classes.get("vessel"), Some(&1));
-    assert_eq!(summary.drift.relations.get("docked_at"), Some(&1));
+    assert_eq!(summary.drift.classes.get("vessel"), 1);
+    assert_eq!(summary.drift.relations.get("docked_at"), 1);
     let status = graph_store::status(&db).unwrap();
     assert_eq!(status.nodes, 8, "Orgenics Ltd is new; Kenya merged");
     assert_eq!(status.drift.total(), 2);

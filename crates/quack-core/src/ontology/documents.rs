@@ -1,20 +1,21 @@
 //! Ontology induction from document evidence (design doc 6.5): open
 //! extraction on a stratified sample of chunks, vocabulary normalization,
 //! structure inference, and support scoring. Model calls go through
-//! [`Extractor`], so the pipeline is tested with a canned one.
+//! [`Extract`], so the pipeline is tested with a canned one.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
-use std::pin::Pin;
-use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use super::induction::{Candidate, Proposal, snake_id};
-use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation};
+use super::induction::{Candidate, Proposal};
+use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation, SnakeId};
 use crate::error::{Error, Result};
+use crate::extraction::{
+    Extract, Extracted, Passage, RunProgress, Tally, evenly_spaced, extractions,
+};
 use crate::llm::{Embeddings, name_similarity};
-use crate::progress::{ChunkDone, Progress};
+use crate::progress::Progress;
 use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
 
 /// What open extraction returns for one chunk.
@@ -64,37 +65,6 @@ Leave a list empty rather than inventing.";
 /// check); `None` means exact matching only.
 pub type Similarity<'a> = Option<&'a dyn Fn(&str, &str) -> bool>;
 
-fn bump(map: &mut BTreeMap<String, u32>, key: &str) {
-    let entry = map.entry(key.to_owned()).or_default();
-    *entry = entry.saturating_add(1);
-}
-
-/// Boxed future so implementations can be trait objects.
-pub type ExtractFuture<'a> = Pin<Box<dyn Future<Output = Result<OpenExtraction>> + Send + 'a>>;
-
-/// Open extraction over one passage of text.
-pub trait Extractor: Send + Sync {
-    fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a>;
-}
-
-/// Parse the model's answer leniently: the first `{` to the last `}`.
-///
-/// # Errors
-///
-/// Returns an error when no JSON object parses.
-pub fn parse_extraction(answer: &str) -> Result<OpenExtraction> {
-    let start = answer.find('{');
-    let end = answer.rfind('}');
-    let (Some(start), Some(end)) = (start, end) else {
-        return Err(Error::Ontology(String::from(
-            "the model returned no JSON object",
-        )));
-    };
-    let slice = answer.get(start..=end).unwrap_or(answer);
-    serde_json::from_str(slice)
-        .map_err(|e| Error::Ontology(format!("the model's JSON does not parse: {e}")))
-}
-
 /// Tuning for document evidence.
 #[derive(Debug, Clone, Copy)]
 pub struct DocumentEvidenceOptions {
@@ -125,6 +95,16 @@ pub struct SampledChunk {
     pub document_id: String,
     pub filename: String,
     pub content: String,
+}
+
+impl Passage for SampledChunk {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn text(&self) -> &str {
+        &self.content
+    }
 }
 
 /// What a run will cost, shown before it starts.
@@ -179,31 +159,17 @@ pub fn sample_chunks(db: &WorkspaceDb, sample: u32) -> Result<Vec<SampledChunk>>
         })?
         .flatten()
         .collect();
-    let mut by_doc: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut by_doc: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
     for (id, document_id, filename) in rows {
-        by_doc.entry(document_id).or_default().push((id, filename));
+        by_doc
+            .entry(document_id.clone())
+            .or_default()
+            .push((id, document_id, filename));
     }
-    if by_doc.is_empty() || sample == 0 {
-        return Ok(Vec::new());
-    }
-    let docs = u32::try_from(by_doc.len()).unwrap_or(u32::MAX);
-    let quota = usize::try_from(sample.div_ceil(docs)).unwrap_or(1).max(1);
-    let mut chosen: Vec<(String, String, String)> = Vec::new();
-    for (document_id, chunks) in &by_doc {
-        let take = quota.min(chunks.len());
-        for k in 0..take {
-            // Evenly spaced positions through the document.
-            let position = k
-                .saturating_mul(chunks.len())
-                .checked_div(take)
-                .unwrap_or(0)
-                .min(chunks.len().saturating_sub(1));
-            if let Some((id, filename)) = chunks.get(position) {
-                chosen.push((id.clone(), document_id.clone(), filename.clone()));
-            }
-        }
-    }
-    chosen.truncate(usize::try_from(sample).unwrap_or(usize::MAX));
+    let chosen = evenly_spaced(
+        by_doc.into_values(),
+        usize::try_from(sample).unwrap_or(usize::MAX),
+    );
     let mut out = Vec::with_capacity(chosen.len());
     for (id, document_id, filename) in chosen {
         let content: String = db.connection().query_row(
@@ -241,7 +207,7 @@ pub struct RunSummary {
 /// Returns an error when every extraction failed or embedding fails.
 pub async fn run(
     sample: Vec<SampledChunk>,
-    extractor: &dyn Extractor,
+    extractor: &dyn Extract<OpenExtraction>,
     current: Option<&Ontology>,
     options: &DocumentEvidenceOptions,
     embeddings: Option<&Embeddings>,
@@ -255,10 +221,10 @@ pub async fn run(
             let mut names: BTreeSet<String> = BTreeSet::new();
             for o in &observations {
                 for e in &o.extraction.entities {
-                    names.insert(singular(&snake_id(&e.type_name)));
+                    names.insert(SnakeId::singular_from(&e.type_name).into_string());
                 }
                 for r in &o.extraction.relations {
-                    names.insert(singular(&snake_id(&r.relation)));
+                    names.insert(SnakeId::singular_from(&r.relation).into_string());
                 }
             }
             let names: Vec<String> = names.into_iter().collect();
@@ -301,61 +267,43 @@ pub struct Observation {
 ///
 /// Returns an error only when every chunk failed.
 pub async fn observe(
-    extractor: &dyn Extractor,
+    extractor: &dyn Extract<OpenExtraction>,
     chunks: &[SampledChunk],
     concurrency: u32,
     progress: Progress<'_>,
 ) -> Result<(Vec<Observation>, u32)> {
-    use futures::StreamExt as _;
-    let started = Instant::now();
-    let total = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
-    // Collected first: an iterator closure held across the awaits fails
-    // the Send check when the run is inside a spawned task.
-    let calls: Vec<_> = chunks.iter().map(|chunk| timed(extractor, chunk)).collect();
-    let mut calls =
-        futures::stream::iter(calls).buffered(usize::try_from(concurrency.max(1)).unwrap_or(1));
+    let mut run = RunProgress::new(chunks.len(), progress);
+    let mut calls = extractions(extractor, chunks, concurrency);
     let mut observations = Vec::with_capacity(chunks.len());
-    let mut failures: u32 = 0;
-    let mut done: u32 = 0;
-    while let Some((chunk, outcome, took)) = calls.next().await {
+    while let Some(Extracted {
+        passage: chunk,
+        outcome,
+        took,
+    }) = calls.next().await
+    {
         match outcome {
-            Ok(extraction) => observations.push(Observation {
-                chunk_id: chunk.id.clone(),
-                document_id: chunk.document_id.clone(),
-                extraction,
-            }),
+            Ok(extraction) => {
+                observations.push(Observation {
+                    chunk_id: chunk.id.clone(),
+                    document_id: chunk.document_id.clone(),
+                    extraction,
+                });
+                run.finished(took, true);
+            }
             Err(e) => {
-                failures = failures.saturating_add(1);
                 tracing::warn!(chunk = %chunk.id, error = %e, "extraction failed for a chunk");
+                run.finished(took, false);
             }
         }
-        done = done.saturating_add(1);
-        progress(ChunkDone {
-            done,
-            total,
-            failed: failures,
-            took,
-            elapsed: started.elapsed(),
-        });
     }
     drop(calls);
-    if observations.is_empty() && !chunks.is_empty() {
+    if run.all_failed() {
         return Err(Error::Ontology(format!(
             "extraction failed for all {} sampled chunks",
             chunks.len()
         )));
     }
-    Ok((observations, failures))
-}
-
-/// One chunk's extraction with how long it took.
-async fn timed<'a>(
-    extractor: &'a dyn Extractor,
-    chunk: &'a SampledChunk,
-) -> (&'a SampledChunk, Result<OpenExtraction>, Duration) {
-    let began = Instant::now();
-    let outcome = extractor.extract(&chunk.content).await;
-    (chunk, outcome, began.elapsed())
+    Ok((observations, run.failed()))
 }
 
 /// A canonical id per raw name. Exact `snake_case` ids and their plurals
@@ -369,21 +317,21 @@ impl Vocabulary {
     /// receives two distinct ids and answers whether they name the same
     /// thing (an embedding cosine check, or `None` for exact matching only).
     #[must_use]
-    pub fn build(counts: &BTreeMap<String, u32>, similarity: Similarity<'_>) -> Self {
+    pub fn build(counts: &Tally, similarity: Similarity<'_>) -> Self {
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        for raw in counts.keys() {
-            let id = singular(&snake_id(raw));
+        for raw in counts.names() {
+            let id = SnakeId::singular_from(raw).into_string();
             let mut placed = false;
             for (leader, members) in &mut groups {
                 let same = *leader == id || similarity.is_some_and(|f| f(leader, &id));
                 if same {
-                    members.push(raw.clone());
+                    members.push(raw.to_owned());
                     placed = true;
                     break;
                 }
             }
             if !placed {
-                groups.push((id, vec![raw.clone()]));
+                groups.push((id, vec![raw.to_owned()]));
             }
         }
         let mut canonical = BTreeMap::new();
@@ -391,10 +339,10 @@ impl Vocabulary {
             // The most frequent raw name decides the id.
             let best = members
                 .iter()
-                .max_by_key(|m| counts.get(*m).copied().unwrap_or(0))
+                .max_by_key(|m| counts.get(m))
                 .cloned()
                 .unwrap_or_default();
-            let id = singular(&snake_id(&best));
+            let id = SnakeId::singular_from(&best).into_string();
             for member in members {
                 canonical.insert(member, id.clone());
             }
@@ -407,19 +355,7 @@ impl Vocabulary {
         self.canonical
             .get(raw)
             .cloned()
-            .unwrap_or_else(|| singular(&snake_id(raw)))
-    }
-}
-
-fn singular(id: &str) -> String {
-    if let Some(stem) = id.strip_suffix("ies") {
-        format!("{stem}y")
-    } else if id.ends_with("ss") || id.len() < 4 {
-        id.to_owned()
-    } else if let Some(stem) = id.strip_suffix('s') {
-        stem.to_owned()
-    } else {
-        id.to_owned()
+            .unwrap_or_else(|| SnakeId::singular_from(raw).into_string())
     }
 }
 
@@ -510,8 +446,8 @@ fn looks_like_date(value: &str) -> bool {
 #[derive(Default)]
 struct RelationStats {
     support: Option<Support>,
-    domains: BTreeMap<String, u32>,
-    ranges: BTreeMap<String, u32>,
+    domains: Tally,
+    ranges: Tally,
 }
 
 /// What the observations say, before it becomes candidates.
@@ -523,14 +459,14 @@ struct Evidence {
 }
 
 fn gather(observations: &[Observation], similarity: Similarity<'_>) -> Evidence {
-    let mut type_counts: BTreeMap<String, u32> = BTreeMap::new();
-    let mut relation_counts: BTreeMap<String, u32> = BTreeMap::new();
+    let mut type_counts = Tally::default();
+    let mut relation_counts = Tally::default();
     for o in observations {
         for e in &o.extraction.entities {
-            bump(&mut type_counts, &e.type_name);
+            type_counts.bump(&e.type_name);
         }
         for r in &o.extraction.relations {
-            bump(&mut relation_counts, &r.relation);
+            relation_counts.bump(&r.relation);
         }
     }
     let types = Vocabulary::build(&type_counts, similarity);
@@ -636,10 +572,10 @@ fn propose_relations(
                 serde_json::json!({ "subject": r.subject, "relation": r.relation, "object": r.object }),
             );
             if let Some(c) = evidence.entity_class.get(&r.subject.trim().to_lowercase()) {
-                bump(&mut entry.domains, c);
+                entry.domains.bump(c);
             }
             if let Some(c) = evidence.entity_class.get(&r.object.trim().to_lowercase()) {
-                bump(&mut entry.ranges, c);
+                entry.ranges.bump(c);
             }
         }
     }
@@ -682,7 +618,7 @@ fn propose_attributes(
             let Some(class) = evidence.entity_class.get(&a.entity.trim().to_lowercase()) else {
                 continue;
             };
-            let property = snake_id(&a.name);
+            let property = SnakeId::from_name(&a.name).into_string();
             let entry = stats
                 .entry((class.clone(), property))
                 .or_insert_with(|| (Support::new(), Vec::new()));
@@ -755,16 +691,16 @@ fn infer_hierarchy(
 
 /// The single most common endpoint class, or the nearest common ancestor
 /// when the endpoints are mixed, or `entity`.
-fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>) -> String {
-    let total: u32 = counts.values().sum();
-    let Some((top, n)) = counts.iter().max_by_key(|(_, n)| **n) else {
+fn generalize(counts: &Tally, parents: &BTreeMap<String, String>) -> String {
+    let total = counts.total();
+    let Some((top, n)) = counts.iter().max_by_key(|(_, n)| *n) else {
         return String::from(ROOT_CLASS);
     };
     if total == 0 {
         return String::from(ROOT_CLASS);
     }
-    if f64::from(*n) / f64::from(total) >= 0.8 {
-        return top.clone();
+    if f64::from(n) / f64::from(total) >= 0.8 {
+        return top.to_owned();
     }
     // Shared ancestor under the inferred hierarchy, if every endpoint has one.
     let chain = |c: &str| {
@@ -781,7 +717,7 @@ fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>
     };
     let first = chain(top);
     for ancestor in &first {
-        if counts.keys().all(|c| chain(c).contains(ancestor)) {
+        if counts.names().all(|c| chain(c).contains(ancestor)) {
             return ancestor.clone();
         }
     }
@@ -791,17 +727,19 @@ fn generalize(counts: &BTreeMap<String, u32>, parents: &BTreeMap<String, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extraction::{ExtractFuture, parse_answer};
+    use crate::progress::ChunkDone;
     use crate::storage::workspace::{NewChunk, NewDocument};
 
     struct Canned;
 
-    impl Extractor for Canned {
-        fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a> {
+    impl Extract<OpenExtraction> for Canned {
+        fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a, OpenExtraction> {
             Box::pin(async move {
                 if text.contains("FAIL") {
                     return Err(Error::Ontology(String::from("boom")));
                 }
-                parse_extraction(&format!(
+                parse_answer::<OpenExtraction>(&format!(
                     r#"Sure! {{"entities": [{{"name": "Orgenics", "type": "vendor"}}, {{"name": "Orgenics", "type": "organization"}}, {{"name": "USAID", "type": "organization"}}, {{"name": "Kenya", "type": "country"}}, {{"name": "{}", "type": "Shipment"}}],
 "relations": [{{"subject": "Orgenics", "relation": "ships to", "object": "Kenya"}}],
 "attributes": [{{"entity": "Orgenics", "name": "founded", "value": "1983"}}, {{"entity": "Kenya", "name": "region", "value": "East Africa"}}]}}"#,
@@ -1025,10 +963,10 @@ mod tests {
 
     #[test]
     fn vocabulary_merges_plurals_and_near_synonyms() {
-        let mut counts = BTreeMap::new();
-        counts.insert(String::from("Vendors"), 5);
-        counts.insert(String::from("vendor"), 2);
-        counts.insert(String::from("supplier"), 1);
+        let mut counts = Tally::default();
+        counts.add("Vendors", 5);
+        counts.add("vendor", 2);
+        counts.add("supplier", 1);
         let exact = Vocabulary::build(&counts, None);
         assert_eq!(exact.id("Vendors"), "vendor");
         assert_eq!(exact.id("vendor"), "vendor");
@@ -1039,14 +977,14 @@ mod tests {
         let clustered = Vocabulary::build(&counts, Some(&near));
         assert_eq!(clustered.id("supplier"), "vendor", "the frequent name wins");
         assert_eq!(
-            parse_extraction("junk")
+            parse_answer::<OpenExtraction>("junk")
                 .err()
                 .map(|e| e.to_string())
                 .unwrap_or_default(),
             "ontology error: the model returned no JSON object"
         );
         assert!(
-            parse_extraction("{\"entities\": [{\"name\": \"x\"}]}").is_err(),
+            parse_answer::<OpenExtraction>("{\"entities\": [{\"name\": \"x\"}]}").is_err(),
             "type is required"
         );
         assert_eq!(
