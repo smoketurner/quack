@@ -2,15 +2,15 @@
 //! handler resolves an [`Access`](super::auth::Access) first, so the role
 //! and scope checks, and the denied audit rows, live in one place.
 
-mod admin;
-mod auth;
-mod context;
+pub(crate) mod admin;
+pub(crate) mod auth;
+pub(crate) mod context;
 pub(crate) mod documents;
 pub(crate) mod embeddings;
 pub(crate) mod graph;
 pub(crate) mod import;
 pub(crate) mod jobs;
-mod members;
+pub(crate) mod members;
 pub(crate) mod okf;
 pub(crate) mod ontology;
 pub(crate) mod query;

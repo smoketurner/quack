@@ -75,30 +75,40 @@ pub(crate) async fn create(
     identity: Identity,
     Json(body): Json<CreateWorkspace>,
 ) -> ApiResult<impl IntoResponse> {
-    require_admin(&identity)?;
-    let name = body.name.trim();
-    if name.is_empty() || name.contains(['/', '\\', '.']) {
-        return Err(ApiError::bad_request(
-            "workspace name must be non-empty and contain no slashes or dots",
-        ));
+    let ws = identity.create_workspace(&app, &body.name).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(workspace_json(&ws, Some(Role::Owner))),
+    ))
+}
+
+impl Identity {
+    /// Create a workspace, from the API or the web console: admins only, a
+    /// name without slashes or dots that is not taken; the creator becomes
+    /// its owner (in local mode everyone already is).
+    pub(crate) async fn create_workspace(&self, app: &App, name: &str) -> ApiResult<WorkspaceRow> {
+        require_admin(self)?;
+        let name = name.trim();
+        if name.is_empty() || name.contains(['/', '\\', '.']) {
+            return Err(ApiError::bad_request(
+                "workspace name must be non-empty and contain no slashes or dots",
+            ));
+        }
+        if app.control.find_workspace_by_name(name).await?.is_some() {
+            return Err(ApiError::new(StatusCode::CONFLICT, "workspace exists"));
+        }
+        let ws = app.control.create_workspace(name).await?;
+        if !app.local {
+            app.control
+                .set_member(&ws.id, &self.user_id, Role::Owner)
+                .await?;
+        }
+        let mut entry = self.audit(AuditAction::Workspace, Outcome::Allowed);
+        entry.workspace_id = Some(ws.id.clone());
+        entry = entry.on(ResourceKind::Workspace.id(&ws.id));
+        app.control.record_audit(&entry).await?;
+        Ok(ws)
     }
-    if app.control.find_workspace_by_name(name).await?.is_some() {
-        return Err(ApiError::new(StatusCode::CONFLICT, "workspace exists"));
-    }
-    let ws = app.control.create_workspace(name).await?;
-    let role = if app.local {
-        Some(Role::Owner)
-    } else {
-        app.control
-            .set_member(&ws.id, &identity.user_id, Role::Owner)
-            .await?;
-        Some(Role::Owner)
-    };
-    let mut entry = identity.audit(AuditAction::Workspace, Outcome::Allowed);
-    entry.workspace_id = Some(ws.id.clone());
-    entry = entry.on(ResourceKind::Workspace.id(&ws.id));
-    app.control.record_audit(&entry).await?;
-    Ok((StatusCode::CREATED, Json(workspace_json(&ws, role))))
 }
 
 pub(crate) async fn show(

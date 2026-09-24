@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{Decision, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
@@ -39,21 +39,8 @@ pub(crate) async fn replace(
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let ontology = Ontology::from_json(&body.to_string())?;
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let stored = with_db(db, move |db| {
-        store::save(db, &ontology, Some(&author), Some("imported"))
-    })
-    .await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "version": stored.version, "classes": stored.classes.len() })),
-        )
+    let stored = access
+        .replace_ontology(&app, &body.to_string(), "imported")
         .await?;
     Ok(Json(serde_json::to_value(stored)?))
 }
@@ -65,32 +52,83 @@ pub(crate) async fn init(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let stored = with_db(db, move |db| {
-        if store::latest_version(db)? > 0 {
-            return Ok(None);
-        }
-        store::save(
-            db,
-            &Ontology::builtin_default(),
-            Some(&author),
-            Some("built-in default"),
-        )
-        .map(Some)
-    })
-    .await?
-    .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "an ontology already exists"))?;
-    access
-        .audit(
-            &app,
+    let stored = access.init_ontology(&app).await?;
+    Ok(Json(serde_json::to_value(stored)?))
+}
+
+/// The ontology writes the API and the web console share: each stores a
+/// new version and audits it as `ontology`.
+impl Access {
+    /// Parse `json`, validate it, and store it as the next version; `note`
+    /// says where it came from.
+    pub(crate) async fn replace_ontology(
+        &self,
+        app: &App,
+        json: &str,
+        note: &'static str,
+    ) -> ApiResult<Ontology> {
+        let ontology = Ontology::from_json(json)?;
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let stored = with_db(db, move |db| {
+            store::save(db, &ontology, Some(&author), Some(note))
+        })
+        .await?;
+        self.audit(
+            app,
             AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id("1")),
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "version": stored.version, "classes": stored.classes.len() })),
+        )
+        .await?;
+        Ok(stored)
+    }
+
+    /// Install the built-in ontology as version 1; 409 once one exists.
+    pub(crate) async fn init_ontology(&self, app: &App) -> ApiResult<Ontology> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let stored = with_db(db, move |db| {
+            if store::latest_version(db)? > 0 {
+                return Ok(None);
+            }
+            store::save(
+                db,
+                &Ontology::builtin_default(),
+                Some(&author),
+                Some("built-in default"),
+            )
+            .map(Some)
+        })
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "an ontology already exists"))?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
             Outcome::Allowed,
             None,
         )
         .await?;
-    Ok(Json(serde_json::to_value(stored)?))
+        Ok(stored)
+    }
+
+    /// Store version `version` again as the newest.
+    pub(crate) async fn restore_ontology(&self, app: &App, version: u32) -> ApiResult<Ontology> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let stored = with_db(db, move |db| store::restore(db, version, Some(&author))).await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "restored": version, "version": stored.version })),
+        )
+        .await?;
+        Ok(stored)
+    }
 }
 
 #[derive(Deserialize)]
@@ -165,18 +203,7 @@ pub(crate) async fn restore(
     Path((id, v)): Path<(String, u32)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let stored = with_db(db, move |db| store::restore(db, v, Some(&author))).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "restored": v, "version": stored.version })),
-        )
-        .await?;
+    let stored = access.restore_ontology(&app, v).await?;
     Ok(Json(serde_json::to_value(stored)?))
 }
 
@@ -221,38 +248,172 @@ pub(crate) async fn propose(
         let started = start_document_run(&app, &access, &id, request.sample).await?;
         return Ok((StatusCode::ACCEPTED, started));
     }
-    let options = app.config.ontology.table_evidence();
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let outcome = with_db(db, move |db| {
-        let current = store::current(db)?;
-        let proposals = propose_from_tables(db, current.as_ref(), &options)?;
-        if proposals.is_empty() {
-            return Ok((0, None, None));
-        }
-        let run = candidates::store_run(db, &proposals)?;
-        let version = if request.auto_accept {
-            Some(candidates::accept_all(db, Some(&author))?.version)
-        } else {
-            None
-        };
-        Ok((proposals.len(), Some(run), version))
-    })
-    .await?;
-    let (count, run, version) = outcome;
-    access
-        .audit(
-            &app,
+    let proposed = access
+        .propose_from_tables(&app, request.auto_accept)
+        .await?;
+    Ok((StatusCode::OK, Json(serde_json::to_value(proposed)?)))
+}
+
+/// What proposing from the tables queued.
+#[derive(Debug, Serialize)]
+pub(crate) struct TableProposal {
+    /// Candidates queued; zero when the ontology already covers the tables.
+    pub candidates: usize,
+    pub run: Option<String>,
+    /// The version accepting them all made, with `auto_accept`.
+    pub version: Option<u32>,
+}
+
+/// Candidates decided one at a time.
+#[derive(Debug, Serialize)]
+pub(crate) struct CandidateDecided {
+    pub candidate: String,
+    pub action: CandidateAction,
+    pub version: Option<u32>,
+}
+
+/// Candidates decided in bulk.
+#[derive(Debug, Serialize)]
+pub(crate) struct CandidatesDecided {
+    pub accepted: usize,
+    pub rejected: usize,
+    pub version: Option<u32>,
+}
+
+/// Induction and the review queue, shared by the API and the web console.
+impl Access {
+    /// Queue what table evidence proposes beyond the current ontology,
+    /// accepting it all at once with `auto_accept`.
+    pub(crate) async fn propose_from_tables(
+        &self,
+        app: &App,
+        auto_accept: bool,
+    ) -> ApiResult<TableProposal> {
+        let options = app.config.ontology.table_evidence();
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let proposed = with_db(db, move |db| {
+            let current = store::current(db)?;
+            let proposals = propose_from_tables(db, current.as_ref(), &options)?;
+            if proposals.is_empty() {
+                return Ok(TableProposal {
+                    candidates: 0,
+                    run: None,
+                    version: None,
+                });
+            }
+            let run = candidates::store_run(db, &proposals)?;
+            let version = if auto_accept {
+                Some(candidates::accept_all(db, Some(&author))?.version)
+            } else {
+                None
+            };
+            Ok(TableProposal {
+                candidates: proposals.len(),
+                run: Some(run),
+                version,
+            })
+        })
+        .await?;
+        self.audit(
+            app,
             AuditAction::Propose,
-            run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
+            proposed.run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
             Outcome::Allowed,
-            Some(serde_json::json!({ "candidates": count, "auto_accept": request.auto_accept, "version": version })),
+            Some(serde_json::json!({ "candidates": proposed.candidates, "auto_accept": auto_accept, "version": proposed.version })),
         )
         .await?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({ "candidates": count, "run": run, "version": version })),
-    ))
+        Ok(proposed)
+    }
+
+    /// Accept (as proposed or amended) or reject one candidate.
+    pub(crate) async fn decide_candidate(
+        &self,
+        app: &App,
+        candidate: &str,
+        action: CandidateAction,
+        target: Option<&str>,
+    ) -> ApiResult<CandidateDecided> {
+        let decision = action.decision(target)?;
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let candidate_id = candidate.to_owned();
+        let version = with_db(db, move |db| {
+            if let Some(decision) = decision {
+                let stored = candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
+                return Ok(Some(stored.version));
+            }
+            candidates::reject(db, &[candidate_id], Some(&author))?;
+            Ok(None)
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            Some(ResourceKind::Candidate.id(candidate)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "action": action, "version": version })),
+        )
+        .await?;
+        Ok(CandidateDecided {
+            candidate: candidate.to_owned(),
+            action,
+            version,
+        })
+    }
+
+    /// Accept and reject candidates in bulk: one new version for every
+    /// acceptance together (issue #55).
+    pub(crate) async fn decide_candidates(
+        &self,
+        app: &App,
+        accept: Vec<String>,
+        reject: Vec<String>,
+    ) -> ApiResult<CandidatesDecided> {
+        if accept.is_empty() && reject.is_empty() {
+            return Err(ApiError::bad_request(
+                "choose at least one candidate to accept or reject",
+            ));
+        }
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let (accepting, rejecting) = (accept.clone(), reject.clone());
+        let (version, rejected) = with_db(db, move |db| {
+            let rejected = if rejecting.is_empty() {
+                0
+            } else {
+                candidates::reject(db, &rejecting, Some(&author))?
+            };
+            let version = if accepting.is_empty() {
+                None
+            } else {
+                let decisions: Vec<(String, Decision)> = accepting
+                    .into_iter()
+                    .map(|id| (id, Decision::Accept))
+                    .collect();
+                Some(candidates::accept(db, &decisions, Some(&author))?.version)
+            };
+            Ok((version, rejected))
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({
+                "accepted": accept,
+                "rejected": reject,
+                "version": version,
+            })),
+        )
+        .await?;
+        Ok(CandidatesDecided {
+            accepted: accept.len(),
+            rejected,
+            version,
+        })
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -296,52 +457,13 @@ pub(crate) async fn decide_many(
     identity: Identity,
     Path(id): Path<String>,
     Json(body): Json<DecideManyRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<CandidatesDecided>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    if body.accept.is_empty() && body.reject.is_empty() {
-        return Err(ApiError::bad_request(
-            "give candidate ids to accept or reject",
-        ));
-    }
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let (accept, reject) = (body.accept.clone(), body.reject.clone());
-    let (version, rejected) = with_db(db, move |db| {
-        let rejected = if reject.is_empty() {
-            0
-        } else {
-            candidates::reject(db, &reject, Some(&author))?
-        };
-        let version = if accept.is_empty() {
-            None
-        } else {
-            let decisions: Vec<(String, Decision)> = accept
-                .into_iter()
-                .map(|id| (id, Decision::Accept))
-                .collect();
-            Some(candidates::accept(db, &decisions, Some(&author))?.version)
-        };
-        Ok((version, rejected))
-    })
-    .await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Ontology,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::json!({
-                "accepted": body.accept,
-                "rejected": body.reject,
-                "version": version,
-            })),
-        )
-        .await?;
-    Ok(Json(serde_json::json!({
-        "accepted": body.accept.len(),
-        "rejected": rejected,
-        "version": version,
-    })))
+    Ok(Json(
+        access
+            .decide_candidates(&app, body.accept, body.reject)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -357,32 +479,12 @@ pub(crate) async fn decide(
     identity: Identity,
     Path((id, cid)): Path<(String, String)>,
     Json(body): Json<DecideRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<CandidateDecided>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let decision = body.action.decision(body.target.as_deref())?;
-    let candidate_id = cid.clone();
-    let version = with_db(db, move |db| {
-        if let Some(decision) = decision {
-            let stored = candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
-            return Ok(Some(stored.version));
-        }
-        candidates::reject(db, &[candidate_id], Some(&author))?;
-        Ok(None)
-    })
-    .await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Ontology,
-            Some(ResourceKind::Candidate.id(&cid)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "action": body.action, "version": version })),
-        )
-        .await?;
     Ok(Json(
-        serde_json::json!({ "candidate": cid, "action": body.action, "version": version }),
+        access
+            .decide_candidate(&app, &cid, body.action, body.target.as_deref())
+            .await?,
     ))
 }
 
