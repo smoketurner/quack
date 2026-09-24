@@ -35,7 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
-pub use cache::{CachedToken, KeySource, TokenCache};
+pub use cache::{CachedToken, KeyLocation, KeySource, TokenCache};
 
 use crate::config::{OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
@@ -102,7 +102,7 @@ pub struct AuthStatus {
     pub logged_in: bool,
     pub expires_at: Option<Timestamp>,
     pub has_refresh_token: bool,
-    pub key_source: KeySource,
+    pub key_location: KeyLocation,
     pub cache_path: PathBuf,
 }
 
@@ -403,7 +403,7 @@ impl TokenManager {
             logged_in: cached.is_some(),
             expires_at: cached.as_ref().map(|t| t.expires_at),
             has_refresh_token: cached.is_some_and(|t| t.refresh_token.is_some()),
-            key_source: self.cache_key_source(),
+            key_location: self.cache.key_location(),
             cache_path: self.cache.path().to_path_buf(),
         })
     }
@@ -417,14 +417,6 @@ impl TokenManager {
         let _refreshing = self.refresh_lock.lock().await;
         *self.current.write().await = None;
         self.cache.clear().await
-    }
-
-    fn cache_key_source(&self) -> KeySource {
-        if self.cache.path().with_extension("key").exists() {
-            KeySource::File
-        } else {
-            KeySource::Keychain
-        }
     }
 
     fn scopes(&self) -> Vec<Scope> {

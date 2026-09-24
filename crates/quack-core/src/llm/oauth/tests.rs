@@ -361,8 +361,9 @@ async fn device_code_login_polls_until_approved_and_caches() {
     assert_eq!(idp.state.pending_polls.load(Ordering::SeqCst), 0);
     let status = m.status().await;
     assert!(
-        status
-            .is_ok_and(|s| s.logged_in && !s.has_refresh_token && s.key_source == KeySource::File)
+        status.is_ok_and(|s| s.logged_in
+            && !s.has_refresh_token
+            && s.key_location == KeyLocation::File)
     );
     assert!(
         m.access_token()

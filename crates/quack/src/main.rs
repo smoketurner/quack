@@ -1057,7 +1057,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
                     ),
                     _ => format!("not logged in; run `quack auth login {name}`"),
                 };
-                writeln!(out, "{name}: {state} (key in {})", status.key_source)?;
+                writeln!(out, "{name}: {state} (key in {})", status.key_location)?;
             }
             out.flush()?;
         }
