@@ -21,7 +21,7 @@ use crate::storage::workspace::{
 use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
 use chunker::Chunker;
-use parser::{FileType, Load, Reader};
+use parser::{FileType, Load, Reader, TextFormat};
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -355,10 +355,10 @@ async fn process_inner<M: EmbeddingModel>(
                 embedding_time: None,
             })
         }
-        Load::Chunks => {
+        Load::Chunks(format) => {
             // Parsing and chunking are the slow, CPU-bound part: off the
             // runtime's workers, and not on the writer.
-            let parsing = Parsing::new(config, file_type, filename, data);
+            let parsing = Parsing::new(config, format, filename, data);
             let Parsed {
                 title,
                 pages_skipped,
@@ -405,7 +405,7 @@ async fn process_inner<M: EmbeddingModel>(
 
 /// A document's bytes on their way to be parsed and chunked.
 struct Parsing {
-    file_type: FileType,
+    format: TextFormat,
     stem: Option<String>,
     data: Vec<u8>,
     chunk_size: u32,
@@ -421,9 +421,9 @@ struct Parsed {
 }
 
 impl Parsing {
-    fn new(config: &Config, file_type: FileType, filename: &str, data: &[u8]) -> Self {
+    fn new(config: &Config, format: TextFormat, filename: &str, data: &[u8]) -> Self {
         Self {
-            file_type,
+            format,
             stem: Path::new(filename)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -436,7 +436,7 @@ impl Parsing {
     }
 
     fn run(self) -> Result<Parsed> {
-        let extracted = parser::extract(self.file_type, &self.data)?;
+        let extracted = self.format.extract(&self.data)?;
         let chunks = Chunker::new(self.chunk_size, self.chunk_overlap, &self.encoding)?
             .document(&extracted, self.stem.as_deref())?;
         Ok(Parsed {
