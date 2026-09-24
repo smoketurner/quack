@@ -108,7 +108,7 @@ pub struct Report {
     pub checks: Vec<Check>,
 }
 
-/// Written as `quack doctor --json` prints it: whether anything failed,
+/// Written as `quack doctor --format json` prints it: whether anything failed,
 /// the failure and warning counts, then every check.
 impl Serialize for Report {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

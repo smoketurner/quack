@@ -531,10 +531,10 @@ pub fn record_turn(
 pub fn history_for_model(
     db: &WorkspaceDb,
     session_id: &SessionId,
-    token_budget: u32,
+    token_budget: Tokens,
 ) -> Result<Vec<rig::message::Message>> {
     let stored = messages(db, session_id)?;
-    let budget = Tokens::new(token_budget);
+    let budget = token_budget;
 
     let mut kept: Vec<rig::message::Message> = Vec::new();
     let mut used = Tokens::default();
@@ -1041,14 +1041,14 @@ mod tests {
         )
         .unwrap();
 
-        let all = history_for_model(&db, &session.id, 10_000).unwrap();
+        let all = history_for_model(&db, &session.id, Tokens::new(10_000)).unwrap();
         assert_eq!(all.len(), 4);
 
         // "second question" + "second answer" ≈ 8 tokens; budget of 9 keeps only those two.
-        let trimmed = history_for_model(&db, &session.id, 9).unwrap();
+        let trimmed = history_for_model(&db, &session.id, Tokens::new(9)).unwrap();
         assert_eq!(trimmed.len(), 2);
 
-        let none = history_for_model(&db, &session.id, 1).unwrap();
+        let none = history_for_model(&db, &session.id, Tokens::new(1)).unwrap();
         assert!(none.is_empty());
     }
 

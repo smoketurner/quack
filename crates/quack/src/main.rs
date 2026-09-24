@@ -217,9 +217,9 @@ enum Commands {
 
 #[derive(clap::Args)]
 struct SessionsArgs {
-    /// Emit one JSON object per session
-    #[arg(long)]
-    json: bool,
+    /// `json` prints one JSON object per session
+    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
 
     /// Maximum number of sessions to show
     #[arg(long, default_value_t = 20)]
@@ -317,9 +317,9 @@ struct ConfigArgs {
     #[arg(long)]
     changed: bool,
 
-    /// Emit the whole report as one JSON document
-    #[arg(long)]
-    json: bool,
+    /// `json` prints the whole report as one JSON document
+    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
 }
 
 #[derive(clap::Args)]
@@ -328,9 +328,9 @@ struct DoctorArgs {
     #[arg(long)]
     offline: bool,
 
-    /// Emit the checks as one JSON document
-    #[arg(long)]
-    json: bool,
+    /// `json` prints the checks as one JSON document
+    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
 }
 
 #[derive(clap::Args)]
@@ -348,9 +348,9 @@ struct DocsArgs {
     #[arg(long, value_name = "DOCUMENT_ID")]
     delete: Option<String>,
 
-    /// Emit one JSON object per document
-    #[arg(long)]
-    json: bool,
+    /// `json` prints one JSON object per document
+    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
 }
 
 #[derive(Subcommand)]
@@ -660,7 +660,7 @@ fn run_config(args: &ConfigArgs) -> Result<ExitCode> {
     } else {
         SettingFilter::All
     };
-    let usable = config_cli::run(&mut out, &inspection, TextOrJson::of(args.json), filter)?;
+    let usable = config_cli::run(&mut out, &inspection, args.format, filter)?;
     out.flush()?;
     Ok(if usable {
         ExitCode::SUCCESS
@@ -686,7 +686,7 @@ async fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
     let report = doctor::run(&inspection, &options).await;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    doctor_cli::write(&mut out, &report, TextOrJson::of(args.json))?;
+    doctor_cli::write(&mut out, &report, args.format)?;
     out.flush()?;
     Ok(if report.has_failures() {
         ExitCode::FAILURE
@@ -831,7 +831,7 @@ async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
 /// `quack sessions`: the session list.
 async fn run_sessions(cli: &Cli, args: &SessionsArgs) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
-    list_sessions(&ws_db, TextOrJson::of(args.json), args.limit)?;
+    list_sessions(&ws_db, args.format, args.limit)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1318,7 +1318,7 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
     }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    list_documents(db, TextOrJson::of(args.json), &mut out)
+    list_documents(db, args.format, &mut out)
 }
 
 /// Resolve a full document id or a unique prefix.
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(!is_broken_pipe(&anyhow::anyhow!("something else")));
     }
 
-    /// `docs --json` prints every recorded field, so a script can tell why a
+    /// `docs --format json` prints every recorded field, so a script can tell why a
     /// document failed.
     #[test]
     #[expect(clippy::unwrap_used, reason = "test")]

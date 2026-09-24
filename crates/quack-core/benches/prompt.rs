@@ -24,6 +24,7 @@ use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
+use quack_core::text::Tokens;
 
 const EMBEDDING_DIM: u32 = 384;
 const DOCUMENTS: usize = 40;
@@ -82,11 +83,11 @@ fn prompt(c: &mut Criterion) {
     let options = PromptOptions {
         mode: ChatMode::Chat,
         write_policy: WritePolicy::Deny,
-        pinned_token_budget: 4_000,
+        pinned_token_budget: Tokens::new(4_000),
         context: Some(String::from(
             "This workspace tracks insurance claims and their supporting policy documents.",
         )),
-        context_max_tokens: 2_000,
+        context_max_tokens: Tokens::new(2_000),
         ollama_context_cap: None,
     };
     c.bench_function("build_system_prompt/150_tables", |b| {

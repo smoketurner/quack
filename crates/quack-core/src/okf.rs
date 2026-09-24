@@ -136,19 +136,6 @@ impl Bundle {
         });
     }
 
-    /// The bundle as an uncompressed tar archive.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if writing the archive fails.
-    pub fn to_tar(&self) -> Result<Vec<u8>> {
-        let mut sink = TarSink::new(Vec::new());
-        for file in &self.files {
-            sink.file(&file.path, &file.content)?;
-        }
-        sink.finish()
-    }
-
     /// Read a bundle from tar bytes; only `.md` entries count.
     ///
     /// # Errors
@@ -217,19 +204,6 @@ impl Bundle {
         }
         bundle.files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(bundle)
-    }
-
-    /// Write the files under `root`, creating directories.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a write fails.
-    pub fn write_to(&self, root: &Path) -> Result<()> {
-        let mut sink = DirSink::new(root);
-        for file in &self.files {
-            sink.file(&file.path, &file.content)?;
-        }
-        Ok(())
     }
 
     /// The `index.md` body, when the bundle has one.
@@ -1398,9 +1372,15 @@ mod tests {
     #[test]
     fn tar_round_trips_and_ignores_non_markdown() {
         let mut bundle = Bundle::default();
-        bundle.push("index.md", String::from("---\ntype: index\n---\nhi"));
-        bundle.push("a/b.md", String::from("---\ntype: thing\n---\nbody"));
-        let bytes = bundle.to_tar().unwrap_or_default();
+        let mut tar = TarSink::new(Vec::new());
+        for (path, content) in [
+            ("index.md", "---\ntype: index\n---\nhi"),
+            ("a/b.md", "---\ntype: thing\n---\nbody"),
+        ] {
+            bundle.push(path, content.to_owned());
+            tar.file(path, content).unwrap_or_default();
+        }
+        let bytes = tar.finish().unwrap_or_default();
         let back = Bundle::from_tar(&bytes).unwrap_or_default();
         assert_eq!(back, bundle);
         assert!(Bundle::from_tar(b"not a tar").is_err());

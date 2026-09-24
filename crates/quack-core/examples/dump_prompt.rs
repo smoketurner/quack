@@ -16,6 +16,7 @@ use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
 use quack_core::storage::workspace::{DocumentStatus, NewDocument, WorkspaceDb};
+use quack_core::text::Tokens;
 
 fn main() {
     let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
@@ -48,9 +49,9 @@ fn main() {
     let options = PromptOptions {
         mode: ChatMode::Chat,
         write_policy: WritePolicy::Deny,
-        pinned_token_budget: 1000,
+        pinned_token_budget: Tokens::new(1000),
         context: Some(String::from("Amounts are in cents.")),
-        context_max_tokens: 1000,
+        context_max_tokens: Tokens::new(1000),
         ollama_context_cap: None,
     };
     let prompt = text_to_sql::SystemPrompt::build(&db, &options).unwrap();

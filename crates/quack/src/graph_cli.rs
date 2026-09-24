@@ -30,8 +30,9 @@ pub(crate) enum GraphAction {
     /// Node and edge counts, whether the graph is provisional or stale,
     /// pending merges, and what the corpus expressed that the ontology lacks
     Status {
-        #[arg(long)]
-        json: bool,
+        /// `json` prints the status as one JSON document
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
     },
     /// Build the graph: rows of mapped tables deterministically, then every
     /// chunk through the chat model (one call per chunk; asks first)
@@ -62,9 +63,9 @@ pub(crate) struct SearchArgs {
     /// Hops out from the entity
     #[arg(long, default_value_t = Hops::NEIGHBORHOOD.get())]
     hops: u32,
-    /// Print the result as JSON (nodes, edges, provenance)
-    #[arg(long)]
-    json: bool,
+    /// `json` prints the result (nodes, edges, provenance) as JSON
+    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
 }
 
 #[derive(clap::Args)]
@@ -73,22 +74,16 @@ pub(crate) struct PathArgs {
     to: String,
     #[arg(long, default_value_t = Hops::PATH.get())]
     max_hops: u32,
-    #[arg(long)]
-    json: bool,
+    /// `json` prints the path (nodes, edges, provenance) as JSON
+    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
 }
 
 #[derive(clap::Args)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each is an independent command-line switch"
-)]
 pub(crate) struct ExtractArgs {
-    /// Only the mapped tables, no model calls
-    #[arg(long, conflicts_with = "documents_only")]
-    tables_only: bool,
-    /// Only the documents
-    #[arg(long)]
-    documents_only: bool,
+    /// What to extract from: all, tables (no model calls), or documents
+    #[arg(long, default_value = "all")]
+    source: ExtractSource,
     /// Chunks to send to the model at most (default: all)
     #[arg(long)]
     sample: Option<u32>,
@@ -98,18 +93,6 @@ pub(crate) struct ExtractArgs {
     /// Do not ask before spending the model calls
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,
-}
-
-impl ExtractArgs {
-    fn sources(&self) -> ExtractSource {
-        if self.tables_only {
-            ExtractSource::Tables
-        } else if self.documents_only {
-            ExtractSource::Documents
-        } else {
-            ExtractSource::All
-        }
-    }
 }
 
 /// A command step that runs on the workspace writer's thread: it renders
@@ -160,9 +143,9 @@ pub(crate) async fn run(
         GraphAction::Extract(args) => {
             run_extract(config, db, out, &args, confirm.or_yes(args.yes), control).await?;
         }
-        GraphAction::Status { json } => {
+        GraphAction::Status { format } => {
             db.render(out, move |db, out| {
-                TextOrJson::of(json).write(out, &graph_store::status(db)?)
+                format.write(out, &graph_store::status(db)?)
             })
             .await?;
         }
@@ -239,7 +222,7 @@ async fn run_search(
         class,
         relation,
         hops,
-        json,
+        format,
     } = args;
     let options = config.graph.options();
     let query = GraphQuery::new(
@@ -263,7 +246,7 @@ async fn run_search(
             }
         })
         .await?;
-    TextOrJson::of(json).write(out, &result)
+    format.write(out, &result)
 }
 
 async fn run_path(
@@ -276,7 +259,7 @@ async fn run_path(
         from,
         to,
         max_hops,
-        json,
+        format,
     } = args;
     let options = config.graph.options();
     let query = PathQuery::new(&from, &to, Some(max_hops))?;
@@ -284,11 +267,11 @@ async fn run_path(
     let ends = query.embeddings(model.as_ref()).await?;
     let max_hops = query.max_hops;
     let result = db.run(move |db| query.run(db, &ends, &options)).await?;
-    if result.is_empty() && !json {
+    if result.is_empty() && format == TextOrJson::Text {
         writeln!(out, "No path within {max_hops} hops.")?;
         return Ok(());
     }
-    TextOrJson::of(json).write(out, &result)
+    format.write(out, &result)
 }
 
 async fn run_extract(
@@ -308,7 +291,7 @@ async fn run_extract(
         db.run(graph_store::clear).await?;
         writeln!(out, "Cleared the graph.")?;
     }
-    let sources = args.sources();
+    let sources = args.source;
     if sources.includes_tables() {
         if ontology.mappings.is_empty() {
             writeln!(

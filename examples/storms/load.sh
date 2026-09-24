@@ -82,7 +82,7 @@ if [ ! -e "$cache/events.csv" ]; then
   ln -s details.csv "$cache/events.csv"
 fi
 
-present="$("$quack" docs -w "$workspace" --json 2>/dev/null || true)"
+present="$("$quack" docs -w "$workspace" --format json 2>/dev/null || true)"
 
 sql() {
   "$quack" -q "$1" -w "$workspace" -f csv </dev/null

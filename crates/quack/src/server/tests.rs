@@ -27,7 +27,7 @@ use crate::server::queue::MAX_WAITING_UPLOADS;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
 use quack_core::jobs::LaneKey;
 use quack_core::llm::CancellationToken;
-use quack_core::okf::{Bundle, BundleFile};
+use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Outcome, Role, Scope, UserKind,
@@ -3206,27 +3206,31 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         )
         .await;
     let ws2 = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
-    let mut incoming = Bundle::default();
-    incoming.files.push(BundleFile {
-        path: String::from("index.md"),
-        content: String::from("---\ntype: index\n---\n# Shipping\n\nAll weights in kg.\n"),
-    });
-    incoming.files.push(BundleFile {
-        path: String::from("vendors/orgenics.md"),
-        content: String::from(
+    let mut incoming = TarSink::new(Vec::new());
+    for (path, content) in [
+        (
+            "index.md",
+            "---\ntype: index\n---\n# Shipping\n\nAll weights in kg.\n",
+        ),
+        (
+            "vendors/orgenics.md",
             "---\ntype: Vendor\ntitle: Orgenics\n---\nShips to [Kenya](../countries/kenya.md).\n",
         ),
-    });
-    incoming.files.push(BundleFile {
-        path: String::from("countries/kenya.md"),
-        content: String::from("---\ntype: Country\ntitle: Kenya\n---\nEast Africa.\n"),
-    });
+        (
+            "countries/kenya.md",
+            "---\ntype: Country\ntitle: Kenya\n---\nEast Africa.\n",
+        ),
+    ] {
+        incoming
+            .file(path, content)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
     let request = Request::builder()
         .method(Method::POST)
         .uri(format!("/api/v1/workspaces/{ws2}/documents"))
         .header(header::CONTENT_TYPE, "application/x-tar")
         .body(Body::from(
-            incoming.to_tar().unwrap_or_else(|e| fail(&e.to_string())),
+            incoming.finish().unwrap_or_else(|e| fail(&e.to_string())),
         ))
         .unwrap_or_else(|e| fail(&e.to_string()));
     let (status, body, _) = h.send(request).await;

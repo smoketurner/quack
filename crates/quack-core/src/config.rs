@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::graph::GraphOptions;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
+use crate::text::Tokens;
 
 pub mod inspect;
 
@@ -779,12 +780,14 @@ impl ServerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ContextConfig {
     /// Approximate token budget for the context in the system prompt.
-    pub max_tokens: u32,
+    pub max_tokens: Tokens,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
-        Self { max_tokens: 4000 }
+        Self {
+            max_tokens: Tokens::new(4000),
+        }
     }
 }
 
@@ -818,7 +821,7 @@ pub struct RetrievalConfig {
     /// Reciprocal rank fusion constant for merging vector and keyword ranks.
     pub rrf_k: u32,
     /// Approximate token budget for pinned documents injected into the prompt.
-    pub pinned_token_budget: u32,
+    pub pinned_token_budget: Tokens,
     /// Also inject the top chunks for every user message via rig's
     /// `dynamic_context`, in addition to the `search_documents` tool.
     /// Off by default: retrieval should be a visible tool call the model
@@ -836,7 +839,7 @@ impl Default for RetrievalConfig {
         Self {
             top_k: 8,
             rrf_k: 60,
-            pinned_token_budget: 8000,
+            pinned_token_budget: Tokens::new(8000),
             always_retrieve: false,
             rerank: RerankMode::None,
             rerank_candidates: 24,
@@ -867,12 +870,12 @@ pub struct AnalysisConfig {
     /// Maximum model round-trips (tool calls) per turn.
     pub max_turns: u32,
     /// Approximate token budget for prior messages replayed to the model.
-    pub history_token_budget: u32,
+    pub history_token_budget: Tokens,
     /// The largest context window quack asks Ollama for (`num_ctx`). Each
     /// turn requests what its prompt needs, rounded up, no more than this;
     /// Ollama's own default is 4,096 and it truncates silently past it.
     /// Other providers size their own window.
-    pub max_context_tokens: u32,
+    pub max_context_tokens: Tokens,
     /// How long one extraction call (ontology document evidence, graph
     /// extraction) may run before the chunk is skipped.
     pub extraction_timeout_seconds: u32,
@@ -907,8 +910,8 @@ impl Default for AnalysisConfig {
             memory_limit_mb: 256,
             threads: 4,
             max_turns: 15,
-            history_token_budget: 32_000,
-            max_context_tokens: 32_768,
+            history_token_budget: Tokens::new(32_000),
+            max_context_tokens: Tokens::new(32_768),
             extraction_timeout_seconds: 120,
             extraction_concurrency: 1,
             reader_pool_size: 4,
@@ -1216,14 +1219,14 @@ rerank = "model"
         assert_eq!(config.ingestion.chunk_size_tokens, 512);
         assert_eq!(config.retrieval.top_k, 8);
         assert_eq!(config.retrieval.rrf_k, 60);
-        assert_eq!(config.retrieval.pinned_token_budget, 8000);
+        assert_eq!(config.retrieval.pinned_token_budget, Tokens::new(8000));
         assert!(!config.retrieval.always_retrieve);
         assert_eq!(config.retrieval.rerank, RerankMode::None);
         assert_eq!(config.retrieval.rerank_candidates, 24);
-        assert_eq!(config.context.max_tokens, 4000);
+        assert_eq!(config.context.max_tokens, Tokens::new(4000));
         assert_eq!(config.analysis.threads, 4);
         assert_eq!(config.analysis.max_turns, 15);
-        assert_eq!(config.analysis.history_token_budget, 32_000);
+        assert_eq!(config.analysis.history_token_budget, Tokens::new(32_000));
         assert_eq!(config.ingestion.upload_max_mb, 512);
         assert_eq!(config.ingestion.embedding_concurrency, 2);
         assert_eq!(config.server.bind, "127.0.0.1:8080");

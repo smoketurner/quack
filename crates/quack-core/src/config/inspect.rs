@@ -242,7 +242,7 @@ impl Inspection {
         }
     }
 
-    /// The whole report as one document, as `quack config --json` writes
+    /// The whole report as one document, as `quack config --format json` writes
     /// it.
     #[must_use]
     pub fn report(&self, filter: SettingFilter) -> Report<'_> {
