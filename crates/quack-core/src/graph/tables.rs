@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::NormalizedLabel;
 use crate::error::{Error, Result};
+use crate::ids::{EdgeId, NodeId};
 use crate::ontology::{Mapping, Ontology};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
@@ -116,7 +117,7 @@ struct NodeKey {
 /// A node the batch will insert or fill in, with its id minted here.
 #[derive(Debug)]
 struct StagedNode {
-    id: String,
+    id: NodeId,
     label: String,
     properties: serde_json::Map<String, serde_json::Value>,
 }
@@ -143,7 +144,7 @@ struct Staged {
     nodes: BTreeMap<NodeKey, StagedNode>,
     node_sources: BTreeSet<RowSource<NodeKey>>,
     /// Edge -> id
-    edges: BTreeMap<EdgeKey, String>,
+    edges: BTreeMap<EdgeKey, EdgeId>,
     edge_sources: BTreeSet<RowSource<EdgeKey>>,
     summary: MappingSummary,
 }
@@ -166,7 +167,7 @@ impl Staged {
             class_id: class_id.to_owned(),
         };
         let entry = self.nodes.entry(key.clone()).or_insert_with(|| StagedNode {
-            id: uuid::Uuid::now_v7().to_string(),
+            id: NodeId::generate(),
             label: label.trim().to_owned(),
             properties: serde_json::Map::new(),
         });
@@ -192,7 +193,7 @@ impl Staged {
         };
         self.edges
             .entry(edge.clone())
-            .or_insert_with(|| uuid::Uuid::now_v7().to_string());
+            .or_insert_with(EdgeId::generate);
         self.edge_sources.insert(RowSource {
             subject: edge,
             row_key: row_key.to_owned(),

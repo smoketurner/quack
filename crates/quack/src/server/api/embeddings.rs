@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::embedding::refresh::{self, Plan};
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::jobs::JobId;
 use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
@@ -60,7 +60,7 @@ pub(crate) enum RefreshStarted {
     /// Every vector was already made with the current profile.
     Current { plan: Plan },
     /// A run embeds the stale and missing ones in the background.
-    Running { plan: Plan, run: String, job: JobId },
+    Running { plan: Plan, run: RunId, job: JobId },
 }
 
 impl RefreshStarted {
@@ -100,7 +100,7 @@ impl Access {
             serde_json::json!({ "plan": plan, "profile": embedder.profile() }),
         )
         .await?;
-        let run_id = run.id().to_owned();
+        let run_id = run.id().clone();
         let job = refresh_in_background(run, Arc::clone(app), self.workspace.id.clone(), embedder);
         Ok(RefreshStarted::Running {
             plan,

@@ -192,6 +192,17 @@ id_type!(
 );
 
 id_type!(
+    /// One message in a chat session.
+    MessageId
+);
+
+id_type!(
+    /// One background run: an induction run whose candidates are stored
+    /// together, or a server run from its start audit row to its closing one.
+    RunId
+);
+
+id_type!(
     /// An access-audit row, shared with the workspace's `_quack_audit`
     /// detail row for the same event.
     AuditId
