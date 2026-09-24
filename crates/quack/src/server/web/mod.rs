@@ -37,6 +37,7 @@ use self::flash::Flash;
 use super::api::admin::CreateUser;
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
+use super::api::graph::ExtractionStarted;
 use super::api::members::AddMember;
 use super::api::ontology::DecideRequest;
 use super::api::workspaces::CreateWorkspace;
@@ -49,7 +50,7 @@ use super::auth::{
     Access, Identity, Need, Peer, access, password_login, request_id, require_admin, session_cookie,
 };
 use super::error::ApiError;
-use super::state::{App, with_db};
+use super::state::App;
 use quack_core::csv::CsvField;
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
@@ -1185,28 +1186,8 @@ async fn table(
     Path((id, name)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let wanted = name.clone();
-    let (list, described) = app
-        .read(&id, move |db| {
-            let list = db.list_tables()?;
-            let described = if list.contains(&wanted) && !wanted.starts_with("_quack_") {
-                Some(db.describe_table(&wanted)?)
-            } else {
-                None
-            };
-            Ok((list, described))
-        })
-        .await?;
-    let described = described.ok_or_else(|| ApiError::not_found("no such table"))?;
-    access
-        .audit(
-            &app,
-            AuditAction::Open,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::json!({ "table": name })),
-        )
-        .await?;
+    let described = access.describe_table(&app, &name).await?;
+    let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
         page: page(&app, &access.identity, &name, Some(&access)),
         tables: list,
@@ -2238,28 +2219,25 @@ async fn graph_extract(
         .sample
         .as_deref()
         .and_then(|s| s.trim().parse::<u32>().ok());
-    let outcome = graph_api::start_extraction(
-        &app,
-        &access,
-        &id,
-        &graph_api::ExtractionPlan {
-            source: form.source.unwrap_or_default(),
-            sample,
-            reset: form.reset,
-        },
+    let started = access
+        .start_extraction(
+            &app,
+            &graph_api::ExtractionPlan {
+                source: form.source.unwrap_or_default(),
+                sample,
+                reset: form.reset,
+            },
+        )
+        .await;
+    Ok(
+        Flash::after(format!("/w/{id}/graph"), started, |started| match started {
+            ExtractionStarted::Running { .. } => Some(String::from(
+                "document extraction started in the background; this page shows the graph as it grows",
+            )),
+            ExtractionStarted::Done { .. } => None,
+        })
+        .into_response(),
     )
-    .await;
-    let target = match outcome {
-        Ok(body) if body.get("status").and_then(|s| s.as_str()) == Some("running") => format!(
-            "/w/{id}/graph?notice={}",
-            urlencoded(
-                "document extraction started in the background; this page shows the graph as it grows"
-            )
-        ),
-        Ok(_) => format!("/w/{id}/graph"),
-        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
 }
 
 async fn graph_revalidate(
@@ -2268,34 +2246,14 @@ async fn graph_revalidate(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let outcome = with_db(db, graph_store::revalidate).await;
-    let target = match outcome {
-        Ok(r) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::GraphRevalidate,
-                    None,
-                    Outcome::Allowed,
-                    Some(serde_json::json!({
-                        "dropped_nodes": r.dropped_nodes,
-                        "dropped_edges": r.dropped_edges,
-                        "version": r.version,
-                    })),
-                )
-                .await?;
-            format!(
-                "/w/{id}/graph?notice={}",
-                urlencoded(&format!(
-                    "dropped {} nodes and {} edges",
-                    r.dropped_nodes, r.dropped_edges
-                ))
-            )
-        }
-        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let revalidated = access.revalidate_graph(&app).await;
+    Ok(Flash::after(format!("/w/{id}/graph"), revalidated, |r| {
+        Some(format!(
+            "dropped {} nodes and {} edges",
+            r.dropped_nodes, r.dropped_edges
+        ))
+    })
+    .into_response())
 }
 
 async fn graph_review(
@@ -2304,12 +2262,8 @@ async fn graph_review(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    with_db(db, graph_store::mark_reviewed).await?;
-    access
-        .audit(&app, AuditAction::GraphReview, None, Outcome::Allowed, None)
-        .await?;
-    Ok(Redirect::to(&format!("/w/{id}/graph")).into_response())
+    access.review_graph(&app).await?;
+    Ok(Flash::to(format!("/w/{id}/graph")).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2326,34 +2280,11 @@ async fn graph_merge_decide(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     // Parsed rather than extracted, so a bad value comes back as a notice
     // on the page instead of an error page.
+    let back = format!("/w/{id}/graph");
     let decision = match form.action.parse::<MergeDecision>() {
         Ok(decision) => decision,
-        Err(e) => {
-            let target = format!("/w/{id}/graph?error={}", urlencoded(&e.to_string()));
-            return Ok(Redirect::to(&target).into_response());
-        }
+        Err(e) => return Ok(Flash::error(back, e.to_string()).into_response()),
     };
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let merge_id = mid.clone();
-    let outcome = with_db(db, move |db| {
-        resolve::decide(db, &merge_id, decision, Some(&author))
-    })
-    .await;
-    let target = match outcome {
-        Ok(proposal) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::GraphMerge,
-                    Some(ResourceKind::GraphMerge.id(&mid)),
-                    Outcome::Allowed,
-                    Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
-                )
-                .await?;
-            format!("/w/{id}/graph")
-        }
-        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let decided = access.decide_merge(&app, &mid, decision).await;
+    Ok(Flash::after(back, decided, |_| None).into_response())
 }

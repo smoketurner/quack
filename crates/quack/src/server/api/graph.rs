@@ -8,16 +8,17 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::embedding::{Input, Vector};
-use quack_core::graph::resolve::MergeDecision;
+use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
+use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphResult, extract, resolve, store as graph_store, tables,
-    traverse,
+    ExtractSource, GraphOptions, GraphResult, GraphStatus, extract, resolve, store as graph_store,
+    tables, traverse,
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
@@ -188,23 +189,51 @@ pub(crate) async fn extract(
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
-    let started = start_extraction(
-        &app,
-        &access,
-        &id,
-        &ExtractionPlan {
-            source: request.source,
-            sample: request.sample,
-            reset: request.reset,
-        },
-    )
-    .await?;
-    let code = if started.get("status").and_then(|s| s.as_str()) == Some("running") {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
-    };
-    Ok((code, Json(started)))
+    let started = access
+        .start_extraction(
+            &app,
+            &ExtractionPlan {
+                source: request.source,
+                sample: request.sample,
+                reset: request.reset,
+            },
+        )
+        .await?;
+    Ok((started.status_code(), Json(serde_json::to_value(started)?)))
+}
+
+/// What starting an extraction did: table work finishes within the
+/// request; document work goes on in the background as a run.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ExtractionStarted {
+    Done {
+        tables: Vec<tables::MappingSummary>,
+        resolution: ResolutionSummary,
+    },
+    Running {
+        tables: Vec<tables::MappingSummary>,
+        cost: ExtractionCost,
+        run: String,
+        job: JobId,
+    },
+}
+
+impl ExtractionStarted {
+    /// 200 when it finished, 202 when a run goes on.
+    pub(crate) fn status_code(&self) -> StatusCode {
+        match self {
+            Self::Done { .. } => StatusCode::OK,
+            Self::Running { .. } => StatusCode::ACCEPTED,
+        }
+    }
+}
+
+/// The model calls a document pass will make.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtractionCost {
+    pub chunks: usize,
+    pub model: String,
 }
 
 /// What to extract.
@@ -214,91 +243,100 @@ pub(crate) struct ExtractionPlan {
     pub reset: bool,
 }
 
-/// The extraction the API and the web page share. Returns the response
-/// body: `{tables, status: "done"}` or `{tables, cost, run, status: "running"}`.
-pub(crate) async fn start_extraction(
-    app: &App,
-    access: &Access,
-    id: &str,
-    plan: &ExtractionPlan,
-) -> ApiResult<serde_json::Value> {
-    let (sample, reset) = (plan.sample, plan.reset);
-    let slot = app.begin_extraction(id).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::CONFLICT,
-            "a graph extraction is already running for this workspace",
-        )
-    })?;
-    let db = app.workspace_db(id).await?;
-    let (ontology, provisional) = app
-        .read(id, |db| {
-            Ok((
-                ontology_store::current(db)?,
-                ontology_store::current_is_auto_accepted(db)?,
-            ))
-        })
-        .await?;
-    let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
-    let options = app.config.graph.options();
-    let embeddings = llm::optional_embedding_model(&app.config).await?;
-    if reset {
-        with_db(Arc::clone(&db), graph_store::clear).await?;
-    }
-    let table_summaries = if plan.source.includes_tables() {
-        extract_tables_in_batches(&db, &ontology, provisional).await?
-    } else {
-        Vec::new()
-    };
-    let chunks = if plan.source.includes_documents() {
-        app.read(id, move |db| extract::chunks(db, sample)).await?
-    } else {
-        Vec::new()
-    };
-    if chunks.is_empty() {
-        let version = ontology.version;
-        let summary = resolve::resolve(&db, embeddings.as_ref(), &options).await?;
-        with_db(Arc::clone(&db), move |db| {
-            graph_store::set_built_with(db, version)
-        })
-        .await?;
-        access
-            .audit(
-                app,
-                AuditAction::GraphExtract,
-                None,
-                Outcome::Allowed,
-                Some(serde_json::json!({ "tables": table_summaries, "resolution": summary })),
+impl Access {
+    /// The extraction the API and the web page share: tables within the
+    /// request, documents as a background run.
+    pub(crate) async fn start_extraction(
+        &self,
+        app: &App,
+        plan: &ExtractionPlan,
+    ) -> ApiResult<ExtractionStarted> {
+        let (access, id) = (self, self.workspace.id.as_str());
+        let (sample, reset) = (plan.sample, plan.reset);
+        let slot = app.begin_extraction(id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "a graph extraction is already running for this workspace",
             )
+        })?;
+        let db = app.workspace_db(id).await?;
+        let (ontology, provisional) = app
+            .read(id, |db| {
+                Ok((
+                    ontology_store::current(db)?,
+                    ontology_store::current_is_auto_accepted(db)?,
+                ))
+            })
             .await?;
-        return Ok(
-            serde_json::json!({ "tables": table_summaries, "resolution": summary, "status": "done" }),
-        );
+        let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
+        let options = app.config.graph.options();
+        let embeddings = llm::optional_embedding_model(&app.config).await?;
+        if reset {
+            with_db(Arc::clone(&db), graph_store::clear).await?;
+        }
+        let table_summaries = if plan.source.includes_tables() {
+            extract_tables_in_batches(&db, &ontology, provisional).await?
+        } else {
+            Vec::new()
+        };
+        let chunks = if plan.source.includes_documents() {
+            app.read(id, move |db| extract::chunks(db, sample)).await?
+        } else {
+            Vec::new()
+        };
+        if chunks.is_empty() {
+            let version = ontology.version;
+            let summary = resolve::resolve(&db, embeddings.as_ref(), &options).await?;
+            with_db(Arc::clone(&db), move |db| {
+                graph_store::set_built_with(db, version)
+            })
+            .await?;
+            access
+                .audit(
+                    app,
+                    AuditAction::GraphExtract,
+                    None,
+                    Outcome::Allowed,
+                    Some(serde_json::json!({ "tables": table_summaries, "resolution": summary })),
+                )
+                .await?;
+            return Ok(ExtractionStarted::Done {
+                tables: table_summaries,
+                resolution: summary,
+            });
+        }
+        // Fail now, not in the background, when no model can be built.
+        let extractor = llm::graph_extractor(&app.config, &ontology).await?;
+        let cost = ExtractionCost {
+            chunks: chunks.len(),
+            model: app.config.chat_model_ref()?.to_string(),
+        };
+        let run = BackgroundRun::start(
+            app,
+            access,
+            RunKind::Graph,
+            serde_json::json!({ "tables": table_summaries, "cost": cost }),
+        )
+        .await?;
+        let run_id = run.id().to_owned();
+        let job = DocumentJob {
+            db,
+            chunks,
+            extractor,
+            ontology,
+            provisional,
+            embeddings,
+            slot,
+            options,
+        }
+        .run_in_background(run, Arc::clone(app));
+        Ok(ExtractionStarted::Running {
+            tables: table_summaries,
+            cost,
+            run: run_id,
+            job,
+        })
     }
-    // Fail now, not in the background, when no model can be built.
-    let extractor = llm::graph_extractor(&app.config, &ontology).await?;
-    let cost = serde_json::json!({ "chunks": chunks.len(), "model": app.config.chat_model_ref()?.to_string() });
-    let run = BackgroundRun::start(
-        app,
-        access,
-        RunKind::Graph,
-        serde_json::json!({ "tables": table_summaries, "cost": cost }),
-    )
-    .await?;
-    let run_id = run.id().to_owned();
-    let job = DocumentJob {
-        db,
-        chunks,
-        extractor,
-        ontology,
-        provisional,
-        embeddings,
-        slot,
-        options,
-    }
-    .run_in_background(run, Arc::clone(app));
-    Ok(
-        serde_json::json!({ "tables": table_summaries, "cost": cost, "run": run_id, "job": job, "status": "running" }),
-    )
 }
 
 /// Table extraction one batch per lock hold, so other requests to the
@@ -413,20 +451,9 @@ pub(crate) async fn revalidate(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let outcome = with_db(db, graph_store::revalidate)
-        .await
-        .map_err(|e| ApiError::bad_request(e.message))?;
-    access
-        .audit(
-            &app,
-            AuditAction::GraphRevalidate,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::to_value(&outcome)?),
-        )
-        .await?;
-    Ok(Json(serde_json::to_value(outcome)?))
+    Ok(Json(serde_json::to_value(
+        access.revalidate_graph(&app).await?,
+    )?))
 }
 
 pub(crate) async fn review(
@@ -435,16 +462,9 @@ pub(crate) async fn review(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let status = with_db(db, |db| {
-        graph_store::mark_reviewed(db)?;
-        graph_store::status(db)
-    })
-    .await?;
-    access
-        .audit(&app, AuditAction::GraphReview, None, Outcome::Allowed, None)
-        .await?;
-    Ok(Json(serde_json::to_value(status)?))
+    Ok(Json(serde_json::to_value(
+        access.review_graph(&app).await?,
+    )?))
 }
 
 pub(crate) async fn merges(
@@ -473,22 +493,64 @@ pub(crate) async fn decide_merge(
     Json(body): Json<DecideMerge>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let decision = body.action;
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let merge_id = mid.clone();
-    let proposal = with_db(db, move |db| {
-        resolve::decide(db, &merge_id, decision, Some(&author))
-    })
-    .await?;
-    access
-        .audit(
-            &app,
+    let proposal = access.decide_merge(&app, &mid, body.action).await?;
+    Ok(Json(serde_json::to_value(proposal)?))
+}
+
+/// The graph writes the API and the web console share.
+impl Access {
+    /// Drop what the current ontology no longer allows.
+    pub(crate) async fn revalidate_graph(&self, app: &App) -> ApiResult<Revalidation> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let outcome = with_db(db, graph_store::revalidate)
+            .await
+            .map_err(|e| ApiError::bad_request(e.message))?;
+        self.audit(
+            app,
+            AuditAction::GraphRevalidate,
+            None,
+            Outcome::Allowed,
+            Some(serde_json::to_value(&outcome)?),
+        )
+        .await?;
+        Ok(outcome)
+    }
+
+    /// Mark the provisional graph reviewed.
+    pub(crate) async fn review_graph(&self, app: &App) -> ApiResult<GraphStatus> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let status = with_db(db, |db| {
+            graph_store::mark_reviewed(db)?;
+            graph_store::status(db)
+        })
+        .await?;
+        self.audit(app, AuditAction::GraphReview, None, Outcome::Allowed, None)
+            .await?;
+        Ok(status)
+    }
+
+    /// Accept or reject one merge proposal.
+    pub(crate) async fn decide_merge(
+        &self,
+        app: &App,
+        merge: &str,
+        decision: MergeDecision,
+    ) -> ApiResult<MergeProposal> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let merge_id = merge.to_owned();
+        let proposal = with_db(db, move |db| {
+            resolve::decide(db, &merge_id, decision, Some(&author))
+        })
+        .await?;
+        self.audit(
+            app,
             AuditAction::GraphMerge,
-            Some(ResourceKind::GraphMerge.id(&mid)),
+            Some(ResourceKind::GraphMerge.id(merge)),
             Outcome::Allowed,
             Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
         )
         .await?;
-    Ok(Json(serde_json::to_value(proposal)?))
+        Ok(proposal)
+    }
 }
