@@ -253,7 +253,7 @@ title and uploader).
 The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;
 `quack mcp` serves it on stdio (unaudited, like the CLI) and `server/mcp_http.rs` serves it
-at `/mcp/v1/{workspace}` behind `access()`, one transport per workspace, user, and write
+at `/mcp/v1/{workspace}` behind `Access::resolve`, one transport per workspace, user, and write
 permission, audited with channel `mcp`.
 
 External data comes in through `quack_core::import` (`quack import`, `POST .../import`, the
@@ -265,11 +265,11 @@ ingestion path as a document with source `import` and the redacted URL as title.
 
 `quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`,
-and `access()` resolves the workspace, checks role and token scope, and writes the denied
+and `Access::resolve` resolves the workspace, checks role and token scope, and writes the denied
 audit row itself, so a handler holding an `Access` is already authorized. Both login paths
 go through one `auth::password_login`, and a browser session expires at
 `[server].session_max_age_hours` or after `session_idle_minutes` unused, whichever is first
-(`state::SessionLookup`); its cookie is `HttpOnly`, `SameSite=Lax`, `Max-Age`d to the
+(`state::WebSessions`); its cookie is `HttpOnly`, `SameSite=Lax`, `Max-Age`d to the
 absolute lifetime, and `Secure` unless the request came from loopback. One `tower_governor`
 limiter covers the web UI, the API, and MCP, with a tighter one on the two login routes and
 none on `/healthz` (design doc 12). The same routes carry `no-store` cache headers
@@ -287,7 +287,7 @@ and run on the work queue in a lane of `[server].workers_per_workspace` per work
 (`queue.rs`), which locks the workspace only around each database step; `api/jobs.rs`
 serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
 and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
-the same `access()` checks and the API's helpers; `WebUser` redirects to `/login` instead
+the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits) and
 htmx and ECharts are vendored (`docs/web-ui.md`). Tests drive the router with
 `tower::ServiceExt::oneshot` and no model. Target CLI (`quack -p`, `quack serve`, `quack mcp`,

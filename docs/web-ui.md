@@ -9,7 +9,7 @@ standalone binary. The code lives in
 in `crates/quack/static/`. Localization via fluent is deferred (design doc section 18).
 
 The web UI is a client of `quack-core` through the same checks as the API: every page
-handler calls `access()` and the API's helpers (`execute_sql`, `enqueue`, `set_pinned`,
+handler calls `Access::resolve` and the API's operations (`Access::execute_sql`, `enqueue`, `set_pinned`,
 `delete_document`), so nothing a page does is unavailable to a script, and every page
 writes the same audit rows.
 
