@@ -25,7 +25,7 @@ use std::thread::{JoinHandle, ThreadId};
 use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
-use crate::priority::{Priority, current_priority};
+use crate::priority::Priority;
 use crate::storage::workspace::WorkspaceDb;
 
 /// A closure on its way to the writer's thread.
@@ -144,7 +144,7 @@ impl Writer {
         &self,
         f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        self.run_at(current_priority(), f).await
+        self.run_at(Priority::current(), f).await
     }
 
     /// [`Self::run`] in `priority`'s line.

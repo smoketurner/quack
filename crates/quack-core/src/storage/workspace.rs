@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::csv::CsvField;
 use crate::embedding::{
-    Dimension, EmbeddingStatus, Fingerprint, Profile, Prompts, StaleVectors, Vector,
+    Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
 use crate::error::{Error, Record, Result};
 use crate::graph;
@@ -876,7 +876,7 @@ impl WorkspaceDb {
             )?;
         }
         tracing::info!(
-            profile = %legacy.describe(),
+            profile = %legacy,
             vectors = untagged,
             "recorded the profile of existing vectors"
         );
@@ -2448,6 +2448,18 @@ pub struct PendingChunk {
     pub id: String,
     pub heading: Option<String>,
     pub content: String,
+}
+
+impl PendingChunk {
+    /// What the embedder is given for this chunk: its text under its
+    /// heading, as at ingestion.
+    #[must_use]
+    pub fn embedding_input(&self) -> Input {
+        Input::Document {
+            title: self.heading.clone(),
+            text: self.content.clone(),
+        }
+    }
 }
 
 /// A row of `id, heading, content`.

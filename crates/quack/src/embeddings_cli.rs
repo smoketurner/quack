@@ -63,7 +63,7 @@ async fn refresh(
         writeln!(
             out,
             "Every vector was made with {}; nothing to refresh.",
-            embedder.profile().describe()
+            embedder.profile()
         )?;
         return Ok(());
     }

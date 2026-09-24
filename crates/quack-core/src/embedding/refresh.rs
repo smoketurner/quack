@@ -18,6 +18,7 @@ use super::{Dimension, Embedder, EmbeddingStatus, Input, Profile, StaleVectors};
 use crate::error::{Error, Result};
 use crate::graph::{resolve, store as graph_store};
 use crate::progress::{ChunkDone, RunControl};
+use crate::storage::workspace::PendingChunk;
 use crate::storage::writer::Writer;
 
 /// A change of vector width: the columns hold `stored`-wide vectors and the
@@ -112,7 +113,7 @@ impl fmt::Display for Plan {
             self.chunks, self.nodes
         )?;
         match &self.profile {
-            Some(profile) => write!(f, " with {}.", profile.describe()),
+            Some(profile) => write!(f, " with {profile}."),
             None => f.write_str("."),
         }
     }
@@ -125,8 +126,8 @@ pub struct Summary {
     pub profile: Profile,
     /// The width the columns had, when they were retyped.
     pub retyped_from: Option<Dimension>,
-    pub chunks: u32,
-    pub nodes: u32,
+    pub chunks: u64,
+    pub nodes: u64,
 }
 
 impl fmt::Display for Summary {
@@ -137,9 +138,7 @@ impl fmt::Display for Summary {
         write!(
             f,
             "Refreshed {} chunks and {} graph node labels with {}.",
-            self.chunks,
-            self.nodes,
-            self.profile.describe()
+            self.chunks, self.nodes, self.profile
         )
     }
 }
@@ -205,16 +204,14 @@ pub async fn run<M: EmbeddingModel>(
         retyped_from,
         nodes,
     } = Prepared::load(db, embedder).await?;
+    // Progress counts in `u32`, like every run's; the summary keeps the
+    // exact counts.
     let chunk_total = u32::try_from(status.stale_chunks().saturating_add(status.missing_chunks))
         .unwrap_or(u32::MAX);
     let total = chunk_total.saturating_add(nodes);
     let batch = batch_size.max(1);
-    let mut summary = Summary {
-        profile: embedder.profile().clone(),
-        retyped_from,
-        chunks: 0,
-        nodes: 0,
-    };
+    let mut chunks: u64 = 0;
+    let mut chunks_done: u32 = 0;
     loop {
         control.check()?;
         let batch_started = Instant::now();
@@ -222,15 +219,9 @@ pub async fn run<M: EmbeddingModel>(
         if pending.is_empty() {
             break;
         }
-        let inputs: Vec<Input> = pending
-            .iter()
-            .map(|chunk| Input::Document {
-                title: chunk.heading.clone(),
-                text: chunk.content.clone(),
-            })
-            .collect();
+        let inputs: Vec<Input> = pending.iter().map(PendingChunk::embedding_input).collect();
         let vectors = embedder.embed(&inputs).await?;
-        let count = u32::try_from(pending.len()).unwrap_or(u32::MAX);
+        let count = pending.len();
         db.run(move |db| {
             db.write_transaction(|db| {
                 for (chunk, vector) in pending.iter().zip(&vectors) {
@@ -240,10 +231,11 @@ pub async fn run<M: EmbeddingModel>(
             })
         })
         .await?;
-        summary.chunks = summary.chunks.saturating_add(count);
+        chunks = chunks.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        chunks_done = u32::try_from(chunks).unwrap_or(u32::MAX);
         (control.progress)(ChunkDone {
-            done: summary.chunks,
-            total: total.max(summary.chunks),
+            done: chunks_done,
+            total: total.max(chunks_done),
             failed: 0,
             took: batch_started.elapsed(),
             elapsed: started.elapsed(),
@@ -251,7 +243,6 @@ pub async fn run<M: EmbeddingModel>(
     }
 
     // Node batches report on the same scale, after the chunks.
-    let chunks_done = summary.chunks;
     let on_nodes = |done: ChunkDone| {
         let done_total = chunks_done.saturating_add(done.done);
         (control.progress)(ChunkDone {
@@ -261,7 +252,7 @@ pub async fn run<M: EmbeddingModel>(
             ..done
         });
     };
-    summary.nodes = resolve::embed_nodes(
+    let nodes = resolve::embed_nodes(
         db,
         embedder,
         RunControl {
@@ -270,7 +261,12 @@ pub async fn run<M: EmbeddingModel>(
         },
     )
     .await?;
-    Ok(summary)
+    Ok(Summary {
+        profile: embedder.profile().clone(),
+        retyped_from,
+        chunks,
+        nodes: u64::from(nodes),
+    })
 }
 
 #[cfg(test)]

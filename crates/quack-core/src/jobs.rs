@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::JobsConfig;
-use crate::priority::{Priority, with_priority};
+use crate::priority::Priority;
 
 /// Snapshots the broadcast channel holds for a slow subscriber before it
 /// lags; a lagged subscriber resynchronizes from [`JobQueue::list`].
@@ -523,7 +523,7 @@ impl Inner {
             match next.send(LanePermit::new(self, key)) {
                 Ok(()) => return,
                 // Disarmed, so dropping it here does not re-enter this lock.
-                Err(mut unclaimed) => unclaimed.armed = false,
+                Err(unclaimed) => unclaimed.disarm(),
             }
         }
         state.running = state.running.saturating_sub(1);
@@ -542,25 +542,28 @@ struct LaneState {
 
 /// A held lane slot; dropping it passes the slot on.
 struct LanePermit {
-    inner: Arc<Inner>,
-    key: String,
-    armed: bool,
+    /// The queue and lane key to hand the slot back to; `None` once
+    /// disarmed.
+    lane: Option<(Arc<Inner>, String)>,
 }
 
 impl LanePermit {
     fn new(inner: &Arc<Inner>, key: &str) -> Self {
         Self {
-            inner: Arc::clone(inner),
-            key: key.to_owned(),
-            armed: true,
+            lane: Some((Arc::clone(inner), key.to_owned())),
         }
+    }
+
+    /// Drop without passing the slot on: the lane already counted it.
+    fn disarm(mut self) {
+        self.lane = None;
     }
 }
 
 impl Drop for LanePermit {
     fn drop(&mut self) {
-        if self.armed {
-            self.inner.leave_lane(&self.key);
+        if let Some((inner, key)) = self.lane.take() {
+            inner.leave_lane(&key);
         }
     }
 }
@@ -665,7 +668,7 @@ impl JobQueue {
                 cancel: cancel.clone(),
                 inner: Arc::clone(&inner),
             };
-            run(&inner, ticket, ctx, kind, work).await;
+            inner.run(ticket, ctx, kind, work).await;
         });
         snapshot
     }
@@ -791,84 +794,86 @@ impl JobInfo {
     }
 }
 
-/// Wait for the lane, run the work, and record its end. The end is recorded
-/// while the lane slot is still held, so the next job in the lane never
-/// starts before its predecessor reads as finished.
-async fn run<F, Fut>(
-    inner: &Arc<Inner>,
-    lane: Option<LaneTicket>,
-    ctx: JobContext,
-    kind: JobKind,
-    work: F,
-) where
-    F: FnOnce(JobContext) -> Fut + Send + 'static,
-    Fut: Future<Output = JobResult> + Send + 'static,
-{
-    let id = ctx.id;
-    // The lane slot lives in `_held` until the end is recorded.
-    let (state, outcome, _held) = run_held(inner, lane, ctx, kind, work).await;
-    inner.finish(id, state, outcome);
-}
-
 /// The lane slot a running job holds; dropped after its end is recorded.
 type Held = Option<LanePermit>;
 
-async fn run_held<F, Fut>(
-    inner: &Arc<Inner>,
-    lane: Option<LaneTicket>,
-    ctx: JobContext,
-    kind: JobKind,
-    work: F,
-) -> (JobState, Option<String>, Held)
-where
-    F: FnOnce(JobContext) -> Fut + Send + 'static,
-    Fut: Future<Output = JobResult> + Send + 'static,
-{
-    let cancel = ctx.cancel_token();
-    let cancelled_while_queued = || {
-        (
-            JobState::Cancelled,
-            Some(String::from("cancelled before it started")),
-            None,
-        )
-    };
-    let lane_permit: Option<LanePermit> = match lane {
-        Some(LaneTicket::Ready(permit)) => Some(permit),
-        Some(LaneTicket::Wait(receiver)) => tokio::select! {
-            biased;
-            () = cancel.cancelled() => return cancelled_while_queued(),
-            permit = receiver => match permit {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return (JobState::Failed, Some(String::from("the lane closed")), None);
-                }
-            },
-        },
-        None => None,
-    };
-    let id = ctx.id;
-    inner.update(id, |info| {
-        info.state = JobState::Running;
-        info.started_at = Some(Timestamp::now());
-    });
-    // Its own task, so a panic in the work surfaces as a join error here,
-    // at its kind's priority.
-    let outcome = tokio::spawn(with_priority(kind.priority(), work(ctx))).await;
-    let (state, text) = match outcome {
-        Ok(Ok(summary)) => (JobState::Succeeded, Some(summary)),
-        Ok(Err(_)) if cancel.is_cancelled() => {
-            (JobState::Cancelled, Some(String::from("cancelled")))
-        }
-        Ok(Err(error)) => (JobState::Failed, Some(error)),
-        Err(join) => {
-            tracing::error!(job = %id, error = %join, "job task failed");
+impl Inner {
+    /// Wait for the lane, run the work, and record its end. The end is recorded
+    /// while the lane slot is still held, so the next job in the lane never
+    /// starts before its predecessor reads as finished.
+    async fn run<F, Fut>(
+        self: &Arc<Self>,
+        lane: Option<LaneTicket>,
+        ctx: JobContext,
+        kind: JobKind,
+        work: F,
+    ) where
+        F: FnOnce(JobContext) -> Fut + Send + 'static,
+        Fut: Future<Output = JobResult> + Send + 'static,
+    {
+        let id = ctx.id;
+        // The lane slot lives in `_held` until the end is recorded.
+        let (state, outcome, _held) = self.run_held(lane, ctx, kind, work).await;
+        self.finish(id, state, outcome);
+    }
+
+    async fn run_held<F, Fut>(
+        &self,
+        lane: Option<LaneTicket>,
+        ctx: JobContext,
+        kind: JobKind,
+        work: F,
+    ) -> (JobState, Option<String>, Held)
+    where
+        F: FnOnce(JobContext) -> Fut + Send + 'static,
+        Fut: Future<Output = JobResult> + Send + 'static,
+    {
+        let cancel = ctx.cancel_token();
+        let cancelled_while_queued = || {
             (
-                JobState::Failed,
-                Some(format!("the job stopped unexpectedly: {join}")),
+                JobState::Cancelled,
+                Some(String::from("cancelled before it started")),
+                None,
             )
-        }
-    };
-    (state, text, lane_permit)
+        };
+        let lane_permit: Option<LanePermit> = match lane {
+            Some(LaneTicket::Ready(permit)) => Some(permit),
+            Some(LaneTicket::Wait(receiver)) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return cancelled_while_queued(),
+                permit = receiver => match permit {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        return (JobState::Failed, Some(String::from("the lane closed")), None);
+                    }
+                },
+            },
+            None => None,
+        };
+        let id = ctx.id;
+        self.update(id, |info| {
+            info.state = JobState::Running;
+            info.started_at = Some(Timestamp::now());
+        });
+        // Its own task, so a panic in the work surfaces as a join error here,
+        // at its kind's priority.
+        let outcome = tokio::spawn(kind.priority().scope(work(ctx))).await;
+        let (state, text) = match outcome {
+            Ok(Ok(summary)) => (JobState::Succeeded, Some(summary)),
+            Ok(Err(_)) if cancel.is_cancelled() => {
+                (JobState::Cancelled, Some(String::from("cancelled")))
+            }
+            Ok(Err(error)) => (JobState::Failed, Some(error)),
+            Err(join) => {
+                tracing::error!(job = %id, error = %join, "job task failed");
+                (
+                    JobState::Failed,
+                    Some(format!("the job stopped unexpectedly: {join}")),
+                )
+            }
+        };
+        (state, text, lane_permit)
+    }
 }
 
 #[cfg(test)]

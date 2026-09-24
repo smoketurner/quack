@@ -30,7 +30,7 @@ use crate::extraction::{Extract, ExtractFuture, parse_answer};
 use crate::graph::extract::Extraction;
 use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
-use crate::priority::{Priority, with_priority};
+use crate::priority::Priority;
 use crate::storage::{context, sessions};
 pub use tokio_util::sync::CancellationToken;
 
@@ -710,21 +710,18 @@ pub async fn run_turn(
     });
     // Someone is watching this turn: its model calls, and the tools' calls
     // inside it, go ahead of background work at the provider (design 4.1).
-    let turn = with_priority(
-        Priority::Interactive,
-        dispatch(
-            config,
-            Arc::clone(&db),
-            reader_db,
-            chat,
-            embedding_model,
-            policy,
-            prompt,
-            history,
-            message,
-            inner_sink,
-        ),
-    );
+    let turn = Priority::Interactive.scope(dispatch(
+        config,
+        Arc::clone(&db),
+        reader_db,
+        chat,
+        embedding_model,
+        policy,
+        prompt,
+        history,
+        message,
+        inner_sink,
+    ));
     let outcome = tokio::select! {
         biased;
         () = cancel.cancelled() => None,

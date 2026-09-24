@@ -22,15 +22,17 @@ tokio::task_local! {
     static PRIORITY: Priority;
 }
 
-/// Run `work` at `priority` (everything it awaits on this task).
-pub async fn with_priority<F: Future>(priority: Priority, work: F) -> F::Output {
-    PRIORITY.scope(priority, work).await
-}
+impl Priority {
+    /// Run `work` at this priority (everything it awaits on this task).
+    pub async fn scope<F: Future>(self, work: F) -> F::Output {
+        PRIORITY.scope(self, work).await
+    }
 
-/// The calling task's priority: interactive unless scoped otherwise.
-#[must_use]
-pub fn current_priority() -> Priority {
-    PRIORITY.try_with(|p| *p).unwrap_or(Priority::Interactive)
+    /// The calling task's priority: interactive unless scoped otherwise.
+    #[must_use]
+    pub fn current() -> Self {
+        PRIORITY.try_with(|p| *p).unwrap_or(Self::Interactive)
+    }
 }
 
 #[cfg(test)]
@@ -39,13 +41,16 @@ mod tests {
 
     #[tokio::test]
     async fn the_priority_follows_its_scope() {
-        assert_eq!(current_priority(), Priority::Interactive);
-        let inside = with_priority(Priority::Background, async {
-            // Nested scopes win.
-            let nested = with_priority(Priority::Interactive, async { current_priority() }).await;
-            (current_priority(), nested)
-        })
-        .await;
+        assert_eq!(Priority::current(), Priority::Interactive);
+        let inside = Priority::Background
+            .scope(async {
+                // Nested scopes win.
+                let nested = Priority::Interactive
+                    .scope(async { Priority::current() })
+                    .await;
+                (Priority::current(), nested)
+            })
+            .await;
         assert_eq!(inside, (Priority::Background, Priority::Interactive));
     }
 }

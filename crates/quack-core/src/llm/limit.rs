@@ -35,7 +35,7 @@ use tokio::sync::oneshot;
 
 use crate::config::{BaseUrl, ProviderConfig, ProviderName, RequestLimit};
 
-use crate::priority::{Priority, current_priority};
+use crate::priority::Priority;
 
 /// Permits of one provider and model, handed to interactive waiters first.
 struct Gate {
@@ -280,7 +280,7 @@ impl HttpClientExt for LimitedHttp {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let gate = self.gate(GateKey::model_of(&body));
-        let priority = current_priority();
+        let priority = Priority::current();
         async move {
             let permit = Self::permit(gate, priority).await;
             let response = inner.send(Request::from_parts(parts, body)).await?;
@@ -297,7 +297,7 @@ impl HttpClientExt for LimitedHttp {
     {
         let inner = self.inner.clone();
         let gate = self.gate(None);
-        let priority = current_priority();
+        let priority = Priority::current();
         async move {
             let permit = Self::permit(gate, priority).await;
             let response = inner.send_multipart(req).await?;
@@ -316,7 +316,7 @@ impl HttpClientExt for LimitedHttp {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let gate = self.gate(GateKey::model_of(&body));
-        let priority = current_priority();
+        let priority = Priority::current();
         async move {
             let permit = Self::permit(gate, priority).await;
             let response = inner
