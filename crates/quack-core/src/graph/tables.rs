@@ -60,16 +60,24 @@ pub fn extract(
         };
         let mut offset = 0;
         loop {
-            let (batch, more) = extract_batch(db, mapping, standing, offset)?;
-            total.absorb(&batch);
-            if !more {
+            let batch = extract_batch(db, mapping, standing, offset)?;
+            total.absorb(&batch.summary);
+            let Some(next) = batch.next_offset else {
                 break;
-            }
-            offset = offset.saturating_add(u64::from(BATCH_ROWS));
+            };
+            offset = next;
         }
         out.push(total);
     }
     Ok(out)
+}
+
+/// What one batch of a mapping did, and where the next one starts.
+#[derive(Debug, Clone)]
+pub struct MappingBatch {
+    pub summary: MappingSummary,
+    /// The next batch's row offset, or `None` when this was the last.
+    pub next_offset: Option<u64>,
 }
 
 /// One batch of a mapping: `BATCH_ROWS` rows from `offset` in key order,
@@ -86,17 +94,17 @@ pub fn extract_batch(
     mapping: &Mapping,
     standing: Standing,
     offset: u64,
-) -> Result<(MappingSummary, bool)> {
+) -> Result<MappingBatch> {
     if offset == 0 && !db.list_tables()?.iter().any(|t| t == &mapping.table) {
         tracing::warn!(table = %mapping.table, "mapped table is not in the workspace; skipping");
-        return Ok((
-            MappingSummary {
+        return Ok(MappingBatch {
+            summary: MappingSummary {
                 table: mapping.table.clone(),
                 skipped: Some(String::from("the table is not in the workspace")),
                 ..MappingSummary::default()
             },
-            false,
-        ));
+            next_offset: None,
+        });
     }
     db.under_timeout(|db| {
         let tx = db.connection().unchecked_transaction()?;
@@ -209,7 +217,7 @@ fn extract_rows(
     mapping: &Mapping,
     standing: Standing,
     offset: u64,
-) -> Result<(MappingSummary, bool)> {
+) -> Result<MappingBatch> {
     let mut columns: Vec<&str> = vec![mapping.key.as_str()];
     for column in mapping.properties.keys() {
         if !columns.contains(&column.as_str()) {
@@ -284,7 +292,10 @@ fn extract_rows(
         }
     }
     staged.write(db, &mapping.table, standing)?;
-    Ok((staged.summary, more))
+    Ok(MappingBatch {
+        summary: staged.summary,
+        next_offset: more.then(|| offset.saturating_add(u64::from(BATCH_ROWS))),
+    })
 }
 
 impl Staged {

@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::terminal::app::{App, Message, MessageKind};
 use crate::terminal::chart::ChartData;
 use crate::terminal::commands::Suggestion;
-use quack_core::analysis::events;
+use quack_core::analysis::events::DetailPreview;
 use quack_core::jobs::{JobCounts, JobInfo, JobState};
 
 /// Jobs listed above the input at most; the rest are counted.
@@ -559,10 +559,13 @@ impl Message {
             return rows;
         };
         let dim = Style::default().fg(Color::DarkGray);
-        let (shown, more): (Vec<&str>, usize) = if expanded {
-            (detail.lines().collect(), 0)
+        let DetailPreview {
+            lines: shown,
+            hidden: more,
+        } = if expanded {
+            DetailPreview::whole(detail)
         } else {
-            events::preview_detail(detail)
+            DetailPreview::of(detail)
         };
         let at = rows.len().min(1);
         let mut detail_rows: Vec<Vec<Span<'static>>> = shown

@@ -17,8 +17,9 @@ use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
+use quack_core::ontology::documents::{self, DocumentProposal};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{Ontology, candidates, documents, store};
+use quack_core::ontology::{Ontology, candidates, store};
 use quack_core::progress::{ChunkDone, RunControl};
 
 pub(crate) async fn show(
@@ -565,7 +566,10 @@ impl Access {
             )
             .await;
             match outcome {
-                Ok((found, summary)) => with_db(db, move |db| {
+                Ok(DocumentProposal {
+                    candidates: found,
+                    summary,
+                }) => with_db(db, move |db| {
                     candidates::store_run(db, &found)?;
                     Ok(summary)
                 })

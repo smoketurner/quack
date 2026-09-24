@@ -177,7 +177,7 @@ impl Bundle {
     /// no text a chunk should hold (issue #53).
     pub fn documents(&self) -> impl Iterator<Item = &BundleFile> {
         self.concepts()
-            .filter(|f| parse_front_matter(&f.content).0.get("generator") != Some(GENERATOR))
+            .filter(|f| parse_front_matter(&f.content).front.get("generator") != Some(GENERATOR))
     }
 
     /// Restore the bundle into a workspace: when the workspace has no
@@ -217,7 +217,7 @@ impl Bundle {
         let Some(file) = self.files.iter().find(|f| f.path == ONTOLOGY_SNAPSHOT) else {
             return Ok(None);
         };
-        let (_, body) = parse_front_matter(&file.content);
+        let body = parse_front_matter(&file.content).body;
         let json = body
             .split("```json")
             .nth(1)
@@ -319,20 +319,33 @@ impl fmt::Display for FrontMatter {
     }
 }
 
+/// A Markdown file split into its front matter and its body.
+#[derive(Debug, Clone)]
+pub struct WithFrontMatter<'a> {
+    pub front: FrontMatter,
+    pub body: &'a str,
+}
+
 /// Split a file into its front matter and body. The front matter is the
 /// flat YAML OKF uses: `key: value` lines and a `tags` list (inline
 /// `[a, b]` or `- a` items); anything else is kept as text.
 #[must_use]
-pub fn parse_front_matter(content: &str) -> (FrontMatter, &str) {
+pub fn parse_front_matter(content: &str) -> WithFrontMatter<'_> {
     let mut front = FrontMatter::default();
     let Some(rest) = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))
     else {
-        return (front, content);
+        return WithFrontMatter {
+            front,
+            body: content,
+        };
     };
     let Some(end) = rest.find("\n---") else {
-        return (front, content);
+        return WithFrontMatter {
+            front,
+            body: content,
+        };
     };
     let block = rest.get(..end).unwrap_or_default();
     let body = rest
@@ -370,7 +383,7 @@ pub fn parse_front_matter(content: &str) -> (FrontMatter, &str) {
         }
         front.fields.push((key.to_owned(), unquote(value)));
     }
-    (front, body)
+    WithFrontMatter { front, body }
 }
 
 fn is_markdown(path: &str) -> bool {
@@ -910,7 +923,7 @@ pub fn propose(bundle: &Bundle, current: Option<&Ontology>) -> Vec<Candidate> {
     let mut bodies: Vec<(&str, &str)> = Vec::new();
     let mut resource_seen = false;
     for file in bundle.concepts() {
-        let (front, body) = parse_front_matter(&file.content);
+        let WithFrontMatter { front, body } = parse_front_matter(&file.content);
         // quack's own structural stubs (tables, documents, ontology files)
         // describe the workspace, not knowledge: only its entity files
         // carry types worth proposing.
@@ -1164,19 +1177,19 @@ mod tests {
 
     #[test]
     fn front_matter_parses_scalars_and_both_tag_forms() {
-        let (front, body) = parse_front_matter(
+        let WithFrontMatter { front, body } = parse_front_matter(
             "---\ntype: DuckDB Table\ntitle: \"Sales, Q1\"\ntags: [a, 'b c']\n---\n\n# Body\n",
         );
         assert_eq!(front.get("type"), Some("DuckDB Table"));
         assert_eq!(front.get("title"), Some("Sales, Q1"));
         assert_eq!(front.tags, ["a", "b c"]);
         assert_eq!(body, "# Body\n");
-        let (front, body) =
+        let WithFrontMatter { front, body } =
             parse_front_matter("---\ntype: x\ntags:\n  - one\n  - two\nresource: r\n---\ntext");
         assert_eq!(front.tags, ["one", "two"]);
         assert_eq!(front.get("resource"), Some("r"));
         assert_eq!(body, "text");
-        let (front, body) = parse_front_matter("no front matter");
+        let WithFrontMatter { front, body } = parse_front_matter("no front matter");
         assert!(front.fields.is_empty());
         assert_eq!(body, "no front matter");
     }

@@ -844,11 +844,11 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert!(!whole.to_string().contains("cut off"), "{tree}");
 
     // The census counts the class and its subclasses without listing them.
-    let (total, samples) = graph_store::class_census(&db, &[ClassId::from("country")], 3).unwrap();
-    assert_eq!(total, 12);
-    assert_eq!(samples, ["Country 00", "Country 01", "Country 02"]);
-    let (none, _) = graph_store::class_census(&db, &[ClassId::from("vendor")], 3).unwrap();
-    assert_eq!(none, 0);
+    let census = graph_store::class_census(&db, &[ClassId::from("country")], 3).unwrap();
+    assert_eq!(census.total, 12);
+    assert_eq!(census.samples, ["Country 00", "Country 01", "Country 02"]);
+    let none = graph_store::class_census(&db, &[ClassId::from("vendor")], 3).unwrap();
+    assert_eq!(none.total, 0);
 }
 
 /// A run over more chunks than one page reads every chunk once, page by
