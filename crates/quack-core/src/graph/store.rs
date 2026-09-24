@@ -9,7 +9,7 @@ use duckdb::types::ToSqlOutput;
 use super::resolve::MergeStatus;
 use super::{Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance};
 use crate::error::{Error, Result};
-use crate::ids::{ChunkId, DocumentId};
+use crate::ids::{ChunkId, DocumentId, EdgeId, NodeId};
 use crate::ontology::{self, OntologyVersion, store as ontology_store};
 use crate::storage::workspace::{MetaKey, WorkspaceDb, embedding_literal};
 
@@ -61,7 +61,7 @@ impl Source {
 /// # Errors
 ///
 /// Returns an error if a write fails.
-pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<String> {
+pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<NodeId> {
     let normalized = NormalizedLabel::new(&node.label);
     if normalized.is_empty() {
         return Err(Error::Analysis(String::from("a node needs a label")));
@@ -69,7 +69,7 @@ pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<String> {
     let conn = db.connection();
     // `optional`, not `.ok()`: a broken query must fail, not read as "not
     // found" and then insert a duplicate.
-    let existing: Option<(String, Option<String>, bool)> = conn
+    let existing: Option<(NodeId, Option<String>, bool)> = conn
         .query_row(
             "SELECT id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes \
              WHERE normalized_label = ? AND class_id = ?",
@@ -86,7 +86,7 @@ pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<String> {
         )?;
         return Ok(id);
     }
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = NodeId::generate();
     conn.execute(
         "INSERT INTO _quack_graph_nodes (id, label, normalized_label, class_id, properties, provisional) \
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -109,14 +109,14 @@ pub fn upsert_node(db: &WorkspaceDb, node: &NewNode) -> Result<String> {
 /// Returns an error if a write fails.
 pub fn upsert_edge(
     db: &WorkspaceDb,
-    source: &str,
-    target: &str,
+    source: &NodeId,
+    target: &NodeId,
     relation_id: &str,
     properties: &Properties,
     provisional: bool,
-) -> Result<String> {
+) -> Result<EdgeId> {
     let conn = db.connection();
-    let existing: Option<String> = conn
+    let existing: Option<EdgeId> = conn
         .query_row(
             "SELECT id FROM _quack_graph_edges \
              WHERE source_node_id = ? AND target_node_id = ? AND relation_id = ?",
@@ -133,7 +133,7 @@ pub fn upsert_edge(
         }
         return Ok(id);
     }
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = EdgeId::generate();
     conn.execute(
         "INSERT INTO _quack_graph_edges (id, source_node_id, target_node_id, relation_id, properties, provisional) \
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -154,7 +154,12 @@ pub fn upsert_edge(
 /// # Errors
 ///
 /// Returns an error if the insert fails.
-pub fn add_provenance(db: &WorkspaceDb, subject_id: &str, source: &Source) -> Result<()> {
+pub fn add_provenance(
+    db: &WorkspaceDb,
+    subject_id: &(impl AsRef<str> + ?Sized),
+    source: &Source,
+) -> Result<()> {
+    let subject_id = subject_id.as_ref();
     // The unused pair is stored as empty text: it is part of the key.
     let (document_id, chunk_id, table_name, row_key) = match &source.origin {
         Origin::Chunk {
@@ -231,7 +236,7 @@ impl TryFrom<&duckdb::Row<'_>> for Edge {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn all_node_ids(db: &WorkspaceDb) -> Result<Vec<String>> {
+pub fn all_node_ids(db: &WorkspaceDb) -> Result<Vec<NodeId>> {
     let mut stmt = db
         .connection()
         .prepare("SELECT id FROM _quack_graph_nodes ORDER BY class_id, label, id")?;
@@ -250,7 +255,7 @@ pub fn all_node_ids(db: &WorkspaceDb) -> Result<Vec<String>> {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn chunks_of_nodes(db: &WorkspaceDb, node_ids: &[String]) -> Result<Vec<ChunkId>> {
+pub fn chunks_of_nodes(db: &WorkspaceDb, node_ids: &[NodeId]) -> Result<Vec<ChunkId>> {
     let mut stmt = db.connection().prepare(
         "SELECT DISTINCT chunk_id FROM _quack_provenance \
          WHERE list_contains(?::VARCHAR[], subject_id) AND chunk_id <> '' ORDER BY chunk_id",
@@ -338,7 +343,7 @@ pub fn class_count(db: &WorkspaceDb, class_ids: &[String]) -> Result<u64> {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn node(db: &WorkspaceDb, id: &str) -> Result<Option<Node>> {
+pub fn node(db: &WorkspaceDb, id: &NodeId) -> Result<Option<Node>> {
     let sql = format!("SELECT {NODE_COLUMNS} WHERE id = ?");
     let mut stmt = db.connection().prepare(&sql)?;
     let mut rows = stmt.query(duckdb::params![id])?;
@@ -353,7 +358,7 @@ pub fn node(db: &WorkspaceDb, id: &str) -> Result<Option<Node>> {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn nodes(db: &WorkspaceDb, ids: &[String]) -> Result<Vec<Node>> {
+pub fn nodes(db: &WorkspaceDb, ids: &[NodeId]) -> Result<Vec<Node>> {
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(node) = node(db, id)? {
@@ -386,7 +391,7 @@ impl EdgeScope {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn edges(db: &WorkspaceDb, node_ids: &[String], scope: EdgeScope) -> Result<Vec<Edge>> {
+pub fn edges(db: &WorkspaceDb, node_ids: &[NodeId], scope: EdgeScope) -> Result<Vec<Edge>> {
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -430,7 +435,7 @@ impl duckdb::ToSql for IdList {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn provenance_of(db: &WorkspaceDb, subject_ids: &[String]) -> Result<Vec<Provenance>> {
+pub fn provenance_of(db: &WorkspaceDb, subject_ids: &[impl AsRef<str>]) -> Result<Vec<Provenance>> {
     if subject_ids.is_empty() {
         return Ok(Vec::new());
     }

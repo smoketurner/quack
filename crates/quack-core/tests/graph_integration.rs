@@ -18,7 +18,7 @@ use quack_core::graph::{
     GraphOptions, GraphResult, Node, Origin, Properties, extract, resolve, store as graph_store,
     tables, traverse,
 };
-use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ids::{ChunkId, DocumentId, NodeId};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::progress::RunControl;
@@ -741,8 +741,8 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
     // An edge between two nodes that do not exist, with provenance.
     let dangling = graph_store::upsert_edge(
         &db,
-        "no-such-source",
-        "no-such-target",
+        &NodeId::from("no-such-source"),
+        &NodeId::from("no-such-target"),
         "mentions",
         &Properties::default(),
         false,
@@ -952,7 +952,7 @@ async fn provenance_maps_between_entities_and_chunks() {
     .unwrap();
 
     let orgenics = traverse::resolve_entry(&db, "Orgenics Ltd", None, None).unwrap();
-    let ids: Vec<String> = orgenics.iter().map(|n| n.id.clone()).collect();
+    let ids: Vec<NodeId> = orgenics.iter().map(|n| n.id.clone()).collect();
     assert!(
         !ids.is_empty(),
         "the canned extractor produces Orgenics Ltd"
@@ -966,7 +966,7 @@ async fn provenance_maps_between_entities_and_chunks() {
 
     // A node built from a table row has no chunk provenance at all.
     let po = traverse::resolve_entry(&db, "PO-1", None, None).unwrap();
-    let po_ids: Vec<String> = po.iter().map(|n| n.id.clone()).collect();
+    let po_ids: Vec<NodeId> = po.iter().map(|n| n.id.clone()).collect();
     assert!(
         graph_store::chunks_of_nodes(&db, &po_ids)
             .unwrap()

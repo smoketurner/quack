@@ -9,6 +9,7 @@ use std::fmt;
 use super::store::{self, EdgeScope, IdList};
 use super::{GraphOptions, GraphResult, Node, NormalizedLabel, Properties};
 use crate::error::Result;
+use crate::ids::{EdgeId, NodeId};
 use crate::ontology::Ontology;
 use crate::storage::workspace::WorkspaceDb;
 
@@ -204,24 +205,24 @@ pub fn neighborhood(
         return Ok(GraphResult::default());
     }
     let depth = hops.get().min(options.max_traversal_depth);
-    let root_ids: Vec<String> = roots.iter().map(|n| n.id.clone()).collect();
+    let root_ids: Vec<NodeId> = roots.iter().map(|n| n.id.clone()).collect();
     // Breadth-first, one query per frontier, never more than `max_nodes`
     // visited: a recursive CTE would enumerate every simple path out of a
     // hub before its LIMIT applied (issue #48).
     let max_visited = usize::try_from(options.max_nodes).unwrap_or(usize::MAX);
-    let mut ids: Vec<String> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut ids: Vec<NodeId> = Vec::new();
+    let mut seen: BTreeSet<NodeId> = BTreeSet::new();
     for id in &root_ids {
         if seen.insert(id.clone()) && ids.len() < max_visited {
             ids.push(id.clone());
         }
     }
-    let mut frontier: Vec<String> = ids.clone();
+    let mut frontier: Vec<NodeId> = ids.clone();
     for _ in 0..depth {
         if frontier.is_empty() || ids.len() >= max_visited {
             break;
         }
-        let mut next: Vec<String> = Vec::new();
+        let mut next: Vec<NodeId> = Vec::new();
         let mut edges = store::edges(db, &frontier, EdgeScope::Touching)?;
         if let Some(relation) = relation {
             edges.retain(|e| e.relation_id == relation);
@@ -279,16 +280,16 @@ pub fn path(
         .min(options.max_traversal_depth.saturating_mul(2))
         .max(1);
     // node id -> (previous node id, edge id)
-    let mut parent: BTreeMap<String, (String, String)> = BTreeMap::new();
-    let mut seen: BTreeSet<String> = BTreeSet::from([from.id.clone()]);
-    let mut frontier: VecDeque<String> = VecDeque::from([from.id.clone()]);
+    let mut parent: BTreeMap<NodeId, (NodeId, EdgeId)> = BTreeMap::new();
+    let mut seen: BTreeSet<NodeId> = BTreeSet::from([from.id.clone()]);
+    let mut frontier: VecDeque<NodeId> = VecDeque::from([from.id.clone()]);
     let mut found = false;
     let max_visited = usize::try_from(options.max_nodes).unwrap_or(usize::MAX);
     for _ in 0..limit {
         if frontier.is_empty() || found {
             break;
         }
-        let current: Vec<String> = frontier.drain(..).collect();
+        let current: Vec<NodeId> = frontier.drain(..).collect();
         let edges = store::edges(db, &current, EdgeScope::Touching)?;
         for edge in edges {
             let (here, there) = if current.contains(&edge.source_node_id) {
@@ -330,7 +331,11 @@ pub fn path(
         .into_iter()
         .filter(|e| edge_ids.contains(&e.id))
         .collect();
-    let subjects: Vec<String> = node_ids.iter().cloned().chain(edge_ids).collect();
+    let subjects: Vec<String> = node_ids
+        .iter()
+        .map(NodeId::to_string)
+        .chain(edge_ids.iter().map(EdgeId::to_string))
+        .collect();
     let provenance = store::provenance_of(db, &subjects)?;
     Ok(GraphResult {
         nodes,
@@ -367,7 +372,7 @@ pub fn by_class(
     let mut rows = stmt.query(duckdb::params![IdList::new(&classes), cap])?;
     let mut ids = Vec::new();
     while let Some(row) = rows.next()? {
-        ids.push(row.get::<_, String>(0)?);
+        ids.push(row.get::<_, NodeId>(0)?);
     }
     drop(rows);
     drop(stmt);
@@ -378,13 +383,13 @@ pub fn by_class(
 }
 
 /// Nodes by id with the edges among them and everything's provenance.
-fn collect(db: &WorkspaceDb, ids: &[String]) -> Result<GraphResult> {
+fn collect(db: &WorkspaceDb, ids: &[NodeId]) -> Result<GraphResult> {
     let nodes = store::nodes(db, ids)?;
     let edges = store::edges(db, ids, EdgeScope::Among)?;
     let subjects: Vec<String> = nodes
         .iter()
-        .map(|n| n.id.clone())
-        .chain(edges.iter().map(|e| e.id.clone()))
+        .map(|n| n.id.to_string())
+        .chain(edges.iter().map(|e| e.id.to_string()))
         .collect();
     let provenance = store::provenance_of(db, &subjects)?;
     Ok(GraphResult {
@@ -529,7 +534,7 @@ mod tests {
 
     fn node(id: &str, label: &str, properties: serde_json::Value) -> Node {
         Node {
-            id: String::from(id),
+            id: NodeId::from(String::from(id)),
             label: String::from(label),
             class_id: String::from("organization"),
             properties: Properties::from(properties),
@@ -545,16 +550,16 @@ mod tests {
                 node("b", "Orgenics", json!({})),
             ],
             edges: vec![Edge {
-                id: String::from("e"),
-                source_node_id: String::from("a"),
-                target_node_id: String::from("b"),
+                id: EdgeId::from("e"),
+                source_node_id: NodeId::from("a"),
+                target_node_id: NodeId::from("b"),
                 relation_id: String::from("supplies"),
                 weight: 1.0,
                 properties: Properties::from(json!({ "since": "2020" })),
                 provisional: false,
             }],
             provenance: Vec::new(),
-            roots: vec![String::from("a")],
+            roots: vec![NodeId::from("a")],
             ..GraphResult::default()
         };
         let tree = result.to_string();
@@ -568,9 +573,9 @@ mod tests {
     #[test]
     fn an_edge_back_to_a_visited_node_names_it_without_descending() {
         let edge = |id: &str, from: &str, to: &str| Edge {
-            id: String::from(id),
-            source_node_id: String::from(from),
-            target_node_id: String::from(to),
+            id: EdgeId::from(String::from(id)),
+            source_node_id: NodeId::from(String::from(from)),
+            target_node_id: NodeId::from(String::from(to)),
             relation_id: String::from("knows"),
             weight: 1.0,
             properties: Properties::default(),

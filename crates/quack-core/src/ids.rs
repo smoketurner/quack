@@ -144,6 +144,16 @@ id_type!(
 );
 
 id_type!(
+    /// A knowledge-graph node.
+    NodeId
+);
+
+id_type!(
+    /// A knowledge-graph edge.
+    EdgeId
+);
+
+id_type!(
     /// An access-audit row, shared with the workspace's `_quack_audit`
     /// detail row for the same event.
     AuditId

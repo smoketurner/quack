@@ -9,7 +9,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ids::ChunkId;
+use crate::ids::{ChunkId, NodeId};
 use crate::storage::workspace::{
     ChunkScope, ChunkSearchResult, HybridLimits, StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb,
     creates_temp_object, quote_ident,
@@ -869,7 +869,7 @@ fn entity_chunks(
             unknown.into()
         });
     }
-    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let ids: Vec<NodeId> = nodes.iter().map(|n| n.id.clone()).collect();
     let chunks = graph::store::chunks_of_nodes(db, &ids)?;
     if chunks.is_empty() {
         return Err(Error::Analysis(format!(
