@@ -2,6 +2,8 @@
 //! or an error in the query string for that page's flash slot
 //! (`FlashQuery` reads it back).
 
+use std::fmt::{self, Write as _};
+
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::server::error::ApiError;
@@ -74,7 +76,7 @@ impl Flash {
             None => self.path.clone(),
             Some((level, text)) => {
                 let joiner = if self.path.contains('?') { '&' } else { '?' };
-                format!("{}{joiner}{}={}", self.path, level.key(), urlencoded(text))
+                format!("{}{joiner}{}={}", self.path, level.key(), UrlEncoded(text))
             }
         }
     }
@@ -86,18 +88,24 @@ impl IntoResponse for Flash {
     }
 }
 
-/// `application/x-www-form-urlencoded` for one value: unreserved bytes as
-/// they are, space as `+`, everything else percent-encoded.
-fn urlencoded(text: &str) -> String {
-    text.bytes()
-        .map(|b| match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
-                char::from(b).to_string()
+/// One value written as `application/x-www-form-urlencoded`: unreserved
+/// bytes as they are, space as `+`, everything else percent-encoded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UrlEncoded<'a>(pub &'a str);
+
+impl fmt::Display for UrlEncoded<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0.bytes() {
+            match byte {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    f.write_char(char::from(byte))?;
+                }
+                b' ' => f.write_char('+')?,
+                other => write!(f, "%{other:02X}")?,
             }
-            b' ' => String::from("+"),
-            other => format!("%{other:02X}"),
-        })
-        .collect()
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -106,8 +114,8 @@ mod tests {
 
     #[test]
     fn urlencoded_escapes_reserved_bytes() {
-        assert_eq!(urlencoded("a b&c=d/é"), "a+b%26c%3Dd%2F%C3%A9");
-        assert_eq!(urlencoded("plain-text_1.2"), "plain-text_1.2");
+        assert_eq!(UrlEncoded("a b&c=d/é").to_string(), "a+b%26c%3Dd%2F%C3%A9");
+        assert_eq!(UrlEncoded("plain-text_1.2").to_string(), "plain-text_1.2");
     }
 
     #[test]

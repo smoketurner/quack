@@ -126,8 +126,7 @@ pub(crate) async fn set_mode(
     mode: ChatMode,
 ) -> ApiResult<sessions::SessionRow> {
     let session = visible_session(app, access, &access.workspace.id, sid).await?;
-    let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
-    if !mine && !access.sees_all_sessions() {
+    if !access.owns(session.created_by.as_deref()) {
         access
             .audit(
                 app,
@@ -169,8 +168,7 @@ pub(crate) async fn set_shared(
     shared: bool,
 ) -> ApiResult<sessions::SessionRow> {
     let session = visible_session(app, access, &access.workspace.id, sid).await?;
-    let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
-    if !mine && !access.sees_all_sessions() {
+    if !access.owns(session.created_by.as_deref()) {
         access
             .audit(
                 app,
@@ -218,8 +216,7 @@ pub(crate) async fn remove(
 /// The shared delete behind the API and the web button.
 pub(crate) async fn delete_session(app: &App, access: &Access, sid: &str) -> ApiResult<()> {
     let session = visible_session(app, access, &access.workspace.id, sid).await?;
-    let mine = session.created_by.as_deref() == Some(access.identity.user_id.as_str());
-    if !mine && !access.sees_all_sessions() {
+    if !access.owns(session.created_by.as_deref()) {
         access
             .audit(
                 app,

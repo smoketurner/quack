@@ -33,17 +33,19 @@ use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
 use rust_embed::Embed;
 use serde::Deserialize;
 
-use self::flash::Flash;
+use self::flash::{Flash, UrlEncoded};
 use super::api::admin::CreateUser;
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
+use super::api::documents::Enqueued;
+use super::api::embeddings::RefreshStarted;
 use super::api::graph::ExtractionStarted;
 use super::api::members::AddMember;
 use super::api::ontology::DecideRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
-    documents as docs_api, embeddings as embeddings_api, graph as graph_api, import as import_api,
-    jobs as jobs_api, ontology as ontology_api, query as query_api, sessions as sessions_api,
+    documents as docs_api, graph as graph_api, import as import_api, jobs as jobs_api,
+    ontology as ontology_api, query as query_api, sessions as sessions_api,
     workspaces as workspaces_api,
 };
 use super::auth::{
@@ -969,22 +971,18 @@ async fn refresh_embeddings(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let target = match embeddings_api::start(&app, &access, &id).await {
-        Ok((_, body)) if body.get("status").and_then(|s| s.as_str()) == Some("running") => {
-            format!(
-                "/w/{id}/documents?notice={}",
-                urlencoded(
+    let started = access.refresh_embeddings(&app).await;
+    Ok(
+        Flash::after(format!("/w/{id}/documents"), started, |started| {
+            Some(String::from(match started {
+                RefreshStarted::Running { .. } => {
                     "refreshing embeddings in the background; the Jobs page shows its progress"
-                )
-            )
-        }
-        Ok(_) => format!(
-            "/w/{id}/documents?notice={}",
-            urlencoded("every vector is already current")
-        ),
-        Err(e) => format!("/w/{id}/documents?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+                }
+                RefreshStarted::Current { .. } => "every vector is already current",
+            }))
+        })
+        .into_response(),
+    )
 }
 
 async fn document_rows(
@@ -1041,16 +1039,20 @@ async fn upload(
     } else {
         vec![docs_api::pasted_file(&text, Some(&title))?]
     };
-    let outcome = enqueue_web(&app, &access, files, pasted).await;
-    let target = match outcome {
-        Ok(skipped) if skipped.is_empty() => format!("/w/{id}/documents"),
-        Ok(skipped) => format!(
-            "/w/{id}/documents?error={}",
-            urlencoded(&format!("Already in the workspace: {}", skipped.join(", ")))
-        ),
-        Err(e) => format!("/w/{id}/documents?error={}", urlencoded(&e.message)),
+    let back = format!("/w/{id}/documents");
+    let skipped = match enqueue_web(&app, &access, files, pasted).await {
+        Ok(skipped) => skipped,
+        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
     };
-    Ok(Redirect::to(&target).into_response())
+    Ok(if skipped.is_empty() {
+        Flash::to(back)
+    } else {
+        Flash::error(
+            back,
+            format!("Already in the workspace: {}", skipped.join(", ")),
+        )
+    }
+    .into_response())
 }
 
 /// Queue uploaded files and pasted text under their own sources; returns
@@ -1072,26 +1074,13 @@ async fn enqueue_web(
         queued.extend(docs_api::enqueue(app, access, DocumentSource::Paste, pasted).await?);
     }
     let mut skipped = Vec::new();
-    for entry in &queued {
-        if entry.get("status").and_then(serde_json::Value::as_str) == Some("duplicate")
-            && let Some(name) = entry.get("filename").and_then(serde_json::Value::as_str)
-        {
-            skipped.push(name.to_owned());
+    for entry in queued {
+        match entry {
+            Enqueued::Duplicate { filename, .. } => skipped.push(filename),
+            Enqueued::Queued { .. } => {}
         }
     }
     Ok(skipped)
-}
-
-fn urlencoded(text: &str) -> String {
-    text.bytes()
-        .map(|b| match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
-                char::from(b).to_string()
-            }
-            b' ' => String::from("+"),
-            other => format!("%{other:02X}"),
-        })
-        .collect()
 }
 
 async fn pin(
@@ -1165,11 +1154,13 @@ async fn import_submit(
         source_table: (!form.source_table.trim().is_empty()).then(|| form.source_table.clone()),
         limit: None,
     };
-    let target = match import_api::run_import(&app, &access, &request).await {
-        Ok(summary) => format!("/w/{id}/tables/{}", summary.table),
-        Err(e) => format!("/w/{id}/tables?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    Ok(
+        match import_api::run_import(&app, &access, &request).await {
+            Ok(summary) => Flash::to(format!("/w/{id}/tables/{}", summary.table)),
+            Err(e) => Flash::error(format!("/w/{id}/tables"), e.message),
+        }
+        .into_response(),
+    )
 }
 
 fn cell(value: &serde_json::Value) -> String {
@@ -1230,7 +1221,7 @@ struct SqlForm {
 }
 
 async fn render_sql(app: &App, access: &Access, sql: &str) -> WebResult<String> {
-    let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, urlencoded(sql));
+    let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
     let result = match query_api::execute_sql(app, access, sql).await {
         Ok(outcome) => SqlResult {
             columns: outcome.columns,
@@ -1770,11 +1761,8 @@ async fn settings_save(
         classification: Some(form.classification),
         allowed_providers,
     };
-    if let Err(e) = workspaces_api::update_settings(&app, &access, changes).await {
-        let error = urlencoded(&e.message);
-        return Ok(Redirect::to(&format!("/w/{id}/settings?error={error}")).into_response());
-    }
-    Ok(Redirect::to(&format!("/w/{id}/settings")).into_response())
+    let saved = workspaces_api::update_settings(&app, &access, changes).await;
+    Ok(Flash::after(format!("/w/{id}/settings"), saved, |_| None).into_response())
 }
 
 async fn member_add(
@@ -1815,8 +1803,7 @@ async fn token_create(
     let access = access(&app, identity, &id, Need::OWN).await?;
     if app.local {
         return Ok(
-            Redirect::to(&format!("/w/{id}/settings?error=local+mode+has+no+users"))
-                .into_response(),
+            Flash::error(format!("/w/{id}/settings"), "local mode has no users").into_response(),
         );
     }
     let scopes = form.scopes;
@@ -1958,12 +1945,6 @@ async fn admin_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn urlencoded_escapes_reserved_bytes() {
-        assert_eq!(urlencoded("a b&c=d/é"), "a+b%26c%3Dd%2F%C3%A9");
-        assert_eq!(urlencoded("plain-text_1.2"), "plain-text_1.2");
-    }
 
     #[test]
     fn cells_render_strings_bare_and_null_empty() {

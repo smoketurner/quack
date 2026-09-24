@@ -9,9 +9,9 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use quack_core::error::Record;
 use quack_core::ingestion;
-use quack_core::jobs::LaneKey;
+use quack_core::jobs::{JobId, LaneKey};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
@@ -221,7 +221,7 @@ pub(crate) async fn enqueue(
     access: &Access,
     source: DocumentSource,
     files: Vec<(String, Vec<u8>)>,
-) -> ApiResult<Vec<serde_json::Value>> {
+) -> ApiResult<Vec<Enqueued>> {
     if files.is_empty() {
         return Err(ApiError::bad_request("no file or text in the request"));
     }
@@ -283,12 +283,11 @@ pub(crate) async fn enqueue(
                         })),
                     )
                     .await?;
-                queued.push(serde_json::json!({
-                    "id": existing.id,
-                    "filename": filename,
-                    "status": "duplicate",
-                    "existing_filename": existing.filename,
-                }));
+                queued.push(Enqueued::Duplicate {
+                    id: existing.id,
+                    filename,
+                    existing_filename: existing.filename,
+                });
                 continue;
             }
         };
@@ -312,14 +311,31 @@ pub(crate) async fn enqueue(
                 data,
             },
         );
-        queued.push(serde_json::json!({
-            "id": document_id,
-            "filename": filename,
-            "status": "queued",
-            "job": job,
-        }));
+        queued.push(Enqueued::Queued {
+            id: document_id,
+            filename,
+            job,
+        });
     }
     Ok(queued)
+}
+
+/// What became of one file given to [`enqueue`].
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum Enqueued {
+    /// Registered and queued for processing.
+    Queued {
+        id: String,
+        filename: String,
+        job: JobId,
+    },
+    /// The same bytes are already a document; nothing was queued.
+    Duplicate {
+        id: String,
+        filename: String,
+        existing_filename: String,
+    },
 }
 
 #[derive(Deserialize)]

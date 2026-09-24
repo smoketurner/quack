@@ -18,6 +18,7 @@ use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::ApiResult;
 use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::App;
+use serde::Serialize;
 
 /// `GET .../embeddings`: how many vectors are current, stale (made under
 /// another profile), or missing, and what a refresh would do.
@@ -47,24 +48,41 @@ pub(crate) async fn refresh(
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let (code, body) = start(&app, &access, &id).await?;
-    Ok((code, Json(body)))
+    let started = access.refresh_embeddings(&app).await?;
+    Ok((started.status_code(), Json(serde_json::to_value(started)?)))
 }
 
-/// The refresh the API and the web page share: `{status: "current"}`
-/// with nothing to do, else `{plan, run, job, status: "running"}`.
-pub(crate) async fn start(
-    app: &App,
-    access: &Access,
-    id: &str,
-) -> ApiResult<(StatusCode, serde_json::Value)> {
-    // Fail now, not in the background, when no model can be built.
-    let embedder = llm::required_embedding_model(&app.config).await?;
-    let status = app.read(id, WorkspaceDb::embedding_status).await?;
-    let plan = Plan::from_status(&status);
-    if plan.is_empty() {
-        access
-            .audit(
+/// What asking for a refresh did.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum RefreshStarted {
+    /// Every vector was already made with the current profile.
+    Current { plan: Plan },
+    /// A run embeds the stale and missing ones in the background.
+    Running { plan: Plan, run: String, job: JobId },
+}
+
+impl RefreshStarted {
+    /// 200 with nothing to do, 202 when a run goes on.
+    pub(crate) fn status_code(&self) -> StatusCode {
+        match self {
+            Self::Current { .. } => StatusCode::OK,
+            Self::Running { .. } => StatusCode::ACCEPTED,
+        }
+    }
+}
+
+impl Access {
+    /// The refresh the API and the web page share.
+    pub(crate) async fn refresh_embeddings(&self, app: &App) -> ApiResult<RefreshStarted> {
+        // Fail now, not in the background, when no model can be built.
+        let embedder = llm::required_embedding_model(&app.config).await?;
+        let status = app
+            .read(&self.workspace.id, WorkspaceDb::embedding_status)
+            .await?;
+        let plan = Plan::from_status(&status);
+        if plan.is_empty() {
+            self.audit(
                 app,
                 AuditAction::EmbeddingsRefresh,
                 None,
@@ -72,24 +90,23 @@ pub(crate) async fn start(
                 Some(serde_json::json!({ "plan": plan, "finished": true })),
             )
             .await?;
-        return Ok((
-            StatusCode::OK,
-            serde_json::json!({ "plan": plan, "status": "current" }),
-        ));
+            return Ok(RefreshStarted::Current { plan });
+        }
+        let run = BackgroundRun::start(
+            app,
+            self,
+            RunKind::Embeddings,
+            serde_json::json!({ "plan": plan, "profile": embedder.profile() }),
+        )
+        .await?;
+        let run_id = run.id().to_owned();
+        let job = refresh_in_background(run, Arc::clone(app), self.workspace.id.clone(), embedder);
+        Ok(RefreshStarted::Running {
+            plan,
+            run: run_id,
+            job,
+        })
     }
-    let run = BackgroundRun::start(
-        app,
-        access,
-        RunKind::Embeddings,
-        serde_json::json!({ "plan": plan, "profile": embedder.profile() }),
-    )
-    .await?;
-    let run_id = run.id().to_owned();
-    let job = refresh_in_background(run, Arc::clone(app), access.workspace.id.clone(), embedder);
-    Ok((
-        StatusCode::ACCEPTED,
-        serde_json::json!({ "plan": plan, "run": run_id, "job": job, "status": "running" }),
-    ))
 }
 
 /// Run the refresh as `run`'s job.
