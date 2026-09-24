@@ -30,8 +30,19 @@ pub enum Load {
     Table(Reader),
     /// One table per sheet.
     Workbook,
-    /// Text, parsed and chunked.
-    Chunks,
+    /// Text in this format, parsed and chunked.
+    Chunks(TextFormat),
+}
+
+/// A file type whose text is parsed and chunked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFormat {
+    Pdf,
+    Text,
+    Markdown,
+    Html,
+    Docx,
+    Pptx,
 }
 
 /// A `DuckDB` reader for a data file.
@@ -90,9 +101,12 @@ impl FileType {
             Self::Parquet => Load::Table(Reader::Parquet),
             Self::Json => Load::Table(Reader::Json),
             Self::Xlsx => Load::Workbook,
-            Self::Pdf | Self::Text | Self::Markdown | Self::Html | Self::Docx | Self::Pptx => {
-                Load::Chunks
-            }
+            Self::Pdf => Load::Chunks(TextFormat::Pdf),
+            Self::Text => Load::Chunks(TextFormat::Text),
+            Self::Markdown => Load::Chunks(TextFormat::Markdown),
+            Self::Html => Load::Chunks(TextFormat::Html),
+            Self::Docx => Load::Chunks(TextFormat::Docx),
+            Self::Pptx => Load::Chunks(TextFormat::Pptx),
         }
     }
 
@@ -100,7 +114,7 @@ impl FileType {
     pub fn table_extensions() -> impl Iterator<Item = &'static str> {
         EXTENSIONS
             .iter()
-            .filter(|(_, file_type)| file_type.load() != Load::Chunks)
+            .filter(|(_, file_type)| !matches!(file_type.load(), Load::Chunks(_)))
             .map(|(ext, _)| *ext)
     }
 
@@ -215,47 +229,46 @@ const EXTENSIONS: &[(&str, FileType)] = &[
     ("pptx", FileType::Pptx),
 ];
 
-/// Extract an unstructured file: PDFs one section per page, Markdown one
-/// per heading, HTML one per heading with the `<title>`, DOCX one per
-/// heading style with the core title, PPTX one per slide, plain text a
-/// single section.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be parsed, or if it has no text at
-/// all (a scanned PDF without a text layer needs OCR, which is not
-/// supported).
-pub fn extract(file_type: FileType, data: &[u8]) -> Result<Extracted> {
-    match file_type {
-        FileType::Pdf => extract_pdf(data),
-        FileType::Markdown => {
-            let text = utf8(data)?;
-            // YAML front matter (Obsidian, Jekyll, OKF) is metadata, not
-            // prose: its `title` is the document's, the rest is dropped.
-            let (front, body) = parse_front_matter(&text);
-            Ok(Extracted {
-                title: front.get("title").map(str::to_owned),
-                sections: markdown_sections(body),
+impl TextFormat {
+    /// Extract a file's text: PDFs one section per page, Markdown one per
+    /// heading, HTML one per heading with the `<title>`, DOCX one per
+    /// heading style with the core title, PPTX one per slide, plain text a
+    /// single section.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be parsed, or if it has no text
+    /// at all (a scanned PDF without a text layer needs OCR, which is not
+    /// supported).
+    pub fn extract(self, data: &[u8]) -> Result<Extracted> {
+        match self {
+            Self::Pdf => extract_pdf(data),
+            Self::Markdown => {
+                let text = utf8(data)?;
+                // YAML front matter (Obsidian, Jekyll, OKF) is metadata, not
+                // prose: its `title` is the document's, the rest is dropped.
+                let (front, body) = parse_front_matter(&text);
+                Ok(Extracted {
+                    title: front.get("title").map(str::to_owned),
+                    sections: markdown_sections(body),
+                    flow: Flow::Sectioned,
+                    pages_skipped: 0,
+                })
+            }
+            Self::Text => Ok(Extracted {
+                title: None,
+                sections: vec![Section {
+                    heading: None,
+                    page: None,
+                    text: utf8(data)?,
+                }],
                 flow: Flow::Sectioned,
                 pages_skipped: 0,
-            })
+            }),
+            Self::Html => html::html(&utf8(data)?),
+            Self::Docx => office::docx(data),
+            Self::Pptx => office::pptx(data),
         }
-        FileType::Text => Ok(Extracted {
-            title: None,
-            sections: vec![Section {
-                heading: None,
-                page: None,
-                text: utf8(data)?,
-            }],
-            flow: Flow::Sectioned,
-            pages_skipped: 0,
-        }),
-        FileType::Html => html::html(&utf8(data)?),
-        FileType::Docx => office::docx(data),
-        FileType::Pptx => office::pptx(data),
-        FileType::Csv | FileType::Parquet | FileType::Json | FileType::Xlsx => Err(
-            Error::Ingestion(format!("cannot extract text from {file_type} files")),
-        ),
     }
 }
 
@@ -450,16 +463,14 @@ mod tests {
 
     #[test]
     fn markdown_front_matter_gives_the_title_and_is_not_chunked() {
-        let extracted = extract(
-            FileType::Markdown,
-            b"---\ntitle: Renewal Guide\ntags: [a]\n---\n\n# Terms\n\nThirty days.\n",
-        )
-        .unwrap_or_else(|_| Extracted {
-            title: None,
-            sections: Vec::new(),
-            flow: Flow::Sectioned,
-            pages_skipped: 0,
-        });
+        let extracted = TextFormat::Markdown
+            .extract(b"---\ntitle: Renewal Guide\ntags: [a]\n---\n\n# Terms\n\nThirty days.\n")
+            .unwrap_or_else(|_| Extracted {
+                title: None,
+                sections: Vec::new(),
+                flow: Flow::Sectioned,
+                pages_skipped: 0,
+            });
         assert_eq!(extracted.title(), Some("Renewal Guide"));
         assert_eq!(extracted.sections.len(), 1);
         assert!(extracted.sections.iter().all(|s| !s.text.contains("tags:")));
@@ -517,17 +528,12 @@ mod tests {
     #[test]
     fn extracts_plain_text() {
         let data = b"Hello, world!";
-        let text = extract(FileType::Text, data)
+        let text = TextFormat::Text
+            .extract(data)
             .ok()
             .and_then(|e| e.sections.into_iter().next())
             .map(|s| s.text);
         assert_eq!(text, Some(String::from("Hello, world!")));
-    }
-
-    #[test]
-    fn rejects_structured_extraction() {
-        let result = extract(FileType::Csv, b"a,b,c");
-        assert!(result.is_err());
     }
 
     #[test]
@@ -566,7 +572,7 @@ mod tests {
 
     #[test]
     fn pdf_without_text_layer_is_an_error() {
-        let err = extract(FileType::Pdf, b"%PDF-1.4\n%%EOF").err();
+        let err = TextFormat::Pdf.extract(b"%PDF-1.4\n%%EOF").err();
         assert!(err.is_some());
     }
 
@@ -585,7 +591,9 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn every_page_of_a_long_pdf_is_kept_with_its_number_and_title() {
-        let extracted = extract(FileType::Pdf, &long_pdf(60, "Long Report")).unwrap();
+        let extracted = TextFormat::Pdf
+            .extract(&long_pdf(60, "Long Report"))
+            .unwrap();
         assert_eq!(extracted.title.as_deref(), Some("Long Report"));
         assert_eq!(extracted.pages_skipped, 0);
         assert_eq!(extracted.sections.len(), 60);
