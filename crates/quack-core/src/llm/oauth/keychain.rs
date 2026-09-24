@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use keyring_core::{CredentialStore, Entry};
 
+use crate::config::ProviderName;
 use crate::error::{Error, Result};
 
 const SERVICE: &str = "quack";
@@ -49,66 +50,84 @@ fn ensure_store() -> keyring_core::Result<()> {
     .map_err(keyring_core::Error::BadStoreFormat)
 }
 
-fn entry(provider: &str) -> keyring_core::Result<Entry> {
-    ensure_store()?;
-    Entry::new(SERVICE, &format!("oauth:{provider}"))
+/// A provider's keychain entry, `quack` / `oauth:<provider>`.
+pub(super) struct KeychainEntry(String);
+
+/// What is done to an entry.
+enum KeychainOp {
+    Read,
+    Write(String),
+    Delete,
 }
 
-fn keychain_error(provider: &str, action: &str, e: &keyring_core::Error) -> Error {
-    Error::Llm(format!(
-        "keychain {action} for provider '{provider}' failed: {e}"
-    ))
-}
-
-/// The stored key, or `None` when the keychain has no entry for the provider.
-///
-/// # Errors
-///
-/// Returns an error when the keychain itself is unavailable or refuses the
-/// read; callers fall back to the key file on that.
-pub(super) async fn get(provider: &str) -> Result<Option<String>> {
-    let provider = provider.to_owned();
-    tokio::task::spawn_blocking(
-        move || match entry(&provider).and_then(|e| e.get_password()) {
-            Ok(key) => Ok(Some(key)),
-            Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(e) => Err(keychain_error(&provider, "read", &e)),
-        },
-    )
-    .await
-    .map_err(|e| Error::Llm(format!("keychain task failed: {e}")))?
-}
-
-/// Store the key for the provider, replacing any previous one.
-///
-/// # Errors
-///
-/// Returns an error when the keychain is unavailable or refuses the write.
-pub(super) async fn set(provider: &str, key: &str) -> Result<()> {
-    let provider = provider.to_owned();
-    let key = key.to_owned();
-    tokio::task::spawn_blocking(move || {
-        entry(&provider)
-            .and_then(|e| e.set_password(&key))
-            .map_err(|e| keychain_error(&provider, "write", &e))
-    })
-    .await
-    .map_err(|e| Error::Llm(format!("keychain task failed: {e}")))?
-}
-
-/// Remove the provider's key. A missing entry is not an error.
-///
-/// # Errors
-///
-/// Returns an error when the keychain is unavailable or refuses the delete.
-pub(super) async fn delete(provider: &str) -> Result<()> {
-    let provider = provider.to_owned();
-    tokio::task::spawn_blocking(move || {
-        match entry(&provider).and_then(|e| e.delete_credential()) {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(e) => Err(keychain_error(&provider, "delete", &e)),
+impl KeychainOp {
+    const fn verb(&self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write(_) => "write",
+            Self::Delete => "delete",
         }
-    })
-    .await
-    .map_err(|e| Error::Llm(format!("keychain task failed: {e}")))?
+    }
+}
+
+impl KeychainEntry {
+    pub(super) fn new(provider: &ProviderName) -> Self {
+        Self(provider.as_str().to_owned())
+    }
+
+    /// Do `op` on the blocking pool, since the stores talk to the OS
+    /// synchronously. A read of a missing entry is `None`; deleting one is
+    /// not an error.
+    async fn run(&self, op: KeychainOp) -> Result<Option<String>> {
+        let provider = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let verb = op.verb();
+            let outcome = ensure_store()
+                .and_then(|()| Entry::new(SERVICE, &format!("oauth:{provider}")))
+                .and_then(|entry| match op {
+                    KeychainOp::Read => entry.get_password().map(Some),
+                    KeychainOp::Write(key) => entry.set_password(&key).map(|()| None),
+                    KeychainOp::Delete => entry.delete_credential().map(|()| None),
+                });
+            match outcome {
+                Ok(found) => Ok(found),
+                Err(keyring_core::Error::NoEntry) => Ok(None),
+                Err(e) => Err(Error::Llm(format!(
+                    "keychain {verb} for provider '{provider}' failed: {e}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| Error::Llm(format!("keychain task failed: {e}")))?
+    }
+
+    /// The stored key, or `None` when the keychain has no entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the keychain itself is unavailable or refuses
+    /// the read; callers fall back to the key file on that.
+    pub(super) async fn get(&self) -> Result<Option<String>> {
+        self.run(KeychainOp::Read).await
+    }
+
+    /// Store the key, replacing any previous one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the keychain is unavailable or refuses the
+    /// write.
+    pub(super) async fn set(&self, key: &str) -> Result<()> {
+        self.run(KeychainOp::Write(key.to_owned())).await.map(drop)
+    }
+
+    /// Remove the key. A missing entry is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the keychain is unavailable or refuses the
+    /// delete.
+    pub(super) async fn delete(&self) -> Result<()> {
+        self.run(KeychainOp::Delete).await.map(drop)
+    }
 }

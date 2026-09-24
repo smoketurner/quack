@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::embedding::refresh::{self, Plan};
 use quack_core::jobs::JobId;
-use quack_core::llm::{self, Embeddings};
+use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{AuditAction, Outcome};
 use quack_core::storage::workspace::WorkspaceDb;
@@ -76,7 +76,7 @@ impl Access {
     /// The refresh the API and the web page share.
     pub(crate) async fn refresh_embeddings(&self, app: &App) -> ApiResult<RefreshStarted> {
         // Fail now, not in the background, when no model can be built.
-        let embedder = llm::required_embedding_model(&app.config).await?;
+        let embedder = Embeddings::require(&app.config).await?;
         let status = app
             .read(&self.workspace.id, WorkspaceDb::embedding_status)
             .await?;

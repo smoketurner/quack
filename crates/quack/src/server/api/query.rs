@@ -15,7 +15,7 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
 use quack_core::error::Record;
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
-use quack_core::llm;
+use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
@@ -451,7 +451,7 @@ pub(crate) async fn search(
     }
     let top_k = q.top_k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
     let rrf_k = app.config.retrieval.rrf_k;
-    let embedding: Option<Vector> = match llm::optional_embedding_model(&app.config).await? {
+    let embedding: Option<Vector> = match Embeddings::from_config(&app.config).await? {
         Some(model) => Some(
             model
                 .embed_interactive(&Input::Query(query.clone()))

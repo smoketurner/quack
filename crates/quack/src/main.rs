@@ -19,11 +19,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::doctor::Options;
+use quack_core::crypto::{self, CryptoModule};
+use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
-use quack_core::llm::oauth::{self, LoginOptions, LoginPrompt, TokenManager};
+use quack_core::llm::Embeddings;
+use quack_core::llm::oauth::{LoginOptions, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, candidates, store as ontology_store};
@@ -34,7 +36,7 @@ use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
 use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
 use quack_core::storage::writer::Writer;
-use quack_core::{config, crypto, doctor, llm};
+use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,11 +62,7 @@ const EXIT_BAD_CONFIG: u8 = 2;
 /// binary from a non-FIPS one without turning on `RUST_LOG=info`. `-V` stays
 /// the bare version. A static because clap takes a `&'static str`.
 static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!(
-        "{}\n{}",
-        env!("CARGO_PKG_VERSION"),
-        crypto::provider_description()
-    )
+    format!("{}\n{}", env!("CARGO_PKG_VERSION"), CryptoModule::linked())
 });
 
 #[derive(Parser)]
@@ -633,8 +631,11 @@ async fn run_doctor(cli: &Cli, offline: bool, json: bool) -> Result<ExitCode> {
     let inspection = config::inspect::Inspection::load();
     let options = Options {
         workspace: cli.workspace.clone(),
-        offline,
-        ..Options::default()
+        probing: if offline {
+            Probing::Offline
+        } else {
+            Probing::default()
+        },
     };
     let report = doctor::run(&inspection, &options).await;
     let stdout = std::io::stdout();
@@ -917,7 +918,7 @@ async fn run_import(
     };
     let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
     let ws_db = spawn_writer(&config, &workspace.id)?;
-    let embedding_model = llm::optional_embedding_model(&config).await?;
+    let embedding_model = Embeddings::from_config(&config).await?;
     let summary = import::import(
         &config,
         &ws_db,
@@ -1056,7 +1057,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
                     ),
                     _ => format!("not logged in; run `quack auth login {name}`"),
                 };
-                writeln!(out, "{name}: {state} (key in {})", status.key_source)?;
+                writeln!(out, "{name}: {state} (key in {})", status.key_location)?;
             }
             out.flush()?;
         }
@@ -1079,7 +1080,7 @@ fn oauth_manager(config: &Config, name: &str) -> Result<Arc<TokenManager>> {
     let Some(oauth) = provider.auth.oauth() else {
         anyhow::bail!("provider '{name}' does not use auth = \"oauth\"");
     };
-    oauth::shared_manager(&config.tokens_dir(), name, oauth)
+    TokenManager::shared(&config.tokens_dir(), name, oauth)
         .context("failed to prepare the OAuth token manager")
 }
 
@@ -1431,7 +1432,7 @@ fn init_logging_at(default: &str) {
         .init();
     // The provider is installed at the top of `main`, before any subscriber
     // exists; this is the first point where saying so reaches a log.
-    crypto::log_provider();
+    CryptoModule::linked().log();
 }
 
 /// The configuration and the workspace this command runs in: the named one,
@@ -1504,7 +1505,7 @@ async fn run_ingest(
     let embedding_model = if no_embed {
         None
     } else {
-        llm::optional_embedding_model(&config)
+        Embeddings::from_config(&config)
             .await
             .context("failed to build embedding model")?
     };
@@ -1600,7 +1601,7 @@ async fn ingest_bundle(
     let embedding_model = if no_embed {
         None
     } else {
-        llm::optional_embedding_model(config)
+        Embeddings::from_config(config)
             .await
             .context("failed to build embedding model")?
     };

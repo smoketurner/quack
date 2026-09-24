@@ -15,12 +15,53 @@ use jiff::Timestamp;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use super::keychain;
+use super::keychain::KeychainEntry;
 use crate::config::ProviderName;
 use crate::error::{Error, Result};
 
-const KEY_LEN: usize = 32;
 const FORMAT_VERSION: u32 = 1;
+
+/// A cache's AES-256-GCM key.
+struct CacheKey([u8; 32]);
+
+impl CacheKey {
+    /// A new key from the process's CSPRNG (aws-lc-rs).
+    fn generate() -> Result<Self> {
+        let mut key = [0u8; 32];
+        aws_lc_rs::rand::fill(&mut key)
+            .map_err(|_| Error::Llm(String::from("random key generation failed")))?;
+        Ok(Self(key))
+    }
+
+    /// A key as the keychain or the key file stores it: base64.
+    fn decode(encoded: &str) -> Result<Self> {
+        BASE64
+            .decode(encoded.trim())
+            .ok()
+            .and_then(|k| k.try_into().ok())
+            .map(Self)
+            .ok_or_else(|| Error::Llm(String::from("stored token cache key is malformed")))
+    }
+
+    fn encode(&self) -> String {
+        BASE64.encode(self.0)
+    }
+
+    /// The cipher this key opens and seals with.
+    fn aead(&self) -> Result<RandomizedNonceKey> {
+        RandomizedNonceKey::new(&AES_256_GCM, &self.0)
+            .map_err(|_| Error::Llm(String::from("token cache key is unusable")))
+    }
+}
+
+/// Whether a missing key is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyLookup {
+    /// Reading: no key means no token.
+    Existing,
+    /// Writing: a missing key is generated and stored.
+    CreateIfMissing,
+}
 
 /// A token as the cache holds it.
 #[derive(Clone)]
@@ -54,6 +95,29 @@ struct Plaintext {
     refresh_token: Option<String>,
 }
 
+impl From<Plaintext> for CachedToken {
+    fn from(plain: Plaintext) -> Self {
+        Self {
+            access_token: SecretString::from(plain.access_token),
+            expires_at: plain.expires_at,
+            refresh_token: plain.refresh_token.map(SecretString::from),
+        }
+    }
+}
+
+impl From<&CachedToken> for Plaintext {
+    fn from(token: &CachedToken) -> Self {
+        Self {
+            access_token: token.access_token.expose_secret().to_owned(),
+            expires_at: token.expires_at,
+            refresh_token: token
+                .refresh_token
+                .as_ref()
+                .map(|t| t.expose_secret().to_owned()),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     version: u32,
@@ -61,7 +125,7 @@ struct Envelope {
     ciphertext: String,
 }
 
-/// Where the cache's encryption key is kept.
+/// Where the cache's encryption key may be kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     /// The OS keychain, falling back to the key file when it is unusable.
@@ -70,7 +134,14 @@ pub enum KeySource {
     File,
 }
 
-impl std::fmt::Display for KeySource {
+/// Where a cache's key turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLocation {
+    Keychain,
+    File,
+}
+
+impl std::fmt::Display for KeyLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Keychain => "keychain",
@@ -109,6 +180,21 @@ impl TokenCache {
         self.path.exists()
     }
 
+    /// Where the key is: the key file when there is one, else the
+    /// keychain.
+    #[must_use]
+    pub fn key_location(&self) -> KeyLocation {
+        if self.key_path.exists() {
+            KeyLocation::File
+        } else {
+            KeyLocation::Keychain
+        }
+    }
+
+    fn keychain(&self) -> KeychainEntry {
+        KeychainEntry::new(&self.provider)
+    }
+
     /// Read and decrypt the cached token, or `None` when there is no cache or
     /// its key is gone (a rebooted kernel keyring, a removed keychain entry).
     ///
@@ -122,7 +208,7 @@ impl TokenCache {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let Some(key) = self.key(false).await? else {
+        let Some(key) = self.key(KeyLookup::Existing).await? else {
             tracing::warn!(
                 provider = %self.provider,
                 "token cache exists but its encryption key is gone; a new login is needed"
@@ -146,9 +232,8 @@ impl TokenCache {
         let mut ciphertext = BASE64
             .decode(envelope.ciphertext)
             .map_err(|e| Error::Llm(format!("token cache ciphertext is not base64: {e}")))?;
-        let aead = RandomizedNonceKey::new(&AES_256_GCM, &key)
-            .map_err(|_| Error::Llm(String::from("token cache key is unusable")))?;
-        let plaintext = aead
+        let plaintext = key
+            .aead()?
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::from(self.provider.as_str().as_bytes()),
@@ -162,11 +247,7 @@ impl TokenCache {
                 ))
             })?;
         let plain: Plaintext = serde_json::from_slice(plaintext)?;
-        Ok(Some(CachedToken {
-            access_token: SecretString::from(plain.access_token),
-            expires_at: plain.expires_at,
-            refresh_token: plain.refresh_token.map(SecretString::from),
-        }))
+        Ok(Some(CachedToken::from(plain)))
     }
 
     /// Encrypt and write the token, creating the key on first use.
@@ -177,21 +258,12 @@ impl TokenCache {
     /// file cannot be written.
     pub async fn store(&self, token: &CachedToken) -> Result<()> {
         let key = self
-            .key(true)
+            .key(KeyLookup::CreateIfMissing)
             .await?
             .ok_or_else(|| Error::Llm(String::from("token cache key could not be created")))?;
-        let plain = Plaintext {
-            access_token: token.access_token.expose_secret().to_owned(),
-            expires_at: token.expires_at,
-            refresh_token: token
-                .refresh_token
-                .as_ref()
-                .map(|t| t.expose_secret().to_owned()),
-        };
-        let mut in_out = serde_json::to_vec(&plain)?;
-        let aead = RandomizedNonceKey::new(&AES_256_GCM, &key)
-            .map_err(|_| Error::Llm(String::from("token cache key is unusable")))?;
-        let nonce = aead
+        let mut in_out = serde_json::to_vec(&Plaintext::from(token))?;
+        let nonce = key
+            .aead()?
             .seal_in_place_append_tag(Aad::from(self.provider.as_str().as_bytes()), &mut in_out)
             .map_err(|_| Error::Llm(String::from("token cache encryption failed")))?;
         let envelope = Envelope {
@@ -214,7 +286,7 @@ impl TokenCache {
         remove_if_present(&self.path)?;
         remove_if_present(&self.key_path)?;
         if self.key_source == KeySource::Keychain
-            && let Err(e) = keychain::delete(self.provider.as_str()).await
+            && let Err(e) = self.keychain().delete().await
         {
             tracing::warn!(provider = %self.provider, error = %e, "keychain entry not removed");
         }
@@ -222,63 +294,49 @@ impl TokenCache {
     }
 
     /// The key, from the keychain when configured and usable, else the key
-    /// file. With `create`, a missing key is generated and stored.
-    async fn key(&self, create: bool) -> Result<Option<[u8; KEY_LEN]>> {
+    /// file.
+    async fn key(&self, lookup: KeyLookup) -> Result<Option<CacheKey>> {
         if self.key_source == KeySource::Keychain {
-            match self.keychain_key(create).await {
+            match self.keychain_key(lookup).await {
                 Ok(key) => return Ok(key),
                 Err(e) => {
                     tracing::warn!(provider = %self.provider, error = %e, "keychain unavailable; using the key file");
                 }
             }
         }
-        self.file_key(create)
+        self.file_key(lookup)
     }
 
-    async fn keychain_key(&self, create: bool) -> Result<Option<[u8; KEY_LEN]>> {
-        if let Some(encoded) = keychain::get(self.provider.as_str()).await? {
-            return decode_key(&encoded).map(Some);
+    async fn keychain_key(&self, lookup: KeyLookup) -> Result<Option<CacheKey>> {
+        let keychain = self.keychain();
+        if let Some(encoded) = keychain.get().await? {
+            return CacheKey::decode(&encoded).map(Some);
         }
-        if !create {
+        if lookup == KeyLookup::Existing {
             return Ok(None);
         }
-        let key = generate_key()?;
-        keychain::set(self.provider.as_str(), &BASE64.encode(key)).await?;
+        let key = CacheKey::generate()?;
+        keychain.set(&key.encode()).await?;
         Ok(Some(key))
     }
 
-    fn file_key(&self, create: bool) -> Result<Option<[u8; KEY_LEN]>> {
+    fn file_key(&self, lookup: KeyLookup) -> Result<Option<CacheKey>> {
         match std::fs::read_to_string(&self.key_path) {
-            Ok(encoded) => decode_key(encoded.trim()).map(Some),
+            Ok(encoded) => CacheKey::decode(&encoded).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if !create {
+                if lookup == KeyLookup::Existing {
                     return Ok(None);
                 }
-                let key = generate_key()?;
+                let key = CacheKey::generate()?;
                 if let Some(dir) = self.key_path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
-                write_private(&self.key_path, BASE64.encode(key).as_bytes())?;
+                write_private(&self.key_path, key.encode().as_bytes())?;
                 Ok(Some(key))
             }
             Err(e) => Err(e.into()),
         }
     }
-}
-
-fn generate_key() -> Result<[u8; KEY_LEN]> {
-    let mut key = [0u8; KEY_LEN];
-    aws_lc_rs::rand::fill(&mut key)
-        .map_err(|_| Error::Llm(String::from("random key generation failed")))?;
-    Ok(key)
-}
-
-fn decode_key(encoded: &str) -> Result<[u8; KEY_LEN]> {
-    BASE64
-        .decode(encoded)
-        .ok()
-        .and_then(|k| k.try_into().ok())
-        .ok_or_else(|| Error::Llm(String::from("stored token cache key is malformed")))
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {

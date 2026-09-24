@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use quack_core::config::Config;
 use quack_core::embedding::refresh::{self, Plan};
-use quack_core::llm;
+use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
@@ -57,7 +57,7 @@ async fn refresh(
     out: &mut impl Write,
     control: RunControl<'_>,
 ) -> Result<()> {
-    let embedder = llm::required_embedding_model(config).await?;
+    let embedder = Embeddings::require(config).await?;
     let plan = Plan::from_status(&db.run(WorkspaceDb::embedding_status).await?);
     if plan.is_empty() {
         writeln!(

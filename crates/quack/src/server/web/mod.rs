@@ -65,7 +65,7 @@ use quack_core::graph::{
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
-use quack_core::llm;
+use quack_core::llm::Embeddings;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::text::NonBlankText;
@@ -2063,7 +2063,7 @@ impl GraphAsk {
         if path.is_err() && search.is_err() {
             return Ok(Self::Nothing);
         }
-        let model = llm::optional_embedding_model(&app.config).await?;
+        let model = Embeddings::from_config(&app.config).await?;
         Ok(match (path, search) {
             (Ok(path), _) => {
                 let ends = path.embeddings(model.as_ref()).await?;

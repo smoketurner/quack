@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
+use quack_core::ingestion;
 use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
+use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::{ingestion, llm};
 
 use super::state::App;
 
@@ -90,7 +91,7 @@ impl UploadJob {
         db: &SharedDb,
         control: RunControl<'_>,
     ) -> JobResult {
-        let model = match llm::optional_embedding_model(config).await {
+        let model = match Embeddings::from_config(config).await {
             Ok(model) => model,
             Err(e) => {
                 tracing::warn!(error = %e, document = %self.document_id, "upload fails: no embedding model");

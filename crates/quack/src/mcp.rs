@@ -437,7 +437,7 @@ impl McpServer {
             .unwrap_or(self.inner.config.retrieval.top_k)
             .clamp(1, 100);
         let rrf_k = self.inner.config.retrieval.rrf_k;
-        let embedding = match llm::optional_embedding_model(&self.inner.config).await {
+        let embedding = match Embeddings::from_config(&self.inner.config).await {
             Ok(Some(model)) => match model.embed_interactive(&Input::Query(query.clone())).await {
                 Ok(vector) => Some(vector),
                 Err(e) => return Ok(failure(format!("embedding failed: {e}"))),
@@ -706,7 +706,7 @@ impl McpServer {
 impl McpServer {
     /// The embedding model, for fuzzy entity resolution; `None` without one.
     async fn embedder(&self) -> Result<Option<Embeddings>, McpError> {
-        llm::optional_embedding_model(&self.inner.config)
+        Embeddings::from_config(&self.inner.config)
             .await
             .map_err(internal)
     }

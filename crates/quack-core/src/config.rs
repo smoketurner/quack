@@ -320,7 +320,7 @@ impl ProviderAuth {
 
 /// A provider's `base_url`: an absolute `http` or `https` URL, checked
 /// when the config is read.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct BaseUrl(Cow<'static, str>);
 
@@ -1106,6 +1106,13 @@ impl Config {
                 config_file: config_file_path(),
             })?;
         self.resolve_model("chat_model", spec)
+    }
+
+    /// `provider/model` for status lines, or a placeholder.
+    #[must_use]
+    pub fn chat_model_label(&self) -> String {
+        self.chat_model_ref()
+            .map_or_else(|_| String::from("no chat model"), |m| m.to_string())
     }
 
     /// The embedding model, if configured.

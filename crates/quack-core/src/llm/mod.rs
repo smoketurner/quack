@@ -24,7 +24,7 @@ use crate::config::{
     BaseUrl, Config, ModelRef, ProviderAuth, ProviderConfig, ProviderName, ProviderType,
     config_file_path,
 };
-use crate::embedding::{Embedder, Input, Profile};
+use crate::embedding::{Embedder, Profile};
 use crate::error::{Error, Record, Result};
 use crate::extraction::{Extract, ExtractFuture, parse_answer};
 use crate::graph::extract::Extraction;
@@ -167,39 +167,112 @@ pub type Embeddings = Embedder<EmbedModel>;
 pub enum EmbedModel {
     Ollama(OllamaEmbedder),
     OpenAi(OpenAiEmbeddingModel),
-    /// An OpenAI-compatible endpoint behind OAuth: the bearer can change
-    /// between batches of a long ingest, so the client is rebuilt per call
-    /// with whatever token the manager holds then.
-    OpenAiOAuth {
-        manager: Arc<oauth::TokenManager>,
-        base_url: Option<BaseUrl>,
-        model: String,
-        ndims: usize,
-        /// The provider's limited client, reused by every rebuild.
-        http: LimitedHttp,
-    },
+    OpenAiOAuth(OAuthEmbedding),
 }
 
-impl EmbedModel {
-    async fn oauth_model(
-        manager: &oauth::TokenManager,
-        base_url: Option<&str>,
-        model: &str,
-        ndims: usize,
-        http: &LimitedHttp,
-    ) -> std::result::Result<OpenAiEmbeddingModel, EmbeddingError> {
-        let token = manager
+/// An OpenAI-compatible embedding endpoint behind OAuth: the bearer can
+/// change between batches of a long ingest, so the client is rebuilt per
+/// call with whatever token the manager holds then.
+#[derive(Clone)]
+pub struct OAuthEmbedding {
+    manager: Arc<oauth::TokenManager>,
+    base_url: Option<BaseUrl>,
+    model: String,
+    ndims: usize,
+    /// The provider's limited client, reused by every rebuild.
+    http: LimitedHttp,
+}
+
+impl OAuthEmbedding {
+    /// The embedding model with the current token.
+    async fn model(&self) -> std::result::Result<OpenAiEmbeddingModel, EmbeddingError> {
+        let token = self
+            .manager
             .access_token()
             .await
             .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
         let client = openai_client_with_key(
-            manager.provider(),
-            base_url,
+            self.manager.provider(),
+            self.base_url.as_ref().map(BaseUrl::as_str),
             token.expose_secret(),
-            http.clone(),
+            self.http.clone(),
         )
         .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
-        Ok(client.embedding_model_with_ndims(model, ndims))
+        Ok(client.embedding_model_with_ndims(&self.model, self.ndims))
+    }
+}
+
+impl EmbedModel {
+    /// The client for `model`, whose provider must serve embeddings.
+    async fn build(config: &Config, model: ModelRef<'_>) -> Result<Self> {
+        let ndims = usize::try_from(model.dimension()?.get())
+            .map_err(|e| Error::Config(format!("embedding_dimension overflow: {e}")))?;
+        let (name, provider) = (model.provider_name, model.provider);
+        match provider.provider_type {
+            ProviderType::Ollama => Ok(Self::Ollama(OllamaEmbedder {
+                client: build_ollama_client(config, name, provider).await?,
+                model: model.model.to_owned(),
+                ndims,
+                num_ctx: OllamaEmbedder::context_window(config.ingestion.chunk_size_tokens),
+            })),
+            ProviderType::Openai if let Some(oauth) = provider.auth.oauth() => {
+                let manager = oauth::TokenManager::shared(&config.tokens_dir(), name, oauth)?;
+                // Fail here, typed, when no login exists; later batches
+                // refresh on their own.
+                drop(manager.access_token().await?);
+                Ok(Self::OpenAiOAuth(OAuthEmbedding {
+                    manager,
+                    base_url: provider.base_url.clone(),
+                    model: model.model.to_owned(),
+                    ndims,
+                    http: LimitedHttp::for_provider(name, provider),
+                }))
+            }
+            ProviderType::Openai => Ok(Self::OpenAi(
+                build_openai_client(config, name, provider)
+                    .await?
+                    .embedding_model_with_ndims(model.model, ndims),
+            )),
+            ProviderType::Anthropic => Err(Error::Config(format!(
+                "embedding_model '{model}': anthropic does not serve embeddings"
+            ))),
+        }
+    }
+}
+
+impl Embeddings {
+    /// The configured embedding model, or `None` when
+    /// `[general].embedding_model` is unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reference or provider is invalid.
+    pub async fn from_config(config: &Config) -> Result<Option<Self>> {
+        let (Some(model), Some(profile)) =
+            (config.embedding_model_ref()?, Profile::from_config(config)?)
+        else {
+            tracing::info!("no embedding model configured");
+            return Ok(None);
+        };
+        tracing::info!(model = %model, "using embedding model");
+        Ok(Some(Self::new(
+            EmbedModel::build(config, model).await?,
+            profile,
+        )))
+    }
+
+    /// The configured embedding model, required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `[general].embedding_model` is unset or invalid.
+    pub async fn require(config: &Config) -> Result<Self> {
+        Self::from_config(config).await?.ok_or_else(|| {
+            Error::Config(format!(
+                "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
+                config_file_path().display()
+            ))
+        })
     }
 }
 
@@ -215,7 +288,7 @@ impl EmbeddingModel for EmbedModel {
         match self {
             Self::Ollama(m) => m.ndims(),
             Self::OpenAi(m) => m.ndims(),
-            Self::OpenAiOAuth { ndims, .. } => *ndims,
+            Self::OpenAiOAuth(oauth) => oauth.ndims,
         }
     }
 
@@ -230,24 +303,7 @@ impl EmbeddingModel for EmbedModel {
         match self {
             Self::Ollama(m) => m.embed_texts(texts).await,
             Self::OpenAi(m) => m.embed_texts(texts).await,
-            Self::OpenAiOAuth {
-                manager,
-                base_url,
-                model,
-                ndims,
-                http,
-            } => {
-                Self::oauth_model(
-                    manager,
-                    base_url.as_ref().map(BaseUrl::as_str),
-                    model,
-                    *ndims,
-                    http,
-                )
-                .await?
-                .embed_texts(texts)
-                .await
-            }
+            Self::OpenAiOAuth(oauth) => oauth.model().await?.embed_texts(texts).await,
         }
     }
 }
@@ -421,55 +477,6 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
     )))
 }
 
-/// A similarity check over the embedding model for clustering type and
-/// relation names: cosine at or above `threshold`.
-///
-/// # Errors
-///
-/// Returns an error when embedding fails.
-pub async fn name_similarity(
-    embedder: &Embeddings,
-    names: &[String],
-    threshold: f64,
-) -> Result<std::collections::HashMap<(String, String), bool>> {
-    let mut out = std::collections::HashMap::new();
-    if names.len() < 2 {
-        return Ok(out);
-    }
-    let inputs: Vec<Input> = names
-        .iter()
-        .map(|n| Input::Similarity(n.replace('_', " ")))
-        .collect();
-    let vectors = embedder.embed(&inputs).await?;
-    for (i, a) in names.iter().enumerate() {
-        for (j, b) in names.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            let (Some(va), Some(vb)) = (vectors.get(i), vectors.get(j)) else {
-                continue;
-            };
-            out.insert((a.clone(), b.clone()), cosine(va, vb) >= threshold);
-        }
-    }
-    Ok(out)
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a
-        .iter()
-        .zip(b)
-        .map(|(x, y)| f64::from(*x) * f64::from(*y))
-        .sum();
-    let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
-}
-
 impl ProviderAuth {
     /// The bearer credential provider `name` is called with: none, the key
     /// from the environment, or the current OAuth access token. A key
@@ -489,7 +496,7 @@ impl ProviderAuth {
                 ))),
             },
             Self::Oauth(oauth) => {
-                let manager = oauth::shared_manager(&config.tokens_dir(), name, oauth)?;
+                let manager = oauth::TokenManager::shared(&config.tokens_dir(), name, oauth)?;
                 let token = manager.access_token().await?;
                 Ok(Some(token.expose_secret().to_owned()))
             }
@@ -514,6 +521,18 @@ pub(crate) struct OllamaRunningModel {
 }
 
 impl OllamaRunningModels {
+    /// The models Ollama has in memory (`GET /api/ps`).
+    async fn loaded(
+        client: &OllamaClient,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use rig::http_client::HttpClientExt;
+
+        let request = client.get("api/ps")?.body(Vec::new())?;
+        let response = client.send::<_, Vec<u8>>(request).await?;
+        let bytes: Vec<u8> = response.into_body().await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     /// Whether `model` is among the loaded ones; a bare name matches its
     /// `:latest` tag, which is how Ollama reports it.
     pub(crate) fn holds(&self, model: &str) -> bool {
@@ -525,31 +544,6 @@ impl OllamaRunningModels {
         self.models
             .iter()
             .any(|m| m.name == wanted || m.model == wanted || m.name == model || m.model == model)
-    }
-}
-
-/// Whether Ollama already has `model` in memory (`GET /api/ps`). A first
-/// request after idle loads the model, which took 5 seconds for a 12 GB
-/// model measured live and shows the user nothing meanwhile, so the turn
-/// says so first. Any failure to ask counts as loaded: the chat call that
-/// follows reports the real error.
-async fn ollama_model_resident(client: &OllamaClient, model: &str) -> bool {
-    use rig::http_client::HttpClientExt;
-
-    let listed = async {
-        let request = client.get("api/ps")?.body(Vec::new())?;
-        let response = client.send::<_, Vec<u8>>(request).await?;
-        let bytes: Vec<u8> = response.into_body().await?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(serde_json::from_slice::<
-            OllamaRunningModels,
-        >(&bytes)?)
-    };
-    match listed.await {
-        Ok(running) => running.holds(model),
-        Err(e) => {
-            tracing::debug!(error = %e, "could not list Ollama's loaded models");
-            true
-        }
     }
 }
 
@@ -647,87 +641,6 @@ async fn build_anthropic_client(
             "failed to build Anthropic client for '{name}': {e}"
         ))
     })
-}
-
-async fn build_embed_model(config: &Config, model: ModelRef<'_>) -> Result<EmbedModel> {
-    let ndims = usize::try_from(model.dimension()?.get())
-        .map_err(|e| Error::Config(format!("embedding_dimension overflow: {e}")))?;
-
-    match model.provider.provider_type {
-        ProviderType::Ollama => {
-            let client = build_ollama_client(config, model.provider_name, model.provider).await?;
-            Ok(EmbedModel::Ollama(OllamaEmbedder {
-                client,
-                model: model.model.to_owned(),
-                ndims,
-                num_ctx: OllamaEmbedder::context_window(config.ingestion.chunk_size_tokens),
-            }))
-        }
-        ProviderType::Openai if let Some(oauth) = model.provider.auth.oauth() => {
-            let manager = oauth::shared_manager(&config.tokens_dir(), model.provider_name, oauth)?;
-            // Fail here, typed, when no login exists; later batches refresh
-            // on their own.
-            drop(manager.access_token().await?);
-            Ok(EmbedModel::OpenAiOAuth {
-                manager,
-                base_url: model.provider.base_url.clone(),
-                model: model.model.to_owned(),
-                ndims,
-                http: LimitedHttp::for_provider(model.provider_name, model.provider),
-            })
-        }
-        ProviderType::Openai => {
-            let client = build_openai_client(config, model.provider_name, model.provider).await?;
-            Ok(EmbedModel::OpenAi(
-                client.embedding_model_with_ndims(model.model, ndims),
-            ))
-        }
-        ProviderType::Anthropic => Err(Error::Config(format!(
-            "embedding_model '{model}': anthropic does not serve embeddings"
-        ))),
-    }
-}
-
-/// The configured embedding model, or `None` when `[general].embedding_model`
-/// is unset.
-///
-/// # Errors
-///
-/// Returns an error if the reference or provider is invalid.
-pub async fn optional_embedding_model(config: &Config) -> Result<Option<Embeddings>> {
-    let (Some(model), Some(profile)) =
-        (config.embedding_model_ref()?, Profile::from_config(config)?)
-    else {
-        tracing::info!("no embedding model configured");
-        return Ok(None);
-    };
-    tracing::info!(model = %model, "using embedding model");
-    Ok(Some(Embedder::new(
-        build_embed_model(config, model).await?,
-        profile,
-    )))
-}
-
-/// The configured embedding model, required.
-///
-/// # Errors
-///
-/// Returns an error if `[general].embedding_model` is unset or invalid.
-pub async fn required_embedding_model(config: &Config) -> Result<Embeddings> {
-    optional_embedding_model(config).await?.ok_or_else(|| {
-        Error::Config(format!(
-            "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
-            config_file_path().display()
-        ))
-    })
-}
-
-/// `provider/model` for status lines, or a placeholder.
-#[must_use]
-pub fn chat_model_display(config: &Config) -> String {
-    config
-        .chat_model_ref()
-        .map_or_else(|_| String::from("no chat model"), |m| m.to_string())
 }
 
 /// Run one agent turn in `session_id` with the configured chat and
@@ -863,7 +776,7 @@ async fn start_turn<'c>(
     let chat = config.chat_model_ref()?;
     // Without an embedding provider the agent still runs: document search
     // is keyword-only and graph entry is exact (issue #58).
-    let embedding_model = optional_embedding_model(config).await?;
+    let embedding_model = Embeddings::from_config(config).await?;
     // On the blocking pool, in the writer's interactive line: an async
     // worker never waits on the connection.
     let session_id = session_id.to_owned();
@@ -919,7 +832,19 @@ async fn dispatch(
 ) -> Result<AgentResponse> {
     match ChatClient::build(config, &chat).await? {
         ChatClient::Ollama(client) => {
-            if !ollama_model_resident(&client, chat.model).await {
+            // A first request after idle loads the model, which took 5
+            // seconds for a 12 GB model measured live and shows the user
+            // nothing meanwhile, so the turn says so first. Any failure to
+            // ask counts as loaded: the chat call that follows reports the
+            // real error.
+            let resident = match OllamaRunningModels::loaded(&client).await {
+                Ok(running) => running.holds(chat.model),
+                Err(e) => {
+                    tracing::debug!(error = %e, "could not list Ollama's loaded models");
+                    true
+                }
+            };
+            if !resident {
                 drop(sink.send(AgentEvent::Status(format!(
                     "loading {}, then thinking; Ollama loads a model on its first request and keeps it \
                      for {OLLAMA_KEEP_ALIVE}",
@@ -1007,21 +932,21 @@ mod tests {
     fn display_name_reports_model_ref_or_placeholder() {
         let config =
             parse("[general]\nchat_model = \"o/llama3\"\n[providers.o]\ntype = \"ollama\"\n");
-        assert_eq!(chat_model_display(&config), "o/llama3");
-        assert_eq!(chat_model_display(&Config::default()), "no chat model");
+        assert_eq!(config.chat_model_label(), "o/llama3");
+        assert_eq!(Config::default().chat_model_label(), "no chat model");
     }
 
     #[tokio::test]
     async fn optional_embedding_model_is_none_when_unset() {
         assert!(matches!(
-            optional_embedding_model(&Config::default()).await,
+            Embeddings::from_config(&Config::default()).await,
             Ok(None)
         ));
     }
 
     #[tokio::test]
     async fn required_embedding_model_errors_when_unset() {
-        let err = required_embedding_model(&Config::default()).await.err();
+        let err = Embeddings::require(&Config::default()).await.err();
         assert!(err.is_some_and(|e| e.to_string().contains("embedding_model")));
     }
 
@@ -1030,7 +955,7 @@ mod tests {
         let config = parse(
             "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"QUACK_TEST_KEY_THAT_IS_UNSET\"\nembedding_dimension = 4\n",
         );
-        let err = required_embedding_model(&config).await.err();
+        let err = Embeddings::require(&config).await.err();
         assert!(err.is_some_and(|e| e.to_string().contains("QUACK_TEST_KEY_THAT_IS_UNSET")));
     }
 
@@ -1039,7 +964,7 @@ mod tests {
         let config = parse(
             "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n",
         );
-        let model = required_embedding_model(&config).await;
+        let model = Embeddings::require(&config).await;
         assert!(model.is_ok_and(|m| m.profile().dimension == Dimension::new(4)));
     }
 
@@ -1048,7 +973,7 @@ mod tests {
         let config = parse(
             "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n[ingestion]\nchunk_size_tokens = 3000\n",
         );
-        let model = required_embedding_model(&config).await;
+        let model = Embeddings::require(&config).await;
         let Some(EmbedModel::Ollama(embedder)) = model.as_ref().ok().map(Embedder::model) else {
             fail("expected the Ollama embedder")
         };
@@ -1097,7 +1022,7 @@ mod tests {
             "[general]\nchat_model = \"az/gpt\"\nembedding_model = \"az/emb\"\n[providers.az]\ntype = \"openai\"\nauth = \"oauth\"\nembedding_dimension = 4\n[providers.az.oauth]\nissuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n",
         );
         config.general.data_dir = dir.path().to_path_buf();
-        let err = required_embedding_model(&config).await.err();
+        let err = Embeddings::require(&config).await.err();
         assert!(err.is_some_and(|e| matches!(e, Error::AuthRequired { .. })));
         let chat = config.chat_model_ref();
         let Ok(chat) = chat else {

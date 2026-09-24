@@ -152,8 +152,8 @@ mod tests {
         round_trips(AuditAction::ALL);
         round_trips(ResourceKind::ALL);
         text_round_trips(Record::ALL);
-        text_round_trips(Status::ALL);
-        text_round_trips(Area::ALL);
+        round_trips(Status::ALL);
+        round_trips(Area::ALL);
         text_round_trips(MetaKey::ALL);
         text_round_trips(ConceptType::ALL);
     }

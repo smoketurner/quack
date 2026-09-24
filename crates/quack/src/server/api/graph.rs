@@ -15,7 +15,7 @@ use quack_core::graph::store::Revalidation;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphStatus, extract, resolve, store as graph_store, tables,
 };
-use quack_core::llm;
+use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,7 @@ pub(crate) async fn search(
         q.hops,
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let model = llm::optional_embedding_model(&app.config).await?;
+    let model = Embeddings::from_config(&app.config).await?;
     let embedding = query.embedding(model.as_ref()).await?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
@@ -86,7 +86,7 @@ pub(crate) async fn path(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = PathQuery::new(&q.from, &q.to, q.max_hops)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let model = llm::optional_embedding_model(&app.config).await?;
+    let model = Embeddings::from_config(&app.config).await?;
     let ends = query.embeddings(model.as_ref()).await?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
@@ -218,7 +218,7 @@ impl Access {
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
         let version = ontology.saved_version()?;
         let options = app.config.graph.options();
-        let embeddings = llm::optional_embedding_model(&app.config).await?;
+        let embeddings = Embeddings::from_config(&app.config).await?;
         if reset {
             with_db(Arc::clone(&db), graph_store::clear).await?;
         }
@@ -328,7 +328,7 @@ struct DocumentJob {
     /// ends.
     version: OntologyVersion,
     provisional: bool,
-    embeddings: Option<llm::Embeddings>,
+    embeddings: Option<Embeddings>,
     /// Freed when the pass ends.
     slot: ExtractionSlot,
     options: GraphOptions,
