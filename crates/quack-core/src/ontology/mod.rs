@@ -330,6 +330,15 @@ pub struct Ontology {
     pub mappings: Vec<Mapping>,
 }
 
+/// The relations one class takes part in.
+#[derive(Debug, Clone)]
+pub struct ClassRelations<'a> {
+    /// Those the class is the domain of.
+    pub from: Vec<&'a Relation>,
+    /// Those the class is the range of.
+    pub to: Vec<&'a Relation>,
+}
+
 impl Ontology {
     /// Parse the JSON interchange form and validate it.
     ///
@@ -429,17 +438,19 @@ impl Ontology {
             .collect()
     }
 
-    /// The relations a class can take part in, inherited ones included:
-    /// those it is the domain of, and those it is the range of.
+    /// The relations a class can take part in, inherited ones included.
     #[must_use]
-    pub fn relations_of(&self, class_id: &str) -> (Vec<&Relation>, Vec<&Relation>) {
-        let mut out = (Vec::new(), Vec::new());
+    pub fn relations_of(&self, class_id: &str) -> ClassRelations<'_> {
+        let mut out = ClassRelations {
+            from: Vec::new(),
+            to: Vec::new(),
+        };
         for relation in &self.relations {
             if self.is_subclass_of(class_id, relation.domain.as_str()) {
-                out.0.push(relation);
+                out.from.push(relation);
             }
             if self.is_subclass_of(class_id, relation.range.as_str()) {
-                out.1.push(relation);
+                out.to.push(relation);
             }
         }
         out
@@ -1236,7 +1247,7 @@ mod tests {
     #[test]
     fn relations_and_subclasses_follow_inheritance() {
         let ontology = Ontology::builtin_default();
-        let (from, to) = ontology.relations_of("person");
+        let ClassRelations { from, to } = ontology.relations_of("person");
         let from: Vec<&str> = from.iter().map(|r| r.id.as_str()).collect();
         let to: Vec<&str> = to.iter().map(|r| r.id.as_str()).collect();
         // `works_at` is the class's own; the `entity`-domain ones are inherited.

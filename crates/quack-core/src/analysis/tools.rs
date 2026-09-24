@@ -18,14 +18,14 @@ use crate::storage::writer::Writer;
 
 use super::chart::{ChartKind, ChartSpec};
 use super::citations::{ChunkLocation, Markers};
-use super::events::{self, ToolName, TurnRecorder};
+use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, ModelReranker, Reranker};
 use super::text_to_sql::Modeled;
 use crate::config::{RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, Input, Vector};
 use crate::error::Error;
-use crate::ontology::{Ontology, store as ontology_store};
+use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::text::NonBlankText;
 
@@ -493,7 +493,7 @@ impl RunSqlTool {
             })
             .map(|(earlier, _)| earlier.clone());
         shapes.push((sql.to_owned(), shape));
-        let (preview, _) = events::preview_detail(earlier.as_deref()?);
+        let preview = DetailPreview::of(earlier.as_deref()?).lines;
         Some(format!(
             "Note: this statement repeats an earlier one with different literal values ({}). \
              Do not run it once per value: one statement covers every group at once with \
@@ -827,8 +827,10 @@ where
         let (results, note) = match &self.rerank {
             Some(rerank) => {
                 let keep = usize::try_from(top_k).unwrap_or(usize::MAX);
-                let (kept, outcome) =
-                    rerank::apply(rerank.reranker.as_ref(), &args.query, results, keep).await;
+                let rerank::Reranked {
+                    results: kept,
+                    outcome,
+                } = rerank::apply(rerank.reranker.as_ref(), &args.query, results, keep).await;
                 let note = match outcome {
                     rerank::RerankOutcome::Skipped => String::new(),
                     rerank::RerankOutcome::Reranked(name) => format!(", reranked by {name}"),
@@ -1514,8 +1516,10 @@ mod tests {
             ClassDescription {
                 ontology: &ontology,
                 class_id,
-                total,
-                samples,
+                census: &ClassCensus {
+                    total,
+                    samples: samples.to_vec(),
+                },
             }
             .to_string()
         };
@@ -2373,6 +2377,7 @@ mod tests {
 
 use crate::error;
 use crate::graph::query::{GraphQuery, Listed, OntologyId, PathEnds, PathQuery, UnknownEntity};
+use crate::graph::store::ClassCensus;
 use crate::graph::{self, GraphResult, Origin};
 
 /// The graph results a turn produced, kept for the response.
@@ -2847,12 +2852,11 @@ impl Tool for DescribeClassTool {
                     )));
                 };
                 let classes = ontology.class_and_descendants(&class_id);
-                let (total, samples) = graph::store::class_census(db, &classes, CLASS_SAMPLES)?;
+                let census = graph::store::class_census(db, &classes, CLASS_SAMPLES)?;
                 Ok(ClassDescription {
                     ontology: &ontology,
                     class_id: &class_id,
-                    total,
-                    samples: &samples,
+                    census: &census,
                 }
                 .to_string())
             })
@@ -2872,10 +2876,8 @@ impl Tool for DescribeClassTool {
 struct ClassDescription<'a> {
     ontology: &'a Ontology,
     class_id: &'a str,
-    /// Entities of the class in the graph.
-    total: u64,
-    /// A few of their labels.
-    samples: &'a [String],
+    /// Entities of the class in the graph, and a few of their labels.
+    census: &'a ClassCensus,
 }
 
 impl std::fmt::Display for ClassDescription<'_> {
@@ -2883,9 +2885,8 @@ impl std::fmt::Display for ClassDescription<'_> {
         let Self {
             ontology,
             class_id,
-            total,
-            samples,
-        } = *self;
+            census: ClassCensus { total, samples },
+        } = self;
         writeln!(
             f,
             "Class {class_id} (inherits: {})",
@@ -2932,7 +2933,7 @@ impl std::fmt::Display for ClassDescription<'_> {
             writeln!(f, "Properties: {}", properties.join(", "))?;
         }
 
-        let (from, to) = ontology.relations_of(class_id);
+        let ClassRelations { from, to } = ontology.relations_of(class_id);
         let from: Vec<String> = from
             .iter()
             .map(|r| format!("{} -> {}", r.id, r.range))
@@ -2957,9 +2958,9 @@ impl std::fmt::Display for ClassDescription<'_> {
             )?;
         }
 
-        if total == 0 {
+        if *total == 0 {
             writeln!(f, "In the graph: no entities of this class")
-        } else if samples.len() < usize::try_from(total).unwrap_or(usize::MAX) {
+        } else if samples.len() < usize::try_from(*total).unwrap_or(usize::MAX) {
             writeln!(
                 f,
                 "In the graph: {total} entities, for example {}",

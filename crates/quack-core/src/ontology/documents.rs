@@ -223,9 +223,12 @@ pub async fn run(
     options: &DocumentEvidenceOptions,
     embeddings: Option<&Embeddings>,
     extraction: ExtractionRun<'_, OpenExtraction>,
-) -> Result<(Vec<Candidate>, RunSummary)> {
+) -> Result<DocumentProposal> {
     let sampled = u32::try_from(sample.len()).unwrap_or(u32::MAX);
-    let (observations, failed) = observe(&sample, extraction).await?;
+    let Observed {
+        observations,
+        failed,
+    } = observe(&sample, extraction).await?;
     let table = match embeddings {
         Some(model) => {
             let mut names: BTreeSet<String> = BTreeSet::new();
@@ -252,7 +255,24 @@ pub async fn run(
         candidates: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
         low_support: low,
     };
-    Ok((candidates, summary))
+    Ok(DocumentProposal {
+        candidates,
+        summary,
+    })
+}
+
+/// What the document pass proposes, and what the run did.
+#[derive(Debug, Clone)]
+pub struct DocumentProposal {
+    pub candidates: Vec<Candidate>,
+    pub summary: RunSummary,
+}
+
+/// The extractions that came back, and how many chunks failed.
+#[derive(Debug, Clone)]
+pub struct Observed {
+    pub observations: Vec<Observation>,
+    pub failed: u32,
 }
 
 /// One extraction with where it came from.
@@ -274,7 +294,7 @@ pub struct Observation {
 pub async fn observe(
     chunks: &[SampledChunk],
     extraction: ExtractionRun<'_, OpenExtraction>,
-) -> Result<(Vec<Observation>, u32)> {
+) -> Result<Observed> {
     let ExtractionRun {
         extractor,
         concurrency,
@@ -313,7 +333,10 @@ pub async fn observe(
             chunks.len()
         )));
     }
-    Ok((observations, run.failed()))
+    Ok(Observed {
+        observations,
+        failed: run.failed(),
+    })
 }
 
 /// A canonical id per raw name. Exact `snake_case` ids and their plurals
@@ -868,7 +891,10 @@ mod tests {
     async fn observations_become_classes_relations_hierarchy_and_properties() {
         let db = workspace_with_docs();
         let sample = sample_chunks(&db, 8).unwrap_or_else(|e| fail(&e.to_string()));
-        let (observations, failures) = observe(
+        let Observed {
+            observations,
+            failed: failures,
+        } = observe(
             &sample,
             ExtractionRun {
                 extractor: &Canned,
@@ -980,7 +1006,10 @@ mod tests {
             progress: &progress,
             cancel: None,
         };
-        let (observations, failures) = observe(
+        let Observed {
+            observations,
+            failed: failures,
+        } = observe(
             &chunks,
             ExtractionRun {
                 extractor: &Canned,

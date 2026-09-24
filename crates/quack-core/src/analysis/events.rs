@@ -24,14 +24,33 @@ type EmbeddingCache = HashMap<Input, Vector>;
 /// rest (the terminal's `/steps` and print mode's `--verbose` show all).
 pub const STEP_PREVIEW_LINES: usize = 3;
 
-/// The first `STEP_PREVIEW_LINES` lines of a detail and how many follow.
-#[must_use]
-pub fn preview_detail(detail: &str) -> (Vec<&str>, usize) {
-    let total = detail.lines().count();
-    (
-        detail.lines().take(STEP_PREVIEW_LINES).collect(),
-        total.saturating_sub(STEP_PREVIEW_LINES),
-    )
+/// The lines of a step's detail an interface shows, and how many it
+/// folds away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailPreview<'a> {
+    pub lines: Vec<&'a str>,
+    pub hidden: usize,
+}
+
+impl<'a> DetailPreview<'a> {
+    /// The first `STEP_PREVIEW_LINES` lines and how many follow.
+    #[must_use]
+    pub fn of(detail: &'a str) -> Self {
+        let total = detail.lines().count();
+        Self {
+            lines: detail.lines().take(STEP_PREVIEW_LINES).collect(),
+            hidden: total.saturating_sub(STEP_PREVIEW_LINES),
+        }
+    }
+
+    /// Every line, nothing folded.
+    #[must_use]
+    pub fn whole(detail: &'a str) -> Self {
+        Self {
+            lines: detail.lines().collect(),
+            hidden: 0,
+        }
+    }
 }
 
 /// The agent's tools, by the name the model calls each one.

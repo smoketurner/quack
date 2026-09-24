@@ -16,9 +16,10 @@ use crate::text_or_json::TextOrJson;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::candidates::Queue;
+use quack_core::ontology::documents::{self, DocumentProposal};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{Ontology, candidates, documents, store};
+use quack_core::ontology::{Ontology, candidates, store};
 use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
@@ -493,7 +494,10 @@ async fn run_documents(
         .await?;
     let extractor = llm::chat_extractor(config).await?;
     let embeddings = Embeddings::from_config(config).await?;
-    let (candidates, summary) = documents::run(
+    let DocumentProposal {
+        candidates,
+        summary,
+    } = documents::run(
         sample,
         current,
         options,

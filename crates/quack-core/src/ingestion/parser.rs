@@ -5,7 +5,7 @@ use pdf_oxide::editor::DocumentInfo;
 
 use super::{html, office};
 use crate::error::{Error, Result};
-use crate::okf::parse_front_matter;
+use crate::okf::{WithFrontMatter, parse_front_matter};
 use crate::text::NonBlankText;
 
 /// Recognized file types for ingestion.
@@ -247,7 +247,7 @@ impl TextFormat {
                 let text = utf8(data)?;
                 // YAML front matter (Obsidian, Jekyll, OKF) is metadata, not
                 // prose: its `title` is the document's, the rest is dropped.
-                let (front, body) = parse_front_matter(&text);
+                let WithFrontMatter { front, body } = parse_front_matter(&text);
                 Ok(Extracted {
                     title: front.get("title").map(str::to_owned),
                     sections: markdown_sections(body),
@@ -300,7 +300,10 @@ fn extract_pdf(data: &[u8]) -> Result<Extracted> {
     let page_count = doc
         .page_count()
         .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
-    let (sections, pages_skipped) = extract_pdf_pages(page_count, |index| {
+    let PdfPages {
+        sections,
+        skipped: pages_skipped,
+    } = extract_pdf_pages(page_count, |index| {
         doc.extract_text(index).map_err(|e| e.to_string())
     })?;
     Ok(Extracted {
@@ -309,6 +312,12 @@ fn extract_pdf(data: &[u8]) -> Result<Extracted> {
         flow: Flow::Continuous,
         pages_skipped,
     })
+}
+
+/// A PDF's pages as sections, and how many pages failed to read.
+struct PdfPages {
+    sections: Vec<Section>,
+    skipped: u32,
 }
 
 /// Read `page_count` pages with `read`, one section per page that has
@@ -321,7 +330,7 @@ fn extract_pdf(data: &[u8]) -> Result<Extracted> {
 fn extract_pdf_pages(
     page_count: usize,
     read: impl Fn(usize) -> std::result::Result<String, String>,
-) -> Result<(Vec<Section>, u32)> {
+) -> Result<PdfPages> {
     let mut sections = Vec::new();
     let mut skipped: u32 = 0;
     for index in 0..page_count {
@@ -349,7 +358,7 @@ fn extract_pdf_pages(
             "no extractable text: the PDF has no text layer (scanned pages need OCR)",
         )));
     }
-    Ok((sections, skipped))
+    Ok(PdfPages { sections, skipped })
 }
 
 /// The Info dictionary's `/Title`, when the file carries one.
@@ -612,7 +621,7 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn a_page_that_fails_to_read_is_skipped_and_counted_not_the_rest() {
-        let (sections, skipped) = extract_pdf_pages(4, |index| match index {
+        let PdfPages { sections, skipped } = extract_pdf_pages(4, |index| match index {
             1 => Err(String::from("bad font")),
             2 => Ok(String::from("   ")),
             _ => Ok(format!("text {index}")),

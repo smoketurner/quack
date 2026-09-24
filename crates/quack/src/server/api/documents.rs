@@ -148,9 +148,12 @@ async fn import_bundle(
         )
     })
     .await?;
-    let context = bundle
-        .index()
-        .map(|index| okf::parse_front_matter(&index.content).1.trim().to_owned());
+    let context = bundle.index().map(|index| {
+        okf::parse_front_matter(&index.content)
+            .body
+            .trim()
+            .to_owned()
+    });
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({

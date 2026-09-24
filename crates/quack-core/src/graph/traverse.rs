@@ -116,8 +116,8 @@ pub fn resolve_entry(
         let nearest = store::nearest_nodes(db, query, class_id, 3)?;
         let best: Vec<Node> = nearest
             .into_iter()
-            .filter(|(_, d)| *d <= ENTRY_MAX_DISTANCE)
-            .map(|(n, _)| n)
+            .filter(|m| m.distance <= ENTRY_MAX_DISTANCE)
+            .map(|m| m.node)
             .collect();
         if !best.is_empty() {
             return Ok(best);
@@ -174,11 +174,11 @@ pub fn suggest_entities(
     drop(rows);
     drop(stmt);
     if let Some(query) = query_embedding {
-        for (node, distance) in store::nearest_nodes(db, query, class_id, SUGGESTION_LIMIT)? {
-            if distance > SUGGESTION_MAX_DISTANCE {
+        for found in store::nearest_nodes(db, query, class_id, SUGGESTION_LIMIT)? {
+            if found.distance > SUGGESTION_MAX_DISTANCE {
                 continue;
             }
-            let label = node.to_string();
+            let label = found.node.to_string();
             if !out.contains(&label) {
                 out.push(label);
             }

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use super::store::{self, NewNode, Source};
+use super::store::{self, ChunkYield, NewNode, Source};
 use super::{Drift, NormalizedLabel, Properties, Standing};
 use crate::error::{Error, Result};
 use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, extractions};
@@ -362,7 +362,7 @@ impl Pass<'_> {
         self.summary.drift.absorb(&validated.drift);
         let (document_id, chunk_id) = (chunk.document_id.clone(), chunk.chunk_id.clone());
         let (standing, version) = (self.standing, self.version);
-        let (nodes, edges) = self
+        let ChunkYield { nodes, edges } = self
             .db
             .run(move |db| {
                 db.under_timeout(|db| {
@@ -397,7 +397,7 @@ pub fn store_validated(
     validated: &Validated,
     source: &Source,
     standing: Standing,
-) -> Result<(u32, u32)> {
+) -> Result<ChunkYield> {
     let mut ids: BTreeMap<NormalizedLabel, NodeId> = BTreeMap::new();
     let mut nodes = 0u32;
     for node in &validated.nodes {
@@ -426,7 +426,7 @@ pub fn store_validated(
         store::add_provenance(db, &id, source)?;
         edges = edges.saturating_add(1);
     }
-    Ok((nodes, edges))
+    Ok(ChunkYield { nodes, edges })
 }
 
 #[cfg(test)]

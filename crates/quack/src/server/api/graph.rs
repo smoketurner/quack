@@ -305,15 +305,15 @@ async fn extract_tables_in_batches(
         let mut offset = 0;
         loop {
             let mapping = mapping.clone();
-            let (batch, more) = with_db(Arc::clone(db), move |db| {
+            let batch = with_db(Arc::clone(db), move |db| {
                 tables::extract_batch(db, &mapping, standing, offset)
             })
             .await?;
-            total.absorb(&batch);
-            if !more {
+            total.absorb(&batch.summary);
+            let Some(next) = batch.next_offset else {
                 break;
-            }
-            offset = offset.saturating_add(u64::from(tables::BATCH_ROWS));
+            };
+            offset = next;
         }
         summaries.push(total);
     }

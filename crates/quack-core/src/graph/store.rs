@@ -305,6 +305,14 @@ pub fn entities_of_chunks(
     Ok(out)
 }
 
+/// How many nodes a set of classes has, and the first few of their labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassCensus {
+    pub total: u64,
+    /// Labels in order, at most the number asked for.
+    pub samples: Vec<String>,
+}
+
 /// How many nodes carry any of `class_ids`, and the first few labels.
 /// Counting is the one graph question traversal cannot answer: user SQL
 /// may not read `_quack_` tables, and a class listing stops at
@@ -313,11 +321,7 @@ pub fn entities_of_chunks(
 /// # Errors
 ///
 /// Returns an error if a query fails.
-pub fn class_census(
-    db: &WorkspaceDb,
-    class_ids: &[ClassId],
-    samples: u32,
-) -> Result<(u64, Vec<String>)> {
+pub fn class_census(db: &WorkspaceDb, class_ids: &[ClassId], samples: u32) -> Result<ClassCensus> {
     let total = class_count(db, class_ids)?;
     let mut stmt = db.connection().prepare(
         "SELECT label FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id) \
@@ -328,7 +332,10 @@ pub fn class_census(
     while let Some(row) = rows.next()? {
         labels.push(row.get::<_, String>(0)?);
     }
-    Ok((total, labels))
+    Ok(ClassCensus {
+        total,
+        samples: labels,
+    })
 }
 
 /// How many nodes carry any of `class_ids`.
@@ -566,6 +573,13 @@ pub fn clear(db: &WorkspaceDb) -> Result<()> {
     db.delete_meta(MetaKey::GraphBuiltWithOntologyVersion)
 }
 
+/// The nodes and edges one extraction stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkYield {
+    pub nodes: u32,
+    pub edges: u32,
+}
+
 /// Note that a chunk was extracted under an ontology version, with what
 /// it yielded, so incremental runs skip it (issue #60).
 ///
@@ -576,12 +590,12 @@ pub fn record_extracted(
     db: &WorkspaceDb,
     chunk_id: &ChunkId,
     ontology_version: OntologyVersion,
-    (nodes, edges): (u32, u32),
+    yielded: ChunkYield,
 ) -> Result<()> {
     db.connection().execute(
         "INSERT OR REPLACE INTO _quack_graph_extracted (chunk_id, ontology_version, nodes, edges) \
          VALUES (?, ?, ?, ?)",
-        duckdb::params![chunk_id, ontology_version, nodes, edges],
+        duckdb::params![chunk_id, ontology_version, yielded.nodes, yielded.edges],
     )?;
     Ok(())
 }
@@ -818,6 +832,14 @@ pub fn count_nodes_needing_embedding(db: &WorkspaceDb) -> Result<u32> {
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
+/// A node near a query vector.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeMatch {
+    pub node: Node,
+    /// Cosine distance from the query.
+    pub distance: f64,
+}
+
 /// Nodes whose label embedding is within `max_distance` (cosine) of
 /// `query`, nearest first, optionally within one class.
 ///
@@ -829,7 +851,7 @@ pub fn nearest_nodes(
     query: &[f32],
     class_id: Option<&str>,
     limit: u32,
-) -> Result<Vec<(Node, f64)>> {
+) -> Result<Vec<NodeMatch>> {
     if !db.embedding_dimension().fits(query.len()) {
         return Ok(Vec::new());
     }
@@ -852,9 +874,10 @@ pub fn nearest_nodes(
     ])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let node = Node::try_from(row)?;
-        let distance: f64 = row.get(5)?;
-        out.push((node, distance));
+        out.push(NodeMatch {
+            node: Node::try_from(row)?,
+            distance: row.get(5)?,
+        });
     }
     Ok(out)
 }

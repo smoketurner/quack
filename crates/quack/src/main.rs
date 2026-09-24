@@ -1622,7 +1622,7 @@ async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> R
     let mut stored = 0usize;
     let mut skipped = 0usize;
     for file in bundle.documents() {
-        let (front, _) = okf::parse_front_matter(&file.content);
+        let front = okf::parse_front_matter(&file.content).front;
         let name = file.document_name();
         let outcome = ingestion::ingest_file(
             config,
@@ -1649,7 +1649,12 @@ async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> R
     )?;
     let index_body = bundle
         .index()
-        .map(|index| okf::parse_front_matter(&index.content).1.trim().to_owned())
+        .map(|index| {
+            okf::parse_front_matter(&index.content)
+                .body
+                .trim()
+                .to_owned()
+        })
         .filter(|body| !body.is_empty());
     // The ontology, the review queue, and the current context: one step on
     // the writer.

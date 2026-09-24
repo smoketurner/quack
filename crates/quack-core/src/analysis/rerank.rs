@@ -34,25 +34,41 @@ pub async fn apply(
     query: &str,
     candidates: Vec<ChunkSearchResult>,
     top_k: usize,
-) -> (Vec<ChunkSearchResult>, RerankOutcome) {
+) -> Reranked {
     if candidates.len() <= 1 {
-        let mut kept = candidates;
-        kept.truncate(top_k);
-        return (kept, RerankOutcome::Skipped);
+        let mut results = candidates;
+        results.truncate(top_k);
+        return Reranked {
+            results,
+            outcome: RerankOutcome::Skipped,
+        };
     }
     match reranker.rank(query, &candidates).await {
         Ok(order) => {
-            let mut kept = reorder(candidates, &order);
-            kept.truncate(top_k);
-            (kept, RerankOutcome::Reranked(reranker.name()))
+            let mut results = reorder(candidates, &order);
+            results.truncate(top_k);
+            Reranked {
+                results,
+                outcome: RerankOutcome::Reranked(reranker.name()),
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, reranker = reranker.name(), "reranking failed; keeping the fused order");
-            let mut kept = candidates;
-            kept.truncate(top_k);
-            (kept, RerankOutcome::Failed(e.to_string()))
+            let mut results = candidates;
+            results.truncate(top_k);
+            Reranked {
+                results,
+                outcome: RerankOutcome::Failed(e.to_string()),
+            }
         }
     }
+}
+
+/// The candidates `apply` kept, in order, and what it did.
+#[derive(Debug, Clone)]
+pub struct Reranked {
+    pub results: Vec<ChunkSearchResult>,
+    pub outcome: RerankOutcome,
 }
 
 /// What `apply` did, for the tool step summary.
@@ -204,7 +220,10 @@ mod tests {
 
     #[tokio::test]
     async fn apply_reorders_and_truncates() {
-        let (kept, outcome) = apply(&Reverse, "q", vec![hit(1), hit(2), hit(3)], 2).await;
+        let Reranked {
+            results: kept,
+            outcome,
+        } = apply(&Reverse, "q", vec![hit(1), hit(2), hit(3)], 2).await;
         assert_eq!(outcome, RerankOutcome::Reranked("reverse"));
         let ids: Vec<&str> = kept.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["c3", "c2"]);
@@ -212,14 +231,23 @@ mod tests {
 
     #[tokio::test]
     async fn apply_keeps_the_fused_order_when_the_reranker_fails_or_has_one_candidate() {
-        let (kept, outcome) = apply(&Broken, "q", vec![hit(1), hit(2)], 5).await;
+        let Reranked {
+            results: kept,
+            outcome,
+        } = apply(&Broken, "q", vec![hit(1), hit(2)], 5).await;
         assert!(matches!(outcome, RerankOutcome::Failed(ref m) if m.contains("boom")));
         assert_eq!(kept.len(), 2);
         assert_eq!(kept.first().map(|c| c.id.as_str()), Some("c1"));
-        let (kept, outcome) = apply(&Reverse, "q", vec![hit(1)], 5).await;
+        let Reranked {
+            results: kept,
+            outcome,
+        } = apply(&Reverse, "q", vec![hit(1)], 5).await;
         assert_eq!(outcome, RerankOutcome::Skipped);
         assert_eq!(kept.len(), 1);
-        let (kept, outcome) = apply(&Reverse, "q", Vec::new(), 5).await;
+        let Reranked {
+            results: kept,
+            outcome,
+        } = apply(&Reverse, "q", Vec::new(), 5).await;
         assert_eq!(outcome, RerankOutcome::Skipped);
         assert!(kept.is_empty());
     }

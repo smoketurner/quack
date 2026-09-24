@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::Sources;
-use quack_core::analysis::events::{self, AgentEvent, ToolName, ToolStep};
+use quack_core::analysis::events::{self, AgentEvent, DetailPreview, ToolName, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
@@ -317,7 +317,10 @@ fn write_started(err: &mut impl Write, tool: ToolName, detail: &str, verbose: bo
         return Ok(());
     }
     // The same preview the terminal shows collapsed.
-    let (shown, more) = events::preview_detail(detail);
+    let DetailPreview {
+        lines: shown,
+        hidden: more,
+    } = DetailPreview::of(detail);
     for line in shown {
         writeln!(err, "  {line}")?;
     }

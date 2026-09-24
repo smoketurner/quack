@@ -100,14 +100,14 @@ pub async fn resolve<M: EmbeddingModel>(
     };
     summary.embedded = embed_nodes(db, embedder, RunControl::unobserved()).await?;
     let options = *options;
-    let (auto_merged, proposed) = db
+    let merges = db
         .run(move |db| {
             log_memory(db, "before merge proposals");
             propose_merges(db, &options)
         })
         .await?;
-    summary.auto_merged = auto_merged;
-    summary.proposed = proposed;
+    summary.auto_merged = merges.auto_merged;
+    summary.proposed = merges.proposed;
     Ok(summary)
 }
 
@@ -207,7 +207,7 @@ impl Candidate {
 
     /// The node to keep and the one to fold into it: the keyed node, else
     /// the one with more provenance, else the earlier id.
-    fn keep_and_drop(self, db: &WorkspaceDb) -> Result<(NodeId, NodeId)> {
+    fn keep_and_drop(self, db: &WorkspaceDb) -> Result<MergePair> {
         let prefer_b = match (self.a.keyed, self.b.keyed) {
             (false, true) => true,
             (true, false) => false,
@@ -216,22 +216,40 @@ impl Candidate {
             }
         };
         Ok(if prefer_b {
-            (self.b.id, self.a.id)
+            MergePair {
+                keep: self.b.id,
+                drop: self.a.id,
+            }
         } else {
-            (self.a.id, self.b.id)
+            MergePair {
+                keep: self.a.id,
+                drop: self.b.id,
+            }
         })
     }
 }
 
+/// Which node of a pair survives a merge and which folds into it.
+struct MergePair {
+    keep: NodeId,
+    drop: NodeId,
+}
+
+/// What one proposal pass did.
+struct MergeCounts {
+    auto_merged: u32,
+    proposed: u32,
+}
+
 /// Compare every embedded node with its nearest same-class neighbours;
-/// returns (auto-merged, proposed).
+/// returns how many pairs merged and how many await review.
 ///
 /// Two nodes that both come from keyed table rows are distinct by
 /// construction (different keys), so they are never candidates, however
 /// alike their labels (issue #41: WEST VIRGINIA is not VIRGINIA). A pair
 /// with one keyed side is only ever proposed; auto-merge is reserved for
 /// two model-extracted nodes.
-fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)> {
+fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<MergeCounts> {
     // The keyed flag is computed per node before the join: a correlated
     // EXISTS per pair row, or a window over the pairs, made DuckDB run
     // out of its 256 MiB on 3,667 nodes, while this streams in seconds.
@@ -295,7 +313,7 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
         }
         let distance = candidate.distance;
         let auto_merge = candidate.extracted_only() && distance <= options.auto_merge_threshold;
-        let (keep, drop) = candidate.keep_and_drop(db)?;
+        let MergePair { keep, drop } = candidate.keep_and_drop(db)?;
         if auto_merge {
             merge_nodes(db, &keep, &drop)?;
             gone.insert(drop);
@@ -316,7 +334,10 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
         )?;
         proposed = proposed.saturating_add(1);
     }
-    Ok((auto, proposed))
+    Ok(MergeCounts {
+        auto_merged: auto,
+        proposed,
+    })
 }
 
 /// `DuckDB`'s own account of its memory, at debug level, for the moments
