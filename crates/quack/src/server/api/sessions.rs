@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
@@ -247,12 +247,18 @@ pub(crate) async fn delete_session(app: &App, access: &Access, sid: &str) -> Api
 
 #[derive(Deserialize)]
 pub(crate) struct ExportQuery {
-    #[serde(default = "default_format")]
-    pub format: String,
+    #[serde(default)]
+    pub format: ExportFormat,
 }
 
-fn default_format() -> String {
-    String::from("markdown")
+/// How a session is exported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ExportFormat {
+    #[default]
+    Markdown,
+    /// `INSERT` statements that recreate the session and its messages.
+    Sql,
 }
 
 pub(crate) async fn export(
@@ -263,10 +269,9 @@ pub(crate) async fn export(
 ) -> ApiResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     let session = visible_session(&app, &access, &id, &sid).await?;
-    let as_sql = match q.format.as_str() {
-        "sql" => true,
-        "markdown" => false,
-        _ => return Err(ApiError::bad_request("format must be sql or markdown")),
+    let as_sql = match q.format {
+        ExportFormat::Sql => true,
+        ExportFormat::Markdown => false,
     };
     let text = app
         .read(&id, move |db| {

@@ -40,8 +40,10 @@ use super::api::context::ReplaceContext;
 use super::api::documents::Enqueued;
 use super::api::embeddings::RefreshStarted;
 use super::api::graph::ExtractionStarted;
+use super::api::import::ImportBody;
 use super::api::members::AddMember;
 use super::api::ontology::DecideRequest;
+use super::api::query::SqlRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
     documents as docs_api, graph as graph_api, import as import_api, jobs as jobs_api,
@@ -1130,30 +1132,14 @@ async fn tables(
     })
 }
 
-#[derive(Deserialize)]
-struct ImportForm {
-    url: String,
-    table: String,
-    #[serde(default)]
-    query: String,
-    #[serde(default)]
-    source_table: String,
-}
-
 async fn import_submit(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Form(form): Form<ImportForm>,
+    Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let request = ImportRequest {
-        url: form.url,
-        table: form.table,
-        query: (!form.query.trim().is_empty()).then(|| form.query.clone()),
-        source_table: (!form.source_table.trim().is_empty()).then(|| form.source_table.clone()),
-        limit: None,
-    };
+    let request = ImportRequest::from(form);
     Ok(
         match import_api::run_import(&app, &access, &request).await {
             Ok(summary) => Flash::to(format!("/w/{id}/tables/{}", summary.table)),
@@ -1215,11 +1201,6 @@ async fn sql_page(
     })
 }
 
-#[derive(Deserialize)]
-struct SqlForm {
-    sql: String,
-}
-
 async fn render_sql(app: &App, access: &Access, sql: &str) -> WebResult<String> {
     let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
     let result = match query_api::execute_sql(app, access, sql).await {
@@ -1251,22 +1232,17 @@ async fn sql_run(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Form(form): Form<SqlForm>,
+    Form(form): Form<SqlRequest>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     Ok(Html(render_sql(&app, &access, &form.sql).await?).into_response())
-}
-
-#[derive(Deserialize)]
-struct SqlQuery {
-    sql: String,
 }
 
 async fn sql_csv(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Query(q): Query<SqlQuery>,
+    Query(q): Query<SqlRequest>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     let outcome = query_api::execute_sql(&app, &access, &q.sql).await?;

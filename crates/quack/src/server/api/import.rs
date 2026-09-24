@@ -22,6 +22,20 @@ pub(crate) struct ImportBody {
     pub limit: Option<u64>,
 }
 
+/// A blank query or source table (an empty form field) is none.
+impl From<ImportBody> for ImportRequest {
+    fn from(body: ImportBody) -> Self {
+        let given = |field: Option<String>| field.filter(|value| !value.trim().is_empty());
+        Self {
+            url: body.url,
+            table: body.table,
+            query: given(body.query),
+            source_table: given(body.source_table),
+            limit: body.limit,
+        }
+    }
+}
+
 pub(crate) async fn import(
     State(app): State<App>,
     identity: Identity,
@@ -29,14 +43,7 @@ pub(crate) async fn import(
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let request = ImportRequest {
-        url: body.url,
-        table: body.table,
-        query: body.query,
-        source_table: body.source_table,
-        limit: body.limit,
-    };
-    let summary = run_import(&app, &access, &request).await?;
+    let summary = run_import(&app, &access, &ImportRequest::from(body)).await?;
     Ok(Json(serde_json::to_value(summary)?))
 }
 

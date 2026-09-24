@@ -41,9 +41,12 @@ the graph page (`graph.html`) shows status banners (provisional, stale, missing 
 tables, drift), the search and path forms, the ECharts result with a node inspector, the
 merge queue, and the extract, revalidate, and review buttons. Fragments that htmx swaps (`documents_rows.html`,
 `sql_result.html`) are their own structs, rendered to a string and inserted with `|safe`.
-askama escapes everything else. Redirects carry outcomes in the query string: `?error=` renders
-red, `?notice=` green, so a started background pass or a revalidation count is not styled as
-a failure. The documents list polls its rows fragment only while a row is still processing
+askama escapes everything else. A form handler calls the same operation the REST handler does
+(a method on `Access` or `Identity` in `server::api`, returning a typed result), so both
+interfaces apply the same validation and write the same audit rows; the API wraps the result in
+JSON and the web handler in a `web::flash::Flash` redirect. Redirects carry outcomes in the
+query string: `?error=` renders red, `?notice=` green, so a started background pass or a
+revalidation count is not styled as a failure. The documents list polls its rows fragment only while a row is still processing
 (the fragment marks that with `data-pending`).
 
 ## Assets

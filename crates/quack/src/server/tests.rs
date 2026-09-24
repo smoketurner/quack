@@ -4035,3 +4035,106 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     assert!(closing("the model went away"), "{details:?}");
     assert!(closing("cancelled before it started"), "{details:?}");
 }
+
+/// Log in through the web form and return the session cookie's value.
+async fn web_session(h: &Harness, username: &str) -> String {
+    let (status, _, headers) = h
+        .form("/login", None, &format!("username={username}&password=pw"))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The web console and the API run one operation each, so the rules the
+/// API enforces hold on the web too, with the reason in the page's flash
+/// slot rather than as an error page.
+#[tokio::test]
+async fn web_forms_follow_the_api_rules_and_say_why() {
+    let h = harness(false).await;
+    h.user("root", true).await;
+    h.user("bob", false).await;
+    let cookie = web_session(&h, "root").await;
+
+    // Workspace names: the API's validation and message.
+    let (status, _, headers) = h.form("/workspaces", Some(&cookie), "name=a.b").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        location(&headers).starts_with("/workspaces?error=workspace+name+must+be+non-empty"),
+        "{}",
+        location(&headers)
+    );
+    let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
+    let ws = location(&headers)
+        .trim_start_matches("/w/")
+        .trim_end_matches("/chat")
+        .to_owned();
+    let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
+    assert_eq!(location(&headers), "/workspaces?error=workspace+exists");
+
+    // Removing someone who is not a member says so; it used to pass silently.
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/members/nobody/remove"), Some(&cookie), "")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        format!("/w/{ws}/settings?error=not+a+member")
+    );
+
+    // Bulk decisions need at least one candidate.
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/candidates"),
+            Some(&cookie),
+            "bulk=accept",
+        )
+        .await;
+    assert_eq!(
+        location(&headers),
+        format!("/w/{ws}/ontology?error=choose+at+least+one+candidate+to+accept+or+reject")
+    );
+
+    // Proposing over no tables queues nothing and says so.
+    let (_, _, headers) = h
+        .form(&format!("/w/{ws}/ontology/propose"), Some(&cookie), "")
+        .await;
+    assert_eq!(
+        location(&headers),
+        format!("/w/{ws}/ontology?notice=nothing+to+propose%3A+the+tables+are+already+covered")
+    );
+
+    // A second init is refused with the API's reason.
+    let (_, _, headers) = h
+        .form(&format!("/w/{ws}/ontology/init"), Some(&cookie), "")
+        .await;
+    assert_eq!(location(&headers), format!("/w/{ws}/ontology"));
+    let (_, _, headers) = h
+        .form(&format!("/w/{ws}/ontology/init"), Some(&cookie), "")
+        .await;
+    assert_eq!(
+        location(&headers),
+        format!("/w/{ws}/ontology?error=an+ontology+already+exists")
+    );
+}
+
+/// Local mode has no logins, so no users can be added from the API
+/// either; the web form already refused.
+#[tokio::test]
+async fn local_mode_refuses_new_users_from_the_api() {
+    let h = harness(true).await;
+    let (status, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/admin/users",
+            None,
+            Some(serde_json::json!({ "username": "carol", "password": "pw" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
