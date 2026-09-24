@@ -8,7 +8,7 @@ mod ui;
 use anyhow::{Context, Result};
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{SessionId, WorkspaceId};
 
 /// Everything a terminal session starts from: the resolved workspace, its
 /// writer and reader pool, and the session to open.
@@ -18,7 +18,7 @@ pub(crate) struct SessionSetup {
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) db: SharedDb,
     pub(crate) reader_db: ReaderDb,
-    pub(crate) session_id: String,
+    pub(crate) session_id: SessionId,
     /// `--allow-write`: the agent may modify the workspace without asking.
     pub(crate) allow_write: bool,
 }

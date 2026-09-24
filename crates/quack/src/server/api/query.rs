@@ -14,7 +14,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
 use quack_core::error::Record;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -33,7 +33,7 @@ use crate::server::web::markdown::to_html;
 #[derive(Deserialize)]
 pub(crate) struct QueryRequest {
     pub prompt: String,
-    pub session_id: Option<String>,
+    pub session_id: Option<SessionId>,
     pub mode: Option<ChatMode>,
     #[serde(default)]
     pub allow_write: bool,
@@ -44,7 +44,7 @@ struct PreparedTurn {
     access: Access,
     db: SharedDb,
     reader: ReaderDb,
-    session_id: String,
+    session_id: SessionId,
     policy: WritePolicy,
     prompt: String,
 }
@@ -204,7 +204,7 @@ struct Turn {
     #[expect(dead_code, reason = "held only so dropping the turn cancels its job")]
     guard: CancelOnDrop,
     access: Access,
-    session_id: String,
+    session_id: SessionId,
     prompt: String,
 }
 

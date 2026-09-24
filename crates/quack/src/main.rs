@@ -25,6 +25,7 @@ use quack_core::config::inspect::SettingFilter;
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
+use quack_core::ids::SessionId;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
@@ -1187,7 +1188,7 @@ fn resolve_session(
     continue_latest: bool,
     resume: Option<&str>,
     mode: Option<ChatMode>,
-) -> Result<String> {
+) -> Result<SessionId> {
     let existing = if let Some(prefix) = resume {
         Some(find_session(db, prefix)?.id)
     } else if continue_latest {
@@ -1348,7 +1349,7 @@ fn list_documents(db: &WorkspaceDb, json: bool, out: &mut impl Write) -> Result<
 
 /// Resolve a full id or a unique prefix to a session.
 fn find_session(db: &WorkspaceDb, prefix: &str) -> Result<sessions::SessionRow> {
-    if let Some(exact) = sessions::get_session(db, prefix)? {
+    if let Some(exact) = sessions::get_session(db, &SessionId::from(prefix))? {
         return Ok(exact);
     }
     Ok(

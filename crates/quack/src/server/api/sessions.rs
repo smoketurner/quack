@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
 use serde::Deserialize;
@@ -51,7 +51,7 @@ impl Access {
     async fn visible_session(
         &self,
         app: &App,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> ApiResult<sessions::SessionRow> {
         let sid = session_id.to_owned();
         let viewer = self.session_viewer();
@@ -60,14 +60,14 @@ impl Access {
                 Ok(sessions::get_session(db, &sid)?.filter(|s| s.visible_to(&viewer)))
             })
             .await?;
-        found.ok_or_else(|| Record::Session.missing(session_id).into())
+        found.ok_or_else(|| Record::Session.missing(session_id.as_str()).into())
     }
 }
 
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(WorkspaceId, String)>,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = access.visible_session(&app, &sid).await?;
@@ -101,7 +101,7 @@ pub(crate) struct UpdateSession {
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(WorkspaceId, String)>,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
     Json(body): Json<UpdateSession>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -123,7 +123,7 @@ pub(crate) async fn update(
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(WorkspaceId, String)>,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> ApiResult<axum::http::StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.delete_session(&app, &sid).await?;
@@ -138,7 +138,7 @@ impl Access {
     async fn own_session(
         &self,
         app: &App,
-        sid: &str,
+        sid: &SessionId,
         action: AuditAction,
         refusal: &'static str,
     ) -> ApiResult<sessions::SessionRow> {
@@ -161,7 +161,7 @@ impl Access {
     pub(crate) async fn set_session_mode(
         &self,
         app: &App,
-        sid: &str,
+        sid: &SessionId,
         mode: ChatMode,
     ) -> ApiResult<sessions::SessionRow> {
         let session = self
@@ -195,7 +195,7 @@ impl Access {
     pub(crate) async fn set_session_shared(
         &self,
         app: &App,
-        sid: &str,
+        sid: &SessionId,
         shared: bool,
     ) -> ApiResult<sessions::SessionRow> {
         let session = self
@@ -226,7 +226,7 @@ impl Access {
     }
 
     /// Delete a session, audited as `delete`.
-    pub(crate) async fn delete_session(&self, app: &App, sid: &str) -> ApiResult<()> {
+    pub(crate) async fn delete_session(&self, app: &App, sid: &SessionId) -> ApiResult<()> {
         let session = self
             .own_session(
                 app,
@@ -258,7 +258,7 @@ pub(crate) struct ExportQuery {
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
-    Path((id, sid)): Path<(WorkspaceId, String)>,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
     Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;

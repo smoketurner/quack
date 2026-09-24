@@ -480,8 +480,11 @@ text_enum!(ResourceKind, "resource kind", {
 impl ResourceKind {
     /// This kind of resource with `id`, as an audit row names it.
     #[must_use]
-    pub fn id(self, id: &str) -> AuditResource<'_> {
-        AuditResource { kind: self, id }
+    pub fn id(self, id: &(impl AsRef<str> + ?Sized)) -> AuditResource<'_> {
+        AuditResource {
+            kind: self,
+            id: id.as_ref(),
+        }
     }
 }
 

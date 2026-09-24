@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::JobsConfig;
-use crate::ids::{UserId, WorkspaceId};
+use crate::ids::{SessionId, UserId, WorkspaceId};
 use crate::priority::Priority;
 
 /// Snapshots the broadcast channel holds for a slow subscriber before it
@@ -216,15 +216,15 @@ pub struct Lane {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LaneKey {
     /// One chat session's turns, answered in the order asked.
-    Session(String),
+    Session(SessionId),
     /// A workspace's uploads.
-    Ingest(String),
+    Ingest(WorkspaceId),
     /// A workspace's graph extraction.
-    Graph(String),
+    Graph(WorkspaceId),
     /// A workspace's ontology document pass.
-    Ontology(String),
+    Ontology(WorkspaceId),
     /// A workspace's embedding refresh.
-    Embeddings(String),
+    Embeddings(WorkspaceId),
 }
 
 impl fmt::Display for LaneKey {
@@ -891,9 +891,9 @@ mod tests {
     /// A job's `lane` shows its key as `kind:id`.
     #[test]
     fn lane_keys_read_as_kind_and_id() {
-        let id = || String::from("w1");
+        let id = || WorkspaceId::from("w1");
         for (key, text) in [
-            (LaneKey::Session(id()), "session:w1"),
+            (LaneKey::Session(SessionId::from("w1")), "session:w1"),
             (LaneKey::Ingest(id()), "ingest:w1"),
             (LaneKey::Graph(id()), "graph:w1"),
             (LaneKey::Ontology(id()), "ontology:w1"),
@@ -998,7 +998,7 @@ mod tests {
                 queue
                     .submit(
                         JobSpec::new(JobKind::Chat, format!("turn {n}"))
-                            .lane(Lane::serial(&LaneKey::Session(String::from("a")))),
+                            .lane(Lane::serial(&LaneKey::Session(SessionId::from("a")))),
                         move |_| async move {
                             if n == 0 {
                                 gate.notified().await;
@@ -1014,7 +1014,7 @@ mod tests {
         let other = queue
             .submit(
                 JobSpec::new(JobKind::Sql, "other")
-                    .lane(Lane::serial(&LaneKey::Session(String::from("b")))),
+                    .lane(Lane::serial(&LaneKey::Session(SessionId::from("b")))),
                 |_| async { Ok(String::from("done")) },
             )
             .id;
@@ -1048,7 +1048,7 @@ mod tests {
             held.push(
                 wide.submit(
                     JobSpec::new(JobKind::Ingest, format!("{n}"))
-                        .lane(Lane::new(&LaneKey::Ingest(String::from("w")), 2)),
+                        .lane(Lane::new(&LaneKey::Ingest(WorkspaceId::from("w")), 2)),
                     move |_| async move {
                         gate.notified().await;
                         Ok(String::new())
@@ -1066,7 +1066,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let counts = wide.counts(None);
         assert_eq!((counts.running, counts.queued), (2, 1));
-        assert_eq!(wide.lane_active(&LaneKey::Ingest(String::from("w"))), 3);
+        assert_eq!(
+            wide.lane_active(&LaneKey::Ingest(WorkspaceId::from("w"))),
+            3
+        );
         for _ in 0..3 {
             gate.notify_one();
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1074,7 +1077,10 @@ mod tests {
         for id in held {
             assert_eq!(finished(&wide, id).await.state, JobState::Succeeded);
         }
-        assert_eq!(wide.lane_active(&LaneKey::Ingest(String::from("w"))), 0);
+        assert_eq!(
+            wide.lane_active(&LaneKey::Ingest(WorkspaceId::from("w"))),
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1088,7 +1094,7 @@ mod tests {
                 queue
                     .submit(
                         JobSpec::new(JobKind::Chat, format!("{n}"))
-                            .lane(Lane::serial(&LaneKey::Session(String::from("x")))),
+                            .lane(Lane::serial(&LaneKey::Session(SessionId::from("x")))),
                         move |_| async move {
                             log.lock().unwrap_or_else(PoisonError::into_inner).push(n);
                             Ok(String::new())
@@ -1117,7 +1123,7 @@ mod tests {
         let running = queue
             .submit(
                 JobSpec::new(JobKind::Chat, "long")
-                    .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
+                    .lane(Lane::serial(&LaneKey::Session(SessionId::from("c")))),
                 |ctx| async move {
                     ctx.cancel_token().cancelled().await;
                     Err(String::from("stopped"))
@@ -1127,7 +1133,7 @@ mod tests {
         let queued = queue
             .submit(
                 JobSpec::new(JobKind::Chat, "never")
-                    .lane(Lane::serial(&LaneKey::Session(String::from("c")))),
+                    .lane(Lane::serial(&LaneKey::Session(SessionId::from("c")))),
                 |_| async { Ok(String::from("ran")) },
             )
             .id;

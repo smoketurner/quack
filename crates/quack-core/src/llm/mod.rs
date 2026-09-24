@@ -28,6 +28,7 @@ use crate::embedding::{Embedder, Profile};
 use crate::error::{Error, Record, Result};
 use crate::extraction::{Extract, ExtractFuture, parse_answer};
 use crate::graph::extract::Extraction;
+use crate::ids::SessionId;
 use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::Priority;
@@ -652,7 +653,7 @@ async fn build_anthropic_client(
 pub struct TurnRequest<'a> {
     pub db: SharedDb,
     pub reader_db: ReaderDb,
-    pub session_id: &'a str,
+    pub session_id: &'a SessionId,
     pub policy: WritePolicy,
     pub message: &'a str,
     pub sink: EventSink,
@@ -696,7 +697,7 @@ impl TurnRequest<'_> {
             }
         };
 
-        tracing::info!(chat_model = %chat, session = session_id, prior_messages = history.len(), "starting agent turn");
+        tracing::info!(chat_model = %chat, session = %session_id, prior_messages = history.len(), "starting agent turn");
 
         // Events pass through here on their way out so the text streamed so
         // far is known if the turn is cancelled (issue #45).
@@ -754,7 +755,7 @@ impl TurnRequest<'_> {
                 cancelled: true,
                 ..AgentResponse::default()
             };
-            tracing::info!(session = session_id, "agent turn cancelled");
+            tracing::info!(session = %session_id, "agent turn cancelled");
             drop(sink.send(AgentEvent::TurnComplete(response.clone())));
             response
         };
@@ -780,7 +781,7 @@ struct StartedTurn<'c> {
 async fn start_turn<'c>(
     config: &'c Config,
     db: &SharedDb,
-    session_id: &str,
+    session_id: &SessionId,
     policy: WritePolicy,
 ) -> Result<StartedTurn<'c>> {
     let chat = config.chat_model_ref()?;

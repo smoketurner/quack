@@ -25,7 +25,7 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::jobs::{
@@ -210,13 +210,13 @@ type DbStep = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
 
 /// A session loaded for the transcript.
 struct Replay {
-    session_id: String,
+    session_id: SessionId,
     rows: Vec<sessions::MessageRow>,
 }
 
 impl Replay {
     /// `session_id`'s messages, read for the transcript.
-    fn load(db: &WorkspaceDb, session_id: &str) -> CoreResult<Self> {
+    fn load(db: &WorkspaceDb, session_id: &SessionId) -> CoreResult<Self> {
         Ok(Self {
             session_id: session_id.to_owned(),
             rows: sessions::messages(db, session_id)?,
@@ -229,7 +229,7 @@ enum Found {
     Current,
     One(Replay),
     None(String),
-    Many(String, Vec<String>),
+    Many(String, Vec<SessionId>),
 }
 
 /// A submitted job as the terminal refers to it.
@@ -287,7 +287,7 @@ struct Turn {
     job: Ticket,
     /// The session it answers in; its events render only while that
     /// session is on screen.
-    session_id: String,
+    session_id: SessionId,
     /// Index of the assistant message text is streaming into, if any.
     streaming: Option<usize>,
     /// Index into `messages` of the step line being filled in.
@@ -304,7 +304,7 @@ impl Turn {
         format!(
             "Job #{} in session {}",
             self.job.number,
-            short_id(&self.session_id)
+            self.session_id.short()
         )
     }
 }
@@ -702,7 +702,7 @@ pub(crate) struct App {
     pub(crate) spinner: Spinner,
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
-    pub(crate) session_id: String,
+    pub(crate) session_id: SessionId,
     pub(crate) current_chart: Option<ChartData>,
     /// Decisions owed, oldest first; the front one is on screen.
     prompts: VecDeque<Prompt>,
@@ -1798,7 +1798,7 @@ impl App {
                         );
                         for id in ids.iter().take(10) {
                             text.push_str("\n  ");
-                            text.push_str(id);
+                            text.push_str(id.as_str());
                         }
                         app.note(MessageKind::Error, text);
                     }
@@ -2134,7 +2134,7 @@ impl App {
     /// The same when the session ends, after the loop: the writer and the
     /// session to drop, taken out first so no borrow of the app is held
     /// across the await.
-    fn session_to_forget(&self) -> Option<(SharedDb, String)> {
+    fn session_to_forget(&self) -> Option<(SharedDb, SessionId)> {
         if self.turns.iter().any(|t| t.session_id == self.session_id) {
             return None;
         }
@@ -2519,7 +2519,7 @@ mod tests {
     fn waiting_turn(app: &mut App) -> Turn {
         let job = app.jobs.submit(
             JobSpec::new(JobKind::Chat, "question")
-                .lane(Lane::serial(&LaneKey::Session(String::from("test")))),
+                .lane(Lane::serial(&LaneKey::Session(SessionId::from("test")))),
             |ctx| async move {
                 ctx.cancel_token().cancelled().await;
                 Err(String::from("cancelled"))
@@ -2946,7 +2946,7 @@ mod tests {
         db_settle(&mut app).await;
         assert_ne!(app.session_id, old);
         assert!(
-            last(&app).content.contains(&app.session_id),
+            last(&app).content.contains(app.session_id.as_str()),
             "the deferred /workspace ran in the new session: {}",
             last(&app).content
         );

@@ -336,7 +336,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(&app.provider_display, Style::default().fg(Color::DarkGray)),
         Span::styled(" \u{00B7} session ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            app.session_id.chars().take(8).collect::<String>(),
+            app.session_id.short().to_owned(),
             Style::default().fg(Color::DarkGray),
         ),
     ]);

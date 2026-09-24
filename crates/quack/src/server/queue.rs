@@ -46,7 +46,7 @@ impl UploadJob {
             .workspace(workspace_id.clone())
             .owner(owner)
             .lane(Lane::new(
-                &LaneKey::Ingest(workspace_id.to_string()),
+                &LaneKey::Ingest(workspace_id.clone()),
                 app.config.server.workers_per_workspace,
             ));
         let config = app.config.clone();

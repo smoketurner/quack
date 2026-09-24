@@ -7,6 +7,7 @@ use rig::streaming::StreamedAssistantContent;
 use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
+use crate::ids::SessionId;
 
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
@@ -125,7 +126,7 @@ impl AgentResponse {
     /// issue #50): print mode's `--format json`, the REST body and SSE
     /// `complete` event, and the MCP structured content all carry this.
     #[must_use]
-    pub fn to_json(&self, session_id: &str) -> serde_json::Value {
+    pub fn to_json(&self, session_id: &SessionId) -> serde_json::Value {
         let citations: Vec<serde_json::Value> = self
             .citations
             .iter()
@@ -681,7 +682,7 @@ mod tests {
             }],
             ..AgentResponse::default()
         };
-        let json = response.to_json("s1");
+        let json = response.to_json(&SessionId::from("s1"));
         assert_eq!(json["answer"], "12 storms [1]");
         assert_eq!(json["queries"][0]["sql"], "SELECT count(*) FROM events");
         assert_eq!(json["queries"][0]["rows"], 1);
@@ -704,7 +705,7 @@ mod tests {
             }),
             ..AgentResponse::default()
         };
-        let json = counted.to_json("s1");
+        let json = counted.to_json(&SessionId::from("s1"));
         assert_eq!(json["usage"]["input_tokens"], 980);
         assert_eq!(json["usage"]["output_tokens"], 43);
         assert_eq!(json["usage"]["total_tokens"], 1_023);

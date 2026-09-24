@@ -255,7 +255,7 @@ pub(crate) async fn enqueue(
     let id = access.workspace.id.clone();
     // Backpressure: every queued upload holds its bytes in memory, so a
     // workspace with a deep line of them turns more away until it drains.
-    let waiting = app.jobs.lane_active(&LaneKey::Ingest(id.to_string()));
+    let waiting = app.jobs.lane_active(&LaneKey::Ingest(id.clone()));
     if waiting.saturating_add(files.len()) > MAX_WAITING_UPLOADS {
         return Err(ApiError::busy(
             format!("{waiting} uploads are already waiting in this workspace; try again shortly"),
