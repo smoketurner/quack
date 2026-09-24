@@ -20,7 +20,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::embedding::Input;
-use quack_core::ids::UserId;
+use quack_core::ids::{SessionId, UserId};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -185,10 +185,10 @@ pub(crate) struct DescribeTableArgs {
 /// The session a `query` call runs in.
 enum TurnSession {
     /// One the caller named, which exists and they may see.
-    Existing(String),
+    Existing(SessionId),
     /// A new one this call made; removed again if the turn records
     /// nothing.
-    Created(String),
+    Created(SessionId),
     /// The caller named one that does not exist or they may not see.
     NotFound,
 }
@@ -716,6 +716,7 @@ impl McpServer {
         if let Some(id) = requested
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty())
+            .map(SessionId::from)
         {
             let requested_id = id.clone();
             let found = self
@@ -1120,7 +1121,7 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()))
             .id;
         let failed = server
-            .query(ask(Some(&existing), Some("query")))
+            .query(ask(Some(existing.as_str()), Some("query")))
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&failed).contains("the agent turn failed"));

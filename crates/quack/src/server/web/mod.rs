@@ -21,7 +21,7 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::citations::Citation;
-use quack_core::ids::{UserId, WorkspaceId};
+use quack_core::ids::{SessionId, UserId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
@@ -807,7 +807,7 @@ async fn chat(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let viewer = access.session_viewer();
-    let wanted = q.session.clone();
+    let wanted = q.session.clone().map(SessionId::from);
     let (sessions_list, current, messages) = app
         .read(&id, move |db| {
             let list = sessions::list_sessions_for(db, 50, &viewer)?;
@@ -853,7 +853,7 @@ async fn chat(
 async fn delete_session(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, sid)): Path<(WorkspaceId, String)>,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.delete_session(&app, &sid).await?;
@@ -863,7 +863,7 @@ async fn delete_session(
 async fn share_session(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, sid)): Path<(WorkspaceId, String)>,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.set_session_shared(&app, &sid, true).await?;
@@ -873,7 +873,7 @@ async fn share_session(
 async fn unshare_session(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, sid)): Path<(WorkspaceId, String)>,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.set_session_shared(&app, &sid, false).await?;

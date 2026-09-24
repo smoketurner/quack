@@ -14,6 +14,7 @@ use quack_core::analysis::events::{self, AgentEvent, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::ids::SessionId;
 use quack_core::llm;
 
 use crate::text_or_json::TextOrJson;
@@ -62,7 +63,7 @@ pub(crate) struct PrintTurn<'a> {
     pub config: &'a Config,
     pub db: SharedDb,
     pub reader_db: ReaderDb,
-    pub session_id: &'a str,
+    pub session_id: &'a SessionId,
     pub policy: WritePolicy,
     pub prompt: &'a str,
     pub format: TextOrJson,

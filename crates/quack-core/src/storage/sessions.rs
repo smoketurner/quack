@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use crate::analysis::agent::AgentResponse;
 use crate::error::{Error, Record, Result};
-use crate::ids::UserId;
+use crate::ids::{SessionId, UserId};
 
 use super::workspace::WorkspaceDb;
 
@@ -53,7 +53,7 @@ text_enum!(MessageRole, "message role", {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionRow {
-    pub id: String,
+    pub id: SessionId,
     pub title: Option<String>,
     pub mode: ChatMode,
     pub model: String,
@@ -114,7 +114,7 @@ pub enum SessionViewer {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageRow {
     pub id: String,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub seq: i64,
     pub role: MessageRole,
     pub content: String,
@@ -161,7 +161,7 @@ pub fn create_session(
     mode: ChatMode,
     created_by: Option<&UserId>,
 ) -> Result<SessionRow> {
-    let id = uuid::Uuid::now_v7().to_string();
+    let id = SessionId::generate();
     db.connection().execute(
         "INSERT INTO _quack_sessions (id, model, mode, created_by) VALUES (?, ?, ?, ?)",
         duckdb::params![id, model, mode.as_str(), created_by],
@@ -175,13 +175,13 @@ pub fn create_session(
 /// # Errors
 ///
 /// Returns an error if the session does not exist or the update fails.
-pub fn set_session_mode(db: &WorkspaceDb, session_id: &str, mode: ChatMode) -> Result<()> {
+pub fn set_session_mode(db: &WorkspaceDb, session_id: &SessionId, mode: ChatMode) -> Result<()> {
     let changed = db.connection().execute(
         "UPDATE _quack_sessions SET mode = ? WHERE id = ?",
         duckdb::params![mode.as_str(), session_id],
     )?;
     if changed == 0 {
-        return Err(Record::Session.missing(session_id));
+        return Err(Record::Session.missing(session_id.as_str()));
     }
     Ok(())
 }
@@ -191,7 +191,7 @@ pub fn set_session_mode(db: &WorkspaceDb, session_id: &str, mode: ChatMode) -> R
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn get_session(db: &WorkspaceDb, id: &str) -> Result<Option<SessionRow>> {
+pub fn get_session(db: &WorkspaceDb, id: &SessionId) -> Result<Option<SessionRow>> {
     let sql = format!("SELECT {SESSION_COLUMNS} FROM _quack_sessions s WHERE s.id = ?");
     let mut stmt = db.connection().prepare(&sql)?;
     let mut rows = stmt.query(duckdb::params![id])?;
@@ -257,13 +257,13 @@ pub fn list_sessions_for(
 /// # Errors
 ///
 /// Returns an error if the update fails or the session does not exist.
-pub fn set_session_shared(db: &WorkspaceDb, session_id: &str, shared: bool) -> Result<()> {
+pub fn set_session_shared(db: &WorkspaceDb, session_id: &SessionId, shared: bool) -> Result<()> {
     let changed = db.connection().execute(
         "UPDATE _quack_sessions SET shared = ? WHERE id = ?",
         duckdb::params![shared, session_id],
     )?;
     if changed == 0 {
-        return Err(Record::Session.missing(session_id));
+        return Err(Record::Session.missing(session_id.as_str()));
     }
     Ok(())
 }
@@ -275,13 +275,13 @@ pub fn set_session_shared(db: &WorkspaceDb, session_id: &str, shared: bool) -> R
 /// Returns an error if the session does not exist or the insert fails.
 pub fn append_message(
     db: &WorkspaceDb,
-    session_id: &str,
+    session_id: &SessionId,
     role: MessageRole,
     content: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<i64> {
     if get_session(db, session_id)?.is_none() {
-        return Err(Record::Session.missing(session_id));
+        return Err(Record::Session.missing(session_id.as_str()));
     }
     let conn = db.connection();
     let seq: i64 = conn.query_row(
@@ -314,7 +314,7 @@ pub fn append_message(
 /// # Errors
 ///
 /// Returns an error if the query fails or a stored role is unknown.
-pub fn messages(db: &WorkspaceDb, session_id: &str) -> Result<Vec<MessageRow>> {
+pub fn messages(db: &WorkspaceDb, session_id: &SessionId) -> Result<Vec<MessageRow>> {
     let mut stmt = db.connection().prepare(
         "SELECT id, session_id, seq, role, content, CAST(metadata AS VARCHAR), \
                 CAST(created_at AS VARCHAR) \
@@ -339,12 +339,12 @@ pub fn messages(db: &WorkspaceDb, session_id: &str) -> Result<Vec<MessageRow>> {
 /// Returns an error if any insert fails.
 pub fn record_turn(
     db: &WorkspaceDb,
-    session_id: &str,
+    session_id: &SessionId,
     user_message: &str,
     response: &AgentResponse,
 ) -> Result<()> {
     let session =
-        get_session(db, session_id)?.ok_or_else(|| Record::Session.missing(session_id))?;
+        get_session(db, session_id)?.ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
 
     append_message(db, session_id, MessageRole::User, user_message, None)?;
 
@@ -429,7 +429,7 @@ fn estimate_tokens(text: &str) -> usize {
 /// Returns an error if the messages cannot be read.
 pub fn history_for_model(
     db: &WorkspaceDb,
-    session_id: &str,
+    session_id: &SessionId,
     token_budget: u32,
 ) -> Result<Vec<rig::message::Message>> {
     let stored = messages(db, session_id)?;
@@ -590,7 +590,7 @@ impl Transcript {
 /// # Errors
 ///
 /// Returns an error if a delete fails.
-pub fn delete_session(db: &WorkspaceDb, session_id: &str) -> Result<bool> {
+pub fn delete_session(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool> {
     if get_session(db, session_id)?.is_none() {
         return Ok(false);
     }
@@ -611,7 +611,7 @@ pub fn delete_session(db: &WorkspaceDb, session_id: &str) -> Result<bool> {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn delete_if_empty(db: &WorkspaceDb, session_id: &str) -> Result<bool> {
+pub fn delete_if_empty(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool> {
     let Some(session) = get_session(db, session_id)? else {
         return Ok(false);
     };
@@ -721,7 +721,7 @@ mod tests {
             list_sessions_for(&db, 10, &SessionViewer::User(UserId::from("u1")))
                 .is_ok_and(|v| v.len() == 2)
         );
-        assert!(set_session_shared(&db, "missing", true).is_err());
+        assert!(set_session_shared(&db, &SessionId::from("missing"), true).is_err());
     }
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -742,7 +742,7 @@ mod tests {
             get_session(&db, &session.id).unwrap().unwrap().mode,
             ChatMode::Query
         );
-        assert!(set_session_mode(&db, "missing", ChatMode::Chat).is_err());
+        assert!(set_session_mode(&db, &SessionId::from("missing"), ChatMode::Chat).is_err());
 
         record_turn(
             &db,
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn append_to_missing_session_is_an_error() {
         let db = db();
-        let err = append_message(&db, "nope", MessageRole::User, "x", None).err();
+        let err = append_message(&db, &SessionId::from("nope"), MessageRole::User, "x", None).err();
         assert!(err.is_some_and(|e| matches!(
             e,
             Error::NotFound {
@@ -924,7 +924,7 @@ mod tests {
         record_turn(&db, &used.id, "q", &response("a", vec![])).unwrap();
         assert!(delete_if_empty(&db, &empty.id).unwrap());
         assert!(!delete_if_empty(&db, &used.id).unwrap());
-        assert!(!delete_if_empty(&db, "missing").unwrap());
+        assert!(!delete_if_empty(&db, &SessionId::from("missing")).unwrap());
         assert_eq!(list_sessions(&db, 10).unwrap().len(), 1);
     }
 

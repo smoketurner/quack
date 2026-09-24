@@ -10,6 +10,7 @@ use std::sync::Arc;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
 use quack_core::graph::resolve::ResolutionSummary;
+use quack_core::ids::WorkspaceId;
 use quack_core::jobs::{JobContext, JobId, JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::documents;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -61,8 +62,8 @@ impl RunKind {
         }
     }
 
-    fn lane(self, workspace_id: &str) -> LaneKey {
-        let workspace = workspace_id.to_owned();
+    fn lane(self, workspace_id: &WorkspaceId) -> LaneKey {
+        let workspace = workspace_id.clone();
         match self {
             Self::Embeddings => LaneKey::Embeddings(workspace),
             Self::Graph => LaneKey::Graph(workspace),
@@ -176,7 +177,7 @@ impl BackgroundRun {
         let spec = JobSpec::new(self.kind.job(), self.kind.label())
             .workspace(workspace_id.clone())
             .owner(Some(self.access.identity.user_id.clone()))
-            .lane(Lane::serial(&self.kind.lane(workspace_id.as_str())));
+            .lane(Lane::serial(&self.kind.lane(&workspace_id)));
         let jobs = self.app.jobs.clone();
         let unstarted = self.clone();
         let id = jobs.submit(spec, move |ctx| async move {

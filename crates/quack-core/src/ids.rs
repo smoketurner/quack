@@ -31,6 +31,13 @@ macro_rules! id_type {
             pub fn into_string(self) -> String {
                 self.0
             }
+
+            /// The first eight characters, for listings where the whole
+            /// id would crowd the line.
+            #[must_use]
+            pub fn short(&self) -> &str {
+                self.0.get(..8).unwrap_or(&self.0)
+            }
         }
 
         impl ::std::fmt::Display for $name {
@@ -44,6 +51,12 @@ macro_rules! id_type {
 
             fn from_str(text: &str) -> ::std::result::Result<Self, Self::Err> {
                 Ok(Self(text.to_owned()))
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
             }
         }
 
@@ -113,6 +126,11 @@ id_type!(
 id_type!(
     /// A server user.
     UserId
+);
+
+id_type!(
+    /// A chat session in a workspace.
+    SessionId
 );
 
 id_type!(

@@ -17,7 +17,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{BaseUrl, Config, ProviderConfig, ProviderName, ProviderType};
 use quack_core::embedding::Dimension;
-use quack_core::ids::{UserId, WorkspaceId};
+use quack_core::ids::{SessionId, UserId, WorkspaceId};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -3557,7 +3557,7 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
             JobSpec::new(JobKind::Chat, "what is our churn?")
                 .workspace(ws.clone())
                 .owner(Some(member.clone()))
-                .lane(Lane::serial(&LaneKey::Session(String::from("s")))),
+                .lane(Lane::serial(&LaneKey::Session(SessionId::from("s")))),
             |ctx| async move {
                 ctx.cancel_token().cancelled().await;
                 Err(String::from("cancelled"))
@@ -3641,7 +3641,7 @@ async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
     let ws = h.workspace("busy", &owner).await;
     let token = h.login("owner").await;
     let release = CancellationToken::new();
-    let lane = LaneKey::Ingest(ws.to_string());
+    let lane = LaneKey::Ingest(ws.clone());
     for n in 0..MAX_WAITING_UPLOADS {
         let release = release.clone();
         h.app.jobs.submit(
