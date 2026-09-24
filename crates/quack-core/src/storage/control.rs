@@ -151,6 +151,39 @@ pub enum UserKind {
 
 flag_enum!(UserKind, false => Standard, true => Admin);
 
+/// A token just minted: the secret, shown to its owner once and stored
+/// only as a hash, and its row.
+#[derive(Debug, Clone)]
+pub struct IssuedToken {
+    pub secret: TokenSecret,
+    pub row: TokenRow,
+}
+
+/// An API token's secret. `Debug` never prints it; `expose` is the one way
+/// to read it.
+#[derive(Clone)]
+pub struct TokenSecret(String);
+
+impl TokenSecret {
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for TokenSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenSecret(<redacted>)")
+    }
+}
+
+/// A workspace a user belongs to, with their role in it.
+#[derive(Debug, Clone)]
+pub struct Membership {
+    pub workspace: WorkspaceRow,
+    pub role: Role,
+}
+
 /// A server user. The password hash never leaves this module.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserRow {
@@ -883,7 +916,7 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn workspaces_for_user(&self, user_id: &UserId) -> Result<Vec<(WorkspaceRow, Role)>> {
+    pub async fn workspaces_for_user(&self, user_id: &UserId) -> Result<Vec<Membership>> {
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -904,7 +937,12 @@ impl ControlPlane {
         )?;
         let rows = bound.query().fetch_all(&self.pool).await?;
         rows.iter()
-            .map(|r| Ok((WorkspaceRow::from_row(r)?, parsed(r, "role")?)))
+            .map(|r| {
+                Ok(Membership {
+                    workspace: WorkspaceRow::from_row(r)?,
+                    role: parsed(r, "role")?,
+                })
+            })
             .collect()
     }
 
@@ -1179,7 +1217,7 @@ impl ControlPlane {
         name: &str,
         scopes: &[Scope],
         expires_at: Option<Expiry>,
-    ) -> Result<(String, TokenRow)> {
+    ) -> Result<IssuedToken> {
         let mut secret = [0u8; 32];
         random_bytes(&mut secret)?;
         let token = format!(
@@ -1226,7 +1264,10 @@ impl ControlPlane {
             .find_token(&hash)
             .await?
             .ok_or_else(|| Error::Config(String::from("token vanished after insert")))?;
-        Ok((token, row))
+        Ok(IssuedToken {
+            secret: TokenSecret(token),
+            row,
+        })
     }
 
     /// The token row for a presented token, by its hash.
@@ -1678,7 +1719,7 @@ mod tests {
         assert!(mine.is_ok_and(|w| {
             w.len() == 1
                 && w.first()
-                    .is_some_and(|(w, r)| w.name == "w" && *r == Role::Owner)
+                    .is_some_and(|m| m.workspace.name == "w" && m.role == Role::Owner)
         }));
         assert!(
             cp.remove_member(&ws.id, &bob.id)
@@ -1714,11 +1755,12 @@ mod tests {
                 "2000-01-01 00:00:00".parse().ok(),
             )
             .await;
-        let Ok((token, row)) = minted else {
+        let Ok(IssuedToken { secret, row }) = minted else {
             fail("token creation failed");
         };
-        assert!(token.starts_with("qk_"));
-        assert_eq!(row.token_hash, sha256_hex(token.as_bytes()));
+        assert!(secret.expose().starts_with("qk_"));
+        assert!(!format!("{secret:?}").contains("qk_"));
+        assert_eq!(row.token_hash, sha256_hex(secret.expose().as_bytes()));
         assert!(row.has_scope(Scope::Write) && !row.has_scope(Scope::Admin));
         let at = |text: &str| {
             text.parse::<Expiry>()

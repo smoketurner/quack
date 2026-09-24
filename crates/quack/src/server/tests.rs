@@ -30,7 +30,7 @@ use quack_core::llm::CancellationToken;
 use quack_core::okf::{Bundle, BundleFile};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditFilter, AuditRow, Channel, ControlPlane, Outcome, Role, Scope, UserKind,
+    AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Outcome, Role, Scope, UserKind,
 };
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
@@ -877,12 +877,15 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("a", &owner).await;
     let other = h.workspace("b", &owner).await;
-    let (read_token, _) = h
+    let read_token = h
         .app
         .control
         .create_token(&ws, &owner, "ro", &[Scope::Read], None)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
     let (status, body) = h
         .get(&format!("/api/v1/workspaces/{ws}/documents"), &read_token)
         .await;
@@ -912,17 +915,21 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     let (status, _) = h.get("/api/v1/admin/users", &read_token).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let (write_token, row) = h
+    let IssuedToken {
+        secret: write_token,
+        row,
+    } = h
         .app
         .control
         .create_token(&ws, &owner, "rw", &[Scope::Write], None)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
+    let write_token = write_token.expose();
     let (status, _) = h
         .call(
             Method::PUT,
             &format!("/api/v1/workspaces/{ws}/context"),
-            Some(&write_token),
+            Some(write_token),
             Some(serde_json::json!({ "content": "x" })),
         )
         .await;
@@ -947,7 +954,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
             .all(|r| r.channel == Channel::Api && r.token_hash.is_some())
     );
 
-    let (expired, _) = h
+    let expired = h
         .app
         .control
         .create_token(
@@ -958,7 +965,10 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
             "2000-01-01 00:00:00".parse().ok(),
         )
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
     let (status, _) = h
         .get(&format!("/api/v1/workspaces/{ws}/documents"), &expired)
         .await;
@@ -2411,18 +2421,24 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     let h = harness(ServeMode::Login).await;
     let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("mcp", &owner).await;
-    let (read_token, _) = h
+    let read_token = h
         .app
         .control
         .create_token(&ws, &owner, "ro", &[Scope::Read], None)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
-    let (write_token, _) = h
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
+    let write_token = h
         .app
         .control
         .create_token(&ws, &owner, "rw", &[Scope::Read, Scope::Write], None)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
 
     // No bearer: refused before any MCP handling.
     let (status, _, _) = mcp_call(

@@ -282,8 +282,11 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             .first()
             .cloned()
             .ok_or_else(|| Error::Ingestion(String::from("the import produced no table")))?;
-        let (columns, rows) = if let Some(rows) = pulled.rows {
-            (pulled.columns, rows)
+        let KeptRows { columns, rows } = if let Some(rows) = pulled.rows {
+            KeptRows {
+                columns: pulled.columns,
+                rows,
+            }
         } else {
             let table = loaded.clone();
             db.run(move |db| cap_loaded_table(db, &table, limit))
@@ -312,15 +315,9 @@ impl<M: EmbeddingModel> Importing<'_, M> {
                     max_mb: config.import.max_download_mb,
                     hosts: policy.hosts,
                 };
-                let (filename, bytes) = control
+                control
                     .or_cancelled(download.fetch(&request.url, table.as_str()))
-                    .await?;
-                Ok(Pulled {
-                    filename,
-                    bytes,
-                    columns: Vec::new(),
-                    rows: None,
-                })
+                    .await
             }
             SourceKind::Sqlite if !policy.local_files => Err(Error::Ingestion(String::from(
                 "files on the server's disk cannot be imported through the server; \
@@ -356,10 +353,16 @@ impl<M: EmbeddingModel> Importing<'_, M> {
     }
 }
 
+/// A loaded table's columns and how many rows it kept.
+struct KeptRows {
+    columns: Vec<String>,
+    rows: u64,
+}
+
 /// A file came in whole, so the row cap applies after the load, as
 /// `--limit` does on a query source: the table keeps its first `limit`
-/// rows. Returns the columns and the rows kept.
-fn cap_loaded_table(db: &WorkspaceDb, table: &str, limit: u64) -> Result<(Vec<String>, u64)> {
+/// rows.
+fn cap_loaded_table(db: &WorkspaceDb, table: &str, limit: u64) -> Result<KeptRows> {
     let described = db.describe_table(table)?;
     let mut rows = u64::try_from(described.row_count).unwrap_or(0);
     if rows > limit {
@@ -370,10 +373,10 @@ fn cap_loaded_table(db: &WorkspaceDb, table: &str, limit: u64) -> Result<(Vec<St
         tracing::info!(table, rows, limit, "cut the imported file to the row cap");
         rows = limit;
     }
-    Ok((
-        described.columns.into_iter().map(|c| c.name).collect(),
+    Ok(KeptRows {
+        columns: described.columns.into_iter().map(|c| c.name).collect(),
         rows,
-    ))
+    })
 }
 
 impl ImportRequest {
@@ -485,7 +488,7 @@ impl Download {
     /// When only public hosts may be reached, the name is resolved first,
     /// every address is checked, and the connection is pinned to those
     /// addresses so a second lookup cannot answer differently.
-    async fn fetch(&self, url: &SourceUrl, table: &str) -> Result<(String, Vec<u8>)> {
+    async fn fetch(&self, url: &SourceUrl, table: &str) -> Result<Pulled> {
         let download = self;
         let url = url.expose();
         // The same extensions `quack ingest` loads as tables.
@@ -566,7 +569,12 @@ impl Download {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok((format!("{table}.{extension}"), bytes))
+        Ok(Pulled {
+            filename: format!("{table}.{extension}"),
+            bytes,
+            columns: Vec::new(),
+            rows: None,
+        })
     }
 }
 
@@ -844,12 +852,11 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\na,b\n1,2\n3,4\n",
         )
         .await;
-        let (name, bytes) = roomy
-            .fetch(&SourceUrl::from(url.as_str()), "t")
-            .await
-            .unwrap_or_else(|e| (e.to_string(), Vec::new()));
-        assert_eq!(name, "t.csv");
-        assert_eq!(bytes, b"a,b\n1,2\n3,4\n");
+        let fetched = roomy.fetch(&SourceUrl::from(url.as_str()), "t").await;
+        assert!(
+            fetched.is_ok_and(|p| p.filename == "t.csv" && p.bytes == b"a,b\n1,2\n3,4\n"),
+            "the capped download of a small file succeeds"
+        );
 
         // The owner may reach any host, so a redirect is followed: here to
         // a closed port, which fails the download itself.

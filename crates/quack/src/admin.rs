@@ -11,8 +11,8 @@ use quack_core::error::Record;
 use quack_core::ids::WorkspaceId;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Expiry, Outcome, ResourceKind,
-    Role, Scope, UserKind, WorkspaceRow,
+    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Expiry, IssuedToken, Outcome,
+    ResourceKind, Role, Scope, UserKind, WorkspaceRow,
 };
 
 use crate::text_or_json::TextOrJson;
@@ -243,7 +243,7 @@ async fn create_token(
         .await?
         .with_context(|| format!("no user named '{user}'"))?;
     let expires_at = expires.map(Expiry::after_days).transpose()?;
-    let (token, row) = control
+    let IssuedToken { secret, row } = control
         .create_token(&ws.id, &user_row.id, name, scopes, expires_at)
         .await?;
     let entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli)
@@ -252,7 +252,7 @@ async fn create_token(
     control.record_audit(&entry).await?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "{token}")?;
+    writeln!(out, "{}", secret.expose())?;
     writeln!(
         out,
         "Token '{}' for {} in workspace '{}' with scopes {}{}. It is shown only once.",

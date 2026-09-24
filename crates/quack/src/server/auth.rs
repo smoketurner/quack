@@ -207,7 +207,7 @@ pub(crate) async fn password_login(
     RequestId(request_id): RequestId,
     username: &str,
     password: &str,
-) -> ApiResult<(UserRow, SessionToken)> {
+) -> ApiResult<Login> {
     let verified = app.control.verify_password(username, password).await?;
     let mut entry = AuditEntry::new(
         LOGIN_ACTION,
@@ -235,7 +235,13 @@ pub(crate) async fn password_login(
         return Err(ApiError::unauthorized("wrong username or password"));
     };
     let token = app.sessions.open(&user.id)?;
-    Ok((user, token))
+    Ok(Login { user, token })
+}
+
+/// A password login that succeeded: who, and their new session.
+pub(crate) struct Login {
+    pub(crate) user: UserRow,
+    pub(crate) token: SessionToken,
 }
 
 impl FromRequestParts<App> for Identity {

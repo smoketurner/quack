@@ -3,7 +3,7 @@ use crate::error::Result;
 use crate::graph::{GraphStatus, store as graph_store};
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{PinnedDocument, WorkspaceDb};
 use std::fmt::Write;
 
 /// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to
@@ -427,7 +427,11 @@ impl SystemPrompt {
             self.text,
             "Pinned documents (full text, always in effect; cite them by filename):"
         )?;
-        for (doc, text) in &pinned {
+        for PinnedDocument {
+            document: doc,
+            text,
+        } in &pinned
+        {
             let cost = text.len().div_ceil(4);
             if used.saturating_add(cost) > budget {
                 writeln!(

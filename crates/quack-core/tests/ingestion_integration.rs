@@ -1736,7 +1736,7 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
     db.set_document_pinning(&doc.id, Pinning::Pinned).unwrap();
     let pinned = db.pinned_documents().unwrap();
     assert_eq!(pinned.len(), 1);
-    assert!(pinned.first().unwrap().1.contains("Flood is excluded."));
+    assert!(pinned.first().unwrap().text.contains("Flood is excluded."));
 }
 
 #[tokio::test]

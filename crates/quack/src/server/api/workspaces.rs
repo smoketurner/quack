@@ -57,7 +57,7 @@ pub(crate) async fn list(
         let all = app.control.list_workspaces().await?;
         all.into_iter()
             .map(|w| {
-                let role = mine.iter().find(|(m, _)| m.id == w.id).map(|(_, r)| *r);
+                let role = mine.iter().find(|m| m.workspace.id == w.id).map(|m| m.role);
                 WorkspaceView::new(w, role)
             })
             .collect()
@@ -66,7 +66,7 @@ pub(crate) async fn list(
             .workspaces_for_user(&identity.user_id)
             .await?
             .into_iter()
-            .map(|(w, r)| WorkspaceView::new(w, Some(r)))
+            .map(|m| WorkspaceView::new(m.workspace, Some(m.role)))
             .collect()
     };
     Ok(Json(serde_json::json!({ "workspaces": rows })))

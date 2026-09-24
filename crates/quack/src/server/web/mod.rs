@@ -31,8 +31,8 @@ use quack_core::ontology::{
 };
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, Expiry, MemberRow, Outcome, ProviderAllowList,
-    ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, Expiry, IssuedToken, MemberRow, Membership, Outcome,
+    ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, SamplePool};
@@ -617,7 +617,7 @@ async fn login_submit(
     // A wrong password is the form again with a message, not a 401; any
     // other failure is still an error page.
     let token = match password_login(&app, peer, request_id, &form.username, &form.password).await {
-        Ok((_, token)) => token,
+        Ok(login) => login.token,
         Err(e) if e.status == StatusCode::UNAUTHORIZED => {
             return Ok(Flash::error("/login", "wrong username or password").into_response());
         }
@@ -665,7 +665,7 @@ async fn workspaces(
                 role: if app.mode == ServeMode::Local {
                     Standing::Member(Role::Owner)
                 } else {
-                    Standing::of(mine.iter().find(|(m, _)| m.id == w.id).map(|(_, r)| *r))
+                    Standing::of(mine.iter().find(|m| m.workspace.id == w.id).map(|m| m.role))
                 },
                 id: w.id.into_string(),
                 name: w.name,
@@ -677,11 +677,11 @@ async fn workspaces(
             .workspaces_for_user(&identity.user_id)
             .await?
             .into_iter()
-            .map(|(w, r)| WsItem {
+            .map(|Membership { workspace: w, role }| WsItem {
                 id: w.id.into_string(),
                 name: w.name,
                 classification: w.classification,
-                role: Standing::Member(r),
+                role: Standing::Member(role),
             })
             .collect()
     };
@@ -1769,7 +1769,7 @@ async fn token_create(
         .filter(|d| *d > 0)
         .map(Expiry::after_days)
         .transpose()?;
-    let (token, row) = app
+    let IssuedToken { secret, row } = app
         .control
         .create_token(
             &id,
@@ -1790,7 +1790,7 @@ async fn token_create(
         .await?;
     // The secret is shown once in this response body, never in a URL where
     // browser history, proxy logs, or a Referer would keep it.
-    html(&SettingsPage::load(&app, &access, Some(token), None).await?)
+    html(&SettingsPage::load(&app, &access, Some(secret.expose().to_owned()), None).await?)
 }
 
 async fn token_revoke(
@@ -2036,8 +2036,11 @@ async fn graph_page(
     // An unknown class or entity is shown on the page, not as a failed page.
     let mut error = q.error;
     let result = match data.result {
-        Some((title, Ok(found))) => Some(GraphResultView::of(title, &found)?),
-        Some((_, Err(e))) => {
+        Some(GraphAnswer {
+            title,
+            result: Ok(found),
+        }) => Some(GraphResultView::of(title, &found)?),
+        Some(GraphAnswer { result: Err(e), .. }) => {
             error = Some(e.to_string());
             None
         }
@@ -2113,24 +2116,23 @@ impl GraphAsk {
     }
 
     /// Its title and result, or why it could not run.
-    fn run(
-        &self,
-        db: &WorkspaceDb,
-        options: &GraphOptions,
-    ) -> Option<(String, CoreResult<GraphResult>)> {
+    fn run(&self, db: &WorkspaceDb, options: &GraphOptions) -> Option<GraphAnswer> {
         match self {
             Self::Nothing => None,
-            Self::Path(path, ends) => Some((
-                format!("Path from {} to {}", path.from, path.to),
-                path.run(db, ends, options),
-            )),
+            Self::Path(path, ends) => Some(GraphAnswer {
+                title: format!("Path from {} to {}", path.from, path.to),
+                result: path.run(db, ends, options),
+            }),
             Self::Search(search, embedding) => {
                 let title = match (&search.entity, &search.class) {
                     (Some(entity), _) => format!("Around {entity}"),
                     (None, Some(class)) => format!("Entities of class {class}"),
                     (None, None) => String::new(),
                 };
-                Some((title, search.run(db, embedding.as_deref(), options)))
+                Some(GraphAnswer {
+                    title,
+                    result: search.run(db, embedding.as_deref(), options),
+                })
             }
         }
     }
@@ -2143,8 +2145,14 @@ struct GraphPageData {
     /// Chunks not yet sent to extraction.
     chunk_count: usize,
     merges: Vec<resolve::MergeProposal>,
-    /// The query's title and result, when it asked for anything.
-    result: Option<(String, CoreResult<GraphResult>)>,
+    /// The query's answer, when it asked for anything.
+    result: Option<GraphAnswer>,
+}
+
+/// A graph page query's title and its result, or why it could not run.
+struct GraphAnswer {
+    title: String,
+    result: CoreResult<GraphResult>,
 }
 
 impl GraphPageData {
