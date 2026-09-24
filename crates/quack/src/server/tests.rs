@@ -16,7 +16,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{BaseUrl, Config, ProviderConfig, ProviderName, ProviderType};
-use quack_core::embedding::Dimension;
+use quack_core::embedding::{Dimension, Vector};
 use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -3836,7 +3836,7 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
             content: "levee report",
             heading: None,
             page: None,
-            embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+            embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
         })?;
         db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
     })

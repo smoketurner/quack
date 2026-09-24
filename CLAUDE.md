@@ -161,8 +161,8 @@ content, print exit 3). `usage` is `AgentResponse::usage`, the provider's own
 `input_tokens`/`output_tokens`/`total_tokens` for the turn taken off rig's final response
 (the per-request counts summed when a turn derails first), `null` when the provider
 reported none, and copied onto the assistant message's metadata in `_quack_messages`. It is
-a record: the history trim and `ollama_window` still use their four-characters-per-token
-estimate, since both run before the call.
+a record: the history trim and `OllamaWindow` still use the four-characters-per-token
+estimate (`text::Tokens`), since both run before the call.
 The ontology (`quack_core::ontology`, design doc 6.3) is classes with single inheritance
 from `entity`, relations with a domain and a range, typed properties, and table mappings.
 It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, checks

@@ -804,7 +804,7 @@ where
             .with_db(move |db| {
                 let mut scope = ChunkScope::for_documents(db, &document_ids)?;
                 if let Some(entity) = entity.as_deref() {
-                    scope = scope.and_chunks(entity_chunks(db, entity, entity_vec.as_deref())?);
+                    scope = scope.and_chunks(entity_chunks(db, entity, entity_vec.as_ref())?);
                 }
                 match &query_vec {
                     Some(vector) => db.search_hybrid_chunks(
@@ -864,7 +864,7 @@ const CHUNK_ENTITIES: usize = 8;
 fn entity_chunks(
     db: &WorkspaceDb,
     entity: &str,
-    embedding: Option<&[f32]>,
+    embedding: Option<&Vector>,
 ) -> error::Result<Vec<ChunkId>> {
     let nodes = graph::traverse::resolve_entry(db, entity, None, embedding)?;
     if nodes.is_empty() {
@@ -1390,7 +1390,8 @@ mod tests {
 
     #[test]
     fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
             db.insert_document(
                 &NewDocument::new(&DocumentId::from("doc-1"), "notes.md", "text/markdown", 1)
@@ -1614,7 +1615,8 @@ mod tests {
 
     #[test]
     fn document_ids_resolve_by_id_prefix_or_filename() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
             db.insert_document(
                 &NewDocument::new(
@@ -1754,7 +1756,8 @@ mod tests {
     fn shared_db() -> SharedDb {
         Arc::new(
             Writer::spawn(
-                WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| unreachable_db(&e.to_string())),
+                WorkspaceDb::open_in_memory(Dimension::new(4))
+                    .unwrap_or_else(|e| unreachable_db(&e.to_string())),
             )
             .unwrap_or_else(|e| fail_test(&e.to_string())),
         )
@@ -2500,9 +2503,9 @@ where
         let lookup = tools
             .db
             .with_db(move |db| {
-                let result = query.run(db, embedding.as_deref(), &options)?;
+                let result = query.run(db, embedding.as_ref(), &options)?;
                 let suggestions = if result.nodes.is_empty() {
-                    query.suggestions(db, embedding.as_deref())?
+                    query.suggestions(db, embedding.as_ref())?
                 } else {
                     Vec::new()
                 };

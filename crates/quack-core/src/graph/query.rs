@@ -87,7 +87,7 @@ impl GraphQuery {
     pub fn run(
         &self,
         db: &WorkspaceDb,
-        embedding: Option<&[f32]>,
+        embedding: Option<&Vector>,
         options: &GraphOptions,
     ) -> Result<GraphResult> {
         let ontology = ontology_store::current(db)?;
@@ -117,7 +117,7 @@ impl GraphQuery {
     /// # Errors
     ///
     /// Returns an error if the lookup fails.
-    pub fn suggestions(&self, db: &WorkspaceDb, embedding: Option<&[f32]>) -> Result<Vec<String>> {
+    pub fn suggestions(&self, db: &WorkspaceDb, embedding: Option<&Vector>) -> Result<Vec<String>> {
         match self.entity.as_deref() {
             Some(entity) => {
                 traverse::suggest_entities(db, entity, self.class.as_deref(), embedding)
@@ -192,12 +192,12 @@ impl PathQuery {
         ends: &PathEnds,
         options: &GraphOptions,
     ) -> Result<GraphResult> {
-        let from = traverse::resolve_entry(db, &self.from, None, ends.from.as_deref())?;
-        let to = traverse::resolve_entry(db, &self.to, None, ends.to.as_deref())?;
+        let from = traverse::resolve_entry(db, &self.from, None, ends.from.as_ref())?;
+        let to = traverse::resolve_entry(db, &self.to, None, ends.to.as_ref())?;
         match (from.first(), to.first()) {
             (Some(a), Some(b)) => traverse::path(db, a, b, self.max_hops, options),
-            (None, _) => Err(UnknownEntity::find(db, &self.from, ends.from.as_deref()).into()),
-            (_, None) => Err(UnknownEntity::find(db, &self.to, ends.to.as_deref()).into()),
+            (None, _) => Err(UnknownEntity::find(db, &self.from, ends.from.as_ref()).into()),
+            (_, None) => Err(UnknownEntity::find(db, &self.to, ends.to.as_ref()).into()),
         }
     }
 }
@@ -214,7 +214,7 @@ impl UnknownEntity {
     /// `name`, which resolved to nothing, and the labels nearest it; a
     /// failed suggestion lookup offers none.
     #[must_use]
-    pub fn find(db: &WorkspaceDb, name: &str, embedding: Option<&[f32]>) -> Self {
+    pub fn find(db: &WorkspaceDb, name: &str, embedding: Option<&Vector>) -> Self {
         Self {
             name: name.to_owned(),
             closest: traverse::suggest_entities(db, name, None, embedding).unwrap_or_default(),

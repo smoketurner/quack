@@ -8,6 +8,7 @@ use std::fmt;
 
 use super::store::{self, EdgeScope, IdList};
 use super::{GraphOptions, GraphResult, Node, NormalizedLabel, Properties};
+use crate::embedding::Vector;
 use crate::error::Result;
 use crate::ids::{ClassId, EdgeId, NodeId};
 use crate::ontology::Ontology;
@@ -86,7 +87,7 @@ pub fn resolve_entry(
     db: &WorkspaceDb,
     entity: &str,
     class_id: Option<&str>,
-    query_embedding: Option<&[f32]>,
+    query_embedding: Option<&Vector>,
 ) -> Result<Vec<Node>> {
     let normalized = NormalizedLabel::new(entity);
     if normalized.is_empty() {
@@ -144,7 +145,7 @@ pub fn suggest_entities(
     db: &WorkspaceDb,
     entity: &str,
     class_id: Option<&str>,
-    query_embedding: Option<&[f32]>,
+    query_embedding: Option<&Vector>,
 ) -> Result<Vec<String>> {
     let normalized = NormalizedLabel::new(entity);
     if normalized.is_empty() {

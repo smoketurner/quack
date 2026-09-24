@@ -615,7 +615,7 @@ names, the `name` column is the directory name and a display name lives in `_qua
 - `data.duckdb` internal statements: parameterized via `duckdb::params!`. Table and column
   names go through `quote_ident`, the single identifier path; the only other interpolation
   is the workspace's `embedding_dimension`, a `u32` field, into `FLOAT[N]`. Vector literals
-  go through `embedding_literal` and are bound, not interpolated. File paths are bound as
+  go through `Vector::sql_literal` and are bound, not interpolated. File paths are bound as
   parameters to `read_csv_auto(?)`. Graph traversal issues one constant query per frontier
   with bound parameters — there is no recursive CTE (section 6.4).
 - Agent-generated and user-typed SQL: executed as-is through the permission layer

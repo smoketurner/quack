@@ -220,6 +220,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::embedding::Dimension;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -228,8 +229,11 @@ mod tests {
 
     fn writer() -> Arc<Writer> {
         Arc::new(
-            Writer::spawn(WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string())))
-                .unwrap_or_else(|e| fail(&e.to_string())),
+            Writer::spawn(
+                WorkspaceDb::open_in_memory(Dimension::new(4))
+                    .unwrap_or_else(|e| fail(&e.to_string())),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string())),
         )
     }
 

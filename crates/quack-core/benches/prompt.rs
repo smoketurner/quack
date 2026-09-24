@@ -18,6 +18,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
+use quack_core::embedding::Dimension;
 use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
@@ -31,7 +32,7 @@ const TABLES: usize = 150;
 const TABLE_ROWS: usize = 10_000;
 
 fn workspace() -> WorkspaceDb {
-    let db = WorkspaceDb::open_in_memory(EMBEDDING_DIM).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(EMBEDDING_DIM)).unwrap();
     for d in 0..DOCUMENTS {
         let doc_id = format!("doc-{d}");
         db.insert_document(

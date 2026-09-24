@@ -110,6 +110,26 @@ impl Vector {
     }
 }
 
+impl Vector {
+    /// The list literal `DuckDB` casts to `FLOAT[N]`. It is always bound as
+    /// a parameter, never interpolated.
+    #[must_use]
+    pub fn sql_literal(&self) -> String {
+        let inner: Vec<String> = self.iter().map(|v| format!("{v}")).collect();
+        format!("[{}]", inner.join(","))
+    }
+}
+
+/// Numbers whose width is their own length: a vector a caller already
+/// holds. Storing or searching with it still checks that width against the
+/// workspace's columns.
+impl From<Vec<f32>> for Vector {
+    fn from(values: Vec<f32>) -> Self {
+        let dimension = Dimension::new(u32::try_from(values.len()).unwrap_or(u32::MAX));
+        Self { values, dimension }
+    }
+}
+
 impl Deref for Vector {
     type Target = [f32];
 
@@ -150,6 +170,19 @@ impl ToSql for Fingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_literals_list_every_number() {
+        let literal = |values: Vec<f32>| Vector::from(values).sql_literal();
+        assert_eq!(literal(vec![1.0, 2.5, -3.0]), "[1,2.5,-3]");
+        assert_eq!(literal(vec![0.5]), "[0.5]");
+        assert_eq!(literal(Vec::new()), "[]");
+    }
+
+    #[test]
+    fn a_vector_from_numbers_is_as_wide_as_they_are() {
+        assert_eq!(Vector::from(vec![0.0; 3]).dimension(), Dimension::new(3));
+    }
 
     #[test]
     fn a_vector_is_made_only_at_its_width() {

@@ -58,7 +58,7 @@ pub(crate) async fn search(
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
     let result = app
-        .read(&id, move |db| query.run(db, embedding.as_deref(), &options))
+        .read(&id, move |db| query.run(db, embedding.as_ref(), &options))
         .await?;
     access
         .audit(

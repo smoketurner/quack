@@ -116,7 +116,7 @@ fn seed(db: &WorkspaceDb, chunks: u32, width: usize) {
             content: &format!("storm report {i}"),
             heading: Some("Reports"),
             page: None,
-            embedding: Some(&vector),
+            embedding: Some(&Vector::from(vector.clone())),
         })
         .unwrap();
     }
@@ -137,7 +137,7 @@ fn make_legacy(db: &WorkspaceDb, model: &str) {
 }
 
 fn vector_hits(db: &WorkspaceDb, width: usize) -> usize {
-    db.search_similar_chunks(&vec![1.0; width], 10, &ChunkScope::all())
+    db.search_similar_chunks(&Vector::from(vec![1.0; width]), 10, &ChunkScope::all())
         .unwrap()
         .len()
 }
@@ -188,7 +188,7 @@ fn vectors_made_before_prefixes_are_stale_for_a_prefixed_model() {
     let hybrid = db
         .search_hybrid_chunks(
             "storm",
-            &[1.0; 4],
+            &Vector::from(vec![1.0; 4]),
             HybridLimits {
                 top_k: 10,
                 rrf_k: 60,
@@ -223,7 +223,7 @@ async fn refresh_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
     let db = WorkspaceDb::open(&gemma, "ws").unwrap();
     assert_eq!(db.embedding_status().unwrap().stale_nodes, 1);
     assert!(
-        graph_store::nearest_nodes(&db, &[1.0; 4], None, 5)
+        graph_store::nearest_nodes(&db, &Vector::from(vec![1.0; 4]), None, 5)
             .unwrap()
             .is_empty(),
         "a stale label vector is not matched"
@@ -266,7 +266,7 @@ async fn refresh_brings_stale_chunks_and_nodes_up_to_date_with_the_role_prefixes
     );
     assert_eq!(vector_hits(&db, 4), 3);
     assert_eq!(
-        graph_store::nearest_nodes(&db, &[1.0; 4], None, 5)
+        graph_store::nearest_nodes(&db, &Vector::from(vec![1.0; 4]), None, 5)
             .unwrap()
             .len(),
         1

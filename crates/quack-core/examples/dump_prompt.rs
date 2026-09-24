@@ -8,6 +8,7 @@
 
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
+use quack_core::embedding::Dimension;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ClassId, DocumentId};
@@ -17,7 +18,7 @@ use quack_core::storage::sessions::ChatMode;
 use quack_core::storage::workspace::{DocumentStatus, NewDocument, WorkspaceDb};
 
 fn main() {
-    let db = WorkspaceDb::open_in_memory(4).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
     db.execute_statement("CREATE TABLE claims(id INT, amount INT, status VARCHAR)")
         .unwrap();
     db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")

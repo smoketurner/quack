@@ -8,12 +8,13 @@ use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
+use crate::text::Tokens;
 
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
-use super::text_to_sql::{self, Modeled, PromptOptions, SystemPrompt};
+use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphResults, GraphTools,
     ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
@@ -237,7 +238,69 @@ enum Window {
     /// The provider sizes its own.
     Provider,
     /// Ollama, asked for this `num_ctx`.
-    Ollama(u32),
+    Ollama(OllamaWindow),
+}
+
+/// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
+/// room for tool results and the answer, rounded up to 8,192, between
+/// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
+/// most workspace prompts, which loses the tool guidance and the question.
+///
+/// `num_ctx` is a load option: asking Ollama for a different value than
+/// the one the model is already loaded with forces a full model reload,
+/// which measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama
+/// serve`, repeated `/api/generate` calls that only changed `num_ctx`) —
+/// against single-digit milliseconds for a request that keeps the same
+/// value. A session's history only grows turn over turn until the
+/// history trim caps it, so the requested size is non-decreasing within
+/// a session; the step below is deliberately coarse (four tiers instead
+/// of one every 2,048 tokens) so a growing conversation crosses it, and
+/// pays that reload, at most three times instead of up to twelve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OllamaWindow(u32);
+
+impl OllamaWindow {
+    const HEADROOM: u32 = 8_192;
+    const FLOOR: u32 = 8_192;
+    const STEP: u32 = 8_192;
+
+    /// The window for a turn: the system prompt, the replayed history, and
+    /// the question, under `cap` (`[analysis].max_context_tokens`). Ollama
+    /// loads a model with a 4,096-token window unless the request says
+    /// otherwise and truncates the front of a longer prompt, which is where
+    /// the tool guidance is.
+    fn for_turn(
+        cap: u32,
+        system_prompt: &str,
+        history: &[rig::message::Message],
+        user_message: &str,
+    ) -> Self {
+        let history_chars = serde_json::to_string(history).map_or(0, |h| h.len());
+        let prompt = Tokens::of_chars(
+            system_prompt
+                .len()
+                .saturating_add(history_chars)
+                .saturating_add(user_message.len()),
+        );
+        if prompt.get() > cap {
+            tracing::warn!(
+                prompt_tokens = %prompt,
+                cap,
+                "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
+            );
+        }
+        Self::for_prompt(prompt, cap)
+    }
+
+    /// The window for a prompt of `prompt` tokens under `cap`.
+    fn for_prompt(prompt: Tokens, cap: u32) -> Self {
+        let needed = prompt.get().saturating_add(Self::HEADROOM);
+        let rounded = needed
+            .div_ceil(Self::STEP)
+            .saturating_mul(Self::STEP)
+            .max(Self::FLOOR);
+        Self(rounded.min(cap.max(Self::FLOOR)))
+    }
 }
 
 impl<M> Analysis<'_, M>
@@ -267,7 +330,12 @@ where
         } = PromptAndModel::read(&reader_db, &prompt).await?;
         let outputs = TurnOutputs::new(recorder.clone());
         let window = prompt.ollama_context_cap.map_or(Window::Provider, |cap| {
-            Window::Ollama(ollama_window(cap, &system_prompt, &history, user_message))
+            Window::Ollama(OllamaWindow::for_turn(
+                cap,
+                &system_prompt,
+                &history,
+                user_message,
+            ))
         });
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
@@ -343,31 +411,6 @@ where
             aggregate.or_else(|| per_call.reported()),
         ))
     }
-}
-
-/// The `num_ctx` for this turn (issue #40): Ollama loads a model with a
-/// 4,096-token window unless the request says otherwise and truncates
-/// the front of a longer prompt, which is where the tool guidance is.
-fn ollama_window(
-    cap: u32,
-    system_prompt: &str,
-    history: &[rig::message::Message],
-    user_message: &str,
-) -> u32 {
-    let history_chars = serde_json::to_string(history).map_or(0, |h| h.len());
-    let chars = system_prompt
-        .len()
-        .saturating_add(history_chars)
-        .saturating_add(user_message.len());
-    let prompt_tokens = chars.div_ceil(4);
-    if prompt_tokens > cap as usize {
-        tracing::warn!(
-            prompt_tokens,
-            cap,
-            "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
-        );
-    }
-    text_to_sql::ollama_context_size(chars, cap)
 }
 
 /// The answer text: what the model streamed for the last turn, else the
@@ -546,7 +589,7 @@ impl BuildContext<'_> {
                 ctx.outputs.recorder.clone(),
             ))
             .temperature(0.1);
-        if let Window::Ollama(num_ctx) = ctx.window {
+        if let Window::Ollama(OllamaWindow(num_ctx)) = ctx.window {
             // `keep_alive` is Ollama-only too (rig lifts it out of
             // `additional_params` into the request's top-level field, never
             // into `options`). Nothing was setting it, so every request fell
@@ -601,6 +644,17 @@ impl BuildContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ollama_window_rounds_up_within_bounds() {
+        let window = |tokens, cap| OllamaWindow::for_prompt(Tokens::new(tokens), cap).0;
+        assert_eq!(window(0, 32_768), 8_192);
+        assert_eq!(window(1_000, 32_768), 16_384);
+        // 12,875 prompt tokens plus headroom rounds to 24,576.
+        assert_eq!(window(12_875, 32_768), 24_576);
+        assert_eq!(window(100_000, 32_768), 32_768);
+        assert_eq!(window(100_000, 2_048), 8_192);
+    }
     use crate::ids::{ChunkId, DocumentId};
     use rig::completion::PromptError;
 
@@ -618,7 +672,8 @@ mod tests {
             chat_history: Box::new(Vec::new()),
         });
         assert!(StreamStop(&unknown).by_agent_loop());
-        let text = StreamStop(&unknown).explain(config.max_turns, Window::Ollama(8_192));
+        let text =
+            StreamStop(&unknown).explain(config.max_turns, Window::Ollama(OllamaWindow(8_192)));
         assert!(text.contains("container.exec"), "{text}");
         assert!(text.contains("max_context_tokens"), "{text}");
         let text = StreamStop(&unknown).explain(config.max_turns, Window::Provider);
@@ -759,7 +814,7 @@ mod tests {
             String::new(),
             Some(String::new()),
             None,
-            Window::Ollama(8_192),
+            Window::Ollama(OllamaWindow(8_192)),
         );
         assert!(empty.contains("max_context_tokens"), "{empty}");
         let empty = turn_text(String::new(), None, None, Window::Provider);

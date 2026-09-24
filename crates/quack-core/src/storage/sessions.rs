@@ -14,6 +14,7 @@ use crate::analysis::events::{ToolName, ToolStep};
 use crate::error::{Error, Record, Result};
 use crate::graph::GraphResult;
 use crate::ids::{MessageId, SessionId, UserId};
+use crate::text::Tokens;
 
 use super::workspace::WorkspaceDb;
 
@@ -520,12 +521,6 @@ pub fn record_turn(
     Ok(())
 }
 
-/// Rough token estimate used for trimming history: four characters per
-/// token, which errs on the side of sending less.
-fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
-}
-
 /// Prior user and assistant messages to replay to the model, newest last,
 /// trimmed from the oldest end to fit `token_budget`. Tool messages are not
 /// replayed; the assistant text already describes what the tools found.
@@ -539,17 +534,17 @@ pub fn history_for_model(
     token_budget: u32,
 ) -> Result<Vec<rig::message::Message>> {
     let stored = messages(db, session_id)?;
-    let budget = usize::try_from(token_budget).unwrap_or(usize::MAX);
+    let budget = Tokens::new(token_budget);
 
     let mut kept: Vec<rig::message::Message> = Vec::new();
-    let mut used = 0usize;
+    let mut used = Tokens::default();
     for row in stored.iter().rev() {
         let message = match row.role {
             MessageRole::User => rig::message::Message::user(row.content.clone()),
             MessageRole::Assistant => rig::message::Message::assistant(row.content.clone()),
             MessageRole::Tool => continue,
         };
-        let cost = estimate_tokens(&row.content);
+        let cost = Tokens::estimate(&row.content);
         if used.saturating_add(cost) > budget {
             break;
         }
@@ -716,6 +711,7 @@ pub fn delete_if_empty(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
 
     /// A flag enum reads the JSON boolean an API body carries and gives
     /// the same boolean back.
@@ -731,7 +727,8 @@ mod tests {
     }
 
     fn db() -> WorkspaceDb {
-        WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| open_failed(&e.to_string()))
+        WorkspaceDb::open_in_memory(Dimension::new(4))
+            .unwrap_or_else(|e| open_failed(&e.to_string()))
     }
 
     #[expect(clippy::panic, reason = "test helper: in-memory DuckDB must open")]
@@ -764,7 +761,8 @@ mod tests {
 
     #[test]
     fn delete_session_removes_its_messages_too() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let session =
             create_session(&db, "m", ChatMode::Chat, None).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(append_message(&db, &session.id, MessageRole::User, "hi", None).is_ok());
@@ -780,7 +778,8 @@ mod tests {
 
     #[test]
     fn created_by_filters_the_listing_unless_the_viewer_sees_all() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let mine = create_session(&db, "m", ChatMode::Chat, Some(&UserId::from("u1")))
             .unwrap_or_else(|e| fail(&e.to_string()));
         let theirs = create_session(&db, "m", ChatMode::Chat, Some(&UserId::from("u2")))

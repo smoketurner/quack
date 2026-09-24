@@ -109,6 +109,7 @@ pub fn list(db: &WorkspaceDb, limit: u32) -> Result<Vec<AuditDetailRow>> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::embedding::Dimension;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -117,7 +118,8 @@ mod tests {
 
     #[test]
     fn detail_rows_round_trip_newest_first() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let first = AuditId::generate();
         let second = AuditId::generate();
         assert!(

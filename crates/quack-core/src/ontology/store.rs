@@ -467,6 +467,7 @@ pub fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
     use crate::ids::ClassId;
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -475,7 +476,7 @@ mod tests {
     }
 
     fn db() -> WorkspaceDb {
-        WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()))
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()))
     }
 
     #[test]

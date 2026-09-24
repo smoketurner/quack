@@ -1170,6 +1170,7 @@ fn type_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
     use crate::graph::{Properties, Standing};
     use crate::ontology::induction::ItemKind;
     use crate::ontology::store::Revision;
@@ -1248,7 +1249,8 @@ mod tests {
     /// neither ingested nor proposed on re-import.
     #[test]
     fn export_carries_ids_resolved_links_the_ontology_and_no_audit() {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| unreachable_db(&e.to_string()));
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
+            .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         let mut ontology = Ontology::builtin_default();
         ontology.classes.push(ontology::Class {
             id: ClassId::from("harbour"),

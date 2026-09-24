@@ -749,6 +749,7 @@ pub enum Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
     use crate::ontology::OntologyVersion;
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -757,7 +758,8 @@ mod tests {
     }
 
     fn db() -> WorkspaceDb {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         for sql in [
             "CREATE TABLE policies (policy_number TEXT, holder TEXT, effective DATE, premium DOUBLE)",
             "CREATE TABLE claims (claim_id INTEGER, policy_number TEXT, amount DOUBLE, status TEXT, filed TEXT, active BOOLEAN)",

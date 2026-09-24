@@ -771,6 +771,7 @@ fn propose_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Dimension;
     use crate::extraction::{Extract, ExtractFuture, parse_answer};
     use crate::progress::ChunkDone;
     use crate::progress::RunControl;
@@ -800,7 +801,8 @@ mod tests {
     }
 
     fn workspace_with_docs() -> WorkspaceDb {
-        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         for d in 1..=4 {
             let doc = format!("doc{d}");
             assert!(

@@ -30,6 +30,59 @@ impl fmt::Display for Count<'_> {
     }
 }
 
+/// A count of model tokens. Everything quack sizes before a call (the
+/// history trim, pinned text, the workspace context, Ollama's window)
+/// estimates at four characters per token, which errs on the side of
+/// sending less; a provider's own count is `analysis::agent::TokenUsage`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tokens(u32);
+
+impl Tokens {
+    const CHARS_PER_TOKEN: usize = 4;
+
+    #[must_use]
+    pub const fn new(count: u32) -> Self {
+        Self(count)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The estimate for `text`.
+    #[must_use]
+    pub fn estimate(text: &str) -> Self {
+        Self::of_chars(text.len())
+    }
+
+    /// The estimate for this many characters.
+    #[must_use]
+    pub fn of_chars(chars: usize) -> Self {
+        Self(u32::try_from(chars.div_ceil(Self::CHARS_PER_TOKEN)).unwrap_or(u32::MAX))
+    }
+
+    /// How many characters this many tokens covers, for cutting text to a
+    /// budget.
+    #[must_use]
+    pub fn chars(self) -> usize {
+        usize::try_from(self.0)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(Self::CHARS_PER_TOKEN)
+    }
+
+    #[must_use]
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+}
+
+impl fmt::Display for Tokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -700,7 +700,7 @@ fn workspace_db_chunk_with_embedding() {
     )
     .unwrap();
 
-    let embedding = [0.5_f32, 0.3, -0.2, 0.8];
+    let embedding = Vector::from(vec![0.5_f32, 0.3, -0.2, 0.8]);
     db.insert_chunk(&NewChunk {
         id: &ChunkId::from("c1"),
         document_id: &DocumentId::from("doc-1"),
@@ -811,7 +811,7 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
         content: "flood exclusion",
         heading: None,
         page: None,
-        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -821,11 +821,11 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
         content: "claims timeline",
         heading: None,
         page: None,
-        embedding: Some(&[0.9, 0.1, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![0.9, 0.1, 0.0, 0.0])),
     })
     .unwrap();
 
-    let query = [1.0_f32, 0.0, 0.0, 0.0];
+    let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
 
     let all = db
         .search_similar_chunks(&query, 5, &ChunkScope::all())
@@ -878,7 +878,7 @@ fn workspace_db_search_similar_chunks() {
         content: "first chunk",
         heading: None,
         page: None,
-        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -888,7 +888,7 @@ fn workspace_db_search_similar_chunks() {
         content: "second chunk",
         heading: None,
         page: None,
-        embedding: Some(&[0.0, 1.0, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -898,11 +898,11 @@ fn workspace_db_search_similar_chunks() {
         content: "third chunk",
         heading: None,
         page: None,
-        embedding: Some(&[0.7, 0.7, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![0.7, 0.7, 0.0, 0.0])),
     })
     .unwrap();
 
-    let query = [1.0_f32, 0.0, 0.0, 0.0];
+    let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
     let results = db
         .search_similar_chunks(&query, 3, &ChunkScope::all())
         .unwrap();
@@ -921,7 +921,7 @@ fn kind(db: &WorkspaceDb, sql: &str) -> StatementKind {
 
 #[test]
 fn classify_select_shapes_as_read() {
-    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(TEST_DIM_U32)).unwrap();
     db.execute_statement("CREATE TABLE t(a INT, b INT)")
         .unwrap();
     for sql in [
@@ -943,7 +943,7 @@ fn classify_select_shapes_as_read() {
 
 #[test]
 fn classify_mutations_and_escapes_as_write() {
-    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(TEST_DIM_U32)).unwrap();
     for sql in [
         "CREATE TABLE t(a INT)",
         "DROP TABLE t",
@@ -974,7 +974,7 @@ fn classify_mutations_and_escapes_as_write() {
 /// never checks `Need::WRITE` for a `Read`-classified statement.
 #[test]
 fn explain_analyze_is_write_and_does_not_mutate_through_read_only() {
-    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(TEST_DIM_U32)).unwrap();
     db.execute_statement("CREATE TABLE t(a INT)").unwrap();
     db.execute_statement("INSERT INTO t VALUES (1)").unwrap();
 
@@ -998,14 +998,14 @@ fn explain_analyze_is_write_and_does_not_mutate_through_read_only() {
 
 #[test]
 fn classify_syntax_errors_as_invalid() {
-    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(TEST_DIM_U32)).unwrap();
     assert!(matches!(kind(&db, "SELEC 1"), StatementKind::Invalid(_)));
     assert!(matches!(kind(&db, ""), StatementKind::Invalid(_)));
 }
 
 #[test]
 fn internal_tables_are_detected_in_parsed_and_unparsed_statements() {
-    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(TEST_DIM_U32)).unwrap();
     db.execute_statement("CREATE TABLE sales(a INT)").unwrap();
     assert!(
         db.references_internal_table("SELECT * FROM _quack_chunks")
@@ -1046,7 +1046,7 @@ fn internal_tables_are_detected_in_parsed_and_unparsed_statements() {
 
 #[test]
 fn long_running_statement_is_interrupted_at_timeout() {
-    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32)
+    let db = WorkspaceDb::open_in_memory(Dimension::new(TEST_DIM_U32))
         .unwrap()
         .with_query_timeout(std::time::Duration::from_millis(200));
     let started = std::time::Instant::now();
@@ -1155,7 +1155,7 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
             content: "x",
             heading: None,
             page: None,
-            embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+            embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
         })
         .unwrap();
     }
@@ -1169,7 +1169,7 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
     assert_eq!(db.embedding_dimension(), Dimension::new(4));
     assert!(!db.embedding_dimension().fits(8));
     assert!(
-        db.search_similar_chunks(&[0.5; 8], 5, &ChunkScope::all())
+        db.search_similar_chunks(&Vector::from(vec![0.5; 8]), 5, &ChunkScope::all())
             .unwrap()
             .is_empty()
     );
@@ -1287,7 +1287,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         content: "y",
         heading: None,
         page: None,
-        embedding: Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -1297,7 +1297,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         content: "y",
         heading: None,
         page: None,
-        embedding: Some(&[0.5; 8]),
+        embedding: Some(&Vector::from(vec![0.5; 8])),
     })
     .unwrap();
 }
@@ -1383,7 +1383,7 @@ async fn ingest_csv_with_quote_in_filename() {
 
 #[test]
 fn describe_table_handles_quoted_identifier() {
-    let db = WorkspaceDb::open_in_memory(TEST_DIM_U32).unwrap();
+    let db = WorkspaceDb::open_in_memory(Dimension::new(TEST_DIM_U32)).unwrap();
     db.execute_statement("CREATE TABLE \"odd \"\"name\"\"\" (x INT)")
         .unwrap();
     db.execute_statement("INSERT INTO \"odd \"\"name\"\"\" VALUES (7)")
@@ -1426,7 +1426,7 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
         content: "Flood damage is excluded from coverage.",
         heading: Some("Exclusions"),
         page: Some(12),
-        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -1436,7 +1436,7 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
         content: "Policy POL-8841 renews every March.",
         heading: None,
         page: None,
-        embedding: Some(&[0.0, 1.0, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
@@ -1446,7 +1446,7 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
         content: "Claims close within thirty days of filing.",
         heading: Some("Claims"),
         page: None,
-        embedding: Some(&[0.0, 0.0, 1.0, 0.0]),
+        embedding: Some(&Vector::from(vec![0.0, 0.0, 1.0, 0.0])),
     })
     .unwrap();
     db
@@ -1458,7 +1458,11 @@ fn chunk_metadata_round_trips_through_search() {
     let config = test_config(dir.path());
     let db = seeded_for_search(&config, "ws-meta-search");
     let hits = db
-        .search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 1, &ChunkScope::all())
+        .search_similar_chunks(
+            &Vector::from(vec![1.0, 0.0, 0.0, 0.0]),
+            1,
+            &ChunkScope::all(),
+        )
         .unwrap();
     let top = hits.first().unwrap();
     assert_eq!(top.id, ChunkId::from("a0"));
@@ -1482,7 +1486,7 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
         vec!["a0"]
     );
     let vector = db
-        .search_similar_chunks(&[0.0, 0.0, 1.0, 0.0], 5, &only_a0)
+        .search_similar_chunks(&Vector::from(vec![0.0, 0.0, 1.0, 0.0]), 5, &only_a0)
         .unwrap();
     assert_eq!(
         vector.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
@@ -1492,7 +1496,7 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
     let hybrid = db
         .search_hybrid_chunks(
             "claims",
-            &[0.0, 0.0, 1.0, 0.0],
+            &Vector::from(vec![0.0, 0.0, 1.0, 0.0]),
             HybridLimits {
                 top_k: 5,
                 rrf_k: 60,
@@ -1520,7 +1524,7 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
             .is_empty()
     );
     assert!(
-        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &nothing)
+        db.search_similar_chunks(&Vector::from(vec![1.0, 0.0, 0.0, 0.0]), 5, &nothing)
             .unwrap()
             .is_empty()
     );
@@ -1664,7 +1668,7 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     let hits = db
         .search_hybrid_chunks(
             "POL-8841",
-            &[1.0, 0.0, 0.0, 0.0],
+            &Vector::from(vec![1.0, 0.0, 0.0, 0.0]),
             HybridLimits {
                 top_k: 3,
                 rrf_k: 60,
@@ -1683,7 +1687,7 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     let limited = db
         .search_hybrid_chunks(
             "flood",
-            &[1.0, 0.0, 0.0, 0.0],
+            &Vector::from(vec![1.0, 0.0, 0.0, 0.0]),
             HybridLimits {
                 top_k: 1,
                 rrf_k: 60,
@@ -2238,7 +2242,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
         content: "zebra crossing",
         heading: None,
         page: None,
-        embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
     assert!(
@@ -2247,9 +2251,13 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
             .is_empty()
     );
     assert!(
-        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &ChunkScope::all())
-            .unwrap()
-            .is_empty()
+        db.search_similar_chunks(
+            &Vector::from(vec![1.0, 0.0, 0.0, 0.0]),
+            5,
+            &ChunkScope::all()
+        )
+        .unwrap()
+        .is_empty()
     );
     db.update_document_status(&DocumentId::from("d"), DocumentStatus::Ready)
         .unwrap();
@@ -2260,9 +2268,13 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
         1
     );
     assert_eq!(
-        db.search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 5, &ChunkScope::all())
-            .unwrap()
-            .len(),
+        db.search_similar_chunks(
+            &Vector::from(vec![1.0, 0.0, 0.0, 0.0]),
+            5,
+            &ChunkScope::all()
+        )
+        .unwrap()
+        .len(),
         1
     );
 
