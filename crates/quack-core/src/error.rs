@@ -44,6 +44,14 @@ pub enum Error {
     #[error("{record} '{id}' does not exist")]
     NotFound { record: Record, id: String },
 
+    /// An id prefix the caller gave names more than one record.
+    #[error("'{prefix}' matches {count} {record}s; use more of the id")]
+    Ambiguous {
+        record: Record,
+        prefix: String,
+        count: usize,
+    },
+
     /// Another process holds the workspace file open.
     #[error("workspace file {} is open in another quack process", path.display())]
     WorkspaceLocked { path: PathBuf },
@@ -140,6 +148,7 @@ pub enum Record {
     OntologyVersion,
     MergeProposal,
     Candidate,
+    Token,
 }
 
 text_enum!(Record, "record", {
@@ -148,6 +157,7 @@ text_enum!(Record, "record", {
     OntologyVersion => "ontology version",
     MergeProposal => "merge proposal",
     Candidate => "candidate",
+    Token => "token",
 });
 
 impl Record {

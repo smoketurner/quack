@@ -6,6 +6,7 @@ use pdf_oxide::editor::DocumentInfo;
 use super::{html, office};
 use crate::error::{Error, Result};
 use crate::okf::parse_front_matter;
+use crate::text::NonBlankText;
 
 /// Recognized file types for ingestion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,8 +120,7 @@ impl Extracted {
     pub fn title(&self) -> Option<&str> {
         self.title
             .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
+            .and_then(str::non_blank)
             .or_else(|| title_of(&self.sections))
     }
 }
@@ -236,8 +236,7 @@ fn title_of(sections: &[Section]) -> Option<&str> {
     sections
         .first()
         .and_then(|s| s.heading.as_deref())
-        .map(str::trim)
-        .filter(|h| !h.is_empty())
+        .and_then(str::non_blank)
 }
 
 fn utf8(data: &[u8]) -> Result<String> {

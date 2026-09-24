@@ -14,12 +14,13 @@
 
 use std::sync::Arc;
 
+use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::embedding::{Input, Vector};
-use quack_core::llm;
+use quack_core::embedding::Input;
+use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
 use quack_core::storage::control::{
@@ -43,8 +44,8 @@ use serde::Deserialize;
 use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
 use quack_core::error::Result as CoreResult;
-use quack_core::graph::traverse::Hops;
-use quack_core::graph::{GraphResult, traverse};
+use quack_core::graph::query::{GraphQuery, PathQuery};
+use quack_core::graph::traverse;
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
 /// server's access log and the workspace detail table for HTTP.
@@ -382,14 +383,8 @@ impl McpServer {
                     .await?;
                 let mut text = response.content.clone();
                 if !response.citations.is_empty() {
-                    text.push_str("\n\nSources:\n");
-                    for c in &response.citations {
-                        text.push_str("  [");
-                        text.push_str(&c.n.to_string());
-                        text.push_str("] ");
-                        text.push_str(&c.label());
-                        text.push('\n');
-                    }
+                    let sources = format!("\n\n{}\n", Sources(&response.citations));
+                    text.push_str(&sources);
                 }
                 if response.write_refused {
                     text.push_str(
@@ -602,52 +597,31 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SearchGraphArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let entity = args
-            .entity
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-            .map(str::to_owned);
-        let class = args
-            .class
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .map(str::to_owned);
-        if entity.is_none() && class.is_none() {
-            return Ok(failure(
-                "give an entity to start from, a class to list, or both",
-            ));
-        }
-        let embedding = match &entity {
-            Some(e) => self.embed(e).await?,
-            None => None,
+        let query = match GraphQuery::new(
+            args.entity.as_deref(),
+            args.class.as_deref(),
+            args.relation.as_deref(),
+            args.hops,
+        ) {
+            Ok(query) => query,
+            Err(e) => return Ok(failure(e.to_string())),
         };
-        let hops = Hops::neighborhood(args.hops);
-        let relation = args.relation.clone();
+        let embedding = query
+            .embedding(self.embedder().await?.as_ref())
+            .await
+            .map_err(internal)?;
         let options = self.inner.config.graph.options();
-        let detail = serde_json::json!({ "entity": entity, "class": class, "relation": relation, "hops": hops });
-        let result = self
-            .reader_db(move |db| {
-                if let Some(entity) = entity {
-                    let roots = traverse::resolve_entry(
-                        db,
-                        &entity,
-                        class.as_deref(),
-                        embedding.as_deref(),
-                    )?;
-                    return traverse::neighborhood(db, &roots, hops, relation.as_deref(), &options);
-                }
-                let ontology = ontology_store::current(db)?;
-                traverse::by_class(
-                    db,
-                    ontology.as_ref(),
-                    class.as_deref().unwrap_or_default(),
-                    options.max_nodes,
-                    &options,
-                )
-            })
-            .await?;
+        let detail = serde_json::to_value(&query).map_err(internal)?;
+        let result = match self
+            .inner
+            .reader
+            .with_db(move |db| query.run(db, embedding.as_deref(), &options))
+            .await
+        {
+            Ok(result) => result,
+            // An unknown class or relation id names the real ones.
+            Err(e) => return Ok(failure(e.to_string())),
+        };
         self.inner
             .auditor
             .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
@@ -665,27 +639,27 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<FindPathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let from = args.from.trim().to_owned();
-        let to = args.to.trim().to_owned();
-        if from.is_empty() || to.is_empty() {
-            return Ok(failure("both entities are needed"));
-        }
-        let a = self.embed(&from).await?;
-        let b = self.embed(&to).await?;
-        let max_hops = Hops::path(args.max_hops);
+        let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
+            Ok(query) => query,
+            Err(e) => return Ok(failure(e.to_string())),
+        };
+        let ends = query
+            .embeddings(self.embedder().await?.as_ref())
+            .await
+            .map_err(internal)?;
         let options = self.inner.config.graph.options();
-        let detail = serde_json::json!({ "from": from, "to": to, "max_hops": max_hops });
-        let (from_label, to_label) = (from.clone(), to.clone());
-        let result = self
-            .reader_db(move |db| {
-                let from_nodes = traverse::resolve_entry(db, &from_label, None, a.as_deref())?;
-                let to_nodes = traverse::resolve_entry(db, &to_label, None, b.as_deref())?;
-                match (from_nodes.first(), to_nodes.first()) {
-                    (Some(a), Some(b)) => traverse::path(db, a, b, max_hops, &options),
-                    _ => Ok(GraphResult::default()),
-                }
-            })
-            .await?;
+        let detail = serde_json::to_value(&query).map_err(internal)?;
+        let PathQuery { from, to, max_hops } = query.clone();
+        let result = match self
+            .inner
+            .reader
+            .with_db(move |db| query.run(db, &ends, &options))
+            .await
+        {
+            Ok(result) => result,
+            // An end that names no entity comes back with the closest labels.
+            Err(e) => return Ok(failure(e.to_string())),
+        };
         self.inner
             .auditor
             .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
@@ -722,19 +696,10 @@ impl McpServer {
 }
 
 impl McpServer {
-    /// A label's embedding for fuzzy entity resolution: `None` without a
-    /// model, an error when the model fails.
-    async fn embed(&self, text: &str) -> Result<Option<Vector>, McpError> {
-        let Some(model) = llm::optional_embedding_model(&self.inner.config)
+    /// The embedding model, for fuzzy entity resolution; `None` without one.
+    async fn embedder(&self) -> Result<Option<Embeddings>, McpError> {
+        llm::optional_embedding_model(&self.inner.config)
             .await
-            .map_err(internal)?
-        else {
-            return Ok(None);
-        };
-        model
-            .embed_interactive(&Input::Similarity(text.to_owned()))
-            .await
-            .map(Some)
             .map_err(internal)
     }
 

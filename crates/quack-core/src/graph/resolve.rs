@@ -11,6 +11,7 @@ use rig::embeddings::EmbeddingModel;
 use super::{GraphOptions, Node, store};
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Record, Result};
+use crate::prefix::PrefixMatch;
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{WorkspaceDb, tokenize};
 use crate::storage::writer::Writer;
@@ -497,20 +498,7 @@ pub fn pending(db: &WorkspaceDb) -> Result<Vec<MergeProposal>> {
 ///
 /// Returns an error when nothing or more than one proposal matches.
 pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<MergeProposal> {
-    let matches: Vec<MergeProposal> = pending(db)?
-        .into_iter()
-        .filter(|m| m.id.starts_with(prefix))
-        .collect();
-    match matches.len() {
-        0 => Err(Record::MergeProposal.missing(prefix)),
-        1 => matches
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Analysis(String::from("merge vanished"))),
-        n => Err(Error::Analysis(format!(
-            "'{prefix}' matches {n} merges; use more of the id"
-        ))),
-    }
+    PrefixMatch::of(pending(db)?, prefix, |m| m.id.as_str()).one(Record::MergeProposal, prefix)
 }
 
 /// Record a reviewer's answer to a pending proposal (full id or unique

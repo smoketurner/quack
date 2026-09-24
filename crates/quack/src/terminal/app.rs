@@ -18,13 +18,14 @@ use tokio::sync::{broadcast, mpsc};
 
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::chart::ChartSpec;
-use quack_core::analysis::citations::Citation;
+use quack_core::analysis::citations::{Citation, Sources};
 use quack_core::analysis::events::{self, AgentEvent, PermissionRequest, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::graph::traverse::{self, Hops};
+use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
+use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
+use quack_core::graph::traverse;
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::jobs::{
@@ -33,12 +34,12 @@ use quack_core::jobs::{
 };
 use quack_core::llm;
 use quack_core::okf;
-use quack_core::ontology::store as ontology_store;
+use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, MessageRole};
-use quack_core::storage::workspace::{DocumentInfo, QueryCanceller, StatementKind, WorkspaceDb};
+use quack_core::storage::workspace::{QueryCanceller, StatementKind, WorkspaceDb};
 
 use crate::ModeArg;
 use crate::embeddings_cli::{self, EmbeddingsAction};
@@ -124,11 +125,7 @@ impl Message {
 
     /// The sources an answer cited, numbered as it cites them.
     fn sources(citations: &[Citation]) -> Self {
-        let lines: Vec<String> = citations
-            .iter()
-            .map(|c| format!("\n  [{}] {}", c.n, c.label()))
-            .collect();
-        Self::new(MessageKind::System, format!("Sources:{}", lines.concat()))
+        Self::new(MessageKind::System, Sources(citations).to_string())
     }
 }
 
@@ -1766,16 +1763,14 @@ impl App {
         self.on_db(
             Side::Read,
             move |db| {
-                let matches: Vec<String> = sessions::list_sessions(db, 1000)?
-                    .into_iter()
-                    .filter(|s| s.id.starts_with(&prefix))
-                    .map(|s| s.id)
-                    .collect();
-                let found = match matches.as_slice() {
-                    [id] if *id == current => Found::Current,
-                    [id] => Found::One(Replay::load(db, id)?),
-                    [] => Found::None(prefix),
-                    _ => Found::Many(prefix, matches),
+                let sessions = sessions::list_sessions(db, 1000)?;
+                let found = match PrefixMatch::of(sessions, &prefix, |s| s.id.as_str()) {
+                    PrefixMatch::One(session) if session.id == current => Found::Current,
+                    PrefixMatch::One(session) => Found::One(Replay::load(db, &session.id)?),
+                    PrefixMatch::None => Found::None(prefix),
+                    PrefixMatch::Many(sessions) => {
+                        Found::Many(prefix, sessions.into_iter().map(|s| s.id).collect())
+                    }
                 };
                 Ok(found)
             },
@@ -1921,7 +1916,8 @@ impl App {
         self.on_db_ok(
             Side::Write,
             move |db| {
-                let doc = resolve_document(db, &prefix)?;
+                let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
+                    .one(Record::Document, &prefix)?;
                 db.delete_document(&doc.id).map(|_| doc.filename)
             },
             |app, filename| {
@@ -1994,19 +1990,27 @@ impl App {
     /// neighbourhood or of the class's entities.
     fn show_graph(&mut self, walk: GraphWalk) {
         let options = self.config.graph.options();
+        let query = match walk {
+            GraphWalk::Class(class) => GraphQuery::new(None, Some(&class), None, None),
+            GraphWalk::Entity { name, hops } => {
+                GraphQuery::new(Some(&name), None, None, Some(hops.get()))
+            }
+        };
+        let query = match query {
+            Ok(query) => query,
+            Err(e) => return self.note(MessageKind::Error, e.to_string()),
+        };
         self.on_db_ok(
             Side::Read,
-            move |db| match walk {
-                GraphWalk::Class(class) => {
-                    let ontology = ontology_store::current(db)?;
-                    traverse::by_class(db, ontology.as_ref(), &class, options.max_nodes, &options)
-                }
-                GraphWalk::Entity { name, hops } => {
-                    let roots = traverse::resolve_entry(db, &name, None, None)?;
-                    if roots.is_empty() {
-                        return Err(CoreError::Analysis(format!("no entity matches '{name}'")));
+            move |db| {
+                let result = query.run(db, None, &options)?;
+                // A walk from an entity always holds that entity, so an
+                // empty one means the name resolved to nothing.
+                match query.entity.as_deref() {
+                    Some(name) if result.nodes.is_empty() => {
+                        Err(UnknownEntity::find(db, name, None).into())
                     }
-                    traverse::neighborhood(db, &roots, hops, None, &options)
+                    Some(_) | None => Ok(result),
                 }
             },
             |app, result| app.note(MessageKind::System, traverse::render_tree(&result)),
@@ -2016,28 +2020,21 @@ impl App {
     /// `/path FROM -> TO`: the shortest relation chain.
     fn show_path(&mut self, route: Route) {
         let options = self.config.graph.options();
-        let shown = route.clone();
+        let query = match PathQuery::new(&route.from, &route.to, None) {
+            Ok(query) => query,
+            Err(e) => return self.note(MessageKind::Error, e.to_string()),
+        };
+        let shown = query.clone();
         self.on_db_ok(
             Side::Read,
-            move |db| {
-                let Route { from, to } = route;
-                let a = traverse::resolve_entry(db, &from, None, None)?;
-                let b = traverse::resolve_entry(db, &to, None, None)?;
-                match (a.first(), b.first()) {
-                    (Some(a), Some(b)) => traverse::path(db, a, b, Hops::PATH, &options),
-                    (None, _) => Err(CoreError::Analysis(format!("no entity matches '{from}'"))),
-                    (_, None) => Err(CoreError::Analysis(format!("no entity matches '{to}'"))),
-                }
-            },
+            move |db| query.run(db, &PathEnds::default(), &options),
             move |app, result| {
                 if result.is_empty() {
                     app.note(
                         MessageKind::System,
                         format!(
                             "No path connects {} and {} within {} hops.",
-                            shown.from,
-                            shown.to,
-                            Hops::PATH
+                            shown.from, shown.to, shown.max_hops
                         ),
                     );
                 } else {
@@ -2073,7 +2070,8 @@ impl App {
         self.on_db_ok(
             Side::Write,
             move |db| {
-                let doc = resolve_document(db, &prefix)?;
+                let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
+                    .one(Record::Document, &prefix)?;
                 db.set_document_pinned(&doc.id, pinned).map(|()| doc.id)
             },
             move |app, id| {
@@ -2436,26 +2434,6 @@ impl App {
                 _ => self.note(MessageKind::Error, err),
             },
         }
-    }
-}
-
-/// The document whose id starts with `prefix`, when exactly one does.
-fn resolve_document(db: &WorkspaceDb, prefix: &str) -> CoreResult<DocumentInfo> {
-    let mut matches: Vec<DocumentInfo> = db
-        .list_documents()?
-        .into_iter()
-        .filter(|d| d.id.starts_with(prefix))
-        .collect();
-    match matches.len() {
-        1 => matches
-            .pop()
-            .ok_or_else(|| CoreError::Ingestion(String::from("document vanished"))),
-        0 => Err(CoreError::Ingestion(format!(
-            "no document matches '{prefix}'"
-        ))),
-        n => Err(CoreError::Ingestion(format!(
-            "'{prefix}' matches {n} documents; use more of the id"
-        ))),
     }
 }
 

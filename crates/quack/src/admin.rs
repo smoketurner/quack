@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use quack_core::config::Config;
 use quack_core::csv::CsvField;
+use quack_core::error::Record;
+use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, ResourceKind, Role,
     Scope, WorkspaceRow,
@@ -254,21 +256,11 @@ async fn list_tokens(control: &ControlPlane, ws: &WorkspaceRow, json: bool) -> R
 }
 
 async fn revoke_token(control: &ControlPlane, ws: &WorkspaceRow, prefix: &str) -> Result<()> {
-    let matches: Vec<String> = control
-        .list_tokens(&ws.id)
-        .await?
-        .into_iter()
-        .filter(|t| t.token_hash.starts_with(prefix))
-        .map(|t| t.token_hash)
-        .collect();
-    let hash = match matches.as_slice() {
-        [one] => one.clone(),
-        [] => anyhow::bail!("no token in '{}' matches '{prefix}'", ws.name),
-        many => anyhow::bail!(
-            "'{prefix}' matches {} tokens; use more of the hash",
-            many.len()
-        ),
-    };
+    let hash = PrefixMatch::of(control.list_tokens(&ws.id).await?, prefix, |t| {
+        t.token_hash.as_str()
+    })
+    .one(Record::Token, prefix)?
+    .token_hash;
     control.delete_token(&hash).await?;
     let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
     entry.workspace_id = Some(ws.id.clone());

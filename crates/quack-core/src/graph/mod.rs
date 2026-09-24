@@ -10,6 +10,7 @@
 //! workspace file.
 
 pub mod extract;
+pub mod query;
 pub mod resolve;
 pub mod store;
 pub mod tables;

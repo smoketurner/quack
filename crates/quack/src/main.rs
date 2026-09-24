@@ -19,12 +19,13 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::{AuthMode, Config};
 use quack_core::doctor::Options;
-use quack_core::error::Error as CoreError;
+use quack_core::error::{Error as CoreError, Record};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::oauth::{self, LoginOptions, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::{Ontology, candidates, store as ontology_store};
+use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
@@ -1320,17 +1321,9 @@ fn run_docs(
 
 /// Resolve a full document id or a unique prefix.
 fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<String> {
-    let matches: Vec<String> = db
-        .list_documents()?
-        .into_iter()
-        .filter(|d| d.id.starts_with(prefix))
-        .map(|d| d.id)
-        .collect();
-    match matches.len() {
-        0 => anyhow::bail!("no document matches '{prefix}'; run `quack docs`"),
-        1 => matches.into_iter().next().context("document vanished"),
-        n => anyhow::bail!("'{prefix}' matches {n} documents; use more of the id"),
-    }
+    let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
+        .one(Record::Document, prefix)?;
+    Ok(document.id)
 }
 
 fn list_documents(db: &WorkspaceDb, json: bool, out: &mut impl Write) -> Result<()> {
@@ -1368,15 +1361,12 @@ fn find_session(db: &WorkspaceDb, prefix: &str) -> Result<sessions::SessionRow> 
     if let Some(exact) = sessions::get_session(db, prefix)? {
         return Ok(exact);
     }
-    let matches: Vec<sessions::SessionRow> = sessions::list_sessions(db, 1000)?
-        .into_iter()
-        .filter(|s| s.id.starts_with(prefix))
-        .collect();
-    match matches.len() {
-        0 => anyhow::bail!("no session matches '{prefix}'; run `quack sessions`"),
-        1 => matches.into_iter().next().context("session vanished"),
-        n => anyhow::bail!("'{prefix}' matches {n} sessions; use more of the id"),
-    }
+    Ok(
+        PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
+            s.id.as_str()
+        })
+        .one(Record::Session, prefix)?,
+    )
 }
 
 fn list_sessions(db: &WorkspaceDb, json: bool, limit: u32) -> Result<()> {

@@ -13,6 +13,7 @@ use quack_core::error::Record;
 use quack_core::ingestion;
 use quack_core::jobs::{JobId, LaneKey};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::text::NonBlankText;
 use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need};
@@ -185,8 +186,7 @@ impl IncomingFile {
             return Err(ApiError::bad_request("text must not be empty"));
         }
         let title = title
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
+            .and_then(str::non_blank)
             .unwrap_or("pasted")
             .to_owned();
         let has_text_extension = std::path::Path::new(&title)

@@ -31,6 +31,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::priority::{Priority, with_priority};
 use crate::storage::control::sha256_hex;
+use crate::text::NonBlankText;
 
 /// The placeholder a document prefix may carry for the chunk's title.
 pub const TITLE_PLACEHOLDER: &str = "{title}";
@@ -77,8 +78,7 @@ impl Prompts {
             Input::Document { title, text } if self.document.contains(TITLE_PLACEHOLDER) => {
                 let title = title
                     .as_deref()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
+                    .and_then(str::non_blank)
                     .unwrap_or(NO_TITLE);
                 format!("{}{text}", self.document.replace(TITLE_PLACEHOLDER, title))
             }
@@ -239,6 +239,18 @@ impl<M: EmbeddingModel> Embedder<M> {
     /// width.
     pub async fn embed_interactive(&self, input: &Input) -> Result<Vector> {
         with_priority(Priority::Interactive, self.embed_one(input)).await
+    }
+
+    /// A label or name, embedded to be compared with entity labels, for
+    /// someone waiting on the answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model fails or answers with the wrong
+    /// width.
+    pub async fn similarity(&self, text: &str) -> Result<Vector> {
+        self.embed_interactive(&Input::Similarity(text.to_owned()))
+            .await
     }
 
     /// One input's vector.
