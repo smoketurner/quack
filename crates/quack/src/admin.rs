@@ -5,7 +5,7 @@
 use std::io::{IsTerminal, Write};
 
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
 use quack_core::error::Record;
 use quack_core::ids::WorkspaceId;
@@ -132,30 +132,21 @@ pub(crate) struct AuditArgs {
     /// Rows to show, newest first; 0 for the whole log
     #[arg(long, default_value_t = 100)]
     limit: u32,
-    /// One JSON object per row
-    #[arg(long, conflicts_with = "csv")]
-    json: bool,
-    /// Comma-separated values with a header
-    #[arg(long)]
-    csv: bool,
+    #[arg(long, value_enum, default_value_t = AuditFormat::Text)]
+    format: AuditFormat,
 }
 
-/// How `quack audit` prints: a listing (text or one JSON object per row),
-/// or CSV with a header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How `quack audit` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AuditFormat {
-    Rows(TextOrJson),
+    /// One line per row
+    Text,
+    /// One JSON object per row
+    Json,
+    /// Comma-separated values with a header
     Csv,
-}
-
-impl AuditArgs {
-    const fn format(&self) -> AuditFormat {
-        if self.csv {
-            AuditFormat::Csv
-        } else {
-            AuditFormat::Rows(TextOrJson::of(self.json))
-        }
-    }
+    /// One OCSF 1.9.0 event per line, for a SIEM or an archive
+    Ocsf,
 }
 
 pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> {
@@ -379,7 +370,7 @@ fn member_entry(ws: &WorkspaceRow, user_id: &str) -> AuditEntry {
 }
 
 pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
-    let format = args.format();
+    let format = args.format;
     let control = ControlPlane::open(config).await?;
     let user_id = match args.user.as_deref() {
         Some(name) => Some(
@@ -435,6 +426,7 @@ const AUDIT_PAGE: u32 = 1_000;
 enum AuditOutput<W: Write> {
     Csv(Box<csv::Writer<W>>),
     Rows(TextOrJson, W),
+    Ocsf(W),
 }
 
 impl<W: Write> AuditOutput<W> {
@@ -460,7 +452,9 @@ impl<W: Write> AuditOutput<W> {
                 ])?;
                 Self::Csv(Box::new(writer))
             }
-            AuditFormat::Rows(format) => Self::Rows(format, out),
+            AuditFormat::Text => Self::Rows(TextOrJson::Text, out),
+            AuditFormat::Json => Self::Rows(TextOrJson::Json, out),
+            AuditFormat::Ocsf => Self::Ocsf(out),
         })
     }
 
@@ -469,6 +463,12 @@ impl<W: Write> AuditOutput<W> {
             Self::Csv(writer) => {
                 for r in rows {
                     writer.serialize(r)?;
+                }
+            }
+            Self::Ocsf(out) => {
+                for r in rows {
+                    serde_json::to_writer(&mut *out, &r.to_ocsf()?)?;
+                    writeln!(out)?;
                 }
             }
             Self::Rows(format, out) => {
@@ -495,7 +495,7 @@ impl<W: Write> AuditOutput<W> {
     fn finish(self) -> Result<()> {
         match self {
             Self::Csv(mut writer) => writer.flush()?,
-            Self::Rows(_, mut out) => out.flush()?,
+            Self::Rows(_, mut out) | Self::Ocsf(mut out) => out.flush()?,
         }
         Ok(())
     }

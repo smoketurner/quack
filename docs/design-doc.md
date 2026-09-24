@@ -600,12 +600,15 @@ what document X says. An admin can see that a user ran a query against a workspa
 which session it belonged to; only a member of that workspace can see the query text,
 which lives in `_quack_audit`. There is no retention or pruning path, which is what
 append-only means here: rows are kept until an operator retires the file. `quack audit`
-filters by user, workspace, action, outcome, and time range and exports as NDJSON
-(`--json`) or CSV (`--csv`), following pages itself (`--limit 0` reads the whole log);
-`GET /api/v1/admin/audit` takes the same filters, caps `limit` at 1000 a page, and answers
-JSON with a `next_cursor` that continues the same filter (`null` on the last page). Pages
-are keyset on `(timestamp, id)`, newest first, so rows appended while a reader pages never
-shift what it has left to read.
+filters by user, workspace, action, outcome, and time range and prints `--format text`,
+`json` (NDJSON), `csv`, or `ocsf`, following pages itself (`--limit 0` reads the whole
+log); `GET /api/v1/admin/audit` takes the same filters and `?format=ocsf`, caps `limit` at
+1000 a page, and answers JSON with a `next_cursor` that continues the same filter (`null`
+on the last page). Pages are keyset on `(timestamp, id)`, newest first, so rows appended
+while a reader pages never shift what it has left to read. `ocsf` renders each stored row
+as an OCSF 1.9.0 event (`quack_core::ocsf`): Authentication [3002] for logins, logouts,
+stale sessions, and rejected bearers, API Activity [6003] for the rest, with only
+`control.db` fields in it; the rows themselves keep their stored shape.
 
 Workspace names themselves are treated as unclassified; if a deployment needs opaque
 names, the `name` column is the directory name and a display name lives in `_quack_meta`.
@@ -1554,7 +1557,7 @@ quack doctor [-w NAME] [--offline] [--json]
 quack serve [--bind ADDR] [--local]
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--json] ; quack token create|list|revoke ;
-quack member add|remove|list ; quack audit [filters] [--json|--csv]      (server admin)
+quack member add|remove|list ; quack audit [filters] [--format text|json|csv|ocsf]   (server admin)
 quack --version    version plus the AWS-LC module the binary links; -V is the bare version
 ```
 

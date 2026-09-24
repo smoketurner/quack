@@ -1844,6 +1844,22 @@ async fn admin_endpoints_manage_users_and_read_the_audit() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "a cursor keeps its filter");
     let (status, _) = h.get("/api/v1/admin/audit?cursor=nonsense", &root).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The same page as OCSF events.
+    let (status, ocsf) = h
+        .get("/api/v1/admin/audit?action=login&format=ocsf", &root)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ocsf}");
+    let events = ocsf["audit"].as_array().cloned().unwrap_or_default();
+    assert_eq!(events.len(), total);
+    assert!(
+        events
+            .iter()
+            .all(|e| e["class_uid"] == 3002 && e["metadata"]["version"] == "1.9.0"),
+        "{ocsf}"
+    );
+    let (status, _) = h.get("/api/v1/admin/audit?format=xml", &root).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test(flavor = "multi_thread")]
