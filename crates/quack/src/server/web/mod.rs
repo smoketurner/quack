@@ -46,8 +46,8 @@ use super::api::ontology::DecideRequest;
 use super::api::query::SqlRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
-    documents as docs_api, graph as graph_api, import as import_api, ontology as ontology_api,
-    query as query_api, sessions as sessions_api, workspaces as workspaces_api,
+    documents as docs_api, graph as graph_api, import as import_api, query as query_api,
+    workspaces as workspaces_api,
 };
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
@@ -829,7 +829,7 @@ async fn delete_session(
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    sessions_api::delete_session(&app, &access, &sid).await?;
+    access.delete_session(&app, &sid).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat")).into_response())
 }
 
@@ -839,7 +839,7 @@ async fn share_session(
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    sessions_api::set_shared(&app, &access, &sid, true).await?;
+    access.set_session_shared(&app, &sid, true).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
@@ -849,7 +849,7 @@ async fn unshare_session(
     Path((id, sid)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    sessions_api::set_shared(&app, &access, &sid, false).await?;
+    access.set_session_shared(&app, &sid, false).await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
@@ -1539,7 +1539,7 @@ async fn ontology_propose(
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = format!("/w/{id}/ontology");
     if form.documents {
-        let started = ontology_api::start_document_run(&app, &access, &id, None).await;
+        let started = access.start_document_run(&app, None).await;
         return Ok(Flash::after(back, started, |_| {
             Some(String::from(
                 "document pass started; candidates appear here when it finishes",

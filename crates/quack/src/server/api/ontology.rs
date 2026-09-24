@@ -245,7 +245,7 @@ pub(crate) async fn propose(
         )));
     }
     if request.documents {
-        let started = start_document_run(&app, &access, &id, request.sample).await?;
+        let started = access.start_document_run(&app, request.sample).await?;
         return Ok((StatusCode::ACCEPTED, started));
     }
     let proposed = access
@@ -491,73 +491,78 @@ pub(crate) async fn decide(
 /// The document pass: answer 202 with the cost, then sample, extract, and
 /// queue the candidates in a background task. The end of the run is
 /// audited under the same run id.
-pub(crate) async fn start_document_run(
-    app: &App,
-    access: &Access,
-    id: &str,
-    sample: Option<u32>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let mut options = app.config.ontology.document_evidence();
-    if let Some(n) = sample {
-        options.sample_chunks = n;
-    }
-    // Fail now, not in the background, when no model can be built.
-    let extractor = llm::chat_extractor(&app.config).await?;
-    let embeddings = llm::optional_embedding_model(&app.config).await?;
-    let (cost, chunks, current) = app
-        .read(id, move |db| {
-            let cost = documents::estimate(db, &options)?;
-            let chunks = documents::sample_chunks(db, options.sample_chunks)?;
-            Ok((cost, chunks, store::current(db)?))
-        })
-        .await?;
-    if chunks.is_empty() {
-        return Err(ApiError::bad_request("no ready documents to sample"));
-    }
-    let db = app.workspace_db(id).await?;
-    let run = BackgroundRun::start(
-        app,
-        access,
-        RunKind::Ontology,
-        serde_json::json!({ "documents": true, "cost": cost }),
-    )
-    .await?;
-    let run_id = run.id().to_owned();
-    let concurrency = app.config.analysis.extraction_concurrency;
-    let progress_run = run_id.clone();
-    let job = run.submit(move |ctx| async move {
-        let run_id = progress_run;
-        let progress = |done: ChunkDone| {
-            ctx.progress(done.done, done.total);
-            tracing::info!(
-                run = %run_id,
-                done = done.done,
-                total = done.total,
-                failed = done.failed,
-                "document evidence progress"
-            );
-        };
-        let outcome = documents::run(
-            chunks,
-            extractor.as_ref(),
-            current.as_ref(),
-            &options,
-            embeddings.as_ref(),
-            concurrency,
-            &progress,
-        )
-        .await;
-        match outcome {
-            Ok((found, summary)) => with_db(db, move |db| {
-                candidates::store_run(db, &found)?;
-                Ok(summary)
-            })
-            .await
-            .map_err(|e| e.message),
-            Err(e) => Err(e.to_string()),
+impl Access {
+    /// The document pass the API and the web console share: answer with
+    /// the cost, then sample, extract, and queue the candidates as a
+    /// background run.
+    pub(crate) async fn start_document_run(
+        &self,
+        app: &App,
+        sample: Option<u32>,
+    ) -> ApiResult<Json<serde_json::Value>> {
+        let (access, id) = (self, self.workspace.id.as_str());
+        let mut options = app.config.ontology.document_evidence();
+        if let Some(n) = sample {
+            options.sample_chunks = n;
         }
-    });
-    Ok(Json(
-        serde_json::json!({ "run": run_id, "cost": cost, "job": job, "status": "running" }),
-    ))
+        // Fail now, not in the background, when no model can be built.
+        let extractor = llm::chat_extractor(&app.config).await?;
+        let embeddings = llm::optional_embedding_model(&app.config).await?;
+        let (cost, chunks, current) = app
+            .read(id, move |db| {
+                let cost = documents::estimate(db, &options)?;
+                let chunks = documents::sample_chunks(db, options.sample_chunks)?;
+                Ok((cost, chunks, store::current(db)?))
+            })
+            .await?;
+        if chunks.is_empty() {
+            return Err(ApiError::bad_request("no ready documents to sample"));
+        }
+        let db = app.workspace_db(id).await?;
+        let run = BackgroundRun::start(
+            app,
+            access,
+            RunKind::Ontology,
+            serde_json::json!({ "documents": true, "cost": cost }),
+        )
+        .await?;
+        let run_id = run.id().to_owned();
+        let concurrency = app.config.analysis.extraction_concurrency;
+        let progress_run = run_id.clone();
+        let job = run.submit(move |ctx| async move {
+            let run_id = progress_run;
+            let progress = |done: ChunkDone| {
+                ctx.progress(done.done, done.total);
+                tracing::info!(
+                    run = %run_id,
+                    done = done.done,
+                    total = done.total,
+                    failed = done.failed,
+                    "document evidence progress"
+                );
+            };
+            let outcome = documents::run(
+                chunks,
+                extractor.as_ref(),
+                current.as_ref(),
+                &options,
+                embeddings.as_ref(),
+                concurrency,
+                &progress,
+            )
+            .await;
+            match outcome {
+                Ok((found, summary)) => with_db(db, move |db| {
+                    candidates::store_run(db, &found)?;
+                    Ok(summary)
+                })
+                .await
+                .map_err(|e| e.message),
+                Err(e) => Err(e.to_string()),
+            }
+        });
+        Ok(Json(
+            serde_json::json!({ "run": run_id, "cost": cost, "job": job, "status": "running" }),
+        ))
+    }
 }
