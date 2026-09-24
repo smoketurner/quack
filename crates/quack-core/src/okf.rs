@@ -1193,13 +1193,13 @@ mod tests {
         });
         let saved = ontology_store::save(&db, &ontology, Revision::reviewed(None, None))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
-        audit::record(
-            &db,
-            "a1",
-            Some("u"),
-            "sql",
-            &serde_json::json!({"sql": "SELECT secret"}),
-        )
+        audit::AuditDetail {
+            id: String::from("a1"),
+            user_id: Some(String::from("u")),
+            action: String::from("sql"),
+            detail: serde_json::json!({"sql": "SELECT secret"}),
+        }
+        .write(&db)
         .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         let node = |label: &str| graph_store::NewNode {
             label: label.to_owned(),

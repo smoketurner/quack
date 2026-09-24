@@ -14,6 +14,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
     WorkspaceRow, sha256_hex,
@@ -431,12 +432,12 @@ impl Access {
         // progress on the writer just to record that it happened.
         app.audit_log(&self.workspace.id)
             .await?
-            .record(
-                entry.id.clone(),
-                Some(self.identity.user_id.clone()),
-                action.to_string(),
+            .record(AuditDetail {
+                id: entry.id.clone(),
+                user_id: Some(self.identity.user_id.clone()),
+                action: action.to_string(),
                 detail,
-            )
+            })
             .await?;
         Ok(entry.id)
     }

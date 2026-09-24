@@ -39,6 +39,23 @@ struct Lines {
     closed: bool,
 }
 
+impl Lines {
+    /// Queue `job` at the back of `priority`'s line.
+    fn push(&mut self, priority: Priority, job: Job) {
+        match priority {
+            Priority::Interactive => self.interactive.push_back(job),
+            Priority::Background => self.background.push_back(job),
+        }
+    }
+
+    /// The next job: interactive first, then background.
+    fn pop_next(&mut self) -> Option<Job> {
+        self.interactive
+            .pop_front()
+            .or_else(|| self.background.pop_front())
+    }
+}
+
 struct Shared {
     lines: Mutex<Lines>,
     ready: Condvar,
@@ -48,6 +65,30 @@ impl Shared {
     fn lines(&self) -> MutexGuard<'_, Lines> {
         // Plain queues: a panic elsewhere cannot leave them inconsistent.
         self.lines.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The writer's thread: run what arrives, interactive first, until
+    /// closed and drained. The connection closes (and checkpoints) when
+    /// this returns.
+    fn serve(&self, db: &WorkspaceDb) {
+        loop {
+            let job = {
+                let mut lines = self.lines();
+                loop {
+                    if let Some(job) = lines.pop_next() {
+                        break job;
+                    }
+                    if lines.closed {
+                        return;
+                    }
+                    lines = self
+                        .ready
+                        .wait(lines)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            job(db);
+        }
     }
 }
 
@@ -84,7 +125,7 @@ impl Writer {
         let serving = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name(String::from("quack-writer"))
-            .spawn(move || serve(&serving, &db))?;
+            .spawn(move || serving.serve(&db))?;
         Ok(Self {
             thread_id: thread.thread().id(),
             shared,
@@ -145,10 +186,7 @@ impl Writer {
         if lines.closed {
             return Err(Error::WriterStopped);
         }
-        match priority {
-            Priority::Interactive => lines.interactive.push_back(job),
-            Priority::Background => lines.background.push_back(job),
-        }
+        lines.push(priority, job);
         drop(lines);
         self.shared.ready.notify_one();
         Ok(())
@@ -159,33 +197,6 @@ impl Writer {
     fn waiting(&self) -> (usize, usize) {
         let lines = self.shared.lines();
         (lines.interactive.len(), lines.background.len())
-    }
-}
-
-/// The writer's thread: run what arrives, interactive first, until closed
-/// and drained. The connection closes (and checkpoints) when this returns.
-fn serve(shared: &Shared, db: &WorkspaceDb) {
-    loop {
-        let job = {
-            let mut lines = shared.lines();
-            loop {
-                if let Some(job) = lines
-                    .interactive
-                    .pop_front()
-                    .or_else(|| lines.background.pop_front())
-                {
-                    break job;
-                }
-                if lines.closed {
-                    return;
-                }
-                lines = shared
-                    .ready
-                    .wait(lines)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-        };
-        job(db);
     }
 }
 
