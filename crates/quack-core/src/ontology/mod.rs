@@ -240,6 +240,53 @@ impl Ontology {
         self.mappings.iter().find(|m| m.class == class_id)
     }
 
+    /// The mapping that builds nodes from `table`, if any.
+    #[must_use]
+    pub fn mapping_for_table(&self, table: &str) -> Option<&Mapping> {
+        self.mappings.iter().find(|m| m.table == table)
+    }
+
+    /// Whether `id` names a class: the root, or one defined here.
+    #[must_use]
+    pub fn defines_class(&self, id: &str) -> bool {
+        id == ROOT_CLASS || self.class(id).is_some()
+    }
+
+    /// Whether `id` names a relation: `mentions`, or one defined here.
+    #[must_use]
+    pub fn defines_relation(&self, id: &str) -> bool {
+        id == MENTIONS_RELATION || self.relation(id).is_some()
+    }
+
+    /// Every class id, the root first.
+    #[must_use]
+    pub fn class_ids(&self) -> Vec<&str> {
+        let mut ids = vec![ROOT_CLASS];
+        ids.extend(self.classes.iter().map(|c| c.id.as_str()));
+        ids
+    }
+
+    /// Every relation id, `mentions` first.
+    #[must_use]
+    pub fn relation_ids(&self) -> Vec<&str> {
+        let mut ids = vec![MENTIONS_RELATION];
+        ids.extend(self.relations.iter().map(|r| r.id.as_str()));
+        ids
+    }
+
+    /// A class and every class under it: what a listing of the class
+    /// covers and what its census counts.
+    #[must_use]
+    pub fn class_and_descendants(&self, class_id: &str) -> Vec<String> {
+        let mut out = vec![class_id.to_owned()];
+        for class in &self.classes {
+            if class.id != class_id && self.is_subclass_of(&class.id, class_id) {
+                out.push(class.id.clone());
+            }
+        }
+        out
+    }
+
     /// The property ids a class carries, its own and inherited.
     #[must_use]
     pub fn class_properties(&self, class_id: &str) -> BTreeSet<String> {

@@ -56,76 +56,77 @@ impl ChartSpec {
             .max()
             .unwrap_or(0)
     }
-}
 
-/// Build a spec from a result set: `x_column` supplies the labels and
-/// `y_column` the values. At most [`MAX_POINTS`] rows.
-///
-/// # Errors
-///
-/// Returns an error if a column is missing, a value is not numeric, or
-/// there are too many rows.
-pub fn generate_chart_spec(
-    results: &QueryResults,
-    kind: &str,
-    x_column: &str,
-    y_column: &str,
-    title: &str,
-) -> Result<ChartSpec> {
-    let kind: ChartKind = kind.parse()?;
-    let column = |name: &str| {
-        results
-            .columns
-            .iter()
-            .position(|c| c == name)
-            .ok_or_else(|| Error::Analysis(format!("column '{name}' not found in query results")))
-    };
-    let x_idx = column(x_column)?;
-    let y_idx = column(y_column)?;
-
-    if results.rows.len() > MAX_POINTS {
-        return Err(Error::Analysis(format!(
-            "{} rows is too many for a chart (max {MAX_POINTS}); aggregate or limit the query",
-            results.rows.len()
-        )));
-    }
-
-    let mut labels = Vec::with_capacity(results.rows.len());
-    let mut values = Vec::with_capacity(results.rows.len());
-    for (i, row) in results.rows.iter().enumerate() {
-        let x = row.get(x_idx).cloned().unwrap_or(serde_json::Value::Null);
-        let y = row.get(y_idx).cloned().unwrap_or(serde_json::Value::Null);
-        labels.push(match x {
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Null => String::from("NULL"),
-            other => other.to_string(),
-        });
-        let number = match &y {
-            serde_json::Value::Number(n) => n.as_f64(),
-            serde_json::Value::String(s) => s.parse::<f64>().ok(),
-            serde_json::Value::Null => Some(0.0),
-            _ => None,
+    /// A `kind` chart of a result set: `x_column` supplies the labels and
+    /// `y_column` the values. At most [`MAX_POINTS`] rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a column is missing, a value is not numeric, or
+    /// there are too many rows.
+    pub fn from_results(
+        results: &QueryResults,
+        kind: ChartKind,
+        x_column: &str,
+        y_column: &str,
+        title: &str,
+    ) -> Result<Self> {
+        let column = |name: &str| {
+            results
+                .columns
+                .iter()
+                .position(|c| c == name)
+                .ok_or_else(|| {
+                    Error::Analysis(format!("column '{name}' not found in query results"))
+                })
         };
-        values.push(number.ok_or_else(|| {
-            Error::Analysis(format!(
-                "row {} of column '{y_column}' is not numeric: {y}",
-                i.saturating_add(1)
-            ))
-        })?);
-    }
+        let x_idx = column(x_column)?;
+        let y_idx = column(y_column)?;
 
-    Ok(ChartSpec {
-        title: title.to_owned(),
-        kind,
-        x: Axis {
-            label: x_column.to_owned(),
-            values: labels,
-        },
-        series: vec![Series {
-            name: y_column.to_owned(),
-            values,
-        }],
-    })
+        if results.rows.len() > MAX_POINTS {
+            return Err(Error::Analysis(format!(
+                "{} rows is too many for a chart (max {MAX_POINTS}); aggregate or limit the query",
+                results.rows.len()
+            )));
+        }
+
+        let mut labels = Vec::with_capacity(results.rows.len());
+        let mut values = Vec::with_capacity(results.rows.len());
+        for (i, row) in results.rows.iter().enumerate() {
+            let x = row.get(x_idx).cloned().unwrap_or(serde_json::Value::Null);
+            let y = row.get(y_idx).cloned().unwrap_or(serde_json::Value::Null);
+            labels.push(match x {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Null => String::from("NULL"),
+                other => other.to_string(),
+            });
+            let number = match &y {
+                serde_json::Value::Number(n) => n.as_f64(),
+                serde_json::Value::String(s) => s.parse::<f64>().ok(),
+                serde_json::Value::Null => Some(0.0),
+                _ => None,
+            };
+            values.push(number.ok_or_else(|| {
+                Error::Analysis(format!(
+                    "row {} of column '{y_column}' is not numeric: {y}",
+                    i.saturating_add(1)
+                ))
+            })?);
+        }
+
+        Ok(Self {
+            title: title.to_owned(),
+            kind,
+            x: Axis {
+                label: x_column.to_owned(),
+                values: labels,
+            },
+            series: vec![Series {
+                name: y_column.to_owned(),
+                values,
+            }],
+        })
+    }
 }
 
 #[cfg(test)]
@@ -152,9 +153,9 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn builds_a_spec_with_labels_and_numeric_values() {
-        let spec = generate_chart_spec(
+        let spec = ChartSpec::from_results(
             &sample_results(),
-            "Bar",
+            ChartKind::Bar,
             "region",
             "sales",
             "Sales by Region",
@@ -177,8 +178,14 @@ mod tests {
         reason = "test asserts Ok and reads known JSON paths"
     )]
     fn spec_round_trips_through_json() {
-        let spec =
-            generate_chart_spec(&sample_results(), "pie", "region", "sales", "Share").unwrap();
+        let spec = ChartSpec::from_results(
+            &sample_results(),
+            ChartKind::Pie,
+            "region",
+            "sales",
+            "Share",
+        )
+        .unwrap();
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["kind"], "pie");
         assert_eq!(json["x"]["values"][0], "North");
@@ -202,7 +209,10 @@ mod tests {
 
     #[test]
     fn missing_column_and_non_numeric_values_are_errors() {
-        assert!(generate_chart_spec(&sample_results(), "bar", "missing", "sales", "t").is_err());
+        assert!(
+            ChartSpec::from_results(&sample_results(), ChartKind::Bar, "missing", "sales", "t")
+                .is_err()
+        );
         let text_values = QueryResults {
             columns: vec!["a".into(), "b".into()],
             rows: vec![vec![
@@ -210,7 +220,7 @@ mod tests {
                 serde_json::Value::String("not a number".into()),
             ]],
         };
-        let err = generate_chart_spec(&text_values, "bar", "a", "b", "t").err();
+        let err = ChartSpec::from_results(&text_values, ChartKind::Bar, "a", "b", "t").err();
         assert!(err.is_some_and(|e| e.to_string().contains("not numeric")));
     }
 
@@ -228,7 +238,7 @@ mod tests {
             columns: vec!["a".into(), "b".into()],
             rows,
         };
-        let err = generate_chart_spec(&big, "line", "a", "b", "t").err();
+        let err = ChartSpec::from_results(&big, ChartKind::Line, "a", "b", "t").err();
         assert!(err.is_some_and(|e| e.to_string().contains("too many")));
     }
 }

@@ -1,9 +1,9 @@
 use crate::analysis::policy::WritePolicy;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::graph::store as graph_store;
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
-use crate::storage::workspace::{CappedResults, QueryResults, WorkspaceDb};
+use crate::storage::workspace::WorkspaceDb;
 use std::fmt::Write;
 
 /// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to
@@ -62,175 +62,12 @@ pub struct PromptOptions {
     pub ollama_context_cap: Option<u32>,
 }
 
-/// Build the system prompt in the order the design fixes (section 7.2):
-/// role and mode, tool guidance and dialect, tables, documents and pinned
-/// text, the workspace context, and the permission rules.
-///
-/// # Errors
-///
-/// Returns an error if schema introspection fails.
-pub fn build_system_prompt(db: &WorkspaceDb, options: &PromptOptions) -> Result<String> {
-    let mut prompt = String::from(
-        "You are a data analysis assistant working inside one workspace that holds tables, \
-         documents, or both. Answer by using the tools: run SQL rather than estimating, search \
-         the documents rather than recalling, state assumptions, and when a question is \
-         ambiguous ask one clarifying question instead of guessing.\n\n",
-    );
-
-    match options.mode {
-        ChatMode::Chat => prompt.push_str(
-            "Mode: chat. You may draw on general knowledge, but whenever you use a retrieved chunk \
-             or a query result, cite it.\n\n",
-        ),
-        ChatMode::Query => prompt.push_str(
-            "Mode: query. Every factual claim must come from a retrieved chunk or from a query you \
-             ran this turn. Do not answer from memory. If search and queries find nothing \
-             relevant, say that the workspace does not cover the question and stop. Every \
-             sentence that states something from a document MUST end with that chunk's [n] \
-             marker, e.g. \"Flood damage is excluded [2].\" An answer about the documents with \
-             no [n] markers is wrong.\n\n",
-        ),
-    }
-
-    let ontology = ontology_store::current(db)?;
-    let graph = graph_store::status(db)?;
-    append_tool_guidance(&mut prompt, graph.enabled(), ontology.is_some());
-
-    let version = db.duckdb_version()?;
-    writeln!(
-        prompt,
-        "DuckDB {version} SQL reference. This is DuckDB's dialect, not Postgres, MySQL, or \
-         SQLite; prefer these idioms:"
-    )?;
-    prompt.push_str(DIALECT_REFERENCE);
-    prompt.push('\n');
-
-    let tables = append_tables(&mut prompt, db)?;
-    let documents = append_documents(&mut prompt, db)?;
-    append_pinned_documents(&mut prompt, db, options.pinned_token_budget)?;
-
-    if let Some(ontology) = ontology {
-        prompt.push_str(&ontology.render_capped(PROMPT_ONTOLOGY_ITEMS));
-        if graph.enabled() {
-            writeln!(
-                prompt,
-                "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}. search_graph and \
-                 find_path read it; both return provenance to cite.",
-                graph.nodes,
-                graph.edges,
-                if graph.provisional() {
-                    " (provisional: built from an unreviewed ontology; say so when you use it)"
-                } else {
-                    ""
-                },
-                if graph.stale {
-                    " (stale: the ontology changed since it was built)"
-                } else {
-                    ""
-                }
-            )?;
-        }
-        writeln!(prompt)?;
-    }
-
-    if tables.is_empty() && documents == 0 {
-        writeln!(
-            prompt,
-            "No tables or documents have been ingested yet. Let the user know they can ingest files first."
-        )?;
-        writeln!(prompt)?;
-    }
-
-    append_context(&mut prompt, options)?;
-
-    prompt.push_str(permissions_text(options.write_policy));
-
-    Ok(prompt)
-}
-
-/// The numbered procedures, one per substrate. The table, SQL, chart and
-/// document tools are always registered; the graph block appears only when
-/// the graph tools do and the `describe_class` line only when an ontology
-/// exists (design doc 7.2), since guidance for a tool the model cannot
-/// call is worse than none.
-fn append_tool_guidance(prompt: &mut String, graph_enabled: bool, ontology_present: bool) {
-    prompt.push_str(
-        "When answering analytical questions about structured data:\n\
-         1. First use list_tables or describe_table to understand the available data; run \
-         SUMMARIZE <table> when you need min, max, null share, or distinct counts per column \
-         before choosing a filter\n\
-         2. Write and execute SQL queries using run_sql\n\
-         3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
-         misspelled one and describe_table shows the real names. Fix the statement and run \
-         it again; do not give up after one error and do not ask the user to correct SQL\n\
-         4. A result that ends with \"more rows not shown\" was cut at the row limit and is \
-         not the whole answer: aggregate further, filter with WHERE, or add ORDER BY and \
-         LIMIT, in one statement. Never re-run a statement once per group; GROUP BY, \
-         IN (...), or a window covers every group at once\n\
-         5. Every run_sql result ends with how many tool calls the turn has left; plan \
-         the remaining statements and answer before they run out\n\
-         6. Explain the results in natural language\n\
-         7. If the user asks for a visualization, use create_chart\n\n\
-         When answering questions about document content:\n\
-         1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
-         2. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
-         3. Cite each claim inline with the chunk's [n] marker, e.g. \"Flood is excluded [2].\"\n\
-         4. Do not write a Sources or References section; one is appended for you from the markers\n\n",
-    );
-
-    if ontology_present {
-        prompt.push_str(
-            "The ontology block below is capped. describe_class gives one class in full: what it \
-             inherits, its subclasses, its typed properties with their enum values, the relations \
-             it takes part in, the table it is mapped to, and how many entities of it the graph \
-             holds. Use it to get an exact id before searching, and for the count of a class — a \
-             class listing stops at the node limit, describe_class does not.\n\n",
-        );
-    }
-
-    if graph_enabled {
-        prompt.push_str(
-            "When answering questions about how entities relate:\n\
-             1. Call search_graph with an entity's name for what it connects to, or with an \
-             ontology class id to list the entities of that class\n\
-             2. Call find_path when the question is how two named entities connect\n\
-             3. Use the class and relation ids from the ontology below, or describe_class to \
-             check one; a wrong id comes back as an error naming the real ones, and a name that \
-             matches no entity comes back with the closest labels, so call again rather than \
-             giving up\n\
-             4. Cite the [n] markers the results register, the same way you cite search_documents. \
-             A result that names table rows can be read with run_sql: it gives the predicate\n\
-             5. A result that says it was cut off at the node limit is not the whole answer; \
-             narrow the class or count with describe_class instead of counting the lines\n\
-             6. If the graph has nothing, search the documents before telling the user the \
-             workspace does not cover the question\n\n",
-        );
-    }
-}
-
-/// The document inventory block; returns how many documents it listed so
-/// the caller can tell an empty workspace from a full one.
-fn append_documents(prompt: &mut String, db: &WorkspaceDb) -> Result<usize> {
-    let docs = db.list_documents()?;
-    if docs.is_empty() {
-        return Ok(0);
-    }
-    writeln!(prompt, "Ingested documents:")?;
-    for doc in &docs {
-        let title = doc
-            .title
-            .as_deref()
-            .map_or(String::new(), |t| format!(" \"{t}\""));
-        writeln!(
-            prompt,
-            "- {}{title} (status: {}, type: {})",
-            doc.filename,
-            doc.status,
-            doc.mime_type.as_deref().unwrap_or("unknown"),
-        )?;
-    }
-    writeln!(prompt)?;
-    Ok(docs.len())
+/// The system prompt, assembled in the order the design fixes (section
+/// 7.2): role and mode, tool guidance and dialect, tables, documents and
+/// pinned text, the workspace context, and the permission rules.
+#[derive(Debug, Default)]
+pub struct SystemPrompt {
+    text: String,
 }
 
 /// Classes, relations and mappings past this many are counted rather than
@@ -240,9 +77,6 @@ fn append_documents(prompt: &mut String, db: &WorkspaceDb) -> Result<usize> {
 /// block has had since issue #40).
 const PROMPT_ONTOLOGY_ITEMS: usize = 30;
 
-/// The tables block: every user table with its row count, columns, and three
-/// sample rows. Returns the table names so the caller knows whether the
-/// workspace is empty.
 /// Tables past this many are listed by name and row count only.
 const DETAILED_TABLES: usize = 25;
 /// Columns past this many per table are counted, not listed.
@@ -252,41 +86,220 @@ const SAMPLED_COLUMNS: usize = 20;
 /// A sample cell longer than this is cut, with an ellipsis.
 const SAMPLE_CELL_CHARS: usize = 60;
 
-/// The tables block, bounded so a wide or narrative table cannot crowd
-/// the tool guidance and the question out of a small context window
-/// (issue #40): the model has `describe_table` for the rest.
-fn append_tables(prompt: &mut String, db: &WorkspaceDb) -> Result<Vec<String>> {
-    let tables = db.list_tables()?;
-    if !tables.is_empty() {
-        writeln!(prompt, "Available tables:")?;
+impl SystemPrompt {
+    /// The prompt for `db` under `options`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema introspection fails.
+    pub fn build(db: &WorkspaceDb, options: &PromptOptions) -> Result<String> {
+        let mut prompt = Self::default();
+        prompt.text.push_str(
+            "You are a data analysis assistant working inside one workspace that holds tables, \
+             documents, or both. Answer by using the tools: run SQL rather than estimating, \
+             search the documents rather than recalling, state assumptions, and when a question \
+             is ambiguous ask one clarifying question instead of guessing.\n\n",
+        );
+
+        match options.mode {
+            ChatMode::Chat => prompt.text.push_str(
+                "Mode: chat. You may draw on general knowledge, but whenever you use a retrieved \
+                 chunk or a query result, cite it.\n\n",
+            ),
+            ChatMode::Query => prompt.text.push_str(
+                "Mode: query. Every factual claim must come from a retrieved chunk or from a \
+                 query you ran this turn. Do not answer from memory. If search and queries find \
+                 nothing relevant, say that the workspace does not cover the question and stop. \
+                 Every sentence that states something from a document MUST end with that chunk's \
+                 [n] marker, e.g. \"Flood damage is excluded [2].\" An answer about the documents \
+                 with no [n] markers is wrong.\n\n",
+            ),
+        }
+
+        let ontology = ontology_store::current(db)?;
+        let graph = graph_store::status(db)?;
+        prompt.tool_guidance(graph.enabled(), ontology.is_some());
+
+        let version = db.duckdb_version()?;
+        writeln!(
+            prompt.text,
+            "DuckDB {version} SQL reference. This is DuckDB's dialect, not Postgres, MySQL, or \
+             SQLite; prefer these idioms:"
+        )?;
+        prompt.text.push_str(DIALECT_REFERENCE);
+        prompt.text.push('\n');
+
+        let tables = prompt.tables(db)?;
+        let documents = prompt.documents(db)?;
+        prompt.pinned_documents(db, options.pinned_token_budget)?;
+
+        if let Some(ontology) = ontology {
+            prompt
+                .text
+                .push_str(&ontology.render_capped(PROMPT_ONTOLOGY_ITEMS));
+            if graph.enabled() {
+                writeln!(
+                    prompt.text,
+                    "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}. search_graph \
+                     and find_path read it; both return provenance to cite.",
+                    graph.nodes,
+                    graph.edges,
+                    if graph.provisional() {
+                        " (provisional: built from an unreviewed ontology; say so when you use it)"
+                    } else {
+                        ""
+                    },
+                    if graph.stale {
+                        " (stale: the ontology changed since it was built)"
+                    } else {
+                        ""
+                    }
+                )?;
+            }
+            writeln!(prompt.text)?;
+        }
+
+        if tables.is_empty() && documents == 0 {
+            writeln!(
+                prompt.text,
+                "No tables or documents have been ingested yet. Let the user know they can ingest files first."
+            )?;
+            writeln!(prompt.text)?;
+        }
+
+        prompt.context(options)?;
+
+        prompt
+            .text
+            .push_str(options.write_policy.prompt_paragraph());
+
+        Ok(prompt.text)
+    }
+
+    /// The numbered procedures, one per substrate. The table, SQL, chart
+    /// and document tools are always registered; the graph block appears
+    /// only when the graph tools do and the `describe_class` line only when
+    /// an ontology exists (design doc 7.2), since guidance for a tool the
+    /// model cannot call is worse than none.
+    fn tool_guidance(&mut self, graph_enabled: bool, ontology_present: bool) {
+        self.text.push_str(
+            "When answering analytical questions about structured data:\n\
+             1. First use list_tables or describe_table to understand the available data; run \
+             SUMMARIZE <table> when you need min, max, null share, or distinct counts per column \
+             before choosing a filter\n\
+             2. Write and execute SQL queries using run_sql\n\
+             3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
+             misspelled one and describe_table shows the real names. Fix the statement and run \
+             it again; do not give up after one error and do not ask the user to correct SQL\n\
+             4. A result that ends with \"more rows not shown\" was cut at the row limit and is \
+             not the whole answer: aggregate further, filter with WHERE, or add ORDER BY and \
+             LIMIT, in one statement. Never re-run a statement once per group; GROUP BY, \
+             IN (...), or a window covers every group at once\n\
+             5. Every run_sql result ends with how many tool calls the turn has left; plan \
+             the remaining statements and answer before they run out\n\
+             6. Explain the results in natural language\n\
+             7. If the user asks for a visualization, use create_chart\n\n\
+             When answering questions about document content:\n\
+             1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
+             2. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
+             3. Cite each claim inline with the chunk's [n] marker, e.g. \"Flood is excluded [2].\"\n\
+             4. Do not write a Sources or References section; one is appended for you from the markers\n\n",
+        );
+
+        if ontology_present {
+            self.text.push_str(
+                "The ontology block below is capped. describe_class gives one class in full: what \
+                 it inherits, its subclasses, its typed properties with their enum values, the \
+                 relations it takes part in, the table it is mapped to, and how many entities of \
+                 it the graph holds. Use it to get an exact id before searching, and for the count \
+                 of a class — a class listing stops at the node limit, describe_class does not.\n\n",
+            );
+        }
+
+        if graph_enabled {
+            self.text.push_str(
+                "When answering questions about how entities relate:\n\
+                 1. Call search_graph with an entity's name for what it connects to, or with an \
+                 ontology class id to list the entities of that class\n\
+                 2. Call find_path when the question is how two named entities connect\n\
+                 3. Use the class and relation ids from the ontology below, or describe_class to \
+                 check one; a wrong id comes back as an error naming the real ones, and a name that \
+                 matches no entity comes back with the closest labels, so call again rather than \
+                 giving up\n\
+                 4. Cite the [n] markers the results register, the same way you cite search_documents. \
+                 A result that names table rows can be read with run_sql: it gives the predicate\n\
+                 5. A result that says it was cut off at the node limit is not the whole answer; \
+                 narrow the class or count with describe_class instead of counting the lines\n\
+                 6. If the graph has nothing, search the documents before telling the user the \
+                 workspace does not cover the question\n\n",
+            );
+        }
+    }
+
+    /// The document inventory block; returns how many documents it listed
+    /// so the caller can tell an empty workspace from a full one.
+    fn documents(&mut self, db: &WorkspaceDb) -> Result<usize> {
+        let docs = db.list_documents()?;
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        writeln!(self.text, "Ingested documents:")?;
+        for doc in &docs {
+            let title = doc
+                .title
+                .as_deref()
+                .map_or(String::new(), |t| format!(" \"{t}\""));
+            writeln!(
+                self.text,
+                "- {}{title} (status: {}, type: {})",
+                doc.filename,
+                doc.status,
+                doc.mime_type.as_deref().unwrap_or("unknown"),
+            )?;
+        }
+        writeln!(self.text)?;
+        Ok(docs.len())
+    }
+
+    /// The tables block: every user table with its row count, columns, and
+    /// three sample rows, bounded so a wide or narrative table cannot crowd
+    /// the tool guidance and the question out of a small context window
+    /// (issue #40): the model has `describe_table` for the rest. Returns
+    /// the table names so the caller knows whether the workspace is empty.
+    fn tables(&mut self, db: &WorkspaceDb) -> Result<Vec<String>> {
+        let tables = db.list_tables()?;
+        if tables.is_empty() {
+            return Ok(tables);
+        }
+        writeln!(self.text, "Available tables:")?;
         for (index, table) in tables.iter().enumerate() {
             // Tables past the detail cap only ever print their row count,
             // so only ask for that: `describe_table` also runs `DESCRIBE`
-            // and a sample-row `SELECT`, whose output would be thrown
-            // away below. A workspace with far more tables than the cap
-            // (a per-table induced ontology, say) otherwise pays for a
-            // full describe and sample of every excess table on every
-            // turn for nothing.
+            // and a sample-row `SELECT`, whose output would be thrown away
+            // below. A workspace with far more tables than the cap (a
+            // per-table induced ontology, say) otherwise pays for a full
+            // describe and sample of every excess table on every turn for
+            // nothing.
             if index >= DETAILED_TABLES {
                 let Ok(row_count) = db.count_rows(table) else {
-                    writeln!(prompt, "- {table}")?;
+                    writeln!(self.text, "- {table}")?;
                     continue;
                 };
-                writeln!(prompt, "- {table} ({row_count} rows)")?;
+                writeln!(self.text, "- {table} ({row_count} rows)")?;
                 continue;
             }
             let Ok(desc) = db.describe_table(table) else {
-                writeln!(prompt, "- {table}")?;
+                writeln!(self.text, "- {table}")?;
                 continue;
             };
-            writeln!(prompt, "- {table} ({} rows)", desc.row_count)?;
-            writeln!(prompt, "  Columns:")?;
+            writeln!(self.text, "- {table} ({} rows)", desc.row_count)?;
+            writeln!(self.text, "  Columns:")?;
             for col in desc.columns.iter().take(LISTED_COLUMNS) {
-                writeln!(prompt, "    - {} ({})", col.name, col.column_type)?;
+                writeln!(self.text, "    - {} ({})", col.name, col.column_type)?;
             }
             if desc.columns.len() > LISTED_COLUMNS {
                 writeln!(
-                    prompt,
+                    self.text,
                     "    ... and {} more columns; describe_table lists them all",
                     desc.columns.len().saturating_sub(LISTED_COLUMNS)
                 )?;
@@ -296,50 +309,99 @@ fn append_tables(prompt: &mut String, db: &WorkspaceDb) -> Result<Vec<String>> {
             }
             if desc.columns.len() > SAMPLED_COLUMNS {
                 writeln!(
-                    prompt,
+                    self.text,
                     "  Sample rows omitted ({} columns); describe_table shows them",
                     desc.columns.len()
                 )?;
                 continue;
             }
-            writeln!(prompt, "  Sample data:")?;
+            writeln!(self.text, "  Sample data:")?;
             let mut buf = Vec::new();
-            if trimmed_sample(&desc.sample_rows)
+            if desc
+                .sample_rows
+                .with_cells_cut(SAMPLE_CELL_CHARS)
                 .write_table(&mut buf)
                 .is_ok()
                 && let Ok(text) = String::from_utf8(buf)
             {
                 for line in text.lines() {
-                    writeln!(prompt, "    {line}")?;
+                    writeln!(self.text, "    {line}")?;
                 }
             }
         }
         if tables.len() > DETAILED_TABLES {
             writeln!(
-                prompt,
+                self.text,
                 "Only the first {DETAILED_TABLES} tables are described here; use describe_table for the others."
             )?;
         }
-        writeln!(prompt)?;
+        writeln!(self.text)?;
+        Ok(tables)
     }
-    Ok(tables)
-}
 
-/// The sample rows with every long text cell cut to `SAMPLE_CELL_CHARS`.
-fn trimmed_sample(sample: &QueryResults) -> QueryResults {
-    let mut out = sample.clone();
-    for row in &mut out.rows {
-        for cell in row.iter_mut() {
-            if let serde_json::Value::String(text) = cell
-                && text.chars().count() > SAMPLE_CELL_CHARS
-            {
-                let mut cut: String = text.chars().take(SAMPLE_CELL_CHARS).collect();
-                cut.push('\u{2026}');
-                *cell = serde_json::Value::String(cut);
-            }
+    /// The owner-written context, truncated to `context_max_tokens` with a
+    /// note so the model knows it is incomplete.
+    fn context(&mut self, options: &PromptOptions) -> Result<()> {
+        let Some(context) = options.context.as_deref() else {
+            return Ok(());
+        };
+        let budget_chars = usize::try_from(options.context_max_tokens)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(4);
+        writeln!(
+            self.text,
+            "Workspace context (written by the workspace owner; follow it over general knowledge):"
+        )?;
+        if context.len() <= budget_chars {
+            writeln!(self.text, "{context}")?;
+        } else {
+            let cut: String = context.chars().take(budget_chars).collect();
+            tracing::warn!(
+                max_tokens = options.context_max_tokens,
+                "workspace context exceeds the token budget and was truncated"
+            );
+            writeln!(self.text, "{cut}")?;
+            writeln!(
+                self.text,
+                "[context truncated at {} tokens; ask the owner to shorten it]",
+                options.context_max_tokens
+            )?;
         }
+        writeln!(self.text)?;
+        Ok(())
     }
-    out
+
+    /// The full text of pinned documents, skipping any that would push the
+    /// total past `pinned_token_budget` (four characters per token).
+    fn pinned_documents(&mut self, db: &WorkspaceDb, pinned_token_budget: u32) -> Result<()> {
+        let pinned = db.pinned_documents()?;
+        if pinned.is_empty() {
+            return Ok(());
+        }
+        let budget = usize::try_from(pinned_token_budget).unwrap_or(usize::MAX);
+        let mut used = 0usize;
+        writeln!(
+            self.text,
+            "Pinned documents (full text, always in effect; cite them by filename):"
+        )?;
+        for (doc, text) in &pinned {
+            let cost = text.len().div_ceil(4);
+            if used.saturating_add(cost) > budget {
+                writeln!(
+                    self.text,
+                    "--- {} (omitted: pinned text exceeds the {pinned_token_budget}-token budget) ---",
+                    doc.filename
+                )?;
+                continue;
+            }
+            used = used.saturating_add(cost);
+            writeln!(self.text, "--- {} ---", doc.filename)?;
+            writeln!(self.text, "{text}")?;
+            writeln!(self.text, "--- end {} ---", doc.filename)?;
+        }
+        writeln!(self.text)?;
+        Ok(())
+    }
 }
 
 /// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
@@ -366,119 +428,6 @@ pub fn ollama_context_size(prompt_chars: usize, cap: u32) -> u32 {
     let needed = prompt_tokens.saturating_add(HEADROOM);
     let rounded = needed.div_ceil(STEP).saturating_mul(STEP).max(FLOOR);
     rounded.min(cap.max(FLOOR))
-}
-
-/// The permissions paragraph for the write policy in force.
-fn permissions_text(policy: WritePolicy) -> &'static str {
-    match policy {
-        WritePolicy::Allow => {
-            "Permissions: SELECT queries always run. The user has permitted statements that \
-             modify the workspace for this session, so when asked to change data, run the \
-             statement with run_sql rather than asking for confirmation.\n"
-        }
-        WritePolicy::Ask => {
-            "Permissions: SELECT queries always run. When you run a statement that modifies the \
-             workspace, the user is asked to approve it before it executes, so when asked to \
-             change data, run the statement with run_sql rather than asking for confirmation \
-             yourself. If the tool reports it was refused, do not retry it; tell the user.\n"
-        }
-        WritePolicy::Deny => {
-            "Permissions: SELECT queries always run. Statements that modify the workspace are \
-             not permitted in this session; if the user asks for one, still attempt it once \
-             with run_sql so the refusal is recorded, then tell the user it needs write \
-             permission (--allow-write). Do not retry.\n"
-        }
-    }
-}
-
-/// The owner-written context, truncated to `context_max_tokens` with a note
-/// so the model knows it is incomplete.
-fn append_context(prompt: &mut String, options: &PromptOptions) -> Result<()> {
-    let Some(context) = options.context.as_deref() else {
-        return Ok(());
-    };
-    let budget_chars = usize::try_from(options.context_max_tokens)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(4);
-    writeln!(
-        prompt,
-        "Workspace context (written by the workspace owner; follow it over general knowledge):"
-    )?;
-    if context.len() <= budget_chars {
-        writeln!(prompt, "{context}")?;
-    } else {
-        let cut: String = context.chars().take(budget_chars).collect();
-        tracing::warn!(
-            max_tokens = options.context_max_tokens,
-            "workspace context exceeds the token budget and was truncated"
-        );
-        writeln!(prompt, "{cut}")?;
-        writeln!(
-            prompt,
-            "[context truncated at {} tokens; ask the owner to shorten it]",
-            options.context_max_tokens
-        )?;
-    }
-    writeln!(prompt)?;
-    Ok(())
-}
-
-/// Inject the full text of pinned documents, skipping any that would push
-/// the total past `pinned_token_budget` (four characters per token).
-fn append_pinned_documents(
-    prompt: &mut String,
-    db: &WorkspaceDb,
-    pinned_token_budget: u32,
-) -> Result<()> {
-    let pinned = db.pinned_documents()?;
-    if pinned.is_empty() {
-        return Ok(());
-    }
-    let budget = usize::try_from(pinned_token_budget).unwrap_or(usize::MAX);
-    let mut used = 0usize;
-    writeln!(
-        prompt,
-        "Pinned documents (full text, always in effect; cite them by filename):"
-    )?;
-    for (doc, text) in &pinned {
-        let cost = text.len().div_ceil(4);
-        if used.saturating_add(cost) > budget {
-            writeln!(
-                prompt,
-                "--- {} (omitted: pinned text exceeds the {pinned_token_budget}-token budget) ---",
-                doc.filename
-            )?;
-            continue;
-        }
-        used = used.saturating_add(cost);
-        writeln!(prompt, "--- {} ---", doc.filename)?;
-        writeln!(prompt, "{text}")?;
-        writeln!(prompt, "--- end {} ---", doc.filename)?;
-    }
-    writeln!(prompt)?;
-    Ok(())
-}
-
-/// Format a query result as a text table string, capped at `max_rows`.
-///
-/// # Errors
-///
-/// Returns an error if formatting fails.
-pub fn format_query_result(capped: &CappedResults) -> Result<String> {
-    let mut table = capped.results.clone();
-    if capped.truncated() {
-        table.rows.push(vec![serde_json::Value::String(format!(
-            "... ({} more rows not shown: the result was cut at the {}-row limit, so \
-             aggregate, filter, or ORDER BY and LIMIT it in one statement rather than \
-             re-running it per group)",
-            capped.omitted(),
-            capped.results.rows.len()
-        ))]);
-    }
-
-    let mut buf = Vec::new();
-    table.write_table(&mut buf)?;
-    String::from_utf8(buf).map_err(|e| Error::Analysis(format!("UTF-8 error: {e}")))
 }
 
 #[cfg(test)]
@@ -516,7 +465,7 @@ mod tests {
         ontology_store::save(&db, &Ontology::builtin_default(), Some("tester"), None).unwrap();
 
         // An ontology alone registers no graph tools, so it gets no procedure.
-        let without = build_system_prompt(&db, &options(ChatMode::Chat, 0)).unwrap();
+        let without = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
         assert!(!without.contains(PROCEDURE), "{without}");
         assert!(without.contains("Ontology (version"), "{without}");
 
@@ -530,7 +479,7 @@ mod tests {
             },
         )
         .unwrap();
-        let with = build_system_prompt(&db, &options(ChatMode::Chat, 0)).unwrap();
+        let with = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
         assert!(with.contains(PROCEDURE), "{with}");
         assert!(
             with.contains("search_graph") && with.contains("find_path"),
@@ -579,8 +528,8 @@ mod tests {
         let mut opts = options(ChatMode::Chat, 1000);
         opts.context = Some(String::from("Amounts are in cents."));
 
-        let first = build_system_prompt(&db, &opts).unwrap();
-        let second = build_system_prompt(&db, &opts).unwrap();
+        let first = SystemPrompt::build(&db, &opts).unwrap();
+        let second = SystemPrompt::build(&db, &opts).unwrap();
         assert_eq!(first, second);
 
         // The volatile, caller-supplied part (the workspace context) comes
@@ -611,7 +560,7 @@ mod tests {
         .unwrap();
         let mut opts = options(ChatMode::Chat, 100);
         opts.context = Some(String::from("Amounts are in cents."));
-        let prompt = build_system_prompt(&db, &opts).unwrap();
+        let prompt = SystemPrompt::build(&db, &opts).unwrap();
         let docs_at = prompt.find("Ingested documents:").unwrap();
         let ctx_at = prompt.find("Workspace context").unwrap();
         let perms_at = prompt.find("Permissions:").unwrap();
@@ -621,7 +570,7 @@ mod tests {
 
         opts.context = Some("x".repeat(100));
         opts.context_max_tokens = 5;
-        let prompt = build_system_prompt(&db, &opts).unwrap();
+        let prompt = SystemPrompt::build(&db, &opts).unwrap();
         assert!(prompt.contains(&"x".repeat(20)));
         assert!(!prompt.contains(&"x".repeat(21)));
         assert!(prompt.contains("[context truncated at 5 tokens"));
@@ -638,12 +587,12 @@ mod tests {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        let chat = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
+        let chat = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
         assert!(chat.contains("Mode: chat."));
         assert!(chat.contains("- claims (0 rows)"));
         db.execute_statement("INSERT INTO claims VALUES (1, 10), (2, 20)")
             .unwrap();
-        let counted = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
+        let counted = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
         assert!(counted.contains("- claims (2 rows)"), "{counted}");
         assert!(chat.contains("- policy.pdf (status: ready"));
         assert!(!chat.contains("Pinned documents"));
@@ -653,13 +602,13 @@ mod tests {
         );
         let mut allowed = options(ChatMode::Chat, 1000);
         allowed.write_policy = WritePolicy::Allow;
-        let allowed = build_system_prompt(&db, &allowed).unwrap();
+        let allowed = SystemPrompt::build(&db, &allowed).unwrap();
         assert!(allowed.contains("has permitted statements that"));
         let mut ask = options(ChatMode::Chat, 1000);
         ask.write_policy = WritePolicy::Ask;
-        let ask = build_system_prompt(&db, &ask).unwrap();
+        let ask = SystemPrompt::build(&db, &ask).unwrap();
         assert!(ask.contains("the user is asked to approve it"));
-        let query = build_system_prompt(&db, &options(ChatMode::Query, 1000)).unwrap();
+        let query = SystemPrompt::build(&db, &options(ChatMode::Query, 1000)).unwrap();
         assert!(query.contains("Mode: query."));
         assert!(query.contains("Do not answer from memory"));
         assert!(query.contains("MUST end with that chunk's [n]"));
@@ -700,7 +649,7 @@ mod tests {
         db.set_document_pinned("d1", true).unwrap();
         db.set_document_pinned("d2", true).unwrap();
         // Budget of 20 tokens fits rules.md (~6 tokens) but not big.md (100).
-        let prompt = build_system_prompt(&db, &options(ChatMode::Chat, 20)).unwrap();
+        let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 20)).unwrap();
         assert!(
             prompt.contains("--- rules.md ---\nfirst rule\nsecond rule\n--- end rules.md ---"),
             "{prompt}"
@@ -715,7 +664,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn dialect_reference_is_pinned_to_the_bundled_duckdb_and_stays_in_the_sandbox() {
         let db = db();
-        let prompt = build_system_prompt(&db, &options(ChatMode::Chat, 100)).unwrap();
+        let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 100)).unwrap();
         let version = db.duckdb_version().unwrap();
         assert!(version.starts_with('v'), "{version}");
         assert!(prompt.contains(&format!("DuckDB {version} SQL reference")));
@@ -774,7 +723,7 @@ mod tests {
             db.execute_statement(&format!("CREATE TABLE t{i:02}(id INT)"))
                 .unwrap();
         }
-        let prompt = build_system_prompt(&db, &options(ChatMode::Chat, 1000)).unwrap();
+        let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
         assert!(prompt.contains("- c39 (INTEGER)"), "{prompt}");
         assert!(!prompt.contains("- c40 (INTEGER)"), "{prompt}");
         assert!(prompt.contains("... and 10 more columns"), "{prompt}");
@@ -809,7 +758,7 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn empty_workspace_prompt_says_so() {
-        let prompt = build_system_prompt(&db(), &options(ChatMode::Chat, 100)).unwrap();
+        let prompt = SystemPrompt::build(&db(), &options(ChatMode::Chat, 100)).unwrap();
         assert!(prompt.contains("No tables or documents have been ingested yet"));
     }
 }

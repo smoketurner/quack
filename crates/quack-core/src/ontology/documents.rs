@@ -595,7 +595,7 @@ fn propose_classes(
     candidates: &mut Vec<Candidate>,
 ) {
     for (class, support) in &evidence.class_support {
-        if class == ROOT_CLASS || current.is_some_and(|o| o.class(class).is_some()) {
+        if current.map_or(class == ROOT_CLASS, |o| o.defines_class(class)) {
             continue;
         }
         let parent = evidence
@@ -647,7 +647,7 @@ fn propose_relations(
         let Some(support) = &stat.support else {
             continue;
         };
-        if id == super::MENTIONS_RELATION || current.is_some_and(|o| o.relation(id).is_some()) {
+        if current.map_or(id == super::MENTIONS_RELATION, |o| o.defines_relation(id)) {
             continue;
         }
         candidates.push(Candidate {

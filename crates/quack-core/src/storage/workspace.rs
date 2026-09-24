@@ -69,6 +69,54 @@ pub enum StatementKind {
     Invalid(String),
 }
 
+impl StatementKind {
+    /// Whether a statement the parser accepted writes; the parser's message
+    /// for one it rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the syntax error of an `Invalid` statement.
+    pub fn writes(self) -> std::result::Result<bool, String> {
+        match self {
+            Self::Read => Ok(false),
+            Self::Write => Ok(true),
+            Self::Invalid(message) => Err(message),
+        }
+    }
+}
+
+/// Message returned to the caller when a statement would create a temp
+/// table or view.
+pub const TEMP_OBJECT_REFUSED: &str = "Temporary tables and views are not visible to every reader \
+     for the rest of this workspace's session; create a regular table instead \
+     (CREATE TABLE, without TEMP or TEMPORARY).";
+
+/// Whether `sql` is a `CREATE [OR REPLACE] {TEMP | TEMPORARY} ...`
+/// statement. `DuckDB` temp objects are connection-local, so one created
+/// on the writer would be invisible to every reader-routed tool for the
+/// rest of the workspace handle's life (they run on other connections);
+/// every path that can run a write (the agent's `run_sql`, the REST and
+/// MCP `sql` handlers) refuses these outright with this as the friendly,
+/// fail-fast message. It cannot be a complete check — a leading comment,
+/// a semicolon before the real statement, or a multi-statement batch all
+/// defeat a text match — so `ReaderDb::observe_write` is the actual
+/// correctness backstop; this is the fast path for the obvious case.
+#[must_use]
+pub fn creates_temp_object(sql: &str) -> bool {
+    let mut words = sql.split_whitespace().map(str::to_uppercase);
+    if words.next().as_deref() != Some("CREATE") {
+        return false;
+    }
+    let mut word = words.next();
+    if word.as_deref() == Some("OR") {
+        if words.next().as_deref() != Some("REPLACE") {
+            return false;
+        }
+        word = words.next();
+    }
+    matches!(word.as_deref(), Some("TEMP" | "TEMPORARY"))
+}
+
 /// Leading keywords that mark terminal input as SQL to run directly rather
 /// than a question for the agent.
 const DIRECT_SQL_KEYWORDS: &[&str] = &[
@@ -133,6 +181,28 @@ impl CappedResults {
     #[must_use]
     pub fn omitted(&self) -> usize {
         self.total_rows.saturating_sub(self.results.rows.len())
+    }
+
+    /// The rows as a text table for the model, with a last row saying how
+    /// many more there were and what to do instead when the cap cut it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if formatting fails.
+    pub fn to_model_text(&self) -> Result<String> {
+        let mut table = self.results.clone();
+        if self.truncated() {
+            table.rows.push(vec![serde_json::Value::String(format!(
+                "... ({} more rows not shown: the result was cut at the {}-row limit, so \
+                 aggregate, filter, or ORDER BY and LIMIT it in one statement rather than \
+                 re-running it per group)",
+                self.omitted(),
+                self.results.rows.len()
+            ))]);
+        }
+        let mut buf = Vec::new();
+        table.write_table(&mut buf)?;
+        String::from_utf8(buf).map_err(|e| Error::Analysis(format!("UTF-8 error: {e}")))
     }
 }
 
@@ -373,11 +443,11 @@ impl WorkspaceDb {
     /// Whether this connection has any temp tables: only ever the CLI's
     /// piped-stdin table, `ingestion::STDIN_TABLE`, loaded before a
     /// workspace handle's first turn — the agent itself is refused any
-    /// statement that would create one (`analysis::tools::gate_statement`),
+    /// statement that would create one (the agent's `SqlGate`),
     /// so none can appear later. `DuckDB` temp tables are connection-local,
     /// so a [`Self::try_clone_reader`] clone would not see one: a caller
     /// building a reader for a workspace handle's lifetime
-    /// (`analysis::tools::open_reader`) checks this once, at open, and
+    /// (`ReaderDb::open`) checks this once, at open, and
     /// reuses the writer instead when it's true.
     ///
     /// # Errors
@@ -2382,7 +2452,7 @@ fn term_count(terms: &[(String, u32)]) -> i64 {
 /// (the chunks a graph entity was extracted from), or to both at once.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChunkScope {
-    /// Empty means every document: `resolve_document_ids` refuses an id
+    /// Empty means every document: `ChunkScope::for_documents` refuses an id
     /// that matches nothing, so an empty list never means "none".
     documents: Vec<String>,
     /// `None` means no chunk restriction at all; `Some(ids)` means exactly
@@ -2405,6 +2475,46 @@ impl ChunkScope {
             documents: ids.into_iter().collect(),
             chunks: None,
         }
+    }
+
+    /// Only chunks of the documents `wanted` names, each by id, id prefix,
+    /// or file name; every document when `wanted` is empty.
+    ///
+    /// # Errors
+    ///
+    /// A name that matches no document is an error listing the documents
+    /// there are, so the caller corrects it rather than reading an empty
+    /// result as "the workspace has nothing on this".
+    pub fn for_documents(db: &WorkspaceDb, wanted: &[String]) -> Result<Self> {
+        if wanted.is_empty() {
+            return Ok(Self::all());
+        }
+        let documents = db.list_documents()?;
+        let mut resolved = Vec::with_capacity(wanted.len());
+        for want in wanted {
+            let want = want.trim();
+            let found = documents
+                .iter()
+                .find(|d| d.id == want || d.filename == want)
+                .or_else(|| {
+                    documents
+                        .iter()
+                        .find(|d| !want.is_empty() && d.id.starts_with(want))
+                });
+            let Some(d) = found else {
+                let known: Vec<String> = documents
+                    .iter()
+                    .map(|d| format!("{} ({})", d.id, d.filename))
+                    .collect();
+                return Err(Error::Analysis(format!(
+                    "no document matches '{want}'; pass an id from list_documents or omit \
+                     document_ids to search everything. Documents: {}",
+                    known.join(", ")
+                )));
+            };
+            resolved.push(d.id.clone());
+        }
+        Ok(Self::documents(resolved))
     }
 
     /// Narrow further to these chunk ids, however few.
@@ -2826,6 +2936,25 @@ fn display_json_value(val: &serde_json::Value) -> String {
 }
 
 impl QueryResults {
+    /// The rows with every text cell longer than `max_chars` cut, with an
+    /// ellipsis.
+    #[must_use]
+    pub fn with_cells_cut(&self, max_chars: usize) -> Self {
+        let mut out = self.clone();
+        for row in &mut out.rows {
+            for cell in row.iter_mut() {
+                if let serde_json::Value::String(text) = cell
+                    && text.chars().count() > max_chars
+                {
+                    let mut cut: String = text.chars().take(max_chars).collect();
+                    cut.push('\u{2026}');
+                    *cell = serde_json::Value::String(cut);
+                }
+            }
+        }
+        out
+    }
+
     /// Write results as a human-readable aligned table.
     ///
     /// # Errors

@@ -17,7 +17,7 @@ use crate::analysis::agent::{self, AgentResponse};
 use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
-use crate::analysis::tools::{ReaderDb, SharedDb, with_db};
+use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
     AuthMode, Config, ModelRef, ProviderConfig, ProviderName, ProviderType, config_file_path,
 };
@@ -743,7 +743,7 @@ pub fn chat_model_display(config: &Config) -> String {
 ///
 /// This is the single dispatch point over provider types; interfaces call it
 /// rather than matching on `provider_type` themselves. `reader_db` is the
-/// workspace handle's reader (`analysis::tools::open_reader`), built once
+/// workspace handle's reader (`ReaderDb::open`), built once
 /// for the handle's whole lifetime by whoever opened it — not here, so
 /// starting a turn never waits on `db`'s mutex to acquire one.
 ///
@@ -846,10 +846,8 @@ pub async fn run_turn(
     };
 
     let (session, text, recorded) = (session_id.to_owned(), message.to_owned(), response.clone());
-    with_db(&db, move |guard| {
-        sessions::record_turn(guard, &session, &text, &recorded)
-    })
-    .await?;
+    db.run(move |guard| sessions::record_turn(guard, &session, &text, &recorded))
+        .await?;
     Ok(response)
 }
 
@@ -881,23 +879,24 @@ async fn start_turn<'c>(
     let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
         .then_some(config.analysis.max_context_tokens);
     let history_budget = config.analysis.history_token_budget;
-    let (prompt, history) = with_db(db, move |guard| {
-        let session = sessions::get_session(guard, &session_id)?
-            .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
-        let prompt = PromptOptions {
-            mode: session.mode,
-            write_policy: policy,
-            pinned_token_budget,
-            context: context::combined(guard)?,
-            context_max_tokens,
-            ollama_context_cap,
-        };
-        Ok((
-            prompt,
-            sessions::history_for_model(guard, &session_id, history_budget)?,
-        ))
-    })
-    .await?;
+    let (prompt, history) = db
+        .run(move |guard| {
+            let session = sessions::get_session(guard, &session_id)?
+                .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
+            let prompt = PromptOptions {
+                mode: session.mode,
+                write_policy: policy,
+                pinned_token_budget,
+                context: context::combined(guard)?,
+                context_max_tokens,
+                ollama_context_cap,
+            };
+            Ok((
+                prompt,
+                sessions::history_for_model(guard, &session_id, history_budget)?,
+            ))
+        })
+        .await?;
     Ok(StartedTurn {
         chat,
         embedding_model,
@@ -993,7 +992,6 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::tools;
     use crate::embedding::Dimension;
     use crate::storage::workspace::WorkspaceDb;
     use crate::storage::writer::Writer;
@@ -1136,7 +1134,7 @@ mod tests {
         let session = sessions::create_session(&db, "o/m", sessions::ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
         let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-        let reader_db = tools::open_reader(&db, config.analysis.reader_pool_size).await;
+        let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
         let (sink, mut events) = events::channel();
         let cancel = CancellationToken::new();
         cancel.cancel();

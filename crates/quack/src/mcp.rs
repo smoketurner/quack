@@ -26,7 +26,9 @@ use quack_core::storage::control::{
     AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
 };
 use quack_core::storage::sessions::{self, ChatMode};
-use quack_core::storage::workspace::{ChunkScope, StatementKind, WorkspaceDb};
+use quack_core::storage::workspace::{
+    ChunkScope, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, ListResourceTemplatesResult, ListResourcesResult,
@@ -40,8 +42,6 @@ use serde::Deserialize;
 
 use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
-use quack_core::analysis::tools;
-use quack_core::analysis::tools::TEMP_OBJECT_REFUSED;
 use quack_core::error::Result as CoreResult;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{GraphResult, traverse};
@@ -488,12 +488,11 @@ impl McpServer {
             Err(e) => return Ok(failure(e.message)),
         };
         let detail = serde_json::json!({ "sql": statement });
-        let is_write = match kind {
-            StatementKind::Read => false,
-            StatementKind::Write => true,
-            StatementKind::Invalid(message) => return Ok(failure(message)),
+        let is_write = match kind.writes() {
+            Ok(is_write) => is_write,
+            Err(message) => return Ok(failure(message)),
         };
-        if is_write && tools::creates_temp_object(&statement) {
+        if is_write && creates_temp_object(&statement) {
             self.inner
                 .auditor
                 .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
@@ -1088,7 +1087,7 @@ mod tests {
         config.general.data_dir = dir.path().to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-        let reader = tools::open_reader(&db, config.analysis.reader_pool_size).await;
+        let reader = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
         let server = McpServer::new(
             config,
             Arc::clone(&db),

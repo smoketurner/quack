@@ -18,6 +18,33 @@ pub enum WritePolicy {
     Ask,
 }
 
+impl WritePolicy {
+    /// The system prompt's permissions paragraph for this policy.
+    #[must_use]
+    pub const fn prompt_paragraph(self) -> &'static str {
+        match self {
+            Self::Allow => {
+                "Permissions: SELECT queries always run. The user has permitted statements that \
+                 modify the workspace for this session, so when asked to change data, run the \
+                 statement with run_sql rather than asking for confirmation.\n"
+            }
+            Self::Ask => {
+                "Permissions: SELECT queries always run. When you run a statement that modifies \
+                 the workspace, the user is asked to approve it before it executes, so when asked \
+                 to change data, run the statement with run_sql rather than asking for \
+                 confirmation yourself. If the tool reports it was refused, do not retry it; tell \
+                 the user.\n"
+            }
+            Self::Deny => {
+                "Permissions: SELECT queries always run. Statements that modify the workspace are \
+                 not permitted in this session; if the user asks for one, still attempt it once \
+                 with run_sql so the refusal is recorded, then tell the user it needs write \
+                 permission (--allow-write). Do not retry.\n"
+            }
+        }
+    }
+}
+
 /// Shared flag set whenever a write was refused during a turn, so the
 /// interface can surface it (print mode exits 3).
 #[derive(Debug, Clone, Default)]

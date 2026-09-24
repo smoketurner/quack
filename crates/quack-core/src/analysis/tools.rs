@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rig::embeddings::EmbeddingModel;
 use rig::tool::{Tool, ToolContext};
@@ -10,18 +10,20 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::storage::workspace::{
-    ChunkScope, ChunkSearchResult, StatementKind, WorkspaceDb, quote_ident,
+    ChunkScope, ChunkSearchResult, StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb,
+    creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
 
-use super::chart::{self, ChartSpec};
+use super::chart::{ChartKind, ChartSpec};
+use super::citations::Markers;
 use super::events::{self, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
-use super::rerank::{self, Reranker};
-use super::text_to_sql;
+use super::rerank::{self, ModelReranker, Reranker};
+use crate::config::{RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, Input, Vector};
 use crate::error::Error;
-use crate::ontology::{self, Ontology, store as ontology_store};
+use crate::ontology::{Ontology, store as ontology_store};
 
 /// A workspace's writer: its one write connection, on a thread of its own
 /// with a two-tier line of work ([`crate::storage::writer`]).
@@ -67,7 +69,7 @@ impl ReaderDb {
     /// through [`WorkspaceDb::read_only`], so a write is refused, but
     /// there is no separate connection. For tests that want the
     /// read-only net without a real clone, and as the degraded fallback
-    /// [`open_reader`] returns when a clone would not serve.
+    /// [`ReaderDb::open`] returns when a clone would not serve.
     #[must_use]
     pub fn new(db: SharedDb) -> Self {
         Self::from_pool(Vec::new(), db)
@@ -159,62 +161,74 @@ impl ReaderDb {
         if self.0.degraded.load(Ordering::Relaxed) {
             return;
         }
-        let has_temp = with_db(&self.0.writer, WorkspaceDb::has_temp_tables)
+        let has_temp = self
+            .0
+            .writer
+            .run(WorkspaceDb::has_temp_tables)
             .await
             .unwrap_or(false);
         if has_temp {
             self.0.degraded.store(true, Ordering::Relaxed);
         }
     }
-}
 
-/// Build a reader pool for a workspace handle's whole lifetime — once, not
-/// once per turn, so acquiring one never waits behind a slow write on the
-/// writer. `pool_size` genuine
-/// [`WorkspaceDb::try_clone_reader`] clones, unless the writer already has
-/// a temp table (the CLI's piped `stdin`) a clone could not see, in which
-/// case every reader-routed tool shares the writer from the start. A clone
-/// that fails (allocation, a `DuckDB` internal error) degrades that one
-/// pool slot to the writer, with a warning, rather than the caller
-/// aborting.
-pub async fn open_reader(shared_db: &SharedDb, pool_size: u32) -> ReaderDb {
-    let pool_size = pool_size.max(1);
-    // One step on the writer for the temp check and every clone, instead
-    // of `pool_size + 1` separate ones:
-    // shortens how long a concurrent first-time open of this workspace
-    // can overlap another one, and is simply less work.
-    let outcome = with_db(shared_db, move |db| {
-        if db.has_temp_tables()? {
-            return Ok((true, Vec::new()));
-        }
-        let clones = (0..pool_size).map(|_| db.try_clone_reader()).collect();
-        Ok((false, clones))
-    })
-    .await;
-    let (has_temp_tables, clones) = outcome.unwrap_or_else(|e| {
-        tracing::warn!(
-            error = %e,
-            "failed to open the reader pool; every read will share the writer"
-        );
-        (true, Vec::new())
-    });
-    if has_temp_tables {
-        return ReaderDb::new(Arc::clone(shared_db));
-    }
-    let readers: Vec<ReaderConn> = clones
-        .into_iter()
-        .filter_map(|clone| match clone {
-            Ok(db) => Some(Arc::new(Mutex::new(db))),
-            Err(e) => {
+    /// Build a reader pool for a workspace handle's whole lifetime — once,
+    /// not once per turn, so acquiring one never waits behind a slow write
+    /// on the writer. `pool_size` genuine [`WorkspaceDb::try_clone_reader`]
+    /// clones, unless the writer already has a temp table (the CLI's piped
+    /// `stdin`) a clone could not see, in which case every reader-routed
+    /// tool shares the writer from the start. A clone that fails
+    /// (allocation, a `DuckDB` internal error) degrades that one pool slot
+    /// to the writer, with a warning, rather than the caller aborting.
+    pub async fn open(shared_db: &SharedDb, pool_size: u32) -> Self {
+        let pool_size = pool_size.max(1);
+        // One step on the writer for the temp check and every clone,
+        // instead of `pool_size + 1` separate ones: shortens how long a
+        // concurrent first-time open of this workspace can overlap another
+        // one, and is simply less work.
+        let opened = shared_db
+            .run(move |db| {
+                if db.has_temp_tables()? {
+                    return Ok(PoolOpen::WriterOnly);
+                }
+                Ok(PoolOpen::Clones(
+                    (0..pool_size).map(|_| db.try_clone_reader()).collect(),
+                ))
+            })
+            .await
+            .unwrap_or_else(|e| {
                 tracing::warn!(
                     error = %e,
-                    "failed to clone a reader connection; the pool is one smaller"
+                    "failed to open the reader pool; every read will share the writer"
                 );
-                None
-            }
-        })
-        .collect();
-    ReaderDb::from_pool(readers, Arc::clone(shared_db))
+                PoolOpen::WriterOnly
+            });
+        let PoolOpen::Clones(clones) = opened else {
+            return Self::new(Arc::clone(shared_db));
+        };
+        let readers: Vec<ReaderConn> = clones
+            .into_iter()
+            .filter_map(|clone| match clone {
+                Ok(db) => Some(Arc::new(Mutex::new(db))),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to clone a reader connection; the pool is one smaller"
+                    );
+                    None
+                }
+            })
+            .collect();
+        Self::from_pool(readers, Arc::clone(shared_db))
+    }
+}
+
+/// What opening a reader pool found on the writer.
+enum PoolOpen {
+    /// A temp table a clone could not see: every read shares the writer.
+    WriterOnly,
+    /// One clone attempt per pool slot.
+    Clones(Vec<error::Result<WorkspaceDb>>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -327,24 +341,6 @@ impl JsonSchema for NonBlank {
     }
 }
 
-/// Run `f` on the workspace's writer and await it (at the calling task's
-/// priority); no async worker waits on the connection. `run_sql` writes
-/// through this; every tool that only reads goes through
-/// [`ReaderDb::with_db`] instead.
-///
-/// # Errors
-///
-/// Returns `f`'s error, or the writer's (a panic in `f`, a stopped writer).
-pub(crate) async fn with_db<T>(
-    db: &SharedDb,
-    f: impl FnOnce(&WorkspaceDb) -> error::Result<T> + Send + 'static,
-) -> error::Result<T>
-where
-    T: Send + 'static,
-{
-    db.run(f).await
-}
-
 /// Prefix of a `run_sql` or `describe_table` result that carries a `DuckDB`
 /// error instead of rows. The model reads what follows and retries.
 pub const SQL_ERROR_PREFIX: &str = "SQL error: ";
@@ -358,92 +354,81 @@ pub const INTERNAL_TABLE_REFUSED: &str =
     "This statement references quack's internal tables, which are not available to queries.";
 
 /// What the gate decided about a statement.
+#[derive(Debug, PartialEq, Eq)]
 enum Gate {
-    /// Run it; the classification the gate already computed, so the
-    /// caller can run a `Read` inside [`WorkspaceDb::read_only`] and a
-    /// `Write` bare instead of re-deciding.
-    Run(StatementKind),
+    /// Run it inside a read-only transaction.
+    Read,
+    /// Run it bare: a write the policy allowed.
+    Write,
     /// Do not run; hand this text back to the model.
     Reject(String),
 }
 
-/// Message returned to the caller when a statement would create a temp
-/// table or view.
-pub const TEMP_OBJECT_REFUSED: &str = "Temporary tables and views are not visible to every reader \
-     for the rest of this workspace's session; create a regular table instead \
-     (CREATE TABLE, without TEMP or TEMPORARY).";
-
-/// Whether `sql` is a `CREATE [OR REPLACE] {TEMP | TEMPORARY} ...`
-/// statement. `DuckDB` temp objects are connection-local, so one created
-/// on the writer would be invisible to every reader-routed tool for the
-/// rest of the workspace handle's life (they run on other connections);
-/// every path that can run a write (`gate_statement`, the REST and MCP
-/// `sql` handlers) refuses these outright with this as the friendly,
-/// fail-fast message. It cannot be a complete check — a leading comment,
-/// a semicolon before the real statement, or a multi-statement batch all
-/// defeat a text match — so [`ReaderDb::observe_write`] is the actual
-/// correctness backstop; this is the fast path for the obvious case.
-#[must_use]
-pub fn creates_temp_object(sql: &str) -> bool {
-    let mut words = sql.split_whitespace().map(str::to_uppercase);
-    if words.next().as_deref() != Some("CREATE") {
-        return false;
-    }
-    let mut word = words.next();
-    if word.as_deref() == Some("OR") {
-        if words.next().as_deref() != Some("REPLACE") {
-            return false;
-        }
-        word = words.next();
-    }
-    matches!(word.as_deref(), Some("TEMP" | "TEMPORARY"))
+/// What a statement from the agent passes before it runs: no internal
+/// tables, a valid parse, and for a write, no temp object and the write
+/// policy.
+#[derive(Clone)]
+struct SqlGate {
+    /// Where the statement is classified: a parse, so a reader serves,
+    /// never the writer's line.
+    db: ReaderDb,
+    policy: WritePolicy,
+    refused: RefusalFlag,
+    recorder: TurnRecorder,
 }
 
-/// Classify a statement and apply the write policy. Takes and releases the
-/// database lock itself so a permission prompt never holds it.
-async fn gate_statement(
-    db: &ReaderDb,
-    sql: &str,
-    policy: WritePolicy,
-    refused: &RefusalFlag,
-    recorder: &TurnRecorder,
-) -> Result<Gate, ToolError> {
-    // Classification is a parse: a reader serves, never the writer's line.
-    let sql_owned = sql.to_owned();
-    let kind = db
-        .with_db(move |db| {
-            if db.references_internal_table(&sql_owned)? {
-                return Ok(None);
-            }
-            db.classify_statement(&sql_owned).map(Some)
-        })
-        .await?;
-    let Some(kind) = kind else {
-        return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
-    };
-    match kind {
-        StatementKind::Read => Ok(Gate::Run(kind)),
-        StatementKind::Invalid(msg) => Ok(Gate::Reject(format!("SQL syntax error: {msg}"))),
-        StatementKind::Write => {
-            if creates_temp_object(sql) {
-                // A mutating statement the caller wanted to run did not
-                // run, same as WRITE_REFUSED: AgentResponse::write_refused
-                // should say so.
-                refused.set();
-                tracing::info!(sql, "refused a statement that would create a temp object");
-                return Ok(Gate::Reject(String::from(TEMP_OBJECT_REFUSED)));
-            }
-            let allowed = match policy {
-                WritePolicy::Allow => true,
-                WritePolicy::Deny => false,
-                WritePolicy::Ask => recorder.ask_permission(sql).await,
-            };
-            if allowed {
-                Ok(Gate::Run(kind))
-            } else {
-                refused.set();
-                tracing::info!(sql, "refused write statement from agent");
-                Ok(Gate::Reject(String::from(WRITE_REFUSED)))
+impl SqlGate {
+    /// A gate that lets no write through and records no refusal: for
+    /// charts, which only ever read.
+    fn read_only(db: ReaderDb, recorder: TurnRecorder) -> Self {
+        Self {
+            db,
+            policy: WritePolicy::Deny,
+            refused: RefusalFlag::default(),
+            recorder,
+        }
+    }
+
+    /// Classify `sql` and apply the write policy. A permission prompt holds
+    /// no connection while it waits.
+    async fn check(&self, sql: &str) -> Result<Gate, ToolError> {
+        let sql_owned = sql.to_owned();
+        let kind = self
+            .db
+            .with_db(move |db| {
+                if db.references_internal_table(&sql_owned)? {
+                    return Ok(None);
+                }
+                db.classify_statement(&sql_owned).map(Some)
+            })
+            .await?;
+        let Some(kind) = kind else {
+            return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
+        };
+        match kind {
+            StatementKind::Read => Ok(Gate::Read),
+            StatementKind::Invalid(msg) => Ok(Gate::Reject(format!("SQL syntax error: {msg}"))),
+            StatementKind::Write => {
+                if creates_temp_object(sql) {
+                    // A mutating statement the caller wanted to run did
+                    // not run, same as WRITE_REFUSED:
+                    // AgentResponse::write_refused should say so.
+                    self.refused.set();
+                    tracing::info!(sql, "refused a statement that would create a temp object");
+                    return Ok(Gate::Reject(String::from(TEMP_OBJECT_REFUSED)));
+                }
+                let allowed = match self.policy {
+                    WritePolicy::Allow => true,
+                    WritePolicy::Deny => false,
+                    WritePolicy::Ask => self.recorder.ask_permission(sql).await,
+                };
+                if allowed {
+                    Ok(Gate::Write)
+                } else {
+                    self.refused.set();
+                    tracing::info!(sql, "refused write statement from agent");
+                    Ok(Gate::Reject(String::from(WRITE_REFUSED)))
+                }
             }
         }
     }
@@ -455,13 +440,11 @@ async fn gate_statement(
 
 pub struct RunSqlTool {
     db: SharedDb,
-    /// The workspace's reader, purely to call [`ReaderDb::observe_write`]
-    /// after a write runs here: `run_sql` never reads through it.
-    reader_db: ReaderDb,
+    /// Its reader classifies statements, and is told through
+    /// [`ReaderDb::observe_write`] when a write runs here: `run_sql` never
+    /// reads through it.
+    gate: SqlGate,
     max_query_rows: u32,
-    policy: WritePolicy,
-    refused: RefusalFlag,
-    recorder: TurnRecorder,
     /// Each statement run this turn with its parse tree blanked of
     /// literals (`WorkspaceDb::statement_shape`), to spot the model
     /// re-running one statement once per value.
@@ -480,21 +463,23 @@ impl RunSqlTool {
     ) -> Self {
         Self {
             db,
-            reader_db,
+            gate: SqlGate {
+                db: reader_db,
+                policy,
+                refused,
+                recorder,
+            },
             max_query_rows,
-            policy,
-            refused,
-            recorder,
             shapes: Mutex::new(Vec::new()),
         }
     }
 
-    /// An earlier statement this turn that `sql` repeats with only its
-    /// literals changed: the one-query-per-group loop that burns the turn
-    /// (a 20B model asked for deaths by state and weather ran the same
-    /// GROUP BY once per state until it hit `max_turns`). Records `sql`
-    /// for the calls after it.
-    fn repeated_shape(&self, sql: &str, shape: Option<String>) -> Option<String> {
+    /// The note for a statement that repeats an earlier one this turn with
+    /// only its literals changed: the one-query-per-group loop that burns
+    /// the turn (a 20B model asked for deaths by state and weather ran the
+    /// same GROUP BY once per state until it hit `max_turns`). Records
+    /// `sql` for the calls after it.
+    fn repeated_note(&self, sql: &str, shape: Option<String>) -> Option<String> {
         let shape = shape?;
         let mut shapes = self.shapes.lock().ok()?;
         let earlier = shapes
@@ -504,21 +489,16 @@ impl RunSqlTool {
             })
             .map(|(earlier, _)| earlier.clone());
         shapes.push((sql.to_owned(), shape));
-        earlier
+        let (preview, _) = events::preview_detail(earlier.as_deref()?);
+        Some(format!(
+            "Note: this statement repeats an earlier one with different literal values ({}). \
+             Do not run it once per value: one statement covers every group at once with \
+             GROUP BY (arg_max(label, measure) picks each group's top label), WHERE col IN \
+             (...), or QUALIFY row_number() OVER (PARTITION BY group_col ORDER BY measure DESC) \
+             <= n.",
+            preview.join(" ")
+        ))
     }
-}
-
-/// The note under a result whose statement repeats `earlier` with other
-/// literals.
-fn per_group_note(earlier: &str) -> String {
-    let (preview, _) = events::preview_detail(earlier);
-    format!(
-        "Note: this statement repeats an earlier one with different literal values ({}). \
-         Do not run it once per value: one statement covers every group at once with \
-         GROUP BY (arg_max(label, measure) picks each group's top label), WHERE col IN (...), \
-         or QUALIFY row_number() OVER (PARTITION BY group_col ORDER BY measure DESC) <= n.",
-        preview.join(" ")
-    )
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -551,69 +531,62 @@ impl Tool for RunSqlTool {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.recorder.start(Self::NAME, args.query.trim());
-        match gate_statement(
-            &self.reader_db,
-            &args.query,
-            self.policy,
-            &self.refused,
-            &self.recorder,
-        )
-        .await?
-        {
+        let step = self.gate.recorder.start(Self::NAME, args.query.trim());
+        let read_only = match self.gate.check(&args.query).await? {
             Gate::Reject(message) => {
                 step.finish("refused");
-                Ok(message)
+                return Ok(message);
             }
-            Gate::Run(kind) => {
-                // DuckDB blocks for up to the query timeout: keep that off
-                // the async workers, and keep the lock inside the blocking
-                // thread with it. A statement the gate classified `Read`
-                // still runs inside a read-only transaction, the same net
-                // every other tool has, in case a future parser
-                // divergence ever let a mutation through as `Read`.
-                let sql = args.query.clone();
-                let max_rows = self.max_query_rows;
-                let read_only = matches!(kind, StatementKind::Read);
-                let (results, shape) = with_db(&self.db, move |db| {
-                    let shape = db.statement_shape(&sql)?;
-                    let results = if read_only {
-                        db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))?
-                    } else {
-                        db.execute_query_capped(&sql, max_rows)
-                    };
-                    Ok((results, shape))
-                })
-                .await?;
-                if !read_only {
-                    // Whatever ran might have created a temp object
-                    // `creates_temp_object` did not catch (a leading
-                    // comment, a multi-statement batch); check the
-                    // writer's catalog regardless of whether the
-                    // statement itself errored, since an earlier
-                    // statement in a batch can have already run.
-                    self.reader_db.observe_write().await;
+            Gate::Read => true,
+            Gate::Write => false,
+        };
+        // DuckDB blocks for up to the query timeout: keep that off
+        // the async workers, and keep the lock inside the blocking
+        // thread with it. A statement the gate classified `Read`
+        // still runs inside a read-only transaction, the same net
+        // every other tool has, in case a future parser
+        // divergence ever let a mutation through as `Read`.
+        let sql = args.query.clone();
+        let max_rows = self.max_query_rows;
+        let (results, shape) = self
+            .db
+            .run(move |db| {
+                let shape = db.statement_shape(&sql)?;
+                let results = if read_only {
+                    db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))?
+                } else {
+                    db.execute_query_capped(&sql, max_rows)
+                };
+                Ok((results, shape))
+            })
+            .await?;
+        if !read_only {
+            // Whatever ran might have created a temp object
+            // `creates_temp_object` did not catch (a leading
+            // comment, a multi-statement batch); check the
+            // writer's catalog regardless of whether the
+            // statement itself errored, since an earlier
+            // statement in a batch can have already run.
+            self.gate.db.observe_write().await;
+        }
+        match results {
+            Ok(results) => {
+                step.finish(format!("{} rows", results.total_rows));
+                let mut text = results.to_model_text()?;
+                if let Some(note) = self.repeated_note(&args.query, shape) {
+                    text.push('\n');
+                    text.push_str(&note);
+                    text.push('\n');
                 }
-                match results {
-                    Ok(results) => {
-                        step.finish(format!("{} rows", results.total_rows));
-                        let mut text = text_to_sql::format_query_result(&results)?;
-                        if let Some(earlier) = self.repeated_shape(&args.query, shape) {
-                            text.push('\n');
-                            text.push_str(&per_group_note(&earlier));
-                            text.push('\n');
-                        }
-                        text.push('\n');
-                        text.push_str(&self.recorder.budget_note());
-                        Ok(text)
-                    }
-                    // A failed statement is a result, not a tool failure: rig
-                    // hides a tool error's message from the model, but DuckDB's
-                    // text (candidate bindings, the missing table) is exactly
-                    // what it needs to fix the statement and retry.
-                    Err(e) => Ok(format!("{SQL_ERROR_PREFIX}{}", step.fail(e))),
-                }
+                text.push('\n');
+                text.push_str(&self.gate.recorder.budget_note());
+                Ok(text)
             }
+            // A failed statement is a result, not a tool failure: rig
+            // hides a tool error's message from the model, but DuckDB's
+            // text (candidate bindings, the missing table) is exactly
+            // what it needs to fix the statement and retry.
+            Err(e) => Ok(format!("{SQL_ERROR_PREFIX}{}", step.fail(e))),
         }
     }
 }
@@ -632,6 +605,13 @@ impl Tool for RunSqlTool {
 /// sweep.
 const MAX_SEARCH_TOP_K: u32 = 50;
 
+/// A reranker, and how many candidates to over-fetch for it before the
+/// top `k` are kept.
+pub struct Rerank {
+    pub reranker: Arc<dyn Reranker>,
+    pub candidates: u32,
+}
+
 pub struct SearchDocumentsTool<M> {
     db: ReaderDb,
     /// `None` runs keyword search alone: a workspace without an embedding
@@ -639,8 +619,7 @@ pub struct SearchDocumentsTool<M> {
     embedding_model: Option<Embedder<M>>,
     default_top_k: u32,
     rrf_k: u32,
-    reranker: Option<Arc<dyn Reranker>>,
-    rerank_candidates: u32,
+    rerank: Option<Rerank>,
     recorder: TurnRecorder,
     /// The graph has nodes, so the `entity` argument can resolve. Without
     /// one the argument is left out of the tool's schema and description:
@@ -650,22 +629,40 @@ pub struct SearchDocumentsTool<M> {
 }
 
 impl<M> SearchDocumentsTool<M> {
+    /// The tool with `retrieval`'s `top_k` and `rrf_k`, and no reranker.
     pub fn new(
         db: ReaderDb,
         embedding_model: Option<Embedder<M>>,
-        default_top_k: u32,
-        rrf_k: u32,
+        retrieval: &RetrievalConfig,
         recorder: TurnRecorder,
     ) -> Self {
         Self {
             db,
             embedding_model,
-            default_top_k,
-            rrf_k,
-            reranker: None,
-            rerank_candidates: 0,
+            default_top_k: retrieval.top_k,
+            rrf_k: retrieval.rrf_k,
+            rerank: None,
             recorder,
             graph_enabled: false,
+        }
+    }
+
+    /// The tool as `[retrieval]` configures it, with the chat model as
+    /// reranker when `rerank = "model"`.
+    pub fn from_config(
+        db: ReaderDb,
+        completion_model: &(impl rig::completion::CompletionModel + Clone + 'static),
+        embedding_model: Option<Embedder<M>>,
+        retrieval: &RetrievalConfig,
+        recorder: TurnRecorder,
+    ) -> Self {
+        let search = Self::new(db, embedding_model, retrieval, recorder);
+        match retrieval.rerank {
+            RerankMode::None => search,
+            RerankMode::Model => search.with_reranker(Rerank {
+                reranker: Arc::new(ModelReranker::new(completion_model.clone())),
+                candidates: retrieval.rerank_candidates,
+            }),
         }
     }
 
@@ -676,12 +673,10 @@ impl<M> SearchDocumentsTool<M> {
         self
     }
 
-    /// Over-fetch `candidates` and let `reranker` order them before the
-    /// top `k` are returned.
+    /// Let `rerank` order the candidates before the top `k` are returned.
     #[must_use]
-    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>, candidates: u32) -> Self {
-        self.reranker = Some(reranker);
-        self.rerank_candidates = candidates;
+    pub fn with_reranker(mut self, rerank: Rerank) -> Self {
+        self.rerank = Some(rerank);
         self
     }
 }
@@ -700,42 +695,6 @@ pub struct SearchDocumentsArgs {
     /// named as it appears in the knowledge graph
     #[serde(default)]
     pub entity: NonBlank,
-}
-
-/// Map what the model passed (an id, an id prefix, or a file name) to
-/// document ids. Anything that matches nothing is an error naming the
-/// documents that exist, so the model retries instead of getting an empty
-/// result it reads as "the workspace has nothing on this".
-fn resolve_document_ids(db: &WorkspaceDb, wanted: &[String]) -> error::Result<Vec<String>> {
-    if wanted.is_empty() {
-        return Ok(Vec::new());
-    }
-    let documents = db.list_documents()?;
-    let mut resolved = Vec::with_capacity(wanted.len());
-    for want in wanted {
-        let want = want.trim();
-        let found = documents
-            .iter()
-            .find(|d| d.id == want || d.filename == want)
-            .or_else(|| {
-                documents
-                    .iter()
-                    .find(|d| !want.is_empty() && d.id.starts_with(want))
-            });
-        let Some(d) = found else {
-            let known: Vec<String> = documents
-                .iter()
-                .map(|d| format!("{} ({})", d.id, d.filename))
-                .collect();
-            return Err(Error::Analysis(format!(
-                "no document matches '{want}'; pass an id from list_documents or omit \
-                 document_ids to search everything. Documents: {}",
-                known.join(", ")
-            )));
-        };
-        resolved.push(d.id.clone());
-    }
-    Ok(resolved)
 }
 
 impl<M> Tool for SearchDocumentsTool<M>
@@ -795,7 +754,11 @@ where
         let query_vec: Option<Vector> = match &self.embedding_model {
             None => None,
             Some(model) => {
-                match cached_embed(model, &self.recorder, Input::Query(args.query.clone())).await {
+                match self
+                    .recorder
+                    .embed_cached(model, Input::Query(args.query.clone()))
+                    .await
+                {
                     Ok(vector) => Some(vector),
                     Err(e) => return Err(ToolError::Embedding(step.fail(e).to_string())),
                 }
@@ -806,11 +769,10 @@ where
             .top_k
             .unwrap_or(self.default_top_k)
             .clamp(1, MAX_SEARCH_TOP_K);
-        let fetch = if self.reranker.is_some() {
-            top_k.max(self.rerank_candidates)
-        } else {
-            top_k
-        };
+        let fetch = self
+            .rerank
+            .as_ref()
+            .map_or(top_k, |rerank| top_k.max(rerank.candidates));
 
         // The entity's own embedding, not the query's: it resolves a label,
         // so `search_documents(query, entity)` is one embed call each,
@@ -818,7 +780,9 @@ where
         // resolves the same label again this turn.
         let entity_vec = match entity {
             Some(entity) => {
-                label_embedding(self.embedding_model.as_ref(), &self.recorder, entity).await?
+                self.recorder
+                    .embed_label(self.embedding_model.as_ref(), entity)
+                    .await?
             }
             None => None,
         };
@@ -830,7 +794,7 @@ where
         let results = self
             .db
             .with_db(move |db| {
-                let mut scope = ChunkScope::documents(resolve_document_ids(db, &document_ids)?);
+                let mut scope = ChunkScope::for_documents(db, &document_ids)?;
                 if let Some(entity) = entity.as_deref() {
                     scope = scope.and_chunks(entity_chunks(db, entity, entity_vec.as_deref())?);
                 }
@@ -844,11 +808,11 @@ where
             Ok(results) => results,
             Err(e) => return Err(step.fail(e.into())),
         };
-        let (results, note) = match &self.reranker {
-            Some(reranker) => {
+        let (results, note) = match &self.rerank {
+            Some(rerank) => {
                 let keep = usize::try_from(top_k).unwrap_or(usize::MAX);
                 let (kept, outcome) =
-                    rerank::apply(reranker.as_ref(), &args.query, results, keep).await;
+                    rerank::apply(rerank.reranker.as_ref(), &args.query, results, keep).await;
                 let note = match outcome {
                     rerank::RerankOutcome::Skipped => String::new(),
                     rerank::RerankOutcome::Reranked(name) => format!(", reranked by {name}"),
@@ -867,8 +831,8 @@ where
             .with_db(move |db| graph::store::entities_of_chunks(db, &chunk_ids, CHUNK_ENTITIES))
             .await
             .unwrap_or_default();
-        let first = self.recorder.citations().register(&results);
-        format_search_results(&results, first, &entities).map_err(Into::into)
+        let markers = self.recorder.citations().register(&results);
+        format_search_results(&results, markers, &entities).map_err(Into::into)
     }
 }
 
@@ -886,17 +850,14 @@ fn entity_chunks(
 ) -> error::Result<Vec<String>> {
     let nodes = graph::traverse::resolve_entry(db, entity, None, embedding)?;
     if nodes.is_empty() {
-        let suggestions = graph::traverse::suggest_entities(db, entity, None, embedding)?;
-        if suggestions.is_empty() {
-            return Err(Error::Analysis(format!(
-                "no entity '{entity}' in the knowledge graph; drop the entity argument to search \
-                 every document"
-            )));
-        }
-        return Err(Error::Analysis(format!(
-            "no entity '{entity}' in the knowledge graph; the closest labels are: {}",
-            suggestions.join(", ")
-        )));
+        let unknown = UnknownEntity::find(db, entity, embedding);
+        return Err(if unknown.closest.is_empty() {
+            Error::Analysis(format!(
+                "{unknown}; drop the entity argument to search every document"
+            ))
+        } else {
+            unknown.into()
+        });
     }
     let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let chunks = graph::store::chunks_of_nodes(db, &ids)?;
@@ -917,7 +878,7 @@ fn entity_chunks(
 /// Returns an error only if formatting into the output buffer fails.
 pub fn format_search_results(
     results: &[ChunkSearchResult],
-    first_marker: u32,
+    markers: Markers,
     entities: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> Result<String, std::fmt::Error> {
     if results.is_empty() {
@@ -929,7 +890,7 @@ pub fn format_search_results(
         "Retrieved chunks. Cite each fact you use with the chunk's [n] marker at the end of the sentence.\n\n",
     );
     for (i, chunk) in results.iter().enumerate() {
-        let n = first_marker.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+        let n = markers.nth(i);
         let page = chunk.page.map_or(String::new(), |p| format!(", page {p}"));
         let heading = chunk
             .heading
@@ -1153,22 +1114,48 @@ impl Tool for ListDocumentsTool {
 // create_chart
 // ---------------------------------------------------------------------------
 
+/// A value one tool leaves for the end of the turn: the chart.
+#[derive(Debug)]
+pub struct TurnSlot<T>(Arc<Mutex<Option<T>>>);
+
+impl<T> Clone for TurnSlot<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> Default for TurnSlot<T> {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+}
+
+impl<T> TurnSlot<T> {
+    /// Leave `value`, replacing what an earlier call left. The lock is
+    /// never poisoned: a panic aborts the process.
+    pub fn put(&self, value: T) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(value);
+    }
+
+    /// What was left, emptying the slot.
+    #[must_use]
+    pub fn take(&self) -> Option<T> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
 pub struct CreateChartTool {
-    db: ReaderDb,
-    chart_spec: Arc<Mutex<Option<ChartSpec>>>,
-    recorder: TurnRecorder,
+    /// Charts only read: the gate lets no write through.
+    gate: SqlGate,
+    chart: TurnSlot<ChartSpec>,
 }
 
 impl CreateChartTool {
-    pub fn new(
-        db: ReaderDb,
-        chart_spec: Arc<Mutex<Option<ChartSpec>>>,
-        recorder: TurnRecorder,
-    ) -> Self {
+    #[must_use]
+    pub fn new(db: ReaderDb, chart: TurnSlot<ChartSpec>, recorder: TurnRecorder) -> Self {
         Self {
-            db,
-            chart_spec,
-            recorder,
+            gate: SqlGate::read_only(db, recorder),
+            chart,
         }
     }
 }
@@ -1212,23 +1199,14 @@ impl Tool for CreateChartTool {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.recorder.start(Self::NAME, args.sql.trim());
-        // Charts are read-only: never prompt, never write.
-        if let Gate::Reject(message) = gate_statement(
-            &self.db,
-            &args.sql,
-            WritePolicy::Deny,
-            &RefusalFlag::default(),
-            &self.recorder,
-        )
-        .await?
-        {
+        let step = self.gate.recorder.start(Self::NAME, args.sql.trim());
+        if let Gate::Reject(message) = self.gate.check(&args.sql).await? {
             step.finish("rejected");
             return Ok(format!("Chart query rejected. {message}"));
         }
 
         let sql = args.sql.clone();
-        let results = self.db.with_db(move |db| db.execute_query(&sql)).await;
+        let results = self.gate.db.with_db(move |db| db.execute_query(&sql)).await;
         let results = match results {
             Ok(r) => r,
             Err(e) => return Err(step.fail(e.into())),
@@ -1241,11 +1219,13 @@ impl Tool for CreateChartTool {
             ));
         }
 
-        let spec =
-            match chart::generate_chart_spec(&results, &args.kind, &args.x, &args.y, &args.title) {
-                Ok(spec) => spec,
-                Err(e) => return Ok(format!("Chart not created: {}", step.fail(e))),
-            };
+        let spec = args.kind.parse::<ChartKind>().and_then(|kind| {
+            ChartSpec::from_results(&results, kind, &args.x, &args.y, &args.title)
+        });
+        let spec = match spec {
+            Ok(spec) => spec,
+            Err(e) => return Ok(format!("Chart not created: {}", step.fail(e))),
+        };
 
         let summary = format!(
             "{} chart \"{}\" with {} points ({} by {})",
@@ -1255,13 +1235,7 @@ impl Tool for CreateChartTool {
             args.y,
             args.x
         );
-        {
-            let mut guard = self
-                .chart_spec
-                .lock()
-                .map_err(|e| ToolError::Analysis(format!("mutex poisoned: {e}")))?;
-            *guard = Some(spec);
-        }
+        self.chart.put(spec);
 
         step.finish(format!("{} points", results.rows.len()));
         Ok(format!(
@@ -1340,10 +1314,12 @@ mod tests {
         let recorder = TurnRecorder::new(sink);
         let name = |text: &str| Input::Similarity(text.to_owned());
 
-        let first = cached_embed(&model, &recorder, name("Acme")).await;
-        let second = cached_embed(&model, &recorder, name("Acme")).await;
-        let other = cached_embed(&model, &recorder, name("Beta")).await;
-        let as_query = cached_embed(&model, &recorder, Input::Query("Acme".into())).await;
+        let first = recorder.embed_cached(&model, name("Acme")).await;
+        let second = recorder.embed_cached(&model, name("Acme")).await;
+        let other = recorder.embed_cached(&model, name("Beta")).await;
+        let as_query = recorder
+            .embed_cached(&model, Input::Query("Acme".into()))
+            .await;
 
         assert!(first.is_ok());
         assert_eq!(first.as_ref().ok(), second.as_ref().ok());
@@ -1360,13 +1336,15 @@ mod tests {
     #[test]
     fn unknown_class_and_relation_ids_are_refused_with_the_real_ones() {
         let ontology = Ontology::builtin_default();
-        assert!(check_class(Some(&ontology), "organization").is_ok());
+        let class = |id| OntologyId::Class(id).check(Some(&ontology));
+        let relation = |id| OntologyId::Relation(id).check(Some(&ontology));
+        assert!(class("organization").is_ok());
         // The root class and `mentions` are implicit: never declared, always valid.
-        assert!(check_class(Some(&ontology), ontology::ROOT_CLASS).is_ok());
-        assert!(check_relation(Some(&ontology), ontology::MENTIONS_RELATION).is_ok());
-        assert!(check_relation(Some(&ontology), "works_at").is_ok());
+        assert!(class(crate::ontology::ROOT_CLASS).is_ok());
+        assert!(relation(crate::ontology::MENTIONS_RELATION).is_ok());
+        assert!(relation("works_at").is_ok());
 
-        let err = check_class(Some(&ontology), "organisation")
+        let err = class("organisation")
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
@@ -1374,7 +1352,7 @@ mod tests {
             err.contains("no class 'organisation'") && err.contains("organization"),
             "{err}"
         );
-        let err = check_relation(Some(&ontology), "employed_by")
+        let err = relation("employed_by")
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
@@ -1382,8 +1360,8 @@ mod tests {
             err.contains("no relation 'employed_by'") && err.contains("works_at"),
             "{err}"
         );
-        assert!(check_class(None, "organization").is_err());
-        assert!(check_relation(None, "works_at").is_err());
+        assert!(OntologyId::Class("organization").check(None).is_err());
+        assert!(OntologyId::Relation("works_at").check(None).is_err());
     }
 
     /// Two chunks about hail, the denser one second, for the search tests.
@@ -1512,23 +1490,28 @@ mod tests {
             properties: BTreeMap::new(),
             relations: Vec::new(),
         });
+        let row = |ontology, table, row_key| {
+            RowReference {
+                ontology,
+                table,
+                row_key,
+            }
+            .to_string()
+        };
         assert_eq!(
-            row_reference(Some(&ontology), "orders", Some("A-42")),
+            row(Some(&ontology), "orders", Some("A-42")),
             "\"orders\" WHERE \"order id\" = 'A-42'"
         );
         // A quote in the key is escaped, not left to break the statement.
         assert_eq!(
-            row_reference(Some(&ontology), "orders", Some("O'Hara")),
+            row(Some(&ontology), "orders", Some("O'Hara")),
             "\"orders\" WHERE \"order id\" = 'O''Hara'"
         );
         // Without a mapping the column is unknown: say the row, do not guess.
+        assert_eq!(row(Some(&ontology), "audit", Some("7")), "audit row 7");
+        assert_eq!(row(None, "orders", Some("7")), "orders row 7");
         assert_eq!(
-            row_reference(Some(&ontology), "audit", Some("7")),
-            "audit row 7"
-        );
-        assert_eq!(row_reference(None, "orders", Some("7")), "orders row 7");
-        assert_eq!(
-            row_reference(Some(&ontology), "orders", None),
+            row(Some(&ontology), "orders", None),
             "orders (row key unknown)"
         );
     }
@@ -1536,8 +1519,16 @@ mod tests {
     #[test]
     fn describe_class_covers_the_ontology_and_the_graph() {
         let ontology = Ontology::builtin_default();
-        let census = (3, vec![String::from("Ada"), String::from("Alan")]);
-        let text = describe_class(&ontology, "person", &census);
+        let describe = |class_id, total, samples: &[String]| {
+            ClassDescription {
+                ontology: &ontology,
+                class_id,
+                total,
+                samples,
+            }
+            .to_string()
+        };
+        let text = describe("person", 3, &[String::from("Ada"), String::from("Alan")]);
         assert!(
             text.contains("Class person (inherits: person -> entity)"),
             "{text}"
@@ -1558,7 +1549,7 @@ mod tests {
             "{text}"
         );
 
-        let empty = describe_class(&ontology, "product", &(0, Vec::new()));
+        let empty = describe("product", 0, &[]);
         assert!(empty.contains("In the graph: no entities"), "{empty}");
         assert!(empty.contains("Properties: none"), "{empty}");
         assert!(empty.contains("produced_by -> organization"), "{empty}");
@@ -1573,11 +1564,11 @@ mod tests {
     fn long_id_lists_are_counted_rather_than_pasted() {
         let ids: Vec<String> = (0..(LISTED_IDS + 5)).map(|i| format!("c{i:03}")).collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let text = listed(&refs);
+        let text = Listed(&refs).to_string();
         assert!(text.starts_with("c000, c001"), "{text}");
         assert!(text.ends_with("... and 5 more"), "{text}");
         assert!(!text.contains("c040"), "{text}");
-        assert_eq!(listed(&["a", "b"]), "a, b");
+        assert_eq!(Listed(&["a", "b"]).to_string(), "a, b");
     }
 
     #[test]
@@ -1653,15 +1644,22 @@ mod tests {
             )
             .is_ok()
         );
-        let by_name = resolve_document_ids(&db, &[String::from("policy.pdf")]);
-        assert!(by_name.is_ok_and(|ids| ids == ["01a0-first"]));
-        let by_prefix = resolve_document_ids(&db, &[String::from("01b0")]);
-        assert!(by_prefix.is_ok_and(|ids| ids == ["01b0-second"]));
-        let by_id =
-            resolve_document_ids(&db, &[String::from("01a0-first"), String::from("notes.md")]);
-        assert!(by_id.is_ok_and(|ids| ids == ["01a0-first", "01b0-second"]));
-        assert!(resolve_document_ids(&db, &[]).is_ok_and(|ids| ids.is_empty()));
-        let err = resolve_document_ids(&db, &[String::from("missing.pdf")]).err();
+        let scope = |wanted: &[&str]| {
+            let wanted: Vec<String> = wanted.iter().map(|w| (*w).to_owned()).collect();
+            ChunkScope::for_documents(&db, &wanted)
+        };
+        let documents = |ids: &[&str]| ChunkScope::documents(ids.iter().map(|i| (*i).to_owned()));
+        assert_eq!(
+            scope(&["policy.pdf"]).ok(),
+            Some(documents(&["01a0-first"]))
+        );
+        assert_eq!(scope(&["01b0"]).ok(), Some(documents(&["01b0-second"])));
+        assert_eq!(
+            scope(&["01a0-first", "notes.md"]).ok(),
+            Some(documents(&["01a0-first", "01b0-second"]))
+        );
+        assert_eq!(scope(&[]).ok(), Some(ChunkScope::all()));
+        let err = scope(&["missing.pdf"]).err();
         assert!(err.is_some_and(|e| {
             let text = e.to_string();
             text.contains("no document matches 'missing.pdf'") && text.contains("policy.pdf")
@@ -1689,7 +1687,7 @@ mod tests {
                 hit(0, "policy.pdf", "  Flood is excluded.  "),
                 hit(1, "faq.md", "Claims close in 30 days."),
             ],
-            1,
+            Markers::starting_at(1),
             &BTreeMap::new(),
         )
         .unwrap();
@@ -1717,7 +1715,7 @@ mod tests {
         )]);
         let out = format_search_results(
             &[hit(0, "efscale.html", "Damage indicators.")],
-            1,
+            Markers::starting_at(1),
             &entities,
         )
         .unwrap();
@@ -1729,22 +1727,31 @@ mod tests {
         );
         assert!(out.contains("\nDamage indicators.\n"), "{out}");
         // A chunk with no entities keeps the plain metadata line.
-        let none =
-            format_search_results(&[hit(0, "efscale.html", "x")], 1, &BTreeMap::new()).unwrap();
+        let none = format_search_results(
+            &[hit(0, "efscale.html", "x")],
+            Markers::starting_at(1),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert!(!none.contains("graph entities"), "{none}");
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn format_search_results_continues_numbering() {
-        let out = format_search_results(&[hit(0, "a.md", "x")], 5, &BTreeMap::new()).unwrap();
+        let out = format_search_results(
+            &[hit(0, "a.md", "x")],
+            Markers::starting_at(5),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert!(out.contains("\n[5] a.md"), "{out}");
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn format_search_results_empty_tells_model_to_say_so() {
-        let out = format_search_results(&[], 4, &BTreeMap::new()).unwrap();
+        let out = format_search_results(&[], Markers::starting_at(4), &BTreeMap::new()).unwrap();
         assert!(out.contains("No relevant chunks found"));
     }
 
@@ -1762,29 +1769,45 @@ mod tests {
         panic!("in-memory DuckDB failed to open: {msg}");
     }
 
+    /// A gate over `db` with `policy`.
+    fn gate(
+        db: &SharedDb,
+        policy: WritePolicy,
+        refused: &RefusalFlag,
+        recorder: &TurnRecorder,
+    ) -> SqlGate {
+        SqlGate {
+            db: ReaderDb::new(Arc::clone(db)),
+            policy,
+            refused: refused.clone(),
+            recorder: recorder.clone(),
+        }
+    }
+
+    /// Retrieval as the search tests expect it: five chunks, `rrf_k` 60.
+    fn retrieval() -> RetrievalConfig {
+        RetrievalConfig {
+            top_k: 5,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        }
+    }
+
     #[tokio::test]
     async fn gate_runs_reads_and_rejects_internal_tables_and_syntax_errors() {
         let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         let refused = RefusalFlag::default();
+        let deny = gate(&db, WritePolicy::Deny, &refused, &recorder);
+        let allow = gate(&db, WritePolicy::Allow, &refused, &recorder);
+        assert_eq!(deny.check("SELECT 1").await.ok(), Some(Gate::Read));
         assert!(matches!(
-            gate_statement(
-                &ReaderDb::new(Arc::clone(&db)),
-                "SELECT 1",
-                WritePolicy::Deny,
-                &refused,
-                &recorder
-            )
-            .await,
-            Ok(Gate::Run(StatementKind::Read))
-        ));
-        assert!(matches!(
-            gate_statement(&ReaderDb::new(Arc::clone(&db)), "SELECT * FROM _quack_chunks", WritePolicy::Allow, &refused, &recorder).await,
+            allow.check("SELECT * FROM _quack_chunks").await,
             Ok(Gate::Reject(m)) if m == INTERNAL_TABLE_REFUSED
         ));
         assert!(matches!(
-            gate_statement(&ReaderDb::new(Arc::clone(&db)), "SELEC 1", WritePolicy::Allow, &refused, &recorder).await,
+            allow.check("SELEC 1").await,
             Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
         ));
         assert!(!refused.was_refused());
@@ -1827,16 +1850,14 @@ mod tests {
     #[tokio::test]
     async fn observe_write_degrades_every_clone_once_a_temp_table_appears() {
         let db = shared_db();
-        let reader_db = open_reader(&db, 2).await;
+        let reader_db = ReaderDb::open(&db, 2).await;
         let reader_clone = reader_db.clone();
 
         // Before the write: the reader pool is real clones, so a temp
         // table on the writer is not yet visible to them.
-        with_db(&db, |db| {
-            db.execute_statement("CREATE TEMP TABLE scratch AS SELECT 1 AS a")
-        })
-        .await
-        .unwrap_or_else(|e| fail_test(&e.to_string()));
+        db.run(|db| db.execute_statement("CREATE TEMP TABLE scratch AS SELECT 1 AS a"))
+            .await
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
             reader_db
                 .with_db(|db| db.execute_query("SELECT * FROM scratch"))
@@ -1880,7 +1901,7 @@ mod tests {
             "SELECT 1; CREATE TEMP TABLE scratch(a INT)",
         ] {
             let db = shared_db();
-            let reader_db = open_reader(&db, 2).await;
+            let reader_db = ReaderDb::open(&db, 2).await;
             let (sink, _rx) = events::channel();
             let recorder = TurnRecorder::new(sink);
             let tool = RunSqlTool::new(
@@ -1925,14 +1946,9 @@ mod tests {
         let db = shared_db();
         let refused = RefusalFlag::default();
         assert!(matches!(
-            gate_statement(
-                &ReaderDb::new(Arc::clone(&db)),
-                "CREATE TEMP TABLE t AS SELECT 1",
-                WritePolicy::Allow,
-                &refused,
-                &recorder
-            )
-            .await,
+            gate(&db, WritePolicy::Allow, &refused, &recorder)
+                .check("CREATE TEMP TABLE t AS SELECT 1")
+                .await,
             Ok(Gate::Reject(m)) if m == TEMP_OBJECT_REFUSED
         ));
         assert!(refused.was_refused());
@@ -1963,8 +1979,7 @@ mod tests {
         let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
-            5,
-            60,
+            &retrieval(),
             recorder.clone(),
         );
         let text = tool
@@ -1990,11 +2005,13 @@ mod tests {
         let reranked = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
-            5,
-            60,
+            &retrieval(),
             recorder.clone(),
         )
-        .with_reranker(Arc::new(Reverse), 5);
+        .with_reranker(Rerank {
+            reranker: Arc::new(Reverse),
+            candidates: 5,
+        });
         let text = reranked
             .call(
                 &mut ToolContext::new(),
@@ -2026,8 +2043,7 @@ mod tests {
         let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(shared_db()),
             None,
-            5,
-            60,
+            &retrieval(),
             TurnRecorder::new(sink),
         );
         let has_entity = |tool: &SearchDocumentsTool<EmbedModel>| {
@@ -2071,8 +2087,7 @@ mod tests {
         let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
-            5,
-            60,
+            &retrieval(),
             recorder,
         );
         let text = tool
@@ -2263,20 +2278,16 @@ mod tests {
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
         let refused = RefusalFlag::default();
-        assert!(matches!(
-            gate_statement(
-                &ReaderDb::new(Arc::clone(&db)),
-                "CREATE TABLE t(a INT)",
-                WritePolicy::Allow,
-                &refused,
-                &recorder
-            )
-            .await,
-            Ok(Gate::Run(StatementKind::Write))
-        ));
+        assert_eq!(
+            gate(&db, WritePolicy::Allow, &refused, &recorder)
+                .check("CREATE TABLE t(a INT)")
+                .await
+                .ok(),
+            Some(Gate::Write)
+        );
         assert!(!refused.was_refused());
         assert!(matches!(
-            gate_statement(&ReaderDb::new(Arc::clone(&db)), "DROP TABLE t", WritePolicy::Deny, &refused, &recorder).await,
+            gate(&db, WritePolicy::Deny, &refused, &recorder).check("DROP TABLE t").await,
             Ok(Gate::Reject(m)) if m == WRITE_REFUSED
         ));
         assert!(refused.was_refused());
@@ -2295,17 +2306,10 @@ mod tests {
             let recorder = recorder.clone();
             let refused = refused.clone();
             async move {
-                matches!(
-                    gate_statement(
-                        &ReaderDb::new(Arc::clone(&db)),
-                        "DELETE FROM t",
-                        WritePolicy::Ask,
-                        &refused,
-                        &recorder
-                    )
-                    .await,
-                    Ok(Gate::Run(StatementKind::Write))
-                )
+                gate(&db, WritePolicy::Ask, &refused, &recorder)
+                    .check("DELETE FROM t")
+                    .await
+                    .is_ok_and(|gate| gate == Gate::Write)
             }
         });
         let req = match rx.recv().await {
@@ -2378,7 +2382,6 @@ mod tests {
 use crate::error;
 use crate::graph::traverse::Hops;
 use crate::graph::{self, GraphResult};
-use crate::ontology::Relation;
 
 /// The graph results a turn produced, kept for the response.
 pub type GraphResults = Arc<Mutex<Vec<GraphResult>>>;
@@ -2462,46 +2465,44 @@ struct GraphQuery {
     embedding: Option<Vector>,
 }
 
-/// A `search_graph` lookup on the database thread: refuse ids the ontology
-/// does not define, traverse from the entity or list the class, and gather
-/// the labels to suggest when nothing matched.
-fn lookup_graph(
-    db: &WorkspaceDb,
-    query: &GraphQuery,
-    options: &graph::GraphOptions,
-) -> error::Result<GraphLookup> {
-    let ontology = ontology_store::current(db)?;
-    let class = query.class.as_deref();
-    let relation = query.relation.as_deref();
-    let embedding = query.embedding.as_deref();
-    if let Some(class) = class {
-        check_class(ontology.as_ref(), class)?;
-    }
-    if let Some(relation) = relation {
-        check_relation(ontology.as_ref(), relation)?;
-    }
-    let result = if let Some(entity) = query.entity.as_deref() {
-        let roots = graph::traverse::resolve_entry(db, entity, class, embedding)?;
-        graph::traverse::neighborhood(db, &roots, query.hops, relation, options)?
-    } else {
-        graph::traverse::by_class(
-            db,
-            ontology.as_ref(),
-            class.unwrap_or_default(),
-            options.max_nodes,
-            options,
-        )?
-    };
-    let suggestions = match query.entity.as_deref() {
-        Some(entity) if result.nodes.is_empty() => {
-            graph::traverse::suggest_entities(db, entity, class, embedding)?
+impl GraphQuery {
+    /// Run it on the database thread: refuse ids the ontology does not
+    /// define, traverse from the entity or list the class, and gather the
+    /// labels to suggest when nothing matched.
+    fn run(&self, db: &WorkspaceDb, options: &graph::GraphOptions) -> error::Result<GraphLookup> {
+        let ontology = ontology_store::current(db)?;
+        let class = self.class.as_deref();
+        let relation = self.relation.as_deref();
+        let embedding = self.embedding.as_deref();
+        if let Some(class) = class {
+            OntologyId::Class(class).check(ontology.as_ref())?;
         }
-        Some(_) | None => Vec::new(),
-    };
-    Ok(GraphLookup {
-        result,
-        suggestions,
-    })
+        if let Some(relation) = relation {
+            OntologyId::Relation(relation).check(ontology.as_ref())?;
+        }
+        let result = if let Some(entity) = self.entity.as_deref() {
+            let roots = graph::traverse::resolve_entry(db, entity, class, embedding)?;
+            graph::traverse::neighborhood(db, &roots, self.hops, relation, options)?
+        } else {
+            graph::traverse::by_class(
+                db,
+                ontology.as_ref(),
+                class.unwrap_or_default(),
+                options.max_nodes,
+                options,
+            )?
+        };
+        let suggestions = match self.entity.as_deref() {
+            Some(entity) if result.nodes.is_empty() => {
+                graph::traverse::suggest_entities(db, entity, class, embedding)?
+            }
+            Some(_) | None => Vec::new(),
+        };
+        Ok(GraphLookup {
+            result,
+            suggestions,
+        })
+    }
 }
 
 /// Ids past this many are counted rather than listed when an unknown id is
@@ -2510,97 +2511,72 @@ const LISTED_IDS: usize = 40;
 
 /// `a, b, c ... and N more`, so a refusal names what exists without
 /// pasting a whole ontology into the model's context.
-fn listed(ids: &[&str]) -> String {
-    let mut shown: Vec<String> = ids
-        .iter()
-        .take(LISTED_IDS)
-        .map(|id| (*id).to_owned())
-        .collect();
-    let hidden = ids.len().saturating_sub(shown.len());
-    if hidden > 0 {
-        shown.push(format!("... and {hidden} more"));
+struct Listed<'a>(&'a [&'a str]);
+
+impl std::fmt::Display for Listed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = self.0.iter().take(LISTED_IDS);
+        for (i, id) in shown.enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(id)?;
+        }
+        let hidden = self.0.len().saturating_sub(LISTED_IDS);
+        if hidden > 0 {
+            write!(f, ", ... and {hidden} more")?;
+        }
+        Ok(())
     }
-    shown.join(", ")
 }
 
-/// Refuse a class the ontology does not define, naming the ones it does.
-/// `resolve_document_ids` sets the contract for `search_documents`: an id
-/// that matches nothing is an error the model can correct, never an empty
-/// result it reads as "the workspace has nothing on this".
-fn check_class(ontology: Option<&Ontology>, class_id: &str) -> error::Result<()> {
-    let Some(ontology) = ontology else {
-        return Err(Error::Analysis(String::from(
-            "this workspace has no ontology, so it has no classes to search by",
-        )));
-    };
-    if class_id == ontology::ROOT_CLASS || ontology.class(class_id).is_some() {
-        return Ok(());
-    }
-    let mut ids: Vec<&str> = vec![ontology::ROOT_CLASS];
-    ids.extend(ontology.classes.iter().map(|c| c.id.as_str()));
-    Err(Error::Analysis(format!(
-        "no class '{class_id}' in the ontology; the classes are: {}",
-        listed(&ids)
-    )))
+/// A class or relation id a tool argument names.
+#[derive(Debug, Clone, Copy)]
+enum OntologyId<'a> {
+    Class(&'a str),
+    Relation(&'a str),
 }
 
-/// Refuse a relation the ontology does not define, naming the ones it does.
-fn check_relation(ontology: Option<&Ontology>, relation_id: &str) -> error::Result<()> {
-    let Some(ontology) = ontology else {
-        return Err(Error::Analysis(String::from(
-            "this workspace has no ontology, so it has no relations to follow",
-        )));
-    };
-    if relation_id == ontology::MENTIONS_RELATION || ontology.relation(relation_id).is_some() {
-        return Ok(());
+impl OntologyId<'_> {
+    /// Refuse an id the ontology does not define, naming the ones it does:
+    /// like a document id in `search_documents`, an id that matches nothing
+    /// is an error the model can correct, never an empty result it reads as
+    /// "the workspace has nothing on this".
+    fn check(self, ontology: Option<&Ontology>) -> error::Result<()> {
+        let Some(ontology) = ontology else {
+            return Err(Error::Analysis(String::from(match self {
+                Self::Class(_) => {
+                    "this workspace has no ontology, so it has no classes to search by"
+                }
+                Self::Relation(_) => {
+                    "this workspace has no ontology, so it has no relations to follow"
+                }
+            })));
+        };
+        let (kind, plural, id, defined, ids) = match self {
+            Self::Class(id) => (
+                "class",
+                "classes",
+                id,
+                ontology.defines_class(id),
+                ontology.class_ids(),
+            ),
+            Self::Relation(id) => (
+                "relation",
+                "relations",
+                id,
+                ontology.defines_relation(id),
+                ontology.relation_ids(),
+            ),
+        };
+        if defined {
+            return Ok(());
+        }
+        Err(Error::Analysis(format!(
+            "no {kind} '{id}' in the ontology; the {plural} are: {}",
+            Listed(&ids)
+        )))
     }
-    let mut ids: Vec<&str> = vec![ontology::MENTIONS_RELATION];
-    ids.extend(ontology.relations.iter().map(|r| r.id.as_str()));
-    Err(Error::Analysis(format!(
-        "no relation '{relation_id}' in the ontology; the relations are: {}",
-        listed(&ids)
-    )))
-}
-
-/// Embed `text` once per turn: cached on the turn recorder by exact input
-/// text, so a turn that asks to embed the same query or entity label more
-/// than once (retrieval and a rerank check, or the same entity resolved
-/// by `search_documents`, `search_graph`, and `find_path` in one turn)
-/// pays for the model call only the first time.
-///
-/// # Errors
-///
-/// Returns the model's error, unwrapped so a caller keeps its usual
-/// message formatting.
-async fn cached_embed<M: EmbeddingModel>(
-    embedder: &Embedder<M>,
-    recorder: &TurnRecorder,
-    input: Input,
-) -> error::Result<Vector> {
-    if let Some(cached) = recorder.cached_embedding(&input) {
-        return Ok(cached);
-    }
-    let vector = embedder.embed_one(&input).await?;
-    recorder.cache_embedding(input, vector.clone());
-    Ok(vector)
-}
-
-/// Embed a label for fuzzy entry-point resolution, when a model exists.
-/// The label's embedding for fuzzy entry: `None` without a model, an
-/// error when the model fails (issue #62: a silent `None` degraded the
-/// search to exact matches without saying so).
-async fn label_embedding<M: EmbeddingModel>(
-    embedder: Option<&Embedder<M>>,
-    recorder: &TurnRecorder,
-    label: &str,
-) -> Result<Option<Vector>, ToolError> {
-    let Some(embedder) = embedder else {
-        return Ok(None);
-    };
-    let vector = cached_embed(embedder, recorder, Input::Similarity(label.to_owned()))
-        .await
-        .map_err(|e| ToolError::Analysis(format!("embedding failed: {e}")))?;
-    Ok(Some(vector))
 }
 
 impl<M> Tool for SearchGraphTool<M>
@@ -2646,7 +2622,12 @@ where
             ))));
         }
         let embedding = match entity {
-            Some(e) => label_embedding(tools.embedding_model.as_ref(), &tools.recorder, e).await?,
+            Some(e) => {
+                tools
+                    .recorder
+                    .embed_label(tools.embedding_model.as_ref(), e)
+                    .await?
+            }
             None => None,
         };
         let query = GraphQuery {
@@ -2657,10 +2638,7 @@ where
             embedding,
         };
         let options = tools.options;
-        let lookup = tools
-            .db
-            .with_db(move |db| lookup_graph(db, &query, &options))
-            .await;
+        let lookup = tools.db.with_db(move |db| query.run(db, &options)).await;
         let lookup = match lookup {
             Ok(lookup) => lookup,
             Err(e) => return Err(step.fail(e.into())),
@@ -2739,10 +2717,14 @@ where
         if from.is_empty() || to.is_empty() {
             return Err(step.fail(ToolError::Analysis(String::from("give both entities"))));
         }
-        let from_embedding =
-            label_embedding(tools.embedding_model.as_ref(), &tools.recorder, from).await?;
-        let to_embedding =
-            label_embedding(tools.embedding_model.as_ref(), &tools.recorder, to).await?;
+        let from_embedding = tools
+            .recorder
+            .embed_label(tools.embedding_model.as_ref(), from)
+            .await?;
+        let to_embedding = tools
+            .recorder
+            .embed_label(tools.embedding_model.as_ref(), to)
+            .await?;
         let max_hops = Hops::path(args.max_hops);
         let from_owned = from.to_owned();
         let to_owned = to.to_owned();
@@ -2760,12 +2742,12 @@ where
                     graph::traverse::resolve_entry(db, &to_owned, None, to_embedding.as_deref())?;
                 match (a.first(), b.first()) {
                     (Some(a), Some(b)) => graph::traverse::path(db, a, b, max_hops, &options),
-                    (None, _) => Err(unresolved_entity(
-                        db,
-                        &from_owned,
-                        from_embedding.as_deref(),
-                    )),
-                    (_, None) => Err(unresolved_entity(db, &to_owned, to_embedding.as_deref())),
+                    (None, _) => {
+                        Err(UnknownEntity::find(db, &from_owned, from_embedding.as_deref()).into())
+                    }
+                    (_, None) => {
+                        Err(UnknownEntity::find(db, &to_owned, to_embedding.as_deref()).into())
+                    }
                 }
             })
             .await;
@@ -2799,18 +2781,39 @@ where
     }
 }
 
-/// The error for a path endpoint that resolved to nothing, carrying the
-/// nearest labels so the model can call again with a real one.
-fn unresolved_entity(db: &WorkspaceDb, entity: &str, embedding: Option<&[f32]>) -> Error {
-    let suggestions =
-        graph::traverse::suggest_entities(db, entity, None, embedding).unwrap_or_default();
-    if suggestions.is_empty() {
-        return Error::Analysis(format!("no entity matches '{entity}'"));
+/// A name that resolved to no entity, with the closest labels, so the
+/// model can call again with a real one.
+struct UnknownEntity {
+    name: String,
+    closest: Vec<String>,
+}
+
+impl UnknownEntity {
+    /// `name`, which resolved to nothing, and the labels nearest it; a
+    /// failed suggestion lookup offers none.
+    fn find(db: &WorkspaceDb, name: &str, embedding: Option<&[f32]>) -> Self {
+        Self {
+            name: name.to_owned(),
+            closest: graph::traverse::suggest_entities(db, name, None, embedding)
+                .unwrap_or_default(),
+        }
     }
-    Error::Analysis(format!(
-        "no entity matches '{entity}'; the closest labels in the graph are: {}",
-        suggestions.join(", ")
-    ))
+}
+
+impl std::fmt::Display for UnknownEntity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no entity '{}' in the knowledge graph", self.name)?;
+        if !self.closest.is_empty() {
+            write!(f, "; the closest labels are: {}", self.closest.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+impl From<UnknownEntity> for Error {
+    fn from(unknown: UnknownEntity) -> Self {
+        Self::Analysis(unknown.to_string())
+    }
 }
 
 /// What the model is told when a lookup came back empty: that the graph
@@ -2911,10 +2914,10 @@ async fn format_graph_result(
         })
         .await?;
     if !chunks.is_empty() {
-        let first = recorder.citations().register(&chunks);
+        let markers = recorder.citations().register(&chunks);
         writeln!(out, "\nSources (cite with the [n] marker):")?;
         for (i, chunk) in chunks.iter().enumerate() {
-            let n = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+            let n = markers.nth(i);
             let page = chunk.page.map_or(String::new(), |p| format!(", page {p}"));
             let excerpt: String = chunk.content.trim().chars().take(200).collect();
             writeln!(out, "[{n}] {}{page}: {excerpt}", chunk.filename)?;
@@ -2927,12 +2930,14 @@ async fn format_graph_result(
         .provenance
         .iter()
         .filter_map(|p| {
-            let table = p.table_name.as_deref()?;
-            Some(row_reference(
-                ontology.as_ref(),
-                table,
-                p.row_key.as_deref(),
-            ))
+            Some(
+                RowReference {
+                    ontology: ontology.as_ref(),
+                    table: p.table_name.as_deref()?,
+                    row_key: p.row_key.as_deref(),
+                }
+                .to_string(),
+            )
         })
         .collect();
     if !rows.is_empty() {
@@ -2999,15 +3004,21 @@ impl Tool for DescribeClassTool {
             .db
             .with_db(move |db| {
                 let ontology = ontology_store::current(db)?;
-                check_class(ontology.as_ref(), &class_id)?;
+                OntologyId::Class(&class_id).check(ontology.as_ref())?;
                 let Some(ontology) = ontology else {
                     return Err(Error::Analysis(String::from(
                         "this workspace has no ontology",
                     )));
                 };
-                let classes = class_and_subclasses(&ontology, &class_id);
-                let census = graph::store::class_census(db, &classes, CLASS_SAMPLES)?;
-                Ok(describe_class(&ontology, &class_id, &census))
+                let classes = ontology.class_and_descendants(&class_id);
+                let (total, samples) = graph::store::class_census(db, &classes, CLASS_SAMPLES)?;
+                Ok(ClassDescription {
+                    ontology: &ontology,
+                    class_id: &class_id,
+                    total,
+                    samples: &samples,
+                }
+                .to_string())
             })
             .await;
         match text {
@@ -3020,112 +3031,112 @@ impl Tool for DescribeClassTool {
     }
 }
 
-/// A class and every class under it, the set `search_graph(class)` lists
-/// and `class_census` counts.
-fn class_and_subclasses(ontology: &Ontology, class_id: &str) -> Vec<String> {
-    let mut out = vec![class_id.to_owned()];
-    for class in &ontology.classes {
-        if class.id != class_id && ontology.is_subclass_of(&class.id, class_id) {
-            out.push(class.id.clone());
-        }
-    }
-    out
-}
-
 /// One class as the model sees it: the ontology's view of it plus what
-/// the graph actually holds.
-fn describe_class(ontology: &Ontology, class_id: &str, census: &(u64, Vec<String>)) -> String {
-    let mut lines = vec![format!(
-        "Class {class_id} (inherits: {})",
-        ontology.ancestry(class_id).join(" -> ")
-    )];
-    if let Some(class) = ontology.class(class_id) {
-        if let Some(description) = class.description.as_deref() {
-            lines.push(format!("  {description}"));
-        }
-        if let Some(key) = class.key.as_deref() {
-            lines.push(format!("Key property: {key}"));
-        }
-    }
-
-    let subclasses: Vec<&str> = ontology
-        .subclasses(class_id)
-        .iter()
-        .map(|c| c.id.as_str())
-        .collect();
-    lines.push(if subclasses.is_empty() {
-        String::from("Subclasses: none")
-    } else {
-        format!(
-            "Subclasses: {} (search_graph on this class covers them too)",
-            listed(&subclasses)
-        )
-    });
-
-    let properties: Vec<String> = ontology
-        .class_properties(class_id)
-        .iter()
-        .map(|id| match ontology.property(id) {
-            Some(property) if property.values.is_empty() => {
-                format!("{id} ({})", property.kind.as_str())
-            }
-            Some(property) => format!("{id} (enum: {})", property.values.join(", ")),
-            None => id.clone(),
-        })
-        .collect();
-    lines.push(if properties.is_empty() {
-        String::from("Properties: none")
-    } else {
-        format!("Properties: {}", properties.join(", "))
-    });
-
-    let (from, to) = ontology.relations_of(class_id);
-    lines.push(relation_line("Relations from it", &from, |relation| {
-        format!("{} -> {}", relation.id, relation.range)
-    }));
-    lines.push(relation_line("Relations to it", &to, |relation| {
-        format!("{} from {}", relation.id, relation.domain)
-    }));
-
-    if let Some(mapping) = ontology.mapping_for(class_id) {
-        lines.push(format!(
-            "Mapped table: {} (key column {}); run_sql can query it directly",
-            mapping.table, mapping.key
-        ));
-    }
-
-    let (total, samples) = census;
-    lines.push(if *total == 0 {
-        String::from("In the graph: no entities of this class")
-    } else if samples.len() < usize::try_from(*total).unwrap_or(usize::MAX) {
-        format!(
-            "In the graph: {total} entities, for example {}",
-            samples.join(", ")
-        )
-    } else {
-        format!(
-            "In the graph: {total} entities \u{2014} {}",
-            samples.join(", ")
-        )
-    });
-
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
+/// the graph holds of it and its subclasses.
+struct ClassDescription<'a> {
+    ontology: &'a Ontology,
+    class_id: &'a str,
+    /// Entities of the class in the graph.
+    total: u64,
+    /// A few of their labels.
+    samples: &'a [String],
 }
 
-/// One `Relations ...` line, or `none` when the class takes part in no
-/// relation in that direction.
-fn relation_line(
-    label: &str,
-    relations: &[&Relation],
-    render: impl Fn(&Relation) -> String,
-) -> String {
-    if relations.is_empty() {
-        return format!("{label}: none");
+impl std::fmt::Display for ClassDescription<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            ontology,
+            class_id,
+            total,
+            samples,
+        } = *self;
+        writeln!(
+            f,
+            "Class {class_id} (inherits: {})",
+            ontology.ancestry(class_id).join(" -> ")
+        )?;
+        if let Some(class) = ontology.class(class_id) {
+            if let Some(description) = class.description.as_deref() {
+                writeln!(f, "  {description}")?;
+            }
+            if let Some(key) = class.key.as_deref() {
+                writeln!(f, "Key property: {key}")?;
+            }
+        }
+
+        let subclasses: Vec<&str> = ontology
+            .subclasses(class_id)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        if subclasses.is_empty() {
+            writeln!(f, "Subclasses: none")?;
+        } else {
+            writeln!(
+                f,
+                "Subclasses: {} (search_graph on this class covers them too)",
+                Listed(&subclasses)
+            )?;
+        }
+
+        let properties: Vec<String> = ontology
+            .class_properties(class_id)
+            .iter()
+            .map(|id| match ontology.property(id) {
+                Some(property) if property.values.is_empty() => {
+                    format!("{id} ({})", property.kind.as_str())
+                }
+                Some(property) => format!("{id} (enum: {})", property.values.join(", ")),
+                None => id.clone(),
+            })
+            .collect();
+        if properties.is_empty() {
+            writeln!(f, "Properties: none")?;
+        } else {
+            writeln!(f, "Properties: {}", properties.join(", "))?;
+        }
+
+        let (from, to) = ontology.relations_of(class_id);
+        let from: Vec<String> = from
+            .iter()
+            .map(|r| format!("{} -> {}", r.id, r.range))
+            .collect();
+        let to: Vec<String> = to
+            .iter()
+            .map(|r| format!("{} from {}", r.id, r.domain))
+            .collect();
+        for (label, relations) in [("Relations from it", from), ("Relations to it", to)] {
+            if relations.is_empty() {
+                writeln!(f, "{label}: none")?;
+            } else {
+                writeln!(f, "{label}: {}", relations.join("; "))?;
+            }
+        }
+
+        if let Some(mapping) = ontology.mapping_for(class_id) {
+            writeln!(
+                f,
+                "Mapped table: {} (key column {}); run_sql can query it directly",
+                mapping.table, mapping.key
+            )?;
+        }
+
+        if total == 0 {
+            writeln!(f, "In the graph: no entities of this class")
+        } else if samples.len() < usize::try_from(total).unwrap_or(usize::MAX) {
+            writeln!(
+                f,
+                "In the graph: {total} entities, for example {}",
+                samples.join(", ")
+            )
+        } else {
+            writeln!(
+                f,
+                "In the graph: {total} entities \u{2014} {}",
+                samples.join(", ")
+            )
+        }
     }
-    let rendered: Vec<String> = relations.iter().map(|r| render(r)).collect();
-    format!("{label}: {}", rendered.join("; "))
 }
 
 /// A row's provenance as something the model can act on: the mapping
@@ -3133,20 +3144,27 @@ fn relation_line(
 /// (`orders WHERE order_id = 'A-42'`) rather than as prose the model has
 /// to guess a column name from. The mapping is what built the node in the
 /// first place (design doc 6.3, table mapping).
-fn row_reference(ontology: Option<&Ontology>, table: &str, row_key: Option<&str>) -> String {
-    let Some(key) = row_key else {
-        return format!("{table} (row key unknown)");
-    };
-    let column = ontology
-        .and_then(|o| o.mappings.iter().find(|m| m.table == table))
-        .map(|m| m.key.as_str());
-    match column {
-        Some(column) => format!(
-            "{} WHERE {} = '{}'",
-            quote_ident(table),
-            quote_ident(column),
-            key.replace('\'', "''")
-        ),
-        None => format!("{table} row {key}"),
+struct RowReference<'a> {
+    ontology: Option<&'a Ontology>,
+    table: &'a str,
+    row_key: Option<&'a str>,
+}
+
+impl std::fmt::Display for RowReference<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let table = self.table;
+        let Some(key) = self.row_key else {
+            return write!(f, "{table} (row key unknown)");
+        };
+        match self.ontology.and_then(|o| o.mapping_for_table(table)) {
+            Some(mapping) => write!(
+                f,
+                "{} WHERE {} = '{}'",
+                quote_ident(table),
+                quote_ident(&mapping.key),
+                key.replace('\'', "''")
+            ),
+            None => write!(f, "{table} row {key}"),
+        }
     }
 }

@@ -18,6 +18,20 @@ pub struct Citation {
 }
 
 impl Citation {
+    /// The retrieved chunk `hit`, cited as `[n]`.
+    #[must_use]
+    pub fn new(n: u32, hit: &ChunkSearchResult) -> Self {
+        Self {
+            n,
+            chunk_id: hit.id.clone(),
+            document_id: hit.document_id.clone(),
+            filename: hit.filename.clone(),
+            chunk_index: hit.chunk_index,
+            page: hit.page,
+            heading: hit.heading.clone(),
+        }
+    }
+
     /// `filename, page 12, under "Exclusions"` for footers and status lines.
     #[must_use]
     pub fn label(&self) -> String {
@@ -32,6 +46,41 @@ impl Citation {
     }
 }
 
+/// The markers one registration assigned: `[first]`, `[first + 1]`, and so
+/// on, one per chunk in the order registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Markers {
+    first: u32,
+}
+
+impl Markers {
+    /// Markers counting up from `first`.
+    #[must_use]
+    pub const fn starting_at(first: u32) -> Self {
+        Self { first }
+    }
+
+    #[must_use]
+    pub const fn first(self) -> u32 {
+        self.first
+    }
+
+    /// The marker of the `index`th chunk registered.
+    #[must_use]
+    pub fn nth(self, index: usize) -> u32 {
+        self.first
+            .saturating_add(u32::try_from(index).unwrap_or(u32::MAX))
+    }
+}
+
+/// An answer with its citation markers checked: the text, and the chunks
+/// it cites in order of first use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitedAnswer {
+    pub text: String,
+    pub citations: Vec<Citation>,
+}
+
 /// Chunks retrieved during one turn, numbered in the order they were shown
 /// to the model. Shared between the search tool and the agent loop.
 #[derive(Debug, Clone, Default)]
@@ -40,73 +89,66 @@ pub struct CitationRegistry {
 }
 
 impl CitationRegistry {
-    /// Assign markers to `hits` continuing from the last one and return the
-    /// first marker number.
+    /// Assign markers to `hits`, continuing from the last one.
     #[must_use]
-    pub fn register(&self, hits: &[ChunkSearchResult]) -> u32 {
+    pub fn register(&self, hits: &[ChunkSearchResult]) -> Markers {
         let Ok(mut all) = self.inner.lock() else {
-            return 1;
+            return Markers { first: 1 };
         };
-        let first = u32::try_from(all.len())
-            .unwrap_or(u32::MAX)
-            .saturating_add(1);
+        let markers = Markers {
+            first: u32::try_from(all.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1),
+        };
         for (i, hit) in hits.iter().enumerate() {
-            let n = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
-            all.push(Citation {
-                n,
-                chunk_id: hit.id.clone(),
-                document_id: hit.document_id.clone(),
-                filename: hit.filename.clone(),
-                chunk_index: hit.chunk_index,
-                page: hit.page,
-                heading: hit.heading.clone(),
-            });
+            all.push(Citation::new(markers.nth(i), hit));
         }
-        first
+        markers
     }
 
     #[must_use]
     pub fn all(&self) -> Vec<Citation> {
         self.inner.lock().map(|c| c.clone()).unwrap_or_default()
     }
-}
 
-/// Keep the `[n]` markers that name a registered chunk, strip the rest, and
-/// return the cited chunks in order of first use with markers renumbered
-/// from 1 so the footer reads naturally.
-#[must_use]
-pub fn validate(answer: &str, registered: &[Citation]) -> (String, Vec<Citation>) {
-    // Some models emit fullwidth brackets (【1】) or superscript-style
-    // `[^1]`; normalize to `[1]` before scanning.
-    let answer = answer
-        .replace('【', "[")
-        .replace('】', "]")
-        .replace("[^", "[");
-    let mut out = String::with_capacity(answer.len());
-    let mut cited: Vec<Citation> = Vec::new();
+    /// Keep the `[n]` markers in `answer` that name a registered chunk,
+    /// strip the rest, and renumber the kept ones from 1 in order of first
+    /// use so the footer reads naturally.
+    #[must_use]
+    pub fn validate(&self, answer: &str) -> CitedAnswer {
+        let registered = self.all();
+        // Some models emit fullwidth brackets (【1】) or superscript-style
+        // `[^1]`; normalize to `[1]` before scanning.
+        let answer = answer
+            .replace('【', "[")
+            .replace('】', "]")
+            .replace("[^", "[");
+        let mut out = String::with_capacity(answer.len());
+        let mut cited: Vec<Citation> = Vec::new();
 
-    // Walk the text as `text[marker]text[marker]...`. Every '[' starts a
-    // candidate; only `[digits]` naming a registered chunk is a marker.
-    let mut pieces = answer.split('[');
-    if let Some(first) = pieces.next() {
-        out.push_str(first);
-    }
-    for piece in pieces {
-        let Some((inside, after)) = piece.split_once(']') else {
-            out.push('[');
-            out.push_str(piece);
-            continue;
-        };
-        let digits = inside.trim();
-        let parsed = if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-            None
-        } else {
-            digits.parse::<u32>().ok()
-        };
-        match parsed.and_then(|n| registered.iter().find(|c| c.n == n)) {
-            Some(source) => {
-                let renumbered =
-                    if let Some(pos) = cited.iter().position(|c| c.chunk_id == source.chunk_id) {
+        // Walk the text as `text[marker]text[marker]...`. Every '[' starts a
+        // candidate; only `[digits]` naming a registered chunk is a marker.
+        let mut pieces = answer.split('[');
+        if let Some(first) = pieces.next() {
+            out.push_str(first);
+        }
+        for piece in pieces {
+            let Some((inside, after)) = piece.split_once(']') else {
+                out.push('[');
+                out.push_str(piece);
+                continue;
+            };
+            let digits = inside.trim();
+            let parsed = if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+                None
+            } else {
+                digits.parse::<u32>().ok()
+            };
+            match parsed.and_then(|n| registered.iter().find(|c| c.n == n)) {
+                Some(source) => {
+                    let renumbered = if let Some(pos) =
+                        cited.iter().position(|c| c.chunk_id == source.chunk_id)
+                    {
                         u32::try_from(pos).unwrap_or(u32::MAX).saturating_add(1)
                     } else {
                         let next = u32::try_from(cited.len())
@@ -117,23 +159,27 @@ pub fn validate(answer: &str, registered: &[Citation]) -> (String, Vec<Citation>
                         cited.push(c);
                         next
                     };
-                out.push('[');
-                out.push_str(&renumbered.to_string());
-                out.push(']');
+                    out.push('[');
+                    out.push_str(&renumbered.to_string());
+                    out.push(']');
+                }
+                None if parsed.is_some() || is_channel_marker(inside) => {
+                    // A marker the model invented, or a provider's channel
+                    // token that leaked into the text: dropped.
+                }
+                None => {
+                    out.push('[');
+                    out.push_str(inside);
+                    out.push(']');
+                }
             }
-            None if parsed.is_some() || is_channel_marker(inside) => {
-                // A marker the model invented, or a provider's channel
-                // token that leaked into the text: dropped.
-            }
-            None => {
-                out.push('[');
-                out.push_str(inside);
-                out.push(']');
-            }
+            out.push_str(after);
         }
-        out.push_str(after);
+        CitedAnswer {
+            text: out,
+            citations: cited,
+        }
     }
-    (out, cited)
 }
 
 /// A harmony-style channel token some providers leak into the answer,
@@ -168,10 +214,12 @@ mod tests {
     fn markers_continue_across_searches() {
         let registry = CitationRegistry::default();
         assert_eq!(
-            registry.register(&[hit("a", "p.pdf", 0), hit("b", "p.pdf", 1)]),
+            registry
+                .register(&[hit("a", "p.pdf", 0), hit("b", "p.pdf", 1)])
+                .first(),
             1
         );
-        assert_eq!(registry.register(&[hit("c", "q.md", 0)]), 3);
+        assert_eq!(registry.register(&[hit("c", "q.md", 0)]).nth(0), 3);
         let all = registry.all();
         assert_eq!(all.iter().map(|c| c.n).collect::<Vec<_>>(), vec![1, 2, 3]);
         assert_eq!(all.last().map(|c| c.chunk_id.as_str()), Some("c"));
@@ -185,10 +233,12 @@ mod tests {
             hit("b", "p.pdf", 1),
             hit("c", "q.md", 0),
         ]);
-        assert_eq!(first, 1);
-        let (text, cited) = validate(
+        assert_eq!(first.first(), 1);
+        let CitedAnswer {
+            text,
+            citations: cited,
+        } = registry.validate(
             "Flood is excluded [3]. Claims close in 30 days [1][3]. See also [7] and [x] and [ 2 ].",
-            &registry.all(),
         );
         assert_eq!(
             text,
@@ -206,8 +256,11 @@ mod tests {
     #[test]
     fn validate_accepts_fullwidth_and_footnote_brackets() {
         let registry = CitationRegistry::default();
-        assert_eq!(registry.register(&[hit("a", "p.pdf", 0)]), 1);
-        let (text, cited) = validate("Renews in March【1】 and again[^1].", &registry.all());
+        assert_eq!(registry.register(&[hit("a", "p.pdf", 0)]).first(), 1);
+        let CitedAnswer {
+            text,
+            citations: cited,
+        } = registry.validate("Renews in March【1】 and again[^1].");
         assert_eq!(text, "Renews in March[1] and again[1].");
         assert_eq!(cited.len(), 1);
     }
@@ -215,10 +268,12 @@ mod tests {
     #[test]
     fn validate_strips_leaked_channel_markers() {
         let registry = CitationRegistry::default();
-        assert_eq!(registry.register(&[hit("a", "p.pdf", 0)]), 1);
-        let (text, cited) = validate(
+        assert_eq!(registry.register(&[hit("a", "p.pdf", 0)]).first(), 1);
+        let CitedAnswer {
+            text,
+            citations: cited,
+        } = registry.validate(
             "[commentary:functions.run_sql] There were 12 storms [1].[analysis] [final] [finally]",
-            &registry.all(),
         );
         assert_eq!(text, " There were 12 storms [1].  [finally]");
         assert_eq!(cited.len(), 1);
@@ -226,7 +281,10 @@ mod tests {
 
     #[test]
     fn validate_leaves_text_without_markers_alone() {
-        let (text, cited) = validate("no citations [here", &[]);
+        let CitedAnswer {
+            text,
+            citations: cited,
+        } = CitationRegistry::default().validate("no citations [here");
         assert_eq!(text, "no citations [here");
         assert!(cited.is_empty());
     }

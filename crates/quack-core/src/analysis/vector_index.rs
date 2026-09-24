@@ -4,8 +4,11 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::tools::ReaderDb;
-use crate::embedding::{Embedder, Input, Vector};
-use crate::storage::workspace::ChunkScope;
+use crate::embedding::{Embedder, Input};
+use crate::storage::workspace::{ChunkScope, ChunkSearchResult};
+
+/// Chunks returned when a request's sample count does not fit.
+const DEFAULT_SAMPLES: u32 = 5;
 
 pub struct DuckDbVectorIndex<M> {
     db: ReaderDb,
@@ -18,15 +21,30 @@ impl<M> DuckDbVectorIndex<M> {
     }
 }
 
+/// A store error rig can carry, from any of ours.
+fn store_error(e: impl std::fmt::Display) -> VectorStoreError {
+    VectorStoreError::datastore(std::io::Error::other(e.to_string()))
+}
+
 impl<M> DuckDbVectorIndex<M>
 where
     M: rig::embeddings::EmbeddingModel + Send + Sync,
 {
-    async fn query_vector(&self, query: &str) -> Result<Vector, VectorStoreError> {
-        self.embedder
-            .embed_one(&Input::Query(query.to_owned()))
+    /// The chunks nearest the request's query, across the workspace.
+    async fn search(
+        &self,
+        req: &VectorSearchRequest<Filter<serde_json::Value>>,
+    ) -> Result<Vec<ChunkSearchResult>, VectorStoreError> {
+        let query_vec = self
+            .embedder
+            .embed_one(&Input::Query(req.query().to_owned()))
             .await
-            .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))
+            .map_err(store_error)?;
+        let samples = u32::try_from(req.samples()).unwrap_or(DEFAULT_SAMPLES);
+        self.db
+            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &ChunkScope::all()))
+            .await
+            .map_err(store_error)
     }
 }
 
@@ -40,27 +58,17 @@ where
         &self,
         req: VectorSearchRequest<Self::Filter>,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let query_vec = self.query_vector(req.query()).await?;
-
-        let samples = u32::try_from(req.samples()).unwrap_or(5);
-
-        let results = self
-            .db
-            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &ChunkScope::all()))
-            .await
-            .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?;
-
-        results
+        self.search(&req)
+            .await?
             .into_iter()
             .map(|chunk| {
-                let score = chunk.score;
                 let value = json!({
                     "content": chunk.content,
                     "source_document": chunk.document_id,
                     "filename": chunk.filename,
                 });
                 let doc: T = serde_json::from_value(value)?;
-                Ok((score, chunk.id, doc))
+                Ok((chunk.score, chunk.id, doc))
             })
             .collect()
     }
@@ -69,17 +77,9 @@ where
         &self,
         req: VectorSearchRequest<Self::Filter>,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        let query_vec = self.query_vector(req.query()).await?;
-
-        let samples = u32::try_from(req.samples()).unwrap_or(5);
-
-        let results = self
-            .db
-            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &ChunkScope::all()))
-            .await
-            .map_err(|e| VectorStoreError::datastore(std::io::Error::other(e.to_string())))?;
-
-        Ok(results
+        Ok(self
+            .search(&req)
+            .await?
             .into_iter()
             .map(|chunk| (chunk.score, chunk.id))
             .collect())

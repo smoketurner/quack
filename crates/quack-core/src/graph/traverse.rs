@@ -364,14 +364,10 @@ pub fn by_class(
     limit: u32,
     options: &GraphOptions,
 ) -> Result<GraphResult> {
-    let mut classes = vec![class_id.to_owned()];
-    if let Some(ontology) = ontology {
-        for class in &ontology.classes {
-            if class.id != class_id && ontology.is_subclass_of(&class.id, class_id) {
-                classes.push(class.id.clone());
-            }
-        }
-    }
+    let classes = ontology.map_or_else(
+        || vec![class_id.to_owned()],
+        |o| o.class_and_descendants(class_id),
+    );
     // Counted before the cap applies: a listing that silently stopped at
     // `max_nodes` reads as the whole population of the class.
     let total: u64 = db.connection().query_row(
