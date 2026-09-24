@@ -652,7 +652,7 @@ fn paths_merges_and_listing(
     // provenance move, the alias is kept, and the path shortens.
     let proposal = resolve::decide(
         db,
-        &pending.first().unwrap().id,
+        pending.first().unwrap().id.as_str(),
         MergeDecision::Accept,
         Some("tester"),
     )
@@ -673,7 +673,7 @@ fn paths_merges_and_listing(
         "the merged vendor's ships_to edge shortens it"
     );
     assert!(resolve::pending(db).unwrap().is_empty());
-    assert!(resolve::decide(db, &proposal.id, MergeDecision::Accept, None).is_err());
+    assert!(resolve::decide(db, proposal.id.as_str(), MergeDecision::Accept, None).is_err());
 }
 
 #[tokio::test]

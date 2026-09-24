@@ -21,7 +21,7 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::citations::Citation;
-use quack_core::ids::{DocumentId, NodeId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{CandidateId, DocumentId, NodeId, SessionId, UserId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
@@ -366,7 +366,7 @@ struct ClassRow {
 }
 
 struct CandidateView {
-    id: String,
+    id: CandidateId,
     kind: ItemKind,
     proposal_id: String,
     confidence: String,

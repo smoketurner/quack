@@ -154,6 +154,16 @@ id_type!(
 );
 
 id_type!(
+    /// A proposed ontology change awaiting review.
+    CandidateId
+);
+
+id_type!(
+    /// A proposed merge of two graph nodes awaiting review.
+    MergeId
+);
+
+id_type!(
     /// An access-audit row, shared with the workspace's `_quack_audit`
     /// detail row for the same event.
     AuditId
