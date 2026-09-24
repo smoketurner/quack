@@ -25,8 +25,8 @@ use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{Ontology, OntologyDiff, candidates, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Scope,
-    TokenRow, UserRow, WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
+    Scope, TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
@@ -131,26 +131,59 @@ struct Page {
 struct WsNav {
     id: String,
     name: String,
-    role: String,
+    role: Standing,
     can_write: bool,
     can_manage: bool,
 }
 
-fn page(app: &App, identity: &Identity, title: &str, access: Option<&Access>) -> Page {
-    Page {
-        title: title.to_owned(),
-        username: identity.username.clone(),
-        is_admin: identity.is_admin,
-        local: app.local,
-        workspace: access.map(|a| WsNav {
-            id: a.workspace.id.clone(),
-            name: a.workspace.name.clone(),
-            role: a
-                .role
-                .map_or_else(|| String::from("admin"), |r| r.to_string()),
-            can_write: a.permits(Need::WRITE),
-            can_manage: a.permits(Need::OWN),
-        }),
+/// Where the caller stands in a workspace, as the pages show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    Member(Role),
+    /// A server admin without membership: settings and members, never
+    /// content.
+    Admin,
+}
+
+impl Standing {
+    fn of(role: Option<Role>) -> Self {
+        role.map_or(Self::Admin, Self::Member)
+    }
+}
+
+impl fmt::Display for Standing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Member(role) => role.fmt(f),
+            Self::Admin => f.write_str("admin"),
+        }
+    }
+}
+
+impl Page {
+    /// A page outside any workspace.
+    fn new(app: &App, identity: &Identity, title: &str) -> Self {
+        Self {
+            title: title.to_owned(),
+            username: identity.username.clone(),
+            is_admin: identity.is_admin,
+            local: app.local,
+            workspace: None,
+        }
+    }
+
+    /// A page inside `access`'s workspace, with its navigation.
+    fn in_workspace(app: &App, title: &str, access: &Access) -> Self {
+        Self {
+            workspace: Some(WsNav {
+                id: access.workspace.id.clone(),
+                name: access.workspace.name.clone(),
+                role: Standing::of(access.role),
+                can_write: access.permits(Need::WRITE),
+                can_manage: access.permits(Need::OWN),
+            }),
+            ..Self::new(app, &access.identity, title)
+        }
     }
 }
 
@@ -177,7 +210,7 @@ struct WsItem {
     id: String,
     name: String,
     classification: String,
-    role: String,
+    role: Standing,
 }
 
 #[derive(Template)]
@@ -628,11 +661,9 @@ async fn workspaces(
             .into_iter()
             .map(|w| WsItem {
                 role: if app.local {
-                    String::from("owner")
+                    Standing::Member(Role::Owner)
                 } else {
-                    mine.iter()
-                        .find(|(m, _)| m.id == w.id)
-                        .map_or_else(|| String::from("admin"), |(_, r)| r.to_string())
+                    Standing::of(mine.iter().find(|(m, _)| m.id == w.id).map(|(_, r)| *r))
                 },
                 id: w.id,
                 name: w.name,
@@ -648,13 +679,13 @@ async fn workspaces(
                 id: w.id,
                 name: w.name,
                 classification: w.classification,
-                role: r.to_string(),
+                role: Standing::Member(r),
             })
             .collect()
     };
     html(&WorkspacesPage {
         can_create: identity.is_admin,
-        page: page(&app, &identity, "Workspaces", None),
+        page: Page::new(&app, &identity, "Workspaces"),
         workspaces: items,
         error: q.error,
     })
@@ -813,7 +844,7 @@ async fn chat(
         (Vec::new(), Vec::new())
     };
     html(&ChatPage {
-        page: page(&app, &access.identity, "Chat", Some(&access)),
+        page: Page::in_workspace(&app, "Chat", &access),
         sessions: sessions_list,
         current,
         messages: messages.iter().filter_map(message_view).collect(),
@@ -905,7 +936,7 @@ async fn jobs_page(
     access.audit_read(&app, AuditAction::Page, "jobs").await?;
     let rows = render_jobs(&app, &access)?;
     html(&JobsPage {
-        page: page(&app, &access.identity, "Jobs", Some(&access)),
+        page: Page::in_workspace(&app, "Jobs", &access),
         rows,
     })
 }
@@ -946,7 +977,7 @@ async fn documents(
     let rows = render_rows(&app, &access).await?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
-        page: page(&app, &access.identity, "Documents", Some(&access)),
+        page: Page::in_workspace(&app, "Documents", &access),
         rows,
         error: q.error,
         notice: q.notice,
@@ -1087,7 +1118,7 @@ async fn tables(
     access.audit_read(&app, AuditAction::Page, "tables").await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
-        page: page(&app, &access.identity, "Tables", Some(&access)),
+        page: Page::in_workspace(&app, "Tables", &access),
         tables: list,
         selected: None,
         error: q.error,
@@ -1128,7 +1159,7 @@ async fn table(
     let described = access.describe_table(&app, &name).await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
-        page: page(&app, &access.identity, &name, Some(&access)),
+        page: Page::in_workspace(&app, &name, &access),
         tables: list,
         error: None,
         selected: Some(TableView {
@@ -1157,7 +1188,7 @@ async fn sql_page(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "sql").await?;
     html(&SqlPage {
-        page: page(&app, &access.identity, "SQL", Some(&access)),
+        page: Page::in_workspace(&app, "SQL", &access),
         sql: String::new(),
         result: String::new(),
     })
@@ -1313,7 +1344,7 @@ async fn ontology_page(
         None => String::new(),
     };
     html(&OntologyPage {
-        page: page(&app, &access.identity, "Ontology", Some(&access)),
+        page: Page::in_workspace(&app, "Ontology", &access),
         classes: ontology.as_ref().map(class_rows).unwrap_or_default(),
         ontology,
         json,
@@ -1593,7 +1624,7 @@ async fn context_page(
         })
         .await?;
     html(&ContextPage {
-        page: page(&app, &access.identity, "Context", Some(&access)),
+        page: Page::in_workspace(&app, "Context", &access),
         content: current
             .as_ref()
             .map(|c| c.content.clone())
@@ -1641,7 +1672,7 @@ async fn settings_view(
         (Vec::new(), Vec::new())
     };
     html(&SettingsPage {
-        page: page(app, &access.identity, "Settings", Some(access)),
+        page: Page::in_workspace(app, "Settings", access),
         classification: access.workspace.classification.clone(),
         providers,
         members,
@@ -1808,7 +1839,7 @@ async fn admin_users(
 ) -> WebResult<Response> {
     identity.require_admin()?;
     html(&AdminUsersPage {
-        page: page(&app, &identity, "Users", None),
+        page: Page::new(&app, &identity, "Users"),
         users: app.control.list_users().await?,
         error: q.error,
     })
@@ -1872,7 +1903,7 @@ async fn admin_audit(
     let filter = AuditFilter::from(q);
     let rows = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
-        page: page(&app, &identity, "Audit", None),
+        page: Page::new(&app, &identity, "Audit"),
         rows,
         action: filter.action.unwrap_or_default(),
         outcome: filter.outcome,
@@ -1982,7 +2013,7 @@ async fn graph_page(
         .collect();
     drift.sort();
     html(&GraphPage {
-        page: page(&app, &access.identity, "Graph", Some(&access)),
+        page: Page::in_workspace(&app, "Graph", &access),
         status,
         drift,
         has_ontology,
