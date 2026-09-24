@@ -24,11 +24,50 @@ const PHRASE_OVER_FETCH: u32 = 4;
 /// Absolute cap on phrase-search candidates, regardless of `top_k`.
 const PHRASE_CANDIDATE_CAP: u32 = 500;
 
+/// Chunks the keyword index rebuild reads at a time.
+const REINDEX_PAGE: u32 = 1000;
+
 /// Every internal table carries this prefix; anything starting with it is hidden.
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
-/// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "10";
+/// The keyword index gained joined identifier terms (`pol8841` beside
+/// `pol` and `8841`); every chunk is reindexed.
+const JOINED_IDENTIFIER_TERMS: u32 = 7;
+/// Every stored vector records the profile it was made under.
+const VECTOR_PROFILES: u32 = 8;
+/// A document's status is one of four values.
+const DOCUMENT_STATUSES: u32 = 9;
+/// An ontology version records whether it was reviewed.
+const ONTOLOGY_ACCEPTANCE: u32 = 10;
+
+/// Schema version of the internal tables, recorded in `_quack_meta`: the
+/// newest step above.
+const WORKSPACE_SCHEMA_VERSION: u32 = ONTOLOGY_ACCEPTANCE;
+
+/// The tables that hold embedding vectors, with the same `embedding` and
+/// `embedding_profile` columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorTable {
+    Chunks,
+    GraphNodes,
+}
+
+impl VectorTable {
+    const ALL: [Self; 2] = [Self::Chunks, Self::GraphNodes];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chunks => "_quack_chunks",
+            Self::GraphNodes => "_quack_graph_nodes",
+        }
+    }
+}
+
+impl std::fmt::Display for VectorTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// The keys of `_quack_meta`, the workspace's own settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +122,40 @@ impl StatementKind {
             Self::Write => Ok(true),
             Self::Invalid(message) => Err(message),
         }
+    }
+}
+
+/// A statement as `DuckDB`'s `json_serialize_sql` returns it.
+enum SerializedStatement {
+    /// A `SELECT`-shaped statement, as its parse tree.
+    Tree(serde_json::Value),
+    /// The parser rejected it, with its message.
+    SyntaxError(String),
+    /// Parsed, but not a shape the serializer covers: any other statement
+    /// type, or several statements.
+    Unserializable,
+}
+
+impl SerializedStatement {
+    /// The parse tree with every constant blanked and the source offsets
+    /// dropped, so two statements that differ only in the values they
+    /// filter on come out the same.
+    fn shape(self) -> Option<String> {
+        let Self::Tree(mut tree) = self else {
+            return None;
+        };
+        blank_constants(&mut tree);
+        Some(tree.to_string())
+    }
+
+    /// The names of the tables the statement reads.
+    fn table_names(&self) -> Option<Vec<String>> {
+        let Self::Tree(tree) = self else {
+            return None;
+        };
+        let mut names = Vec::new();
+        collect_table_names(tree, &mut names);
+        Some(names)
     }
 }
 
@@ -522,6 +595,28 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the classification query itself fails.
     pub fn classify_statement(&self, sql: &str) -> Result<StatementKind> {
+        Ok(match self.serialize(sql)? {
+            SerializedStatement::Tree(tree) => {
+                let statement_count = tree
+                    .get("statements")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                if statement_count == 0 {
+                    StatementKind::Invalid(String::from("empty statement"))
+                } else {
+                    StatementKind::Read
+                }
+            }
+            SerializedStatement::SyntaxError(message) => StatementKind::Invalid(message),
+            SerializedStatement::Unserializable if is_single_read_only_statement(sql) => {
+                StatementKind::Read
+            }
+            SerializedStatement::Unserializable => StatementKind::Write,
+        })
+    }
+
+    /// `sql` as `DuckDB`'s own parser sees it.
+    fn serialize(&self, sql: &str) -> Result<SerializedStatement> {
         let serialized: String = self.conn.query_row(
             "SELECT json_serialize_sql(?::VARCHAR)",
             duckdb::params![sql],
@@ -533,31 +628,19 @@ impl WorkspaceDb {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         if !is_error {
-            let statement_count = parsed
-                .get("statements")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, Vec::len);
-            return Ok(if statement_count == 0 {
-                StatementKind::Invalid(String::from("empty statement"))
-            } else {
-                StatementKind::Read
-            });
+            return Ok(SerializedStatement::Tree(parsed));
         }
-        let error_type = parsed
-            .get("error_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if error_type == "parser" {
-            let message = parsed
-                .get("error_message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("syntax error");
-            return Ok(StatementKind::Invalid(message.to_owned()));
-        }
-        Ok(if is_single_read_only_statement(sql) {
-            StatementKind::Read
+        let error_type = parsed.get("error_type").and_then(serde_json::Value::as_str);
+        Ok(if error_type == Some("parser") {
+            SerializedStatement::SyntaxError(
+                parsed
+                    .get("error_message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("syntax error")
+                    .to_owned(),
+            )
         } else {
-            StatementKind::Write
+            SerializedStatement::Unserializable
         })
     }
 
@@ -570,42 +653,13 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the serialization query itself fails.
     pub fn statement_shape(&self, sql: &str) -> Result<Option<String>> {
-        let serialized: String = self.conn.query_row(
-            "SELECT json_serialize_sql(?::VARCHAR)",
-            duckdb::params![sql],
-            |row| row.get(0),
-        )?;
-        let mut parsed: serde_json::Value = serde_json::from_str(&serialized)?;
-        let is_error = parsed
-            .get("error")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        if is_error {
-            return Ok(None);
-        }
-        blank_constants(&mut parsed);
-        Ok(Some(parsed.to_string()))
+        Ok(self.serialize(sql)?.shape())
     }
 
     /// Names of tables a statement references, as `DuckDB` parsed them, or
     /// `None` when `DuckDB` cannot serialize the statement.
     fn referenced_base_tables(&self, sql: &str) -> Result<Option<Vec<String>>> {
-        let serialized: String = self.conn.query_row(
-            "SELECT json_serialize_sql(?::VARCHAR)",
-            duckdb::params![sql],
-            |row| row.get(0),
-        )?;
-        let parsed: serde_json::Value = serde_json::from_str(&serialized)?;
-        let is_error = parsed
-            .get("error")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        if is_error {
-            return Ok(None);
-        }
-        let mut names = Vec::new();
-        collect_table_names(&parsed, &mut names);
-        Ok(Some(names))
+        Ok(self.serialize(sql)?.table_names())
     }
 
     /// Classify a statement a user or client wrote: `_quack_` tables are
@@ -735,7 +789,6 @@ impl WorkspaceDb {
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
         self.upgrade_data(dim)?;
-        self.set_meta(MetaKey::SchemaVersion, WORKSPACE_SCHEMA_VERSION)?;
         self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
         // DuckDB cannot replay an `ADD COLUMN` from the write-ahead log (an
         // internal error on the next open), so a column added to an older
@@ -745,29 +798,26 @@ impl WorkspaceDb {
     }
 
     /// The data rebuilds a schema version asks of a workspace recorded
-    /// under an older one.
+    /// under an older one, then the version it now matches.
     fn upgrade_data(&self, dim: Dimension) -> Result<()> {
         let recorded = self
             .meta(MetaKey::SchemaVersion)?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
-        // Version 4 introduced the term index; version 6 changed its tokens
-        // (stemming) and version 7 added joined identifier terms, so older
-        // workspaces rebuild it on open.
-        if recorded < 7 && self.chunk_count()? > 0 {
+        // Version 4 introduced the term index and version 6 changed its
+        // tokens (stemming); both are before the joined terms.
+        if recorded < JOINED_IDENTIFIER_TERMS && self.chunk_count()? > 0 {
             tracing::info!("indexing existing chunks for keyword search");
             self.reindex_terms()?;
         }
-        // Version 8 records the profile of every stored vector. Those made
-        // before it went to the model unprefixed, under the model the
-        // workspace last recorded.
-        if recorded < 8 {
+        // Vectors made before profiles went to the model unprefixed, under
+        // the model the workspace last recorded.
+        if recorded < VECTOR_PROFILES {
             self.tag_legacy_vectors(dim)?;
         }
-        // Version 9 reads a document's status as one of four values. Rows
-        // written before every insert named its status took the column's
-        // old default, `pending`, and were never processed.
-        if recorded < 9 {
+        // Rows written before every insert named its status took the
+        // column's old default, `pending`, and were never processed.
+        if recorded < DOCUMENT_STATUSES {
             self.conn.execute(
                 "UPDATE _quack_documents SET status = ?, \
                  error_message = 'never finished processing; upload it again' \
@@ -775,26 +825,34 @@ impl WorkspaceDb {
                 duckdb::params![DocumentStatus::Error],
             )?;
         }
-        // Version 10 records whether an ontology version was reviewed in its
-        // own column. Before it, `--auto-accept` said so only in the note.
-        if recorded < 10 {
+        // Before its own column, `--auto-accept` said so only in the note.
+        if recorded < ONTOLOGY_ACCEPTANCE {
             self.conn.execute(
                 "UPDATE _quack_ontology_versions SET acceptance = ? WHERE note LIKE 'auto-accepted%'",
                 duckdb::params![Acceptance::Auto],
             )?;
         }
-        Ok(())
+        self.set_meta(
+            MetaKey::SchemaVersion,
+            &WORKSPACE_SCHEMA_VERSION.to_string(),
+        )
     }
 
     /// Record the profile vectors made before profiles existed were made
     /// under, and tag them with it.
     fn tag_legacy_vectors(&self, dim: Dimension) -> Result<()> {
-        let untagged: i64 = self.conn.query_row(
-            "SELECT (SELECT count(*) FROM _quack_chunks WHERE embedding IS NOT NULL AND embedding_profile IS NULL) \
-                  + (SELECT count(*) FROM _quack_graph_nodes WHERE embedding IS NOT NULL AND embedding_profile IS NULL)",
-            [],
-            |row| row.get(0),
-        )?;
+        let mut untagged: i64 = 0;
+        for table in VectorTable::ALL {
+            let count: i64 = self.conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM {table} \
+                     WHERE embedding IS NOT NULL AND embedding_profile IS NULL"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            untagged = untagged.saturating_add(count);
+        }
         let model = self.meta(MetaKey::EmbeddingModel)?;
         // The profile table replaces this key.
         self.conn.execute(
@@ -808,7 +866,7 @@ impl WorkspaceDb {
         let legacy = Profile::new(&model, dim, Prompts::default());
         self.insert_profile(&legacy)?;
         let fingerprint = legacy.fingerprint();
-        for table in ["_quack_chunks", "_quack_graph_nodes"] {
+        for table in VectorTable::ALL {
             self.conn.execute(
                 &format!(
                     "UPDATE {table} SET embedding_profile = ? \
@@ -965,15 +1023,14 @@ impl WorkspaceDb {
     ///
     /// Returns an error if a statement fails.
     pub fn retype_vectors(&self, dimension: Dimension) -> Result<()> {
-        self.conn.execute_batch(&format!(
-            "ALTER TABLE _quack_chunks ALTER embedding SET DATA TYPE FLOAT[{dimension}] USING NULL::FLOAT[{dimension}];
-             UPDATE _quack_chunks SET embedding_profile = NULL;"
-        ))?;
-        if self.table_exists("_quack_graph_nodes")? {
-            self.conn.execute_batch(&format!(
-                "ALTER TABLE _quack_graph_nodes ALTER embedding SET DATA TYPE FLOAT[{dimension}] USING NULL::FLOAT[{dimension}];
-                 UPDATE _quack_graph_nodes SET embedding_profile = NULL;"
-            ))?;
+        for table in VectorTable::ALL {
+            if self.table_exists(table.as_str())? {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ALTER embedding SET DATA TYPE FLOAT[{dimension}] \
+                     USING NULL::FLOAT[{dimension}];
+                     UPDATE {table} SET embedding_profile = NULL;"
+                ))?;
+            }
         }
         self.vectors
             .column_dimension
@@ -1077,7 +1134,7 @@ impl WorkspaceDb {
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![sha256, DocumentStatus::Error])?;
         match rows.next()? {
-            Some(row) => Ok(Some(document_from_row(row)?)),
+            Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
     }
@@ -1096,7 +1153,7 @@ impl WorkspaceDb {
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![DocumentStatus::Error, table])?;
         match rows.next()? {
-            Some(row) => Ok(Some(document_from_row(row)?)),
+            Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
     }
@@ -1228,7 +1285,7 @@ impl WorkspaceDb {
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(document_from_row(row)?)),
+            Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
     }
@@ -1298,12 +1355,11 @@ impl WorkspaceDb {
             "SELECT DISTINCT subject_id FROM _quack_provenance \
              WHERE document_id = ? OR list_contains(?::VARCHAR[], table_name)",
         )?;
-        let mut rows = stmt.query(duckdb::params![document_id, table_list])?;
-        let mut touched: Vec<String> = Vec::new();
-        while let Some(row) = rows.next()? {
-            touched.push(row.get(0)?);
-        }
-        drop(rows);
+        let touched = stmt
+            .query_map(duckdb::params![document_id, table_list], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<duckdb::Result<Vec<_>>>()?;
         drop(stmt);
         if touched.is_empty() {
             return Ok(());
@@ -1376,8 +1432,8 @@ impl WorkspaceDb {
     /// Returns an error if the insert fails.
     pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> Result<()> {
         let page = chunk.page.map(i64::from);
-        let terms = term_frequencies(chunk.content, chunk.heading);
-        let length = term_count(&terms);
+        let terms = TermFrequencies::of(chunk.content, chunk.heading);
+        let length = terms.total();
         match chunk.embedding {
             Some(emb) => {
                 self.check_vector_width(emb.len())?;
@@ -1421,12 +1477,12 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    fn insert_terms(&self, chunk_id: &str, terms: &[(String, u32)]) -> Result<()> {
-        if terms.is_empty() {
+    fn insert_terms(&self, chunk_id: &str, terms: &TermFrequencies) -> Result<()> {
+        if terms.0.is_empty() {
             return Ok(());
         }
         let mut appender = self.conn.appender("_quack_terms")?;
-        for (term, tf) in terms {
+        for (term, tf) in &terms.0 {
             appender.append_row(duckdb::params![chunk_id, term, i64::from(*tf)])?;
         }
         appender.flush()?;
@@ -1445,24 +1501,38 @@ impl WorkspaceDb {
     ///
     /// Returns an error if reading chunks or writing terms fails.
     pub fn reindex_terms(&self) -> Result<()> {
+        self.reindex_terms_by(REINDEX_PAGE)
+    }
+
+    /// [`Self::reindex_terms`], reading `page` chunks at a time.
+    fn reindex_terms_by(&self, page: u32) -> Result<()> {
         self.conn.execute("DELETE FROM _quack_terms", [])?;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, content, heading FROM _quack_chunks")?;
-        let mut rows = stmt.query([])?;
-        let mut chunks: Vec<(String, String, Option<String>)> = Vec::new();
-        while let Some(row) = rows.next()? {
-            chunks.push((row.get(0)?, row.get(1)?, row.get(2)?));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, heading, content FROM _quack_chunks \
+             WHERE ?::VARCHAR IS NULL OR id > ? ORDER BY id LIMIT ?",
+        )?;
+        // A page at a time by id, so a large workspace never holds every
+        // chunk's text at once.
+        let mut after: Option<String> = None;
+        loop {
+            let page = stmt
+                .query_map(duckdb::params![after, after, i64::from(page)], |row| {
+                    PendingChunk::try_from(row)
+                })?
+                .collect::<duckdb::Result<Vec<_>>>()?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            after = Some(last.id.clone());
+            for chunk in &page {
+                let terms = TermFrequencies::of(&chunk.content, chunk.heading.as_deref());
+                self.conn.execute(
+                    "UPDATE _quack_chunks SET token_count = ? WHERE id = ?",
+                    duckdb::params![terms.total(), chunk.id],
+                )?;
+                self.insert_terms(&chunk.id, &terms)?;
+            }
         }
-        for (id, content, heading) in &chunks {
-            let terms = term_frequencies(content, heading.as_deref());
-            self.conn.execute(
-                "UPDATE _quack_chunks SET token_count = ? WHERE id = ?",
-                duckdb::params![term_count(&terms), id],
-            )?;
-            self.insert_terms(id, &terms)?;
-        }
-        Ok(())
     }
 
     /// Store a chunk's vector, made under the current profile.
@@ -1472,7 +1542,7 @@ impl WorkspaceDb {
     /// Returns an error if the vector does not fit the columns or the
     /// update fails.
     pub fn set_chunk_embedding(&self, chunk_id: &str, embedding: &Vector) -> Result<()> {
-        self.set_vector("_quack_chunks", chunk_id, embedding)
+        self.set_vector(VectorTable::Chunks, chunk_id, embedding)
     }
 
     /// Store a graph node's label vector, made under the current profile.
@@ -1482,14 +1552,13 @@ impl WorkspaceDb {
     /// Returns an error if the vector does not fit the columns or the
     /// update fails.
     pub fn set_node_embedding(&self, node_id: &str, embedding: &Vector) -> Result<()> {
-        self.set_vector("_quack_graph_nodes", node_id, embedding)
+        self.set_vector(VectorTable::GraphNodes, node_id, embedding)
     }
 
-    fn set_vector(&self, table: &str, id: &str, embedding: &Vector) -> Result<()> {
+    fn set_vector(&self, table: VectorTable, id: &str, embedding: &Vector) -> Result<()> {
         self.check_vector_width(embedding.len())?;
         let sql = format!(
-            "UPDATE {} SET embedding = ?::{}, embedding_profile = ? WHERE id = ?",
-            quote_ident(table),
+            "UPDATE {table} SET embedding = ?::{}, embedding_profile = ? WHERE id = ?",
             self.vector_type()
         );
         self.conn.execute(
@@ -1517,20 +1586,15 @@ impl WorkspaceDb {
                AND (c.embedding IS NULL OR c.embedding_profile IS DISTINCT FROM ?) \
              ORDER BY c.id LIMIT ?",
         )?;
-        let mut rows = stmt.query(duckdb::params![
-            DocumentStatus::Ready,
-            self.embedding_fingerprint(),
-            i64::from(limit)
-        ])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(PendingChunk {
-                id: row.get(0)?,
-                heading: row.get(1)?,
-                content: row.get(2)?,
-            });
-        }
-        Ok(out)
+        let rows = stmt.query_map(
+            duckdb::params![
+                DocumentStatus::Ready,
+                self.embedding_fingerprint(),
+                i64::from(limit)
+            ],
+            |row| PendingChunk::try_from(row),
+        )?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
     }
 
     /// How this workspace's stored vectors stand against the current
@@ -1549,7 +1613,6 @@ impl WorkspaceDb {
             duckdb::params![current, DocumentStatus::Ready],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut stale = Vec::new();
         let mut stmt = self.conn.prepare(
             "SELECT CAST(p.profile AS VARCHAR), count(*) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
@@ -1558,14 +1621,15 @@ impl WorkspaceDb {
                AND c.embedding_profile IS DISTINCT FROM ? \
              GROUP BY ALL ORDER BY 2 DESC",
         )?;
-        let mut rows = stmt.query(duckdb::params![DocumentStatus::Ready, current])?;
-        while let Some(row) = rows.next()? {
-            let profile: Option<String> = row.get(0)?;
-            stale.push(StaleVectors {
-                profile: profile.and_then(|json| serde_json::from_str(&json).ok()),
-                chunks: row.get(1)?,
-            });
-        }
+        let stale = stmt
+            .query_map(duckdb::params![DocumentStatus::Ready, current], |row| {
+                let profile: Option<String> = row.get(0)?;
+                Ok(StaleVectors {
+                    profile: profile.and_then(|json| serde_json::from_str(&json).ok()),
+                    chunks: row.get(1)?,
+                })
+            })?
+            .collect::<duckdb::Result<Vec<_>>>()?;
         let stale_nodes: u64 = if self.table_exists("_quack_graph_nodes")? {
             self.conn.query_row(
                 "SELECT count(*) FROM _quack_graph_nodes \
@@ -1617,22 +1681,16 @@ impl WorkspaceDb {
         if scope.is_empty() {
             return Ok(Vec::new());
         }
-        let terms: Vec<String> = term_frequencies(query, None)
+        let terms: Vec<String> = TermFrequencies::of(query, None)
+            .0
             .into_iter()
             .map(|(t, _)| t)
             .collect();
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let phrases = extract_phrases(query);
-        let fetch_k = if phrases.is_empty() {
-            top_k
-        } else {
-            top_k
-                .saturating_mul(PHRASE_OVER_FETCH)
-                .min(PHRASE_CANDIDATE_CAP)
-                .max(top_k)
-        };
+        let phrases = Phrases::parse(query);
+        let fetch_k = phrases.fetch(top_k, top_k);
         // Quoted, so a token such as `null` stays a word and not a NULL
         // element (issue #62).
         let term_list = sql_text_list(&terms);
@@ -1666,16 +1724,10 @@ impl WorkspaceDb {
         params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
-        let mut rows = stmt.query(params.as_slice())?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            results.push(chunk_from_row(row)?);
-        }
-        if phrases.is_empty() {
-            return Ok(results);
-        }
-        filter_by_phrases(&mut results, &phrases);
-        results.truncate(usize::try_from(top_k).unwrap_or(usize::MAX));
+        let mut results = stmt
+            .query_map(params.as_slice(), |row| ChunkSearchResult::try_from(row))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        phrases.retain_matching(&mut results, top_k);
         Ok(results)
     }
 
@@ -1694,28 +1746,16 @@ impl WorkspaceDb {
         &self,
         query_text: &str,
         query_embedding: &[f32],
-        top_k: u32,
-        rrf_k: u32,
+        limits: HybridLimits,
         scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
-        let phrases = extract_phrases(query_text);
-        let candidates = top_k.saturating_mul(2).max(1);
-        let fuse_k = if phrases.is_empty() {
-            top_k
-        } else {
-            candidates
-                .saturating_mul(PHRASE_OVER_FETCH)
-                .min(PHRASE_CANDIDATE_CAP)
-                .max(top_k)
-        };
+        let phrases = Phrases::parse(query_text);
+        let candidates = limits.top_k.saturating_mul(2).max(1);
+        let fuse_k = phrases.fetch(limits.top_k, candidates);
         let vector = self.search_similar_chunks(query_embedding, fuse_k, scope)?;
         let keyword = self.search_keyword_chunks(query_text, fuse_k, scope)?;
-        let mut fused = fuse_rankings(vector, keyword, fuse_k, rrf_k);
-        if phrases.is_empty() {
-            return Ok(fused);
-        }
-        filter_by_phrases(&mut fused, &phrases);
-        fused.truncate(usize::try_from(top_k).unwrap_or(usize::MAX));
+        let mut fused = limits.fuse(vector, keyword, fuse_k);
+        phrases.retain_matching(&mut fused, limits.top_k);
         Ok(fused)
     }
 
@@ -1768,14 +1808,102 @@ impl WorkspaceDb {
         params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
-        let mut rows = stmt.query(params.as_slice())?;
-        let mut results = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            results.push(chunk_from_row(row)?);
-        }
-
+        let results = stmt
+            .query_map(params.as_slice(), |row| ChunkSearchResult::try_from(row))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
         Ok(results)
+    }
+
+    /// How many chunks `pool` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn pool_size(&self, pool: SamplePool) -> Result<u64> {
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM _quack_chunks c \
+                 JOIN _quack_documents d ON d.id = c.document_id \
+                 WHERE d.status = ? AND {}",
+                pool.filter()
+            ),
+            duckdb::params![DocumentStatus::Ready],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Up to `limit` chunk ids from `pool`, spread evenly over its
+    /// documents: each gets an equal quota, taken at evenly spaced
+    /// positions through it, so a sample covers every document and not
+    /// just the first one's front matter. Chosen in SQL, so only the ids
+    /// of the chosen chunks leave the database.
+    ///
+    /// A document of `len` chunks with a quota of `take` keeps the chunks
+    /// at `floor(k * len / take)` for `k` below `take`; the chunk at
+    /// `pos` is one of them when `k = ceil(pos * take / len)` is below
+    /// `take` and maps back to `pos`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn sample_chunk_ids(&self, pool: SamplePool, limit: u32) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "WITH pool AS ( \
+                 SELECT c.id, c.document_id, c.chunk_index, d.ingested_at, d.id AS doc, \
+                        row_number() OVER (PARTITION BY c.document_id ORDER BY c.chunk_index) - 1 AS pos, \
+                        count(*) OVER (PARTITION BY c.document_id) AS len \
+                 FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+                 WHERE d.status = ? AND {filter}), \
+             quota AS ( \
+                 SELECT greatest(1, (?::BIGINT + count(DISTINCT document_id) - 1) \
+                                    // greatest(count(DISTINCT document_id), 1)) AS q \
+                 FROM pool), \
+             placed AS ( \
+                 SELECT p.*, least(quota.q, p.len) AS take FROM pool p, quota) \
+             SELECT id FROM placed \
+             WHERE (pos * take + len - 1) // len < take \
+               AND (((pos * take + len - 1) // len) * len) // take = pos \
+             ORDER BY {order}, chunk_index \
+             LIMIT ?",
+            filter = pool.filter(),
+            order = pool.document_order(),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let ids = stmt.query_map(
+            duckdb::params![DocumentStatus::Ready, i64::from(limit), i64::from(limit)],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(ids.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Up to `size` chunks of `pool` after the chunk `after`, by id, with
+    /// the citation metadata a search hit carries (score 1): how a run
+    /// over every chunk reads them a page at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn chunk_page(
+        &self,
+        pool: SamplePool,
+        after: Option<&str>,
+        size: u32,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE d.status = ? AND {} AND (?::VARCHAR IS NULL OR c.id > ?) \
+             ORDER BY c.id LIMIT ?",
+            pool.filter()
+        ))?;
+        let rows = stmt.query_map(
+            duckdb::params![DocumentStatus::Ready, after, after, i64::from(size)],
+            |row| ChunkSearchResult::try_from(row),
+        )?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
     }
 
     /// Chunks by id, in the order given, with the citation metadata a
@@ -1793,7 +1921,7 @@ impl WorkspaceDb {
         for id in ids {
             let mut rows = stmt.query(duckdb::params![id])?;
             if let Some(row) = rows.next()? {
-                out.push(chunk_from_row(row)?);
+                out.push(ChunkSearchResult::try_from(row)?);
             }
         }
         Ok(out)
@@ -1827,11 +1955,9 @@ impl WorkspaceDb {
             let mut stmt = self.conn.prepare(
                 "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
             )?;
-            let mut rows = stmt.query(duckdb::params![doc.id])?;
-            let mut parts: Vec<String> = Vec::new();
-            while let Some(row) = rows.next()? {
-                parts.push(row.get(0)?);
-            }
+            let parts = stmt
+                .query_map(duckdb::params![doc.id], |row| row.get::<_, String>(0))?
+                .collect::<duckdb::Result<Vec<_>>>()?;
             out.push((doc, parts.join("\n")));
         }
         Ok(out)
@@ -2030,15 +2156,13 @@ impl WorkspaceDb {
         let mut stmt = self.conn.prepare(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name",
         )?;
-        let mut rows = stmt.query([])?;
-        let mut tables = Vec::new();
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(0)?;
-            if !is_internal_name(&name) {
-                tables.push(name);
-            }
-        }
-        Ok(tables)
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(names
+            .into_iter()
+            .filter(|name| !is_internal_name(name))
+            .collect())
     }
 
     /// Describe a table's columns (name, type) and return up to 3 sample rows.
@@ -2049,14 +2173,14 @@ impl WorkspaceDb {
     pub fn describe_table(&self, table_name: &str) -> Result<TableDescription> {
         let describe_sql = format!("DESCRIBE {}", quote_ident(table_name));
         let mut stmt = self.conn.prepare(&describe_sql)?;
-        let mut rows = stmt.query([])?;
-        let mut columns = Vec::new();
-        while let Some(row) = rows.next()? {
-            columns.push(ColumnInfo {
-                name: row.get(0)?,
-                column_type: row.get(1)?,
-            });
-        }
+        let columns = stmt
+            .query_map([], |row| {
+                Ok(ColumnInfo {
+                    name: row.get(0)?,
+                    column_type: row.get(1)?,
+                })
+            })?
+            .collect::<duckdb::Result<Vec<_>>>()?;
 
         let sample_sql = format!("SELECT * FROM {} LIMIT 3", quote_ident(table_name));
         let sample = self.execute_query(&sample_sql)?;
@@ -2104,12 +2228,8 @@ impl WorkspaceDb {
     pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
         let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC");
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-        let mut docs = Vec::new();
-        while let Some(row) = rows.next()? {
-            docs.push(document_from_row(row)?);
-        }
-        Ok(docs)
+        let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
     }
 
     /// Access the underlying `DuckDB` connection.
@@ -2296,25 +2416,30 @@ const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, statu
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
      ingested_by, CAST(tables AS VARCHAR) FROM _quack_documents";
 
-fn document_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<DocumentInfo> {
-    Ok(DocumentInfo {
-        id: row.get(0)?,
-        filename: row.get(1)?,
-        mime_type: row.get(2)?,
-        size_bytes: row.get(3)?,
-        status: row.get(4)?,
-        error_message: row.get(5)?,
-        pinned: row.get(6)?,
-        ingested_at: row.get(7)?,
-        title: row.get(8)?,
-        sha256: row.get(9)?,
-        source: DocumentSource::from_column(row.get(10)?)?,
-        chunk_count: row.get(11)?,
-        ingested_by: row.get(12)?,
-        tables: row
-            .get::<_, Option<String>>(13)?
-            .and_then(|json| serde_json::from_str(&json).ok()),
-    })
+/// A row selected with [`DOCUMENT_SELECT`].
+impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
+    type Error = duckdb::Error;
+
+    fn try_from(row: &duckdb::Row<'_>) -> duckdb::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            filename: row.get(1)?,
+            mime_type: row.get(2)?,
+            size_bytes: row.get(3)?,
+            status: row.get(4)?,
+            error_message: row.get(5)?,
+            pinned: row.get(6)?,
+            ingested_at: row.get(7)?,
+            title: row.get(8)?,
+            sha256: row.get(9)?,
+            source: DocumentSource::from_column(row.get(10)?)?,
+            chunk_count: row.get(11)?,
+            ingested_by: row.get(12)?,
+            tables: row
+                .get::<_, Option<String>>(13)?
+                .and_then(|json| serde_json::from_str(&json).ok()),
+        })
+    }
 }
 
 /// A chunk whose vector is missing or stale.
@@ -2323,6 +2448,19 @@ pub struct PendingChunk {
     pub id: String,
     pub heading: Option<String>,
     pub content: String,
+}
+
+/// A row of `id, heading, content`.
+impl TryFrom<&duckdb::Row<'_>> for PendingChunk {
+    type Error = duckdb::Error;
+
+    fn try_from(row: &duckdb::Row<'_>) -> duckdb::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            heading: row.get(1)?,
+            content: row.get(2)?,
+        })
+    }
 }
 
 /// A chunk to store.
@@ -2352,18 +2490,24 @@ pub struct ChunkSearchResult {
     pub score: f64,
 }
 
-fn chunk_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<ChunkSearchResult> {
-    let page: Option<i64> = row.get(6)?;
-    Ok(ChunkSearchResult {
-        id: row.get(0)?,
-        content: row.get(1)?,
-        document_id: row.get(2)?,
-        chunk_index: row.get(3)?,
-        filename: row.get(4)?,
-        heading: row.get(5)?,
-        page: page.and_then(|p| u32::try_from(p).ok()),
-        score: row.get(7)?,
-    })
+/// A row of `id, content, document_id, chunk_index, filename, heading,
+/// page, score`, the columns every search selects.
+impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
+    type Error = duckdb::Error;
+
+    fn try_from(row: &duckdb::Row<'_>) -> duckdb::Result<Self> {
+        let page: Option<i64> = row.get(6)?;
+        Ok(Self {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            document_id: row.get(2)?,
+            chunk_index: row.get(3)?,
+            filename: row.get(4)?,
+            heading: row.get(5)?,
+            page: page.and_then(|p| u32::try_from(p).ok()),
+            score: row.get(7)?,
+        })
+    }
 }
 
 /// Punctuation that joins alphanumeric runs into one identifier (`POL-8841`,
@@ -2407,72 +2551,127 @@ pub fn tokenize(text: &str) -> Vec<String> {
     terms
 }
 
-/// Quoted phrases from a keyword query: each `"..."` pair is taken as an
-/// exact adjacency requirement. An odd number of `"` characters is an
-/// unbalanced quote, so the whole query is left as ordinary text instead of
-/// guessing which quote was meant to close.
-fn extract_phrases(query: &str) -> Vec<String> {
-    if !query.matches('"').count().is_multiple_of(2) {
-        return Vec::new();
+/// The quoted phrases of a keyword query: each `"..."` pair is an exact
+/// adjacency requirement, checked as a substring after retrieval since
+/// `_quack_terms` carries no positions.
+struct Phrases(Vec<String>);
+
+impl Phrases {
+    /// An odd number of `"` characters is an unbalanced quote, so the whole
+    /// query is left as ordinary text instead of guessing which quote was
+    /// meant to close.
+    fn parse(query: &str) -> Self {
+        if !query.matches('"').count().is_multiple_of(2) {
+            return Self(Vec::new());
+        }
+        Self(
+            query
+                .split('"')
+                .enumerate()
+                .filter_map(|(i, s)| (i % 2 == 1).then_some(s.trim()))
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+        )
     }
-    query
-        .split('"')
-        .enumerate()
-        .filter_map(|(i, s)| (i % 2 == 1).then_some(s.trim()))
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
-}
 
-/// Collapse runs of whitespace to a single space and trim the ends, so
-/// phrase matching does not care whether a chunk wrapped the phrase across a
-/// line break.
-fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Whether `phrase` occurs in `text` as a case-insensitive,
-/// whitespace-normalized substring.
-fn contains_phrase(text: &str, phrase: &str) -> bool {
-    normalize_whitespace(text)
-        .to_lowercase()
-        .contains(&normalize_whitespace(phrase).to_lowercase())
-}
-
-/// Keep only the results whose content or heading contains every phrase,
-/// preserving the existing (ranked) order. Shared by
-/// [`WorkspaceDb::search_keyword_chunks`] and
-/// [`WorkspaceDb::search_hybrid_chunks`], since the latter's vector leg
-/// carries no phrase information of its own.
-fn filter_by_phrases(results: &mut Vec<ChunkSearchResult>, phrases: &[String]) {
-    results.retain(|r| {
-        phrases.iter().all(|phrase| {
-            contains_phrase(&r.content, phrase)
-                || r.heading
-                    .as_deref()
-                    .is_some_and(|h| contains_phrase(h, phrase))
-        })
-    });
-}
-
-/// Term frequencies for a chunk's content plus its heading.
-fn term_frequencies(content: &str, heading: Option<&str>) -> Vec<(String, u32)> {
-    let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-    for term in tokenize(content)
-        .into_iter()
-        .chain(heading.map(tokenize).unwrap_or_default())
-    {
-        let entry = counts.entry(term).or_insert(0);
-        *entry = entry.saturating_add(1);
+    /// How many candidates to fetch for `top_k` results: `top_k` without a
+    /// phrase, else `base` over-fetched, since the filter drops some.
+    fn fetch(&self, top_k: u32, base: u32) -> u32 {
+        if self.0.is_empty() {
+            top_k
+        } else {
+            base.saturating_mul(PHRASE_OVER_FETCH)
+                .min(PHRASE_CANDIDATE_CAP)
+                .max(top_k)
+        }
     }
-    counts.into_iter().collect()
+
+    /// Keep the first `top_k` results whose content or heading contains
+    /// every phrase, in their ranked order. Hybrid search runs this on the
+    /// fused ranking, since its vector leg knows nothing of phrases.
+    fn retain_matching(&self, results: &mut Vec<ChunkSearchResult>, top_k: u32) {
+        if self.0.is_empty() {
+            return;
+        }
+        results.retain(|r| {
+            self.0.iter().all(|phrase| {
+                Self::contains(&r.content, phrase)
+                    || r.heading
+                        .as_deref()
+                        .is_some_and(|h| Self::contains(h, phrase))
+            })
+        });
+        results.truncate(usize::try_from(top_k).unwrap_or(usize::MAX));
+    }
+
+    /// Whether `phrase` occurs in `text`, ignoring case and how the
+    /// whitespace runs (a chunk may wrap a phrase across a line break).
+    fn contains(text: &str, phrase: &str) -> bool {
+        let normalize = |s: &str| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
+        normalize(text).contains(&normalize(phrase))
+    }
 }
 
-/// Total term occurrences, the chunk length BM25 normalizes by.
-fn term_count(terms: &[(String, u32)]) -> i64 {
-    terms
-        .iter()
-        .fold(0i64, |acc, (_, tf)| acc.saturating_add(i64::from(*tf)))
+/// How often each term occurs in a chunk's content and heading, by term.
+struct TermFrequencies(Vec<(String, u32)>);
+
+impl TermFrequencies {
+    fn of(content: &str, heading: Option<&str>) -> Self {
+        let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for term in tokenize(content)
+            .into_iter()
+            .chain(heading.map(tokenize).unwrap_or_default())
+        {
+            let entry = counts.entry(term).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+        Self(counts.into_iter().collect())
+    }
+
+    /// Total term occurrences, the chunk length BM25 normalizes by.
+    fn total(&self) -> i64 {
+        self.0
+            .iter()
+            .fold(0i64, |acc, (_, tf)| acc.saturating_add(i64::from(*tf)))
+    }
+}
+
+/// The chunks of ready documents a long run draws from, and the order
+/// its documents come in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplePool {
+    /// Chunks the graph has not extracted yet, documents in ingest order.
+    NotGraphExtracted,
+    /// Chunks with more than a line of text, documents by id: what the
+    /// ontology's document evidence reads.
+    Substantive,
+}
+
+impl SamplePool {
+    /// The `AND ...` condition on `_quack_chunks c`.
+    const fn filter(self) -> &'static str {
+        match self {
+            Self::NotGraphExtracted => {
+                "NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id)"
+            }
+            Self::Substantive => "length(c.content) > 40",
+        }
+    }
+
+    /// How the documents are ordered, in the sampler's own columns: when
+    /// the document was ingested, and its id.
+    const fn document_order(self) -> &'static str {
+        match self {
+            Self::NotGraphExtracted => "ingested_at, doc",
+            Self::Substantive => "doc",
+        }
+    }
 }
 
 /// Which chunks a search may return. Empty means the whole workspace; a
@@ -2592,34 +2791,46 @@ impl ChunkScope {
     }
 }
 
-/// Reciprocal rank fusion of two rankings of the same chunk space.
-fn fuse_rankings(
-    vector: Vec<ChunkSearchResult>,
-    keyword: Vec<ChunkSearchResult>,
-    top_k: u32,
-    rrf_k: u32,
-) -> Vec<ChunkSearchResult> {
-    let mut fused: Vec<ChunkSearchResult> = Vec::new();
-    let k = f64::from(rrf_k);
-    for ranking in [vector, keyword] {
-        for (rank, mut hit) in ranking.into_iter().enumerate() {
-            let contribution = 1.0 / (k + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)) + 1.0);
-            if let Some(existing) = fused.iter_mut().find(|h| h.id == hit.id) {
-                existing.score += contribution;
-            } else {
-                hit.score = contribution;
-                fused.push(hit);
+/// How many hits a hybrid search returns, and how steeply reciprocal rank
+/// fusion discounts rank (`[retrieval].rrf_k`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridLimits {
+    pub top_k: u32,
+    pub rrf_k: u32,
+}
+
+impl HybridLimits {
+    /// Reciprocal rank fusion of two rankings of the same chunk space, the
+    /// first `keep` of them.
+    fn fuse(
+        self,
+        vector: Vec<ChunkSearchResult>,
+        keyword: Vec<ChunkSearchResult>,
+        keep: u32,
+    ) -> Vec<ChunkSearchResult> {
+        let mut fused: Vec<ChunkSearchResult> = Vec::new();
+        let k = f64::from(self.rrf_k);
+        for ranking in [vector, keyword] {
+            for (rank, mut hit) in ranking.into_iter().enumerate() {
+                let contribution =
+                    1.0 / (k + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)) + 1.0);
+                if let Some(existing) = fused.iter_mut().find(|h| h.id == hit.id) {
+                    existing.score += contribution;
+                } else {
+                    hit.score = contribution;
+                    fused.push(hit);
+                }
             }
         }
+        fused.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk_index.cmp(&b.chunk_index))
+        });
+        fused.truncate(usize::try_from(keep).unwrap_or(usize::MAX));
+        fused
     }
-    fused.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.chunk_index.cmp(&b.chunk_index))
-    });
-    fused.truncate(usize::try_from(top_k).unwrap_or(usize::MAX));
-    fused
 }
 
 /// Lets another thread stop the statements one piece of work runs, and
@@ -2638,11 +2849,6 @@ struct CancelSlot {
 }
 
 impl QueryCanceller {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn slot(&self) -> std::sync::MutexGuard<'_, CancelSlot> {
         self.0
             .lock()
@@ -3244,7 +3450,7 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()))
             .with_query_timeout(Duration::from_secs(60));
         // Cancelled before the work starts: it never runs.
-        let early = QueryCanceller::new();
+        let early = QueryCanceller::default();
         early.cancel();
         assert!(matches!(
             db.cancellable(&early, |_| Ok(())),
@@ -3252,7 +3458,7 @@ mod tests {
         ));
 
         // Cancelled while a long statement runs: the statement stops.
-        let canceller = QueryCanceller::new();
+        let canceller = QueryCanceller::default();
         let remote = canceller.clone();
         let stopper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
@@ -3271,7 +3477,7 @@ mod tests {
 
         // The connection is free again, and a canceller no longer guarding
         // anything interrupts nothing.
-        let after = QueryCanceller::new();
+        let after = QueryCanceller::default();
         assert!(
             db.cancellable(&after, |db| db.execute_query_capped("SELECT 1", 10))
                 .is_ok()
@@ -3785,46 +3991,60 @@ mod tests {
 
     #[test]
     fn term_frequencies_count_heading_too() {
-        let tf = term_frequencies("flood flood damage", Some("Flood Exclusions"));
+        let tf = TermFrequencies::of("flood flood damage", Some("Flood Exclusions"));
         assert_eq!(
-            tf,
+            tf.0,
             vec![
                 (String::from("damag"), 1),
                 (String::from("exclus"), 1),
                 (String::from("flood"), 3),
             ]
         );
-        assert_eq!(term_count(&tf), 5);
+        assert_eq!(tf.total(), 5);
     }
 
     #[test]
-    fn extract_phrases_reads_balanced_quotes() {
+    fn phrases_read_balanced_quotes() {
         assert_eq!(
-            extract_phrases("\"flood exclusion\""),
+            Phrases::parse("\"flood exclusion\"").0,
             vec![String::from("flood exclusion")]
         );
         assert_eq!(
-            extract_phrases("find \"flood exclusion\" near \"water damage\""),
+            Phrases::parse("find \"flood exclusion\" near \"water damage\"").0,
             vec![
                 String::from("flood exclusion"),
                 String::from("water damage")
             ]
         );
-        assert!(extract_phrases("no quotes here").is_empty());
-        assert!(extract_phrases("\"\"").is_empty());
+        assert!(Phrases::parse("no quotes here").0.is_empty());
+        assert!(Phrases::parse("\"\"").0.is_empty());
         // Unbalanced quotes: an odd count is ordinary text, not a phrase.
-        assert!(extract_phrases("say \"hello").is_empty());
-        assert!(extract_phrases("a \"b\" c\" d").is_empty());
+        assert!(Phrases::parse("say \"hello").0.is_empty());
+        assert!(Phrases::parse("a \"b\" c\" d").0.is_empty());
     }
 
     #[test]
-    fn contains_phrase_normalizes_case_and_whitespace() {
-        assert!(contains_phrase(
+    fn phrases_match_ignoring_case_and_whitespace() {
+        assert!(Phrases::contains(
             "the FLOOD   Exclusion\napplies here",
             "flood exclusion"
         ));
-        assert!(!contains_phrase("flood and exclusion", "flood exclusion"));
-        assert!(contains_phrase("Flood Exclusion", "  flood   exclusion  "));
+        assert!(!Phrases::contains("flood and exclusion", "flood exclusion"));
+        assert!(Phrases::contains(
+            "Flood Exclusion",
+            "  flood   exclusion  "
+        ));
+    }
+
+    #[test]
+    fn phrases_over_fetch_only_when_there_is_one() {
+        assert_eq!(Phrases::parse("plain words").fetch(10, 20), 10);
+        assert_eq!(Phrases::parse("\"a b\"").fetch(10, 20), 80);
+        assert_eq!(
+            Phrases::parse("\"a b\"").fetch(10, 1000),
+            PHRASE_CANDIDATE_CAP
+        );
+        assert_eq!(Phrases::parse("\"a b\"").fetch(900, 20), 900);
     }
 
     #[test]
@@ -3954,6 +4174,135 @@ mod tests {
         let output = String::from_utf8_lossy(&buf);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    /// Up to `limit` items spread evenly over the groups: each group (one
+    /// document's chunks, in order) gets an equal quota, taken at evenly
+    /// spaced positions, so a sample covers every document and not just the
+    /// front matter of the first.
+    fn evenly_spaced<T>(groups: impl IntoIterator<Item = Vec<T>>, limit: usize) -> Vec<T> {
+        let groups: Vec<Vec<T>> = groups.into_iter().filter(|g| !g.is_empty()).collect();
+        if limit == 0 || groups.is_empty() {
+            return Vec::new();
+        }
+        let quota = limit.div_ceil(groups.len()).max(1);
+        let mut chosen = Vec::with_capacity(limit);
+        for group in groups {
+            let len = group.len();
+            let take = quota.min(len);
+            let mut positions: Vec<usize> = (0..take)
+                .map(|k| {
+                    k.saturating_mul(len)
+                        .checked_div(take)
+                        .unwrap_or(0)
+                        .min(len.saturating_sub(1))
+                })
+                .collect();
+            positions.dedup();
+            let mut positions = positions.into_iter().peekable();
+            for (index, item) in group.into_iter().enumerate() {
+                if positions.peek() == Some(&index) {
+                    positions.next();
+                    chosen.push(item);
+                }
+            }
+        }
+        chosen.truncate(limit);
+        chosen
+    }
+
+    #[test]
+    fn a_sample_spreads_across_every_group() {
+        let groups = vec![(0..10).collect::<Vec<u32>>(), vec![100, 101], vec![]];
+        assert_eq!(evenly_spaced(groups.clone(), 4), vec![0, 5, 100, 101]);
+        assert_eq!(evenly_spaced(groups.clone(), 3), vec![0, 5, 100]);
+        assert!(evenly_spaced(groups, 0).is_empty());
+        assert_eq!(evenly_spaced(vec![vec![1, 2, 3]], 10), vec![1, 2, 3]);
+    }
+
+    /// The SQL sampler picks exactly what `evenly_spaced` picks from the
+    /// same documents in the same order, for every limit, from both pools.
+    #[test]
+    fn the_sql_sample_matches_evenly_spaced() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        // Ids sort in insertion order, so ingest order and id order agree.
+        let sizes = [10_u32, 2, 7, 1, 13, 3];
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for (d, size) in sizes.iter().enumerate() {
+            let doc = format!("d{d}");
+            insert_ready_document(&db, &doc);
+            let mut group = Vec::new();
+            for i in 0..*size {
+                let id = format!("{doc}-c{i:02}");
+                insert_text_chunk(
+                    &db,
+                    &id,
+                    &doc,
+                    i,
+                    "a passage long enough to count as more than a line of text",
+                );
+                group.push(id);
+            }
+            groups.push(group);
+        }
+        for pool in [SamplePool::NotGraphExtracted, SamplePool::Substantive] {
+            assert_eq!(
+                db.pool_size(pool).unwrap_or_else(|e| fail(&e.to_string())),
+                36
+            );
+            for limit in 0..40_u32 {
+                let expected = evenly_spaced(groups.clone(), limit as usize);
+                let sampled = db
+                    .sample_chunk_ids(pool, limit)
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                assert_eq!(sampled, expected, "{pool:?} limit {limit}");
+            }
+        }
+    }
+
+    /// A rebuild read a page at a time indexes every chunk, the last page
+    /// short, exactly as the inserts did.
+    #[test]
+    fn a_paged_reindex_restores_every_chunk() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "d0");
+        for i in 0..7 {
+            insert_text_chunk(&db, &format!("c{i}"), "d0", i, &format!("flood report {i}"));
+        }
+        let snapshot = |db: &WorkspaceDb| {
+            db.execute_query(
+                "SELECT (SELECT count(*) FROM _quack_terms), (SELECT sum(token_count) FROM _quack_chunks)",
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .rows
+        };
+        let indexed = snapshot(&db);
+        db.execute_statement("DELETE FROM _quack_terms")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.reindex_terms_by(3)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(snapshot(&db), indexed);
+    }
+
+    /// Paging by id visits every chunk of the pool once, in id order.
+    #[test]
+    fn chunk_pages_visit_the_pool_once() {
+        let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "d0");
+        for i in 0..7 {
+            insert_text_chunk(&db, &format!("c{i}"), "d0", i, "some text");
+        }
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = db
+                .chunk_page(SamplePool::NotGraphExtracted, after.as_deref(), 3)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let Some(last) = page.last() else { break };
+            after = Some(last.id.clone());
+            seen.extend(page.into_iter().map(|c| c.id));
+        }
+        assert_eq!(seen, ["c0", "c1", "c2", "c3", "c4", "c5", "c6"]);
     }
 
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {
@@ -4125,7 +4474,15 @@ mod tests {
         .unwrap_or_else(|e| fail(&e.to_string()));
 
         let results = db
-            .search_hybrid_chunks("POL-8841", &embedding, 10, 60, &ChunkScope::all())
+            .search_hybrid_chunks(
+                "POL-8841",
+                &embedding,
+                HybridLimits {
+                    top_k: 10,
+                    rrf_k: 60,
+                },
+                &ChunkScope::all(),
+            )
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
     }
@@ -4160,8 +4517,10 @@ mod tests {
             .search_hybrid_chunks(
                 "\"flood exclusion\"",
                 &embedding,
-                10,
-                60,
+                HybridLimits {
+                    top_k: 10,
+                    rrf_k: 60,
+                },
                 &ChunkScope::all(),
             )
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -4232,7 +4591,7 @@ mod tests {
             reopened
                 .meta(MetaKey::SchemaVersion)
                 .unwrap_or_else(|e| fail(&e.to_string())),
-            Some(String::from(WORKSPACE_SCHEMA_VERSION))
+            Some(WORKSPACE_SCHEMA_VERSION.to_string())
         );
         let rows = reopened
             .execute_query("SELECT count(*) FROM _quack_terms WHERE term = 'pol8841'")

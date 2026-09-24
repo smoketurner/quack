@@ -193,7 +193,8 @@ background, auditing the run's end under the same run id.
 The knowledge graph (`quack_core::graph`, design doc 6.4) lives in `_quack_graph_nodes`,
 `_quack_graph_edges`, `_quack_provenance`, and `_quack_graph_merges`. `graph::tables`
 turns mapped rows into nodes and edges deterministically; `graph::extract` sends each
-ready chunk to the chat model (`llm::graph_extractor`, preamble from
+chunk its `ChunkPlan` names (every unextracted one, or an even sample chosen in SQL by
+`WorkspaceDb::sample_chunk_ids`, reading text a page at a time) to the chat model (`llm::graph_extractor`, preamble from
 `Ontology::extraction_prompt`) and validates the answer against the ontology, counting unknown
 classes and relations as drift in `_quack_meta.graph_drift`; `graph::resolve` embeds
 node labels, merges near-identical labels of one class, and queues the rest as merge
@@ -224,7 +225,9 @@ its role: `Query` (search), `Document { title, text }` (a chunk under its headin
 model family was trained with (`presets::Family::of`, from each model card; `[embedding]`
 overrides any role, `ResolvedPrompts::for_model`) and returns `Vector`s checked against the
 profile's `Dimension`; `.clippy.toml` disallows rig's raw `embed_text`/`embed_texts`.
-Long runs take a `progress::RunControl` (progress plus cancel). The model, width, and
+Every long run (ingestion, import, graph extraction, the ontology's document pass,
+embeddings refresh) takes one `progress::RunControl`: progress per unit, and the cancel
+token it checks between units and races model calls against. The model, width, and
 prefixes are the `Profile`; every stored
 chunk and node vector carries its fingerprint (`embedding_profile`, profiles in
 `_quack_embedding_profiles`), and vector search, label matching, and merge proposals use
@@ -251,7 +254,7 @@ bytes' SHA-256 already belong to a non-failed document whose table or chunks sti
 `Error::TableTaken` when the file's table belongs to another live document) plus `process_document`
 (`processing` to `ready` or `error`, recording `chunk_count` and the parsed title);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
-title and uploader).
+title and uploader, and its `RunControl`).
 
 The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;

@@ -5,6 +5,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use quack_core::llm;
+use quack_core::progress::RunControl;
 use quack_core::storage::control::{AuditAction, Outcome};
 use quack_core::text::NonBlankText;
 use serde::Deserialize;
@@ -73,7 +74,7 @@ pub(crate) async fn run_import(
         request,
         policy,
         embeddings.as_ref(),
-        None,
+        RunControl::unobserved(),
     )
     .await;
     let detail = serde_json::json!({

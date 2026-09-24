@@ -23,9 +23,9 @@ use crate::csv::CsvField;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ingestion::{self, IngestOutcome, NewFile, parser};
+use crate::progress::RunControl;
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
-use tokio_util::sync::CancellationToken;
 
 /// What to import and where to put it.
 #[derive(Debug, Clone)]
@@ -177,7 +177,8 @@ fn table_name(raw: &str) -> Result<String> {
 ///
 /// Returns an error when the URL is unsupported, the source cannot be
 /// reached or queried, or the load fails; [`Error::Cancelled`] when
-/// `cancel` fires first (a download or query in flight is abandoned).
+/// `control` is cancelled first (a download or query in flight is
+/// abandoned).
 pub async fn import<M: EmbeddingModel>(
     config: &Config,
     db: &Writer,
@@ -185,7 +186,7 @@ pub async fn import<M: EmbeddingModel>(
     request: &ImportRequest,
     policy: ImportPolicy,
     embedder: Option<&Embedder<M>>,
-    cancel: Option<&CancellationToken>,
+    control: RunControl<'_>,
 ) -> Result<ImportSummary> {
     let table = table_name(&request.table)?;
     let limit = request
@@ -203,9 +204,9 @@ pub async fn import<M: EmbeddingModel>(
                 private_hosts: policy.private_hosts,
                 redirects: policy.private_hosts,
             };
-            let (filename, bytes) =
-                ingestion::or_cancelled(cancel, fetch_http(&request.url, &table, &download))
-                    .await?;
+            let (filename, bytes) = control
+                .or_cancelled(fetch_http(&request.url, &table, &download))
+                .await?;
             (filename, bytes, Vec::new(), None)
         }
         SourceKind::Sqlite if !policy.local_files => {
@@ -232,7 +233,7 @@ pub async fn import<M: EmbeddingModel>(
                         ))
                     })?
             };
-            let fetched = ingestion::or_cancelled(cancel, fetch).await?;
+            let fetched = control.or_cancelled(fetch).await?;
             (
                 format!("{table}.csv"),
                 fetched.csv.into_bytes(),
@@ -248,7 +249,7 @@ pub async fn import<M: EmbeddingModel>(
         &NewFile::new(&filename, &bytes)
             .source(DocumentSource::Import)
             .title(Some(&source))
-            .cancel(cancel),
+            .control(control),
         embedder,
     )
     .await?;
@@ -834,7 +835,7 @@ mod tests {
             &request,
             ImportPolicy::owner(),
             None::<&Embeddings>,
-            None,
+            RunControl::unobserved(),
         )
         .await
         .unwrap_or_else(|e| no_import(&e.to_string()));
@@ -911,7 +912,7 @@ mod tests {
                 &request,
                 ImportPolicy::owner(),
                 None::<&Embeddings>,
-                None,
+                RunControl::unobserved(),
             )
             .await
             .err()

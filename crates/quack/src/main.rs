@@ -31,7 +31,7 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
 use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, crypto, doctor, llm};
@@ -850,7 +850,10 @@ async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode
         &ws_db,
         action,
         &mut out,
-        &ontology_cli::chunk_progress,
+        RunControl {
+            progress: &ontology_cli::chunk_progress,
+            cancel: None,
+        },
     )
     .await?;
     Ok(ExitCode::SUCCESS)
@@ -885,7 +888,10 @@ async fn run_ontology(cli: &Cli, action: ontology_cli::OntologyAction) -> Result
         &ws_db,
         action,
         &mut out,
-        &ontology_cli::chunk_progress,
+        RunControl {
+            progress: &ontology_cli::chunk_progress,
+            cancel: None,
+        },
     )
     .await?;
     Ok(ExitCode::SUCCESS)
@@ -919,7 +925,7 @@ async fn run_import(
         request,
         ImportPolicy::owner(),
         embedding_model.as_ref(),
-        None,
+        RunControl::unobserved(),
     )
     .await
     .context("import failed")?;
@@ -1400,8 +1406,7 @@ fn list_sessions(db: &WorkspaceDb, json: bool, limit: u32) -> Result<()> {
 }
 
 fn export_session(db: &WorkspaceDb, prefix: &str, format: ExportFormat) -> Result<()> {
-    let session = find_session(db, prefix)?;
-    let text = format.render(&session, &sessions::messages(db, &session.id)?)?;
+    let text = Transcript::load(db, find_session(db, prefix)?)?.render(format)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     write!(out, "{text}")?;

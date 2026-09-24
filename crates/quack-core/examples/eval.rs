@@ -30,14 +30,15 @@ use quack_core::config::{
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
 use quack_core::extraction::{Extract, ExtractFuture};
-use quack_core::graph::extract::{ChunkText, Extraction};
+use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, store};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::ontology::store::{self as ontology_store, Revision};
-use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, WorkspaceDb};
+use quack_core::progress::RunControl;
+use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, HybridLimits, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use serde::{Deserialize, Serialize};
@@ -328,14 +329,13 @@ fn file_name(path: &Path) -> Result<&str> {
 
 struct ChunkRow {
     id: String,
-    document_id: String,
     filename: String,
     content: String,
 }
 
 fn load_chunk_index(db: &WorkspaceDb) -> Result<Vec<ChunkRow>> {
     let mut stmt = db.connection().prepare(
-        "SELECT c.id, c.document_id, d.filename, c.content FROM _quack_chunks c \
+        "SELECT c.id, d.filename, c.content FROM _quack_chunks c \
          JOIN _quack_documents d ON d.id = c.document_id \
          ORDER BY d.filename, c.chunk_index",
     )?;
@@ -344,9 +344,8 @@ fn load_chunk_index(db: &WorkspaceDb) -> Result<Vec<ChunkRow>> {
     while let Some(row) = rows.next()? {
         out.push(ChunkRow {
             id: row.get(0)?,
-            document_id: row.get(1)?,
-            filename: row.get(2)?,
-            content: row.get(3)?,
+            filename: row.get(1)?,
+            content: row.get(2)?,
         });
     }
     Ok(out)
@@ -531,8 +530,7 @@ async fn evaluate_retrieval(
         let hybrid_ids = ids_of(db.search_hybrid_chunks(
             &q.question,
             &query_vec,
-            top_k,
-            rrf_k,
+            HybridLimits { top_k, rrf_k },
             &ChunkScope::all(),
         )?);
 
@@ -752,7 +750,7 @@ async fn evaluate_graph(
     )?;
 
     let mut answers = BTreeMap::new();
-    let mut chunk_texts = Vec::with_capacity(fixture.chunks.len());
+    let mut chunk_ids = Vec::with_capacity(fixture.chunks.len());
     for fixture_chunk in &fixture.chunks {
         let row = chunks
             .iter()
@@ -767,23 +765,19 @@ async fn evaluate_graph(
             fixture_chunk.anchor.clone(),
             fixture_chunk.canned_answer.clone(),
         );
-        chunk_texts.push(ChunkText {
-            chunk_id: row.id.clone(),
-            document_id: row.document_id.clone(),
-            text: row.content.clone(),
-        });
+        chunk_ids.push(row.id.clone());
     }
     let extractor = FixtureExtractor { answers };
 
     let writer = writer_of(db)?;
     let summary = graph::extract::run(
         &writer,
-        chunk_texts,
+        &ChunkPlan::Sample(chunk_ids),
         &extractor,
         &ontology,
         false,
         4,
-        &|_| {},
+        RunControl::unobserved(),
     )
     .await?;
 

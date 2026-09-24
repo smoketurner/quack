@@ -37,7 +37,7 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, MessageRole};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat, MessageRole, Transcript};
 use quack_core::storage::workspace::{QueryCanceller, StatementKind, WorkspaceDb};
 
 use crate::ModeArg;
@@ -493,20 +493,20 @@ impl CliJob {
     /// the work that checks for it between batches.
     async fn run(self, env: &JobEnv, ctx: &JobContext) -> Result<String> {
         let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
+        let cancel = ctx.cancel_token();
+        let control = RunControl {
+            progress: &progress,
+            cancel: Some(&cancel),
+        };
         let mut out: Vec<u8> = Vec::new();
         match self {
             Self::Ontology(action) => {
-                ontology_cli::run(&env.config, &env.db, action, &mut out, &progress).await?;
+                ontology_cli::run(&env.config, &env.db, action, &mut out, control).await?;
             }
             Self::Graph(action) => {
-                graph_cli::run(&env.config, &env.db, action, &mut out, &progress).await?;
+                graph_cli::run(&env.config, &env.db, action, &mut out, control).await?;
             }
             Self::Embeddings(action) => {
-                let cancel = ctx.cancel_token();
-                let control = RunControl {
-                    progress: &progress,
-                    cancel: Some(&cancel),
-                };
                 embeddings_cli::run(&env.config, &env.db, action, &mut out, control).await?;
             }
             Self::Okf(dir) => {
@@ -537,16 +537,19 @@ impl CliJob {
                     current.version
                 ));
             }
-            Self::Import(request) => return Self::import(env, &request, ctx).await,
-            Self::Ingest(path) => return Self::ingest(env, &path, ctx).await,
+            Self::Import(request) => return Self::import(env, &request, control).await,
+            Self::Ingest(path) => return Self::ingest(env, &path, control).await,
         }
         Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
     }
 
     /// Rows from an external source as a workspace table.
-    async fn import(env: &JobEnv, request: &ImportRequest, ctx: &JobContext) -> Result<String> {
+    async fn import(
+        env: &JobEnv,
+        request: &ImportRequest,
+        control: RunControl<'_>,
+    ) -> Result<String> {
         let embedding_model = llm::optional_embedding_model(&env.config).await?;
-        let cancel = ctx.cancel_token();
         let summary = import::import(
             &env.config,
             &env.db,
@@ -554,7 +557,7 @@ impl CliJob {
             request,
             ImportPolicy::owner(),
             embedding_model.as_ref(),
-            Some(&cancel),
+            control,
         )
         .await?;
         Ok(format!(
@@ -567,7 +570,7 @@ impl CliJob {
     }
 
     /// A file as a table or tables, or as chunks.
-    async fn ingest(env: &JobEnv, path: &Path, ctx: &JobContext) -> Result<String> {
+    async fn ingest(env: &JobEnv, path: &Path, control: RunControl<'_>) -> Result<String> {
         let read = path.to_owned();
         let data = tokio::task::spawn_blocking(move || std::fs::read(read))
             .await?
@@ -578,12 +581,11 @@ impl CliJob {
             .unwrap_or("unknown")
             .to_owned();
         let embedding_model = llm::optional_embedding_model(&env.config).await?;
-        let cancel = ctx.cancel_token();
         let outcome = ingestion::ingest_file(
             &env.config,
             &env.db,
             &env.workspace_id,
-            &NewFile::new(&filename, &data).cancel(Some(&cancel)),
+            &NewFile::new(&filename, &data).control(control),
             embedding_model.as_ref(),
         )
         .await
@@ -636,7 +638,7 @@ impl DirectSql {
         max_rows: u32,
         ctx: &JobContext,
     ) -> BackgroundResult {
-        let canceller = QueryCanceller::new();
+        let canceller = QueryCanceller::default();
         let watch = {
             let canceller = canceller.clone();
             let token = ctx.cancel_token();
@@ -1955,7 +1957,7 @@ impl App {
             move |db| {
                 let found = sessions::get_session(db, &session)?
                     .ok_or_else(|| CoreError::Analysis(String::from("session vanished")))?;
-                format.render(&found, &sessions::messages(db, &session)?)
+                Transcript::load(db, found)?.render(format)
             },
             move |app, text| match file {
                 Some(path) => match std::fs::write(&path, &text) {

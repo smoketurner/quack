@@ -8,6 +8,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::extraction::Extract;
+use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::Revalidation;
@@ -26,7 +27,7 @@ use crate::server::state::{App, ExtractionSlot, with_db};
 use quack_core::analysis::tools::SharedDb;
 use quack_core::jobs::JobId;
 use quack_core::ontology::{Ontology, OntologyVersion};
-use quack_core::progress::ChunkDone;
+use quack_core::progress::{ChunkDone, RunControl};
 
 #[derive(Deserialize, Default)]
 pub(crate) struct SearchQuery {
@@ -227,9 +228,9 @@ impl Access {
             Vec::new()
         };
         let chunks = if plan.source.includes_documents() {
-            app.read(id, move |db| extract::chunks(db, sample)).await?
+            app.read(id, move |db| ChunkPlan::new(db, sample)).await?
         } else {
-            Vec::new()
+            ChunkPlan::Sample(Vec::new())
         };
         if chunks.is_empty() {
             let summary = resolve::resolve(&db, embeddings.as_ref(), &options).await?;
@@ -320,7 +321,7 @@ async fn extract_tables_in_batches(
 /// Everything the background document pass needs.
 struct DocumentJob {
     db: SharedDb,
-    chunks: Vec<extract::ChunkText>,
+    chunks: ChunkPlan,
     extractor: Box<dyn Extract<extract::Extraction>>,
     ontology: Ontology,
     /// The ontology's saved version, which the graph records when the pass
@@ -361,14 +362,19 @@ impl DocumentJob {
                     "graph extraction progress"
                 );
             };
+            let cancel = ctx.cancel_token();
+            let control = RunControl {
+                progress: &progress,
+                cancel: Some(&cancel),
+            };
             let outcome = extract::run(
                 &db,
-                chunks,
+                &chunks,
                 extractor.as_ref(),
                 &ontology,
                 provisional,
                 app.config.analysis.extraction_concurrency,
-                &progress,
+                control,
             )
             .await;
             let result = match outcome {

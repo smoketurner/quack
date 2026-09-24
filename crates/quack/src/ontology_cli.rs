@@ -17,7 +17,7 @@ use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, ROOT_CLASS, candidates, documents, store};
-use quack_core::progress::{ChunkDone, Progress};
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
@@ -96,17 +96,17 @@ pub(crate) enum OntologyAction {
 /// (stdout for the CLI, the transcript for the terminal session).
 ///
 /// Each database step goes to the workspace writer on its own, never
-/// spanning a model call; `progress` hears about every chunk of a document pass.
+/// spanning a model call; `control` hears about every chunk of a document pass and can stop it.
 pub(crate) async fn run(
     config: &Config,
     db: &Writer,
     action: OntologyAction,
     out: &mut impl Write,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<()> {
     match action {
         propose_action @ OntologyAction::Propose { .. } => {
-            run_propose(config, db, propose_action, out, progress).await?;
+            run_propose(config, db, propose_action, out, control).await?;
         }
         review @ (OntologyAction::Review { .. }
         | OntologyAction::Accept { .. }
@@ -229,7 +229,7 @@ async fn run_propose(
     db: &Writer,
     action: OntologyAction,
     out: &mut impl Write,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<()> {
     let OntologyAction::Propose {
         auto_accept,
@@ -257,7 +257,7 @@ async fn run_propose(
             documents: pass,
         },
         out,
-        progress,
+        control,
     )
     .await
 }
@@ -387,7 +387,7 @@ async fn propose(
     db: &Writer,
     args: ProposeArgs,
     out: &mut impl Write,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<()> {
     let current = db.run(store::current).await?;
     let (known, evidence) = (current.clone(), config.ontology.table_evidence());
@@ -420,7 +420,7 @@ async fn propose(
             writeln!(out, "Skipped the document pass.")?;
         } else {
             let from_documents =
-                run_documents(config, db, current.as_ref(), &options, out, progress).await?;
+                run_documents(config, db, current.as_ref(), &options, out, control).await?;
             proposals.extend(from_documents);
         }
     }
@@ -488,7 +488,7 @@ async fn run_documents(
     current: Option<&Ontology>,
     options: &documents::DocumentEvidenceOptions,
     out: &mut impl Write,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<Vec<Candidate>> {
     let count = options.sample_chunks;
     let sample = db
@@ -503,7 +503,7 @@ async fn run_documents(
         options,
         embeddings.as_ref(),
         config.analysis.extraction_concurrency,
-        progress,
+        control,
     )
     .await?;
     writeln!(

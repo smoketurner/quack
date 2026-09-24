@@ -7,6 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use quack_core::config::Config;
+use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
@@ -14,7 +15,7 @@ use quack_core::graph::{
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
-use quack_core::progress::Progress;
+use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
@@ -91,13 +92,13 @@ pub(crate) enum GraphAction {
 ///
 /// Each database step goes to the workspace writer on its own, never
 /// spanning a model call, so the terminal's other work keeps going during
-/// an extraction; `progress` hears about every extracted chunk.
+/// an extraction; `control` hears about every extracted chunk and can stop it.
 pub(crate) async fn run(
     config: &Config,
     db: &Writer,
     action: GraphAction,
     out: &mut impl Write,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<()> {
     match action {
         search @ GraphAction::Search { .. } => run_search(config, db, out, search).await?,
@@ -126,7 +127,7 @@ pub(crate) async fn run(
                     reset,
                     yes,
                 },
-                progress,
+                control,
             )
             .await?;
         }
@@ -277,7 +278,7 @@ async fn run_extract(
     db: &Writer,
     out: &mut impl Write,
     args: ExtractArgs,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<()> {
     let ontology = db
         .run(ontology_store::current)
@@ -313,8 +314,8 @@ async fn run_extract(
     }
     if args.sources.includes_documents() {
         let sample = args.sample;
-        let chunks = db.run(move |db| extract::chunks(db, sample)).await?;
-        if chunks.is_empty() {
+        let plan = db.run(move |db| ChunkPlan::new(db, sample)).await?;
+        if plan.is_empty() {
             writeln!(
                 out,
                 "No chunks left to extract: every chunk of every ready document is on record (`--reset` starts over)."
@@ -324,19 +325,19 @@ async fn run_extract(
             writeln!(
                 out,
                 "Document extraction: {} chunks, one model call each to {chat}.",
-                chunks.len()
+                plan.len()
             )?;
             out.flush()?;
             if Confirm::from_yes(args.yes).ask(out, "Proceed?", Some("--yes"))? {
                 let extractor = llm::graph_extractor(config, &ontology).await?;
                 let summary = extract::run(
                     db,
-                    chunks,
+                    &plan,
                     extractor.as_ref(),
                     &ontology,
                     provisional,
                     config.analysis.extraction_concurrency,
-                    progress,
+                    control,
                 )
                 .await?;
                 writeln!(

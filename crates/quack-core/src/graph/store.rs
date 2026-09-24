@@ -1,7 +1,7 @@
 //! Persistence for nodes, edges, provenance, and the graph's bookkeeping in
 //! `_quack_meta`: the ontology version it was built with, and drift.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use duckdb::OptionalExt as _;
 use duckdb::types::ToSqlOutput;
@@ -597,65 +597,6 @@ pub fn mark_reviewed(db: &WorkspaceDb) -> Result<()> {
     Ok(())
 }
 
-/// Delete the given nodes with their edges and provenance.
-///
-/// # Errors
-///
-/// Returns an error if a delete fails.
-pub fn delete_nodes(db: &WorkspaceDb, ids: &[String]) -> Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let list = IdList::new(ids);
-    let conn = db.connection();
-    conn.execute(
-        "DELETE FROM _quack_provenance WHERE subject_id IN (SELECT id FROM _quack_graph_edges \
-         WHERE list_contains(?::VARCHAR[], source_node_id) OR list_contains(?::VARCHAR[], target_node_id))",
-        duckdb::params![list, list],
-    )?;
-    conn.execute(
-        "DELETE FROM _quack_graph_edges WHERE list_contains(?::VARCHAR[], source_node_id) \
-         OR list_contains(?::VARCHAR[], target_node_id)",
-        duckdb::params![list, list],
-    )?;
-    conn.execute(
-        "DELETE FROM _quack_provenance WHERE list_contains(?::VARCHAR[], subject_id)",
-        duckdb::params![list],
-    )?;
-    conn.execute(
-        "DELETE FROM _quack_graph_merges WHERE list_contains(?::VARCHAR[], keep_node_id) \
-         OR list_contains(?::VARCHAR[], drop_node_id)",
-        duckdb::params![list, list],
-    )?;
-    conn.execute(
-        "DELETE FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], id)",
-        duckdb::params![list],
-    )?;
-    Ok(())
-}
-
-/// Delete the given edges with their provenance.
-///
-/// # Errors
-///
-/// Returns an error if a delete fails.
-pub fn delete_edges(db: &WorkspaceDb, ids: &[String]) -> Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let list = IdList::new(ids);
-    let conn = db.connection();
-    conn.execute(
-        "DELETE FROM _quack_provenance WHERE list_contains(?::VARCHAR[], subject_id)",
-        duckdb::params![list],
-    )?;
-    conn.execute(
-        "DELETE FROM _quack_graph_edges WHERE list_contains(?::VARCHAR[], id)",
-        duckdb::params![list],
-    )?;
-    Ok(())
-}
-
 /// What revalidation removed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Revalidation {
@@ -666,7 +607,11 @@ pub struct Revalidation {
 
 /// Bring a stale graph in line with the current ontology without a model
 /// call: nodes whose class no longer exists go, and edges whose relation
-/// is gone or whose endpoints no longer fit its domain and range go.
+/// is gone or whose endpoints no longer fit its domain and range go. What
+/// goes is chosen in SQL; only the distinct (relation, source class,
+/// target class) combinations the edges use are read, to check each
+/// against the ontology once, so the work does not grow with the graph in
+/// memory.
 ///
 /// # Errors
 ///
@@ -675,62 +620,148 @@ pub fn revalidate(db: &WorkspaceDb) -> Result<Revalidation> {
     let ontology = ontology_store::current(db)?
         .ok_or_else(|| Error::Ontology(String::from("no ontology to validate against")))?;
     let version = ontology.saved_version()?;
-    let classes: BTreeSet<&str> = ontology.classes.iter().map(|c| c.id.as_str()).collect();
-    let conn = db.connection();
-    let mut stmt = conn.prepare("SELECT id, class_id FROM _quack_graph_nodes")?;
-    let mut rows = stmt.query([])?;
-    let mut bad_nodes = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id: String = row.get(0)?;
-        let class: String = row.get(1)?;
-        if class != ontology::ROOT_CLASS && !classes.contains(class.as_str()) {
-            bad_nodes.push(id);
-        }
-    }
-    drop(rows);
-    drop(stmt);
-    delete_nodes(db, &bad_nodes)?;
+    let mut classes: Vec<String> = ontology.classes.iter().map(|c| c.id.clone()).collect();
+    classes.push(String::from(ontology::ROOT_CLASS));
+    let dropped_nodes = delete_nodes_outside(db, &IdList::new(&classes))?;
 
+    let conn = db.connection();
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.relation_id, s.class_id, t.class_id FROM _quack_graph_edges e \
+        "SELECT DISTINCT e.relation_id, s.class_id, t.class_id FROM _quack_graph_edges e \
          JOIN _quack_graph_nodes s ON s.id = e.source_node_id \
          JOIN _quack_graph_nodes t ON t.id = e.target_node_id",
     )?;
-    let mut rows = stmt.query([])?;
-    let mut bad_edges = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id: String = row.get(0)?;
-        let relation: String = row.get(1)?;
-        let source_class: String = row.get(2)?;
-        let target_class: String = row.get(3)?;
-        if !ontology.allows_edge(&relation, &source_class, &target_class) {
-            bad_edges.push(id);
+    let combinations = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<duckdb::Result<Vec<(String, String, String)>>>()?;
+    drop(stmt);
+    let mut dropped_edges: u64 = 0;
+    for (relation, source, target) in combinations {
+        if !ontology.allows_edge(&relation, &source, &target) {
+            let set = EdgeSet::Combination {
+                relation,
+                source,
+                target,
+            };
+            dropped_edges = dropped_edges.saturating_add(set.delete(db)?);
         }
     }
-    drop(rows);
-    drop(stmt);
     // Edges whose endpoint vanished with a dropped node are gone already;
     // any left dangling (orphaned by an older bug) go too.
-    let mut stmt = conn.prepare(
-        "SELECT e.id FROM _quack_graph_edges e \
-         WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = e.source_node_id) \
-         OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = e.target_node_id)",
-    )?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        bad_edges.push(row.get(0)?);
-    }
-    drop(rows);
-    drop(stmt);
-    bad_edges.sort();
-    bad_edges.dedup();
-    delete_edges(db, &bad_edges)?;
+    dropped_edges = dropped_edges.saturating_add(EdgeSet::Dangling.delete(db)?);
     set_built_with(db, version)?;
     Ok(Revalidation {
-        dropped_nodes: u64::try_from(bad_nodes.len()).unwrap_or(u64::MAX),
-        dropped_edges: u64::try_from(bad_edges.len()).unwrap_or(u64::MAX),
+        dropped_nodes,
+        dropped_edges,
         version,
     })
+}
+
+/// Delete every node whose class is not in `classes`, with its edges,
+/// their provenance, its own, and its merge proposals; returns how many
+/// nodes went.
+fn delete_nodes_outside(db: &WorkspaceDb, classes: &IdList) -> Result<u64> {
+    const NODES: &str =
+        "SELECT id FROM _quack_graph_nodes WHERE NOT list_contains(?::VARCHAR[], class_id)";
+    let conn = db.connection();
+    let count: u64 = conn.query_row(
+        &format!("SELECT count(*) FROM ({NODES})"),
+        duckdb::params![classes],
+        |row| row.get(0),
+    )?;
+    if count == 0 {
+        return Ok(0);
+    }
+    conn.execute(
+        &format!(
+            "DELETE FROM _quack_provenance WHERE subject_id IN (SELECT id FROM _quack_graph_edges \
+             WHERE source_node_id IN ({NODES}) OR target_node_id IN ({NODES}))"
+        ),
+        duckdb::params![classes, classes],
+    )?;
+    conn.execute(
+        &format!(
+            "DELETE FROM _quack_graph_edges \
+             WHERE source_node_id IN ({NODES}) OR target_node_id IN ({NODES})"
+        ),
+        duckdb::params![classes, classes],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM _quack_provenance WHERE subject_id IN ({NODES})"),
+        duckdb::params![classes],
+    )?;
+    conn.execute(
+        &format!(
+            "DELETE FROM _quack_graph_merges \
+             WHERE keep_node_id IN ({NODES}) OR drop_node_id IN ({NODES})"
+        ),
+        duckdb::params![classes, classes],
+    )?;
+    conn.execute(
+        "DELETE FROM _quack_graph_nodes WHERE NOT list_contains(?::VARCHAR[], class_id)",
+        duckdb::params![classes],
+    )?;
+    Ok(count)
+}
+
+/// Edges revalidation drops, as a query over the stored graph.
+enum EdgeSet {
+    /// Every edge of `relation` from a `source` node to a `target` node.
+    Combination {
+        relation: String,
+        source: String,
+        target: String,
+    },
+    /// Edges with an end that no longer exists.
+    Dangling,
+}
+
+impl EdgeSet {
+    /// The `SELECT id` of the set, and its parameters.
+    fn query(&self) -> (&'static str, Vec<&dyn duckdb::ToSql>) {
+        match self {
+            Self::Combination {
+                relation,
+                source,
+                target,
+            } => (
+                "SELECT e.id FROM _quack_graph_edges e \
+                 JOIN _quack_graph_nodes s ON s.id = e.source_node_id \
+                 JOIN _quack_graph_nodes t ON t.id = e.target_node_id \
+                 WHERE e.relation_id = ? AND s.class_id = ? AND t.class_id = ?",
+                vec![relation, source, target],
+            ),
+            Self::Dangling => (
+                "SELECT e.id FROM _quack_graph_edges e \
+                 WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = e.source_node_id) \
+                 OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = e.target_node_id)",
+                Vec::new(),
+            ),
+        }
+    }
+
+    /// Delete the set's edges and their provenance; returns how many edges
+    /// went.
+    fn delete(&self, db: &WorkspaceDb) -> Result<u64> {
+        let (edges, params) = self.query();
+        let conn = db.connection();
+        let count: u64 = conn.query_row(
+            &format!("SELECT count(*) FROM ({edges})"),
+            params.as_slice(),
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            return Ok(0);
+        }
+        conn.execute(
+            &format!("DELETE FROM _quack_provenance WHERE subject_id IN ({edges})"),
+            params.as_slice(),
+        )?;
+        conn.execute(
+            &format!("DELETE FROM _quack_graph_edges WHERE id IN ({edges})"),
+            params.as_slice(),
+        )?;
+        Ok(count)
+    }
 }
 
 /// Nodes whose label vector is missing or was made under another profile.

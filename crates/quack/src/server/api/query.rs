@@ -18,7 +18,9 @@ use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
-use quack_core::storage::workspace::{ChunkScope, TEMP_OBJECT_REFUSED, creates_temp_object};
+use quack_core::storage::workspace::{
+    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, creates_temp_object,
+};
 use serde::{Deserialize, Serialize};
 
 use super::StreamEvent;
@@ -84,12 +86,12 @@ impl PreparedTurn {
         let requested = body.session_id.clone();
         let model = chat.to_string();
         let user = access.identity.user_id.clone();
-        let sees_all = access.sees_all_sessions();
+        let viewer = access.session_viewer();
         let session_id = with_db(Arc::clone(&db), move |db| {
             if let Some(id) = requested {
                 // A session the caller may not see reads as missing, not forbidden.
                 sessions::get_session(db, &id)?
-                    .filter(|s| sessions::visible_to(s, &user, sees_all))
+                    .filter(|s| s.visible_to(&viewer))
                     .ok_or_else(|| Record::Session.missing(id.as_str()))?;
                 // A session's mode is set when it is created; `mode` on a
                 // later turn is ignored, and PATCH .../sessions/{sid} changes
@@ -463,7 +465,9 @@ pub(crate) async fn search(
         .with_db(move |db| {
             let scope = ChunkScope::all();
             match embedding.as_deref() {
-                Some(vector) => db.search_hybrid_chunks(&text, vector, top_k, rrf_k, &scope),
+                Some(vector) => {
+                    db.search_hybrid_chunks(&text, vector, HybridLimits { top_k, rrf_k }, &scope)
+                }
                 None => db.search_keyword_chunks(&text, top_k, &scope),
             }
         })

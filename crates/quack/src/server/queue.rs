@@ -10,6 +10,7 @@ use std::sync::Arc;
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::{ingestion, llm};
 
 use super::state::App;
@@ -53,8 +54,13 @@ impl UploadJob {
         let id = app
             .jobs
             .submit(spec, move |ctx| async move {
+                let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
                 let cancel = ctx.cancel_token();
-                self.process(&config, &workspace, &worker_db, &cancel).await
+                let control = RunControl {
+                    progress: &progress,
+                    cancel: Some(&cancel),
+                };
+                self.process(&config, &workspace, &worker_db, control).await
             })
             .id;
         // The work records its own outcome; a job that ends without running
@@ -74,14 +80,15 @@ impl UploadJob {
         id
     }
 
-    /// Process the upload; a cancel stops it between steps or mid-embedding
-    /// and leaves the document `error: cancelled`.
+    /// Process the upload, reporting each embedded batch; a cancel stops it
+    /// between steps or mid-embedding and leaves the document
+    /// `error: cancelled`.
     async fn process(
         self,
         config: &Config,
         workspace_id: &str,
         db: &SharedDb,
-        cancel: &llm::CancellationToken,
+        control: RunControl<'_>,
     ) -> JobResult {
         let model = match llm::optional_embedding_model(config).await {
             Ok(model) => model,
@@ -99,7 +106,7 @@ impl UploadJob {
             &self.filename,
             &self.data,
             model.as_ref(),
-            Some(cancel),
+            control,
         )
         .await;
         match result {

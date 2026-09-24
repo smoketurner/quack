@@ -11,13 +11,11 @@ use serde::{Deserialize, Serialize};
 use super::induction::{Candidate, Proposal};
 use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation, SnakeId};
 use crate::error::{Error, Result};
-use crate::extraction::{
-    Extract, Extracted, Passage, RunProgress, Tally, evenly_spaced, extractions,
-};
+use crate::extraction::{Extract, Extracted, Passage, RunProgress, Tally, extractions};
 use crate::graph::NormalizedLabel;
 use crate::llm::{Embeddings, name_similarity};
-use crate::progress::Progress;
-use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
+use crate::progress::RunControl;
+use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
 /// What open extraction returns for one chunk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -148,44 +146,17 @@ pub fn estimate(db: &WorkspaceDb, options: &DocumentEvidenceOptions) -> Result<C
 ///
 /// Returns an error if a query fails.
 pub fn sample_chunks(db: &WorkspaceDb, sample: u32) -> Result<Vec<SampledChunk>> {
-    let mut stmt = db.connection().prepare(
-        "SELECT c.id, c.document_id, d.filename FROM _quack_chunks c \
-         JOIN _quack_documents d ON d.id = c.document_id \
-         WHERE d.status = ? AND length(c.content) > 40 \
-         ORDER BY c.document_id, c.chunk_index",
-    )?;
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([DocumentStatus::Ready], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?
-        .flatten()
-        .collect();
-    let mut by_doc: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
-    for (id, document_id, filename) in rows {
-        by_doc
-            .entry(document_id.clone())
-            .or_default()
-            .push((id, document_id, filename));
-    }
-    let chosen = evenly_spaced(
-        by_doc.into_values(),
-        usize::try_from(sample).unwrap_or(usize::MAX),
-    );
-    let mut out = Vec::with_capacity(chosen.len());
-    for (id, document_id, filename) in chosen {
-        let content: String = db.connection().query_row(
-            "SELECT content FROM _quack_chunks WHERE id = ?",
-            duckdb::params![id],
-            |r| r.get(0),
-        )?;
-        out.push(SampledChunk {
-            id,
-            document_id,
-            filename,
-            content,
-        });
-    }
-    Ok(out)
+    let ids = db.sample_chunk_ids(SamplePool::Substantive, sample)?;
+    Ok(db
+        .chunks_by_ids(&ids)?
+        .into_iter()
+        .map(|chunk| SampledChunk {
+            id: chunk.id,
+            document_id: chunk.document_id,
+            filename: chunk.filename,
+            content: chunk.content,
+        })
+        .collect())
 }
 
 /// The outcome of a document-evidence run.
@@ -213,10 +184,10 @@ pub async fn run(
     options: &DocumentEvidenceOptions,
     embeddings: Option<&Embeddings>,
     concurrency: u32,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<(Vec<Candidate>, RunSummary)> {
     let sampled = u32::try_from(sample.len()).unwrap_or(u32::MAX);
-    let (observations, failed) = observe(extractor, &sample, concurrency, progress).await?;
+    let (observations, failed) = observe(extractor, &sample, concurrency, control).await?;
     let table = match embeddings {
         Some(model) => {
             let mut names: BTreeSet<String> = BTreeSet::new();
@@ -271,16 +242,18 @@ pub async fn observe(
     extractor: &dyn Extract<OpenExtraction>,
     chunks: &[SampledChunk],
     concurrency: u32,
-    progress: Progress<'_>,
+    control: RunControl<'_>,
 ) -> Result<(Vec<Observation>, u32)> {
-    let mut run = RunProgress::new(chunks.len(), progress);
+    let mut run = RunProgress::new(chunks.len(), control.progress);
     let mut calls = extractions(extractor, chunks, concurrency);
     let mut observations = Vec::with_capacity(chunks.len());
     while let Some(Extracted {
         passage: chunk,
         outcome,
         took,
-    }) = calls.next().await
+    }) = control
+        .or_cancelled(async { Ok(calls.next().await) })
+        .await?
     {
         match outcome {
             Ok(extraction) => {
@@ -853,7 +826,7 @@ mod tests {
     async fn observations_become_classes_relations_hierarchy_and_properties() {
         let db = workspace_with_docs();
         let sample = sample_chunks(&db, 8).unwrap_or_else(|e| fail(&e.to_string()));
-        let (observations, failures) = observe(&Canned, &sample, 1, &|_| {})
+        let (observations, failures) = observe(&Canned, &sample, 1, RunControl::unobserved())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!((observations.len(), failures), (8, 0));
@@ -954,7 +927,11 @@ mod tests {
                 seen.push((done.done, done.total, done.failed));
             }
         };
-        let (observations, failures) = observe(&Canned, &chunks, 2, &progress)
+        let control = RunControl {
+            progress: &progress,
+            cancel: None,
+        };
+        let (observations, failures) = observe(&Canned, &chunks, 2, control)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!((observations.len(), failures), (1, 1));
@@ -970,7 +947,31 @@ mod tests {
             filename: String::from("f"),
             content: String::from("FAIL"),
         }];
-        assert!(observe(&Canned, &all_bad, 1, &|_| {}).await.is_err());
+        assert!(
+            observe(&Canned, &all_bad, 1, RunControl::unobserved())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_stops_before_the_next_chunk() {
+        let chunks = vec![SampledChunk {
+            id: String::from("a"),
+            document_id: String::from("d"),
+            filename: String::from("f"),
+            content: String::from("Fine passage"),
+        }];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let control = RunControl {
+            progress: &|_| {},
+            cancel: Some(&cancel),
+        };
+        assert!(matches!(
+            observe(&Canned, &chunks, 1, control).await,
+            Err(Error::Cancelled)
+        ));
     }
 
     #[test]

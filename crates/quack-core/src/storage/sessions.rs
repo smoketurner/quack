@@ -65,6 +65,51 @@ pub struct SessionRow {
     pub message_count: i64,
 }
 
+/// A row selected with [`SESSION_COLUMNS`].
+impl TryFrom<&duckdb::Row<'_>> for SessionRow {
+    type Error = duckdb::Error;
+
+    fn try_from(row: &duckdb::Row<'_>) -> duckdb::Result<Self> {
+        let mode: String = row.get(2)?;
+        Ok(Self {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            mode: mode.parse().unwrap_or_default(),
+            model: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            message_count: row.get(6)?,
+            created_by: row.get(7)?,
+            shared: row.get(8)?,
+        })
+    }
+}
+
+impl SessionRow {
+    /// Whether `viewer` may read this session: every session for
+    /// [`SessionViewer::All`], else its creator's, and any shared or
+    /// ownerless one.
+    #[must_use]
+    pub fn visible_to(&self, viewer: &SessionViewer) -> bool {
+        match viewer {
+            SessionViewer::All => true,
+            SessionViewer::User(user_id) => {
+                self.shared || self.created_by.as_deref().is_none_or(|c| c == user_id)
+            }
+        }
+    }
+}
+
+/// Who is asking for sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionViewer {
+    /// A workspace owner, an admin, or a local caller: every session.
+    All,
+    /// A server user: their own sessions, shared ones, and ownerless ones
+    /// (started from the CLI or the terminal).
+    User(String),
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageRow {
     pub id: String,
@@ -76,6 +121,25 @@ pub struct MessageRow {
     pub created_at: String,
 }
 
+/// A row of `id, session_id, seq, role, content, metadata, created_at`.
+impl TryFrom<&duckdb::Row<'_>> for MessageRow {
+    type Error = Error;
+
+    fn try_from(row: &duckdb::Row<'_>) -> Result<Self> {
+        let role: String = row.get(3)?;
+        let metadata: Option<String> = row.get(5)?;
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            seq: row.get(2)?,
+            role: role.parse()?,
+            content: row.get(4)?,
+            metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
+            created_at: row.get(6)?,
+        })
+    }
+}
+
 /// Longest title derived from the first user message.
 const TITLE_CHARS: usize = 80;
 
@@ -83,21 +147,6 @@ const SESSION_COLUMNS: &str = "s.id, s.title, s.mode, s.model, CAST(s.created_at
      CAST(s.updated_at AS VARCHAR), \
      (SELECT count(*) FROM _quack_messages m WHERE m.session_id = s.id), s.created_by, \
      COALESCE(s.shared, false)";
-
-fn session_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<SessionRow> {
-    let mode: String = row.get(2)?;
-    Ok(SessionRow {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        mode: mode.parse().unwrap_or_default(),
-        model: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-        message_count: row.get(6)?,
-        created_by: row.get(7)?,
-        shared: row.get(8)?,
-    })
-}
 
 /// Start a new session for `model` (`provider/model`) in `mode`, owned by
 /// `created_by` in server mode.
@@ -146,7 +195,7 @@ pub fn get_session(db: &WorkspaceDb, id: &str) -> Result<Option<SessionRow>> {
     let mut stmt = db.connection().prepare(&sql)?;
     let mut rows = stmt.query(duckdb::params![id])?;
     match rows.next()? {
-        Some(row) => Ok(Some(session_from_row(row)?)),
+        Some(row) => Ok(Some(SessionRow::try_from(row)?)),
         None => Ok(None),
     }
 }
@@ -170,16 +219,14 @@ pub fn list_sessions(db: &WorkspaceDb, limit: u32) -> Result<Vec<SessionRow>> {
         "SELECT {SESSION_COLUMNS} FROM _quack_sessions s ORDER BY s.updated_at DESC, s.id DESC LIMIT ?"
     );
     let mut stmt = db.connection().prepare(&sql)?;
-    let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(session_from_row(row)?);
-    }
-    Ok(out)
+    let rows = stmt.query_map(duckdb::params![i64::from(limit)], |row| {
+        SessionRow::try_from(row)
+    })?;
+    Ok(rows.collect::<duckdb::Result<_>>()?)
 }
 
-/// Sessions a server user may see: their own, those marked shared, and
-/// those without an owner (started from the CLI or TUI). An owner sees all.
+/// The sessions `viewer` may see, most recently updated first
+/// ([`SessionRow::visible_to`]).
 ///
 /// # Errors
 ///
@@ -187,31 +234,21 @@ pub fn list_sessions(db: &WorkspaceDb, limit: u32) -> Result<Vec<SessionRow>> {
 pub fn list_sessions_for(
     db: &WorkspaceDb,
     limit: u32,
-    user_id: &str,
-    sees_all: bool,
+    viewer: &SessionViewer,
 ) -> Result<Vec<SessionRow>> {
-    if sees_all {
+    let SessionViewer::User(user_id) = viewer else {
         return list_sessions(db, limit);
-    }
+    };
     let sql = format!(
         "SELECT {SESSION_COLUMNS} FROM _quack_sessions s \
          WHERE s.created_by IS NULL OR s.created_by = ? OR s.shared \
          ORDER BY s.updated_at DESC, s.id DESC LIMIT ?"
     );
     let mut stmt = db.connection().prepare(&sql)?;
-    let mut rows = stmt.query(duckdb::params![user_id, i64::from(limit)])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(session_from_row(row)?);
-    }
-    Ok(out)
-}
-
-/// Whether `user_id` may read the session: its creator, or any user when it
-/// is shared or ownerless. Owners bypass this with `sees_all`.
-#[must_use]
-pub fn visible_to(session: &SessionRow, user_id: &str, sees_all: bool) -> bool {
-    sees_all || session.shared || session.created_by.as_deref().is_none_or(|c| c == user_id)
+    let rows = stmt.query_map(duckdb::params![user_id, i64::from(limit)], |row| {
+        SessionRow::try_from(row)
+    })?;
+    Ok(rows.collect::<duckdb::Result<_>>()?)
 }
 
 /// Share a session with every member of the workspace, or take it back.
@@ -284,18 +321,10 @@ pub fn messages(db: &WorkspaceDb, session_id: &str) -> Result<Vec<MessageRow>> {
     )?;
     let mut rows = stmt.query(duckdb::params![session_id])?;
     let mut out = Vec::new();
+    // Not `query_map`: a stored role that does not parse is this crate's
+    // error, which a `duckdb::Result` closure cannot carry.
     while let Some(row) = rows.next()? {
-        let role: String = row.get(3)?;
-        let metadata: Option<String> = row.get(5)?;
-        out.push(MessageRow {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            seq: row.get(2)?,
-            role: role.parse()?,
-            content: row.get(4)?,
-            metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
-            created_at: row.get(6)?,
-        });
+        out.push(MessageRow::try_from(row)?);
     }
     Ok(out)
 }
@@ -436,105 +465,123 @@ pub enum ExportFormat {
     Sql,
 }
 
-impl ExportFormat {
-    /// `session`, whose messages are `rows`, in this format.
+/// A session with every message in it, as the exports read it.
+#[derive(Debug, Clone)]
+pub struct Transcript {
+    pub session: SessionRow,
+    pub messages: Vec<MessageRow>,
+}
+
+impl Transcript {
+    /// The session's transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a read fails.
+    pub fn load(db: &WorkspaceDb, session: SessionRow) -> Result<Self> {
+        let messages = messages(db, &session.id)?;
+        Ok(Self { session, messages })
+    }
+
+    /// The transcript in `format`.
     ///
     /// # Errors
     ///
     /// Returns an error only if formatting into the output buffer fails.
-    pub fn render(self, session: &SessionRow, rows: &[MessageRow]) -> Result<String> {
-        match self {
-            Self::Markdown => export_markdown(session, rows),
-            Self::Sql => export_sql(rows),
+    pub fn render(&self, format: ExportFormat) -> Result<String> {
+        match format {
+            ExportFormat::Markdown => self.to_markdown(),
+            ExportFormat::Sql => self.to_sql(),
         }
     }
-}
 
-/// Every executed statement in order, each preceded by the question that
-/// led to it, as a runnable `.sql` file.
-fn export_sql(rows: &[MessageRow]) -> Result<String> {
-    let mut out = String::new();
-    let mut question: Option<&str> = None;
-    for row in rows {
-        match row.role {
-            MessageRole::User => question = Some(row.content.as_str()),
-            MessageRole::Tool => {
-                let Some(meta) = &row.metadata else { continue };
-                let tool = meta.get("tool").and_then(serde_json::Value::as_str);
-                if !matches!(tool, Some("run_sql" | "create_chart")) {
-                    continue;
+    /// Every executed statement in order, each preceded by the question that
+    /// led to it, as a runnable `.sql` file.
+    fn to_sql(&self) -> Result<String> {
+        let mut out = String::new();
+        let mut question: Option<&str> = None;
+        for row in &self.messages {
+            match row.role {
+                MessageRole::User => question = Some(row.content.as_str()),
+                MessageRole::Tool => {
+                    let Some(meta) = &row.metadata else { continue };
+                    let tool = meta.get("tool").and_then(serde_json::Value::as_str);
+                    if !matches!(tool, Some("run_sql" | "create_chart")) {
+                        continue;
+                    }
+                    let Some(sql) = meta.get("detail").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    if let Some(q) = question.take() {
+                        for line in q.lines() {
+                            writeln!(out, "-- {line}")?;
+                        }
+                    }
+                    writeln!(out, "-- {}", row.content)?;
+                    let statement = sql.trim().trim_end_matches(';');
+                    writeln!(out, "{statement};\n")?;
                 }
-                let Some(sql) = meta.get("detail").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                if let Some(q) = question.take() {
-                    for line in q.lines() {
-                        writeln!(out, "-- {line}")?;
+                MessageRole::Assistant => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// The transcript as Markdown: questions, steps, and answers.
+    fn to_markdown(&self) -> Result<String> {
+        let session = &self.session;
+        let mut out = String::new();
+        let title = session.title.as_deref().unwrap_or("Session");
+        writeln!(out, "# {title}\n")?;
+        writeln!(
+            out,
+            "Session `{}` · model `{}` · started {}\n",
+            session.id, session.model, session.created_at
+        )?;
+        for row in &self.messages {
+            match row.role {
+                MessageRole::User => {
+                    writeln!(out, "## {}\n", row.content.trim())?;
+                }
+                MessageRole::Tool => {
+                    let tool = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("tool"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool");
+                    let detail = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("detail"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let ms = row
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("duration_ms"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    writeln!(out, "**{tool}** — {}, {ms} ms\n", row.content)?;
+                    if !detail.is_empty() {
+                        let lang = if matches!(tool, "run_sql" | "create_chart") {
+                            "sql"
+                        } else {
+                            "text"
+                        };
+                        writeln!(out, "```{lang}\n{}\n```\n", detail.trim())?;
                     }
                 }
-                writeln!(out, "-- {}", row.content)?;
-                let statement = sql.trim().trim_end_matches(';');
-                writeln!(out, "{statement};\n")?;
-            }
-            MessageRole::Assistant => {}
-        }
-    }
-    Ok(out)
-}
-
-/// The transcript as Markdown: questions, steps, and answers.
-fn export_markdown(session: &SessionRow, rows: &[MessageRow]) -> Result<String> {
-    let mut out = String::new();
-    let title = session.title.as_deref().unwrap_or("Session");
-    writeln!(out, "# {title}\n")?;
-    writeln!(
-        out,
-        "Session `{}` · model `{}` · started {}\n",
-        session.id, session.model, session.created_at
-    )?;
-    for row in rows {
-        match row.role {
-            MessageRole::User => {
-                writeln!(out, "## {}\n", row.content.trim())?;
-            }
-            MessageRole::Tool => {
-                let tool = row
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("tool"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("tool");
-                let detail = row
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("detail"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let ms = row
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("duration_ms"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                writeln!(out, "**{tool}** — {}, {ms} ms\n", row.content)?;
-                if !detail.is_empty() {
-                    let lang = if matches!(tool, "run_sql" | "create_chart") {
-                        "sql"
-                    } else {
-                        "text"
-                    };
-                    writeln!(out, "```{lang}\n{}\n```\n", detail.trim())?;
-                }
-            }
-            MessageRole::Assistant => {
-                writeln!(out, "{}\n", row.content.trim())?;
-                if row.metadata.as_ref().and_then(|m| m.get("chart")).is_some() {
-                    writeln!(out, "_(chart attached)_\n")?;
+                MessageRole::Assistant => {
+                    writeln!(out, "{}\n", row.content.trim())?;
+                    if row.metadata.as_ref().and_then(|m| m.get("chart")).is_some() {
+                        writeln!(out, "_(chart attached)_\n")?;
+                    }
                 }
             }
         }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// Remove a session and every message in it. Returns whether it existed.
@@ -639,15 +686,21 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let cli =
             create_session(&db, "m", ChatMode::Chat, None).unwrap_or_else(|e| fail(&e.to_string()));
-        let visible = list_sessions_for(&db, 10, "u1", false);
+        let visible = list_sessions_for(&db, 10, &SessionViewer::User(String::from("u1")));
         assert!(visible.is_ok_and(|v| {
             v.iter()
                 .map(|s| s.id.as_str())
                 .eq([cli.id.as_str(), mine.id.as_str()])
         }));
-        assert!(list_sessions_for(&db, 10, "u1", true).is_ok_and(|v| v.len() == 3));
-        assert!(visible_to(&mine, "u1", false) && !visible_to(&theirs, "u1", false));
-        assert!(visible_to(&theirs, "u1", true) && visible_to(&cli, "u1", false));
+        assert!(list_sessions_for(&db, 10, &SessionViewer::All).is_ok_and(|v| v.len() == 3));
+        assert!(
+            mine.visible_to(&SessionViewer::User(String::from("u1")))
+                && !theirs.visible_to(&SessionViewer::User(String::from("u1")))
+        );
+        assert!(
+            theirs.visible_to(&SessionViewer::All)
+                && cli.visible_to(&SessionViewer::User(String::from("u1")))
+        );
         assert_eq!(mine.created_by.as_deref(), Some("u1"));
         assert!(!mine.shared);
 
@@ -657,10 +710,16 @@ mod tests {
             .ok()
             .flatten()
             .unwrap_or_else(|| fail("session vanished"));
-        assert!(theirs.shared && visible_to(&theirs, "u1", false));
-        assert!(list_sessions_for(&db, 10, "u1", false).is_ok_and(|v| v.len() == 3));
+        assert!(theirs.shared && theirs.visible_to(&SessionViewer::User(String::from("u1"))));
+        assert!(
+            list_sessions_for(&db, 10, &SessionViewer::User(String::from("u1")))
+                .is_ok_and(|v| v.len() == 3)
+        );
         set_session_shared(&db, &theirs.id, false).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(list_sessions_for(&db, 10, "u1", false).is_ok_and(|v| v.len() == 2));
+        assert!(
+            list_sessions_for(&db, 10, &SessionViewer::User(String::from("u1")))
+                .is_ok_and(|v| v.len() == 2)
+        );
         assert!(set_session_shared(&db, "missing", true).is_err());
     }
 
@@ -844,7 +903,11 @@ mod tests {
             ),
         )
         .unwrap();
-        let sql = export_sql(&messages(&db, &session.id).unwrap()).unwrap();
+        let session = get_session(&db, &session.id).unwrap().unwrap();
+        let sql = Transcript::load(&db, session)
+            .unwrap()
+            .render(ExportFormat::Sql)
+            .unwrap();
         assert_eq!(
             sql,
             "-- open claims?\n-- 1 rows\nSELECT count(*) FROM claims WHERE open;\n\n"
@@ -877,7 +940,10 @@ mod tests {
         )
         .unwrap();
         let session = get_session(&db, &session.id).unwrap().unwrap();
-        let md = export_markdown(&session, &messages(&db, &session.id).unwrap()).unwrap();
+        let md = Transcript::load(&db, session)
+            .unwrap()
+            .render(ExportFormat::Markdown)
+            .unwrap();
         assert!(md.starts_with("# open claims?\n"));
         assert!(md.contains("## open claims?\n"));
         assert!(md.contains("**run_sql** — 1 rows, 7 ms\n\n```sql\nSELECT 1\n```"));

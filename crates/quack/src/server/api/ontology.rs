@@ -17,7 +17,7 @@ use quack_core::llm;
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, candidates, documents, store};
-use quack_core::progress::ChunkDone;
+use quack_core::progress::{ChunkDone, RunControl};
 
 pub(crate) async fn show(
     State(app): State<App>,
@@ -545,6 +545,11 @@ impl Access {
                     "document evidence progress"
                 );
             };
+            let cancel = ctx.cancel_token();
+            let control = RunControl {
+                progress: &progress,
+                cancel: Some(&cancel),
+            };
             let outcome = documents::run(
                 chunks,
                 extractor.as_ref(),
@@ -552,7 +557,7 @@ impl Access {
                 &options,
                 embeddings.as_ref(),
                 concurrency,
-                &progress,
+                control,
             )
             .await;
             match outcome {

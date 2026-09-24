@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture};
-use quack_core::graph::extract::Extraction;
+use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::traverse::Hops;
@@ -19,7 +19,10 @@ use quack_core::graph::{
 };
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
-use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
+use quack_core::progress::RunControl;
+use quack_core::storage::workspace::{
+    DocumentStatus, NewChunk, NewDocument, SamplePool, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 
@@ -299,13 +302,23 @@ fn extraction_samples_evenly_across_documents() {
         })
         .unwrap();
     }
-    let sampled = extract::chunks(&db, Some(2)).unwrap();
+    let sampled = db
+        .sample_chunk_ids(SamplePool::NotGraphExtracted, 2)
+        .unwrap();
+    assert_eq!(
+        ChunkPlan::new(&db, Some(2)).unwrap(),
+        ChunkPlan::Sample(sampled.clone())
+    );
+    let chunks = db.chunks_by_ids(&sampled).unwrap();
     let docs: std::collections::BTreeSet<&str> =
-        sampled.iter().map(|c| c.document_id.as_str()).collect();
-    assert_eq!(sampled.len(), 2, "{sampled:?}");
+        chunks.iter().map(|c| c.document_id.as_str()).collect();
+    assert_eq!(chunks.len(), 2, "{sampled:?}");
     assert_eq!(docs.len(), 2, "one chunk from each document: {sampled:?}");
-    assert_eq!(extract::chunks(&db, Some(0)).unwrap().len(), 0);
-    assert_eq!(extract::chunks(&db, None).unwrap().len(), 6);
+    assert!(ChunkPlan::new(&db, Some(0)).unwrap().is_empty());
+    assert_eq!(
+        ChunkPlan::new(&db, None).unwrap(),
+        ChunkPlan::All { total: 6 }
+    );
 }
 
 /// Resolution respects provenance (issue #41): two nodes from keyed rows
@@ -503,17 +516,27 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 
     // Constrained extraction: the vessel and docked_at are drift, the
     // failed chunk is skipped, Kenya merges with the table's Kenya.
-    let chunks = extract::chunks(&db, None).unwrap();
-    assert_eq!(chunks.len(), 2);
-    let summary = extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})
-        .await
-        .unwrap();
+    let plan = ChunkPlan::new(&db, None).unwrap();
+    assert_eq!(plan.len(), 2);
+    let summary = extract::run(
+        &writer,
+        &plan,
+        &Canned,
+        &current,
+        false,
+        2,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
     // Both chunks are on record (the failed one is not), so the next run
     // sends only the failed one again.
     assert_eq!(graph_store::extracted_chunks(&db).unwrap(), 1);
-    let remaining = extract::chunks(&db, None).unwrap();
+    let remaining = db
+        .chunk_page(SamplePool::NotGraphExtracted, None, 10)
+        .unwrap();
     assert_eq!(remaining.len(), 1, "{remaining:?}");
-    assert_eq!(remaining.first().map(|c| c.chunk_id.as_str()), Some("c2"));
+    assert_eq!(remaining.first().map(|c| c.id.as_str()), Some("c2"));
     assert_eq!(
         (
             summary.chunks,
@@ -699,6 +722,64 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     assert_eq!(status.built_with_version, None);
 }
 
+/// Revalidation drops edges whose relation no longer fits their ends,
+/// checked once per relation and class combination, and edges left
+/// dangling, with their provenance, and keeps every node.
+#[test]
+fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, false).unwrap();
+    let before = graph_store::status(&db).unwrap();
+
+    // An edge between two nodes that do not exist, with provenance.
+    let dangling = graph_store::upsert_edge(
+        &db,
+        "no-such-source",
+        "no-such-target",
+        "mentions",
+        &Properties::default(),
+        false,
+    )
+    .unwrap();
+    graph_store::add_provenance(&db, &dangling, &graph_store::Source::row("shipments", "x"))
+        .unwrap();
+
+    // `supplied_by` now ends at a country, so every shipment -> vendor
+    // edge of it no longer fits.
+    let mut edited = current.clone();
+    for relation in &mut edited.relations {
+        if relation.id == "supplied_by" {
+            relation.range = String::from("country");
+        }
+    }
+    if let Some(mapping) = edited.mappings.first_mut() {
+        mapping.relations.retain(|r| r.relation != "supplied_by");
+    }
+    store::save(
+        &db,
+        &edited,
+        Revision::reviewed(None, Some("supplied_by moved")),
+    )
+    .unwrap();
+
+    let outcome = graph_store::revalidate(&db).unwrap();
+    assert_eq!(outcome.dropped_nodes, 0);
+    assert_eq!(
+        outcome.dropped_edges, 4,
+        "three supplied_by edges and the dangling one"
+    );
+    let after = graph_store::status(&db).unwrap();
+    assert_eq!(after.nodes, before.nodes);
+    assert_eq!(after.edges, before.edges - 3);
+    assert!(
+        graph_store::provenance_of(&db, &[dangling])
+            .unwrap()
+            .is_empty(),
+        "the dangling edge's provenance went with it"
+    );
+}
+
 #[test]
 fn auto_accepted_ontologies_are_provisional_until_reviewed() {
     let db = WorkspaceDb::open_in_memory(4).unwrap();
@@ -765,6 +846,70 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert_eq!(none, 0);
 }
 
+/// A run over more chunks than one page reads every chunk once, page by
+/// page: the fixture's two plus 150 more, three pages of 64.
+#[tokio::test]
+async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
+    let db = workspace();
+    db.insert_document(
+        &NewDocument::new("doc-2", "long.md", "text/markdown", 10)
+            .with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    for i in 0..150 {
+        db.insert_chunk(&NewChunk {
+            id: &format!("l{i:03}"),
+            document_id: "doc-2",
+            chunk_index: i,
+            content: "Filler text about nothing in particular.",
+            heading: None,
+            page: None,
+            embedding: None,
+        })
+        .unwrap();
+    }
+    let writer = writer_of(&db);
+    let current = store::current(&db).unwrap().unwrap();
+    let plan = ChunkPlan::new(&db, None).unwrap();
+    assert_eq!(plan, ChunkPlan::All { total: 152 });
+    let seen = std::sync::Mutex::new(Vec::new());
+    let progress = |done: quack_core::progress::ChunkDone| {
+        seen.lock().unwrap().push(done.done);
+    };
+    let control = RunControl {
+        progress: &progress,
+        cancel: None,
+    };
+    let summary = extract::run(&writer, &plan, &Canned, &current, false, 4, control)
+        .await
+        .unwrap();
+    assert_eq!((summary.chunks, summary.failed_chunks), (152, 1));
+    assert_eq!(graph_store::extracted_chunks(&db).unwrap(), 151);
+    assert_eq!(seen.into_inner().unwrap(), (1..=152).collect::<Vec<u32>>());
+
+    // A sample reads only its chunks, across the same pages. Each document
+    // gets a quota of 50, which the two-chunk one cannot fill.
+    graph_store::clear(&db).unwrap();
+    let plan = ChunkPlan::new(&db, Some(100)).unwrap();
+    assert_eq!(plan.len(), 52);
+    let summary = extract::run(
+        &writer,
+        &plan,
+        &Canned,
+        &current,
+        false,
+        4,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.chunks, 52);
+    assert_eq!(
+        graph_store::extracted_chunks(&db).unwrap(),
+        52 - u64::from(summary.failed_chunks)
+    );
+}
+
 /// Provenance joins the two substrates both ways: an entity names the
 /// chunks it was extracted from, and a chunk names the entities in it.
 #[tokio::test]
@@ -773,10 +918,18 @@ async fn provenance_maps_between_entities_and_chunks() {
     let writer = writer_of(&db);
     let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, false).unwrap();
-    let chunks = extract::chunks(&db, None).unwrap();
-    extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})
-        .await
-        .unwrap();
+    let plan = ChunkPlan::new(&db, None).unwrap();
+    extract::run(
+        &writer,
+        &plan,
+        &Canned,
+        &current,
+        false,
+        2,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
 
     let orgenics = traverse::resolve_entry(&db, "Orgenics Ltd", None, None).unwrap();
     let ids: Vec<String> = orgenics.iter().map(|n| n.id.clone()).collect();

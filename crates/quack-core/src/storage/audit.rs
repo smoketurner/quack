@@ -29,21 +29,45 @@ impl AuditLog {
         Ok(Self(Writer::spawn(db.try_clone_reader()?)?))
     }
 
-    /// Append the detail for access-audit row `id` and await its commit.
+    /// Append `detail` and await its commit.
     ///
     /// # Errors
     ///
     /// Returns an error if the insert fails.
-    pub async fn record(
-        &self,
-        id: String,
-        user_id: Option<String>,
-        action: String,
-        detail: serde_json::Value,
-    ) -> Result<()> {
-        self.0
-            .run(move |db| record(db, &id, user_id.as_deref(), &action, &detail))
-            .await
+    pub async fn record(&self, detail: AuditDetail) -> Result<()> {
+        self.0.run(move |db| detail.write(db)).await
+    }
+}
+
+/// What one access-audit row did, recorded under the same id.
+#[derive(Debug, Clone)]
+pub struct AuditDetail {
+    /// The `control.db.audit_log` row's id.
+    pub id: String,
+    pub user_id: Option<String>,
+    pub action: String,
+    /// The SQL, the file names, the context version: whatever the action
+    /// touched.
+    pub detail: serde_json::Value,
+}
+
+impl AuditDetail {
+    /// Append this row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert fails.
+    pub fn write(&self, db: &WorkspaceDb) -> Result<()> {
+        db.connection().execute(
+            "INSERT INTO _quack_audit (id, user_id, action, detail) VALUES (?, ?, ?, ?)",
+            duckdb::params![
+                self.id,
+                self.user_id,
+                self.action,
+                serde_json::to_string(&self.detail)?
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -57,25 +81,6 @@ pub struct AuditDetailRow {
     pub detail: Option<serde_json::Value>,
 }
 
-/// Append the detail for an access-audit row of the same id.
-///
-/// # Errors
-///
-/// Returns an error if the insert fails.
-pub fn record(
-    db: &WorkspaceDb,
-    id: &str,
-    user_id: Option<&str>,
-    action: &str,
-    detail: &serde_json::Value,
-) -> Result<()> {
-    db.connection().execute(
-        "INSERT INTO _quack_audit (id, user_id, action, detail) VALUES (?, ?, ?, ?)",
-        duckdb::params![id, user_id, action, serde_json::to_string(detail)?],
-    )?;
-    Ok(())
-}
-
 /// Detail rows, newest first.
 ///
 /// # Errors
@@ -86,19 +91,17 @@ pub fn list(db: &WorkspaceDb, limit: u32) -> Result<Vec<AuditDetailRow>> {
         "SELECT id, CAST(timestamp AS VARCHAR), user_id, action, CAST(detail AS VARCHAR) \
          FROM _quack_audit ORDER BY id DESC LIMIT ?",
     )?;
-    let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
+    let rows = stmt.query_map(duckdb::params![i64::from(limit)], |row| {
         let detail: Option<String> = row.get(4)?;
-        out.push(AuditDetailRow {
+        Ok(AuditDetailRow {
             id: row.get(0)?,
             timestamp: row.get(1)?,
             user_id: row.get(2)?,
             action: row.get(3)?,
             detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
-        });
-    }
-    Ok(out)
+        })
+    })?;
+    Ok(rows.collect::<duckdb::Result<_>>()?)
 }
 
 #[cfg(test)]
@@ -117,23 +120,23 @@ mod tests {
         let first = uuid::Uuid::now_v7().to_string();
         let second = uuid::Uuid::now_v7().to_string();
         assert!(
-            record(
-                &db,
-                &first,
-                Some("u1"),
-                "sql",
-                &serde_json::json!({"sql": "SELECT 1"})
-            )
+            AuditDetail {
+                id: first.clone(),
+                user_id: Some(String::from("u1")),
+                action: String::from("sql"),
+                detail: serde_json::json!({"sql": "SELECT 1"})
+            }
+            .write(&db)
             .is_ok()
         );
         assert!(
-            record(
-                &db,
-                &second,
-                None,
-                "ingest",
-                &serde_json::json!({"filename": "a.csv"})
-            )
+            AuditDetail {
+                id: second.clone(),
+                user_id: None,
+                action: String::from("ingest"),
+                detail: serde_json::json!({"filename": "a.csv"})
+            }
+            .write(&db)
             .is_ok()
         );
         let rows = list(&db, 10);
@@ -180,7 +183,13 @@ mod tests {
             ok(writer
                 .execute_statement("CREATE TABLE held AS SELECT range AS n FROM range(100000)"));
             let id = uuid::Uuid::now_v7().to_string();
-            ok(record(&audit_conn, &id, Some("u"), "list", &detail));
+            ok(AuditDetail {
+                id: id.clone(),
+                user_id: Some(String::from("u")),
+                action: String::from("list"),
+                detail: detail.clone(),
+            }
+            .write(&audit_conn));
             ids.push(id);
             // Committed and visible before the writer commits.
             assert!(list(&reader, 10).is_ok_and(|r| r.len() == 1));
@@ -196,7 +205,13 @@ mod tests {
             let before = ids.len();
             while !running.is_finished() && ids.len() < before + 20 {
                 let id = uuid::Uuid::now_v7().to_string();
-                ok(record(&audit_conn, &id, Some("u"), "list", &detail));
+                ok(AuditDetail {
+                    id: id.clone(),
+                    user_id: Some(String::from("u")),
+                    action: String::from("list"),
+                    detail: detail.clone(),
+                }
+                .write(&audit_conn));
                 ids.push(id);
             }
             let overlapped = ids.len().saturating_sub(before);

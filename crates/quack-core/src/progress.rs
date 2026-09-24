@@ -1,6 +1,6 @@
-//! Progress of a long model run (ontology document evidence, graph
-//! extraction, embeddings refresh), for the interface that shows it, and the
-//! cancel token that stops it (issue #67).
+//! Progress of a long run (ingestion, import, ontology document evidence,
+//! graph extraction, embeddings refresh), for the interface that shows it,
+//! and the cancel token that stops it.
 
 use std::time::Duration;
 
@@ -33,6 +33,14 @@ pub struct RunControl<'a> {
     pub cancel: Option<&'a CancellationToken>,
 }
 
+impl std::fmt::Debug for RunControl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunControl")
+            .field("cancel", &self.cancel)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RunControl<'_> {
     /// Nobody watching, nothing to cancel.
     #[must_use]
@@ -53,6 +61,27 @@ impl RunControl<'_> {
             Err(Error::Cancelled)
         } else {
             Ok(())
+        }
+    }
+
+    /// Run `work` unless the run is cancelled first, in which case it is
+    /// dropped (a request in flight is abandoned) and the answer is
+    /// [`Error::Cancelled`].
+    ///
+    /// # Errors
+    ///
+    /// `work`'s error, or [`Error::Cancelled`].
+    pub async fn or_cancelled<T>(
+        &self,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match self.cancel {
+            None => work.await,
+            Some(token) => tokio::select! {
+                biased;
+                () = token.cancelled() => Err(Error::Cancelled),
+                result = work => result,
+            },
         }
     }
 }

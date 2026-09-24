@@ -53,7 +53,8 @@ pub struct Extracted<'a, P, T> {
 }
 
 /// The extractions of `passages`, up to `concurrency` at a time, in the
-/// passages' order.
+/// passages' order. Every call is built before the first runs, so
+/// callers pass one page of a run, never the whole of it.
 pub fn extractions<'a, P: Passage, T: 'a>(
     extractor: &'a dyn Extract<T>,
     passages: &'a [P],
@@ -127,42 +128,6 @@ impl<'p> RunProgress<'p> {
     pub const fn all_failed(&self) -> bool {
         self.total > 0 && self.failed == self.total
     }
-}
-
-/// Up to `limit` items spread evenly over the groups: each group (one
-/// document's chunks, in order) gets an equal quota, taken at evenly
-/// spaced positions, so a sample covers every document and not just the
-/// front matter of the first.
-#[must_use]
-pub fn evenly_spaced<T>(groups: impl IntoIterator<Item = Vec<T>>, limit: usize) -> Vec<T> {
-    let groups: Vec<Vec<T>> = groups.into_iter().filter(|g| !g.is_empty()).collect();
-    if limit == 0 || groups.is_empty() {
-        return Vec::new();
-    }
-    let quota = limit.div_ceil(groups.len()).max(1);
-    let mut chosen = Vec::with_capacity(limit);
-    for group in groups {
-        let len = group.len();
-        let take = quota.min(len);
-        let mut positions: Vec<usize> = (0..take)
-            .map(|k| {
-                k.saturating_mul(len)
-                    .checked_div(take)
-                    .unwrap_or(0)
-                    .min(len.saturating_sub(1))
-            })
-            .collect();
-        positions.dedup();
-        let mut positions = positions.into_iter().peekable();
-        for (index, item) in group.into_iter().enumerate() {
-            if positions.peek() == Some(&index) {
-                positions.next();
-                chosen.push(item);
-            }
-        }
-    }
-    chosen.truncate(limit);
-    chosen
 }
 
 /// How many times each name was seen.
@@ -239,15 +204,6 @@ mod tests {
         );
         assert!(parse_answer::<Shape>("no json here").is_err());
         assert!(parse_answer::<Shape>("{\"m\": 1}").is_err());
-    }
-
-    #[test]
-    fn a_sample_spreads_across_every_group() {
-        let groups = vec![(0..10).collect::<Vec<u32>>(), vec![100, 101], vec![]];
-        assert_eq!(evenly_spaced(groups.clone(), 4), vec![0, 5, 100, 101]);
-        assert_eq!(evenly_spaced(groups.clone(), 3), vec![0, 5, 100]);
-        assert!(evenly_spaced(groups, 0).is_empty());
-        assert_eq!(evenly_spaced(vec![vec![1, 2, 3]], 10), vec![1, 2, 3]);
     }
 
     #[test]

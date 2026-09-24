@@ -36,17 +36,15 @@ pub fn history(db: &WorkspaceDb, limit: u32) -> Result<Vec<ContextVersion>> {
         "SELECT version, content, edited_by, CAST(edited_at AS VARCHAR) \
          FROM _quack_context ORDER BY version DESC LIMIT ?",
     )?;
-    let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(ContextVersion {
+    let rows = stmt.query_map(duckdb::params![i64::from(limit)], |row| {
+        Ok(ContextVersion {
             version: row.get(0)?,
             content: row.get(1)?,
             edited_by: row.get(2)?,
             edited_at: row.get(3)?,
-        });
-    }
-    Ok(out)
+        })
+    })?;
+    Ok(rows.collect::<duckdb::Result<_>>()?)
 }
 
 /// Record a new version. Content identical to the current version is not

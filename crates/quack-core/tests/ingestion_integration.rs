@@ -16,10 +16,11 @@ use quack_core::graph::store as graph_store;
 use quack_core::import::{ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
 use quack_core::llm::CancellationToken;
+use quack_core::progress::RunControl;
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentSource, DocumentStatus, MetaKey, NewChunk, NewDocument, StatementKind,
-    WorkspaceDb,
+    ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
+    StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::{import, ingestion};
@@ -427,17 +428,35 @@ async fn embedding_batch_size_bounds_every_embed_request() {
         .map(|i| format!("# Section {i}\n\nA short paragraph about topic number {i}.\n"))
         .collect();
     let data = sections.join("\n");
+    let reported = std::sync::Mutex::new(Vec::new());
+    let progress = |done: quack_core::progress::ChunkDone| {
+        reported.lock().unwrap().push((done.done, done.total));
+    };
+    let control = RunControl {
+        progress: &progress,
+        cancel: None,
+    };
     let result = ingestion::ingest_file(
         &config,
         &writer,
         workspace_id,
-        &ingestion::NewFile::new("batches.md", data.as_bytes()),
+        &ingestion::NewFile::new("batches.md", data.as_bytes()).control(control),
         Some(&model),
     )
     .await
     .unwrap()
     .ingested()
     .unwrap();
+
+    // One report per stored batch, counting chunks, ending at all of them.
+    let reported = reported.into_inner().unwrap();
+    let batch_count = model.model().batches.lock().unwrap().len();
+    assert_eq!(reported.len(), batch_count, "{reported:?}");
+    assert!(reported.is_sorted_by(|a, b| a.0 < b.0), "{reported:?}");
+    assert_eq!(
+        reported.last().copied(),
+        Some((result.chunks_stored, result.chunks_stored))
+    );
 
     let batches = model.model().batches.lock().unwrap().clone();
     let total: usize = batches.iter().sum();
@@ -1452,7 +1471,15 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
         "the closer chunk b1 is outside the scope"
     );
     let hybrid = db
-        .search_hybrid_chunks("claims", &[0.0, 0.0, 1.0, 0.0], 5, 60, &only_a0)
+        .search_hybrid_chunks(
+            "claims",
+            &[0.0, 0.0, 1.0, 0.0],
+            HybridLimits {
+                top_k: 5,
+                rrf_k: 60,
+            },
+            &only_a0,
+        )
         .unwrap();
     assert!(hybrid.iter().all(|h| h.id == "a0"), "{hybrid:?}");
 
@@ -1610,7 +1637,15 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     let db = seeded_for_search(&config, "ws-hybrid");
     // Vector nearest is a0 (flood); the keyword "POL-8841" only matches b0.
     let hits = db
-        .search_hybrid_chunks("POL-8841", &[1.0, 0.0, 0.0, 0.0], 3, 60, &ChunkScope::all())
+        .search_hybrid_chunks(
+            "POL-8841",
+            &[1.0, 0.0, 0.0, 0.0],
+            HybridLimits {
+                top_k: 3,
+                rrf_k: 60,
+            },
+            &ChunkScope::all(),
+        )
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids.len(), 3);
@@ -1621,7 +1656,15 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
     assert!(hits.iter().all(|h| h.score <= top_score));
 
     let limited = db
-        .search_hybrid_chunks("flood", &[1.0, 0.0, 0.0, 0.0], 1, 60, &ChunkScope::all())
+        .search_hybrid_chunks(
+            "flood",
+            &[1.0, 0.0, 0.0, 0.0],
+            HybridLimits {
+                top_k: 1,
+                rrf_k: 60,
+            },
+            &ChunkScope::all(),
+        )
         .unwrap();
     assert_eq!(limited.len(), 1);
     assert_eq!(limited.first().unwrap().id, "a0");
@@ -2050,7 +2093,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         &request,
         ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
-        None,
+        RunControl::unobserved(),
     )
     .await
     .unwrap();
@@ -2106,7 +2149,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         &request,
         ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
-        None,
+        RunControl::unobserved(),
     )
     .await
     .unwrap();
@@ -2346,7 +2389,7 @@ async fn server_policy_refuses_local_sqlite_files() {
         },
         server_policy,
         None::<&Embedder<MockEmbeddingModel>>,
-        None,
+        RunControl::unobserved(),
     )
     .await;
     assert!(local_file.is_err_and(|e| e.to_string().contains("allow_local_files")));
@@ -2387,7 +2430,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         &first,
         ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
-        None,
+        RunControl::unobserved(),
     )
     .await
     .unwrap();
@@ -2406,7 +2449,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
-        None,
+        RunControl::unobserved(),
     )
     .await;
     assert!(again.is_err_and(|e| e.to_string().contains("identical")));
@@ -2423,7 +2466,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
-        None,
+        RunControl::unobserved(),
     )
     .await;
     assert!(bad.is_err_and(|e| e.to_string().contains("rejected the query")));
@@ -2440,7 +2483,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         },
         ImportPolicy::owner(),
         None::<&Embedder<MockEmbeddingModel>>,
-        None,
+        RunControl::unobserved(),
     )
     .await;
     assert!(unsupported.is_err());
@@ -2513,7 +2556,10 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
         &config,
         &writer,
         workspace_id,
-        &ingestion::NewFile::new("long.md", b"# Long\n\nSome text to embed.").cancel(Some(&cancel)),
+        &ingestion::NewFile::new("long.md", b"# Long\n\nSome text to embed.").control(RunControl {
+            progress: &|_| {},
+            cancel: Some(&cancel),
+        }),
         Some(&model),
     )
     .await;
@@ -2541,7 +2587,10 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
         &config,
         &writer,
         workspace_id,
-        &ingestion::NewFile::new("other.md", b"# Other").cancel(Some(&early)),
+        &ingestion::NewFile::new("other.md", b"# Other").control(RunControl {
+            progress: &|_| {},
+            cancel: Some(&early),
+        }),
         Some(&model),
     )
     .await;

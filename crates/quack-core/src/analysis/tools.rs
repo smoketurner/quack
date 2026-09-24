@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::storage::workspace::{
-    ChunkScope, ChunkSearchResult, StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb,
+    ChunkScope, ChunkSearchResult, HybridLimits, StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb,
     creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
@@ -800,7 +800,15 @@ where
                     scope = scope.and_chunks(entity_chunks(db, entity, entity_vec.as_deref())?);
                 }
                 match &query_vec {
-                    Some(vector) => db.search_hybrid_chunks(&query, vector, fetch, rrf_k, &scope),
+                    Some(vector) => db.search_hybrid_chunks(
+                        &query,
+                        vector,
+                        HybridLimits {
+                            top_k: fetch,
+                            rrf_k,
+                        },
+                        &scope,
+                    ),
                     None => db.search_keyword_chunks(&query, fetch, &scope),
                 }
             })

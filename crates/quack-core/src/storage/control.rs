@@ -8,17 +8,17 @@
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use sea_query::{Expr, ExprTrait, Order, Query, SqliteQueryBuilder};
+use sea_query::{Expr, ExprTrait, Order, Query};
 use serde::{Serialize, Serializer};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{AssertSqlSafe, Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::{FromRow, Row, SqlitePool};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
 use jiff::{SignedDuration, Timestamp};
 
-use super::queries::{ApiTokens, AuditLog, Members, Users, Workspaces};
+use super::queries::{ApiTokens, AuditLog, Bound, Members, Users, Workspaces};
 use crate::config::Config;
 use crate::error::{Error, Result};
 
@@ -39,6 +39,34 @@ pub struct WorkspaceRow {
     pub name: String,
     pub classification: String,
     pub allowed_providers: AllowedProviders,
+}
+
+impl FromRow<'_, SqliteRow> for WorkspaceRow {
+    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            id: r.try_get("id")?,
+            name: r.try_get("name")?,
+            classification: r.try_get("classification")?,
+            allowed_providers: AllowedProviders::from_column(
+                r.try_get::<Option<String>, _>("allowed_providers")?
+                    .as_deref(),
+            ),
+        })
+    }
+}
+
+/// A stored text column parsed into a typed value; a value that does not
+/// parse is a decode error for the column, not a silent default.
+fn parsed<T>(r: &SqliteRow, column: &str) -> sqlx::Result<T>
+where
+    T: std::str::FromStr<Err = Error>,
+{
+    r.try_get::<String, _>(column)?
+        .parse()
+        .map_err(|e: Error| sqlx::Error::ColumnDecode {
+            index: column.to_owned(),
+            source: Box::new(e),
+        })
 }
 
 /// Which configured providers a workspace's questions may use. Stored as a
@@ -118,6 +146,17 @@ pub struct UserRow {
     pub created_at: String,
 }
 
+impl FromRow<'_, SqliteRow> for UserRow {
+    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            id: r.try_get("id")?,
+            username: r.try_get("username")?,
+            is_admin: r.try_get("is_admin")?,
+            created_at: r.try_get("created_at")?,
+        })
+    }
+}
+
 /// What a member may do in a workspace (design doc 12).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -148,6 +187,18 @@ pub struct MemberRow {
     pub created_at: String,
 }
 
+impl FromRow<'_, SqliteRow> for MemberRow {
+    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            workspace_id: r.try_get("workspace_id")?,
+            user_id: r.try_get("user_id")?,
+            username: r.try_get("username")?,
+            role: parsed(r, "role")?,
+            created_at: r.try_get("created_at")?,
+        })
+    }
+}
+
 /// What an API token may do (design doc 12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -174,6 +225,25 @@ pub struct TokenRow {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
+}
+
+impl FromRow<'_, SqliteRow> for TokenRow {
+    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+        let scopes: String = r.try_get("scopes")?;
+        Ok(Self {
+            token_hash: r.try_get("token_hash")?,
+            workspace_id: r.try_get("workspace_id")?,
+            user_id: r.try_get("user_id")?,
+            name: r.try_get("name")?,
+            scopes: serde_json::from_str(&scopes).map_err(|e| sqlx::Error::ColumnDecode {
+                index: String::from("scopes"),
+                source: Box::new(e),
+            })?,
+            created_at: r.try_get("created_at")?,
+            expires_at: r.try_get("expires_at")?,
+            last_used_at: r.try_get("last_used_at")?,
+        })
+    }
 }
 
 impl TokenRow {
@@ -476,6 +546,25 @@ pub struct AuditRow {
     pub request_id: Option<String>,
 }
 
+impl FromRow<'_, SqliteRow> for AuditRow {
+    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            id: r.try_get("id")?,
+            timestamp: r.try_get("timestamp")?,
+            user_id: r.try_get("user_id")?,
+            token_hash: r.try_get("token_hash")?,
+            workspace_id: r.try_get("workspace_id")?,
+            action: r.try_get("action")?,
+            resource_type: r.try_get("resource_type")?,
+            resource_id: r.try_get("resource_id")?,
+            outcome: parsed(r, "outcome")?,
+            channel: parsed(r, "channel")?,
+            client_addr: r.try_get("client_addr")?,
+            request_id: r.try_get("request_id")?,
+        })
+    }
+}
+
 /// Filters for reading the audit log; every field is optional.
 #[derive(Debug, Clone, Default)]
 pub struct AuditFilter {
@@ -512,24 +601,38 @@ pub fn random_bytes(bytes: &mut [u8]) -> Result<()> {
         .map_err(|_| Error::Config(String::from("random generation failed")))
 }
 
-/// Hash a password with argon2id and default parameters.
-///
-/// # Errors
-///
-/// Returns an error when hashing fails (out of memory).
-pub fn hash_password(password: &str) -> Result<String> {
-    Argon2::default()
-        .hash_password(password.as_bytes())
-        .map(|h| h.to_string())
-        .map_err(|e| Error::Config(format!("password hashing failed: {e}")))
-}
+/// A password as `users.password_hash` stores it: argon2id with default
+/// parameters. The hash never leaves this module.
+struct StoredPasswordHash(String);
 
-fn verify_password_hash(password: &str, hash: &str) -> bool {
-    PasswordHash::new(hash).is_ok_and(|parsed| {
+impl StoredPasswordHash {
+    /// A valid argon2id hash of a random string, verified against when the
+    /// username is unknown so login timing does not reveal which usernames
+    /// exist.
+    const DUMMY: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$Pm2ZmwZKKGUUtY5t1M2p5iP5B0KJ5FhBwa0zDf5Tr3Y";
+
+    /// Hash `password`.
+    fn new(password: &str) -> Result<Self> {
         Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok()
-    })
+            .hash_password(password.as_bytes())
+            .map(|h| Self(h.to_string()))
+            .map_err(|e| Error::Config(format!("password hashing failed: {e}")))
+    }
+
+    /// The stored hash, or [`Self::DUMMY`] for a user with none.
+    fn stored_or_dummy(stored: Option<String>) -> Self {
+        Self(stored.unwrap_or_else(|| String::from(Self::DUMMY)))
+    }
+
+    /// Whether `password` is the one hashed. A stored value that is not a
+    /// hash verifies nothing.
+    fn verifies(&self, password: &str) -> bool {
+        PasswordHash::new(&self.0).is_ok_and(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
+    }
 }
 
 /// Manages the SQLite control plane database.
@@ -642,31 +745,15 @@ impl ControlPlane {
             .to_owned()
     }
 
-    fn workspace_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<WorkspaceRow> {
-        Ok(WorkspaceRow {
-            id: r.try_get("id")?,
-            name: r.try_get("name")?,
-            classification: r.try_get("classification")?,
-            allowed_providers: AllowedProviders::from_column(
-                r.try_get::<Option<String>, _>("allowed_providers")?
-                    .as_deref(),
-            ),
-        })
-    }
-
     /// Look up a workspace by name.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
     pub async fn find_workspace_by_name(&self, name: &str) -> Result<Option<WorkspaceRow>> {
-        let sql = Self::workspace_select()
-            .and_where(Expr::col(Workspaces::Name).eq(name))
-            .to_string(SqliteQueryBuilder);
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
-        row.as_ref().map(Self::workspace_from_row).transpose()
+        let bound =
+            Bound::new(Self::workspace_select().and_where(Expr::col(Workspaces::Name).eq(name)))?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
     /// Look up a workspace by id.
@@ -675,13 +762,9 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn get_workspace(&self, id: &str) -> Result<Option<WorkspaceRow>> {
-        let sql = Self::workspace_select()
-            .and_where(Expr::col(Workspaces::Id).eq(id))
-            .to_string(SqliteQueryBuilder);
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
-        row.as_ref().map(Self::workspace_from_row).transpose()
+        let bound =
+            Bound::new(Self::workspace_select().and_where(Expr::col(Workspaces::Id).eq(id)))?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
     /// Create a new workspace and return its row.
@@ -692,15 +775,14 @@ impl ControlPlane {
     pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceRow> {
         let id = uuid::Uuid::now_v7().to_string();
 
-        let sql = Query::insert()
-            .into_table(Workspaces::Table)
-            .columns([Workspaces::Id, Workspaces::Name, Workspaces::Classification])
-            .values([id.as_str().into(), name.into(), "internal".into()])?
-            .to_string(SqliteQueryBuilder);
+        let bound = Bound::new(
+            Query::insert()
+                .into_table(Workspaces::Table)
+                .columns([Workspaces::Id, Workspaces::Name, Workspaces::Classification])
+                .values([id.as_str().into(), name.into(), "internal".into()])?,
+        )?;
 
-        sqlx::query(AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
+        bound.query().execute(&self.pool).await?;
 
         tracing::info!(workspace_name = name, workspace_id = %id, "created workspace");
 
@@ -736,7 +818,7 @@ impl ControlPlane {
         changes: &WorkspaceChanges,
     ) -> Result<WorkspaceRow> {
         // The builder is dropped before the await so the future stays Send.
-        let sql = {
+        let bound = {
             let mut update = Query::update();
             update
                 .table(Workspaces::Table)
@@ -754,11 +836,9 @@ impl ControlPlane {
                     update.value(Workspaces::AllowedProviders, serde_json::to_string(names)?);
                 }
             }
-            update.to_string(SqliteQueryBuilder)
+            Bound::new(&update)?
         };
-        sqlx::query(AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
+        bound.query().execute(&self.pool).await?;
         self.get_workspace(id)
             .await?
             .ok_or_else(|| Error::WorkspaceNotFound(id.to_owned()))
@@ -770,13 +850,8 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn list_workspaces(&self) -> Result<Vec<WorkspaceRow>> {
-        let sql = Self::workspace_select()
-            .order_by(Workspaces::Name, Order::Asc)
-            .to_string(SqliteQueryBuilder);
-        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(Self::workspace_from_row).collect()
+        let bound = Bound::new(Self::workspace_select().order_by(Workspaces::Name, Order::Asc))?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
     }
 
     /// Workspaces the user is a member of, with the role.
@@ -785,45 +860,31 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn workspaces_for_user(&self, user_id: &str) -> Result<Vec<(WorkspaceRow, Role)>> {
-        let sql = Query::select()
-            .columns([
-                (Workspaces::Table, Workspaces::Id),
-                (Workspaces::Table, Workspaces::Name),
-                (Workspaces::Table, Workspaces::Classification),
-                (Workspaces::Table, Workspaces::AllowedProviders),
-            ])
-            .column((Members::Table, Members::Role))
-            .from(Workspaces::Table)
-            .inner_join(
-                Members::Table,
-                Expr::col((Members::Table, Members::WorkspaceId))
-                    .equals((Workspaces::Table, Workspaces::Id)),
-            )
-            .and_where(Expr::col((Members::Table, Members::UserId)).eq(user_id))
-            .order_by((Workspaces::Table, Workspaces::Name), Order::Asc)
-            .to_string(SqliteQueryBuilder);
-        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
+        let bound = Bound::new(
+            Query::select()
+                .columns([
+                    (Workspaces::Table, Workspaces::Id),
+                    (Workspaces::Table, Workspaces::Name),
+                    (Workspaces::Table, Workspaces::Classification),
+                    (Workspaces::Table, Workspaces::AllowedProviders),
+                ])
+                .column((Members::Table, Members::Role))
+                .from(Workspaces::Table)
+                .inner_join(
+                    Members::Table,
+                    Expr::col((Members::Table, Members::WorkspaceId))
+                        .equals((Workspaces::Table, Workspaces::Id)),
+                )
+                .and_where(Expr::col((Members::Table, Members::UserId)).eq(user_id))
+                .order_by((Workspaces::Table, Workspaces::Name), Order::Asc),
+        )?;
+        let rows = bound.query().fetch_all(&self.pool).await?;
         rows.iter()
-            .map(|r| {
-                let role: String = r.try_get("role")?;
-                Ok((Self::workspace_from_row(r)?, role.parse::<Role>()?))
-            })
+            .map(|r| Ok((WorkspaceRow::from_row(r)?, parsed(r, "role")?)))
             .collect()
     }
 
     // --- users --------------------------------------------------------------
-
-    fn user_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<UserRow> {
-        let is_admin: i64 = r.try_get("is_admin")?;
-        Ok(UserRow {
-            id: r.try_get("id")?,
-            username: r.try_get("username")?,
-            is_admin: is_admin != 0,
-            created_at: r.try_get("created_at")?,
-        })
-    }
 
     fn user_select() -> sea_query::SelectStatement {
         Query::select()
@@ -852,26 +913,28 @@ impl ControlPlane {
             return Err(Error::Config(String::from("password must not be empty")));
         }
         let password = password.to_owned();
-        let hash = tokio::task::spawn_blocking(move || hash_password(&password))
+        let hash = tokio::task::spawn_blocking(move || StoredPasswordHash::new(&password))
             .await
             .map_err(|e| Error::Config(format!("password hashing task failed: {e}")))??;
         let id = uuid::Uuid::now_v7().to_string();
-        let sql = Query::insert()
-            .into_table(Users::Table)
-            .columns([
-                Users::Id,
-                Users::Username,
-                Users::PasswordHash,
-                Users::IsAdmin,
-            ])
-            .values([
-                id.as_str().into(),
-                username.into(),
-                hash.as_str().into(),
-                i64::from(is_admin).into(),
-            ])?
-            .to_string(SqliteQueryBuilder);
-        sqlx::query(AssertSqlSafe(sql.as_str()))
+        let bound = Bound::new(
+            Query::insert()
+                .into_table(Users::Table)
+                .columns([
+                    Users::Id,
+                    Users::Username,
+                    Users::PasswordHash,
+                    Users::IsAdmin,
+                ])
+                .values([
+                    id.as_str().into(),
+                    username.into(),
+                    hash.0.as_str().into(),
+                    i64::from(is_admin).into(),
+                ])?,
+        )?;
+        bound
+            .query()
             .execute(&self.pool)
             .await
             .map_err(|e| match &e {
@@ -892,13 +955,8 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn get_user(&self, id: &str) -> Result<Option<UserRow>> {
-        let sql = Self::user_select()
-            .and_where(Expr::col(Users::Id).eq(id))
-            .to_string(SqliteQueryBuilder);
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
-        row.as_ref().map(Self::user_from_row).transpose()
+        let bound = Bound::new(Self::user_select().and_where(Expr::col(Users::Id).eq(id)))?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
     /// The user with the given username.
@@ -907,13 +965,10 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn find_user_by_username(&self, username: &str) -> Result<Option<UserRow>> {
-        let sql = Self::user_select()
-            .and_where(Expr::col(Users::Username).eq(username.trim()))
-            .to_string(SqliteQueryBuilder);
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
-        row.as_ref().map(Self::user_from_row).transpose()
+        let bound = Bound::new(
+            Self::user_select().and_where(Expr::col(Users::Username).eq(username.trim())),
+        )?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
     /// Every user, by name.
@@ -922,13 +977,8 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn list_users(&self) -> Result<Vec<UserRow>> {
-        let sql = Self::user_select()
-            .order_by(Users::Username, Order::Asc)
-            .to_string(SqliteQueryBuilder);
-        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(Self::user_from_row).collect()
+        let bound = Bound::new(Self::user_select().order_by(Users::Username, Order::Asc))?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
     }
 
     /// Check a password login. Returns the user on success; `None` for an
@@ -940,21 +990,20 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn verify_password(&self, username: &str, password: &str) -> Result<Option<UserRow>> {
-        let sql = Query::select()
-            .columns([Users::Id, Users::PasswordHash])
-            .from(Users::Table)
-            .and_where(Expr::col(Users::Username).eq(username.trim()))
-            .to_string(SqliteQueryBuilder);
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
+        let bound = Bound::new(
+            Query::select()
+                .columns([Users::Id, Users::PasswordHash])
+                .from(Users::Table)
+                .and_where(Expr::col(Users::Username).eq(username.trim())),
+        )?;
+        let row = bound.query().fetch_optional(&self.pool).await?;
         let (id, hash): (Option<String>, Option<String>) = match row {
             Some(r) => (Some(r.try_get("id")?), r.try_get("password_hash")?),
             None => (None, None),
         };
         let password = password.to_owned();
-        let hash = hash.unwrap_or_else(|| DUMMY_HASH.to_owned());
-        let ok = tokio::task::spawn_blocking(move || verify_password_hash(&password, &hash))
+        let hash = StoredPasswordHash::stored_or_dummy(hash);
+        let ok = tokio::task::spawn_blocking(move || hash.verifies(&password))
             .await
             .map_err(|e| Error::Config(format!("password verification task failed: {e}")))?;
         match (ok, id) {
@@ -973,21 +1022,24 @@ impl ControlPlane {
     /// write fails.
     pub async fn set_member(&self, workspace_id: &str, user_id: &str, role: Role) -> Result<()> {
         let existing = self.member_role(workspace_id, user_id).await?;
-        let sql = if existing.is_some() {
-            Query::update()
-                .table(Members::Table)
-                .value(Members::Role, role.as_str())
-                .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
-                .and_where(Expr::col(Members::UserId).eq(user_id))
-                .to_string(SqliteQueryBuilder)
+        let bound = if existing.is_some() {
+            Bound::new(
+                Query::update()
+                    .table(Members::Table)
+                    .value(Members::Role, role.as_str())
+                    .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
+                    .and_where(Expr::col(Members::UserId).eq(user_id)),
+            )?
         } else {
-            Query::insert()
-                .into_table(Members::Table)
-                .columns([Members::WorkspaceId, Members::UserId, Members::Role])
-                .values([workspace_id.into(), user_id.into(), role.as_str().into()])?
-                .to_string(SqliteQueryBuilder)
+            Bound::new(
+                Query::insert()
+                    .into_table(Members::Table)
+                    .columns([Members::WorkspaceId, Members::UserId, Members::Role])
+                    .values([workspace_id.into(), user_id.into(), role.as_str().into()])?,
+            )?
         };
-        sqlx::query(AssertSqlSafe(sql.as_str()))
+        bound
+            .query()
             .execute(&self.pool)
             .await
             .map_err(|e| match &e {
@@ -1005,14 +1057,13 @@ impl ControlPlane {
     ///
     /// Returns an error if the delete fails.
     pub async fn remove_member(&self, workspace_id: &str, user_id: &str) -> Result<bool> {
-        let sql = Query::delete()
-            .from_table(Members::Table)
-            .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
-            .and_where(Expr::col(Members::UserId).eq(user_id))
-            .to_string(SqliteQueryBuilder);
-        let done = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
+        let bound = Bound::new(
+            Query::delete()
+                .from_table(Members::Table)
+                .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
+                .and_where(Expr::col(Members::UserId).eq(user_id)),
+        )?;
+        let done = bound.query().execute(&self.pool).await?;
         Ok(done.rows_affected() > 0)
     }
 
@@ -1022,20 +1073,15 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn member_role(&self, workspace_id: &str, user_id: &str) -> Result<Option<Role>> {
-        let sql = Query::select()
-            .column(Members::Role)
-            .from(Members::Table)
-            .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
-            .and_where(Expr::col(Members::UserId).eq(user_id))
-            .to_string(SqliteQueryBuilder);
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|r| {
-            let role: String = r.try_get("role")?;
-            role.parse::<Role>()
-        })
-        .transpose()
+        let bound = Bound::new(
+            Query::select()
+                .column(Members::Role)
+                .from(Members::Table)
+                .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
+                .and_where(Expr::col(Members::UserId).eq(user_id)),
+        )?;
+        let row = bound.query().fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| parsed(&r, "role")).transpose()?)
     }
 
     /// Members of a workspace with their usernames.
@@ -1044,54 +1090,27 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn list_members(&self, workspace_id: &str) -> Result<Vec<MemberRow>> {
-        let sql = Query::select()
-            .columns([
-                (Members::Table, Members::WorkspaceId),
-                (Members::Table, Members::UserId),
-                (Members::Table, Members::Role),
-                (Members::Table, Members::CreatedAt),
-            ])
-            .column((Users::Table, Users::Username))
-            .from(Members::Table)
-            .inner_join(
-                Users::Table,
-                Expr::col((Users::Table, Users::Id)).equals((Members::Table, Members::UserId)),
-            )
-            .and_where(Expr::col((Members::Table, Members::WorkspaceId)).eq(workspace_id))
-            .order_by((Users::Table, Users::Username), Order::Asc)
-            .to_string(SqliteQueryBuilder);
-        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|r| {
-                let role: String = r.try_get("role")?;
-                Ok(MemberRow {
-                    workspace_id: r.try_get("workspace_id")?,
-                    user_id: r.try_get("user_id")?,
-                    username: r.try_get("username")?,
-                    role: role.parse::<Role>()?,
-                    created_at: r.try_get("created_at")?,
-                })
-            })
-            .collect()
+        let bound = Bound::new(
+            Query::select()
+                .columns([
+                    (Members::Table, Members::WorkspaceId),
+                    (Members::Table, Members::UserId),
+                    (Members::Table, Members::Role),
+                    (Members::Table, Members::CreatedAt),
+                ])
+                .column((Users::Table, Users::Username))
+                .from(Members::Table)
+                .inner_join(
+                    Users::Table,
+                    Expr::col((Users::Table, Users::Id)).equals((Members::Table, Members::UserId)),
+                )
+                .and_where(Expr::col((Members::Table, Members::WorkspaceId)).eq(workspace_id))
+                .order_by((Users::Table, Users::Username), Order::Asc),
+        )?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
     }
 
     // --- API tokens ---------------------------------------------------------
-
-    fn token_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<TokenRow> {
-        let scopes: String = r.try_get("scopes")?;
-        Ok(TokenRow {
-            token_hash: r.try_get("token_hash")?,
-            workspace_id: r.try_get("workspace_id")?,
-            user_id: r.try_get("user_id")?,
-            name: r.try_get("name")?,
-            scopes: serde_json::from_str(&scopes)?,
-            created_at: r.try_get("created_at")?,
-            expires_at: r.try_get("expires_at")?,
-            last_used_at: r.try_get("last_used_at")?,
-        })
-    }
 
     fn token_select() -> sea_query::SelectStatement {
         Query::select()
@@ -1136,26 +1155,28 @@ impl ControlPlane {
         } else {
             scopes.to_vec()
         };
-        let sql = Query::insert()
-            .into_table(ApiTokens::Table)
-            .columns([
-                ApiTokens::TokenHash,
-                ApiTokens::WorkspaceId,
-                ApiTokens::UserId,
-                ApiTokens::Name,
-                ApiTokens::Scopes,
-                ApiTokens::ExpiresAt,
-            ])
-            .values([
-                hash.as_str().into(),
-                workspace_id.into(),
-                user_id.into(),
-                name.into(),
-                serde_json::to_string(&scopes)?.into(),
-                expires_at.map(|at| at.to_string()).into(),
-            ])?
-            .to_string(SqliteQueryBuilder);
-        sqlx::query(AssertSqlSafe(sql.as_str()))
+        let bound = Bound::new(
+            Query::insert()
+                .into_table(ApiTokens::Table)
+                .columns([
+                    ApiTokens::TokenHash,
+                    ApiTokens::WorkspaceId,
+                    ApiTokens::UserId,
+                    ApiTokens::Name,
+                    ApiTokens::Scopes,
+                    ApiTokens::ExpiresAt,
+                ])
+                .values([
+                    hash.as_str().into(),
+                    workspace_id.into(),
+                    user_id.into(),
+                    name.into(),
+                    serde_json::to_string(&scopes)?.into(),
+                    expires_at.map(|at| at.to_string()).into(),
+                ])?,
+        )?;
+        bound
+            .query()
             .execute(&self.pool)
             .await
             .map_err(|e| match &e {
@@ -1177,13 +1198,10 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn find_token(&self, token_hash: &str) -> Result<Option<TokenRow>> {
-        let sql = Self::token_select()
-            .and_where(Expr::col(ApiTokens::TokenHash).eq(token_hash))
-            .to_string(SqliteQueryBuilder);
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_optional(&self.pool)
-            .await?;
-        row.as_ref().map(Self::token_from_row).transpose()
+        let bound = Bound::new(
+            Self::token_select().and_where(Expr::col(ApiTokens::TokenHash).eq(token_hash)),
+        )?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
     /// Record that a token was just used.
@@ -1192,14 +1210,13 @@ impl ControlPlane {
     ///
     /// Returns an error if the update fails.
     pub async fn touch_token(&self, token_hash: &str) -> Result<()> {
-        let sql = Query::update()
-            .table(ApiTokens::Table)
-            .value(ApiTokens::LastUsedAt, Expr::cust("CURRENT_TIMESTAMP"))
-            .and_where(Expr::col(ApiTokens::TokenHash).eq(token_hash))
-            .to_string(SqliteQueryBuilder);
-        sqlx::query(AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
+        let bound = Bound::new(
+            Query::update()
+                .table(ApiTokens::Table)
+                .value(ApiTokens::LastUsedAt, Expr::cust("CURRENT_TIMESTAMP"))
+                .and_where(Expr::col(ApiTokens::TokenHash).eq(token_hash)),
+        )?;
+        bound.query().execute(&self.pool).await?;
         Ok(())
     }
 
@@ -1209,14 +1226,12 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn list_tokens(&self, workspace_id: &str) -> Result<Vec<TokenRow>> {
-        let sql = Self::token_select()
-            .and_where(Expr::col(ApiTokens::WorkspaceId).eq(workspace_id))
-            .order_by(ApiTokens::CreatedAt, Order::Desc)
-            .to_string(SqliteQueryBuilder);
-        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(Self::token_from_row).collect()
+        let bound = Bound::new(
+            Self::token_select()
+                .and_where(Expr::col(ApiTokens::WorkspaceId).eq(workspace_id))
+                .order_by(ApiTokens::CreatedAt, Order::Desc),
+        )?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
     }
 
     /// Revoke a token. Returns whether it existed.
@@ -1225,13 +1240,12 @@ impl ControlPlane {
     ///
     /// Returns an error if the delete fails.
     pub async fn delete_token(&self, token_hash: &str) -> Result<bool> {
-        let sql = Query::delete()
-            .from_table(ApiTokens::Table)
-            .and_where(Expr::col(ApiTokens::TokenHash).eq(token_hash))
-            .to_string(SqliteQueryBuilder);
-        let done = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
+        let bound = Bound::new(
+            Query::delete()
+                .from_table(ApiTokens::Table)
+                .and_where(Expr::col(ApiTokens::TokenHash).eq(token_hash)),
+        )?;
+        let done = bound.query().execute(&self.pool).await?;
         Ok(done.rows_affected() > 0)
     }
 
@@ -1243,10 +1257,60 @@ impl ControlPlane {
     ///
     /// Returns an error if the insert fails.
     pub async fn record_audit(&self, entry: &AuditEntry) -> Result<()> {
-        let sql = Query::insert()
-            .into_table(AuditLog::Table)
+        let bound = Bound::new(
+            Query::insert()
+                .into_table(AuditLog::Table)
+                .columns([
+                    AuditLog::Id,
+                    AuditLog::UserId,
+                    AuditLog::TokenHash,
+                    AuditLog::WorkspaceId,
+                    AuditLog::Action,
+                    AuditLog::ResourceType,
+                    AuditLog::ResourceId,
+                    AuditLog::Outcome,
+                    AuditLog::Channel,
+                    AuditLog::ClientAddr,
+                    AuditLog::RequestId,
+                ])
+                .values([
+                    entry.id.as_str().into(),
+                    entry.user_id.as_deref().into(),
+                    entry.token_hash.as_deref().into(),
+                    entry.workspace_id.as_deref().into(),
+                    entry.action.as_str().into(),
+                    entry.resource_type.map(ResourceKind::as_str).into(),
+                    entry.resource_id.as_deref().into(),
+                    entry.outcome.as_str().into(),
+                    entry.channel.as_str().into(),
+                    entry.client_addr.as_deref().into(),
+                    entry.request_id.as_deref().into(),
+                ])?,
+        )?;
+        bound.query().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Audit rows matching the filter, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditRow>> {
+        Ok(filter.select()?.query_as().fetch_all(&self.pool).await?)
+    }
+}
+
+impl AuditFilter {
+    /// The filtered audit select, built and bound in one scope so no builder
+    /// lives across an await.
+    fn select(&self) -> sqlx::Result<Bound> {
+        let filter = self;
+        let mut select = Query::select();
+        select
             .columns([
                 AuditLog::Id,
+                AuditLog::Timestamp,
                 AuditLog::UserId,
                 AuditLog::TokenHash,
                 AuditLog::WorkspaceId,
@@ -1258,108 +1322,36 @@ impl ControlPlane {
                 AuditLog::ClientAddr,
                 AuditLog::RequestId,
             ])
-            .values([
-                entry.id.as_str().into(),
-                entry.user_id.as_deref().into(),
-                entry.token_hash.as_deref().into(),
-                entry.workspace_id.as_deref().into(),
-                entry.action.as_str().into(),
-                entry.resource_type.map(ResourceKind::as_str).into(),
-                entry.resource_id.as_deref().into(),
-                entry.outcome.as_str().into(),
-                entry.channel.as_str().into(),
-                entry.client_addr.as_deref().into(),
-                entry.request_id.as_deref().into(),
-            ])?
-            .to_string(SqliteQueryBuilder);
-        sqlx::query(AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Audit rows matching the filter, newest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query fails.
-    pub async fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditRow>> {
-        let sql = audit_query_sql(filter);
-        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|r| {
-                Ok(AuditRow {
-                    id: r.try_get("id")?,
-                    timestamp: r.try_get("timestamp")?,
-                    user_id: r.try_get("user_id")?,
-                    token_hash: r.try_get("token_hash")?,
-                    workspace_id: r.try_get("workspace_id")?,
-                    action: r.try_get("action")?,
-                    resource_type: r.try_get("resource_type")?,
-                    resource_id: r.try_get("resource_id")?,
-                    outcome: r.try_get::<String, _>("outcome")?.parse()?,
-                    channel: r.try_get::<String, _>("channel")?.parse()?,
-                    client_addr: r.try_get("client_addr")?,
-                    request_id: r.try_get("request_id")?,
-                })
-            })
-            .collect()
+            .from(AuditLog::Table)
+            .order_by(AuditLog::Timestamp, Order::Desc)
+            .order_by(AuditLog::Id, Order::Desc)
+            .limit(u64::from(Ord::max(filter.limit, 1)));
+        if let Some(v) = &filter.user_id {
+            select.and_where(Expr::col(AuditLog::UserId).eq(v.as_str()));
+        }
+        if let Some(v) = &filter.workspace_id {
+            select.and_where(Expr::col(AuditLog::WorkspaceId).eq(v.as_str()));
+        }
+        if let Some(v) = &filter.action {
+            select.and_where(Expr::col(AuditLog::Action).eq(v.as_str()));
+        }
+        if let Some(v) = filter.outcome {
+            select.and_where(Expr::col(AuditLog::Outcome).eq(v.as_str()));
+        }
+        if let Some(v) = &filter.since {
+            select.and_where(Expr::col(AuditLog::Timestamp).gte(v.as_str()));
+        }
+        if let Some(v) = &filter.until {
+            select.and_where(Expr::col(AuditLog::Timestamp).lt(v.as_str()));
+        }
+        Bound::new(&select)
     }
 }
-
-/// The filtered audit select, built and rendered in one scope so no
-/// builder lives across an await.
-fn audit_query_sql(filter: &AuditFilter) -> String {
-    let mut select = Query::select();
-    select
-        .columns([
-            AuditLog::Id,
-            AuditLog::Timestamp,
-            AuditLog::UserId,
-            AuditLog::TokenHash,
-            AuditLog::WorkspaceId,
-            AuditLog::Action,
-            AuditLog::ResourceType,
-            AuditLog::ResourceId,
-            AuditLog::Outcome,
-            AuditLog::Channel,
-            AuditLog::ClientAddr,
-            AuditLog::RequestId,
-        ])
-        .from(AuditLog::Table)
-        .order_by(AuditLog::Timestamp, Order::Desc)
-        .order_by(AuditLog::Id, Order::Desc)
-        .limit(u64::from(Ord::max(filter.limit, 1)));
-    if let Some(v) = &filter.user_id {
-        select.and_where(Expr::col(AuditLog::UserId).eq(v.as_str()));
-    }
-    if let Some(v) = &filter.workspace_id {
-        select.and_where(Expr::col(AuditLog::WorkspaceId).eq(v.as_str()));
-    }
-    if let Some(v) = &filter.action {
-        select.and_where(Expr::col(AuditLog::Action).eq(v.as_str()));
-    }
-    if let Some(v) = filter.outcome {
-        select.and_where(Expr::col(AuditLog::Outcome).eq(v.as_str()));
-    }
-    if let Some(v) = &filter.since {
-        select.and_where(Expr::col(AuditLog::Timestamp).gte(v.as_str()));
-    }
-    if let Some(v) = &filter.until {
-        select.and_where(Expr::col(AuditLog::Timestamp).lt(v.as_str()));
-    }
-    select.to_string(SqliteQueryBuilder)
-}
-
-/// A valid argon2id hash of a random string, verified against when the
-/// username is unknown so login timing does not reveal which usernames exist.
-const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$Pm2ZmwZKKGUUtY5t1M2p5iP5B0KJ5FhBwa0zDf5Tr3Y";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::AssertSqlSafe;
 
     async fn open() -> (tempfile::TempDir, ControlPlane) {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -1417,6 +1409,34 @@ mod tests {
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         pool.close().await;
+    }
+
+    /// Values are bound, not written into the SQL: a name full of quotes
+    /// and statement separators is stored and found as the text it is.
+    #[tokio::test]
+    async fn values_are_bound_not_spliced_into_the_sql() {
+        let (_dir, cp) = open().await;
+        let name = "o'brien\"; DROP TABLE users; --";
+        let created = cp
+            .create_workspace(name)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let found = cp
+            .find_workspace_by_name(name)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(found.map(|w| w.id), Some(created.id));
+        assert!(cp.list_users().await.is_ok(), "users table still there");
+    }
+
+    #[test]
+    fn a_value_type_control_db_never_stores_is_refused() {
+        let insert = Query::insert()
+            .into_table(Users::Table)
+            .columns([Users::Id])
+            .values([1.5_f64.into()])
+            .map_or_else(|e| fail(&e.to_string()), |q| q.to_owned());
+        assert!(Bound::new(&insert).is_err());
     }
 
     #[tokio::test]
@@ -1764,7 +1784,7 @@ mod tests {
 
     #[test]
     fn dummy_hash_parses_as_argon2id() {
-        assert!(PasswordHash::new(DUMMY_HASH).is_ok());
-        assert!(!verify_password_hash("anything", DUMMY_HASH));
+        assert!(PasswordHash::new(StoredPasswordHash::DUMMY).is_ok());
+        assert!(!StoredPasswordHash::stored_or_dummy(None).verifies("anything"));
     }
 }
