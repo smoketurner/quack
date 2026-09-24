@@ -2310,14 +2310,24 @@ fn banner_names_the_address_mode_and_models() {
         },
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
-    let text = super::banner(&config, addr, true, 0, 2);
+    let banner = |local, users, workspaces| {
+        super::Banner {
+            config: &config,
+            addr,
+            local,
+            users,
+            workspaces,
+        }
+        .to_string()
+    };
+    let text = banner(true, 0, 2);
     assert!(text.contains("http://127.0.0.1:8080/"));
     assert!(text.contains("local: no login"));
     assert!(text.contains("chat model     ollama/llama3"));
     assert!(text.contains("none (documents stored without vectors)"));
-    assert!(text.contains("ollama (ollama, no auth)"));
+    assert!(text.contains("ollama (ollama, auth none)"));
     assert!(text.contains("workspaces     2"));
-    let auth = super::banner(&config, addr, false, 3, 0);
+    let auth = banner(false, 3, 0);
     assert!(auth.contains("3 user(s)"));
 }
 

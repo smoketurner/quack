@@ -14,7 +14,7 @@ pub(crate) mod members;
 pub(crate) mod okf;
 pub(crate) mod ontology;
 pub(crate) mod query;
-pub(crate) mod sessions;
+mod sessions;
 mod tables;
 pub(crate) mod workspaces;
 

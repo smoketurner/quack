@@ -12,6 +12,7 @@ pub(crate) mod state;
 mod tests;
 mod web;
 
+use std::fmt;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,7 +33,6 @@ use tower_http::request_id::{
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
-use quack_core::config::AuthMode;
 use quack_core::storage::control::{ControlPlane, sha256_hex};
 use state::{App, AppState};
 
@@ -209,45 +209,49 @@ async fn no_store(mut response: axum::response::Response) -> axum::response::Res
 }
 
 /// The startup banner: what this server is and how it is configured.
-fn banner(
-    config: &Config,
+struct Banner<'a> {
+    config: &'a Config,
     addr: SocketAddr,
     local: bool,
     users: usize,
     workspaces: usize,
-) -> String {
-    let chat = config.chat_model_ref().map_or_else(
-        |_| String::from("none (set [general].chat_model)"),
-        |m| m.to_string(),
-    );
-    let embedding = config.embedding_model_ref().ok().flatten().map_or_else(
-        || String::from("none (documents stored without vectors)"),
-        |m| m.to_string(),
-    );
-    let providers: Vec<String> = config
-        .providers
-        .iter()
-        .map(|(name, p)| {
-            let auth = match p.auth {
-                AuthMode::None => "no auth",
-                AuthMode::ApiKey => "api key",
-                AuthMode::Oauth => "oauth",
-            };
-            format!("{name} ({}, {auth})", p.provider_type)
-        })
-        .collect();
-    let providers = if providers.is_empty() {
-        String::from("none configured")
-    } else {
-        providers.join(", ")
-    };
-    let mode = if local {
-        String::from("local: no login, one implicit owner")
-    } else {
-        format!("password and token login, {users} user(s)")
-    };
-    format!(
-        r"
+}
+
+impl fmt::Display for Banner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            config,
+            addr,
+            local,
+            users,
+            workspaces,
+        } = self;
+        let chat = config.chat_model_ref().map_or_else(
+            |_| String::from("none (set [general].chat_model)"),
+            |m| m.to_string(),
+        );
+        let embedding = config.embedding_model_ref().ok().flatten().map_or_else(
+            || String::from("none (documents stored without vectors)"),
+            |m| m.to_string(),
+        );
+        let providers: Vec<String> = config
+            .providers
+            .iter()
+            .map(|(name, p)| format!("{name} ({}, auth {})", p.provider_type, p.auth))
+            .collect();
+        let providers = if providers.is_empty() {
+            String::from("none configured")
+        } else {
+            providers.join(", ")
+        };
+        let mode = if *local {
+            String::from("local: no login, one implicit owner")
+        } else {
+            format!("password and token login, {users} user(s)")
+        };
+        write!(
+            f,
+            r"
      __
    <(o )___     quack {version}
     ( ._> /     knowledge engine: documents, tables, graph
@@ -264,11 +268,12 @@ fn banner(
   api            http://{addr}/api/v1
 
 ",
-        version = env!("CARGO_PKG_VERSION"),
-        data = config.data_dir().display(),
-        upload = config.ingestion.upload_max_mb,
-        workers = config.server.workers_per_workspace,
-    )
+            version = env!("CARGO_PKG_VERSION"),
+            data = config.data_dir().display(),
+            upload = config.ingestion.upload_max_mb,
+            workers = config.server.workers_per_workspace,
+        )
+    }
 }
 
 /// Bind and serve until Ctrl-C.
@@ -296,7 +301,14 @@ pub(crate) async fn serve(config: Config, bind: Option<String>, local: bool) -> 
     {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        write!(out, "{}", banner(&config, addr, local, users, workspaces))?;
+        let banner = Banner {
+            config: &config,
+            addr,
+            local,
+            users,
+            workspaces,
+        };
+        write!(out, "{banner}")?;
         out.flush()?;
     }
     let app = Arc::new(AppState::new(config, control, local));
