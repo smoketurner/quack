@@ -14,12 +14,14 @@ mod progress_line;
 mod server;
 mod stdio;
 mod terminal;
+mod text_or_json;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::config::inspect::SettingFilter;
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
@@ -44,8 +46,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::confirm::Confirm;
+use crate::print::{PrintTurn, TurnOutcome};
 use crate::stdio::{NamedInput, StdioPath};
 use crate::terminal::SessionSetup;
+use crate::text_or_json::TextOrJson;
 
 /// How a command ended when not plainly: the exit status scripts check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,6 +473,37 @@ impl OutputFormat {
             Self::Ndjson
         }
     }
+
+    /// The format for `-p`, which prints an answer: text or JSON.
+    const fn for_prompt(self) -> Option<TextOrJson> {
+        match self {
+            Self::Text => Some(TextOrJson::Text),
+            Self::Json => Some(TextOrJson::Json),
+            Self::Table | Self::Ndjson | Self::Csv | Self::Markdown => None,
+        }
+    }
+
+    /// The format for `-q`, which prints a result set.
+    const fn for_query(self) -> Option<QueryFormat> {
+        match self {
+            Self::Table => Some(QueryFormat::Table),
+            Self::Json => Some(QueryFormat::Json),
+            Self::Ndjson => Some(QueryFormat::Ndjson),
+            Self::Csv => Some(QueryFormat::Csv),
+            Self::Markdown => Some(QueryFormat::Markdown),
+            Self::Text => None,
+        }
+    }
+}
+
+/// How `-q` prints a result set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryFormat {
+    Table,
+    Json,
+    Ndjson,
+    Csv,
+    Markdown,
 }
 
 #[tokio::main]
@@ -540,9 +575,14 @@ async fn run() -> Result<ExitCode> {
 
     if let Some(sql) = cli.query.as_deref() {
         init_logging();
-        let format = cli
+        let Some(format) = cli
             .format
-            .unwrap_or_else(|| OutputFormat::default_for(stdout_is_tty));
+            .unwrap_or_else(|| OutputFormat::default_for(stdout_is_tty))
+            .for_query()
+        else {
+            tracing::error!("-q accepts --format table, json, ndjson, csv, or markdown");
+            return Ok(ExitCode::from(Exit::Usage));
+        };
         run_query(sql, cli.workspace.as_deref(), format, cli.stdin).await?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -612,7 +652,12 @@ fn run_config(args: &ConfigArgs) -> Result<ExitCode> {
     let inspection = config::inspect::Inspection::load();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    let usable = config_cli::run(&mut out, &inspection, args.json, args.changed)?;
+    let filter = if args.changed {
+        SettingFilter::Changed
+    } else {
+        SettingFilter::All
+    };
+    let usable = config_cli::run(&mut out, &inspection, TextOrJson::of(args.json), filter)?;
     out.flush()?;
     Ok(if usable {
         ExitCode::SUCCESS
@@ -638,7 +683,7 @@ async fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
     let report = doctor::run(&inspection, &options).await;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    doctor_cli::write(&mut out, &report, args.json)?;
+    doctor_cli::write(&mut out, &report, TextOrJson::of(args.json))?;
     out.flush()?;
     Ok(if report.has_failures() {
         ExitCode::FAILURE
@@ -650,13 +695,9 @@ async fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
 /// `quack -p PROMPT`: one turn, answer to stdout, steps to stderr.
 async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<ExitCode> {
     init_logging();
-    let format = match cli.format.unwrap_or(OutputFormat::Text) {
-        OutputFormat::Json => print::PromptFormat::Json,
-        OutputFormat::Text => print::PromptFormat::Text,
-        OutputFormat::Table | OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::Markdown => {
-            tracing::error!("-p accepts only --format text or json");
-            return Ok(ExitCode::from(Exit::Usage));
-        }
+    let Some(format) = cli.format.unwrap_or(OutputFormat::Text).for_prompt() else {
+        tracing::error!("-p accepts only --format text or json");
+        return Ok(ExitCode::from(Exit::Usage));
     };
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
     let config = &opened.config;
@@ -682,26 +723,25 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         cli.mode.map(ChatMode::from),
     )?;
     let (db, reader_db) = opened.shared(ws_db).await?;
-    let outcome = print::run_prompt(
+    let outcome = PrintTurn {
         config,
-        Arc::clone(&db),
+        db: Arc::clone(&db),
         reader_db,
-        &session_id,
+        session_id: &session_id,
         policy,
         prompt,
         format,
-        cli.verbose,
-    )
+        verbose: cli.verbose,
+    }
+    .run()
     .await;
     if outcome.is_err() {
         let id = session_id.clone();
         drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
-    let refused = outcome?;
-    Ok(if refused {
-        ExitCode::from(Exit::WriteRefused)
-    } else {
-        ExitCode::SUCCESS
+    Ok(match outcome? {
+        TurnOutcome::WriteRefused => ExitCode::from(Exit::WriteRefused),
+        TurnOutcome::Answered => ExitCode::SUCCESS,
     })
 }
 
@@ -1431,7 +1471,7 @@ impl OpenedWorkspace {
 async fn run_query(
     sql: &str,
     workspace_name: Option<&str>,
-    format: OutputFormat,
+    format: QueryFormat,
     wait_for_stdin: bool,
 ) -> Result<()> {
     let opened = OpenedWorkspace::resolve(workspace_name).await?;
@@ -1444,11 +1484,11 @@ async fn run_query(
     let mut out = std::io::BufWriter::new(stdout.lock());
 
     match format {
-        OutputFormat::Table | OutputFormat::Text => results.write_table(&mut out)?,
-        OutputFormat::Json => results.write_json(&mut out)?,
-        OutputFormat::Ndjson => results.write_ndjson(&mut out)?,
-        OutputFormat::Csv => results.write_csv(&mut out)?,
-        OutputFormat::Markdown => results.write_markdown(&mut out)?,
+        QueryFormat::Table => results.write_table(&mut out)?,
+        QueryFormat::Json => results.write_json(&mut out)?,
+        QueryFormat::Ndjson => results.write_ndjson(&mut out)?,
+        QueryFormat::Csv => results.write_csv(&mut out)?,
+        QueryFormat::Markdown => results.write_markdown(&mut out)?,
     }
 
     out.flush()?;

@@ -16,148 +16,177 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::llm;
 
-/// A token that Ctrl+C cancels, and the task watching for it. The turn
-/// is then recorded as cancelled with whatever streamed; a second Ctrl+C
-/// is left to the runtime.
-fn cancel_on_ctrl_c() -> (llm::CancellationToken, tokio::task::JoinHandle<()>) {
-    let cancel = llm::CancellationToken::new();
-    let interrupt = tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                cancel.cancel();
-            }
-        }
-    });
-    (cancel, interrupt)
+use crate::text_or_json::TextOrJson;
+
+/// A cancellation token that Ctrl+C trips, for as long as the guard
+/// lives: the turn is then recorded as cancelled with whatever streamed,
+/// and a second Ctrl+C is left to the runtime. Dropping the guard stops
+/// the watcher, whichever way the turn ended.
+struct CtrlCGuard {
+    cancel: llm::CancellationToken,
+    watcher: tokio::task::JoinHandle<()>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PromptFormat {
-    Text,
-    Json,
+impl CtrlCGuard {
+    fn new() -> Self {
+        let cancel = llm::CancellationToken::new();
+        let watcher = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    cancel.cancel();
+                }
+            }
+        });
+        Self { cancel, watcher }
+    }
 }
 
-/// Run one turn in `session_id` and print it. Returns whether a write was
-/// refused.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors llm::run_turn plus print mode's own formatting options"
-)]
-pub(crate) async fn run_prompt(
-    config: &Config,
-    db: SharedDb,
-    reader_db: ReaderDb,
-    session_id: &str,
-    policy: WritePolicy,
-    prompt: &str,
-    format: PromptFormat,
-    verbose: bool,
-) -> Result<bool> {
-    let (sink, mut events) = events::channel();
+impl Drop for CtrlCGuard {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
 
-    let (cancel, interrupt) = cancel_on_ctrl_c();
-    let turn = tokio::spawn({
-        let config = config.clone();
-        let prompt = prompt.to_owned();
-        let session_id = session_id.to_owned();
-        async move {
-            llm::TurnRequest {
-                db,
-                reader_db,
-                session_id: &session_id,
-                policy,
-                message: &prompt,
-                sink,
-                cancel,
+/// How a printed turn ended, for the exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnOutcome {
+    Answered,
+    /// The agent needed a write the policy did not permit.
+    WriteRefused,
+}
+
+/// One print-mode turn: the workspace, the session, the write policy, the
+/// prompt, and how to print it.
+pub(crate) struct PrintTurn<'a> {
+    pub config: &'a Config,
+    pub db: SharedDb,
+    pub reader_db: ReaderDb,
+    pub session_id: &'a str,
+    pub policy: WritePolicy,
+    pub prompt: &'a str,
+    pub format: TextOrJson,
+    /// Full tool inputs and outputs on stderr.
+    pub verbose: bool,
+}
+
+impl PrintTurn<'_> {
+    /// Run the turn and print it.
+    pub(crate) async fn run(self) -> Result<TurnOutcome> {
+        let (config, db, reader_db, session_id) =
+            (self.config, self.db, self.reader_db, self.session_id);
+        let (policy, prompt, format, verbose) =
+            (self.policy, self.prompt, self.format, self.verbose);
+        let (sink, mut events) = events::channel();
+
+        let interrupt = CtrlCGuard::new();
+        let cancel = interrupt.cancel.clone();
+        let turn = tokio::spawn({
+            let config = config.clone();
+            let prompt = prompt.to_owned();
+            let session_id = session_id.to_owned();
+            async move {
+                llm::TurnRequest {
+                    db,
+                    reader_db,
+                    session_id: &session_id,
+                    policy,
+                    message: &prompt,
+                    sink,
+                    cancel,
+                }
+                .run(&config)
+                .await
             }
-            .run(&config)
-            .await
+        });
+
+        // Never hold the stdout or stderr locks across an await: the tracing
+        // subscriber writes to stderr from the agent's threads, and holding the
+        // lock here deadlocks the turn the moment a tool logs anything.
+        let mut err = std::io::stderr();
+        let mut out = std::io::stdout();
+        // What went to stdout as it streamed, to compare with the validated
+        // answer at the end. Text streams only on a terminal: a pipeline gets
+        // the validated answer alone (issue #64).
+        let mut streamed = String::new();
+        let stream_live = format == TextOrJson::Text && out.is_terminal();
+        // Once a search has run, the answer may carry [n] markers that citation
+        // validation renumbers after the stream ends, so buffer instead of
+        // printing text that would then need to be reprinted.
+        let mut searched = false;
+
+        // On a terminal, show what the turn is waiting on (the model, or a
+        // tool) with the elapsed time, and erase it before any real output.
+        let mut spinner = Spinner::new(std::io::stderr().is_terminal());
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+
+        loop {
+            let event = tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+                _ = ticker.tick(), if spinner.active() => {
+                    spinner.draw(&mut err)?;
+                    continue;
+                }
+            };
+            spinner.clear(&mut err)?;
+            match event {
+                AgentEvent::Status(status) => spinner.set(&status),
+                AgentEvent::TextDelta(text) => {
+                    if stream_live && !searched {
+                        write!(out, "{text}")?;
+                        out.flush()?;
+                        streamed.push_str(&text);
+                        spinner.stop();
+                    } else {
+                        spinner.set("answering");
+                    }
+                }
+                AgentEvent::ToolStarted { tool, detail } => {
+                    if tool == "search_documents" {
+                        searched = true;
+                    }
+                    write_started(&mut err, &tool, &detail, verbose)?;
+                    spinner.set(&format!("running {tool}"));
+                }
+                AgentEvent::ToolFinished(step) => {
+                    write_finished(&mut err, &step)?;
+                    spinner.set("thinking");
+                }
+                AgentEvent::PermissionRequired(request) => {
+                    // Print mode never prompts; the policy is Allow or Deny.
+                    request.deny();
+                }
+                AgentEvent::TurnComplete(_) | AgentEvent::Failed(_) => spinner.stop(),
+            }
         }
-    });
-
-    // Never hold the stdout or stderr locks across an await: the tracing
-    // subscriber writes to stderr from the agent's threads, and holding the
-    // lock here deadlocks the turn the moment a tool logs anything.
-    let mut err = std::io::stderr();
-    let mut out = std::io::stdout();
-    // What went to stdout as it streamed, to compare with the validated
-    // answer at the end. Text streams only on a terminal: a pipeline gets
-    // the validated answer alone (issue #64).
-    let mut streamed = String::new();
-    let stream_live = format == PromptFormat::Text && out.is_terminal();
-    // Once a search has run, the answer may carry [n] markers that citation
-    // validation renumbers after the stream ends, so buffer instead of
-    // printing text that would then need to be reprinted.
-    let mut searched = false;
-
-    // On a terminal, show what the turn is waiting on (the model, or a
-    // tool) with the elapsed time, and erase it before any real output.
-    let mut spinner = Spinner::new(std::io::stderr().is_terminal());
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
-
-    loop {
-        let event = tokio::select! {
-            event = events.recv() => match event {
-                Some(event) => event,
-                None => break,
-            },
-            _ = ticker.tick(), if spinner.active() => {
-                spinner.draw(&mut err)?;
-                continue;
-            }
-        };
         spinner.clear(&mut err)?;
-        match event {
-            AgentEvent::Status(status) => spinner.set(&status),
-            AgentEvent::TextDelta(text) => {
-                if stream_live && !searched {
-                    write!(out, "{text}")?;
-                    out.flush()?;
-                    streamed.push_str(&text);
-                    spinner.stop();
-                } else {
-                    spinner.set("answering");
-                }
+
+        let response = turn
+            .await
+            .context("agent task panicked")?
+            .context("agent turn failed")?;
+        drop(interrupt);
+
+        match format {
+            TextOrJson::Text => write_text_answer(&mut out, &streamed, &response)?,
+            TextOrJson::Json => {
+                let object = response.to_json(session_id);
+                serde_json::to_writer_pretty(&mut out, &object)?;
+                writeln!(out)?;
             }
-            AgentEvent::ToolStarted { tool, detail } => {
-                if tool == "search_documents" {
-                    searched = true;
-                }
-                write_started(&mut err, &tool, &detail, verbose)?;
-                spinner.set(&format!("running {tool}"));
-            }
-            AgentEvent::ToolFinished(step) => {
-                write_finished(&mut err, &step)?;
-                spinner.set("thinking");
-            }
-            AgentEvent::PermissionRequired(request) => {
-                // Print mode never prompts; the policy is Allow or Deny.
-                request.deny();
-            }
-            AgentEvent::TurnComplete(_) | AgentEvent::Failed(_) => spinner.stop(),
         }
+        out.flush()?;
+        writeln!(err, "session {session_id}")?;
+
+        Ok(if response.write_refused {
+            TurnOutcome::WriteRefused
+        } else {
+            TurnOutcome::Answered
+        })
     }
-    spinner.clear(&mut err)?;
-
-    let response = turn
-        .await
-        .context("agent task panicked")?
-        .context("agent turn failed")?;
-    interrupt.abort();
-
-    match format {
-        PromptFormat::Text => write_text_answer(&mut out, &streamed, &response)?,
-        PromptFormat::Json => {
-            let object = response.to_json(session_id);
-            serde_json::to_writer_pretty(&mut out, &object)?;
-            writeln!(out)?;
-        }
-    }
-    out.flush()?;
-    writeln!(err, "session {session_id}")?;
-
-    Ok(response.write_refused)
 }
 
 /// The text-mode answer after the turn: the validated content when

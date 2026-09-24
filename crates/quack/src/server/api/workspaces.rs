@@ -110,7 +110,7 @@ impl Identity {
                 .await?;
         }
         let mut entry = self.audit(AuditAction::Workspace, Outcome::Allowed);
-        entry.workspace_id = Some(ws.id.clone());
+        entry = entry.in_workspace(&ws.id);
         entry = entry.on(ResourceKind::Workspace.id(&ws.id));
         app.control.record_audit(&entry).await?;
         Ok(ws)

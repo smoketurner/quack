@@ -14,6 +14,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde::{Serialize, Serializer};
 use toml::{Table, Value as TomlValue};
 
 use crate::embedding::ResolvedPrompts;
@@ -38,6 +39,13 @@ pub enum Origin {
     Env(&'static str),
 }
 
+/// Written as it prints: `default`, `file`, or `env NAME`.
+impl Serialize for Origin {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -48,8 +56,10 @@ impl fmt::Display for Origin {
     }
 }
 
-/// One setting this binary recognizes, and what it makes of it.
-#[derive(Debug, Clone)]
+/// One setting this binary recognizes, and what it makes of it. Values
+/// are rendered as TOML, the form the config file writes them in, so a
+/// string keeps its quotes.
+#[derive(Debug, Clone, Serialize)]
 pub struct Setting {
     /// The table it lives in: `general`, `providers.ollama`, and so on.
     pub section: String,
@@ -97,7 +107,7 @@ impl Setting {
 /// A key in the file that no setting corresponds to. Every section sets
 /// `deny_unknown_fields`, so one of these is why the binary refuses the
 /// file rather than a setting that quietly does nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UnknownKey {
     /// Dotted path as the file writes it: `retrieval.topk`.
     pub path: String,
@@ -108,7 +118,7 @@ pub struct UnknownKey {
 
 /// An environment variable this binary reads, and whether it is set. The
 /// value is never recorded: some of these hold credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnvVar {
     pub name: String,
     pub set: bool,
@@ -222,6 +232,65 @@ impl Inspection {
             .iter()
             .filter(|s| !s.is_default() || s.file_value.is_some())
     }
+
+    /// The settings `filter` keeps, in file order.
+    #[must_use]
+    pub fn shown(&self, filter: SettingFilter) -> Vec<&Setting> {
+        match filter {
+            SettingFilter::All => self.settings.iter().collect(),
+            SettingFilter::Changed => self.changed().collect(),
+        }
+    }
+
+    /// The whole report as one document, as `quack config --json` writes
+    /// it.
+    #[must_use]
+    pub fn report(&self, filter: SettingFilter) -> Report<'_> {
+        let (state, error) = match &self.file_state {
+            FileState::Missing => ("missing", None),
+            FileState::Loaded => ("loaded", None),
+            FileState::Rejected(error) => ("rejected", Some(error.as_str())),
+        };
+        Report {
+            config_file: ConfigFile {
+                path: self.config_path.display().to_string(),
+                state,
+                error,
+            },
+            data_dir: self.config.data_dir().display().to_string(),
+            settings: self.shown(filter),
+            unrecognized: &self.unknown,
+            environment: &self.environment,
+        }
+    }
+}
+
+/// Which settings a report lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingFilter {
+    /// Every recognized setting.
+    All,
+    /// Only those the file or the environment has a say in.
+    Changed,
+}
+
+/// An inspection as one document.
+#[derive(Debug, Serialize)]
+pub struct Report<'a> {
+    pub config_file: ConfigFile<'a>,
+    pub data_dir: String,
+    pub settings: Vec<&'a Setting>,
+    pub unrecognized: &'a [UnknownKey],
+    pub environment: &'a [EnvVar],
+}
+
+/// Where the config file is and what became of it: `missing`, `loaded`,
+/// or `rejected` with the error.
+#[derive(Debug, Serialize)]
+pub struct ConfigFile<'a> {
+    pub path: String,
+    pub state: &'static str,
+    pub error: Option<&'a str>,
 }
 
 /// Every section and the keys it accepts. A test probes each section

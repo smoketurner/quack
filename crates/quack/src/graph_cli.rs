@@ -2,7 +2,6 @@
 //! the mapped tables and the documents, keep it in step with the ontology,
 //! and review merge proposals. Design doc 6.4.
 
-use std::fmt;
 use std::io::Write;
 
 use anyhow::{Context, Result};
@@ -18,9 +17,9 @@ use quack_core::ontology::store as ontology_store;
 use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
-use serde::Serialize;
 
 use crate::confirm::Confirm;
+use crate::text_or_json::TextOrJson;
 
 #[derive(Subcommand)]
 pub(crate) enum GraphAction {
@@ -113,32 +112,6 @@ impl ExtractArgs {
     }
 }
 
-/// How a result is printed: the text rendering, or pretty JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GraphFormat {
-    Text,
-    Json,
-}
-
-impl GraphFormat {
-    /// `--json`, or the text rendering.
-    pub(crate) const fn of(json: bool) -> Self {
-        if json { Self::Json } else { Self::Text }
-    }
-
-    pub(crate) fn write<T: Serialize + fmt::Display>(
-        self,
-        out: &mut impl Write,
-        value: &T,
-    ) -> Result<()> {
-        match self {
-            Self::Json => writeln!(out, "{}", serde_json::to_string_pretty(value)?)?,
-            Self::Text => write!(out, "{value}")?,
-        }
-        Ok(())
-    }
-}
-
 /// A command step that runs on the workspace writer's thread: it renders
 /// there into a buffer, and the bytes come back to be written to `out`
 /// (which cannot cross to that thread).
@@ -186,7 +159,7 @@ pub(crate) async fn run(
         GraphAction::Extract(args) => run_extract(config, db, out, &args, control).await?,
         GraphAction::Status { json } => {
             db.render(out, move |db, out| {
-                GraphFormat::of(json).write(out, &graph_store::status(db)?)
+                TextOrJson::of(json).write(out, &graph_store::status(db)?)
             })
             .await?;
         }
@@ -287,7 +260,7 @@ async fn run_search(
             }
         })
         .await?;
-    GraphFormat::of(json).write(out, &result)
+    TextOrJson::of(json).write(out, &result)
 }
 
 async fn run_path(
@@ -312,7 +285,7 @@ async fn run_path(
         writeln!(out, "No path within {max_hops} hops.")?;
         return Ok(());
     }
-    GraphFormat::of(json).write(out, &result)
+    TextOrJson::of(json).write(out, &result)
 }
 
 async fn run_extract(

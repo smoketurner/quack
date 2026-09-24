@@ -143,8 +143,8 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
         UserAction::Add { username, admin } => {
             let password = read_password(&format!("Password for {username}: "))?;
             let user = control.create_user(&username, &password, admin).await?;
-            let mut entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
-            entry = entry.on(ResourceKind::User.id(&user.id));
+            let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
+                .on(ResourceKind::User.id(&user.id));
             control.record_audit(&entry).await?;
             let mut out = stdout.lock();
             writeln!(
@@ -227,9 +227,9 @@ async fn create_token(
     let (token, row) = control
         .create_token(&ws.id, &user_row.id, name, scopes, expires_at)
         .await?;
-    let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
-    entry.workspace_id = Some(ws.id.clone());
-    entry = entry.on(ResourceKind::Token.id(&row.token_hash));
+    let entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli)
+        .in_workspace(&ws.id)
+        .on(ResourceKind::Token.id(&row.token_hash));
     control.record_audit(&entry).await?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -284,9 +284,9 @@ async fn revoke_token(control: &ControlPlane, ws: &WorkspaceRow, prefix: &str) -
     .one(Record::Token, prefix)?
     .token_hash;
     control.delete_token(&hash).await?;
-    let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
-    entry.workspace_id = Some(ws.id.clone());
-    entry = entry.on(ResourceKind::Token.id(&hash));
+    let entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli)
+        .in_workspace(&ws.id)
+        .on(ResourceKind::Token.id(&hash));
     control.record_audit(&entry).await?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -310,7 +310,7 @@ pub(crate) async fn run_member(
                 .await?
                 .with_context(|| format!("no user named '{username}'"))?;
             control.set_member(&ws.id, &user.id, role).await?;
-            audit_member(&control, &ws, &user.id).await?;
+            control.record_audit(&member_entry(&ws, &user.id)).await?;
             let mut out = stdout.lock();
             writeln!(out, "{} is now {role} of '{}'.", user.username, ws.name)?;
             out.flush()?;
@@ -321,7 +321,7 @@ pub(crate) async fn run_member(
                 .await?
                 .with_context(|| format!("no user named '{username}'"))?;
             let removed = control.remove_member(&ws.id, &user.id).await?;
-            audit_member(&control, &ws, &user.id).await?;
+            control.record_audit(&member_entry(&ws, &user.id)).await?;
             let mut out = stdout.lock();
             if removed {
                 writeln!(out, "Removed {} from '{}'.", user.username, ws.name)?;
@@ -355,12 +355,11 @@ pub(crate) async fn run_member(
     Ok(())
 }
 
-async fn audit_member(control: &ControlPlane, ws: &WorkspaceRow, user_id: &str) -> Result<()> {
-    let mut entry = AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli);
-    entry.workspace_id = Some(ws.id.clone());
-    entry = entry.on(ResourceKind::User.id(user_id));
-    control.record_audit(&entry).await?;
-    Ok(())
+/// The audit row for a membership change to `user_id` in `ws`.
+fn member_entry(ws: &WorkspaceRow, user_id: &str) -> AuditEntry {
+    AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli)
+        .in_workspace(&ws.id)
+        .on(ResourceKind::User.id(user_id))
 }
 
 pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
