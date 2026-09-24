@@ -320,7 +320,7 @@ impl ProviderAuth {
 
 /// A provider's `base_url`: an absolute `http` or `https` URL, checked
 /// when the config is read.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct BaseUrl(Cow<'static, str>);
 

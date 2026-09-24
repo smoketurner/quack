@@ -295,7 +295,7 @@ async fn expiring_token_is_refreshed_once_under_concurrency() {
 async fn refresh_keeps_the_old_refresh_token_when_the_issuer_omits_one() {
     let response: oauth2::basic::BasicTokenResponse =
         serde_json::from_str(&token_json("a", None)).unwrap_or_else(|e| fail(&e.to_string()));
-    let token = cached_from_response(&response);
+    let token = CachedToken::from_response(&response);
     assert!(token.refresh_token.is_none());
     assert!(token.is_fresh(Timestamp::now(), REUSE_MARGIN));
 }
@@ -499,10 +499,10 @@ async fn discovery_failure_is_reported_with_the_url() {
 fn shared_manager_is_one_per_provider() {
     let dir = temp();
     let oauth = oauth_config("http://127.0.0.1:9", false);
-    let a = shared_manager(dir.path(), &name("shared"), &oauth);
-    let b = shared_manager(dir.path(), &name("shared"), &oauth);
+    let a = TokenManager::shared(dir.path(), &name("shared"), &oauth);
+    let b = TokenManager::shared(dir.path(), &name("shared"), &oauth);
     assert!(matches!((&a, &b), (Ok(a), Ok(b)) if Arc::ptr_eq(a, b)));
-    let other = shared_manager(dir.path(), &name("other"), &oauth);
+    let other = TokenManager::shared(dir.path(), &name("other"), &oauth);
     assert!(matches!((&a, &other), (Ok(a), Ok(o)) if !Arc::ptr_eq(a, o)));
 }
 

@@ -103,7 +103,7 @@ impl Gate {
                 Ok(()) => return,
                 // A waiter that gave up (its request was dropped): disarm
                 // the returned permit so its drop does not re-enter here.
-                Err(mut unclaimed) => unclaimed.armed = false,
+                Err(unclaimed) => unclaimed.disarm(),
             }
         }
     }
@@ -115,45 +115,61 @@ impl Gate {
 }
 
 /// One held permit; dropping it passes it on.
-struct GatePermit {
-    gate: Arc<Gate>,
-    armed: bool,
-}
+struct GatePermit(Option<Arc<Gate>>);
 
 impl GatePermit {
     fn new(gate: &Arc<Gate>) -> Self {
-        Self {
-            gate: Arc::clone(gate),
-            armed: true,
-        }
+        Self(Some(Arc::clone(gate)))
+    }
+
+    /// Drop without passing the permit on: the gate already counted it.
+    fn disarm(mut self) {
+        self.0 = None;
     }
 }
 
 impl Drop for GatePermit {
     fn drop(&mut self) {
-        if self.armed {
-            self.gate.release();
+        if let Some(gate) = self.0.take() {
+            gate.release();
         }
     }
 }
 
-/// The gates, by provider name, base URL, and model.
-fn registry() -> &'static Mutex<HashMap<String, Arc<Gate>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Gate>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// A provider as its gates know it: two entries with one name and base URL
+/// share their limits.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderKey {
+    name: ProviderName,
+    base_url: Option<BaseUrl>,
 }
 
-/// The model a request names in its JSON body (`""` when it names none, as
-/// Ollama's `GET api/ps` does).
-fn model_of(body: &[u8]) -> String {
-    #[derive(serde::Deserialize)]
-    struct Named {
-        model: Option<String>,
+/// Which gate a request waits at: its provider, and the model its body
+/// names (none for a request that names no model, as Ollama's
+/// `GET api/ps`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GateKey {
+    provider: ProviderKey,
+    model: Option<String>,
+}
+
+impl GateKey {
+    /// The gates, process-wide.
+    fn registry() -> &'static Mutex<HashMap<Self, Arc<Gate>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<GateKey, Arc<Gate>>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
     }
-    serde_json::from_slice::<Named>(body)
-        .ok()
-        .and_then(|n| n.model)
-        .unwrap_or_default()
+
+    /// The model a request names in its JSON body.
+    fn model_of(body: &[u8]) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct Named {
+            model: Option<String>,
+        }
+        serde_json::from_slice::<Named>(body)
+            .ok()
+            .and_then(|n| n.model)
+    }
 }
 
 /// A reqwest client that takes a permit of its provider's limit for the
@@ -163,9 +179,8 @@ fn model_of(body: &[u8]) -> String {
 #[derive(Clone, Default)]
 pub struct LimitedHttp {
     inner: reqwest::Client,
-    /// The provider's gate key (`name\0base_url`) and its limit, or `None`
-    /// for the unlimited default.
-    provider: Option<(Arc<str>, RequestLimit)>,
+    /// The provider and its limit, or `None` for the unlimited default.
+    provider: Option<(ProviderKey, RequestLimit)>,
 }
 
 impl std::fmt::Debug for LimitedHttp {
@@ -183,10 +198,10 @@ impl LimitedHttp {
         Self {
             inner: reqwest::Client::default(),
             provider: Some((
-                Arc::from(format!(
-                    "{name}\u{0}{}",
-                    provider.base_url.as_ref().map_or("", BaseUrl::as_str)
-                )),
+                ProviderKey {
+                    name: name.clone(),
+                    base_url: provider.base_url.clone(),
+                },
                 provider.request_limit(),
             )),
         }
@@ -194,10 +209,15 @@ impl LimitedHttp {
 
     /// The gate for `model`, created with this client's limit on first use;
     /// a later config for the same provider in one process keeps the first.
-    fn gate(&self, model: &str) -> Option<Arc<Gate>> {
+    fn gate(&self, model: Option<String>) -> Option<Arc<Gate>> {
         let (provider, limit) = self.provider.as_ref()?;
-        let key = format!("{provider}\u{0}{model}");
-        let mut map = registry().lock().unwrap_or_else(PoisonError::into_inner);
+        let key = GateKey {
+            provider: provider.clone(),
+            model,
+        };
+        let mut map = GateKey::registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         Some(Arc::clone(map.entry(key).or_insert_with(|| {
             Gate::new(usize::try_from(limit.get()).unwrap_or(1))
         })))
@@ -259,7 +279,7 @@ impl HttpClientExt for LimitedHttp {
         // is chosen by the model it names.
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let gate = self.gate(&model_of(&body));
+        let gate = self.gate(GateKey::model_of(&body));
         let priority = current_priority();
         async move {
             let permit = Self::permit(gate, priority).await;
@@ -276,7 +296,7 @@ impl HttpClientExt for LimitedHttp {
         U: From<Bytes> + Send + 'static,
     {
         let inner = self.inner.clone();
-        let gate = self.gate("");
+        let gate = self.gate(None);
         let priority = current_priority();
         async move {
             let permit = Self::permit(gate, priority).await;
@@ -295,7 +315,7 @@ impl HttpClientExt for LimitedHttp {
         let inner = self.inner.clone();
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let gate = self.gate(&model_of(&body));
+        let gate = self.gate(GateKey::model_of(&body));
         let priority = current_priority();
         async move {
             let permit = Self::permit(gate, priority).await;
@@ -420,7 +440,9 @@ mod tests {
             assert_eq!(&body[..], b"ok");
         }
         assert_eq!(peak.load(Ordering::SeqCst), 2);
-        let gate = limited.gate("m").unwrap_or_else(|| fail("no gate"));
+        let gate = limited
+            .gate(Some(String::from("m")))
+            .unwrap_or_else(|| fail("no gate"));
         assert_eq!(gate.available(), 2, "every permit came back");
 
         // Ollama defaults to one at a time, hosted APIs to eight.
@@ -458,8 +480,11 @@ mod tests {
             );
         }
         assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert_eq!(model_of(br#"{"model":"x","input":["a"]}"#), "x");
-        assert_eq!(model_of(b""), "");
+        assert_eq!(
+            GateKey::model_of(br#"{"model":"x","input":["a"]}"#).as_deref(),
+            Some("x")
+        );
+        assert_eq!(GateKey::model_of(b""), None);
     }
 
     #[tokio::test]

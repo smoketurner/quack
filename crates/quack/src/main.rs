@@ -24,7 +24,7 @@ use quack_core::error::{Error as CoreError, Record};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
-use quack_core::llm::oauth::{self, LoginOptions, LoginPrompt, TokenManager};
+use quack_core::llm::oauth::{LoginOptions, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, candidates, store as ontology_store};
@@ -1080,7 +1080,7 @@ fn oauth_manager(config: &Config, name: &str) -> Result<Arc<TokenManager>> {
     let Some(oauth) = provider.auth.oauth() else {
         anyhow::bail!("provider '{name}' does not use auth = \"oauth\"");
     };
-    oauth::shared_manager(&config.tokens_dir(), name, oauth)
+    TokenManager::shared(&config.tokens_dir(), name, oauth)
         .context("failed to prepare the OAuth token manager")
 }
 

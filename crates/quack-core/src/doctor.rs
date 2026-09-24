@@ -20,7 +20,8 @@ use crate::config::{
 use crate::embedding::Dimension;
 use crate::embedding::{PromptSource, ResolvedPrompts};
 use crate::error::Error;
-use crate::llm::{OllamaRunningModels, oauth};
+use crate::llm::OllamaRunningModels;
+use crate::llm::oauth::TokenManager;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::Count;
@@ -772,7 +773,7 @@ async fn oauth_token(
     oauth: &OAuthConfig,
 ) -> std::result::Result<String, String> {
     let manager =
-        oauth::shared_manager(&config.tokens_dir(), name, oauth).map_err(|e| e.to_string())?;
+        TokenManager::shared(&config.tokens_dir(), name, oauth).map_err(|e| e.to_string())?;
     let status = manager.status().await.map_err(|e| e.to_string())?;
     if !status.logged_in {
         return Err(format!("provider '{name}' uses OAuth and is not logged in"));

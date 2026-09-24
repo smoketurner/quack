@@ -72,26 +72,6 @@ enum HttpError {
 type HttpFuture =
     Pin<Box<dyn Future<Output = std::result::Result<oauth2::HttpResponse, HttpError>> + Send>>;
 
-/// Bridge from the `oauth2` crate's request type to the rustls + aws-lc-rs
-/// reqwest client the rest of the crate uses. Redirects are refused, as the
-/// crate's own client does, so a token endpoint cannot bounce credentials
-/// elsewhere.
-fn http_client(client: reqwest::Client) -> impl Fn(oauth2::HttpRequest) -> HttpFuture {
-    move |request| {
-        let client = client.clone();
-        Box::pin(async move {
-            let request = reqwest::Request::try_from(request)?;
-            let response = client.execute(request).await?;
-            let status = response.status();
-            let headers = response.headers().clone();
-            let body = response.bytes().await?.to_vec();
-            let mut out = http::Response::builder().status(status).body(body)?;
-            *out.headers_mut() = headers;
-            Ok(out)
-        })
-    }
-}
-
 /// What the interface must show the user during a login.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginPrompt {
@@ -148,6 +128,58 @@ impl std::fmt::Debug for TokenManager {
 }
 
 impl TokenManager {
+    /// One manager per provider per process, shared across turns and (later)
+    /// server requests so refreshes serialize.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is not configured for OAuth or the
+    /// manager cannot be built.
+    pub fn shared(
+        tokens_dir: &Path,
+        name: &ProviderName,
+        oauth: &OAuthConfig,
+    ) -> Result<Arc<Self>> {
+        static MANAGERS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokenManager>>>> = OnceLock::new();
+        let key = tokens_dir.join(name.as_str());
+        let mut managers = MANAGERS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .map_err(|e| Error::Llm(format!("token manager registry poisoned: {e}")))?;
+        if let Some(existing) = managers.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        let manager = Arc::new(Self::new(
+            tokens_dir,
+            name,
+            oauth.clone(),
+            KeySource::Keychain,
+        )?);
+        managers.insert(key, Arc::clone(&manager));
+        Ok(manager)
+    }
+
+    /// Bridge from the `oauth2` crate's request type to the rustls + aws-lc-rs
+    /// reqwest client the rest of the crate uses. Redirects are refused, as the
+    /// crate's own client does, so a token endpoint cannot bounce credentials
+    /// elsewhere.
+    fn oauth_http(&self) -> impl Fn(oauth2::HttpRequest) -> HttpFuture + use<> {
+        let client = self.http.clone();
+        move |request| {
+            let client = client.clone();
+            Box::pin(async move {
+                let request = reqwest::Request::try_from(request)?;
+                let response = client.execute(request).await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.bytes().await?.to_vec();
+                let mut out = http::Response::builder().status(status).body(body)?;
+                *out.headers_mut() = headers;
+                Ok(out)
+            })
+        }
+    }
+
     /// A manager for `provider`, caching under `tokens_dir`.
     ///
     /// # Errors
@@ -237,13 +269,13 @@ impl TokenManager {
     async fn refresh(&self, refresh: &SecretString) -> Result<CachedToken> {
         tracing::info!(provider = %self.provider, "refreshing the OAuth access token");
         let client = self.client().await?;
-        let http = http_client(self.http.clone());
+        let http = self.oauth_http();
         let response = client
             .exchange_refresh_token(&RefreshToken::new(refresh.expose_secret().to_owned()))
             .request_async(&http)
             .await
             .map_err(|e| self.auth_required(AuthReason::RefreshFailed(e.to_string())))?;
-        let mut token = cached_from_response(&response);
+        let mut token = CachedToken::from_response(&response);
         if token.refresh_token.is_none() {
             token.refresh_token = Some(refresh.clone());
         }
@@ -315,14 +347,14 @@ impl TokenManager {
             ))
         })??;
 
-        let http = http_client(self.http.clone());
+        let http = self.oauth_http();
         let response = client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(verifier)
             .request_async(&http)
             .await
             .map_err(|e| Error::Llm(format!("code exchange failed: {e}")))?;
-        Ok(cached_from_response(&response))
+        Ok(CachedToken::from_response(&response))
     }
 
     async fn login_device_code(
@@ -330,7 +362,7 @@ impl TokenManager {
         notify: &(dyn Fn(LoginPrompt) + Sync),
     ) -> Result<CachedToken> {
         let client = self.client().await?;
-        let http = http_client(self.http.clone());
+        let http = self.oauth_http();
         let details: StandardDeviceAuthorizationResponse = client
             .exchange_device_code()
             .map_err(|_| {
@@ -356,7 +388,7 @@ impl TokenManager {
             .request_async(&http, tokio::time::sleep, None)
             .await
             .map_err(|e| Error::Llm(format!("device login failed: {e}")))?;
-        Ok(cached_from_response(&response))
+        Ok(CachedToken::from_response(&response))
     }
 
     /// Whether a token is cached, and its lifetime, without any network use.
@@ -466,19 +498,23 @@ impl TokenManager {
     }
 }
 
-fn cached_from_response<T: TokenResponse>(response: &T) -> CachedToken {
-    let lifetime = response
-        .expires_in()
-        .and_then(|d| SignedDuration::try_from(d).ok())
-        .unwrap_or(DEFAULT_LIFETIME);
-    CachedToken {
-        access_token: SecretString::from(response.access_token().secret().clone()),
-        expires_at: Timestamp::now()
-            .checked_add(lifetime)
-            .unwrap_or(Timestamp::MAX),
-        refresh_token: response
-            .refresh_token()
-            .map(|t| SecretString::from(t.secret().clone())),
+impl CachedToken {
+    /// The token a token endpoint answered with; an answer without a
+    /// lifetime gets the default one.
+    fn from_response<T: TokenResponse>(response: &T) -> Self {
+        let lifetime = response
+            .expires_in()
+            .and_then(|d| SignedDuration::try_from(d).ok())
+            .unwrap_or(DEFAULT_LIFETIME);
+        Self {
+            access_token: SecretString::from(response.access_token().secret().clone()),
+            expires_at: Timestamp::now()
+                .checked_add(lifetime)
+                .unwrap_or(Timestamp::MAX),
+            refresh_token: response
+                .refresh_token()
+                .map(|t| SecretString::from(t.secret().clone())),
+        }
     }
 }
 
@@ -523,7 +559,7 @@ async fn wait_for_callback(
             .strip_prefix(path)
             .and_then(|rest| rest.strip_prefix('?'))
         else {
-            respond(&mut stream, "404 Not Found", "Not found.").await;
+            respond(&mut stream, http::StatusCode::NOT_FOUND, "Not found.").await;
             continue;
         };
         let params: HashMap<String, String> = oauth2::url::form_urlencoded::parse(query.as_bytes())
@@ -532,7 +568,7 @@ async fn wait_for_callback(
         if params.get("state").map(String::as_str) != Some(expected_state) {
             respond(
                 &mut stream,
-                "400 Bad Request",
+                http::StatusCode::BAD_REQUEST,
                 "State mismatch; start the login again.",
             )
             .await;
@@ -544,7 +580,7 @@ async fn wait_for_callback(
                 .map_or(String::new(), |d| format!(": {d}"));
             respond(
                 &mut stream,
-                "200 OK",
+                http::StatusCode::OK,
                 "Login failed. You can close this window.",
             )
             .await;
@@ -553,12 +589,12 @@ async fn wait_for_callback(
             )));
         }
         let Some(code) = params.get("code") else {
-            respond(&mut stream, "400 Bad Request", "Missing code.").await;
+            respond(&mut stream, http::StatusCode::BAD_REQUEST, "Missing code.").await;
             continue;
         };
         respond(
             &mut stream,
-            "200 OK",
+            http::StatusCode::OK,
             "Login complete. You can close this window and return to quack.",
         )
         .await;
@@ -566,46 +602,17 @@ async fn wait_for_callback(
     }
 }
 
-async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+async fn respond(stream: &mut tokio::net::TcpStream, status: http::StatusCode, body: &str) {
     let page = format!("<!doctype html><title>quack</title><p>{body}</p>");
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or_default(),
         page.len()
     );
     // The browser has what it needs; a failed write changes nothing.
     drop(stream.write_all(response.as_bytes()).await);
     drop(stream.shutdown().await);
-}
-
-/// One manager per provider per process, shared across turns and (later)
-/// server requests so refreshes serialize.
-///
-/// # Errors
-///
-/// Returns an error when the provider is not configured for OAuth or the
-/// manager cannot be built.
-pub fn shared_manager(
-    tokens_dir: &Path,
-    name: &ProviderName,
-    oauth: &OAuthConfig,
-) -> Result<Arc<TokenManager>> {
-    static MANAGERS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokenManager>>>> = OnceLock::new();
-    let key = tokens_dir.join(name.as_str());
-    let mut managers = MANAGERS
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .map_err(|e| Error::Llm(format!("token manager registry poisoned: {e}")))?;
-    if let Some(existing) = managers.get(&key) {
-        return Ok(Arc::clone(existing));
-    }
-    let manager = Arc::new(TokenManager::new(
-        tokens_dir,
-        name,
-        oauth.clone(),
-        KeySource::Keychain,
-    )?);
-    managers.insert(key, Arc::clone(&manager));
-    Ok(manager)
 }
 
 #[cfg(test)]
