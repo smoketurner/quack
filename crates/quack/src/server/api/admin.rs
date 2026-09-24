@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
-    AuditAction, AuditCursor, AuditFilter, Outcome, ResourceKind, UserKind, UserRow,
+    AuditAction, AuditCursor, AuditFilter, AuditRow, Outcome, ResourceKind, UserKind, UserRow,
 };
 use serde::Deserialize;
 
@@ -70,6 +70,19 @@ pub(crate) struct AuditQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
     pub cursor: Option<AuditCursor>,
+    #[serde(default)]
+    pub format: AuditShape,
+}
+
+/// How each row of an audit page is shaped.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AuditShape {
+    /// The stored row's own fields.
+    #[default]
+    Quack,
+    /// An OCSF 1.9.0 event.
+    Ocsf,
 }
 
 fn default_limit() -> u32 {
@@ -98,8 +111,18 @@ pub(crate) async fn audit(
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     identity.require_admin()?;
+    let shape = q.format;
     let page = app.control.query_audit(&AuditFilter::from(q)).await?;
+    let audit = match shape {
+        AuditShape::Quack => serde_json::to_value(&page.rows)?,
+        AuditShape::Ocsf => serde_json::Value::Array(
+            page.rows
+                .iter()
+                .map(AuditRow::to_ocsf)
+                .collect::<quack_core::error::Result<_>>()?,
+        ),
+    };
     Ok(Json(
-        serde_json::json!({ "audit": page.rows, "next_cursor": page.next }),
+        serde_json::json!({ "audit": audit, "next_cursor": page.next }),
     ))
 }

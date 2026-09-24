@@ -127,9 +127,11 @@ impl AuditRow {
             .and_then(|dt| dt.to_zoned(TimeZone::UTC))
             .map_err(|e| Error::Config(format!("audit timestamp {:?}: {e}", self.timestamp)))?
             .timestamp();
-        let user = self.user_id.as_ref().map_or_else(
-            || json!({ "name": "unknown", "type_id": 0 }),
-            |id| json!({ "uid": id }),
+        let user = self.user_id.as_ref().map(|id| json!({ "uid": id }));
+        // An operator at the shell has no user row: the CLI is the actor.
+        let actor = user.clone().map_or_else(
+            || json!({ "application": { "name": format!("quack {}", self.channel) } }),
+            |user| json!({ "user": user }),
         );
         // CLI and terminal rows have no client address: they ran on the host.
         let src_endpoint = self
@@ -176,12 +178,13 @@ impl AuditRow {
             },
         });
         let fields = match class {
+            // Authentication requires a user; an unknown account is type 0.
             EventClass::Authentication(_) => json!({
-                "user": user,
+                "user": user.unwrap_or_else(|| json!({ "name": "unknown", "type_id": 0 })),
                 "service": { "name": "quack" },
             }),
             EventClass::Api(_) => json!({
-                "actor": { "user": user },
+                "actor": actor,
                 "api": { "operation": self.action },
                 "resources": resources,
             }),
@@ -189,7 +192,21 @@ impl AuditRow {
         if let (Some(event), Some(fields)) = (event.as_object_mut(), fields.as_object()) {
             event.extend(fields.clone());
         }
-        Ok(event)
+        Ok(without_nulls(event))
+    }
+}
+
+/// OCSF leaves an attribute out rather than setting it to null.
+fn without_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, without_nulls(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(without_nulls).collect()),
+        other => other,
     }
 }
 
@@ -249,7 +266,7 @@ mod tests {
                 assert!(event["user"].is_object() && event["service"]["name"].is_string());
             }
             Some(6003) => {
-                assert!(event["actor"]["user"].is_object(), "{event}");
+                assert!(event["actor"].is_object(), "{event}");
                 assert!(event["api"]["operation"].is_string(), "{event}");
                 assert!(event["src_endpoint"].is_object(), "{event}");
             }
@@ -316,12 +333,20 @@ mod tests {
         let mut cli = row("workspace", Outcome::Allowed);
         cli.client_addr = None;
         cli.channel = Channel::Cli;
+        cli.user_id = None;
+        cli.request_id = None;
         let event = render(&cli);
         assert_required(&event);
         assert_eq!(event["type_uid"], 600_399);
         assert_eq!(event["activity_name"], "workspace");
         assert_eq!(event["src_endpoint"]["name"], "local");
         assert_eq!(event["unmapped"]["channel"], "cli");
+        assert_eq!(event["actor"]["application"]["name"], "quack cli");
+        assert!(
+            event["metadata"].get("correlation_uid").is_none(),
+            "{event}"
+        );
+        assert!(event["unmapped"].get("token_hash").is_none(), "{event}");
 
         let retired = render(&row("retired_action", Outcome::Allowed));
         assert_eq!(retired["type_uid"], 600_399);
