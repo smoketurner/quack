@@ -18,7 +18,7 @@ use crate::storage::writer::Writer;
 
 use super::chart::{ChartKind, ChartSpec};
 use super::citations::{ChunkLocation, Markers};
-use super::events::{self, TurnRecorder};
+use super::events::{self, ToolName, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, ModelReranker, Reranker};
 use crate::config::{RerankMode, RetrievalConfig};
@@ -510,7 +510,7 @@ pub struct RunSqlArgs {
 }
 
 impl Tool for RunSqlTool {
-    const NAME: &'static str = "run_sql";
+    const NAME: &'static str = ToolName::RunSql.as_str();
     type Error = ToolError;
     type Args = RunSqlArgs;
     type Output = String;
@@ -533,7 +533,10 @@ impl Tool for RunSqlTool {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.gate.recorder.start(Self::NAME, args.query.trim());
+        let step = self
+            .gate
+            .recorder
+            .start(ToolName::RunSql, args.query.trim());
         let read_only = match self.gate.check(&args.query).await? {
             Gate::Reject(message) => {
                 step.finish("refused");
@@ -573,7 +576,7 @@ impl Tool for RunSqlTool {
         }
         match results {
             Ok(results) => {
-                step.finish(format!("{} rows", results.total_rows));
+                step.finish_rows(u64::try_from(results.total_rows).unwrap_or(u64::MAX));
                 let mut text = results.to_model_text()?;
                 if let Some(note) = self.repeated_note(&args.query, shape) {
                     text.push('\n');
@@ -703,7 +706,7 @@ impl<M> Tool for SearchDocumentsTool<M>
 where
     M: EmbeddingModel + Send + Sync,
 {
-    const NAME: &'static str = "search_documents";
+    const NAME: &'static str = ToolName::SearchDocuments.as_str();
     type Error = ToolError;
     type Args = SearchDocumentsArgs;
     type Output = String;
@@ -752,7 +755,7 @@ where
                 args.document_ids.join(", ")
             ),
         };
-        let step = self.recorder.start(Self::NAME, &detail);
+        let step = self.recorder.start(ToolName::SearchDocuments, &detail);
         let query_vec: Option<Vector> = match &self.embedding_model {
             None => None,
             Some(model) => {
@@ -937,7 +940,7 @@ pub struct DescribeTableArgs {
 }
 
 impl Tool for DescribeTableTool {
-    const NAME: &'static str = "describe_table";
+    const NAME: &'static str = ToolName::DescribeTable.as_str();
     type Error = ToolError;
     type Args = DescribeTableArgs;
     type Output = String;
@@ -955,7 +958,10 @@ impl Tool for DescribeTableTool {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.0.recorder.start(Self::NAME, &args.table_name);
+        let step = self
+            .0
+            .recorder
+            .start(ToolName::DescribeTable, &args.table_name);
         let table_name = args.table_name.clone();
         let outcome = self
             .0
@@ -1015,7 +1021,7 @@ impl Tool for DescribeTableTool {
 pub struct ListTablesTool(pub ToolDeps);
 
 impl Tool for ListTablesTool {
-    const NAME: &'static str = "list_tables";
+    const NAME: &'static str = ToolName::ListTables.as_str();
     type Error = ToolError;
     type Args = NoArgs;
     type Output = String;
@@ -1033,7 +1039,7 @@ impl Tool for ListTablesTool {
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.0.recorder.start(Self::NAME, "");
+        let step = self.0.recorder.start(ToolName::ListTables, "");
         // One reader round trip for the listing and every table's row
         // count, rather than one per table; each count is its own
         // timeout-guarded statement, so one huge table cannot pin the
@@ -1074,7 +1080,7 @@ impl Tool for ListTablesTool {
 pub struct ListDocumentsTool(pub ToolDeps);
 
 impl Tool for ListDocumentsTool {
-    const NAME: &'static str = "list_documents";
+    const NAME: &'static str = ToolName::ListDocuments.as_str();
     type Error = ToolError;
     type Args = NoArgs;
     type Output = String;
@@ -1092,7 +1098,7 @@ impl Tool for ListDocumentsTool {
         _context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.0.recorder.start(Self::NAME, "");
+        let step = self.0.recorder.start(ToolName::ListDocuments, "");
         let docs = self.0.db.with_db(WorkspaceDb::list_documents).await?;
         step.finish(format!("{} documents", docs.len()));
         if docs.is_empty() {
@@ -1186,7 +1192,7 @@ pub struct CreateChartArgs {
 }
 
 impl Tool for CreateChartTool {
-    const NAME: &'static str = "create_chart";
+    const NAME: &'static str = ToolName::CreateChart.as_str();
     type Error = ToolError;
     type Args = CreateChartArgs;
     type Output = String;
@@ -1207,7 +1213,10 @@ impl Tool for CreateChartTool {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.gate.recorder.start(Self::NAME, args.sql.trim());
+        let step = self
+            .gate
+            .recorder
+            .start(ToolName::CreateChart, args.sql.trim());
         if let Gate::Reject(message) = self.gate.check(&args.sql).await? {
             step.finish("rejected");
             return Ok(format!("Chart query rejected. {message}"));
@@ -2431,7 +2440,7 @@ impl<M> Tool for SearchGraphTool<M>
 where
     M: EmbeddingModel + Send + Sync,
 {
-    const NAME: &'static str = "search_graph";
+    const NAME: &'static str = ToolName::SearchGraph.as_str();
     type Error = ToolError;
     type Args = SearchGraphArgs;
     type Output = String;
@@ -2461,7 +2470,7 @@ where
             (None, Some(c)) => format!("class {c}"),
             (None, None) => String::new(),
         };
-        let step = tools.recorder.start(Self::NAME, &detail);
+        let step = tools.recorder.start(ToolName::SearchGraph, &detail);
         let query = match GraphQuery::new(
             args.entity.get(),
             args.class.get(),
@@ -2537,7 +2546,7 @@ impl<M> Tool for FindPathTool<M>
 where
     M: EmbeddingModel + Send + Sync,
 {
-    const NAME: &'static str = "find_path";
+    const NAME: &'static str = ToolName::FindPath.as_str();
     type Error = ToolError;
     type Args = FindPathArgs;
     type Output = String;
@@ -2560,7 +2569,7 @@ where
     ) -> Result<Self::Output, Self::Error> {
         let tools = &self.0;
         let step = tools.recorder.start(
-            Self::NAME,
+            ToolName::FindPath,
             &format!("{} -> {}", args.from.trim(), args.to.trim()),
         );
         let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
@@ -2779,7 +2788,7 @@ pub struct DescribeClassArgs {
 }
 
 impl Tool for DescribeClassTool {
-    const NAME: &'static str = "describe_class";
+    const NAME: &'static str = ToolName::DescribeClass.as_str();
     type Error = ToolError;
     type Args = DescribeClassArgs;
     type Output = String;
@@ -2804,7 +2813,7 @@ impl Tool for DescribeClassTool {
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let class_id = args.class_id.trim().to_owned();
-        let step = self.0.recorder.start(Self::NAME, &class_id);
+        let step = self.0.recorder.start(ToolName::DescribeClass, &class_id);
         let text = self
             .0
             .db

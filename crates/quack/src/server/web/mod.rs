@@ -20,7 +20,7 @@ use axum_extra::extract::CookieJar;
 // Multi-valued fields (checkboxes) need serde_html_form, which axum's own
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
-use quack_core::analysis::citations::Citation;
+use quack_core::analysis::events::ToolStep;
 use quack_core::ids::{
     CandidateId, ClassId, DocumentId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
 };
@@ -34,7 +34,7 @@ use quack_core::storage::control::{
     AuditAction, AuditFilter, AuditRow, Expiry, MemberRow, Outcome, ProviderAllowList,
     ResourceKind, Role, Scope, TokenRow, UserRow, WorkspaceChanges,
 };
-use quack_core::storage::sessions::{self, MessageRole, SessionRow};
+use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource, SamplePool};
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -234,18 +234,11 @@ struct MessageView {
     role: String,
     /// Rendered HTML for assistant answers; escaped text for user messages.
     content_html: String,
-    steps: Vec<StepView>,
+    steps: Vec<ToolStep>,
     citations: Vec<CitationView>,
     chart_json: Option<String>,
     /// One JSON `GraphResult` per graph tool call the turn made.
     graphs: Vec<String>,
-}
-
-struct StepView {
-    tool: String,
-    detail: String,
-    summary: String,
-    duration_ms: u64,
 }
 
 struct CitationView {
@@ -721,83 +714,59 @@ struct ChatQuery {
 }
 
 impl MessageView {
-    /// A stored message as the chat page shows it; tool messages are
-    /// folded into the answer after them.
-    fn of(row: &sessions::MessageRow) -> Option<Self> {
-        let role = match row.role {
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-            MessageRole::Tool => return None,
-        };
-        let meta = row.metadata.clone().unwrap_or(serde_json::Value::Null);
-        let steps = meta
-            .get("steps")
-            .and_then(|s| s.as_array())
-            .map(|steps| {
-                steps
-                    .iter()
-                    .map(|s| StepView {
-                        tool: s
-                            .get("tool")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                        detail: s
-                            .get("detail")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                        summary: s
-                            .get("summary")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                        duration_ms: s
-                            .get("duration_ms")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let citations = meta
-            .get("citations")
-            .and_then(|c| c.as_array())
-            .map(|cs| {
-                cs.iter()
-                    .filter_map(|c| serde_json::from_value::<Citation>(c.clone()).ok())
-                    .map(|c| CitationView {
-                        n: u64::from(c.n),
-                        label: c.label(),
-                        document_id: c.document_id,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let chart_json = meta
-            .get("chart")
-            .filter(|c| !c.is_null())
-            .map(ToString::to_string);
-        let graphs = meta
-            .get("graph")
-            .and_then(|g| g.as_array())
-            .map(|gs| gs.iter().map(ToString::to_string).collect())
-            .unwrap_or_default();
-        let content_html = if row.role == MessageRole::Assistant {
-            markdown::to_html(&row.content)
-        } else {
-            askama::filters::escape(&row.content, askama::filters::Html)
+    /// The chat page's messages: user questions, and each answer with the
+    /// tool steps recorded before it folded in.
+    fn transcript(rows: &[MessageRow]) -> Vec<Self> {
+        let mut out = Vec::new();
+        let mut steps = Vec::new();
+        for row in rows {
+            match row.role {
+                MessageRole::Tool => steps.extend(row.tool().map(|m| m.step(row.content.clone()))),
+                MessageRole::User => out.push(Self::question(row)),
+                MessageRole::Assistant => out.push(Self::answer(row, std::mem::take(&mut steps))),
+            }
+        }
+        out
+    }
+
+    fn question(row: &MessageRow) -> Self {
+        Self {
+            role: String::from("user"),
+            content_html: askama::filters::escape(&row.content, askama::filters::Html)
                 .map(|e| e.to_string())
-                .unwrap_or_default()
-        };
-        Some(MessageView {
-            role: role.to_owned(),
-            content_html,
+                .unwrap_or_default(),
+            steps: Vec::new(),
+            citations: Vec::new(),
+            chart_json: None,
+            graphs: Vec::new(),
+        }
+    }
+
+    fn answer(row: &MessageRow, steps: Vec<ToolStep>) -> Self {
+        let meta = row.assistant().cloned().unwrap_or_default();
+        Self {
+            role: String::from("assistant"),
+            content_html: markdown::to_html(&row.content),
             steps,
-            citations,
-            chart_json,
-            graphs,
-        })
+            citations: meta
+                .citations
+                .iter()
+                .map(|c| CitationView {
+                    n: u64::from(c.n),
+                    label: c.label(),
+                    document_id: c.document_id.clone(),
+                })
+                .collect(),
+            chart_json: meta
+                .chart
+                .as_ref()
+                .and_then(|c| serde_json::to_string(c).ok()),
+            graphs: meta
+                .graph
+                .iter()
+                .filter_map(|g| serde_json::to_string(g).ok())
+                .collect(),
+        }
     }
 }
 
@@ -846,7 +815,7 @@ async fn chat(
         page: Page::in_workspace(&app, "Chat", &access),
         sessions: sessions_list,
         current,
-        messages: messages.iter().filter_map(MessageView::of).collect(),
+        messages: MessageView::transcript(&messages),
         tables,
         documents,
     })
@@ -1933,6 +1902,10 @@ async fn admin_audit(
 
 #[cfg(test)]
 mod tests {
+    use quack_core::analysis::events::ToolName;
+    use quack_core::ids::MessageId;
+    use quack_core::storage::sessions::{AssistantMeta, MessageMeta, ToolMeta};
+
     use super::*;
 
     #[test]
@@ -1941,6 +1914,67 @@ mod tests {
         assert_eq!(text(&serde_json::json!("s")), "s");
         assert_eq!(text(&serde_json::Value::Null), "");
         assert_eq!(text(&serde_json::json!(4.5)), "4.5");
+    }
+
+    /// A reloaded session shows each answer with the steps recorded before
+    /// it, and a tool row whose metadata did not decode is left out.
+    #[test]
+    fn transcript_folds_tool_rows_into_the_answer_after_them() {
+        let row = |seq: i64, role: MessageRole, content: &str, metadata: Option<MessageMeta>| {
+            MessageRow {
+                id: MessageId::from(format!("m{seq}")),
+                session_id: SessionId::from("s"),
+                seq,
+                role,
+                content: content.to_owned(),
+                metadata,
+                created_at: String::new(),
+            }
+        };
+        let tool = |detail: &str| {
+            Some(MessageMeta::Tool(ToolMeta {
+                tool: ToolName::RunSql,
+                detail: detail.to_owned(),
+                duration_ms: 3,
+                rows: Some(1),
+            }))
+        };
+        let rows = vec![
+            row(1, MessageRole::User, "how many?", None),
+            row(2, MessageRole::Tool, "1 rows", tool("SELECT 1")),
+            row(3, MessageRole::Tool, "lost", None),
+            row(4, MessageRole::Tool, "1 rows", tool("SELECT 2")),
+            row(
+                5,
+                MessageRole::Assistant,
+                "Two.",
+                Some(MessageMeta::Assistant(AssistantMeta {
+                    write_refused: true,
+                    ..AssistantMeta::default()
+                })),
+            ),
+            row(6, MessageRole::User, "and now?", None),
+            row(7, MessageRole::Assistant, "Same.", None),
+        ];
+        let views = MessageView::transcript(&rows);
+        let shape: Vec<(&str, Vec<&str>)> = views
+            .iter()
+            .map(|v| {
+                (
+                    v.role.as_str(),
+                    v.steps.iter().map(|s| s.detail.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("user", vec![]),
+                ("assistant", vec!["SELECT 1", "SELECT 2"]),
+                ("user", vec![]),
+                ("assistant", vec![]),
+            ]
+        );
     }
 }
 

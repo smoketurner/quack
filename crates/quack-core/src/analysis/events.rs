@@ -20,7 +20,6 @@ use crate::error::Error;
 /// A turn's embeddings, by input (the role is part of it).
 type EmbeddingCache = HashMap<Input, Vector>;
 
-/// One tool invocation, recorded for the transcript and the final response.
 /// Lines of a step's detail every interface shows before folding the
 /// rest (the terminal's `/steps` and print mode's `--verbose` show all).
 pub const STEP_PREVIEW_LINES: usize = 3;
@@ -35,14 +34,62 @@ pub fn preview_detail(detail: &str) -> (Vec<&str>, usize) {
     )
 }
 
+/// The agent's tools, by the name the model calls each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolName {
+    RunSql,
+    SearchDocuments,
+    ListDocuments,
+    ListTables,
+    DescribeTable,
+    CreateChart,
+    SearchGraph,
+    FindPath,
+    DescribeClass,
+}
+
+text_enum!(ToolName, "tool", {
+    RunSql => "run_sql",
+    SearchDocuments => "search_documents",
+    ListDocuments => "list_documents",
+    ListTables => "list_tables",
+    DescribeTable => "describe_table",
+    CreateChart => "create_chart",
+    SearchGraph => "search_graph",
+    FindPath => "find_path",
+    DescribeClass => "describe_class",
+});
+
+impl ToolName {
+    /// Whether the step's detail is a SQL statement.
+    #[must_use]
+    pub fn takes_sql(self) -> bool {
+        match self {
+            Self::RunSql | Self::CreateChart => true,
+            Self::SearchDocuments
+            | Self::ListDocuments
+            | Self::ListTables
+            | Self::DescribeTable
+            | Self::SearchGraph
+            | Self::FindPath
+            | Self::DescribeClass => false,
+        }
+    }
+}
+
+/// One tool invocation, recorded for the transcript and the final response.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolStep {
-    pub tool: String,
+    pub tool: ToolName,
     /// What the tool was asked to do: the SQL text, the search query, the
     /// table name.
     pub detail: String,
     /// What came back, in one line: `6 rows`, `8 chunks`, `refused`.
     pub summary: String,
+    /// Rows a statement produced, on a step that ran one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
     pub duration_ms: u64,
 }
 
@@ -96,7 +143,7 @@ pub enum AgentEvent {
     /// A piece of the assistant's answer, as it streams.
     TextDelta(String),
     ToolStarted {
-        tool: String,
+        tool: ToolName,
         detail: String,
     },
     ToolFinished(ToolStep),
@@ -297,14 +344,14 @@ impl TurnRecorder {
 
     /// Announce a tool call. Finish the returned guard to record the result.
     #[must_use]
-    pub fn start(&self, tool: &str, detail: &str) -> StepInProgress {
+    pub fn start(&self, tool: ToolName, detail: &str) -> StepInProgress {
         self.emit(AgentEvent::ToolStarted {
-            tool: tool.to_owned(),
+            tool,
             detail: detail.to_owned(),
         });
         StepInProgress {
             recorder: self.clone(),
-            tool: tool.to_owned(),
+            tool,
             detail: detail.to_owned(),
             started: Instant::now(),
         }
@@ -342,17 +389,27 @@ impl TurnRecorder {
 /// A tool call that has started; call `finish` with its one-line result.
 pub struct StepInProgress {
     recorder: TurnRecorder,
-    tool: String,
+    tool: ToolName,
     detail: String,
     started: Instant,
 }
 
 impl StepInProgress {
     pub fn finish(self, summary: impl Into<String>) {
+        self.record(summary.into(), None);
+    }
+
+    /// Finish a statement that produced `rows` rows.
+    pub fn finish_rows(self, rows: u64) {
+        self.record(format!("{rows} rows"), Some(rows));
+    }
+
+    fn record(self, summary: String, rows: Option<u64>) {
         let step = ToolStep {
             tool: self.tool,
             detail: self.detail,
-            summary: summary.into(),
+            summary,
+            rows,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
         if let Ok(mut steps) = self.recorder.steps.lock() {
@@ -409,18 +466,24 @@ mod tests {
         let recorder = TurnRecorder::new(sink);
         assert_eq!(recorder.budget_note(), "");
         let recorder = recorder.with_turn_limit(5);
-        recorder.start("run_sql", "SELECT 1").finish("1 rows");
+        recorder
+            .start(ToolName::RunSql, "SELECT 1")
+            .finish("1 rows");
         assert_eq!(
             recorder.budget_note(),
             "(tool call 1 of at most 5 this turn)"
         );
-        recorder.start("run_sql", "SELECT 2").finish("1 rows");
+        recorder
+            .start(ToolName::RunSql, "SELECT 2")
+            .finish("1 rows");
         assert_eq!(
             recorder.budget_note(),
             "(tool call 2 of at most 5 this turn; 3 left, so answer from what you have)"
         );
         for _ in 0..4 {
-            recorder.start("run_sql", "SELECT 3").finish("1 rows");
+            recorder
+                .start(ToolName::RunSql, "SELECT 3")
+                .finish("1 rows");
         }
         assert_eq!(
             recorder.budget_note(),
@@ -432,9 +495,11 @@ mod tests {
     async fn steps_are_emitted_and_recorded_in_order() {
         let (sink, mut rx) = channel();
         let recorder = TurnRecorder::new(sink);
-        recorder.start("run_sql", "SELECT 1").finish("1 rows");
         recorder
-            .start("search_documents", "flood")
+            .start(ToolName::RunSql, "SELECT 1")
+            .finish("1 rows");
+        recorder
+            .start(ToolName::SearchDocuments, "flood")
             .finish("0 chunks");
 
         let steps = recorder.steps();
@@ -443,7 +508,7 @@ mod tests {
         assert_eq!(steps.last().map(|s| s.summary.as_str()), Some("0 chunks"));
 
         assert!(
-            matches!(rx.recv().await, Some(AgentEvent::ToolStarted { tool, .. }) if tool == "run_sql")
+            matches!(rx.recv().await, Some(AgentEvent::ToolStarted { tool, .. }) if tool == ToolName::RunSql)
         );
         assert!(
             matches!(rx.recv().await, Some(AgentEvent::ToolFinished(s)) if s.detail == "SELECT 1")
@@ -528,7 +593,7 @@ mod tests {
         let (sink, rx) = channel();
         drop(rx);
         let recorder = TurnRecorder::new(sink);
-        recorder.start("run_sql", "SELECT 1").finish("ok");
+        recorder.start(ToolName::RunSql, "SELECT 1").finish("ok");
         assert_eq!(recorder.steps().len(), 1);
     }
 }

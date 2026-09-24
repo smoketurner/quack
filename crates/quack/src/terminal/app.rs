@@ -17,9 +17,8 @@ use ratatui_textarea::TextArea;
 use tokio::sync::{broadcast, mpsc};
 
 use quack_core::analysis::agent::AgentResponse;
-use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::citations::{Citation, Sources};
-use quack_core::analysis::events::{self, AgentEvent, PermissionRequest, ToolStep};
+use quack_core::analysis::events::{self, AgentEvent, PermissionRequest, ToolName, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
@@ -116,7 +115,7 @@ impl Message {
 
     /// A tool call as it starts: its header, with the detail kept for
     /// `/steps`; the outcome is appended when it finishes.
-    fn step_started(tool: &str, detail: String) -> Self {
+    fn step_started(tool: ToolName, detail: String) -> Self {
         Self {
             detail: Some(detail),
             ..Self::new(MessageKind::Step, format!("> {tool}"))
@@ -841,46 +840,33 @@ impl App {
             format!("Resumed session {session_id} ({} messages)", rows.len()),
         );
         for row in rows {
-            let meta = row.metadata.as_ref();
             match row.role {
                 MessageRole::User => self.note(MessageKind::User, row.content),
                 MessageRole::Assistant => {
+                    let meta = row.assistant().cloned().unwrap_or_default();
                     let mut message = Message::new(MessageKind::Assistant, row.content);
-                    if let Some(spec) = meta
-                        .and_then(|m| m.get("chart"))
-                        .and_then(|c| serde_json::from_value::<ChartSpec>(c.clone()).ok())
-                    {
-                        let chart = ChartData::from_spec(&spec);
+                    if let Some(spec) = &meta.chart {
+                        let chart = ChartData::from_spec(spec);
                         self.current_chart = Some(chart.clone());
                         message.chart = Some(chart);
                     }
                     self.post(message);
-                    if let Some(citations) = meta
-                        .and_then(|m| m.get("citations"))
-                        .and_then(|c| serde_json::from_value::<Vec<Citation>>(c.clone()).ok())
-                        && !citations.is_empty()
-                    {
-                        self.post(Message::sources(&citations));
+                    if !meta.citations.is_empty() {
+                        self.post(Message::sources(&meta.citations));
                     }
                 }
                 // The stored row is the summary; the tool, its detail (the
                 // SQL, the search text), and its time sit in its metadata.
-                MessageRole::Tool => {
-                    let text = |key: &str| {
-                        meta.and_then(|m| m.get(key))
-                            .and_then(serde_json::Value::as_str)
-                    };
-                    let step = ToolStep {
-                        tool: text("tool").unwrap_or("tool").to_owned(),
-                        detail: text("detail").unwrap_or_default().to_owned(),
-                        summary: row.content,
-                        duration_ms: meta
-                            .and_then(|m| m.get("duration_ms"))
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0),
-                    };
-                    self.post(Message::from(&step));
-                }
+                MessageRole::Tool => match row.tool() {
+                    Some(meta) => {
+                        let step = meta.step(row.content.clone());
+                        self.post(Message::from(&step));
+                    }
+                    None => self.post(Message::new(
+                        MessageKind::Step,
+                        format!("> tool\n  {}", row.content),
+                    )),
+                },
             }
         }
     }
@@ -1123,7 +1109,7 @@ impl App {
             }
             AgentEvent::ToolStarted { tool, detail } if visible => {
                 turn.streaming = None;
-                self.post(Message::step_started(&tool, detail));
+                self.post(Message::step_started(tool, detail));
                 turn.open_step = Some(self.messages.len().saturating_sub(1));
             }
             AgentEvent::ToolFinished(step) if visible => {
@@ -2445,6 +2431,7 @@ mod tests {
     use quack_core::storage::writer::Writer;
 
     use quack_core::analysis::agent::AgentResponse;
+    use quack_core::analysis::chart::ChartSpec;
     use quack_core::analysis::events::ToolStep;
 
     use super::*;
@@ -2641,7 +2628,7 @@ mod tests {
         app.handle_turn_event(
             &mut turn,
             AgentEvent::ToolStarted {
-                tool: String::from("run_sql"),
+                tool: ToolName::RunSql,
                 detail: (1..=6)
                     .map(|i| format!("line {i}"))
                     .collect::<Vec<_>>()
@@ -2651,9 +2638,10 @@ mod tests {
         app.handle_turn_event(
             &mut turn,
             AgentEvent::ToolFinished(ToolStep {
-                tool: String::from("run_sql"),
+                tool: ToolName::RunSql,
                 detail: String::new(),
                 summary: String::from("3 rows"),
+                rows: Some(3),
                 duration_ms: 4,
             }),
         );

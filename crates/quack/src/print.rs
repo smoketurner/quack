@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::Sources;
-use quack_core::analysis::events::{self, AgentEvent, ToolStep};
+use quack_core::analysis::events::{self, AgentEvent, ToolName, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
@@ -146,10 +146,10 @@ impl PrintTurn<'_> {
                     }
                 }
                 AgentEvent::ToolStarted { tool, detail } => {
-                    if tool == "search_documents" {
+                    if tool == ToolName::SearchDocuments {
                         searched = true;
                     }
-                    write_started(&mut err, &tool, &detail, verbose)?;
+                    write_started(&mut err, tool, &detail, verbose)?;
                     spinner.set(&format!("running {tool}"));
                 }
                 AgentEvent::ToolFinished(step) => {
@@ -305,7 +305,7 @@ impl Spinner {
     }
 }
 
-fn write_started(err: &mut impl Write, tool: &str, detail: &str, verbose: bool) -> Result<()> {
+fn write_started(err: &mut impl Write, tool: ToolName, detail: &str, verbose: bool) -> Result<()> {
     writeln!(err, "> {tool}")?;
     if detail.is_empty() {
         return Ok(());
@@ -389,7 +389,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut folded = Vec::new();
-        write_started(&mut folded, "run_sql", &detail, false)
+        write_started(&mut folded, ToolName::RunSql, &detail, false)
             .unwrap_or_else(|e| fail(&e.to_string()));
         let folded = String::from_utf8_lossy(&folded);
         assert!(folded.starts_with("> run_sql\n  SELECT 1\n"), "{folded}");
@@ -403,12 +403,12 @@ mod tests {
         );
 
         let mut whole = Vec::new();
-        write_started(&mut whole, "run_sql", &detail, true)
+        write_started(&mut whole, ToolName::RunSql, &detail, true)
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(String::from_utf8_lossy(&whole).contains("  SELECT 5\n"));
 
         let mut empty = Vec::new();
-        write_started(&mut empty, "list_tables", "", false)
+        write_started(&mut empty, ToolName::ListTables, "", false)
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(String::from_utf8_lossy(&empty), "> list_tables\n");
 
@@ -416,9 +416,10 @@ mod tests {
         write_finished(
             &mut finished,
             &ToolStep {
-                tool: String::from("run_sql"),
+                tool: ToolName::RunSql,
                 detail: String::new(),
                 summary: String::from("3 rows"),
+                rows: Some(3),
                 duration_ms: 12,
             },
         )
