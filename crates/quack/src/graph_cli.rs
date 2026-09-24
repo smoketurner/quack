@@ -2,6 +2,7 @@
 //! the mapped tables and the documents, keep it in step with the ontology,
 //! and review merge proposals. Design doc 6.4.
 
+use std::fmt;
 use std::io::Write;
 
 use anyhow::{Context, Result};
@@ -11,45 +12,22 @@ use quack_core::extraction::ExtractionRun;
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
 use quack_core::graph::traverse::Hops;
-use quack_core::graph::{
-    ExtractSource, GraphResult, GraphStatus, extract, resolve, store as graph_store, tables,
-};
+use quack_core::graph::{ExtractSource, extract, resolve, store as graph_store, tables};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
+use serde::Serialize;
 
 use crate::confirm::Confirm;
 
 #[derive(Subcommand)]
 pub(crate) enum GraphAction {
     /// Print an entity's neighbourhood as a tree, or every entity of a class
-    Search {
-        /// The entity's name as it appears in the data
-        entity: Option<String>,
-        /// Only this class (with its subclasses when listing)
-        #[arg(long)]
-        class: Option<String>,
-        /// Follow only this relation
-        #[arg(long)]
-        relation: Option<String>,
-        /// Hops out from the entity
-        #[arg(long, default_value_t = Hops::NEIGHBORHOOD.get())]
-        hops: u32,
-        /// Print the result as JSON (nodes, edges, provenance)
-        #[arg(long)]
-        json: bool,
-    },
+    Search(SearchArgs),
     /// The shortest chain of relations between two entities
-    Path {
-        from: String,
-        to: String,
-        #[arg(long, default_value_t = Hops::PATH.get())]
-        max_hops: u32,
-        #[arg(long)]
-        json: bool,
-    },
+    Path(PathArgs),
     /// Node and edge counts, whether the graph is provisional or stale,
     /// pending merges, and what the corpus expressed that the ontology lacks
     Status {
@@ -58,23 +36,7 @@ pub(crate) enum GraphAction {
     },
     /// Build the graph: rows of mapped tables deterministically, then every
     /// chunk through the chat model (one call per chunk; asks first)
-    Extract {
-        /// Only the mapped tables, no model calls
-        #[arg(long, conflicts_with = "documents_only")]
-        tables_only: bool,
-        /// Only the documents
-        #[arg(long)]
-        documents_only: bool,
-        /// Chunks to send to the model at most (default: all)
-        #[arg(long)]
-        sample: Option<u32>,
-        /// Start from an empty graph instead of adding to it
-        #[arg(long)]
-        reset: bool,
-        /// Do not ask before spending the model calls
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
+    Extract(ExtractArgs),
     /// Drop nodes and edges the current ontology no longer allows (no
     /// model calls) and record the version the graph now matches
     Revalidate,
@@ -86,6 +48,123 @@ pub(crate) enum GraphAction {
     Merge { ids: Vec<String> },
     /// Decline merge proposals by id (prefixes accepted)
     Reject { ids: Vec<String> },
+}
+
+#[derive(clap::Args)]
+pub(crate) struct SearchArgs {
+    /// The entity's name as it appears in the data
+    entity: Option<String>,
+    /// Only this class (with its subclasses when listing)
+    #[arg(long)]
+    class: Option<String>,
+    /// Follow only this relation
+    #[arg(long)]
+    relation: Option<String>,
+    /// Hops out from the entity
+    #[arg(long, default_value_t = Hops::NEIGHBORHOOD.get())]
+    hops: u32,
+    /// Print the result as JSON (nodes, edges, provenance)
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct PathArgs {
+    from: String,
+    to: String,
+    #[arg(long, default_value_t = Hops::PATH.get())]
+    max_hops: u32,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is an independent command-line switch"
+)]
+pub(crate) struct ExtractArgs {
+    /// Only the mapped tables, no model calls
+    #[arg(long, conflicts_with = "documents_only")]
+    tables_only: bool,
+    /// Only the documents
+    #[arg(long)]
+    documents_only: bool,
+    /// Chunks to send to the model at most (default: all)
+    #[arg(long)]
+    sample: Option<u32>,
+    /// Start from an empty graph instead of adding to it
+    #[arg(long)]
+    reset: bool,
+    /// Do not ask before spending the model calls
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+}
+
+impl ExtractArgs {
+    fn sources(&self) -> ExtractSource {
+        if self.tables_only {
+            ExtractSource::Tables
+        } else if self.documents_only {
+            ExtractSource::Documents
+        } else {
+            ExtractSource::All
+        }
+    }
+}
+
+/// How a result is printed: the text rendering, or pretty JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphFormat {
+    Text,
+    Json,
+}
+
+impl GraphFormat {
+    /// `--json`, or the text rendering.
+    pub(crate) const fn of(json: bool) -> Self {
+        if json { Self::Json } else { Self::Text }
+    }
+
+    pub(crate) fn write<T: Serialize + fmt::Display>(
+        self,
+        out: &mut impl Write,
+        value: &T,
+    ) -> Result<()> {
+        match self {
+            Self::Json => writeln!(out, "{}", serde_json::to_string_pretty(value)?)?,
+            Self::Text => write!(out, "{value}")?,
+        }
+        Ok(())
+    }
+}
+
+/// A command step that runs on the workspace writer's thread: it renders
+/// there into a buffer, and the bytes come back to be written to `out`
+/// (which cannot cross to that thread).
+pub(crate) trait RenderOnWriter {
+    async fn render(
+        &self,
+        out: &mut impl Write,
+        step: impl FnOnce(&WorkspaceDb, &mut Vec<u8>) -> Result<()> + Send + 'static,
+    ) -> Result<()>;
+}
+
+impl RenderOnWriter for Writer {
+    async fn render(
+        &self,
+        out: &mut impl Write,
+        step: impl FnOnce(&WorkspaceDb, &mut Vec<u8>) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        let rendered = self
+            .run(move |db| {
+                let mut buf = Vec::new();
+                Ok(step(db, &mut buf).map(|()| buf))
+            })
+            .await??;
+        out.write_all(&rendered)?;
+        Ok(())
+    }
 }
 
 /// Run one graph action, writing what the user should see to `out`
@@ -102,125 +181,90 @@ pub(crate) async fn run(
     control: RunControl<'_>,
 ) -> Result<()> {
     match action {
-        search @ GraphAction::Search { .. } => run_search(config, db, out, search).await?,
-        path @ GraphAction::Path { .. } => run_path(config, db, out, path).await?,
-        GraphAction::Extract {
-            tables_only,
-            documents_only,
-            sample,
-            reset,
-            yes,
-        } => {
-            let sources = if tables_only {
-                ExtractSource::Tables
-            } else if documents_only {
-                ExtractSource::Documents
-            } else {
-                ExtractSource::All
-            };
-            run_extract(
-                config,
-                db,
-                out,
-                ExtractArgs {
-                    sources,
-                    sample,
-                    reset,
-                    yes,
-                },
-                control,
-            )
+        GraphAction::Search(args) => run_search(config, db, out, args).await?,
+        GraphAction::Path(args) => run_path(config, db, out, args).await?,
+        GraphAction::Extract(args) => run_extract(config, db, out, &args, control).await?,
+        GraphAction::Status { json } => {
+            db.render(out, move |db, out| {
+                GraphFormat::of(json).write(out, &graph_store::status(db)?)
+            })
             .await?;
         }
-        quick => {
-            // One step on the workspace: rendered into a buffer there, then
-            // written here (the output cannot cross to the writer's thread).
-            let rendered = db
-                .run(move |db| Ok(rendered(|buf| run_quick(db, quick, buf))))
-                .await?;
-            out.write_all(&rendered.map_err(anyhow::Error::msg)?)?;
+        GraphAction::Revalidate => {
+            db.render(out, |db, out| {
+                let outcome = graph_store::revalidate(db)?;
+                writeln!(
+                    out,
+                    "Dropped {} nodes and {} edges; the graph now matches ontology version {}.",
+                    outcome.dropped_nodes, outcome.dropped_edges, outcome.version
+                )?;
+                Ok(())
+            })
+            .await?;
+        }
+        GraphAction::Review => {
+            db.render(out, |db, out| {
+                graph_store::mark_reviewed(db)?;
+                writeln!(out, "The graph is no longer provisional.")?;
+                Ok(())
+            })
+            .await?;
+        }
+        GraphAction::Merges => {
+            db.render(out, |db, out| {
+                let pending = resolve::pending(db)?;
+                if pending.is_empty() {
+                    writeln!(out, "No pending merges.")?;
+                }
+                for m in &pending {
+                    writeln!(
+                        out,
+                        "{}  {:.3}  {} ({}) <- {}",
+                        m.id, m.distance, m.keep.label, m.keep.class_id, m.drop.label
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        GraphAction::Merge { ids } => {
+            db.render(out, move |db, out| {
+                for id in &ids {
+                    let m = resolve::decide(db, id, resolve::MergeDecision::Accept, None)?;
+                    writeln!(out, "Merged {} into {}.", m.drop.label, m.keep.label)?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        GraphAction::Reject { ids } => {
+            db.render(out, move |db, out| {
+                for id in &ids {
+                    let m = resolve::decide(db, id, resolve::MergeDecision::Reject, None)?;
+                    writeln!(out, "Kept {} and {} apart.", m.keep.label, m.drop.label)?;
+                }
+                Ok(())
+            })
+            .await?;
         }
     }
     out.flush()?;
     Ok(())
 }
 
-/// The actions that are one short run of database work.
-fn run_quick(db: &WorkspaceDb, action: GraphAction, out: &mut impl Write) -> Result<()> {
-    match action {
-        GraphAction::Search { .. } | GraphAction::Path { .. } | GraphAction::Extract { .. } => {}
-        GraphAction::Status { json } => {
-            let status = graph_store::status(db)?;
-            if json {
-                writeln!(out, "{}", serde_json::to_string_pretty(&status)?)?;
-            } else {
-                write!(out, "{}", status_text(&status))?;
-            }
-        }
-        GraphAction::Revalidate => {
-            let outcome = graph_store::revalidate(db)?;
-            writeln!(
-                out,
-                "Dropped {} nodes and {} edges; the graph now matches ontology version {}.",
-                outcome.dropped_nodes, outcome.dropped_edges, outcome.version
-            )?;
-        }
-        GraphAction::Review => {
-            graph_store::mark_reviewed(db)?;
-            writeln!(out, "The graph is no longer provisional.")?;
-        }
-        GraphAction::Merges => {
-            let pending = resolve::pending(db)?;
-            if pending.is_empty() {
-                writeln!(out, "No pending merges.")?;
-            }
-            for m in &pending {
-                writeln!(
-                    out,
-                    "{}  {:.3}  {} ({}) <- {}",
-                    m.id, m.distance, m.keep.label, m.keep.class_id, m.drop.label
-                )?;
-            }
-        }
-        GraphAction::Merge { ids } => {
-            for id in &ids {
-                let m = resolve::decide(db, id, resolve::MergeDecision::Accept, None)?;
-                writeln!(out, "Merged {} into {}.", m.drop.label, m.keep.label)?;
-            }
-        }
-        GraphAction::Reject { ids } => {
-            for id in &ids {
-                let m = resolve::decide(db, id, resolve::MergeDecision::Reject, None)?;
-                writeln!(out, "Kept {} and {} apart.", m.keep.label, m.drop.label)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-struct ExtractArgs {
-    sources: ExtractSource,
-    sample: Option<u32>,
-    reset: bool,
-    yes: bool,
-}
-
 async fn run_search(
     config: &Config,
     db: &Writer,
     out: &mut impl Write,
-    action: GraphAction,
+    args: SearchArgs,
 ) -> Result<()> {
-    let GraphAction::Search {
+    let SearchArgs {
         entity,
         class,
         relation,
         hops,
         json,
-    } = action
-    else {
-        return Ok(());
-    };
+    } = args;
     let options = config.graph.options();
     let query = GraphQuery::new(
         entity.as_deref(),
@@ -243,24 +287,21 @@ async fn run_search(
             }
         })
         .await?;
-    print_result(out, &result, json)
+    GraphFormat::of(json).write(out, &result)
 }
 
 async fn run_path(
     config: &Config,
     db: &Writer,
     out: &mut impl Write,
-    action: GraphAction,
+    args: PathArgs,
 ) -> Result<()> {
-    let GraphAction::Path {
+    let PathArgs {
         from,
         to,
         max_hops,
         json,
-    } = action
-    else {
-        return Ok(());
-    };
+    } = args;
     let options = config.graph.options();
     let query = PathQuery::new(&from, &to, Some(max_hops))?;
     let model = Embeddings::from_config(config).await?;
@@ -271,14 +312,14 @@ async fn run_path(
         writeln!(out, "No path within {max_hops} hops.")?;
         return Ok(());
     }
-    print_result(out, &result, json)
+    GraphFormat::of(json).write(out, &result)
 }
 
 async fn run_extract(
     config: &Config,
     db: &Writer,
     out: &mut impl Write,
-    args: ExtractArgs,
+    args: &ExtractArgs,
     control: RunControl<'_>,
 ) -> Result<()> {
     let ontology = db
@@ -290,7 +331,8 @@ async fn run_extract(
         db.run(graph_store::clear).await?;
         writeln!(out, "Cleared the graph.")?;
     }
-    if args.sources.includes_tables() {
+    let sources = args.sources();
+    if sources.includes_tables() {
         if ontology.mappings.is_empty() {
             writeln!(
                 out,
@@ -313,7 +355,7 @@ async fn run_extract(
             }
         }
     }
-    if args.sources.includes_documents() {
+    if sources.includes_documents() {
         let sample = args.sample;
         let plan = db.run(move |db| ChunkPlan::new(db, sample)).await?;
         if plan.is_empty() {
@@ -376,88 +418,6 @@ async fn run_extract(
     let version = ontology.saved_version()?;
     db.run(move |db| graph_store::set_built_with(db, version))
         .await?;
-    write!(out, "{}", status_text(&db.run(graph_store::status).await?))?;
+    write!(out, "{}", db.run(graph_store::status).await?)?;
     Ok(())
-}
-
-/// What `write` printed, or its error's text as the CLI shows it: a
-/// command step that runs on the workspace writer's thread renders there
-/// and hands the bytes back.
-pub(crate) fn rendered(
-    write: impl FnOnce(&mut Vec<u8>) -> Result<()>,
-) -> std::result::Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    write(&mut buf).map_err(|e| format!("{e:#}"))?;
-    Ok(buf)
-}
-
-fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Result<()> {
-    if json {
-        writeln!(out, "{}", serde_json::to_string_pretty(result)?)?;
-    } else {
-        write!(out, "{result}")?;
-    }
-    Ok(())
-}
-
-/// The status as `quack graph status` prints it.
-pub(crate) fn status_text(status: &GraphStatus) -> String {
-    let ontology_version = status
-        .ontology_version
-        .map_or_else(|| String::from("none"), |v| v.to_string());
-    let built_with = status.built_with_version.map_or_else(
-        || String::from("never built"),
-        |v| format!("built with {v}"),
-    );
-    let mut lines = vec![format!(
-        "Graph: {} nodes, {} edges (ontology version {ontology_version}, {built_with}){}{}",
-        status.nodes,
-        status.edges,
-        if status.stale {
-            "; stale: run `quack graph revalidate` or `quack graph extract`"
-        } else {
-            ""
-        },
-        if status.provisional() {
-            "; provisional: built from an unreviewed ontology, `quack graph review` clears it"
-        } else {
-            ""
-        }
-    )];
-    if status.pending_merges > 0 {
-        lines.push(format!(
-            "{} merge proposals pending: `quack graph merges`",
-            status.pending_merges
-        ));
-    }
-    if !status.missing_tables.is_empty() {
-        lines.push(format!(
-            "Mapped tables no longer in the workspace (extraction skips them): {}",
-            status.missing_tables.join(", ")
-        ));
-    }
-    if status.drift.total() > 0 {
-        let mut items: Vec<String> = status
-            .drift
-            .classes
-            .iter()
-            .map(|(k, v)| format!("class {k} ({v})"))
-            .chain(
-                status
-                    .drift
-                    .relations
-                    .iter()
-                    .map(|(k, v)| format!("relation {k} ({v})")),
-            )
-            .collect();
-        items.sort();
-        lines.push(format!(
-            "The corpus expressed {} things the ontology lacks: {}",
-            status.drift.total(),
-            items.join(", ")
-        ));
-    }
-    let mut text = lines.join("\n");
-    text.push('\n');
-    text
 }

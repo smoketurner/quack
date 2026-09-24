@@ -423,16 +423,16 @@ enum CliJob {
 impl CliJob {
     /// `/ontology VERB`. The terminal owns stdin, so nothing may prompt.
     fn ontology(mut action: OntologyAction) -> Self {
-        if let OntologyAction::Propose { yes, .. } = &mut action {
-            *yes = true;
+        if let OntologyAction::Propose(args) = &mut action {
+            args.yes = true;
         }
         Self::Ontology(action)
     }
 
     /// `/graph VERB`, never prompting.
     fn graph(mut action: GraphAction) -> Self {
-        if let GraphAction::Extract { yes, .. } = &mut action {
-            *yes = true;
+        if let GraphAction::Extract(args) = &mut action {
+            args.yes = true;
         }
         Self::Graph(action)
     }
