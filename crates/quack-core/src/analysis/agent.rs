@@ -270,7 +270,7 @@ impl OllamaWindow {
     /// otherwise and truncates the front of a longer prompt, which is where
     /// the tool guidance is.
     fn for_turn(
-        cap: u32,
+        cap: Tokens,
         system_prompt: &str,
         history: &[rig::message::Message],
         user_message: &str,
@@ -282,10 +282,10 @@ impl OllamaWindow {
                 .saturating_add(history_chars)
                 .saturating_add(user_message.len()),
         );
-        if prompt.get() > cap {
+        if prompt > cap {
             tracing::warn!(
                 prompt_tokens = %prompt,
-                cap,
+                %cap,
                 "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
             );
         }
@@ -293,13 +293,13 @@ impl OllamaWindow {
     }
 
     /// The window for a prompt of `prompt` tokens under `cap`.
-    fn for_prompt(prompt: Tokens, cap: u32) -> Self {
+    fn for_prompt(prompt: Tokens, cap: Tokens) -> Self {
         let needed = prompt.get().saturating_add(Self::HEADROOM);
         let rounded = needed
             .div_ceil(Self::STEP)
             .saturating_mul(Self::STEP)
             .max(Self::FLOOR);
-        Self(rounded.min(cap.max(Self::FLOOR)))
+        Self(rounded.min(cap.get().max(Self::FLOOR)))
     }
 }
 
@@ -647,7 +647,8 @@ mod tests {
 
     #[test]
     fn the_ollama_window_rounds_up_within_bounds() {
-        let window = |tokens, cap| OllamaWindow::for_prompt(Tokens::new(tokens), cap).0;
+        let window =
+            |tokens, cap| OllamaWindow::for_prompt(Tokens::new(tokens), Tokens::new(cap)).0;
         assert_eq!(window(0, 32_768), 8_192);
         assert_eq!(window(1_000, 32_768), 16_384);
         // 12,875 prompt tokens plus headroom rounds to 24,576.

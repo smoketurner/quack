@@ -34,7 +34,19 @@ impl fmt::Display for Count<'_> {
 /// history trim, pinned text, the workspace context, Ollama's window)
 /// estimates at four characters per token, which errs on the side of
 /// sending less; a provider's own count is `analysis::agent::TokenUsage`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct Tokens(u32);
 
 impl Tokens {

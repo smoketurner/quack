@@ -52,15 +52,15 @@ pub struct PromptOptions {
     /// attempts statements through the tool instead of refusing on its own.
     pub write_policy: WritePolicy,
     /// Budget for pinned document text (four characters per token).
-    pub pinned_token_budget: u32,
+    pub pinned_token_budget: Tokens,
     /// Global prefix plus workspace context, already joined, if any.
     pub context: Option<String>,
     /// Budget for `context` (four characters per token).
-    pub context_max_tokens: u32,
+    pub context_max_tokens: Tokens,
     /// For Ollama, the cap on the context window the turn requests
     /// (`[analysis].max_context_tokens`); `None` for providers that size
     /// their own.
-    pub ollama_context_cap: Option<u32>,
+    pub ollama_context_cap: Option<Tokens>,
 }
 
 /// The system prompt, assembled in the order the design fixes (section
@@ -389,7 +389,7 @@ impl SystemPrompt {
         let Some(context) = options.context.as_deref() else {
             return Ok(());
         };
-        let budget_chars = Tokens::new(options.context_max_tokens).chars();
+        let budget_chars = options.context_max_tokens.chars();
         writeln!(
             self.text,
             "Workspace context (written by the workspace owner; follow it over general knowledge):"
@@ -399,7 +399,7 @@ impl SystemPrompt {
         } else {
             let cut: String = context.chars().take(budget_chars).collect();
             tracing::warn!(
-                max_tokens = options.context_max_tokens,
+                max_tokens = %options.context_max_tokens,
                 "workspace context exceeds the token budget and was truncated"
             );
             writeln!(self.text, "{cut}")?;
@@ -415,12 +415,12 @@ impl SystemPrompt {
 
     /// The full text of pinned documents, skipping any that would push the
     /// total past `pinned_token_budget` (four characters per token).
-    fn pinned_documents(&mut self, db: &WorkspaceDb, pinned_token_budget: u32) -> Result<()> {
+    fn pinned_documents(&mut self, db: &WorkspaceDb, pinned_token_budget: Tokens) -> Result<()> {
         let pinned = db.pinned_documents()?;
         if pinned.is_empty() {
             return Ok(());
         }
-        let budget = Tokens::new(pinned_token_budget);
+        let budget = pinned_token_budget;
         let mut used = Tokens::default();
         writeln!(
             self.text,
@@ -495,9 +495,9 @@ mod tests {
         PromptOptions {
             mode,
             write_policy: WritePolicy::Deny,
-            pinned_token_budget: pinned,
+            pinned_token_budget: Tokens::new(pinned),
             context: None,
-            context_max_tokens: 4000,
+            context_max_tokens: Tokens::new(4000),
             ollama_context_cap: None,
         }
     }
@@ -624,7 +624,7 @@ mod tests {
         assert!(!prompt.contains("truncated"));
 
         opts.context = Some("x".repeat(100));
-        opts.context_max_tokens = 5;
+        opts.context_max_tokens = Tokens::new(5);
         let prompt = SystemPrompt::build(&db, &opts).unwrap();
         assert!(prompt.contains(&"x".repeat(20)));
         assert!(!prompt.contains(&"x".repeat(21)));
