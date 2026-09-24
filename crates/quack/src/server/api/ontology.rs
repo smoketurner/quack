@@ -13,7 +13,7 @@ use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
-use quack_core::llm;
+use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, candidates, documents, store};
@@ -511,7 +511,7 @@ impl Access {
         }
         // Fail now, not in the background, when no model can be built.
         let extractor = llm::chat_extractor(&app.config).await?;
-        let embeddings = llm::optional_embedding_model(&app.config).await?;
+        let embeddings = Embeddings::from_config(&app.config).await?;
         let (cost, chunks, current) = app
             .read(id, move |db| {
                 let cost = documents::estimate(db, &options)?;

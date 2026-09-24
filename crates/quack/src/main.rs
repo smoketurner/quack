@@ -23,6 +23,7 @@ use quack_core::doctor::Options;
 use quack_core::error::{Error as CoreError, Record};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
+use quack_core::llm::Embeddings;
 use quack_core::llm::oauth::{self, LoginOptions, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
@@ -34,7 +35,7 @@ use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
 use quack_core::storage::workspace::{DocumentSource, WorkspaceDb};
 use quack_core::storage::writer::Writer;
-use quack_core::{config, crypto, doctor, llm};
+use quack_core::{config, crypto, doctor};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -917,7 +918,7 @@ async fn run_import(
     };
     let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
     let ws_db = spawn_writer(&config, &workspace.id)?;
-    let embedding_model = llm::optional_embedding_model(&config).await?;
+    let embedding_model = Embeddings::from_config(&config).await?;
     let summary = import::import(
         &config,
         &ws_db,
@@ -1504,7 +1505,7 @@ async fn run_ingest(
     let embedding_model = if no_embed {
         None
     } else {
-        llm::optional_embedding_model(&config)
+        Embeddings::from_config(&config)
             .await
             .context("failed to build embedding model")?
     };
@@ -1600,7 +1601,7 @@ async fn ingest_bundle(
     let embedding_model = if no_embed {
         None
     } else {
-        llm::optional_embedding_model(config)
+        Embeddings::from_config(config)
             .await
             .context("failed to build embedding model")?
     };

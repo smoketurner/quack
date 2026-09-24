@@ -13,7 +13,7 @@ use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphResult, GraphStatus, extract, resolve, store as graph_store, tables,
 };
-use quack_core::llm;
+use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -227,7 +227,7 @@ async fn run_search(
         relation.as_deref(),
         Some(hops),
     )?;
-    let model = llm::optional_embedding_model(config).await?;
+    let model = Embeddings::from_config(config).await?;
     let embedding = query.embedding(model.as_ref()).await?;
     let result = db
         .run(move |db| {
@@ -262,7 +262,7 @@ async fn run_path(
     };
     let options = config.graph.options();
     let query = PathQuery::new(&from, &to, Some(max_hops))?;
-    let model = llm::optional_embedding_model(config).await?;
+    let model = Embeddings::from_config(config).await?;
     let ends = query.embeddings(model.as_ref()).await?;
     let max_hops = query.max_hops;
     let result = db.run(move |db| query.run(db, &ends, &options)).await?;
@@ -361,7 +361,7 @@ async fn run_extract(
             }
         }
     }
-    let embeddings = llm::optional_embedding_model(config).await?;
+    let embeddings = Embeddings::from_config(config).await?;
     let resolved = resolve::resolve(db, embeddings.as_ref(), &config.graph.options()).await?;
     if resolved.auto_merged > 0 || resolved.proposed > 0 {
         writeln!(

@@ -90,6 +90,26 @@ impl Vector {
     }
 }
 
+impl Vector {
+    /// The cosine of the angle between this vector and `other`, 0 when
+    /// either has no length.
+    #[must_use]
+    pub fn cosine(&self, other: &Self) -> f64 {
+        let dot: f64 = self
+            .iter()
+            .zip(other.iter())
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum();
+        let norm = |v: &Self| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        let (a, b) = (norm(self), norm(other));
+        if a == 0.0 || b == 0.0 {
+            0.0
+        } else {
+            dot / (a * b)
+        }
+    }
+}
+
 impl Deref for Vector {
     type Target = [f32];
 

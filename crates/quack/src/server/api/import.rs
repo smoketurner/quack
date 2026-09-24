@@ -4,7 +4,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use quack_core::llm;
+use quack_core::llm::Embeddings;
 use quack_core::progress::RunControl;
 use quack_core::storage::control::{AuditAction, Outcome};
 use quack_core::text::NonBlankText;
@@ -59,7 +59,7 @@ pub(crate) async fn run_import(
     let source = import::redact(&request.url);
     import::source_kind(&request.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let db = app.workspace_db(&access.workspace.id).await?;
-    let embeddings = llm::optional_embedding_model(&app.config).await?;
+    let embeddings = Embeddings::from_config(&app.config).await?;
     // `--local` is the owner at a keyboard; anyone else is held to
     // `[import]`: no files from the server's disk, no private hosts.
     let policy = if app.local {

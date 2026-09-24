@@ -11,7 +11,7 @@ use quack_core::config::Config;
 use crate::confirm::Confirm;
 use crate::graph_cli::rendered;
 use crate::stdio::StdioPath;
-use quack_core::llm;
+use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
@@ -409,7 +409,7 @@ async fn propose(
             cost.chunks,
             cost.documents,
             cost.model_calls,
-            llm::chat_model_display(config)
+            config.chat_model_label()
         )?;
         // Shown before the model calls, ahead of the progress lines on
         // stderr.
@@ -495,7 +495,7 @@ async fn run_documents(
         .run(move |db| documents::sample_chunks(db, count))
         .await?;
     let extractor = llm::chat_extractor(config).await?;
-    let embeddings = llm::optional_embedding_model(config).await?;
+    let embeddings = Embeddings::from_config(config).await?;
     let (candidates, summary) = documents::run(
         sample,
         extractor.as_ref(),

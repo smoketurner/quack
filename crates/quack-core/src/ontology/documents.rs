@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use super::induction::{Candidate, Proposal};
 use super::{Class, Ontology, Property, PropertyType, ROOT_CLASS, Relation, SnakeId};
+use crate::embedding::Input;
 use crate::error::{Error, Result};
 use crate::extraction::{Extract, Extracted, Passage, RunProgress, Tally, extractions};
 use crate::graph::NormalizedLabel;
-use crate::llm::{Embeddings, name_similarity};
+use crate::llm::Embeddings;
 use crate::progress::RunControl;
 use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
@@ -63,6 +64,45 @@ Leave a list empty rather than inventing.";
 /// Whether two distinct ids name the same thing (an embedding cosine
 /// check); `None` means exact matching only.
 pub type Similarity<'a> = Option<&'a dyn Fn(&str, &str) -> bool>;
+
+/// Which pairs of type or relation names mean the same thing: those whose
+/// embeddings' cosine is at or above a threshold.
+#[derive(Debug, Default)]
+pub struct SimilarNames(std::collections::HashSet<(String, String)>);
+
+impl SimilarNames {
+    /// Embed `names` and keep every pair at or above `threshold`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when embedding fails.
+    pub async fn embed(embedder: &Embeddings, names: &[String], threshold: f64) -> Result<Self> {
+        let mut out = Self::default();
+        if names.len() < 2 {
+            return Ok(out);
+        }
+        let inputs: Vec<Input> = names
+            .iter()
+            .map(|n| Input::Similarity(n.replace('_', " ")))
+            .collect();
+        let vectors = embedder.embed(&inputs).await?;
+        for (i, (a, va)) in names.iter().zip(&vectors).enumerate() {
+            for (b, vb) in names.iter().zip(&vectors).skip(i.saturating_add(1)) {
+                if va.cosine(vb) >= threshold {
+                    out.0.insert((a.clone(), b.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `a` and `b` name the same thing, in either order.
+    #[must_use]
+    pub fn same(&self, a: &str, b: &str) -> bool {
+        self.0.contains(&(a.to_owned(), b.to_owned()))
+            || self.0.contains(&(b.to_owned(), a.to_owned()))
+    }
+}
 
 /// Tuning for document evidence.
 #[derive(Debug, Clone, Copy)]
@@ -200,17 +240,11 @@ pub async fn run(
                 }
             }
             let names: Vec<String> = names.into_iter().collect();
-            Some(name_similarity(model, &names, options.cluster_threshold).await?)
+            Some(SimilarNames::embed(model, &names, options.cluster_threshold).await?)
         }
         None => None,
     };
-    let lookup = |a: &str, b: &str| {
-        table
-            .as_ref()
-            .and_then(|t| t.get(&(a.to_owned(), b.to_owned())))
-            .copied()
-            .unwrap_or(false)
-    };
+    let lookup = |a: &str, b: &str| table.as_ref().is_some_and(|t| t.same(a, b));
     let similarity: Similarity<'_> = if table.is_some() { Some(&lookup) } else { None };
     let candidates = propose(&observations, current, options, similarity);
     let low = u32::try_from(candidates.iter().filter(|c| c.low_support).count()).unwrap_or(0);

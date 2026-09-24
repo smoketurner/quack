@@ -1108,6 +1108,13 @@ impl Config {
         self.resolve_model("chat_model", spec)
     }
 
+    /// `provider/model` for status lines, or a placeholder.
+    #[must_use]
+    pub fn chat_model_label(&self) -> String {
+        self.chat_model_ref()
+            .map_or_else(|_| String::from("no chat model"), |m| m.to_string())
+    }
+
     /// The embedding model, if configured.
     ///
     /// # Errors

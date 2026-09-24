@@ -31,7 +31,7 @@ use quack_core::jobs::{
     JobContext, JobCounts, JobId, JobInfo, JobKind, JobNumber, JobQueue, JobResult, JobSpec,
     JobState, Lane, LaneKey,
 };
-use quack_core::llm;
+use quack_core::llm::{self, Embeddings};
 use quack_core::okf;
 use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
@@ -549,7 +549,7 @@ impl CliJob {
         request: &ImportRequest,
         control: RunControl<'_>,
     ) -> Result<String> {
-        let embedding_model = llm::optional_embedding_model(&env.config).await?;
+        let embedding_model = Embeddings::from_config(&env.config).await?;
         let summary = import::import(
             &env.config,
             &env.db,
@@ -580,7 +580,7 @@ impl CliJob {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_owned();
-        let embedding_model = llm::optional_embedding_model(&env.config).await?;
+        let embedding_model = Embeddings::from_config(&env.config).await?;
         let outcome = ingestion::ingest_file(
             &env.config,
             &env.db,
@@ -763,7 +763,7 @@ impl App {
             should_quit: false,
             spinner: Spinner::default(),
             workspace_name,
-            provider_display: llm::chat_model_display(&config),
+            provider_display: config.chat_model_label(),
             session_id,
             current_chart: None,
             prompts: VecDeque::new(),
