@@ -34,7 +34,7 @@ use quack_core::extraction::{Extract, ExtractFuture};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, store};
-use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ids::{ChunkId, DocumentId, NodeId};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
@@ -783,7 +783,7 @@ async fn evaluate_graph(
     let node_ids = store::all_node_ids(db)?;
     let nodes = store::nodes(db, &node_ids)?;
     let edges = store::edges(db, &node_ids, EdgeScope::Among)?;
-    let label_of: BTreeMap<String, String> = nodes
+    let label_of: BTreeMap<NodeId, String> = nodes
         .iter()
         .map(|n| (n.id.clone(), n.label.clone()))
         .collect();
