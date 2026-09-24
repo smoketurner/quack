@@ -1,6 +1,7 @@
 //! What every handler shares: the config, the control plane, one open
 //! `DuckDB` handle per workspace, the browser sessions, and the work queue.
 
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -40,7 +41,8 @@ pub(crate) struct AppState {
     /// The cell is what enforces "once": `DuckDB`'s file lock is advisory
     /// and per-process, so two concurrent opens of one file both succeed
     /// and yield independent databases whose writes overwrite each other.
-    workspaces: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<WorkspaceHandle>>>>,
+    workspaces:
+        tokio::sync::Mutex<HashMap<WorkspaceId, Arc<tokio::sync::OnceCell<WorkspaceHandle>>>>,
     /// Browser and API-login sessions.
     pub sessions: WebSessions,
     /// Every background job: uploads, extraction and proposal runs, agent
@@ -52,13 +54,13 @@ pub(crate) struct AppState {
     mcp: tokio::sync::Mutex<HashMap<McpKey, McpEntry>>,
     /// Workspaces with a graph extraction in flight: one at a time each,
     /// so a reset cannot clear a run part way (issue #48).
-    extractions: Mutex<HashSet<String>>,
+    extractions: Mutex<HashSet<WorkspaceId>>,
 }
 
 /// A live browser session. Both bounds are measured with [`Instant`], so a
 /// clock the operator moves cannot extend or shorten one.
 struct WebSession {
-    user_id: String,
+    user_id: UserId,
     /// When the session was opened, against `session_max_age`.
     started: Instant,
     /// The last request that presented it, against `session_idle`.
@@ -68,7 +70,7 @@ struct WebSession {
 /// What a presented session token resolved to.
 pub(crate) enum SessionLookup {
     /// A live session, belonging to this user id.
-    Active(String),
+    Active(UserId),
     /// The token named a session that had outlived one of its bounds. It is
     /// gone now; the caller must log in again.
     Expired,
@@ -79,7 +81,7 @@ pub(crate) enum SessionLookup {
 /// Holds a workspace's extraction slot; dropping it frees the slot.
 pub(crate) struct ExtractionSlot {
     app: App,
-    workspace_id: String,
+    workspace_id: WorkspaceId,
 }
 
 impl Drop for ExtractionSlot {
@@ -96,8 +98,8 @@ pub(crate) type McpTransport = StreamableHttpService<McpServer, LocalSessionMana
 /// write permission, so its audit rows and its writes are that caller's.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct McpKey {
-    pub workspace_id: String,
-    pub user_id: String,
+    pub workspace_id: WorkspaceId,
+    pub user_id: UserId,
     pub policy: WritePolicy,
 }
 
@@ -130,14 +132,17 @@ impl AppState {
 
     /// Claim the workspace's extraction slot, or `None` while another
     /// extraction runs there.
-    pub(crate) fn begin_extraction(self: &Arc<Self>, workspace_id: &str) -> Option<ExtractionSlot> {
+    pub(crate) fn begin_extraction(
+        self: &Arc<Self>,
+        workspace_id: &WorkspaceId,
+    ) -> Option<ExtractionSlot> {
         let mut running = self.extractions.lock().ok()?;
-        if !running.insert(workspace_id.to_owned()) {
+        if !running.insert(workspace_id.clone()) {
             return None;
         }
         Some(ExtractionSlot {
             app: Arc::clone(self),
-            workspace_id: workspace_id.to_owned(),
+            workspace_id: workspace_id.clone(),
         })
     }
 
@@ -181,20 +186,20 @@ impl AppState {
     /// A failed open is never remembered. `get_or_try_init` leaves the cell
     /// empty on error, so the next request retries rather than inheriting a
     /// permanent failure; nothing here may cache the error alongside it.
-    async fn workspace_handle(&self, workspace_id: &str) -> ApiResult<WorkspaceHandle> {
+    async fn workspace_handle(&self, workspace_id: &WorkspaceId) -> ApiResult<WorkspaceHandle> {
         let cell = {
             let mut open = self.workspaces.lock().await;
             Arc::clone(
-                open.entry(workspace_id.to_owned())
+                open.entry(workspace_id.clone())
                     .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
             )
         };
         let config = self.config.clone();
-        let id = workspace_id.to_owned();
+        let id = workspace_id.clone();
         let pool_size = self.config.analysis.reader_pool_size;
         cell.get_or_try_init(|| async move {
             let (db, audit) = tokio::task::spawn_blocking(move || {
-                let db = WorkspaceDb::open(&config, &id)?;
+                let db = WorkspaceDb::open(&config, id.as_str())?;
                 // Uploads a previous process took but never finished cannot
                 // be resumed: their bytes are gone with it.
                 let stale = db.fail_stale_uploads()?;
@@ -221,19 +226,19 @@ impl AppState {
     }
 
     /// The writer handle for a workspace, opening the file on first use.
-    pub(crate) async fn workspace_db(&self, workspace_id: &str) -> ApiResult<SharedDb> {
+    pub(crate) async fn workspace_db(&self, workspace_id: &WorkspaceId) -> ApiResult<SharedDb> {
         Ok(self.workspace_handle(workspace_id).await?.writer)
     }
 
     /// The reader handle for a workspace (built once, alongside the
     /// writer, on first use): every read-only handler should prefer this
     /// over [`Self::workspace_db`] so it never queues behind a write.
-    pub(crate) async fn reader_db(&self, workspace_id: &str) -> ApiResult<ReaderDb> {
+    pub(crate) async fn reader_db(&self, workspace_id: &WorkspaceId) -> ApiResult<ReaderDb> {
         Ok(self.workspace_handle(workspace_id).await?.reader)
     }
 
     /// The workspace's insert-only audit connection, opened with its writer.
-    pub(crate) async fn audit_log(&self, workspace_id: &str) -> ApiResult<Arc<AuditLog>> {
+    pub(crate) async fn audit_log(&self, workspace_id: &WorkspaceId) -> ApiResult<Arc<AuditLog>> {
         Ok(self.workspace_handle(workspace_id).await?.audit)
     }
 
@@ -241,7 +246,7 @@ impl AppState {
     /// read-only transaction: it never waits for a write in progress, and
     /// anything that would write is refused. Every read-only handler reads
     /// through this; writes go to the writer through [`with_db`].
-    pub(crate) async fn read<T, F>(&self, workspace_id: &str, f: F) -> ApiResult<T>
+    pub(crate) async fn read<T, F>(&self, workspace_id: &WorkspaceId, f: F) -> ApiResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
@@ -254,9 +259,16 @@ impl AppState {
     }
 }
 
-/// A login session's token: `qs_` and 32 random bytes, base64url.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A login session's token: `qs_` and 32 random bytes, base64url. It
+/// grants the user's access, so `Debug` shows only its prefix.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SessionToken(String);
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SessionToken").field(&"qs_…").finish()
+    }
+}
 
 impl SessionToken {
     /// A fresh token from the control plane's random source (aws-lc-rs).
@@ -267,6 +279,11 @@ impl SessionToken {
             "qs_{}",
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
         )))
+    }
+
+    /// A token a request presented, to be looked up.
+    pub(crate) const fn presented(token: String) -> Self {
+        Self(token)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -298,7 +315,7 @@ impl WebSessions {
     }
 
     /// Start a session for the user and return its token.
-    pub(crate) fn open(&self, user_id: &str) -> ApiResult<SessionToken> {
+    pub(crate) fn open(&self, user_id: &UserId) -> ApiResult<SessionToken> {
         let token = SessionToken::generate()?;
         let now = Instant::now();
         let mut live = self
@@ -312,7 +329,7 @@ impl WebSessions {
         live.insert(
             token.as_str().to_owned(),
             WebSession {
-                user_id: user_id.to_owned(),
+                user_id: user_id.clone(),
                 started: now,
                 last_seen: now,
             },

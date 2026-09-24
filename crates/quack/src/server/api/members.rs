@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind, Role};
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +14,7 @@ use crate::server::state::App;
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
@@ -37,7 +38,7 @@ fn default_role() -> Role {
 pub(crate) async fn add(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<AddMember>,
 ) -> ApiResult<Json<NewMember>> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
@@ -47,7 +48,7 @@ pub(crate) async fn add(
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
-    Path((id, user_id)): Path<(String, String)>,
+    Path((id, user_id)): Path<(WorkspaceId, UserId)>,
 ) -> ApiResult<StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     access.remove_member(&app, &user_id).await?;
@@ -57,7 +58,7 @@ pub(crate) async fn remove(
 /// A member as added.
 #[derive(Debug, Serialize)]
 pub(crate) struct NewMember {
-    pub user_id: String,
+    pub user_id: UserId,
     pub username: String,
     pub role: Role,
 }
@@ -77,7 +78,7 @@ impl Access {
         self.audit(
             app,
             AuditAction::Member,
-            Some(ResourceKind::User.id(&user.id)),
+            Some(ResourceKind::User.id(user.id.as_str())),
             Outcome::Allowed,
             None,
         )
@@ -91,7 +92,7 @@ impl Access {
 
     /// Take a user out of this workspace; one who was not a member is an
     /// error, after the attempt is audited.
-    pub(crate) async fn remove_member(&self, app: &App, user_id: &str) -> ApiResult<()> {
+    pub(crate) async fn remove_member(&self, app: &App, user_id: &UserId) -> ApiResult<()> {
         let removed = app
             .control
             .remove_member(&self.workspace.id, user_id)
@@ -99,7 +100,7 @@ impl Access {
         self.audit(
             app,
             AuditAction::Member,
-            Some(ResourceKind::User.id(user_id)),
+            Some(ResourceKind::User.id(user_id.as_str())),
             Outcome::Allowed,
             None,
         )

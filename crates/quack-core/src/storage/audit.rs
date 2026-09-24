@@ -6,6 +6,7 @@
 //! context version. Members of the workspace read it; admins do not.
 
 use crate::error::Result;
+use crate::ids::{AuditId, UserId};
 use crate::storage::workspace::WorkspaceDb;
 use crate::storage::writer::Writer;
 
@@ -43,8 +44,8 @@ impl AuditLog {
 #[derive(Debug, Clone)]
 pub struct AuditDetail {
     /// The `control.db.audit_log` row's id.
-    pub id: String,
-    pub user_id: Option<String>,
+    pub id: AuditId,
+    pub user_id: Option<UserId>,
     pub action: String,
     /// The SQL, the file names, the context version: whatever the action
     /// touched.
@@ -74,9 +75,9 @@ impl AuditDetail {
 /// A stored detail row.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditDetailRow {
-    pub id: String,
+    pub id: AuditId,
     pub timestamp: String,
-    pub user_id: Option<String>,
+    pub user_id: Option<UserId>,
     pub action: String,
     pub detail: Option<serde_json::Value>,
 }
@@ -117,12 +118,12 @@ mod tests {
     #[test]
     fn detail_rows_round_trip_newest_first() {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail(&e.to_string()));
-        let first = uuid::Uuid::now_v7().to_string();
-        let second = uuid::Uuid::now_v7().to_string();
+        let first = AuditId::generate();
+        let second = AuditId::generate();
         assert!(
             AuditDetail {
                 id: first.clone(),
-                user_id: Some(String::from("u1")),
+                user_id: Some(UserId::from("u1")),
                 action: String::from("sql"),
                 detail: serde_json::json!({"sql": "SELECT 1"})
             }
@@ -182,10 +183,10 @@ mod tests {
             ok(writer.execute_statement("BEGIN TRANSACTION"));
             ok(writer
                 .execute_statement("CREATE TABLE held AS SELECT range AS n FROM range(100000)"));
-            let id = uuid::Uuid::now_v7().to_string();
+            let id = AuditId::generate();
             ok(AuditDetail {
                 id: id.clone(),
-                user_id: Some(String::from("u")),
+                user_id: Some(UserId::from("u")),
                 action: String::from("list"),
                 detail: detail.clone(),
             }
@@ -204,10 +205,10 @@ mod tests {
             });
             let before = ids.len();
             while !running.is_finished() && ids.len() < before + 20 {
-                let id = uuid::Uuid::now_v7().to_string();
+                let id = AuditId::generate();
                 ok(AuditDetail {
                     id: id.clone(),
-                    user_id: Some(String::from("u")),
+                    user_id: Some(UserId::from("u")),
                     action: String::from("list"),
                     detail: detail.clone(),
                 }

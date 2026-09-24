@@ -21,6 +21,7 @@ use jiff::{SignedDuration, Timestamp};
 use super::queries::{ApiTokens, AuditLog, Bound, Members, Users, Workspaces};
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::ids::{AuditId, UserId, WorkspaceId};
 
 /// The `control.db` schema, as plain SQL files embedded at compile time.
 ///
@@ -35,7 +36,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// A workspace row from the control plane.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkspaceRow {
-    pub id: String,
+    pub id: WorkspaceId,
     pub name: String,
     pub classification: String,
     pub allowed_providers: AllowedProviders,
@@ -140,7 +141,7 @@ pub enum ProviderAllowList {
 /// A server user. The password hash never leaves this module.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserRow {
-    pub id: String,
+    pub id: UserId,
     pub username: String,
     pub is_admin: bool,
     pub created_at: String,
@@ -180,8 +181,8 @@ text_enum!(Role, "role", {
 /// One membership, with the username for listings.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemberRow {
-    pub workspace_id: String,
-    pub user_id: String,
+    pub workspace_id: WorkspaceId,
+    pub user_id: UserId,
     pub username: String,
     pub role: Role,
     pub created_at: String,
@@ -218,8 +219,8 @@ text_enum!(Scope, "scope", {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TokenRow {
     pub token_hash: String,
-    pub workspace_id: String,
-    pub user_id: String,
+    pub workspace_id: WorkspaceId,
+    pub user_id: UserId,
     pub name: String,
     pub scopes: Vec<Scope>,
     pub created_at: String,
@@ -305,10 +306,10 @@ impl FromStr for Expiry {
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     /// UUID v7; the same id keys `_quack_audit` inside the workspace.
-    pub id: String,
-    pub user_id: Option<String>,
+    pub id: AuditId,
+    pub user_id: Option<UserId>,
     pub token_hash: Option<String>,
-    pub workspace_id: Option<String>,
+    pub workspace_id: Option<WorkspaceId>,
     pub action: AuditAction,
     pub resource_type: Option<ResourceKind>,
     /// An opaque id or a table name; never content.
@@ -324,7 +325,7 @@ impl AuditEntry {
     #[must_use]
     pub fn new(action: AuditAction, outcome: Outcome, channel: Channel) -> Self {
         Self {
-            id: uuid::Uuid::now_v7().to_string(),
+            id: AuditId::generate(),
             user_id: None,
             token_hash: None,
             workspace_id: None,
@@ -340,8 +341,8 @@ impl AuditEntry {
 
     /// The workspace the action concerned.
     #[must_use]
-    pub fn in_workspace(mut self, workspace_id: &str) -> Self {
-        self.workspace_id = Some(workspace_id.to_owned());
+    pub fn in_workspace(mut self, workspace_id: &WorkspaceId) -> Self {
+        self.workspace_id = Some(workspace_id.clone());
         self
     }
 
@@ -539,11 +540,11 @@ text_enum!(Channel, "channel", {
 /// A stored access-audit row.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditRow {
-    pub id: String,
+    pub id: AuditId,
     pub timestamp: String,
-    pub user_id: Option<String>,
+    pub user_id: Option<UserId>,
     pub token_hash: Option<String>,
-    pub workspace_id: Option<String>,
+    pub workspace_id: Option<WorkspaceId>,
     pub action: String,
     pub resource_type: Option<String>,
     pub resource_id: Option<String>,
@@ -575,8 +576,8 @@ impl FromRow<'_, SqliteRow> for AuditRow {
 /// Filters for reading the audit log; every field is optional.
 #[derive(Debug, Clone, Default)]
 pub struct AuditFilter {
-    pub user_id: Option<String>,
-    pub workspace_id: Option<String>,
+    pub user_id: Option<UserId>,
+    pub workspace_id: Option<WorkspaceId>,
     pub action: Option<String>,
     pub outcome: Option<Outcome>,
     /// Inclusive lower bound on `timestamp` (SQLite text form).
@@ -768,7 +769,7 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn get_workspace(&self, id: &str) -> Result<Option<WorkspaceRow>> {
+    pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Option<WorkspaceRow>> {
         let bound =
             Bound::new(Self::workspace_select().and_where(Expr::col(Workspaces::Id).eq(id)))?;
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
@@ -780,13 +781,13 @@ impl ControlPlane {
     ///
     /// Returns an error if the insert fails (a duplicate name included).
     pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceRow> {
-        let id = uuid::Uuid::now_v7().to_string();
+        let id = WorkspaceId::generate();
 
         let bound = Bound::new(
             Query::insert()
                 .into_table(Workspaces::Table)
                 .columns([Workspaces::Id, Workspaces::Name, Workspaces::Classification])
-                .values([id.as_str().into(), name.into(), "internal".into()])?,
+                .values([id.clone().into(), name.into(), "internal".into()])?,
         )?;
 
         bound.query().execute(&self.pool).await?;
@@ -821,7 +822,7 @@ impl ControlPlane {
     /// Returns an error if the update fails or the workspace does not exist.
     pub async fn update_workspace(
         &self,
-        id: &str,
+        id: &WorkspaceId,
         changes: &WorkspaceChanges,
     ) -> Result<WorkspaceRow> {
         // The builder is dropped before the await so the future stays Send.
@@ -848,7 +849,7 @@ impl ControlPlane {
         bound.query().execute(&self.pool).await?;
         self.get_workspace(id)
             .await?
-            .ok_or_else(|| Error::WorkspaceNotFound(id.to_owned()))
+            .ok_or_else(|| Error::WorkspaceNotFound(id.to_string()))
     }
 
     /// List all workspaces.
@@ -866,7 +867,7 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn workspaces_for_user(&self, user_id: &str) -> Result<Vec<(WorkspaceRow, Role)>> {
+    pub async fn workspaces_for_user(&self, user_id: &UserId) -> Result<Vec<(WorkspaceRow, Role)>> {
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -923,7 +924,7 @@ impl ControlPlane {
         let hash = tokio::task::spawn_blocking(move || StoredPasswordHash::new(&password))
             .await
             .map_err(|e| Error::Config(format!("password hashing task failed: {e}")))??;
-        let id = uuid::Uuid::now_v7().to_string();
+        let id = UserId::generate();
         let bound = Bound::new(
             Query::insert()
                 .into_table(Users::Table)
@@ -934,7 +935,7 @@ impl ControlPlane {
                     Users::IsAdmin,
                 ])
                 .values([
-                    id.as_str().into(),
+                    (&id).into(),
                     username.into(),
                     hash.0.as_str().into(),
                     i64::from(is_admin).into(),
@@ -961,7 +962,7 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn get_user(&self, id: &str) -> Result<Option<UserRow>> {
+    pub async fn get_user(&self, id: &UserId) -> Result<Option<UserRow>> {
         let bound = Bound::new(Self::user_select().and_where(Expr::col(Users::Id).eq(id)))?;
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
@@ -1004,7 +1005,7 @@ impl ControlPlane {
                 .and_where(Expr::col(Users::Username).eq(username.trim())),
         )?;
         let row = bound.query().fetch_optional(&self.pool).await?;
-        let (id, hash): (Option<String>, Option<String>) = match row {
+        let (id, hash): (Option<UserId>, Option<String>) = match row {
             Some(r) => (Some(r.try_get("id")?), r.try_get("password_hash")?),
             None => (None, None),
         };
@@ -1027,7 +1028,12 @@ impl ControlPlane {
     ///
     /// Returns an error if the workspace or user does not exist or the
     /// write fails.
-    pub async fn set_member(&self, workspace_id: &str, user_id: &str, role: Role) -> Result<()> {
+    pub async fn set_member(
+        &self,
+        workspace_id: &WorkspaceId,
+        user_id: &UserId,
+        role: Role,
+    ) -> Result<()> {
         let existing = self.member_role(workspace_id, user_id).await?;
         let bound = if existing.is_some() {
             Bound::new(
@@ -1063,7 +1069,11 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the delete fails.
-    pub async fn remove_member(&self, workspace_id: &str, user_id: &str) -> Result<bool> {
+    pub async fn remove_member(
+        &self,
+        workspace_id: &WorkspaceId,
+        user_id: &UserId,
+    ) -> Result<bool> {
         let bound = Bound::new(
             Query::delete()
                 .from_table(Members::Table)
@@ -1079,7 +1089,11 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn member_role(&self, workspace_id: &str, user_id: &str) -> Result<Option<Role>> {
+    pub async fn member_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        user_id: &UserId,
+    ) -> Result<Option<Role>> {
         let bound = Bound::new(
             Query::select()
                 .column(Members::Role)
@@ -1096,7 +1110,7 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn list_members(&self, workspace_id: &str) -> Result<Vec<MemberRow>> {
+    pub async fn list_members(&self, workspace_id: &WorkspaceId) -> Result<Vec<MemberRow>> {
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -1144,8 +1158,8 @@ impl ControlPlane {
     /// insert fails.
     pub async fn create_token(
         &self,
-        workspace_id: &str,
-        user_id: &str,
+        workspace_id: &WorkspaceId,
+        user_id: &UserId,
         name: &str,
         scopes: &[Scope],
         expires_at: Option<Expiry>,
@@ -1232,7 +1246,7 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn list_tokens(&self, workspace_id: &str) -> Result<Vec<TokenRow>> {
+    pub async fn list_tokens(&self, workspace_id: &WorkspaceId) -> Result<Vec<TokenRow>> {
         let bound = Bound::new(
             Self::token_select()
                 .and_where(Expr::col(ApiTokens::WorkspaceId).eq(workspace_id))
@@ -1281,10 +1295,10 @@ impl ControlPlane {
                     AuditLog::RequestId,
                 ])
                 .values([
-                    entry.id.as_str().into(),
-                    entry.user_id.as_deref().into(),
+                    (&entry.id).into(),
+                    entry.user_id.as_ref().map(UserId::as_str).into(),
                     entry.token_hash.as_deref().into(),
-                    entry.workspace_id.as_deref().into(),
+                    entry.workspace_id.as_ref().map(WorkspaceId::as_str).into(),
                     entry.action.as_str().into(),
                     entry.resource_type.map(ResourceKind::as_str).into(),
                     entry.resource_id.as_deref().into(),
@@ -1568,7 +1582,7 @@ mod tests {
             .await;
         assert!(cleared.is_ok_and(|w| w.allowed_providers == AllowedProviders::All));
         assert!(
-            cp.update_workspace("missing", &WorkspaceChanges::default())
+            cp.update_workspace(&WorkspaceId::from("missing"), &WorkspaceChanges::default())
                 .await
                 .is_err()
         );
@@ -1623,7 +1637,11 @@ mod tests {
             .create_user("bob", "pw", false)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(cp.set_member(&ws.id, "ghost", Role::Member).await.is_err());
+        assert!(
+            cp.set_member(&ws.id, &UserId::from("ghost"), Role::Member)
+                .await
+                .is_err()
+        );
         assert!(cp.set_member(&ws.id, &bob.id, Role::Viewer).await.is_ok());
         assert!(
             cp.member_role(&ws.id, &bob.id)
@@ -1715,7 +1733,7 @@ mod tests {
         );
         assert!(cp.list_tokens(&ws.id).await.is_ok_and(|t| t.len() == 1));
         assert!(
-            cp.create_token("nope", &bob.id, "x", &[], None)
+            cp.create_token(&WorkspaceId::from("nope"), &bob.id, "x", &[], None)
                 .await
                 .is_err()
         );
@@ -1731,12 +1749,12 @@ mod tests {
     #[tokio::test]
     async fn audit_rows_append_and_filter() {
         let (_dir, cp) = open().await;
-        let mut allowed =
-            AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api).in_workspace("w1");
-        allowed.user_id = Some(String::from("u1"));
-        let mut denied =
-            AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Web).in_workspace("w1");
-        denied.user_id = Some(String::from("u2"));
+        let mut allowed = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api)
+            .in_workspace(&WorkspaceId::from("w1"));
+        allowed.user_id = Some(UserId::from("u1"));
+        let mut denied = AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Web)
+            .in_workspace(&WorkspaceId::from("w1"));
+        denied.user_id = Some(UserId::from("u2"));
         let login = AuditEntry::new(AuditAction::Login, Outcome::Error, Channel::Web);
         for e in [&allowed, &denied, &login] {
             assert!(cp.record_audit(e).await.is_ok());
@@ -1758,12 +1776,12 @@ mod tests {
         assert!(denied_only.is_ok_and(|r| {
             r.len() == 1
                 && r.first()
-                    .is_some_and(|r| r.user_id.as_deref() == Some("u2"))
+                    .is_some_and(|r| r.user_id == Some(UserId::from("u2")))
         }));
         let for_ws = cp
             .query_audit(&AuditFilter {
-                workspace_id: Some(String::from("w1")),
-                user_id: Some(String::from("u1")),
+                workspace_id: Some(WorkspaceId::from("w1")),
+                user_id: Some(UserId::from("u1")),
                 limit: 10,
                 ..AuditFilter::default()
             })

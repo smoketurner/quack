@@ -708,7 +708,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         return Ok(ExitCode::from(Exit::Usage));
     }
     let ws_db = opened.open_db()?;
-    load_piped_stdin(config, &ws_db, &opened.workspace.id, cli.stdin).await?;
+    load_piped_stdin(config, &ws_db, opened.workspace.id.as_str(), cli.stdin).await?;
     if let Some(note) = ws_db.embedding_status()?.note() {
         tracing::warn!(
             "{note} Run `quack embeddings refresh -w {}` to update them.",
@@ -921,7 +921,7 @@ async fn run_import(cli: &Cli, args: ImportArgs) -> Result<ExitCode> {
     let summary = import::Importing {
         config,
         db: &ws_db,
-        workspace_id: &opened.workspace.id,
+        workspace_id: opened.workspace.id.as_str(),
         request,
         policy: ImportPolicy::owner(),
         embedder: embedding_model.as_ref(),
@@ -1446,7 +1446,7 @@ impl OpenedWorkspace {
 
     /// The workspace's connection.
     fn open_db(&self) -> Result<WorkspaceDb> {
-        WorkspaceDb::open(&self.config, &self.workspace.id)
+        WorkspaceDb::open(&self.config, self.workspace.id.as_str())
             .context("failed to open workspace database")
     }
 
@@ -1476,7 +1476,13 @@ async fn run_query(
 ) -> Result<()> {
     let opened = OpenedWorkspace::resolve(workspace_name).await?;
     let ws_db = opened.open_db()?;
-    load_piped_stdin(&opened.config, &ws_db, &opened.workspace.id, wait_for_stdin).await?;
+    load_piped_stdin(
+        &opened.config,
+        &ws_db,
+        opened.workspace.id.as_str(),
+        wait_for_stdin,
+    )
+    .await?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
 
@@ -1533,7 +1539,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     let outcome = ingestion::ingest_file(
         config,
         &ws_db,
-        &opened.workspace.id,
+        opened.workspace.id.as_str(),
         &NewFile::new(&effective_filename, &data)
             .source(source)
             .title(title.as_deref()),

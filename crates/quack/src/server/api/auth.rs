@@ -51,7 +51,7 @@ impl Identity {
     /// closed, the logout audited, and the session cookie cleared.
     pub(crate) async fn log_out(&self, app: &App, jar: CookieJar) -> ApiResult<CookieJar> {
         if let Credential::Session(token) = &self.credential {
-            app.sessions.close(token);
+            app.sessions.close(token.as_str());
         }
         let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
         app.control.record_audit(&entry).await?;

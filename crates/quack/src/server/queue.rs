@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::ingestion::{NewFile, Processing};
 use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
 use quack_core::llm::Embeddings;
@@ -37,19 +38,19 @@ impl UploadJob {
     pub(crate) fn submit(
         self,
         app: &App,
-        workspace_id: &str,
-        owner: Option<String>,
+        workspace_id: &WorkspaceId,
+        owner: Option<UserId>,
         db: SharedDb,
     ) -> JobId {
         let spec = JobSpec::new(JobKind::Ingest, self.filename.clone())
-            .workspace(workspace_id)
+            .workspace(workspace_id.clone())
             .owner(owner)
             .lane(Lane::new(
-                &LaneKey::Ingest(workspace_id.to_owned()),
+                &LaneKey::Ingest(workspace_id.to_string()),
                 app.config.server.workers_per_workspace,
             ));
         let config = app.config.clone();
-        let workspace = workspace_id.to_owned();
+        let workspace = workspace_id.to_string();
         let document_id = self.document_id.clone();
         let worker_db = Arc::clone(&db);
         let id = app

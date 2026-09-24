@@ -8,6 +8,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::embedding::refresh::{self, Plan};
+use quack_core::ids::WorkspaceId;
 use quack_core::jobs::JobId;
 use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
@@ -25,7 +26,7 @@ use serde::Serialize;
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let status = app.read(&id, WorkspaceDb::embedding_status).await?;
@@ -45,7 +46,7 @@ pub(crate) async fn show(
 pub(crate) async fn refresh(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let started = access.refresh_embeddings(&app).await?;
@@ -113,7 +114,7 @@ impl Access {
 fn refresh_in_background(
     run: BackgroundRun,
     app: App,
-    workspace_id: String,
+    workspace_id: WorkspaceId,
     embedder: Embeddings,
 ) -> JobId {
     run.submit(move |ctx| async move {

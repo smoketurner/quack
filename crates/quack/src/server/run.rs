@@ -176,7 +176,7 @@ impl BackgroundRun {
         let spec = JobSpec::new(self.kind.job(), self.kind.label())
             .workspace(workspace_id.clone())
             .owner(Some(self.access.identity.user_id.clone()))
-            .lane(Lane::serial(&self.kind.lane(&workspace_id)));
+            .lane(Lane::serial(&self.kind.lane(workspace_id.as_str())));
         let jobs = self.app.jobs.clone();
         let unstarted = self.clone();
         let id = jobs.submit(spec, move |ctx| async move {

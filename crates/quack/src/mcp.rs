@@ -20,6 +20,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::embedding::Input;
+use quack_core::ids::UserId;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -114,7 +115,7 @@ pub(crate) struct McpSetup {
     pub reader: ReaderDb,
     pub workspace: WorkspaceRow,
     pub policy: WritePolicy,
-    pub user_id: Option<String>,
+    pub user_id: Option<UserId>,
     pub auditor: Auditor,
 }
 
@@ -742,7 +743,7 @@ impl McpServer {
             .map_err(internal)?;
         let id = self
             .db(move |db| {
-                sessions::create_session(db, &model, mode.unwrap_or_default(), user.as_deref())
+                sessions::create_session(db, &model, mode.unwrap_or_default(), user.as_ref())
                     .map(|s| s.id)
             })
             .await?;
@@ -921,6 +922,7 @@ mod tests {
     use quack_core::config::Config;
 
     use super::*;
+    use quack_core::ids::WorkspaceId;
     use quack_core::storage::control::AllowedProviders;
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -939,7 +941,7 @@ mod tests {
             db,
             reader,
             workspace: WorkspaceRow {
-                id: String::from("ws"),
+                id: WorkspaceId::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
                 allowed_providers: AllowedProviders::All,
@@ -1062,7 +1064,7 @@ mod tests {
             db: Arc::clone(&db),
             reader,
             workspace: WorkspaceRow {
-                id: String::from("ws"),
+                id: WorkspaceId::from("ws"),
                 name: String::from("stdio"),
                 classification: String::from("internal"),
                 allowed_providers: AllowedProviders::All,

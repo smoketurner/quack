@@ -4,6 +4,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
+use quack_core::ids::WorkspaceId;
 use quack_core::storage::context::{self, ContextVersion};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
@@ -16,7 +17,7 @@ pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -46,7 +47,7 @@ pub(crate) struct ReplaceContext {
 pub(crate) async fn replace(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Json(body): Json<ReplaceContext>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -90,7 +91,7 @@ fn default_limit() -> u32 {
 pub(crate) async fn versions(
     State(app): State<App>,
     identity: Identity,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;

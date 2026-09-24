@@ -21,6 +21,7 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::citations::Citation;
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
@@ -181,7 +182,7 @@ impl Page {
     fn in_workspace(app: &App, title: &str, access: &Access) -> Self {
         Self {
             workspace: Some(WsNav {
-                id: access.workspace.id.clone(),
+                id: access.workspace.id.to_string(),
                 name: access.workspace.name.clone(),
                 role: Standing::of(access.role),
                 can_write: access.permits(Need::WRITE),
@@ -671,7 +672,7 @@ async fn workspaces(
                 } else {
                     Standing::of(mine.iter().find(|(m, _)| m.id == w.id).map(|(_, r)| *r))
                 },
-                id: w.id,
+                id: w.id.into_string(),
                 name: w.name,
                 classification: w.classification,
             })
@@ -682,7 +683,7 @@ async fn workspaces(
             .await?
             .into_iter()
             .map(|(w, r)| WsItem {
-                id: w.id,
+                id: w.id.into_string(),
                 name: w.name,
                 classification: w.classification,
                 role: Standing::Member(r),
@@ -708,7 +709,7 @@ async fn create_workspace(
     })
 }
 
-async fn workspace_index(Path(id): Path<String>) -> Redirect {
+async fn workspace_index(Path(id): Path<WorkspaceId>) -> Redirect {
     Redirect::to(&format!("/w/{id}/chat"))
 }
 
@@ -801,7 +802,7 @@ impl MessageView {
 async fn chat(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<ChatQuery>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -852,7 +853,7 @@ async fn chat(
 async fn delete_session(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, sid)): Path<(String, String)>,
+    Path((id, sid)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.delete_session(&app, &sid).await?;
@@ -862,7 +863,7 @@ async fn delete_session(
 async fn share_session(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, sid)): Path<(String, String)>,
+    Path((id, sid)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.set_session_shared(&app, &sid, true).await?;
@@ -872,7 +873,7 @@ async fn share_session(
 async fn unshare_session(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, sid)): Path<(String, String)>,
+    Path((id, sid)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.set_session_shared(&app, &sid, false).await?;
@@ -887,7 +888,7 @@ impl DocumentRows {
             .await?;
         let pending = documents.iter().any(|d| d.status.is_in_flight());
         Ok(Self {
-            ws_id: access.workspace.id.clone(),
+            ws_id: access.workspace.id.to_string(),
             can_write: access.permits(Need::WRITE),
             documents,
             pending,
@@ -920,7 +921,7 @@ impl JobRows {
             .collect();
         let pending = jobs.iter().any(|j| j.active);
         Self {
-            ws_id: access.workspace.id.clone(),
+            ws_id: access.workspace.id.to_string(),
             jobs,
             pending,
         }
@@ -930,7 +931,7 @@ impl JobRows {
 async fn jobs_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "jobs").await?;
@@ -944,7 +945,7 @@ async fn jobs_page(
 async fn job_rows(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -956,7 +957,7 @@ async fn job_rows(
 async fn job_cancel(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, job)): Path<(String, String)>,
+    Path((id, job)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let cancelled = access.cancel_job(&app, &job).await?;
@@ -967,7 +968,7 @@ async fn job_cancel(
 async fn documents(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -990,7 +991,7 @@ async fn documents(
 async fn refresh_embeddings(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let started = access.refresh_embeddings(&app).await;
@@ -1010,7 +1011,7 @@ async fn refresh_embeddings(
 async fn document_rows(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -1022,7 +1023,7 @@ async fn document_rows(
 async fn upload(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     multipart: Multipart,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -1081,7 +1082,7 @@ async fn enqueue_web(
 async fn pin(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, doc)): Path<(String, String)>,
+    Path((id, doc)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, true).await?;
@@ -1091,7 +1092,7 @@ async fn pin(
 async fn unpin(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, doc)): Path<(String, String)>,
+    Path((id, doc)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, false).await?;
@@ -1101,7 +1102,7 @@ async fn unpin(
 async fn delete_doc(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, doc)): Path<(String, String)>,
+    Path((id, doc)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::delete_document(&app, &access, &doc).await?;
@@ -1111,7 +1112,7 @@ async fn delete_doc(
 async fn tables(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<FlashQuery>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -1128,7 +1129,7 @@ async fn tables(
 async fn import_submit(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -1159,7 +1160,7 @@ impl fmt::Display for JsonText<'_> {
 async fn table(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, name)): Path<(String, String)>,
+    Path((id, name)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let described = access.describe_table(&app, &name).await?;
@@ -1189,7 +1190,7 @@ async fn table(
 async fn sql_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "sql").await?;
@@ -1232,7 +1233,7 @@ impl SqlResult {
 async fn sql_run(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Form(form): Form<SqlRequest>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -1242,7 +1243,7 @@ async fn sql_run(
 async fn sql_csv(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<SqlRequest>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -1298,7 +1299,7 @@ impl ClassRow {
 async fn ontology_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<OntologyQuery>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -1372,7 +1373,7 @@ async fn ontology_page(
 async fn ontology_decide_many(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     MultiForm(form): MultiForm<BulkDecideForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -1548,7 +1549,7 @@ struct ProposeForm {
 async fn ontology_propose(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Form(form): Form<ProposeForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -1573,7 +1574,7 @@ async fn ontology_propose(
 async fn ontology_decide(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, cid)): Path<(String, String)>,
+    Path((id, cid)): Path<(WorkspaceId, String)>,
     Form(form): Form<DecideRequest>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -1591,7 +1592,7 @@ struct OntologyForm {
 async fn ontology_import(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Form(form): Form<OntologyForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -1604,7 +1605,7 @@ async fn ontology_import(
 async fn ontology_init(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.init_ontology(&app).await;
@@ -1614,7 +1615,7 @@ async fn ontology_init(
 async fn ontology_restore(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, v)): Path<(String, OntologyVersion)>,
+    Path((id, v)): Path<(WorkspaceId, OntologyVersion)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await;
@@ -1624,7 +1625,7 @@ async fn ontology_restore(
 async fn context_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -1649,7 +1650,7 @@ async fn context_page(
 async fn context_save(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Form(form): Form<ReplaceContext>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -1701,7 +1702,7 @@ impl SettingsPage {
 async fn settings(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<SettingsQuery>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
@@ -1721,7 +1722,7 @@ struct SettingsForm {
 async fn settings_save(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     MultiForm(form): MultiForm<SettingsForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
@@ -1749,7 +1750,7 @@ async fn settings_save(
 async fn member_add(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Form(form): Form<AddMember>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
@@ -1760,7 +1761,7 @@ async fn member_add(
 async fn member_remove(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, user_id)): Path<(String, String)>,
+    Path((id, user_id)): Path<(WorkspaceId, UserId)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let removed = access.remove_member(&app, &user_id).await;
@@ -1778,7 +1779,7 @@ struct TokenForm {
 async fn token_create(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     MultiForm(form): MultiForm<TokenForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
@@ -1820,7 +1821,7 @@ async fn token_create(
 async fn token_revoke(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, hash)): Path<(String, String)>,
+    Path((id, hash)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let owned = app
@@ -1883,7 +1884,7 @@ impl From<AuditQuery> for AuditFilter {
         Self {
             action: given(q.action),
             outcome: q.outcome,
-            workspace_id: given(q.workspace_id),
+            workspace_id: given(q.workspace_id).map(WorkspaceId::from),
             limit: 200,
             ..Self::default()
         }
@@ -1921,7 +1922,10 @@ async fn admin_audit(
         action: filter.action.unwrap_or_default(),
         outcome: filter.outcome,
         outcomes: Outcome::ALL,
-        workspace_id: filter.workspace_id.unwrap_or_default(),
+        workspace_id: filter
+            .workspace_id
+            .map(WorkspaceId::into_string)
+            .unwrap_or_default(),
     })
 }
 
@@ -1978,7 +1982,7 @@ impl GraphQueryView {
 async fn graph_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Query(q): Query<GraphPageQuery>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -2203,7 +2207,7 @@ struct ExtractForm {
 async fn graph_extract(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
     Form(form): Form<ExtractForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -2235,7 +2239,7 @@ async fn graph_extract(
 async fn graph_revalidate(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let revalidated = access.revalidate_graph(&app).await;
@@ -2251,7 +2255,7 @@ async fn graph_revalidate(
 async fn graph_review(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path(id): Path<String>,
+    Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     access.review_graph(&app).await?;
@@ -2266,7 +2270,7 @@ struct MergeForm {
 async fn graph_merge_decide(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, mid)): Path<(String, String)>,
+    Path((id, mid)): Path<(WorkspaceId, String)>,
     Form(form): Form<MergeForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
