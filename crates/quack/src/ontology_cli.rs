@@ -12,6 +12,7 @@ use crate::confirm::Confirm;
 use crate::graph_cli::rendered;
 use crate::stdio::StdioPath;
 use quack_core::llm;
+use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::Revision;
@@ -40,9 +41,12 @@ pub(crate) enum OntologyAction {
         limit: u32,
     },
     /// What changed between two versions (defaults: previous and current)
-    Diff { from: Option<u32>, to: Option<u32> },
+    Diff {
+        from: Option<OntologyVersion>,
+        to: Option<OntologyVersion>,
+    },
     /// Store an earlier version as the newest one
-    Restore { version: u32 },
+    Restore { version: OntologyVersion },
     /// Propose the classes, properties, keys, relations, and mappings the
     /// current ontology lacks (a full draft when there is none) from the
     /// tables (no model calls) and, with --documents, from a sample of the
@@ -135,7 +139,7 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
             Some(ontology) => write!(out, "{}", summary(&ontology))?,
         },
         OntologyAction::Init => {
-            if store::latest_version(db)? > 0 {
+            if store::latest_version(db)?.is_some() {
                 anyhow::bail!(
                     "an ontology already exists; import a file or restore a version instead"
                 );
@@ -148,7 +152,7 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
             writeln!(
                 out,
                 "installed the built-in ontology as version {}",
-                stored.version
+                stored.saved_version()?
             )?;
         }
         OntologyAction::Export { file } => {
@@ -159,7 +163,7 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
                 StdioPath::Path(path) => {
                     std::fs::write(path, format!("{json}\n"))
                         .with_context(|| format!("failed to write {file}"))?;
-                    writeln!(out, "wrote version {} to {file}", ontology.version)?;
+                    writeln!(out, "wrote version {} to {file}", ontology.saved_version()?)?;
                 }
             }
         }
@@ -171,7 +175,7 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
                 &ontology,
                 Revision::reviewed(None, Some(&format!("imported from {file}"))),
             )?;
-            writeln!(out, "ontology is now version {}", stored.version)?;
+            writeln!(out, "ontology is now version {}", stored.saved_version()?)?;
         }
         OntologyAction::Versions { limit } => {
             let versions = store::versions(db, limit)?;
@@ -190,9 +194,13 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
             }
         }
         OntologyAction::Diff { from, to } => {
-            let latest = store::latest_version(db)?;
-            let to = to.unwrap_or(latest);
-            let from = from.unwrap_or(to.saturating_sub(1));
+            let to = match to {
+                Some(to) => to,
+                None => store::latest_version(db)?.context("no ontology yet")?,
+            };
+            let from = from.or_else(|| to.previous()).with_context(|| {
+                format!("version {to} is the first; name one to compare it with")
+            })?;
             let older = store::version(db, from)?
                 .with_context(|| format!("version {from} does not exist"))?;
             let newer =
@@ -204,7 +212,7 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
             writeln!(
                 out,
                 "restored version {version} as version {}",
-                stored.version
+                stored.saved_version()?
             )?;
         }
         OntologyAction::Propose { .. }
@@ -321,7 +329,7 @@ fn run_review(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
                 out,
                 "accepted {} candidate(s); ontology is now version {}",
                 decisions.len(),
-                stored.version
+                stored.saved_version()?
             )?;
         }
         OntologyAction::Reject { ids } => {
@@ -364,7 +372,11 @@ fn seed(db: &WorkspaceDb, from: Option<&str>, out: &mut impl Write) -> Result<()
         &ontology,
         Revision::reviewed(None, Some(&format!("seeded from {file}"))),
     )?;
-    writeln!(out, "seeded version {} from {file}", stored.version)?;
+    writeln!(
+        out,
+        "seeded version {} from {file}",
+        stored.saved_version()?
+    )?;
     Ok(())
 }
 
@@ -426,7 +438,7 @@ async fn propose(
             out,
             "accepted {} proposals; ontology is now version {}",
             proposals.len(),
-            stored.version
+            stored.saved_version()?
         )?;
     } else {
         let run = proposals.clone();
@@ -604,7 +616,10 @@ fn summary(ontology: &Ontology) -> String {
         }
     }
     let mut lines = vec![
-        format!("Ontology version {}", ontology.version),
+        match ontology.version {
+            Some(version) => format!("Ontology version {version}"),
+            None => String::from("Ontology (unsaved)"),
+        },
         String::from("classes:"),
     ];
     children(ontology, ROOT_CLASS, 0, &mut lines);

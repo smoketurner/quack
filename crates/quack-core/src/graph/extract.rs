@@ -248,6 +248,7 @@ pub async fn run(
     concurrency: u32,
     progress: Progress<'_>,
 ) -> Result<RunSummary> {
+    let version = ontology.saved_version()?;
     let mut summary = RunSummary::default();
     let mut run = RunProgress::new(chunks.len(), progress);
     let mut calls = extractions(extractor, &chunks, concurrency);
@@ -276,11 +277,7 @@ pub async fn run(
             .invalid_edges
             .saturating_add(validated.invalid_edges);
         summary.drift.absorb(&validated.drift);
-        let (document_id, chunk_id, version) = (
-            chunk.document_id.clone(),
-            chunk.chunk_id.clone(),
-            ontology.version,
-        );
+        let (document_id, chunk_id) = (chunk.document_id.clone(), chunk.chunk_id.clone());
         let (nodes, edges) = db
             .run(move |db| {
                 db.under_timeout(|db| {

@@ -23,7 +23,9 @@ use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::citations::Citation;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
-use quack_core::ontology::{Ontology, OntologyDiff, candidates, store as ontology_store};
+use quack_core::ontology::{
+    Ontology, OntologyDiff, OntologyVersion, candidates, store as ontology_store,
+};
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditFilter, AuditRow, Expiry, MemberRow, Outcome, ProviderAllowList,
@@ -1320,12 +1322,15 @@ async fn ontology_page(
         .read(&id, |db| {
             let current = ontology_store::current(db)?;
             let versions = ontology_store::versions(db, 20)?;
-            let diff = match &current {
-                Some(c) if c.version > 1 => {
-                    ontology_store::version(db, c.version.saturating_sub(1))?
-                        .map(|older| c.diff(&older))
+            let previous = current
+                .as_ref()
+                .and_then(|c| c.version)
+                .and_then(OntologyVersion::previous);
+            let diff = match (&current, previous) {
+                (Some(c), Some(previous)) => {
+                    ontology_store::version(db, previous)?.map(|older| c.diff(&older))
                 }
-                _ => None,
+                (Some(_) | None, None) | (None, Some(_)) => None,
             };
             let pending = candidates::queue(db, Queue::Pending)?;
             let low_support = candidates::queue(db, Queue::LowSupport)?;
@@ -1621,7 +1626,7 @@ async fn ontology_init(
 async fn ontology_restore(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Path((id, v)): Path<(String, u32)>,
+    Path((id, v)): Path<(String, OntologyVersion)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await;

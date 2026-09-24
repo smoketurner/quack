@@ -9,7 +9,7 @@ use duckdb::types::ToSqlOutput;
 use super::resolve::MergeStatus;
 use super::{Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance};
 use crate::error::{Error, Result};
-use crate::ontology::{self, store as ontology_store};
+use crate::ontology::{self, OntologyVersion, store as ontology_store};
 use crate::storage::workspace::{MetaKey, WorkspaceDb, embedding_literal};
 
 /// A node to store: merged into an existing one with the same normalized
@@ -450,11 +450,10 @@ pub fn provenance_of(db: &WorkspaceDb, subject_ids: &[String]) -> Result<Vec<Pro
 /// # Errors
 ///
 /// Returns an error if the read fails.
-pub fn built_with(db: &WorkspaceDb) -> Result<u32> {
+pub fn built_with(db: &WorkspaceDb) -> Result<Option<OntologyVersion>> {
     Ok(db
         .meta(MetaKey::GraphBuiltWithOntologyVersion)?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0))
+        .and_then(|v| v.parse().ok()))
 }
 
 /// Record the ontology version the graph now matches.
@@ -462,7 +461,7 @@ pub fn built_with(db: &WorkspaceDb) -> Result<u32> {
 /// # Errors
 ///
 /// Returns an error if the write fails.
-pub fn set_built_with(db: &WorkspaceDb, version: u32) -> Result<()> {
+pub fn set_built_with(db: &WorkspaceDb, version: OntologyVersion) -> Result<()> {
     db.set_meta(MetaKey::GraphBuiltWithOntologyVersion, &version.to_string())
 }
 
@@ -547,7 +546,7 @@ pub fn clear(db: &WorkspaceDb) -> Result<()> {
          DELETE FROM _quack_graph_extracted;",
     )?;
     db.set_meta(MetaKey::GraphDrift, "{}")?;
-    db.set_meta(MetaKey::GraphBuiltWithOntologyVersion, "0")
+    db.delete_meta(MetaKey::GraphBuiltWithOntologyVersion)
 }
 
 /// Note that a chunk was extracted under an ontology version, with what
@@ -559,7 +558,7 @@ pub fn clear(db: &WorkspaceDb) -> Result<()> {
 pub fn record_extracted(
     db: &WorkspaceDb,
     chunk_id: &str,
-    ontology_version: u32,
+    ontology_version: OntologyVersion,
     (nodes, edges): (u32, u32),
 ) -> Result<()> {
     db.connection().execute(
@@ -658,11 +657,11 @@ pub fn delete_edges(db: &WorkspaceDb, ids: &[String]) -> Result<()> {
 }
 
 /// What revalidation removed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Revalidation {
     pub dropped_nodes: u64,
     pub dropped_edges: u64,
-    pub version: u32,
+    pub version: OntologyVersion,
 }
 
 /// Bring a stale graph in line with the current ontology without a model
@@ -675,6 +674,7 @@ pub struct Revalidation {
 pub fn revalidate(db: &WorkspaceDb) -> Result<Revalidation> {
     let ontology = ontology_store::current(db)?
         .ok_or_else(|| Error::Ontology(String::from("no ontology to validate against")))?;
+    let version = ontology.saved_version()?;
     let classes: BTreeSet<&str> = ontology.classes.iter().map(|c| c.id.as_str()).collect();
     let conn = db.connection();
     let mut stmt = conn.prepare("SELECT id, class_id FROM _quack_graph_nodes")?;
@@ -725,11 +725,11 @@ pub fn revalidate(db: &WorkspaceDb) -> Result<Revalidation> {
     bad_edges.sort();
     bad_edges.dedup();
     delete_edges(db, &bad_edges)?;
-    set_built_with(db, ontology.version)?;
+    set_built_with(db, version)?;
     Ok(Revalidation {
         dropped_nodes: u64::try_from(bad_nodes.len()).unwrap_or(u64::MAX),
         dropped_edges: u64::try_from(bad_edges.len()).unwrap_or(u64::MAX),
-        version: ontology.version,
+        version,
     })
 }
 

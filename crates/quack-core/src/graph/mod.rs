@@ -23,6 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::embedding::{Dimension, Input};
 use crate::extraction::Tally;
+use crate::ontology::OntologyVersion;
 
 /// A stored node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -365,9 +366,10 @@ pub struct GraphStatus {
     pub edges: u64,
     pub provisional_nodes: u64,
     /// The ontology version the graph was last built or revalidated with;
-    /// `0` when never built.
-    pub built_with_version: u32,
-    pub ontology_version: u32,
+    /// `None` when never built.
+    pub built_with_version: Option<OntologyVersion>,
+    /// The newest saved ontology version; `None` when none was saved.
+    pub ontology_version: Option<OntologyVersion>,
     pub stale: bool,
     pub pending_merges: u64,
     pub drift: Drift,

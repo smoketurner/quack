@@ -108,7 +108,7 @@ fn ontology() -> Ontology {
         range: range.to_owned(),
     };
     Ontology {
-        version: 0,
+        version: None,
         classes: vec![
             class("organization", ontology::ROOT_CLASS, None),
             class("vendor", "organization", Some("name")),
@@ -652,7 +652,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     let db = workspace();
     let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, true).unwrap();
-    graph_store::set_built_with(&db, current.version).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(status.provisional() && !status.stale);
 
@@ -687,7 +687,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 2, "Kenya and Uganda");
     assert_eq!(outcome.dropped_edges, 0, "their edges went with them");
-    assert_eq!(outcome.version, saved.version);
+    assert_eq!(Some(outcome.version), saved.version);
     let status = graph_store::status(&db).unwrap();
     assert_eq!(status.nodes, 5);
     assert_eq!(status.edges, 3);
@@ -696,7 +696,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     graph_store::clear(&db).unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(!status.enabled());
-    assert_eq!(status.built_with_version, 0);
+    assert_eq!(status.built_with_version, None);
 }
 
 #[test]
@@ -771,7 +771,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
 async fn provenance_maps_between_entities_and_chunks() {
     let db = workspace();
     let writer = writer_of(&db);
-    let current = ontology();
+    let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, false).unwrap();
     let chunks = extract::chunks(&db, None).unwrap();
     extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})

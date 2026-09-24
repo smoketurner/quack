@@ -745,6 +745,7 @@ pub enum Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ontology::OntologyVersion;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -938,7 +939,7 @@ mod tests {
         let candidates = propose_from_tables(&db, None, &TableEvidenceOptions::default())
             .unwrap_or_else(|e| fail(&e.to_string()));
         let mut base = Ontology::builtin_default();
-        base.version = 1;
+        base.version = Some(OntologyVersion::FIRST);
         let decisions: Vec<(Proposal, Decision)> = candidates
             .iter()
             .map(|c| {

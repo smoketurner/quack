@@ -636,18 +636,19 @@ fn export_ontology(bundle: &mut Bundle, index: &mut String, ontology: &Ontology)
         )?;
     }
     export_relations_and_properties(bundle, ontology)?;
+    let version = ontology.saved_version()?;
     let mut snapshot = front(
         &[
             ("type", ConceptType::Ontology.to_string()),
             ("generator", String::from(GENERATOR)),
-            ("version", ontology.version.to_string()),
+            ("version", version.to_string()),
         ],
         &[],
     );
     writeln!(
         snapshot,
         "# Ontology version {}\n\nThe exact snapshot, as `quack ontology export` writes it; `quack ingest DIR` restores it into a workspace that has no ontology yet.\n\n```json\n{}\n```",
-        ontology.version,
+        version,
         ontology.to_json()?
     )?;
     bundle.push(ONTOLOGY_SNAPSHOT, snapshot);

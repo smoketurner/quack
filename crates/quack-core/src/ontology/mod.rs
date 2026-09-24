@@ -13,8 +13,10 @@ pub mod induction;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 
-use serde::{Deserialize, Serialize};
+use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
 use induction::ItemKind;
@@ -124,6 +126,86 @@ impl NotSnakeCase {
 /// The implicit relation from any entity to any entity.
 pub const MENTIONS_RELATION: &str = "mentions";
 
+/// A saved ontology version: the first save is 1 and each save counts up.
+/// An ontology not yet saved, and a graph never built, have none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OntologyVersion(NonZeroU32);
+
+impl OntologyVersion {
+    pub const FIRST: Self = Self(NonZeroU32::MIN);
+
+    /// `None` for 0, which no saved version has.
+    #[must_use]
+    pub fn new(version: u32) -> Option<Self> {
+        NonZeroU32::new(version).map(Self)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The version a save writes after `latest`.
+    #[must_use]
+    pub fn after(latest: Option<Self>) -> Self {
+        latest.map_or(Self::FIRST, |v| Self(v.0.saturating_add(1)))
+    }
+
+    /// The version before this one, if there is one.
+    #[must_use]
+    pub fn previous(self) -> Option<Self> {
+        Self::new(self.get().saturating_sub(1))
+    }
+
+    /// Reads a version field that older files and hand-written JSON may
+    /// give as `0` or `null` for "not saved".
+    fn zero_as_none<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Self>, D::Error> {
+        Ok(Option::<u32>::deserialize(deserializer)?.and_then(Self::new))
+    }
+}
+
+impl std::fmt::Display for OntologyVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A version typed at a prompt or in a URL.
+impl std::str::FromStr for OntologyVersion {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        text.trim()
+            .parse::<u32>()
+            .ok()
+            .and_then(Self::new)
+            .ok_or_else(|| {
+                Error::Ontology(format!(
+                    "'{text}' is not an ontology version: versions count from 1"
+                ))
+            })
+    }
+}
+
+impl duckdb::ToSql for OntologyVersion {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(i64::from(self.get())))
+    }
+}
+
+impl FromSql for OntologyVersion {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let version = i64::column_result(value)?;
+        u32::try_from(version)
+            .ok()
+            .and_then(Self::new)
+            .ok_or(FromSqlError::OutOfRange(i128::from(version)))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Class {
@@ -230,9 +312,13 @@ impl Mapping {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ontology {
-    /// The stored version this was read from; `0` for one not yet saved.
-    #[serde(default)]
-    pub version: u32,
+    /// The stored version this was read from; `None` for one not yet saved.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "OntologyVersion::zero_as_none"
+    )]
+    pub version: Option<OntologyVersion>,
     #[serde(default)]
     pub classes: Vec<Class>,
     #[serde(default)]
@@ -254,6 +340,20 @@ impl Ontology {
             .map_err(|e| Error::Ontology(format!("ontology does not parse: {e}")))?;
         ontology.validate()?;
         Ok(ontology)
+    }
+
+    /// The version this was read from. The graph records which version it
+    /// was built with, so it can only be built from a saved ontology.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an ontology that was never saved.
+    pub fn saved_version(&self) -> Result<OntologyVersion> {
+        self.version.ok_or_else(|| {
+            Error::Ontology(String::from(
+                "the ontology has not been saved, so it has no version",
+            ))
+        })
     }
 
     /// The JSON interchange form.
@@ -615,7 +715,10 @@ impl Ontology {
     #[must_use]
     pub fn render_capped(&self, limit: usize) -> String {
         let mut lines = vec![
-            format!("Ontology (version {}):", self.version),
+            match self.version {
+                Some(version) => format!("Ontology (version {version}):"),
+                None => String::from("Ontology (unsaved):"),
+            },
             String::from("- classes (child: parent [key] {properties}):"),
         ];
         for class in self.classes.iter().take(limit) {
@@ -741,7 +844,7 @@ impl Ontology {
             values: Vec::new(),
         };
         Self {
-            version: 0,
+            version: None,
             classes: vec![
                 class("person", ROOT_CLASS, &["title", "email"]),
                 class("organization", ROOT_CLASS, &["industry", "country"]),
@@ -807,8 +910,8 @@ impl Changes {
 /// The difference between two versions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct OntologyDiff {
-    pub from: u32,
-    pub to: u32,
+    pub from: Option<OntologyVersion>,
+    pub to: Option<OntologyVersion>,
     pub classes: Changes,
     pub relations: Changes,
     pub properties: Changes,
@@ -827,7 +930,10 @@ impl OntologyDiff {
 
 impl std::fmt::Display for OntologyDiff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "version {} -> {}", self.from, self.to)?;
+        let side = |version: Option<OntologyVersion>| {
+            version.map_or_else(|| String::from("unsaved"), |v| v.to_string())
+        };
+        writeln!(f, "version {} -> {}", side(self.from), side(self.to))?;
         if self.is_empty() {
             return writeln!(f, "  no changes");
         }
@@ -858,6 +964,45 @@ impl std::fmt::Display for OntologyDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_count_from_one() {
+        assert_eq!(OntologyVersion::new(0), None);
+        assert_eq!(OntologyVersion::after(None), OntologyVersion::FIRST);
+        let second = OntologyVersion::after(Some(OntologyVersion::FIRST));
+        assert_eq!(second.get(), 2);
+        assert_eq!(second.previous(), Some(OntologyVersion::FIRST));
+        assert_eq!(OntologyVersion::FIRST.previous(), None);
+        assert_eq!(
+            " 7 "
+                .parse::<OntologyVersion>()
+                .map(OntologyVersion::get)
+                .ok(),
+            Some(7)
+        );
+        for bad in ["0", "-1", "v2", ""] {
+            assert!(bad.parse::<OntologyVersion>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_unsaved_version_is_absent_in_json_and_read_from_zero_or_null() {
+        let json = Ontology::builtin_default().to_json().unwrap_or_default();
+        assert!(!json.contains("\"version\""), "{json}");
+        for version in ["0", "null"] {
+            let text = format!(r#"{{"version": {version}}}"#);
+            assert_eq!(
+                Ontology::from_json(&text).map(|o| o.version).ok(),
+                Some(None),
+                "{text}"
+            );
+        }
+        let saved = Ontology::from_json(r#"{"version": 3}"#)
+            .map(|o| o.version)
+            .ok();
+        assert_eq!(saved, Some(OntologyVersion::new(3)));
+        assert!(Ontology::from_json(r#"{"version": -1}"#).is_err());
+    }
 
     #[test]
     fn snake_ids_are_checked_not_repaired() {
@@ -1025,7 +1170,7 @@ mod tests {
     fn diff_reports_added_removed_and_changed_ids() {
         let base = Ontology::from_json(INSURANCE).unwrap_or_else(|e| fail(&e.to_string()));
         let mut next = base.clone();
-        next.version = 2;
+        next.version = OntologyVersion::new(2);
         next.classes.retain(|c| c.id != "vendor");
         next.classes.push(Class {
             id: String::from("adjuster"),

@@ -194,7 +194,7 @@ The knowledge graph (`quack_core::graph`, design doc 6.4) lives in `_quack_graph
 `_quack_graph_edges`, `_quack_provenance`, and `_quack_graph_merges`. `graph::tables`
 turns mapped rows into nodes and edges deterministically; `graph::extract` sends each
 ready chunk to the chat model (`llm::graph_extractor`, preamble from
-`extract::prompt_for`) and validates the answer against the ontology, counting unknown
+`Ontology::extraction_prompt`) and validates the answer against the ontology, counting unknown
 classes and relations as drift in `_quack_meta.graph_drift`; `graph::resolve` embeds
 node labels, merges near-identical labels of one class, and queues the rest as merge
 proposals; `graph::traverse` resolves an entry point (exact label, alias, then embedding)
@@ -207,7 +207,7 @@ was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending 
 and drift; `revalidate` drops what the current ontology no longer allows. The agent
 registers `search_graph` and `find_path` only when the graph has nodes, query mode drops
 provisional results, and every response shape carries the turn's `graph` results. Their
-rendering (`graph::traverse::render_tree`, shared with `quack graph` and the terminal)
+rendering (`Display for GraphResult` in `graph::traverse`, shared with `quack graph` and the terminal)
 carries each node's and edge's typed properties, bounded; a class or relation id the
 ontology does not define is refused with the ids that do exist, a name that matches no
 entity comes back with the closest labels (`traverse::suggest_entities`), and a result

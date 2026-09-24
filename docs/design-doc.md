@@ -873,7 +873,7 @@ visit more than `[graph].max_nodes`.
 **Provenance.** Every node and edge has at least one `_quack_provenance` row. Answers from
 the graph cite the source chunk or row the same way document answers cite chunks.
 
-**Traversal.** Breadth-first in Rust over plain SQL: one constant `edges_touching` query
+**Traversal.** Breadth-first in Rust over plain SQL: one constant `store::edges` query (`EdgeScope::Touching`)
 per frontier, with bound parameters, no DuckPGQ and no recursive CTE. The CTE this design
 originally specified was removed (#48) because it enumerated every simple path out of a hub
 before its `LIMIT` applied, which on a hub node never came back.

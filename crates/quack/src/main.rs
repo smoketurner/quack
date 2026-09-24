@@ -1714,7 +1714,7 @@ fn restore_bundle_ontology(
     writeln!(
         out,
         "Restored the bundle's ontology (version {} in this workspace).",
-        restored.version
+        restored.saved_version()?
     )?;
     Ok(Some(restored))
 }

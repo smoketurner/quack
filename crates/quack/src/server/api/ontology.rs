@@ -14,6 +14,7 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
 use quack_core::llm;
+use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, candidates, documents, store};
 use quack_core::progress::ChunkDone;
@@ -78,7 +79,7 @@ impl Access {
         self.audit(
             app,
             AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
+            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version, "classes": stored.classes.len() })),
         )
@@ -91,7 +92,7 @@ impl Access {
         let db = app.workspace_db(&self.workspace.id).await?;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| {
-            if store::latest_version(db)? > 0 {
+            if store::latest_version(db)?.is_some() {
                 return Ok(None);
             }
             store::save(
@@ -106,7 +107,7 @@ impl Access {
         self.audit(
             app,
             AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
+            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
             Outcome::Allowed,
             None,
         )
@@ -115,14 +116,18 @@ impl Access {
     }
 
     /// Store version `version` again as the newest.
-    pub(crate) async fn restore_ontology(&self, app: &App, version: u32) -> ApiResult<Ontology> {
+    pub(crate) async fn restore_ontology(
+        &self,
+        app: &App,
+        version: OntologyVersion,
+    ) -> ApiResult<Ontology> {
         let db = app.workspace_db(&self.workspace.id).await?;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| store::restore(db, version, Some(&author))).await?;
         self.audit(
             app,
             AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
+            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "restored": version, "version": stored.version })),
         )
@@ -159,13 +164,13 @@ pub(crate) async fn versions(
 #[derive(Deserialize)]
 pub(crate) struct DiffQuery {
     /// The older version to compare against; default: the one before.
-    pub against: Option<u32>,
+    pub against: Option<OntologyVersion>,
 }
 
 pub(crate) async fn version(
     State(app): State<App>,
     identity: Identity,
-    Path((id, v)): Path<(String, u32)>,
+    Path((id, v)): Path<(String, OntologyVersion)>,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
@@ -178,14 +183,13 @@ pub(crate) async fn version(
             None,
         )
         .await?;
-    let against = q.against.unwrap_or(v.saturating_sub(1));
+    let against = q.against.or_else(|| v.previous());
     let (snapshot, older) = app
         .read(&id, move |db| {
             let snapshot = store::version(db, v)?;
-            let older = if against == 0 {
-                None
-            } else {
-                store::version(db, against)?
+            let older = match against {
+                Some(against) => store::version(db, against)?,
+                None => None,
             };
             Ok((snapshot, older))
         })
@@ -200,7 +204,7 @@ pub(crate) async fn version(
 pub(crate) async fn restore(
     State(app): State<App>,
     identity: Identity,
-    Path((id, v)): Path<(String, u32)>,
+    Path((id, v)): Path<(String, OntologyVersion)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await?;
@@ -261,7 +265,7 @@ pub(crate) struct TableProposal {
     pub candidates: usize,
     pub run: Option<String>,
     /// The version accepting them all made, with `auto_accept`.
-    pub version: Option<u32>,
+    pub version: Option<OntologyVersion>,
 }
 
 /// Candidates decided one at a time.
@@ -269,7 +273,7 @@ pub(crate) struct TableProposal {
 pub(crate) struct CandidateDecided {
     pub candidate: String,
     pub action: CandidateAction,
-    pub version: Option<u32>,
+    pub version: Option<OntologyVersion>,
 }
 
 /// Candidates decided in bulk.
@@ -277,7 +281,7 @@ pub(crate) struct CandidateDecided {
 pub(crate) struct CandidatesDecided {
     pub accepted: usize,
     pub rejected: usize,
-    pub version: Option<u32>,
+    pub version: Option<OntologyVersion>,
 }
 
 /// Induction and the review queue, shared by the API and the web console.
@@ -304,7 +308,7 @@ impl Access {
             }
             let run = candidates::store_run(db, &proposals)?;
             let version = if auto_accept {
-                Some(candidates::accept_all(db, Some(&author))?.version)
+                candidates::accept_all(db, Some(&author))?.version
             } else {
                 None
             };
@@ -341,7 +345,7 @@ impl Access {
         let version = with_db(db, move |db| {
             if let Some(decision) = decision {
                 let stored = candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
-                return Ok(Some(stored.version));
+                return Ok(stored.version);
             }
             candidates::reject(db, &[candidate_id], Some(&author))?;
             Ok(None)
@@ -391,7 +395,7 @@ impl Access {
                     .into_iter()
                     .map(|id| (id, Decision::Accept))
                     .collect();
-                Some(candidates::accept(db, &decisions, Some(&author))?.version)
+                candidates::accept(db, &decisions, Some(&author))?.version
             };
             Ok((version, rejected))
         })

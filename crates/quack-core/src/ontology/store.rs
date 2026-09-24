@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Class, Mapping, MappingRelation, Ontology, Property, PropertyType, ROOT_CLASS, Relation,
+    Class, Mapping, MappingRelation, Ontology, OntologyVersion, Property, PropertyType, ROOT_CLASS,
+    Relation,
 };
 use crate::error::{Error, Record, Result};
 use crate::storage::workspace::WorkspaceDb;
@@ -63,25 +64,24 @@ impl<'a> Revision<'a> {
 /// A stored version's header.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct VersionRow {
-    pub version: u32,
+    pub version: OntologyVersion,
     pub author: Option<String>,
     pub note: Option<String>,
     pub acceptance: Acceptance,
     pub created_at: String,
 }
 
-/// The newest version number, `0` when no ontology has been saved.
+/// The newest version, `None` when no ontology has been saved.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn latest_version(db: &WorkspaceDb) -> Result<u32> {
-    let latest: Option<i64> = db.connection().query_row(
+pub fn latest_version(db: &WorkspaceDb) -> Result<Option<OntologyVersion>> {
+    Ok(db.connection().query_row(
         "SELECT max(version) FROM _quack_ontology_versions",
         [],
         |r| r.get(0),
-    )?;
-    Ok(latest.and_then(|v| u32::try_from(v).ok()).unwrap_or(0))
+    )?)
 }
 
 /// Whether the newest version was written by `--auto-accept` and nobody
@@ -103,13 +103,12 @@ pub fn current_is_auto_accepted(db: &WorkspaceDb) -> Result<bool> {
 ///
 /// Returns an error if a read fails or a stored row is malformed.
 pub fn current(db: &WorkspaceDb) -> Result<Option<Ontology>> {
-    let version = latest_version(db)?;
-    if version == 0 {
+    let Some(version) = latest_version(db)? else {
         return Ok(None);
-    }
+    };
     let conn = db.connection();
     let mut ontology = Ontology {
-        version,
+        version: Some(version),
         ..Ontology::default()
     };
     let mut stmt = conn.prepare(
@@ -192,16 +191,16 @@ pub fn current(db: &WorkspaceDb) -> Result<Option<Ontology>> {
 /// # Errors
 ///
 /// Returns an error if the query fails or the snapshot does not parse.
-pub fn version(db: &WorkspaceDb, version: u32) -> Result<Option<Ontology>> {
+pub fn version(db: &WorkspaceDb, version: OntologyVersion) -> Result<Option<Ontology>> {
     let mut stmt = db.connection().prepare(
         "SELECT CAST(snapshot AS VARCHAR) FROM _quack_ontology_versions WHERE version = ?",
     )?;
-    let mut rows = stmt.query(duckdb::params![i64::from(version)])?;
+    let mut rows = stmt.query(duckdb::params![version])?;
     match rows.next()? {
         Some(row) => {
             let text: String = row.get(0)?;
             let mut ontology: Ontology = serde_json::from_str(&text)?;
-            ontology.version = version;
+            ontology.version = Some(version);
             Ok(Some(ontology))
         }
         None => Ok(None),
@@ -221,9 +220,8 @@ pub fn versions(db: &WorkspaceDb, limit: u32) -> Result<Vec<VersionRow>> {
     let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let version: i64 = row.get(0)?;
         out.push(VersionRow {
-            version: u32::try_from(version).unwrap_or(0),
+            version: row.get(0)?,
             author: row.get(1)?,
             note: row.get(2)?,
             acceptance: row.get::<_, Option<Acceptance>>(3)?.unwrap_or_default(),
@@ -244,13 +242,13 @@ pub fn save(db: &WorkspaceDb, ontology: &Ontology, revision: Revision<'_>) -> Re
     ontology.validate()?;
     check_mappings(db, ontology)?;
     let previous = current(db)?;
-    let next = latest_version(db)?.saturating_add(1);
+    let next = OntologyVersion::after(latest_version(db)?);
     let conn = db.connection();
     let mut stored = ontology.normalized();
-    stored.version = next;
+    stored.version = Some(next);
     let snapshot = serde_json::to_string(&stored)?;
     conn.execute("BEGIN", [])?;
-    let outcome = write_version(conn, &stored, previous.as_ref(), &snapshot, revision);
+    let outcome = write_version(conn, next, &stored, previous.as_ref(), &snapshot, revision);
     match outcome {
         Ok(()) => {
             conn.execute("COMMIT", [])?;
@@ -265,6 +263,7 @@ pub fn save(db: &WorkspaceDb, ontology: &Ontology, revision: Revision<'_>) -> Re
 
 fn write_version(
     conn: &duckdb::Connection,
+    version: OntologyVersion,
     stored: &Ontology,
     previous: Option<&Ontology>,
     snapshot: &str,
@@ -274,7 +273,7 @@ fn write_version(
         "INSERT INTO _quack_ontology_versions (version, snapshot, author, note, acceptance) \
          VALUES (?, ?, ?, ?, ?)",
         duckdb::params![
-            i64::from(stored.version),
+            version,
             snapshot,
             revision.author,
             revision.note,
@@ -287,7 +286,7 @@ fn write_version(
         let kept = existed
             .then(|| prior_since.get(&(kind, id.to_owned())).copied())
             .flatten();
-        i64::from(kept.unwrap_or(stored.version))
+        i64::from(kept.unwrap_or(version.get()))
     };
     for table in [
         "_quack_ontology_classes",
@@ -439,7 +438,11 @@ fn check_mappings(db: &WorkspaceDb, ontology: &Ontology) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error when the version does not exist or the save fails.
-pub fn restore(db: &WorkspaceDb, target: u32, author: Option<&str>) -> Result<Ontology> {
+pub fn restore(
+    db: &WorkspaceDb,
+    target: OntologyVersion,
+    author: Option<&str>,
+) -> Result<Ontology> {
     let snapshot =
         version(db, target)?.ok_or_else(|| Record::OntologyVersion.missing(target.to_string()))?;
     save(
@@ -466,14 +469,14 @@ mod tests {
     fn save_current_versions_and_restore_round_trip() {
         let db = db();
         assert!(current(&db).is_ok_and(|o| o.is_none()));
-        assert_eq!(latest_version(&db).unwrap_or(99), 0);
+        assert!(latest_version(&db).is_ok_and(|v| v.is_none()));
         let v1 = save(
             &db,
             &Ontology::builtin_default(),
             Revision::reviewed(Some("alice"), Some("default")),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(v1.version, 1);
+        assert_eq!(v1.version, OntologyVersion::new(1));
         let live = current(&db)
             .unwrap_or_else(|e| fail(&e.to_string()))
             .unwrap_or_else(|| fail("no ontology"));
@@ -496,7 +499,7 @@ mod tests {
         edited.classes.retain(|c| c.id != "concept");
         let v2 = save(&db, &edited, Revision::reviewed(None, None))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(v2.version, 2);
+        assert_eq!(v2.version, OntologyVersion::new(2));
         let since: Vec<(String, i64)> = {
             let mut stmt = db.connection().prepare("SELECT id, since_version FROM _quack_ontology_classes WHERE id IN ('person', 'vendor') ORDER BY id").unwrap_or_else(|e| fail(&e.to_string()));
             let rows = stmt
@@ -511,14 +514,14 @@ mod tests {
 
         let headers = versions(&db, 10).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(
-            headers.iter().map(|h| h.version).collect::<Vec<_>>(),
+            headers.iter().map(|h| h.version.get()).collect::<Vec<_>>(),
             [2, 1]
         );
         assert_eq!(
             headers.last().and_then(|h| h.author.clone()).as_deref(),
             Some("alice")
         );
-        let old = version(&db, 1)
+        let old = version(&db, OntologyVersion::FIRST)
             .unwrap_or_else(|e| fail(&e.to_string()))
             .unwrap_or_else(|| fail("no v1"));
         assert!(old.class("concept").is_some() && old.class("vendor").is_none());
@@ -526,11 +529,13 @@ mod tests {
         assert_eq!(diff.classes.added, ["vendor"]);
         assert_eq!(diff.classes.removed, ["concept"]);
 
-        let restored = restore(&db, 1, Some("bob")).unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(restored.version, 3);
+        let restored = restore(&db, OntologyVersion::FIRST, Some("bob"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(restored.version, OntologyVersion::new(3));
         assert!(restored.class("concept").is_some() && restored.class("vendor").is_none());
-        assert!(version(&db, 9).is_ok_and(|v| v.is_none()));
-        assert!(restore(&db, 9, None).is_err());
+        let nine = OntologyVersion::new(9).unwrap_or(OntologyVersion::FIRST);
+        assert!(version(&db, nine).is_ok_and(|v| v.is_none()));
+        assert!(restore(&db, nine, None).is_err());
     }
 
     #[test]
@@ -550,7 +555,7 @@ mod tests {
         let again = save(&db, &live, Revision::reviewed(None, None))
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(again.diff(&live).is_empty());
-        let snapshot = version(&db, 1)
+        let snapshot = version(&db, OntologyVersion::FIRST)
             .unwrap_or_else(|e| fail(&e.to_string()))
             .unwrap_or_else(|| fail("no v1"));
         assert_eq!(snapshot, live);
@@ -591,8 +596,8 @@ mod tests {
         let wrong = save(&db, &wrong_column, Revision::reviewed(None, None)).err();
         assert!(wrong.is_some_and(|e| e.to_string().contains("column 'ghost'")));
         assert_eq!(
-            latest_version(&db).unwrap_or(0),
-            2,
+            latest_version(&db).ok().flatten(),
+            OntologyVersion::new(2),
             "failed saves write nothing"
         );
     }

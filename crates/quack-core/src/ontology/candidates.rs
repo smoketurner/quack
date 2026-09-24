@@ -355,6 +355,7 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ontology::OntologyVersion;
     use crate::ontology::induction::{Candidate, TableEvidenceOptions, propose_from_tables};
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -465,7 +466,7 @@ mod tests {
             })
             .collect();
         let stored = accept(&db, &rest, Some("bob")).unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(stored.version, 1);
+        assert_eq!(stored.version, OntologyVersion::new(1));
         assert!(
             stored
                 .class("supplier")

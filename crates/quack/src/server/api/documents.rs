@@ -152,7 +152,7 @@ async fn import_bundle(
                 &snapshot,
                 Revision::reviewed(Some(&author), Some("restored from a bundle")),
             )?;
-            restored = Some(saved.version);
+            restored = saved.version;
             current = Some(saved);
         }
         let candidates = okf::propose(&for_candidates, current.as_ref());

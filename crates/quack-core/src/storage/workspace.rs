@@ -214,9 +214,10 @@ const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontolo
                 snapshot JSON NOT NULL,
                 author TEXT,
                 note TEXT,
-                created_at TIMESTAMP DEFAULT now()
+                created_at TIMESTAMP DEFAULT now(),
+                acceptance TEXT
             );
-            ALTER TABLE _quack_ontology_versions ADD COLUMN IF NOT EXISTS acceptance TEXT DEFAULT 'reviewed';
+            ALTER TABLE _quack_ontology_versions ADD COLUMN IF NOT EXISTS acceptance TEXT;
             CREATE TABLE IF NOT EXISTS _quack_ontology_classes (
                 id TEXT PRIMARY KEY,
                 parent_id TEXT,
@@ -736,6 +737,10 @@ impl WorkspaceDb {
         self.upgrade_data(dim)?;
         self.set_meta(MetaKey::SchemaVersion, WORKSPACE_SCHEMA_VERSION)?;
         self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
+        // DuckDB cannot replay an `ADD COLUMN` from the write-ahead log (an
+        // internal error on the next open), so a column added to an older
+        // file goes into the database file before anything else runs.
+        self.conn.execute_batch("CHECKPOINT")?;
         Ok(())
     }
 
@@ -892,6 +897,19 @@ impl WorkspaceDb {
         self.conn.execute(
             "INSERT OR REPLACE INTO _quack_meta (key, value) VALUES (?, ?)",
             duckdb::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a `_quack_meta` entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub fn delete_meta(&self, key: MetaKey) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM _quack_meta WHERE key = ?",
+            duckdb::params![key],
         )?;
         Ok(())
     }
@@ -4170,10 +4188,18 @@ mod tests {
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()));
             }
+            // A file from before version 10 has no acceptance column.
+            db.execute_statement("ALTER TABLE _quack_ontology_versions DROP COLUMN acceptance")
+                .unwrap_or_else(|e| fail(&e.to_string()));
             db.set_meta(MetaKey::SchemaVersion, "9")
                 .unwrap_or_else(|e| fail(&e.to_string()));
         }
+        // The second open runs while the first is still live, so it replays
+        // the first one's column change from the write-ahead log, as the next
+        // start does after a process dies before a checkpoint.
+        let upgraded = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        drop(upgraded);
         let acceptance: Vec<Acceptance> = store::versions(&reopened, 10)
             .unwrap_or_else(|e| fail(&e.to_string()))
             .into_iter()
