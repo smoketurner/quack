@@ -16,6 +16,7 @@ struct MockState {
     /// Device polls answered `authorization_pending` before success.
     pending_polls: AtomicUsize,
     code_exchanges: AtomicUsize,
+    client_credentials_requests: AtomicUsize,
     last_token_body: StdMutex<String>,
 }
 
@@ -156,6 +157,19 @@ fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static s
                         )
                     }
                 }
+                Some("client_credentials") => {
+                    state
+                        .client_credentials_requests
+                        .fetch_add(1, Ordering::SeqCst);
+                    if form(body, "client_secret").as_deref() == Some(env!("CARGO_PKG_NAME")) {
+                        ("200 OK", token_json("service-access", None))
+                    } else {
+                        (
+                            "401 Unauthorized",
+                            String::from("{\"error\":\"invalid_client\"}"),
+                        )
+                    }
+                }
                 Some("urn:ietf:params:oauth:grant-type:device_code") => {
                     let pending = state.pending_polls.load(Ordering::SeqCst);
                     if pending > 0 {
@@ -186,7 +200,11 @@ fn free_port() -> u16 {
         .map_or(19876, |a| a.port())
 }
 
-fn oauth_config(issuer: &str, device_code: bool) -> OAuthConfig {
+/// An environment variable `cargo test` always sets, standing in for a
+/// client secret so no test has to set one.
+const SECRET_ENV: &str = "CARGO_PKG_NAME";
+
+fn oauth_config(issuer: &str, grant: Grant) -> OAuthConfig {
     OAuthConfig {
         issuer_url: issuer.to_owned(),
         client_id: String::from("client-1"),
@@ -195,8 +213,11 @@ fn oauth_config(issuer: &str, device_code: bool) -> OAuthConfig {
             String::from("offline_access"),
         ],
         redirect_uri: format!("http://127.0.0.1:{}/callback", free_port()),
-        device_code,
-        client_secret_env: None,
+        grant,
+        client_secret_env: match grant {
+            Grant::ClientCredentials => Some(String::from(SECRET_ENV)),
+            Grant::AuthorizationCode | Grant::DeviceCode => None,
+        },
     }
 }
 
@@ -214,11 +235,11 @@ fn fail(msg: &str) -> ! {
     panic!("{msg}")
 }
 
-fn manager(dir: &Path, idp: &MockIdp, device_code: bool) -> TokenManager {
+fn manager(dir: &Path, idp: &MockIdp, grant: Grant) -> TokenManager {
     match TokenManager::new(
         dir,
         &name("p"),
-        oauth_config(&idp.issuer, device_code),
+        oauth_config(&idp.issuer, grant),
         KeySource::File,
     ) {
         Ok(m) => m,
@@ -240,7 +261,7 @@ fn seed(offset: SignedDuration, refresh: Option<&str>) -> CachedToken {
 async fn fresh_cached_token_is_reused_without_the_network() {
     let idp = MockIdp::start().await;
     let dir = temp();
-    let m = manager(dir.path(), &idp, false);
+    let m = manager(dir.path(), &idp, Grant::AuthorizationCode);
     assert!(
         m.cache
             .store(&seed(SignedDuration::from_hours(1), Some("r")))
@@ -258,7 +279,7 @@ async fn fresh_cached_token_is_reused_without_the_network() {
 async fn expiring_token_is_refreshed_once_under_concurrency() {
     let idp = MockIdp::start().await;
     let dir = temp();
-    let m = Arc::new(manager(dir.path(), &idp, false));
+    let m = Arc::new(manager(dir.path(), &idp, Grant::AuthorizationCode));
     assert!(
         m.cache
             .store(&seed(SignedDuration::from_secs(30), Some("r")))
@@ -304,7 +325,7 @@ async fn refresh_keeps_the_old_refresh_token_when_the_issuer_omits_one() {
 async fn missing_cache_and_failed_refresh_both_require_a_login() {
     let idp = MockIdp::start().await;
     let dir = temp();
-    let m = manager(dir.path(), &idp, false);
+    let m = manager(dir.path(), &idp, Grant::AuthorizationCode);
     let err = m.access_token().await.err();
     assert!(
         err.as_ref()
@@ -343,7 +364,7 @@ async fn device_code_login_polls_until_approved_and_caches() {
     let idp = MockIdp::start().await;
     idp.state.pending_polls.store(2, Ordering::SeqCst);
     let dir = temp();
-    let m = manager(dir.path(), &idp, true);
+    let m = manager(dir.path(), &idp, Grant::DeviceCode);
     let prompts = StdMutex::new(Vec::new());
     let notify = |p: LoginPrompt| {
         if let Ok(mut v) = prompts.lock() {
@@ -375,10 +396,91 @@ async fn device_code_login_polls_until_approved_and_caches() {
 }
 
 #[tokio::test]
+async fn client_credentials_needs_no_login_and_runs_again_when_the_token_runs_out() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = manager(dir.path(), &idp, Grant::ClientCredentials);
+    let requests = || idp.state.client_credentials_requests.load(Ordering::SeqCst);
+
+    assert!(m.status().await.is_ok_and(|s| s.token.is_none()));
+    let first = m.access_token().await;
+    assert!(first.is_ok_and(|t| t.expose_secret() == "service-access"));
+    assert!(
+        m.access_token()
+            .await
+            .is_ok_and(|t| t.expose_secret() == "service-access")
+    );
+    assert_eq!(requests(), 1);
+    let body = idp
+        .state
+        .last_token_body
+        .lock()
+        .map(|b| b.clone())
+        .unwrap_or_default();
+    assert!(body.contains("client_id=client-1"), "{body}");
+    assert!(body.contains("scope=api"), "{body}");
+    assert!(
+        m.status()
+            .await
+            .is_ok_and(|s| s.token.is_some_and(|t| t.renewal == Renewal::Regrant))
+    );
+
+    // An expiring token is replaced by the grant, never refreshed, even when
+    // the issuer handed out a refresh token.
+    let fresh = manager(dir.path(), &idp, Grant::ClientCredentials);
+    assert!(
+        fresh
+            .cache
+            .store(&seed(SignedDuration::from_secs(30), Some("r")))
+            .await
+            .is_ok()
+    );
+    assert!(
+        fresh
+            .access_token()
+            .await
+            .is_ok_and(|t| t.expose_secret() == "service-access")
+    );
+    assert_eq!(requests(), 2);
+    assert_eq!(idp.state.refresh_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn client_credentials_login_checks_the_credentials_and_ignores_the_device_flow() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = manager(dir.path(), &idp, Grant::ClientCredentials);
+    let prompted = AtomicUsize::new(0);
+    let notify = |_: LoginPrompt| {
+        prompted.fetch_add(1, Ordering::SeqCst);
+    };
+    let token = m.login(LoginFlow::DeviceCode, &notify).await;
+    assert!(token.is_ok_and(|t| t.access_token.expose_secret() == "service-access"));
+    assert_eq!(prompted.load(Ordering::SeqCst), 0);
+    assert!(m.status().await.is_ok_and(|s| s.token.is_some()));
+}
+
+#[tokio::test]
+async fn a_refused_client_secret_is_an_error_not_a_login_prompt() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let mut config = oauth_config(&idp.issuer, Grant::ClientCredentials);
+    // Set by cargo for every test run, and not the secret the issuer expects.
+    config.client_secret_env = Some(String::from("CARGO_PKG_VERSION"));
+    let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
+        fail("manager build failed");
+    };
+    let err = m.access_token().await.err();
+    assert!(err.as_ref().is_some_and(|e| matches!(e, Error::Llm(_))));
+    assert!(err.is_some_and(|e| e.to_string().contains("client-credentials grant failed")),);
+    assert!(m.status().await.is_ok_and(|s| s.token.is_none()));
+}
+
+#[tokio::test]
 async fn browser_login_rejects_bad_state_then_accepts_the_code() {
     let idp = MockIdp::start().await;
     let dir = temp();
-    let m = Arc::new(manager(dir.path(), &idp, false));
+    let m = Arc::new(manager(dir.path(), &idp, Grant::AuthorizationCode));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let login = {
         let m = Arc::clone(&m);
@@ -431,7 +533,7 @@ async fn browser_login_rejects_bad_state_then_accepts_the_code() {
 async fn browser_login_reports_the_issuer_error() {
     let idp = MockIdp::start().await;
     let dir = temp();
-    let m = Arc::new(manager(dir.path(), &idp, false));
+    let m = Arc::new(manager(dir.path(), &idp, Grant::AuthorizationCode));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let login = {
         let m = Arc::clone(&m);
@@ -464,7 +566,7 @@ async fn browser_login_reports_the_issuer_error() {
 #[tokio::test]
 async fn device_login_without_a_device_endpoint_is_an_error() {
     let dir = temp();
-    let config = oauth_config("http://127.0.0.1:9", true);
+    let config = oauth_config("http://127.0.0.1:9", Grant::DeviceCode);
     let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
         fail("manager build failed");
     };
@@ -481,7 +583,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
 #[tokio::test]
 async fn discovery_failure_is_reported_with_the_url() {
     let dir = temp();
-    let config = oauth_config("http://127.0.0.1:9", false);
+    let config = oauth_config("http://127.0.0.1:9", Grant::AuthorizationCode);
     let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
         fail("manager build failed");
     };
@@ -498,7 +600,7 @@ async fn discovery_failure_is_reported_with_the_url() {
 #[test]
 fn shared_manager_is_one_per_provider() {
     let dir = temp();
-    let oauth = oauth_config("http://127.0.0.1:9", false);
+    let oauth = oauth_config("http://127.0.0.1:9", Grant::AuthorizationCode);
     let a = TokenManager::shared(dir.path(), &name("shared"), &oauth);
     let b = TokenManager::shared(dir.path(), &name("shared"), &oauth);
     assert!(matches!((&a, &b), (Ok(a), Ok(b)) if Arc::ptr_eq(a, b)));
