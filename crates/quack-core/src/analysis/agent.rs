@@ -611,6 +611,7 @@ impl BuildContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{ChunkId, DocumentId};
     use rig::completion::PromptError;
 
     fn prompt_error(e: PromptError) -> rig::agent::StreamingError {
@@ -673,8 +674,8 @@ mod tests {
             ],
             citations: vec![Citation {
                 n: 1,
-                chunk_id: String::from("c"),
-                document_id: String::from("d"),
+                chunk_id: ChunkId::from("c"),
+                document_id: DocumentId::from("d"),
                 filename: String::from("noaa.pdf"),
                 chunk_index: 2,
                 page: Some(4),

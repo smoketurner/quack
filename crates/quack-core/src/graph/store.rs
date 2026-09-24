@@ -9,6 +9,7 @@ use duckdb::types::ToSqlOutput;
 use super::resolve::MergeStatus;
 use super::{Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance};
 use crate::error::{Error, Result};
+use crate::ids::{ChunkId, DocumentId};
 use crate::ontology::{self, OntologyVersion, store as ontology_store};
 use crate::storage::workspace::{MetaKey, WorkspaceDb, embedding_literal};
 
@@ -31,11 +32,11 @@ pub struct Source {
 
 impl Source {
     #[must_use]
-    pub fn chunk(document_id: &str, chunk_id: &str, confidence: f64) -> Self {
+    pub fn chunk(document_id: &DocumentId, chunk_id: &ChunkId, confidence: f64) -> Self {
         Self {
             origin: Origin::Chunk {
-                document_id: Some(document_id.to_owned()),
-                chunk_id: chunk_id.to_owned(),
+                document_id: Some(document_id.clone()),
+                chunk_id: chunk_id.clone(),
             },
             confidence,
         }
@@ -159,7 +160,12 @@ pub fn add_provenance(db: &WorkspaceDb, subject_id: &str, source: &Source) -> Re
         Origin::Chunk {
             document_id,
             chunk_id,
-        } => (document_id.as_deref(), chunk_id.as_str(), "", ""),
+        } => (
+            document_id.as_ref().map(DocumentId::as_str),
+            chunk_id.as_str(),
+            "",
+            "",
+        ),
         Origin::Row {
             table_name,
             row_key,
@@ -244,7 +250,7 @@ pub fn all_node_ids(db: &WorkspaceDb) -> Result<Vec<String>> {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn chunks_of_nodes(db: &WorkspaceDb, node_ids: &[String]) -> Result<Vec<String>> {
+pub fn chunks_of_nodes(db: &WorkspaceDb, node_ids: &[String]) -> Result<Vec<ChunkId>> {
     let mut stmt = db.connection().prepare(
         "SELECT DISTINCT chunk_id FROM _quack_provenance \
          WHERE list_contains(?::VARCHAR[], subject_id) AND chunk_id <> '' ORDER BY chunk_id",
@@ -252,7 +258,7 @@ pub fn chunks_of_nodes(db: &WorkspaceDb, node_ids: &[String]) -> Result<Vec<Stri
     let mut rows = stmt.query(duckdb::params![IdList::new(node_ids)])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        out.push(row.get::<_, String>(0)?);
+        out.push(row.get::<_, ChunkId>(0)?);
     }
     Ok(out)
 }
@@ -267,18 +273,18 @@ pub fn chunks_of_nodes(db: &WorkspaceDb, node_ids: &[String]) -> Result<Vec<Stri
 /// Returns an error if the query fails.
 pub fn entities_of_chunks(
     db: &WorkspaceDb,
-    chunk_ids: &[String],
+    chunk_ids: &[ChunkId],
     per_chunk: usize,
-) -> Result<BTreeMap<String, Vec<String>>> {
+) -> Result<BTreeMap<ChunkId, Vec<String>>> {
     let mut stmt = db.connection().prepare(
         "SELECT n.id, n.label, n.class_id, CAST(n.properties AS VARCHAR), n.provisional, p.chunk_id \
          FROM _quack_provenance p JOIN _quack_graph_nodes n ON n.id = p.subject_id \
          WHERE list_contains(?::VARCHAR[], p.chunk_id) ORDER BY p.chunk_id, n.label",
     )?;
     let mut rows = stmt.query(duckdb::params![IdList::new(chunk_ids)])?;
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut out: BTreeMap<ChunkId, Vec<String>> = BTreeMap::new();
     while let Some(row) = rows.next()? {
-        let chunk_id: String = row.get(5)?;
+        let chunk_id: ChunkId = row.get(5)?;
         let entity = Node::try_from(row)?.to_string();
         let entities = out.entry(chunk_id).or_default();
         if entities.len() < per_chunk && !entities.contains(&entity) {
@@ -404,10 +410,10 @@ pub fn edges(db: &WorkspaceDb, node_ids: &[String], scope: EdgeScope) -> Result<
 pub(crate) struct IdList(String);
 
 impl IdList {
-    pub(crate) fn new(ids: &[String]) -> Self {
+    pub(crate) fn new(ids: &[impl AsRef<str>]) -> Self {
         let quoted: Vec<String> = ids
             .iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .map(|id| format!("'{}'", id.as_ref().replace('\'', "''")))
             .collect();
         Self(format!("[{}]", quoted.join(",")))
     }
@@ -557,7 +563,7 @@ pub fn clear(db: &WorkspaceDb) -> Result<()> {
 /// Returns an error if the write fails.
 pub fn record_extracted(
     db: &WorkspaceDb,
-    chunk_id: &str,
+    chunk_id: &ChunkId,
     ontology_version: OntologyVersion,
     (nodes, edges): (u32, u32),
 ) -> Result<()> {

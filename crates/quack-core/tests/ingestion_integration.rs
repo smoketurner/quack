@@ -13,6 +13,7 @@ use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::Properties;
 use quack_core::graph::store as graph_store;
+use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
 use quack_core::llm::CancellationToken;
@@ -635,7 +636,7 @@ fn workspace_db_document_crud() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     db.insert_document(
-        &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
+        &NewDocument::new(&DocumentId::from("doc-1"), "test.txt", "text/plain", 100)
             .with_status(DocumentStatus::Queued),
     )
     .unwrap();
@@ -645,7 +646,7 @@ fn workspace_db_document_crud() {
         .unwrap();
     assert_eq!(qr.rows.len(), 1);
 
-    db.update_document_status("doc-1", DocumentStatus::Ready)
+    db.update_document_status(&DocumentId::from("doc-1"), DocumentStatus::Ready)
         .unwrap();
 
     let qr = db
@@ -663,14 +664,14 @@ fn workspace_db_chunk_without_embedding() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
-        &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
+        &NewDocument::new(&DocumentId::from("doc-1"), "test.txt", "text/plain", 100)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
     db.insert_chunk(&NewChunk {
-        id: "c1",
-        document_id: "doc-1",
+        id: &ChunkId::from("c1"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 0,
         content: "hello world",
         heading: None,
@@ -695,15 +696,15 @@ fn workspace_db_chunk_with_embedding() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
-        &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
+        &NewDocument::new(&DocumentId::from("doc-1"), "test.txt", "text/plain", 100)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
     let embedding = [0.5_f32, 0.3, -0.2, 0.8];
     db.insert_chunk(&NewChunk {
-        id: "c1",
-        document_id: "doc-1",
+        id: &ChunkId::from("c1"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 0,
         content: "embedded chunk",
         heading: None,
@@ -726,14 +727,14 @@ fn workspace_db_set_chunk_embedding() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
-        &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
+        &NewDocument::new(&DocumentId::from("doc-1"), "test.txt", "text/plain", 100)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
     db.insert_chunk(&NewChunk {
-        id: "c1",
-        document_id: "doc-1",
+        id: &ChunkId::from("c1"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 0,
         content: "hello world",
         heading: None,
@@ -752,7 +753,7 @@ fn workspace_db_set_chunk_embedding() {
     assert_eq!(count, &serde_json::Value::Number(1.into()));
 
     // Update with an embedding
-    db.set_chunk_embedding("c1", &vector(&[1.0, 0.0, 0.0, 0.0]))
+    db.set_chunk_embedding(&ChunkId::from("c1"), &vector(&[1.0, 0.0, 0.0, 0.0]))
         .unwrap();
 
     // Embedding should now be non-NULL
@@ -790,18 +791,23 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
     let db = WorkspaceDb::open(&config, "ws-search-filter").unwrap();
 
     db.insert_document(
-        &NewDocument::new("doc-a", "policy.pdf", "application/pdf", 10)
-            .with_status(DocumentStatus::Ready),
+        &NewDocument::new(
+            &DocumentId::from("doc-a"),
+            "policy.pdf",
+            "application/pdf",
+            10,
+        )
+        .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_document(
-        &NewDocument::new("doc-b", "faq.md", "text/markdown", 10)
+        &NewDocument::new(&DocumentId::from("doc-b"), "faq.md", "text/markdown", 10)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "a0",
-        document_id: "doc-a",
+        id: &ChunkId::from("a0"),
+        document_id: &DocumentId::from("doc-a"),
         chunk_index: 0,
         content: "flood exclusion",
         heading: None,
@@ -810,8 +816,8 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "b0",
-        document_id: "doc-b",
+        id: &ChunkId::from("b0"),
+        document_id: &DocumentId::from("doc-b"),
         chunk_index: 0,
         content: "claims timeline",
         heading: None,
@@ -830,14 +836,25 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
     assert_eq!(all.last().unwrap().filename, "faq.md");
 
     let only_b = db
-        .search_similar_chunks(&query, 5, &ChunkScope::documents([String::from("doc-b")]))
+        .search_similar_chunks(
+            &query,
+            5,
+            &ChunkScope::documents([DocumentId::from("doc-b")]),
+        )
         .unwrap();
     assert_eq!(only_b.len(), 1);
-    assert_eq!(only_b.first().unwrap().document_id, "doc-b");
+    assert_eq!(
+        only_b.first().unwrap().document_id,
+        DocumentId::from("doc-b")
+    );
     assert_eq!(only_b.first().unwrap().filename, "faq.md");
 
     let none = db
-        .search_similar_chunks(&query, 5, &ChunkScope::documents([String::from("missing")]))
+        .search_similar_chunks(
+            &query,
+            5,
+            &ChunkScope::documents([DocumentId::from("missing")]),
+        )
         .unwrap();
     assert!(none.is_empty());
 }
@@ -850,14 +867,14 @@ fn workspace_db_search_similar_chunks() {
 
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
     db.insert_document(
-        &NewDocument::new("doc-1", "test.txt", "text/plain", 100)
+        &NewDocument::new(&DocumentId::from("doc-1"), "test.txt", "text/plain", 100)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
 
     db.insert_chunk(&NewChunk {
-        id: "c1",
-        document_id: "doc-1",
+        id: &ChunkId::from("c1"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 0,
         content: "first chunk",
         heading: None,
@@ -866,8 +883,8 @@ fn workspace_db_search_similar_chunks() {
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c2",
-        document_id: "doc-1",
+        id: &ChunkId::from("c2"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 1,
         content: "second chunk",
         heading: None,
@@ -876,8 +893,8 @@ fn workspace_db_search_similar_chunks() {
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c3",
-        document_id: "doc-1",
+        id: &ChunkId::from("c3"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 2,
         content: "third chunk",
         heading: None,
@@ -1128,12 +1145,13 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
     {
         let db = WorkspaceDb::open(&config, "ws-mismatch").unwrap();
         db.insert_document(
-            &NewDocument::new("d", "a.txt", "text/plain", 1).with_status(DocumentStatus::Ready),
+            &NewDocument::new(&DocumentId::from("d"), "a.txt", "text/plain", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_chunk(&NewChunk {
-            id: "c",
-            document_id: "d",
+            id: &ChunkId::from("c"),
+            document_id: &DocumentId::from("d"),
             chunk_index: 0,
             content: "x",
             heading: None,
@@ -1163,7 +1181,7 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
         1
     );
     let err = db
-        .set_chunk_embedding("c", &vector(&[0.5; 8]))
+        .set_chunk_embedding(&ChunkId::from("c"), &vector(&[0.5; 8]))
         .unwrap_err()
         .to_string();
     assert!(err.contains("quack embeddings refresh"), "{err}");
@@ -1203,12 +1221,13 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     {
         let db = WorkspaceDb::open(&config, "ws-adopt").unwrap();
         db.insert_document(
-            &NewDocument::new("d", "a.txt", "text/plain", 1).with_status(DocumentStatus::Ready),
+            &NewDocument::new(&DocumentId::from("d"), "a.txt", "text/plain", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_chunk(&NewChunk {
-            id: "c",
-            document_id: "d",
+            id: &ChunkId::from("c"),
+            document_id: &DocumentId::from("d"),
             chunk_index: 0,
             content: "x",
             heading: None,
@@ -1255,7 +1274,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     );
     // The chunk ingested without an embedding survives, term index and
     // all, and the new width takes embeddings.
-    let kept = db.chunks_by_ids(&[String::from("c")]).unwrap();
+    let kept = db.chunks_by_ids(&[ChunkId::from("c")]).unwrap();
     assert_eq!(kept.len(), 1);
     assert!(
         !db.search_keyword_chunks("x", 5, &ChunkScope::all())
@@ -1263,8 +1282,8 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             .is_empty()
     );
     db.insert_chunk(&NewChunk {
-        id: "c8",
-        document_id: "d",
+        id: &ChunkId::from("c8"),
+        document_id: &DocumentId::from("d"),
         chunk_index: 1,
         content: "y",
         heading: None,
@@ -1273,8 +1292,8 @@ fn dimension_change_without_embeddings_adopts_new_width() {
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c2",
-        document_id: "d",
+        id: &ChunkId::from("c2"),
+        document_id: &DocumentId::from("d"),
         chunk_index: 1,
         content: "y",
         heading: None,
@@ -1387,18 +1406,23 @@ fn describe_table_handles_quoted_identifier() {
 fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
     let db = WorkspaceDb::open(config, ws).unwrap();
     db.insert_document(
-        &NewDocument::new("doc-a", "policy.pdf", "application/pdf", 10)
-            .with_status(DocumentStatus::Ready),
+        &NewDocument::new(
+            &DocumentId::from("doc-a"),
+            "policy.pdf",
+            "application/pdf",
+            10,
+        )
+        .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_document(
-        &NewDocument::new("doc-b", "faq.md", "text/markdown", 10)
+        &NewDocument::new(&DocumentId::from("doc-b"), "faq.md", "text/markdown", 10)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "a0",
-        document_id: "doc-a",
+        id: &ChunkId::from("a0"),
+        document_id: &DocumentId::from("doc-a"),
         chunk_index: 0,
         content: "Flood damage is excluded from coverage.",
         heading: Some("Exclusions"),
@@ -1407,8 +1431,8 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "b0",
-        document_id: "doc-b",
+        id: &ChunkId::from("b0"),
+        document_id: &DocumentId::from("doc-b"),
         chunk_index: 0,
         content: "Policy POL-8841 renews every March.",
         heading: None,
@@ -1417,8 +1441,8 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "b1",
-        document_id: "doc-b",
+        id: &ChunkId::from("b1"),
+        document_id: &DocumentId::from("doc-b"),
         chunk_index: 1,
         content: "Claims close within thirty days of filing.",
         heading: Some("Claims"),
@@ -1438,7 +1462,7 @@ fn chunk_metadata_round_trips_through_search() {
         .search_similar_chunks(&[1.0, 0.0, 0.0, 0.0], 1, &ChunkScope::all())
         .unwrap();
     let top = hits.first().unwrap();
-    assert_eq!(top.id, "a0");
+    assert_eq!(top.id, ChunkId::from("a0"));
     assert_eq!(top.heading.as_deref(), Some("Exclusions"));
     assert_eq!(top.page, Some(12));
     assert!(top.score > 0.99, "{}", top.score);
@@ -1452,7 +1476,7 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
     let config = test_config(dir.path());
     let db = seeded_for_search(&config, "ws-chunk-scope");
 
-    let only_a0 = ChunkScope::all().and_chunks([String::from("a0")]);
+    let only_a0 = ChunkScope::all().and_chunks([ChunkId::from("a0")]);
     let keyword = db.search_keyword_chunks("flood", 5, &only_a0).unwrap();
     assert_eq!(
         keyword.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
@@ -1477,10 +1501,14 @@ fn a_chunk_scope_narrows_both_legs_and_an_empty_one_finds_nothing() {
             &only_a0,
         )
         .unwrap();
-    assert!(hybrid.iter().all(|h| h.id == "a0"), "{hybrid:?}");
+    assert!(
+        hybrid.iter().all(|h| h.id == ChunkId::from("a0")),
+        "{hybrid:?}"
+    );
 
     // Both filters at once, contradicting each other.
-    let crossed = ChunkScope::documents([String::from("doc-b")]).and_chunks([String::from("a0")]);
+    let crossed =
+        ChunkScope::documents([DocumentId::from("doc-b")]).and_chunks([ChunkId::from("a0")]);
     assert!(
         db.search_keyword_chunks("flood", 5, &crossed)
             .unwrap()
@@ -1520,7 +1548,11 @@ fn keyword_search_finds_exact_tokens_the_vector_misses() {
         .unwrap();
     assert!(none.is_empty());
     let filtered = db
-        .search_keyword_chunks("flood", 5, &ChunkScope::documents([String::from("doc-b")]))
+        .search_keyword_chunks(
+            "flood",
+            5,
+            &ChunkScope::documents([DocumentId::from("doc-b")]),
+        )
         .unwrap();
     assert!(filtered.is_empty());
     // Stemming: an inflected query finds the base form in the chunk.
@@ -1579,12 +1611,13 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     {
         let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
         db.insert_document(
-            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
+            &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_chunk(&NewChunk {
-            id: "c0",
-            document_id: "d",
+            id: &ChunkId::from("c0"),
+            document_id: &DocumentId::from("d"),
             chunk_index: 0,
             content: "renewal POL-8841 notice",
             heading: None,
@@ -1663,7 +1696,7 @@ fn hybrid_search_fuses_vector_and_keyword_rankings() {
         )
         .unwrap();
     assert_eq!(limited.len(), 1);
-    assert_eq!(limited.first().unwrap().id, "a0");
+    assert_eq!(limited.first().unwrap().id, ChunkId::from("a0"));
 }
 
 #[tokio::test]
@@ -2161,12 +2194,13 @@ fn keyword_search_treats_null_as_a_word() {
     let config = test_config(dir.path());
     let db = WorkspaceDb::open(&config, "ws-null").unwrap();
     db.insert_document(
-        &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
+        &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
+            .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c",
-        document_id: "d",
+        id: &ChunkId::from("c"),
+        document_id: &DocumentId::from("d"),
         chunk_index: 0,
         content: "The null hypothesis was rejected.",
         heading: None,
@@ -2197,12 +2231,13 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
     let db = WorkspaceDb::open(&config, "ws-failed").unwrap();
     let writer = writer_of(&db);
     db.insert_document(
-        &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Error),
+        &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
+            .with_status(DocumentStatus::Error),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c",
-        document_id: "d",
+        id: &ChunkId::from("c"),
+        document_id: &DocumentId::from("d"),
         chunk_index: 0,
         content: "zebra crossing",
         heading: None,
@@ -2220,7 +2255,7 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
             .unwrap()
             .is_empty()
     );
-    db.update_document_status("d", DocumentStatus::Ready)
+    db.update_document_status(&DocumentId::from("d"), DocumentStatus::Ready)
         .unwrap();
     assert_eq!(
         db.search_keyword_chunks("zebra", 5, &ChunkScope::all())
@@ -2313,7 +2348,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     .await;
     let err = changed.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("belongs to document"), "{err}");
-    assert!(err.contains(&first.document_id), "{err}");
+    assert!(err.contains(first.document_id.as_str()), "{err}");
     assert_eq!(
         db.list_documents().unwrap().len(),
         1,

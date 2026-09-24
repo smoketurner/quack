@@ -18,6 +18,7 @@ use quack_core::graph::{
     GraphOptions, GraphResult, Node, Origin, Properties, extract, resolve, store as graph_store,
     tables, traverse,
 };
+use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::progress::RunControl;
@@ -178,13 +179,13 @@ fn workspace() -> WorkspaceDb {
     )
     .unwrap();
     db.insert_document(
-        &NewDocument::new("doc-1", "notes.md", "text/markdown", 10)
+        &NewDocument::new(&DocumentId::from("doc-1"), "notes.md", "text/markdown", 10)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c1",
-        document_id: "doc-1",
+        id: &ChunkId::from("c1"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 0,
         content: "Orgenics ships to Kenya from its plant.",
         heading: Some("Vendors"),
@@ -193,8 +194,8 @@ fn workspace() -> WorkspaceDb {
     })
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c2",
-        document_id: "doc-1",
+        id: &ChunkId::from("c2"),
+        document_id: &DocumentId::from("doc-1"),
         chunk_index: 1,
         content: "FAIL this one",
         heading: None,
@@ -287,14 +288,14 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
 fn extraction_samples_evenly_across_documents() {
     let db = workspace();
     db.insert_document(
-        &NewDocument::new("doc-2", "long.md", "text/markdown", 10)
+        &NewDocument::new(&DocumentId::from("doc-2"), "long.md", "text/markdown", 10)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     for i in 0..4 {
         db.insert_chunk(&NewChunk {
-            id: &format!("l{i}"),
-            document_id: "doc-2",
+            id: &ChunkId::from(format!("l{i}")),
+            document_id: &DocumentId::from("doc-2"),
             chunk_index: i,
             content: "Filler text about nothing in particular.",
             heading: None,
@@ -345,7 +346,9 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     graph_store::add_provenance(&db, &coast, &graph_store::Source::row("places", "KC")).unwrap();
     // An extracted look-alike of a keyed node, and two extracted
     // look-alikes of each other.
-    let doc = |chunk: &str| graph_store::Source::chunk("doc-1", chunk, 0.9);
+    let doc = |chunk: &str| {
+        graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(chunk), 0.9)
+    };
     let kenya_ltd = graph_store::upsert_node(&db, &node("Kenya Ltd")).unwrap();
     graph_store::add_provenance(&db, &kenya_ltd, &doc("c1")).unwrap();
     let uganda_north = graph_store::upsert_node(&db, &node("Uganda North")).unwrap();
@@ -407,13 +410,13 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     // A second document adds one node of its own, one edge of its own,
     // and a second source for a vendor the table already produced.
     db.insert_document(
-        &NewDocument::new("doc-2", "extra.md", "text/markdown", 10)
+        &NewDocument::new(&DocumentId::from("doc-2"), "extra.md", "text/markdown", 10)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     db.insert_chunk(&NewChunk {
-        id: "c3",
-        document_id: "doc-2",
+        id: &ChunkId::from("c3"),
+        document_id: &DocumentId::from("doc-2"),
         chunk_index: 0,
         content: "Orgenics ships to Nowhere.",
         heading: None,
@@ -427,7 +430,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         properties: Properties::default(),
         provisional: false,
     };
-    let source = graph_store::Source::chunk("doc-2", "c3", 0.9);
+    let source = graph_store::Source::chunk(&DocumentId::from("doc-2"), &ChunkId::from("c3"), 0.9);
     let orgenics = graph_store::upsert_node(&db, &node("Orgenics", "vendor")).unwrap();
     graph_store::add_provenance(&db, &orgenics, &source).unwrap();
     let nowhere = graph_store::upsert_node(&db, &node("Nowhere", "country")).unwrap();
@@ -444,7 +447,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     graph_store::add_provenance(&db, &edge, &source).unwrap();
     assert_eq!(graph_store::status(&db).unwrap().nodes, 8);
 
-    assert!(db.delete_document("doc-2").unwrap());
+    assert!(db.delete_document(&DocumentId::from("doc-2")).unwrap());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (7, 6));
     assert!(graph_store::node(&db, &nowhere).unwrap().is_none());
@@ -465,13 +468,13 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     // The document that loaded the mapped table: the table drops, and
     // with it every node and edge the rows supported.
     db.insert_document(
-        &NewDocument::new("doc-t", "shipments.csv", "text/csv", 10)
+        &NewDocument::new(&DocumentId::from("doc-t"), "shipments.csv", "text/csv", 10)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.set_document_tables("doc-t", &[String::from("shipments")])
+    db.set_document_tables(&DocumentId::from("doc-t"), &[String::from("shipments")])
         .unwrap();
-    assert!(db.delete_document("doc-t").unwrap());
+    assert!(db.delete_document(&DocumentId::from("doc-t")).unwrap());
     assert!(db.list_tables().unwrap().is_empty());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (0, 0));
@@ -592,7 +595,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     assert!(
         hood.provenance
             .iter()
-            .any(|p| p.origin.chunk_id() == Some("c1"))
+            .any(|p| p.origin.chunk_id() == Some(&ChunkId::from("c1")))
     );
     assert!(
         hood.provenance.iter().any(
@@ -855,14 +858,14 @@ fn class_listings_report_the_total_they_were_capped_from() {
 async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
     let db = workspace();
     db.insert_document(
-        &NewDocument::new("doc-2", "long.md", "text/markdown", 10)
+        &NewDocument::new(&DocumentId::from("doc-2"), "long.md", "text/markdown", 10)
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
     for i in 0..150 {
         db.insert_chunk(&NewChunk {
-            id: &format!("l{i:03}"),
-            document_id: "doc-2",
+            id: &ChunkId::from(format!("l{i:03}")),
+            document_id: &DocumentId::from("doc-2"),
             chunk_index: i,
             content: "Filler text about nothing in particular.",
             heading: None,
@@ -955,7 +958,11 @@ async fn provenance_maps_between_entities_and_chunks() {
         "the canned extractor produces Orgenics Ltd"
     );
     let chunks = graph_store::chunks_of_nodes(&db, &ids).unwrap();
-    assert_eq!(chunks, ["c1"], "extracted from the one chunk that parsed");
+    assert_eq!(
+        chunks,
+        [ChunkId::from("c1")],
+        "extracted from the one chunk that parsed"
+    );
 
     // A node built from a table row has no chunk provenance at all.
     let po = traverse::resolve_entry(&db, "PO-1", None, None).unwrap();
@@ -967,8 +974,11 @@ async fn provenance_maps_between_entities_and_chunks() {
         "table rows leave table provenance, not chunks"
     );
 
-    let entities = graph_store::entities_of_chunks(&db, &[String::from("c1")], 8).unwrap();
-    let in_c1 = entities.get("c1").cloned().unwrap_or_default();
+    let entities = graph_store::entities_of_chunks(&db, &[ChunkId::from("c1")], 8).unwrap();
+    let in_c1 = entities
+        .get(&ChunkId::from("c1"))
+        .cloned()
+        .unwrap_or_default();
     assert!(
         in_c1.contains(&String::from("Orgenics Ltd (vendor)")),
         "{in_c1:?}"
@@ -978,12 +988,12 @@ async fn provenance_maps_between_entities_and_chunks() {
         "{in_c1:?}"
     );
     // Bounded per chunk, and a chunk nothing was extracted from is absent.
-    let capped = graph_store::entities_of_chunks(&db, &[String::from("c1")], 1).unwrap();
-    assert_eq!(capped.get("c1").map(Vec::len), Some(1));
+    let capped = graph_store::entities_of_chunks(&db, &[ChunkId::from("c1")], 1).unwrap();
+    assert_eq!(capped.get(&ChunkId::from("c1")).map(Vec::len), Some(1));
     assert!(
-        !graph_store::entities_of_chunks(&db, &[String::from("c2")], 8)
+        !graph_store::entities_of_chunks(&db, &[ChunkId::from("c2")], 8)
             .unwrap()
-            .contains_key("c2")
+            .contains_key(&ChunkId::from("c2"))
     );
 }
 

@@ -14,6 +14,7 @@ use crate::embedding::Input;
 use crate::error::{Error, Result};
 use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, Tally, extractions};
 use crate::graph::NormalizedLabel;
+use crate::ids::{ChunkId, DocumentId};
 use crate::llm::Embeddings;
 use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
@@ -129,15 +130,15 @@ impl Default for DocumentEvidenceOptions {
 /// A sampled chunk.
 #[derive(Debug, Clone)]
 pub struct SampledChunk {
-    pub id: String,
-    pub document_id: String,
+    pub id: ChunkId,
+    pub document_id: DocumentId,
     pub filename: String,
     pub content: String,
 }
 
 impl Passage for SampledChunk {
     fn id(&self) -> &str {
-        &self.id
+        self.id.as_str()
     }
 
     fn text(&self) -> &str {
@@ -257,8 +258,8 @@ pub async fn run(
 /// One extraction with where it came from.
 #[derive(Debug, Clone)]
 pub struct Observation {
-    pub chunk_id: String,
-    pub document_id: String,
+    pub chunk_id: ChunkId,
+    pub document_id: DocumentId,
     pub extraction: OpenExtraction,
 }
 
@@ -371,7 +372,7 @@ impl Vocabulary {
 #[derive(Default)]
 struct Support {
     occurrences: u32,
-    documents: BTreeSet<String>,
+    documents: BTreeSet<DocumentId>,
     examples: Vec<serde_json::Value>,
 }
 
@@ -384,7 +385,7 @@ impl Support {
             if let serde_json::Value::Object(map) = &mut example {
                 map.insert(
                     String::from("chunk_id"),
-                    serde_json::Value::String(observation.chunk_id.clone()),
+                    serde_json::Value::String(observation.chunk_id.to_string()),
                 );
             }
             self.examples.push(example);
@@ -781,8 +782,13 @@ mod tests {
             let doc = format!("doc{d}");
             assert!(
                 db.insert_document(
-                    &NewDocument::new(&doc, &format!("{doc}.md"), "text/markdown", 10)
-                        .with_status(DocumentStatus::Ready)
+                    &NewDocument::new(
+                        &DocumentId::from(doc.as_str()),
+                        &format!("{doc}.md"),
+                        "text/markdown",
+                        10
+                    )
+                    .with_status(DocumentStatus::Ready)
                 )
                 .is_ok()
             );
@@ -793,8 +799,8 @@ mod tests {
                 let id = format!("{doc}-{i}");
                 assert!(
                     db.insert_chunk(&NewChunk {
-                        id: &id,
-                        document_id: &doc,
+                        id: &ChunkId::from(id.as_str()),
+                        document_id: &DocumentId::from(doc.as_str()),
                         chunk_index: i,
                         content: &content,
                         heading: None,
@@ -807,15 +813,15 @@ mod tests {
         }
         assert!(
             db.insert_document(
-                &NewDocument::new("pending", "p.md", "text/markdown", 1)
+                &NewDocument::new(&DocumentId::from("pending"), "p.md", "text/markdown", 1)
                     .with_status(DocumentStatus::Queued)
             )
             .is_ok()
         );
         assert!(
             db.insert_chunk(&NewChunk {
-                id: "p-0",
-                document_id: "pending",
+                id: &ChunkId::from("p-0"),
+                document_id: &DocumentId::from("pending"),
                 chunk_index: 0,
                 content: "not ready but long enough to pass the length filter here",
                 heading: None,
@@ -846,10 +852,14 @@ mod tests {
             m
         });
         assert!(per_doc.values().all(|n| *n == 2), "{per_doc:?}");
-        assert!(sample.iter().all(|c| c.document_id != "pending"));
+        assert!(
+            sample
+                .iter()
+                .all(|c| c.document_id != DocumentId::from("pending"))
+        );
         let ids: Vec<&str> = sample
             .iter()
-            .filter(|c| c.document_id == "doc1")
+            .filter(|c| c.document_id == DocumentId::from("doc1"))
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["doc1-0", "doc1-2"], "evenly spaced");
@@ -952,14 +962,14 @@ mod tests {
     async fn failed_chunks_are_skipped_and_all_failures_is_an_error() {
         let chunks = vec![
             SampledChunk {
-                id: String::from("a"),
-                document_id: String::from("d"),
+                id: ChunkId::from("a"),
+                document_id: DocumentId::from("d"),
                 filename: String::from("f"),
                 content: String::from("FAIL here"),
             },
             SampledChunk {
-                id: String::from("b"),
-                document_id: String::from("d"),
+                id: ChunkId::from("b"),
+                document_id: DocumentId::from("d"),
                 filename: String::from("f"),
                 content: String::from("Fine passage"),
             },
@@ -992,8 +1002,8 @@ mod tests {
             [(1, 2, 1), (2, 2, 1)]
         );
         let all_bad = vec![SampledChunk {
-            id: String::from("a"),
-            document_id: String::from("d"),
+            id: ChunkId::from("a"),
+            document_id: DocumentId::from("d"),
             filename: String::from("f"),
             content: String::from("FAIL"),
         }];
@@ -1014,8 +1024,8 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_run_stops_before_the_next_chunk() {
         let chunks = vec![SampledChunk {
-            id: String::from("a"),
-            document_id: String::from("d"),
+            id: ChunkId::from("a"),
+            document_id: DocumentId::from("d"),
             filename: String::from("f"),
             content: String::from("Fine passage"),
         }];

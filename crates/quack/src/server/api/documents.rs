@@ -10,7 +10,7 @@ use axum::extract::{FromRequest, Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use quack_core::error::Record;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{DocumentId, WorkspaceId};
 use quack_core::ingestion;
 use quack_core::jobs::{JobId, LaneKey};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -41,7 +41,7 @@ pub(crate) async fn list(
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
-    Path((id, doc)): Path<(WorkspaceId, String)>,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -357,13 +357,13 @@ pub(crate) async fn enqueue(
 pub(crate) enum Enqueued {
     /// Registered and queued for processing.
     Queued {
-        id: String,
+        id: DocumentId,
         filename: String,
         job: JobId,
     },
     /// The same bytes are already a document; nothing was queued.
     Duplicate {
-        id: String,
+        id: DocumentId,
         filename: String,
         existing_filename: String,
     },
@@ -377,7 +377,7 @@ pub(crate) struct UpdateDocument {
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
-    Path((id, doc)): Path<(WorkspaceId, String)>,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
     Json(body): Json<UpdateDocument>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -389,11 +389,11 @@ pub(crate) async fn update(
 pub(crate) async fn set_pinned(
     app: &App,
     access: &Access,
-    doc: &str,
+    doc: &DocumentId,
     pinned: bool,
 ) -> ApiResult<DocumentInfo> {
     let db = app.workspace_db(&access.workspace.id).await?;
-    let doc_id = doc.to_owned();
+    let doc_id = doc.clone();
     let document = with_db(db, move |db| {
         db.set_document_pinned(&doc_id, pinned)?;
         db.document(&doc_id)?
@@ -415,7 +415,7 @@ pub(crate) async fn set_pinned(
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
-    Path((id, doc)): Path<(WorkspaceId, String)>,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> ApiResult<StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     delete_document(&app, &access, &doc).await?;
@@ -424,9 +424,13 @@ pub(crate) async fn remove(
 
 /// Delete a document (and its table when it was loaded as one), audited.
 /// Returns the filename.
-pub(crate) async fn delete_document(app: &App, access: &Access, doc: &str) -> ApiResult<String> {
+pub(crate) async fn delete_document(
+    app: &App,
+    access: &Access,
+    doc: &DocumentId,
+) -> ApiResult<String> {
     let db = app.workspace_db(&access.workspace.id).await?;
-    let doc_id = doc.to_owned();
+    let doc_id = doc.clone();
     let filename = with_db(db, move |db| {
         let document = db
             .document(&doc_id)?

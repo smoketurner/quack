@@ -25,7 +25,7 @@ use quack_core::config::inspect::SettingFilter;
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
-use quack_core::ids::SessionId;
+use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
@@ -1311,7 +1311,7 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
 }
 
 /// Resolve a full document id or a unique prefix.
-fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<String> {
+fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<DocumentId> {
     let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
         .one(Record::Document, prefix)?;
     Ok(document.id)
@@ -1745,9 +1745,15 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test")]
     fn docs_json_carries_every_document_field() {
         let db = WorkspaceDb::open_in_memory(4).unwrap();
-        db.insert_document(&NewDocument::new("d1", "broken.pdf", "application/pdf", 3))
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from("d1"),
+            "broken.pdf",
+            "application/pdf",
+            3,
+        ))
+        .unwrap();
+        db.mark_document_error(&DocumentId::from("d1"), "no text layer")
             .unwrap();
-        db.mark_document_error("d1", "no text layer").unwrap();
         let mut out = Vec::new();
         list_documents(&db, true, &mut out).unwrap();
         let row: serde_json::Value = serde_json::from_slice(&out).unwrap();

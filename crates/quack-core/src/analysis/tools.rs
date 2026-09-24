@@ -9,6 +9,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::ids::ChunkId;
 use crate::storage::workspace::{
     ChunkScope, ChunkSearchResult, HybridLimits, StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb,
     creates_temp_object, quote_ident,
@@ -832,7 +833,7 @@ where
             None => (results, String::new()),
         };
         step.finish(format!("{} chunks{note}", results.len()));
-        let chunk_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+        let chunk_ids: Vec<ChunkId> = results.iter().map(|r| r.id.clone()).collect();
         // Best effort: the annotation is extra context, so a graph that
         // cannot be read must not fail a search that already succeeded.
         let entities = self
@@ -856,7 +857,7 @@ fn entity_chunks(
     db: &WorkspaceDb,
     entity: &str,
     embedding: Option<&[f32]>,
-) -> error::Result<Vec<String>> {
+) -> error::Result<Vec<ChunkId>> {
     let nodes = graph::traverse::resolve_entry(db, entity, None, embedding)?;
     if nodes.is_empty() {
         let unknown = UnknownEntity::find(db, entity, embedding);
@@ -888,7 +889,7 @@ fn entity_chunks(
 pub fn format_search_results(
     results: &[ChunkSearchResult],
     markers: Markers,
-    entities: &std::collections::BTreeMap<String, Vec<String>>,
+    entities: &std::collections::BTreeMap<ChunkId, Vec<String>>,
 ) -> Result<String, std::fmt::Error> {
     if results.is_empty() {
         return Ok(String::from(
@@ -1261,6 +1262,7 @@ mod tests {
     use crate::embedding::{Dimension, Profile, Prompts};
     use crate::graph::Properties;
     use crate::graph::store::NewNode;
+    use crate::ids::DocumentId;
     use crate::llm::EmbedModel;
     use crate::ontology::Mapping;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
@@ -1346,7 +1348,7 @@ mod tests {
         use crate::storage::workspace::{NewChunk, NewDocument};
         db.run(|guard| {
             guard.insert_document(
-                &NewDocument::new("d", "storms.md", "text/markdown", 1)
+                &NewDocument::new(&DocumentId::from("d"), "storms.md", "text/markdown", 1)
                     .with_status(DocumentStatus::Ready),
             )?;
             for (i, text) in [
@@ -1357,8 +1359,8 @@ mod tests {
             .enumerate()
             {
                 guard.insert_chunk(&NewChunk {
-                    id: &format!("c{i}"),
-                    document_id: "d",
+                    id: &ChunkId::from(format!("c{i}")),
+                    document_id: &DocumentId::from("d"),
                     chunk_index: u32::try_from(i).unwrap_or(0),
                     content: text,
                     heading: None,
@@ -1377,15 +1379,15 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
             db.insert_document(
-                &NewDocument::new("doc-1", "notes.md", "text/markdown", 1)
+                &NewDocument::new(&DocumentId::from("doc-1"), "notes.md", "text/markdown", 1)
                     .with_status(DocumentStatus::Ready)
             )
             .is_ok()
         );
         assert!(
             db.insert_chunk(&NewChunk {
-                id: "c1",
-                document_id: "doc-1",
+                id: &ChunkId::from("c1"),
+                document_id: &DocumentId::from("doc-1"),
                 chunk_index: 0,
                 content: "Acme ships to Kenya.",
                 heading: None,
@@ -1406,7 +1408,7 @@ mod tests {
             graph::store::add_provenance(
                 &db,
                 &acme,
-                &graph::store::Source::chunk("doc-1", "c1", 1.0)
+                &graph::store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from("c1"), 1.0)
             )
             .is_ok()
         );
@@ -1423,7 +1425,7 @@ mod tests {
 
         assert_eq!(
             entity_chunks(&db, "acme", None).unwrap_or_default(),
-            [String::from("c1")],
+            [ChunkId::from("c1")],
             "the entry point normalizes the label"
         );
 
@@ -1598,15 +1600,25 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(4).unwrap_or_else(|e| fail_test(&e.to_string()));
         assert!(
             db.insert_document(
-                &NewDocument::new("01a0-first", "policy.pdf", "application/pdf", 1)
-                    .with_status(DocumentStatus::Ready)
+                &NewDocument::new(
+                    &DocumentId::from("01a0-first"),
+                    "policy.pdf",
+                    "application/pdf",
+                    1
+                )
+                .with_status(DocumentStatus::Ready)
             )
             .is_ok()
         );
         assert!(
             db.insert_document(
-                &NewDocument::new("01b0-second", "notes.md", "text/markdown", 1)
-                    .with_status(DocumentStatus::Ready)
+                &NewDocument::new(
+                    &DocumentId::from("01b0-second"),
+                    "notes.md",
+                    "text/markdown",
+                    1
+                )
+                .with_status(DocumentStatus::Ready)
             )
             .is_ok()
         );
@@ -1614,7 +1626,8 @@ mod tests {
             let wanted: Vec<String> = wanted.iter().map(|w| (*w).to_owned()).collect();
             ChunkScope::for_documents(&db, &wanted)
         };
-        let documents = |ids: &[&str]| ChunkScope::documents(ids.iter().map(|i| (*i).to_owned()));
+        let documents =
+            |ids: &[&str]| ChunkScope::documents(ids.iter().map(|i| DocumentId::from(*i)));
         assert_eq!(
             scope(&["policy.pdf"]).ok(),
             Some(documents(&["01a0-first"]))
@@ -1634,9 +1647,9 @@ mod tests {
 
     fn hit(n: u32, filename: &str, content: &str) -> ChunkSearchResult {
         ChunkSearchResult {
-            id: format!("c{n}"),
+            id: ChunkId::from(format!("c{n}")),
             content: content.to_owned(),
-            document_id: String::from("doc-1"),
+            document_id: DocumentId::from("doc-1"),
             chunk_index: n,
             filename: filename.to_owned(),
             heading: (n == 0).then(|| String::from("Exclusions")),
@@ -1673,7 +1686,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn search_results_name_the_entities_a_chunk_was_the_source_of() {
         let entities = BTreeMap::from([(
-            String::from("c0"),
+            ChunkId::from("c0"),
             vec![
                 String::from("OKLAHOMA (state)"),
                 String::from("EF4 (scale)"),
@@ -2030,13 +2043,13 @@ mod tests {
         let db = shared_db();
         db.run(|guard| {
             guard.insert_document(
-                &NewDocument::new("d", "storms.md", "text/markdown", 1)
+                &NewDocument::new(&DocumentId::from("d"), "storms.md", "text/markdown", 1)
                     .with_status(DocumentStatus::Ready),
             )?;
             for i in 0..(MAX_SEARCH_TOP_K * 2) {
                 guard.insert_chunk(&NewChunk {
-                    id: &format!("c{i}"),
-                    document_id: "d",
+                    id: &ChunkId::from(format!("c{i}")),
+                    document_id: &DocumentId::from("d"),
                     chunk_index: i,
                     content: &format!("Hail fell in county {i}."),
                     heading: None,
@@ -2684,13 +2697,13 @@ async fn format_graph_result(
     };
     // Bounded like the tree: a 200-node listing can carry a source per
     // node, and every one of them would be quoted in full.
-    let all_chunk_ids: std::collections::BTreeSet<String> = result
+    let all_chunk_ids: std::collections::BTreeSet<ChunkId> = result
         .provenance
         .iter()
-        .filter_map(|p| p.origin.chunk_id().map(str::to_owned))
+        .filter_map(|p| p.origin.chunk_id().cloned())
         .collect();
     let hidden_chunks = all_chunk_ids.len().saturating_sub(MAX_GRAPH_SOURCES);
-    let chunk_ids: Vec<String> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
+    let chunk_ids: Vec<ChunkId> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
     let (chunks, ontology) = db
         .with_db(move |db| {
             let chunks = db.chunks_by_ids(&chunk_ids)?;

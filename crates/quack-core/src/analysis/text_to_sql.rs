@@ -435,6 +435,7 @@ mod tests {
     use super::*;
     use crate::graph::Properties;
     use crate::graph::store::NewNode;
+    use crate::ids::{ChunkId, DocumentId};
     use crate::ontology::Ontology;
     use crate::ontology::store::Revision;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
@@ -517,7 +518,7 @@ mod tests {
         db.execute_statement("INSERT INTO claims VALUES (1, 100, 'paid'), (2, 200, 'denied')")
             .unwrap();
         db.insert_document(
-            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+            &NewDocument::new(&DocumentId::from("d1"), "policy.pdf", "application/pdf", 1)
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
@@ -566,7 +567,7 @@ mod tests {
     fn context_is_placed_after_documents_and_truncated_to_budget() {
         let db = db();
         db.insert_document(
-            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+            &NewDocument::new(&DocumentId::from("d1"), "policy.pdf", "application/pdf", 1)
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
@@ -595,7 +596,7 @@ mod tests {
         db.execute_statement("CREATE TABLE claims(id INT, amount INT)")
             .unwrap();
         db.insert_document(
-            &NewDocument::new("d1", "policy.pdf", "application/pdf", 1)
+            &NewDocument::new(&DocumentId::from("d1"), "policy.pdf", "application/pdf", 1)
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
@@ -631,12 +632,12 @@ mod tests {
     fn pinned_documents_are_injected_within_budget() {
         let db = db();
         db.insert_document(
-            &NewDocument::new("d1", "rules.md", "text/markdown", 1)
+            &NewDocument::new(&DocumentId::from("d1"), "rules.md", "text/markdown", 1)
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
         db.insert_document(
-            &NewDocument::new("d2", "big.md", "text/markdown", 1)
+            &NewDocument::new(&DocumentId::from("d2"), "big.md", "text/markdown", 1)
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
@@ -648,8 +649,8 @@ mod tests {
         ];
         for (i, (doc, text)) in chunks.iter().enumerate() {
             db.insert_chunk(&NewChunk {
-                id: &format!("c{i}"),
-                document_id: doc,
+                id: &ChunkId::from(format!("c{i}")),
+                document_id: &DocumentId::from(*doc),
                 chunk_index: u32::try_from(i).unwrap(),
                 content: text,
                 heading: None,
@@ -658,8 +659,10 @@ mod tests {
             })
             .unwrap();
         }
-        db.set_document_pinned("d1", true).unwrap();
-        db.set_document_pinned("d2", true).unwrap();
+        db.set_document_pinned(&DocumentId::from("d1"), true)
+            .unwrap();
+        db.set_document_pinned(&DocumentId::from("d2"), true)
+            .unwrap();
         // Budget of 20 tokens fits rules.md (~6 tokens) but not big.md (100).
         let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 20)).unwrap();
         assert!(
@@ -669,7 +672,10 @@ mod tests {
         assert!(
             prompt.contains("--- big.md (omitted: pinned text exceeds the 20-token budget) ---")
         );
-        assert!(db.set_document_pinned("missing", true).is_err());
+        assert!(
+            db.set_document_pinned(&DocumentId::from("missing"), true)
+                .is_err()
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{BaseUrl, Config, ProviderConfig, ProviderName, ProviderType};
 use quack_core::embedding::Dimension;
-use quack_core::ids::{SessionId, UserId, WorkspaceId};
+use quack_core::ids::{ChunkId, DocumentId, SessionId, UserId, WorkspaceId};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -3810,11 +3810,12 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         .unwrap_or_else(|e| fail(&e.message));
     db.run(|db| {
         db.insert_document(
-            &NewDocument::new("d", "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
+            &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
         )?;
         db.insert_chunk(&NewChunk {
-            id: "c",
-            document_id: "d",
+            id: &ChunkId::from("c"),
+            document_id: &DocumentId::from("d"),
             chunk_index: 0,
             content: "levee report",
             heading: None,

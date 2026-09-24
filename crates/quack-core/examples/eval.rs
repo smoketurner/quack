@@ -34,6 +34,7 @@ use quack_core::extraction::{Extract, ExtractFuture};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, store};
+use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
@@ -408,7 +409,7 @@ struct RetrievalReport {
 }
 
 fn ids_of(results: Vec<ChunkSearchResult>) -> Vec<String> {
-    results.into_iter().map(|r| r.id).collect()
+    results.into_iter().map(|r| r.id.into_string()).collect()
 }
 
 fn recall_at(expectation: &Expectation, ranked: &[String], k: usize) -> f64 {
@@ -761,7 +762,7 @@ async fn evaluate_graph(
             fixture_chunk.anchor.clone(),
             fixture_chunk.canned_answer.clone(),
         );
-        chunk_ids.push(row.id.clone());
+        chunk_ids.push(ChunkId::from(row.id.as_str()));
     }
     let extractor = FixtureExtractor { answers };
 
@@ -864,9 +865,9 @@ fn evaluate_citations(path: &Path) -> Result<CitationReport> {
         let registry = CitationRegistry::default();
         let registered: Vec<ChunkSearchResult> = (0..case.registered_chunks)
             .map(|i| ChunkSearchResult {
-                id: format!("chunk-{i}"),
+                id: ChunkId::from(format!("chunk-{i}")),
                 content: String::new(),
-                document_id: String::from("doc"),
+                document_id: DocumentId::from("doc"),
                 chunk_index: i,
                 filename: String::from("doc.md"),
                 heading: None,

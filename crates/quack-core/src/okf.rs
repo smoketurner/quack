@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::graph::Origin;
 use crate::graph::store::EdgeScope;
 use crate::graph::{self, store as graph_store};
+use crate::ids::DocumentId;
 use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::store::Revision;
 use crate::ontology::{
@@ -804,11 +805,11 @@ struct EntityExport<'a> {
 
 impl EntityExport<'_> {
     /// The file name of a document by id, else the id.
-    fn filename_of(&self, document_id: &str) -> String {
+    fn filename_of(&self, document_id: &DocumentId) -> String {
         self.documents
             .iter()
-            .find(|d| d.id == document_id)
-            .map_or_else(|| document_id.to_owned(), |d| d.filename.clone())
+            .find(|d| &d.id == document_id)
+            .map_or_else(|| document_id.to_string(), |d| d.filename.clone())
     }
 
     /// One node as a concept file: front matter, properties, links per

@@ -4,14 +4,15 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::ids::{ChunkId, DocumentId};
 use crate::storage::workspace::ChunkSearchResult;
 
 /// One retrievable source the model may cite by its marker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Citation {
     pub n: u32,
-    pub chunk_id: String,
-    pub document_id: String,
+    pub chunk_id: ChunkId,
+    pub document_id: DocumentId,
     pub filename: String,
     pub chunk_index: u32,
     pub page: Option<u32>,
@@ -242,9 +243,9 @@ mod tests {
 
     fn hit(id: &str, file: &str, idx: u32) -> ChunkSearchResult {
         ChunkSearchResult {
-            id: id.to_owned(),
+            id: ChunkId::from(id.to_owned()),
             content: String::new(),
-            document_id: format!("doc-{file}"),
+            document_id: DocumentId::from(format!("doc-{file}")),
             chunk_index: idx,
             filename: file.to_owned(),
             heading: None,
@@ -336,8 +337,8 @@ mod tests {
     fn label_includes_page_and_heading_when_present() {
         let c = Citation {
             n: 1,
-            chunk_id: String::from("a"),
-            document_id: String::from("d"),
+            chunk_id: ChunkId::from("a"),
+            document_id: DocumentId::from("d"),
             filename: String::from("policy.pdf"),
             chunk_index: 0,
             page: Some(12),
