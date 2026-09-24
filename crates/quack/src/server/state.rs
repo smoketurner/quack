@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb, open_reader};
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::jobs::JobQueue;
 use quack_core::storage::audit::AuditLog;
@@ -209,7 +209,7 @@ impl AppState {
             let writer: SharedDb = Arc::new(
                 Writer::spawn(db).map_err(|e| ApiError::internal(e.to_string()))?,
             );
-            let reader = open_reader(&writer, pool_size).await;
+            let reader = ReaderDb::open(&writer, pool_size).await;
             Ok(WorkspaceHandle {
                 writer,
                 reader,

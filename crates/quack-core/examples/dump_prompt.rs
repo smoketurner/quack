@@ -45,6 +45,6 @@ fn main() {
         context_max_tokens: 1000,
         ollama_context_cap: None,
     };
-    let prompt = text_to_sql::build_system_prompt(&db, &options).unwrap();
+    let prompt = text_to_sql::SystemPrompt::build(&db, &options).unwrap();
     println!("{}", serde_json::to_string(&prompt).unwrap());
 }

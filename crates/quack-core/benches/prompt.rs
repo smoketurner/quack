@@ -1,4 +1,4 @@
-//! System prompt assembly on a large workspace: `build_system_prompt` runs
+//! System prompt assembly on a large workspace: `SystemPrompt::build` runs
 //! on every turn, so its cost against many tables (150 here, more than the
 //! 25 the prompt details) is what a request pays before the model sees
 //! anything.
@@ -83,7 +83,7 @@ fn prompt(c: &mut Criterion) {
     };
     c.bench_function("build_system_prompt/150_tables", |b| {
         b.iter(|| {
-            let prompt = text_to_sql::build_system_prompt(&db, black_box(&options)).unwrap();
+            let prompt = text_to_sql::SystemPrompt::build(&db, black_box(&options)).unwrap();
             assert!(!prompt.is_empty());
         });
     });

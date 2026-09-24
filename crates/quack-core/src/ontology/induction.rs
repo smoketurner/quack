@@ -332,28 +332,22 @@ impl Known<'_> {
         self.0.and_then(|o| o.relation(id))
     }
     fn mapping(&self, table: &str) -> bool {
-        self.0
-            .is_some_and(|o| o.mappings.iter().any(|m| m.table == table))
+        self.0.is_some_and(|o| o.mapping_for_table(table).is_some())
     }
     /// The class a mapped table already feeds, whatever it is called
     /// (issue #55: `notable_events` maps to `storm_event`, not to a new
     /// `notable_event`).
     fn mapped_class(&self, table: &str) -> Option<String> {
-        self.0.and_then(|o| {
-            o.mappings
-                .iter()
-                .find(|m| m.table == table)
-                .map(|m| m.class.clone())
-        })
+        self.0
+            .and_then(|o| o.mapping_for_table(table))
+            .map(|m| m.class.clone())
     }
     /// Whether the table's mapping already turns this column into a
     /// relation.
     fn mapped_relation(&self, table: &str, column: &str) -> bool {
-        self.0.is_some_and(|o| {
-            o.mappings
-                .iter()
-                .any(|m| m.table == table && m.relations.iter().any(|r| r.column == column))
-        })
+        self.0
+            .and_then(|o| o.mapping_for_table(table))
+            .is_some_and(|m| m.relations.iter().any(|r| r.column == column))
     }
 }
 

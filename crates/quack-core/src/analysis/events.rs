@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
-use crate::embedding::{Input, Vector};
+use crate::embedding::{Embedder, Input, Vector};
 use crate::error::Error;
 
 /// A turn's embeddings, by input (the role is part of it).
@@ -231,16 +231,57 @@ impl TurnRecorder {
     /// This turn's cached embedding of `input`, if some earlier call this
     /// turn already computed it. A query and an entity name with the same
     /// text are different inputs.
-    #[must_use]
-    pub fn cached_embedding(&self, input: &Input) -> Option<Vector> {
+    fn cached_embedding(&self, input: &Input) -> Option<Vector> {
         self.embedding_cache.lock().ok()?.get(input).cloned()
     }
 
     /// Remember `input`'s embedding for the rest of this turn.
-    pub fn cache_embedding(&self, input: Input, embedding: Vector) {
+    fn cache_embedding(&self, input: Input, embedding: Vector) {
         if let Ok(mut cache) = self.embedding_cache.lock() {
             cache.insert(input, embedding);
         }
+    }
+
+    /// `input`'s embedding, paid for once per turn: a turn that embeds the
+    /// same query or entity label more than once (the same entity resolved
+    /// by `search_documents`, `search_graph`, and `find_path`) calls the
+    /// model only the first time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the model's error.
+    pub async fn embed_cached<M: rig::embeddings::EmbeddingModel>(
+        &self,
+        embedder: &Embedder<M>,
+        input: Input,
+    ) -> Result<Vector, Error> {
+        if let Some(cached) = self.cached_embedding(&input) {
+            return Ok(cached);
+        }
+        let vector = embedder.embed_one(&input).await?;
+        self.cache_embedding(input, vector.clone());
+        Ok(vector)
+    }
+
+    /// A label's embedding for fuzzy entity resolution: `None` without a
+    /// model, and an error when the model fails, since a silent `None`
+    /// would narrow the search to exact matches without saying so.
+    ///
+    /// # Errors
+    ///
+    /// Returns the model's error, as an analysis error naming it.
+    pub async fn embed_label<M: rig::embeddings::EmbeddingModel>(
+        &self,
+        embedder: Option<&Embedder<M>>,
+        label: &str,
+    ) -> Result<Option<Vector>, Error> {
+        let Some(embedder) = embedder else {
+            return Ok(None);
+        };
+        self.embed_cached(embedder, Input::Similarity(label.to_owned()))
+            .await
+            .map(Some)
+            .map_err(|e| Error::Analysis(format!("embedding failed: {e}")))
     }
 
     /// The chunks retrieved so far this turn, numbered for citing.

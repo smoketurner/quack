@@ -85,52 +85,6 @@ pub const RERANK_PROMPT: &str = "You rank passages by how well they answer a que
     passage numbers, most relevant first, leaving out passages that do not help answer the \
     question. No prose.";
 
-/// The user message for one ranking call: the query and numbered
-/// passages, each cut to `max_chars`.
-#[must_use]
-pub fn rerank_request(query: &str, candidates: &[ChunkSearchResult], max_chars: usize) -> String {
-    let mut text = format!("Question: {query}\n\nPassages:\n");
-    for (i, chunk) in candidates.iter().enumerate() {
-        let body: String = chunk.content.trim().chars().take(max_chars).collect();
-        let n = i.saturating_add(1);
-        text.push('[');
-        text.push_str(&n.to_string());
-        text.push_str("] ");
-        text.push_str(&body);
-        text.push_str("\n\n");
-    }
-    text
-}
-
-/// Parse the model's answer leniently: the first JSON array of numbers in
-/// it, 1-based, mapped to 0-based indices below `len`.
-///
-/// # Errors
-///
-/// Returns an error when no array of numbers can be found.
-pub fn parse_ranking(answer: &str, len: usize) -> Result<Vec<usize>> {
-    let start = answer.find('[');
-    let end = answer.rfind(']');
-    let (Some(start), Some(end)) = (start, end) else {
-        return Err(Error::Analysis(String::from(
-            "the reranker returned no JSON array",
-        )));
-    };
-    let slice = answer.get(start..=end).unwrap_or(answer);
-    let numbers: Vec<serde_json::Value> = serde_json::from_str(slice)
-        .map_err(|e| Error::Analysis(format!("the reranker's array does not parse: {e}")))?;
-    let mut order = Vec::with_capacity(numbers.len());
-    for value in numbers {
-        let Some(n) = value.as_u64().and_then(|n| usize::try_from(n).ok()) else {
-            continue;
-        };
-        if n >= 1 && n <= len {
-            order.push(n.saturating_sub(1));
-        }
-    }
-    Ok(order)
-}
-
 /// Characters of each passage shown to the ranking model.
 pub const PASSAGE_CHARS: usize = 1200;
 
@@ -156,14 +110,55 @@ impl ModelReranker {
                 .build(),
         }
     }
+
+    /// The user message for one ranking call: the query and numbered
+    /// passages, each cut to `max_chars`.
+    fn request(query: &str, candidates: &[ChunkSearchResult], max_chars: usize) -> String {
+        let mut text = format!("Question: {query}\n\nPassages:\n");
+        for (i, chunk) in candidates.iter().enumerate() {
+            let body: String = chunk.content.trim().chars().take(max_chars).collect();
+            let n = i.saturating_add(1);
+            text.push('[');
+            text.push_str(&n.to_string());
+            text.push_str("] ");
+            text.push_str(&body);
+            text.push_str("\n\n");
+        }
+        text
+    }
+
+    /// The model's answer, read leniently: the first JSON array of numbers
+    /// in it, 1-based, mapped to 0-based indices below `len`.
+    fn ranking(answer: &str, len: usize) -> Result<Vec<usize>> {
+        let start = answer.find('[');
+        let end = answer.rfind(']');
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(Error::Analysis(String::from(
+                "the reranker returned no JSON array",
+            )));
+        };
+        let slice = answer.get(start..=end).unwrap_or(answer);
+        let numbers: Vec<serde_json::Value> = serde_json::from_str(slice)
+            .map_err(|e| Error::Analysis(format!("the reranker's array does not parse: {e}")))?;
+        let mut order = Vec::with_capacity(numbers.len());
+        for value in numbers {
+            let Some(n) = value.as_u64().and_then(|n| usize::try_from(n).ok()) else {
+                continue;
+            };
+            if n >= 1 && n <= len {
+                order.push(n.saturating_sub(1));
+            }
+        }
+        Ok(order)
+    }
 }
 
 impl Reranker for ModelReranker {
     fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
         Box::pin(async move {
-            let request = rerank_request(query, candidates, PASSAGE_CHARS);
+            let request = Self::request(query, candidates, PASSAGE_CHARS);
             let answer = stream_answer(&self.agent, &request, RERANK_TIMEOUT, "rerank").await?;
-            parse_ranking(&answer, candidates.len())
+            Self::ranking(&answer, candidates.len())
         })
     }
 
@@ -241,15 +236,15 @@ mod tests {
     #[test]
     fn parse_ranking_is_lenient_and_one_based() {
         assert_eq!(
-            parse_ranking("Sure: [3, 1, 7, 0, 2]", 3).unwrap_or_default(),
+            ModelReranker::ranking("Sure: [3, 1, 7, 0, 2]", 3).unwrap_or_default(),
             vec![2, 0, 1]
         );
         assert_eq!(
-            parse_ranking("[]", 3).unwrap_or_default(),
+            ModelReranker::ranking("[]", 3).unwrap_or_default(),
             Vec::<usize>::new()
         );
-        assert!(parse_ranking("no numbers here", 3).is_err());
-        assert!(parse_ranking("[1, 2", 3).is_err());
+        assert!(ModelReranker::ranking("no numbers here", 3).is_err());
+        assert!(ModelReranker::ranking("[1, 2", 3).is_err());
     }
 
     #[test]
@@ -258,7 +253,7 @@ mod tests {
             content: "x".repeat(50),
             ..hit(1)
         };
-        let text = rerank_request("why?", &[long, hit(2)], 10);
+        let text = ModelReranker::request("why?", &[long, hit(2)], 10);
         assert!(text.starts_with("Question: why?"));
         assert!(text.contains("[1] xxxxxxxxxx\n"));
         assert!(text.contains("[2] passage 2"));

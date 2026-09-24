@@ -21,7 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use quack_core::analysis::citations::{self, CitationRegistry};
+use quack_core::analysis::citations::CitationRegistry;
 use quack_core::config::{
     AnalysisConfig, AuthMode, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
     ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
@@ -874,7 +874,7 @@ fn evaluate_citations(path: &Path) -> Result<CitationReport> {
             })
             .collect();
         let _first_marker = registry.register(&registered);
-        let (_, cited) = citations::validate(&case.answer, &registry.all());
+        let cited = registry.validate(&case.answer).citations;
         original_markers = original_markers.saturating_add(count_numeric_markers(&case.answer));
         survived_markers = survived_markers.saturating_add(cited.len());
         if cited.len() == case.expected_surviving_markers {

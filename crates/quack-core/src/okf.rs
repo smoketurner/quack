@@ -450,7 +450,7 @@ fn export_tables(
     let tables = db.list_tables()?;
     for table in &tables {
         let described = db.describe_table(table)?;
-        let mapping = ontology.and_then(|o| o.mappings.iter().find(|m| &m.table == table));
+        let mapping = ontology.and_then(|o| o.mapping_for_table(table));
         let mut text = front(
             &[
                 ("type", ConceptType::Table.to_string()),
@@ -899,7 +899,7 @@ pub fn propose(bundle: &Bundle, current: Option<&Ontology>) -> Vec<Candidate> {
     }
     let mut candidates = Vec::new();
     for (kind, titles) in &examples {
-        if kind == ontology::ROOT_CLASS || current.is_some_and(|o| o.class(kind).is_some()) {
+        if current.map_or(kind == ontology::ROOT_CLASS, |o| o.defines_class(kind)) {
             continue;
         }
         candidates.push(Candidate {

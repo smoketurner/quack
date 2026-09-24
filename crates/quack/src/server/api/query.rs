@@ -18,7 +18,7 @@ use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
-use quack_core::storage::workspace::{ChunkScope, StatementKind};
+use quack_core::storage::workspace::{ChunkScope, TEMP_OBJECT_REFUSED, creates_temp_object};
 use serde::{Deserialize, Serialize};
 
 use super::StreamEvent;
@@ -26,8 +26,6 @@ use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 use crate::server::web::markdown::to_html;
-use quack_core::analysis::tools;
-use quack_core::analysis::tools::TEMP_OBJECT_REFUSED;
 
 #[derive(Deserialize)]
 pub(crate) struct QueryRequest {
@@ -379,13 +377,9 @@ impl Access {
             })
             .await
             .map_err(|e| ApiError::forbidden(e.message))?;
-        let is_write = match kind {
-            StatementKind::Read => false,
-            StatementKind::Write => true,
-            StatementKind::Invalid(message) => return Err(ApiError::bad_request(message)),
-        };
+        let is_write = kind.writes().map_err(ApiError::bad_request)?;
         let detail = serde_json::json!({ "sql": statement });
-        if is_write && tools::creates_temp_object(statement) {
+        if is_write && creates_temp_object(statement) {
             access
                 .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;

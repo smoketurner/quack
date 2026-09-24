@@ -16,7 +16,7 @@ mod terminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{SharedDb, open_reader};
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::{AuthMode, Config};
 use quack_core::doctor::Options;
 use quack_core::error::Error as CoreError;
@@ -677,7 +677,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     )?;
     let db: SharedDb =
         Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
-    let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
+    let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
     let outcome = print::run_prompt(
         &config,
         Arc::clone(&db),
@@ -962,7 +962,7 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
         WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
     let db: SharedDb =
         Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
-    let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
+    let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
     let policy = if allow_write {
         WritePolicy::Allow
     } else {
@@ -1162,7 +1162,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     )?;
     let db: SharedDb =
         Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
-    let reader_db = open_reader(&db, config.analysis.reader_pool_size).await;
+    let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
     terminal::run(SessionSetup {
         config,
         workspace_name: ws_name,

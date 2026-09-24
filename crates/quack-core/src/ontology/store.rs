@@ -303,7 +303,7 @@ fn write_version(
         )?;
     }
     for mapping in &stored.mappings {
-        let existed = previous.is_some_and(|p| p.mappings.iter().any(|m| m.table == mapping.table));
+        let existed = previous.is_some_and(|p| p.mapping_for_table(&mapping.table).is_some());
         conn.execute(
             "INSERT INTO _quack_ontology_mappings (id, table_name, class_id, key_column, property_map, relation_map, since_version) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
