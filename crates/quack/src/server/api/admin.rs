@@ -4,11 +4,11 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use quack_core::storage::control::{AuditAction, AuditFilter, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, AuditFilter, Outcome, ResourceKind, UserRow};
 use serde::Deserialize;
 
 use crate::server::auth::{Identity, require_admin};
-use crate::server::error::ApiResult;
+use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
 pub(crate) async fn users(
@@ -33,15 +33,27 @@ pub(crate) async fn create_user(
     identity: Identity,
     Json(body): Json<CreateUser>,
 ) -> ApiResult<impl IntoResponse> {
-    require_admin(&identity)?;
-    let user = app
-        .control
-        .create_user(&body.username, &body.password, body.is_admin)
-        .await?;
-    let mut entry = identity.audit(AuditAction::Admin, Outcome::Allowed);
-    entry = entry.on(ResourceKind::User.id(&user.id));
-    app.control.record_audit(&entry).await?;
+    let user = identity.create_user(&app, &body).await?;
     Ok((StatusCode::CREATED, Json(serde_json::to_value(user)?)))
+}
+
+impl Identity {
+    /// Add a server user, from the API or the web console: admins only,
+    /// and not in local mode, which has no logins.
+    pub(crate) async fn create_user(&self, app: &App, user: &CreateUser) -> ApiResult<UserRow> {
+        require_admin(self)?;
+        if app.local {
+            return Err(ApiError::bad_request("local mode has no users"));
+        }
+        let created = app
+            .control
+            .create_user(&user.username, &user.password, user.is_admin)
+            .await?;
+        let mut entry = self.audit(AuditAction::Admin, Outcome::Allowed);
+        entry = entry.on(ResourceKind::User.id(&created.id));
+        app.control.record_audit(&entry).await?;
+        Ok(created)
+    }
 }
 
 #[derive(Deserialize)]

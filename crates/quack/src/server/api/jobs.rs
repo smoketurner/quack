@@ -24,8 +24,7 @@ const PRIVATE_QUESTION: &str = "a question in a private session";
 
 /// `job` as `access` may see it: another member's question is not shown.
 pub(crate) fn redact(access: &Access, mut job: JobInfo) -> JobInfo {
-    let own = job.owner.as_deref() == Some(access.identity.user_id.as_str());
-    if job.kind == JobKind::Chat && !own && !access.sees_all_sessions() {
+    if job.kind == JobKind::Chat && !access.owns(job.owner.as_deref()) {
         job.label = String::from(PRIVATE_QUESTION);
         job.outcome = None;
         job.status = None;
@@ -48,9 +47,7 @@ pub(crate) fn visible_jobs(app: &App, access: &Access) -> Vec<JobInfo> {
 /// Whether the caller may cancel `job`: their own, or any as an owner or
 /// admin; and never without the write permission.
 pub(crate) fn may_cancel(access: &Access, job: &JobInfo) -> bool {
-    access.permits(Need::WRITE)
-        && (job.owner.as_deref() == Some(access.identity.user_id.as_str())
-            || access.sees_all_sessions())
+    access.permits(Need::WRITE) && access.owns(job.owner.as_deref())
 }
 
 pub(crate) async fn list(

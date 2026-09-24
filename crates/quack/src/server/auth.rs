@@ -352,6 +352,12 @@ pub(crate) struct Access {
 
 impl Access {
     /// Owners and admins see every session; others see their own.
+    /// Whether the caller may act on something `owner` created: their own,
+    /// or anyone's as a workspace owner or an admin.
+    pub(crate) fn owns(&self, owner: Option<&str>) -> bool {
+        owner == Some(self.identity.user_id.as_str()) || self.sees_all_sessions()
+    }
+
     pub(crate) fn sees_all_sessions(&self) -> bool {
         self.identity.is_admin || self.role == Some(Role::Owner)
     }

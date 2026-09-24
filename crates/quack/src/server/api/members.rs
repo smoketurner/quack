@@ -4,9 +4,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind, Role};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
@@ -43,26 +43,9 @@ pub(crate) async fn add(
     identity: Identity,
     Path(id): Path<String>,
     Json(body): Json<AddMember>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<NewMember>> {
     let access = access(&app, identity, &id, Need::OWN).await?;
-    let user = app
-        .control
-        .find_user_by_username(&body.username)
-        .await?
-        .ok_or_else(|| ApiError::not_found("no such user"))?;
-    app.control.set_member(&id, &user.id, body.role).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Member,
-            Some(ResourceKind::User.id(&user.id)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-    Ok(Json(
-        serde_json::json!({ "user_id": user.id, "username": user.username, "role": body.role }),
-    ))
+    Ok(Json(access.add_member(&app, &body).await?))
 }
 
 pub(crate) async fn remove(
@@ -71,19 +54,64 @@ pub(crate) async fn remove(
     Path((id, user_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let access = access(&app, identity, &id, Need::OWN).await?;
-    let removed = app.control.remove_member(&id, &user_id).await?;
-    access
-        .audit(
-            &app,
+    access.remove_member(&app, &user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A member as added.
+#[derive(Debug, Serialize)]
+pub(crate) struct NewMember {
+    pub user_id: String,
+    pub username: String,
+    pub role: Role,
+}
+
+impl Access {
+    /// Give a user a role in this workspace, from the API or the web
+    /// console; an existing member's role changes.
+    pub(crate) async fn add_member(&self, app: &App, member: &AddMember) -> ApiResult<NewMember> {
+        let user = app
+            .control
+            .find_user_by_username(&member.username)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such user"))?;
+        app.control
+            .set_member(&self.workspace.id, &user.id, member.role)
+            .await?;
+        self.audit(
+            app,
             AuditAction::Member,
-            Some(ResourceKind::User.id(&user_id)),
+            Some(ResourceKind::User.id(&user.id)),
             Outcome::Allowed,
             None,
         )
         .await?;
-    if removed {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::not_found("not a member"))
+        Ok(NewMember {
+            user_id: user.id,
+            username: user.username,
+            role: member.role,
+        })
+    }
+
+    /// Take a user out of this workspace; one who was not a member is an
+    /// error, after the attempt is audited.
+    pub(crate) async fn remove_member(&self, app: &App, user_id: &str) -> ApiResult<()> {
+        let removed = app
+            .control
+            .remove_member(&self.workspace.id, user_id)
+            .await?;
+        self.audit(
+            app,
+            AuditAction::Member,
+            Some(ResourceKind::User.id(user_id)),
+            Outcome::Allowed,
+            None,
+        )
+        .await?;
+        if removed {
+            Ok(())
+        } else {
+            Err(ApiError::not_found("not a member"))
+        }
     }
 }

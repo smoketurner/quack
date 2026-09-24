@@ -4,11 +4,11 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
-use quack_core::storage::context;
+use quack_core::storage::context::{self, ContextVersion};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
 
-use crate::server::auth::{Identity, Need, access};
+use crate::server::auth::{Access, Identity, Need, access};
 use crate::server::error::ApiResult;
 use crate::server::state::{App, with_db};
 
@@ -50,19 +50,31 @@ pub(crate) async fn replace(
     Json(body): Json<ReplaceContext>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let editor = access.identity.username.clone();
-    let stored = with_db(db, move |db| context::set(db, &body.content, Some(&editor))).await?;
-    access
-        .audit(
-            &app,
+    let stored = access.save_context(&app, body.content).await?;
+    Ok(Json(serde_json::json!({ "context": stored })))
+}
+
+impl Access {
+    /// Store `content` as the next version of the workspace context, from
+    /// the API or the web console, and audit it.
+    pub(crate) async fn save_context(
+        &self,
+        app: &App,
+        content: String,
+    ) -> ApiResult<ContextVersion> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let editor = self.identity.username.clone();
+        let stored = with_db(db, move |db| context::set(db, &content, Some(&editor))).await?;
+        self.audit(
+            app,
             AuditAction::Context,
             Some(ResourceKind::Context.id(&stored.version.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version, "chars": stored.content.chars().count() })),
         )
         .await?;
-    Ok(Json(serde_json::json!({ "context": stored })))
+        Ok(stored)
+    }
 }
 
 #[derive(Deserialize)]

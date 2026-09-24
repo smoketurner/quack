@@ -51,15 +51,21 @@ pub(crate) async fn logout(
     identity: Identity,
     jar: CookieJar,
 ) -> ApiResult<impl IntoResponse> {
-    if let Credential::Session(token) = &identity.credential {
-        app.close_web_session(token);
+    let jar = identity.log_out(&app, jar).await?;
+    Ok((jar, StatusCode::NO_CONTENT))
+}
+
+impl Identity {
+    /// End this login, from the API or the web console: the session is
+    /// closed, the logout audited, and the session cookie cleared.
+    pub(crate) async fn log_out(&self, app: &App, jar: CookieJar) -> ApiResult<CookieJar> {
+        if let Credential::Session(token) = &self.credential {
+            app.close_web_session(token);
+        }
+        let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
+        app.control.record_audit(&entry).await?;
+        Ok(jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()))
     }
-    let entry = identity.audit(AuditAction::Logout, Outcome::Allowed);
-    app.control.record_audit(&entry).await?;
-    Ok((
-        jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()),
-        StatusCode::NO_CONTENT,
-    ))
 }
 
 pub(crate) async fn me(identity: Identity) -> Json<serde_json::Value> {

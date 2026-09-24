@@ -68,7 +68,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts |
 | `ontology_cli`, `graph_cli`, `embeddings_cli`, `admin` | `quack ontology`, `quack graph`, `quack embeddings`, and the server administration commands |
 | `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
-| `server` | `quack serve`: `auth` (identity and `access()`), `api` (REST handlers), `web` (askama pages over the same helpers, [web-ui.md](web-ui.md)), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
+| `server` | `quack serve`: `auth` (identity and `access()`), `api` (REST handlers), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (the audited background runs: embeddings refresh, graph and ontology document passes), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
 
 ## The storage boundary
 

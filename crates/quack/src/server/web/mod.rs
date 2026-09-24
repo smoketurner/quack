@@ -3,6 +3,7 @@
 //! the streamed chat (design doc 11.1). Everything a page does, the API can
 //! do; the handlers here only shape the response as HTML.
 
+mod flash;
 pub(crate) mod markdown;
 
 use std::collections::BTreeSet;
@@ -19,31 +20,41 @@ use axum_extra::extract::CookieJar;
 // Multi-valued fields (checkboxes) need serde_html_form, which axum's own
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
-use axum_extra::extract::cookie::Cookie;
 use quack_core::ontology::candidates::{CandidateAction, Queue};
-use quack_core::ontology::induction::{Decision, ItemKind, Proposal, propose_from_tables};
+use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{Ontology, OntologyDiff, candidates, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Role,
-    Scope, TokenRow, UserRow, WorkspaceChanges,
+    AuditAction, AuditFilter, AuditRow, MemberRow, Outcome, ProviderAllowList, ResourceKind, Scope,
+    TokenRow, UserRow, WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, SessionRow};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource};
 use rust_embed::Embed;
 use serde::Deserialize;
 
+use self::flash::{Flash, UrlEncoded};
+use super::api::admin::CreateUser;
+use super::api::auth::LoginRequest;
+use super::api::context::ReplaceContext;
+use super::api::documents::Enqueued;
+use super::api::embeddings::RefreshStarted;
+use super::api::graph::ExtractionStarted;
+use super::api::import::ImportBody;
+use super::api::members::AddMember;
+use super::api::ontology::DecideRequest;
+use super::api::query::SqlRequest;
+use super::api::workspaces::CreateWorkspace;
 use super::api::{
-    documents as docs_api, embeddings as embeddings_api, graph as graph_api, import as import_api,
-    jobs as jobs_api, ontology as ontology_api, query as query_api, sessions as sessions_api,
+    documents as docs_api, graph as graph_api, import as import_api, jobs as jobs_api,
+    ontology as ontology_api, query as query_api, sessions as sessions_api,
     workspaces as workspaces_api,
 };
 use super::auth::{
-    Access, Credential, Identity, Need, Peer, SESSION_COOKIE, access, password_login, request_id,
-    require_admin, session_cookie,
+    Access, Identity, Need, Peer, access, password_login, request_id, require_admin, session_cookie,
 };
 use super::error::ApiError;
-use super::state::{App, with_db};
+use super::state::App;
 use quack_core::csv::CsvField;
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
@@ -562,18 +573,12 @@ async fn login_page(State(app): State<App>, Query(q): Query<LoginQuery>) -> WebR
     html(&LoginPage { error: q.error })
 }
 
-#[derive(Deserialize)]
-struct LoginForm {
-    username: String,
-    password: String,
-}
-
 async fn login_submit(
     State(app): State<App>,
     peer: Peer,
     jar: CookieJar,
     headers: axum::http::HeaderMap,
-    Form(form): Form<LoginForm>,
+    Form(form): Form<LoginRequest>,
 ) -> WebResult<Response> {
     if app.local {
         return Ok(Redirect::to("/workspaces").into_response());
@@ -591,7 +596,7 @@ async fn login_submit(
     {
         Ok((_, token)) => token,
         Err(e) if e.status == StatusCode::UNAUTHORIZED => {
-            return Ok(Redirect::to("/login?error=wrong+username+or+password").into_response());
+            return Ok(Flash::error("/login", "wrong username or password").into_response());
         }
         Err(e) => return Err(e.into()),
     };
@@ -607,17 +612,8 @@ async fn logout(
     WebUser(identity): WebUser,
     jar: CookieJar,
 ) -> WebResult<Response> {
-    if let Credential::Session(token) = &identity.credential {
-        app.close_web_session(token);
-    }
-    app.control
-        .record_audit(&identity.audit(AuditAction::Logout, Outcome::Allowed))
-        .await?;
-    Ok((
-        jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()),
-        Redirect::to("/login"),
-    )
-        .into_response())
+    let jar = identity.log_out(&app, jar).await?;
+    Ok((jar, Redirect::to("/login")).into_response())
 }
 
 #[derive(Deserialize)]
@@ -676,35 +672,15 @@ async fn workspaces(
     })
 }
 
-#[derive(Deserialize)]
-struct NameForm {
-    name: String,
-}
-
 async fn create_workspace(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Form(form): Form<NameForm>,
+    Form(form): Form<CreateWorkspace>,
 ) -> WebResult<Response> {
-    require_admin(&identity)?;
-    let name = form.name.trim();
-    if name.is_empty() || name.contains(['/', '\\', '.']) {
-        return Ok(Redirect::to("/workspaces?error=bad+workspace+name").into_response());
-    }
-    if app.control.find_workspace_by_name(name).await?.is_some() {
-        return Ok(Redirect::to("/workspaces?error=workspace+exists").into_response());
-    }
-    let ws = app.control.create_workspace(name).await?;
-    if !app.local {
-        app.control
-            .set_member(&ws.id, &identity.user_id, Role::Owner)
-            .await?;
-    }
-    let mut entry = identity.audit(AuditAction::Workspace, Outcome::Allowed);
-    entry.workspace_id = Some(ws.id.clone());
-    entry = entry.on(ResourceKind::Workspace.id(&ws.id));
-    app.control.record_audit(&entry).await?;
-    Ok(Redirect::to(&format!("/w/{}/chat", ws.id)).into_response())
+    Ok(match identity.create_workspace(&app, &form.name).await {
+        Ok(ws) => Redirect::to(&format!("/w/{}/chat", ws.id)).into_response(),
+        Err(e) => Flash::error("/workspaces", e.message).into_response(),
+    })
 }
 
 async fn workspace_index(Path(id): Path<String>) -> Redirect {
@@ -997,22 +973,18 @@ async fn refresh_embeddings(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let target = match embeddings_api::start(&app, &access, &id).await {
-        Ok((_, body)) if body.get("status").and_then(|s| s.as_str()) == Some("running") => {
-            format!(
-                "/w/{id}/documents?notice={}",
-                urlencoded(
+    let started = access.refresh_embeddings(&app).await;
+    Ok(
+        Flash::after(format!("/w/{id}/documents"), started, |started| {
+            Some(String::from(match started {
+                RefreshStarted::Running { .. } => {
                     "refreshing embeddings in the background; the Jobs page shows its progress"
-                )
-            )
-        }
-        Ok(_) => format!(
-            "/w/{id}/documents?notice={}",
-            urlencoded("every vector is already current")
-        ),
-        Err(e) => format!("/w/{id}/documents?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+                }
+                RefreshStarted::Current { .. } => "every vector is already current",
+            }))
+        })
+        .into_response(),
+    )
 }
 
 async fn document_rows(
@@ -1069,16 +1041,20 @@ async fn upload(
     } else {
         vec![docs_api::pasted_file(&text, Some(&title))?]
     };
-    let outcome = enqueue_web(&app, &access, files, pasted).await;
-    let target = match outcome {
-        Ok(skipped) if skipped.is_empty() => format!("/w/{id}/documents"),
-        Ok(skipped) => format!(
-            "/w/{id}/documents?error={}",
-            urlencoded(&format!("Already in the workspace: {}", skipped.join(", ")))
-        ),
-        Err(e) => format!("/w/{id}/documents?error={}", urlencoded(&e.message)),
+    let back = format!("/w/{id}/documents");
+    let skipped = match enqueue_web(&app, &access, files, pasted).await {
+        Ok(skipped) => skipped,
+        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
     };
-    Ok(Redirect::to(&target).into_response())
+    Ok(if skipped.is_empty() {
+        Flash::to(back)
+    } else {
+        Flash::error(
+            back,
+            format!("Already in the workspace: {}", skipped.join(", ")),
+        )
+    }
+    .into_response())
 }
 
 /// Queue uploaded files and pasted text under their own sources; returns
@@ -1100,26 +1076,13 @@ async fn enqueue_web(
         queued.extend(docs_api::enqueue(app, access, DocumentSource::Paste, pasted).await?);
     }
     let mut skipped = Vec::new();
-    for entry in &queued {
-        if entry.get("status").and_then(serde_json::Value::as_str) == Some("duplicate")
-            && let Some(name) = entry.get("filename").and_then(serde_json::Value::as_str)
-        {
-            skipped.push(name.to_owned());
+    for entry in queued {
+        match entry {
+            Enqueued::Duplicate { filename, .. } => skipped.push(filename),
+            Enqueued::Queued { .. } => {}
         }
     }
     Ok(skipped)
-}
-
-fn urlencoded(text: &str) -> String {
-    text.bytes()
-        .map(|b| match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
-                char::from(b).to_string()
-            }
-            b' ' => String::from("+"),
-            other => format!("%{other:02X}"),
-        })
-        .collect()
 }
 
 async fn pin(
@@ -1169,35 +1132,21 @@ async fn tables(
     })
 }
 
-#[derive(Deserialize)]
-struct ImportForm {
-    url: String,
-    table: String,
-    #[serde(default)]
-    query: String,
-    #[serde(default)]
-    source_table: String,
-}
-
 async fn import_submit(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Form(form): Form<ImportForm>,
+    Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let request = ImportRequest {
-        url: form.url,
-        table: form.table,
-        query: (!form.query.trim().is_empty()).then(|| form.query.clone()),
-        source_table: (!form.source_table.trim().is_empty()).then(|| form.source_table.clone()),
-        limit: None,
-    };
-    let target = match import_api::run_import(&app, &access, &request).await {
-        Ok(summary) => format!("/w/{id}/tables/{}", summary.table),
-        Err(e) => format!("/w/{id}/tables?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let request = ImportRequest::from(form);
+    Ok(
+        match import_api::run_import(&app, &access, &request).await {
+            Ok(summary) => Flash::to(format!("/w/{id}/tables/{}", summary.table)),
+            Err(e) => Flash::error(format!("/w/{id}/tables"), e.message),
+        }
+        .into_response(),
+    )
 }
 
 fn cell(value: &serde_json::Value) -> String {
@@ -1214,28 +1163,8 @@ async fn table(
     Path((id, name)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
-    let wanted = name.clone();
-    let (list, described) = app
-        .read(&id, move |db| {
-            let list = db.list_tables()?;
-            let described = if list.contains(&wanted) && !wanted.starts_with("_quack_") {
-                Some(db.describe_table(&wanted)?)
-            } else {
-                None
-            };
-            Ok((list, described))
-        })
-        .await?;
-    let described = described.ok_or_else(|| ApiError::not_found("no such table"))?;
-    access
-        .audit(
-            &app,
-            AuditAction::Open,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::json!({ "table": name })),
-        )
-        .await?;
+    let described = access.describe_table(&app, &name).await?;
+    let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
         page: page(&app, &access.identity, &name, Some(&access)),
         tables: list,
@@ -1272,13 +1201,8 @@ async fn sql_page(
     })
 }
 
-#[derive(Deserialize)]
-struct SqlForm {
-    sql: String,
-}
-
 async fn render_sql(app: &App, access: &Access, sql: &str) -> WebResult<String> {
-    let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, urlencoded(sql));
+    let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
     let result = match query_api::execute_sql(app, access, sql).await {
         Ok(outcome) => SqlResult {
             columns: outcome.columns,
@@ -1308,22 +1232,17 @@ async fn sql_run(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Form(form): Form<SqlForm>,
+    Form(form): Form<SqlRequest>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     Ok(Html(render_sql(&app, &access, &form.sql).await?).into_response())
-}
-
-#[derive(Deserialize)]
-struct SqlQuery {
-    sql: String,
 }
 
 async fn sql_csv(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Query(q): Query<SqlQuery>,
+    Query(q): Query<SqlRequest>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::READ).await?;
     let outcome = query_api::execute_sql(&app, &access, &q.sql).await?;
@@ -1462,64 +1381,15 @@ async fn ontology_decide_many(
         Queue::LowSupport => format!("/w/{id}/ontology?status={}", Queue::LowSupport),
         Queue::Pending => format!("/w/{id}/ontology"),
     };
-    if form.ids.is_empty() {
-        return Ok(Redirect::to(&format!(
-            "{back}{}error=tick+at+least+one+candidate",
-            if back.contains('?') { "&" } else { "?" }
-        ))
-        .into_response());
-    }
-    let accept = match form.bulk {
-        CandidateAction::Accept => true,
-        CandidateAction::Reject => false,
+    let (accept, reject) = match form.bulk {
+        CandidateAction::Accept => (form.ids, Vec::new()),
+        CandidateAction::Reject => (Vec::new(), form.ids),
         CandidateAction::Rename | CandidateAction::MergeInto | CandidateAction::Reparent => {
-            return Ok(Redirect::to(&format!(
-                "{back}{}error=unknown+bulk+action",
-                if back.contains('?') { "&" } else { "?" }
-            ))
-            .into_response());
+            return Ok(Flash::error(back, "the bulk action is accept or reject").into_response());
         }
     };
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let ids = form.ids.clone();
-    let outcome = with_db(db, move |db| {
-        if accept {
-            let decisions: Vec<(String, Decision)> =
-                ids.into_iter().map(|id| (id, Decision::Accept)).collect();
-            Ok(Some(
-                candidates::accept(db, &decisions, Some(&author))?.version,
-            ))
-        } else {
-            candidates::reject(db, &ids, Some(&author))?;
-            Ok(None)
-        }
-    })
-    .await;
-    let target = match outcome {
-        Ok(version) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::Ontology,
-                    None,
-                    Outcome::Allowed,
-                    Some(serde_json::json!({
-                        "bulk": form.bulk,
-                        "ids": form.ids,
-                        "version": version,
-                    })),
-                )
-                .await?;
-            back
-        }
-        Err(e) => format!(
-            "{back}{}error={}",
-            if back.contains('?') { "&" } else { "?" },
-            urlencoded(&e.message)
-        ),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let decided = access.decide_candidates(&app, accept, reject).await;
+    Ok(Flash::after(back, decided, |_| None).into_response())
 }
 
 /// The one-line detail of a model- or bundle-sourced proposal.
@@ -1677,101 +1547,35 @@ async fn ontology_propose(
     Form(form): Form<ProposeForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/ontology");
     if form.documents {
-        let target = match ontology_api::start_document_run(&app, &access, &id, None).await {
-            Ok(_) => format!(
-                "/w/{id}/ontology?notice=document+pass+started%3B+candidates+appear+here+when+it+finishes"
-            ),
-            Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
-        };
-        return Ok(Redirect::to(&target).into_response());
+        let started = ontology_api::start_document_run(&app, &access, &id, None).await;
+        return Ok(Flash::after(back, started, |_| {
+            Some(String::from(
+                "document pass started; candidates appear here when it finishes",
+            ))
+        })
+        .into_response());
     }
-    let options = app.config.ontology.table_evidence();
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let outcome = with_db(db, move |db| {
-        let current = ontology_store::current(db)?;
-        let proposals = propose_from_tables(db, current.as_ref(), &options)?;
-        if proposals.is_empty() {
-            return Ok((0, None));
-        }
-        let run = candidates::store_run(db, &proposals)?;
-        if form.auto_accept {
-            candidates::accept_all(db, Some(&author))?;
-        }
-        Ok((proposals.len(), Some(run)))
+    let proposed = access.propose_from_tables(&app, form.auto_accept).await;
+    Ok(Flash::after(back, proposed, |proposed| {
+        (proposed.candidates == 0)
+            .then(|| String::from("nothing to propose: the tables are already covered"))
     })
-    .await;
-    let target = match outcome {
-        Ok((0, _)) => {
-            format!("/w/{id}/ontology?notice=nothing+to+propose%3A+the+tables+are+already+covered")
-        }
-        Ok((count, run)) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::Propose,
-                    run.as_deref().map(|r| ResourceKind::InductionRun.id(r)),
-                    Outcome::Allowed,
-                    Some(serde_json::json!({ "candidates": count })),
-                )
-                .await?;
-            format!("/w/{id}/ontology")
-        }
-        Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
-}
-
-#[derive(Deserialize)]
-struct DecideForm {
-    action: CandidateAction,
-    #[serde(default)]
-    target: String,
+    .into_response())
 }
 
 async fn ontology_decide(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path((id, cid)): Path<(String, String)>,
-    Form(form): Form<DecideForm>,
+    Form(form): Form<DecideRequest>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let decision = match form.action.decision(Some(&form.target)) {
-        Ok(decision) => decision,
-        Err(e) => {
-            let target = format!("/w/{id}/ontology?error={}", urlencoded(&e.to_string()));
-            return Ok(Redirect::to(&target).into_response());
-        }
-    };
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let candidate_id = cid.clone();
-    let outcome = with_db(db, move |db| {
-        if let Some(decision) = decision {
-            let stored = candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
-            return Ok(Some(stored.version));
-        }
-        candidates::reject(db, &[candidate_id], Some(&author))?;
-        Ok(None)
-    })
-    .await;
-    let target = match outcome {
-        Ok(version) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::Ontology,
-                    Some(ResourceKind::Candidate.id(&cid)),
-                    Outcome::Allowed,
-                    Some(serde_json::json!({ "action": form.action, "version": version })),
-                )
-                .await?;
-            format!("/w/{id}/ontology")
-        }
-        Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let decided = access
+        .decide_candidate(&app, &cid, form.action, form.target.as_deref())
+        .await;
+    Ok(Flash::after(format!("/w/{id}/ontology"), decided, |_| None).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1786,37 +1590,10 @@ async fn ontology_import(
     Form(form): Form<OntologyForm>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let ontology = match Ontology::from_json(&form.json) {
-        Ok(o) => o,
-        Err(e) => {
-            let target = format!("/w/{id}/ontology?error={}", urlencoded(&e.to_string()));
-            return Ok(Redirect::to(&target).into_response());
-        }
-    };
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let saved = with_db(db, move |db| {
-        ontology_store::save(db, &ontology, Some(&author), Some("edited in the web UI"))
-    })
-    .await;
-    match saved {
-        Ok(stored) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::Ontology,
-                    Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
-                    Outcome::Allowed,
-                    Some(serde_json::json!({ "version": stored.version })),
-                )
-                .await?;
-            Ok(Redirect::to(&format!("/w/{id}/ontology")).into_response())
-        }
-        Err(e) => {
-            let target = format!("/w/{id}/ontology?error={}", urlencoded(&e.message));
-            Ok(Redirect::to(&target).into_response())
-        }
-    }
+    let stored = access
+        .replace_ontology(&app, &form.json, "edited in the web UI")
+        .await;
+    Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
 
 async fn ontology_init(
@@ -1825,38 +1602,8 @@ async fn ontology_init(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let saved = with_db(db, move |db| {
-        if ontology_store::latest_version(db)? > 0 {
-            return Err(CoreError::Ontology(String::from(
-                "an ontology already exists",
-            )));
-        }
-        ontology_store::save(
-            db,
-            &Ontology::builtin_default(),
-            Some(&author),
-            Some("built-in default"),
-        )
-    })
-    .await;
-    if let Ok(stored) = &saved {
-        access
-            .audit(
-                &app,
-                AuditAction::Ontology,
-                Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
-                Outcome::Allowed,
-                None,
-            )
-            .await?;
-    }
-    let target = match saved {
-        Ok(_) => format!("/w/{id}/ontology"),
-        Err(e) => format!("/w/{id}/ontology?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let stored = access.init_ontology(&app).await;
+    Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
 
 async fn ontology_restore(
@@ -1865,19 +1612,8 @@ async fn ontology_restore(
     Path((id, v)): Path<(String, u32)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let stored = with_db(db, move |db| ontology_store::restore(db, v, Some(&author))).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.version.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "restored": v })),
-        )
-        .await?;
-    Ok(Redirect::to(&format!("/w/{id}/ontology")).into_response())
+    let stored = access.restore_ontology(&app, v).await;
+    Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
 
 async fn context_page(
@@ -1905,31 +1641,15 @@ async fn context_page(
     })
 }
 
-#[derive(Deserialize)]
-struct ContextForm {
-    content: String,
-}
-
 async fn context_save(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Form(form): Form<ContextForm>,
+    Form(form): Form<ReplaceContext>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let editor = access.identity.username.clone();
-    let stored = with_db(db, move |db| context::set(db, &form.content, Some(&editor))).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Context,
-            Some(ResourceKind::Context.id(&stored.version.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "version": stored.version })),
-        )
-        .await?;
-    Ok(Redirect::to(&format!("/w/{id}/context")).into_response())
+    access.save_context(&app, form.content).await?;
+    Ok(Flash::to(format!("/w/{id}/context")).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2017,40 +1737,19 @@ async fn settings_save(
         classification: Some(form.classification),
         allowed_providers,
     };
-    if let Err(e) = workspaces_api::update_settings(&app, &access, changes).await {
-        let error = urlencoded(&e.message);
-        return Ok(Redirect::to(&format!("/w/{id}/settings?error={error}")).into_response());
-    }
-    Ok(Redirect::to(&format!("/w/{id}/settings")).into_response())
-}
-
-#[derive(Deserialize)]
-struct MemberForm {
-    username: String,
-    role: Role,
+    let saved = workspaces_api::update_settings(&app, &access, changes).await;
+    Ok(Flash::after(format!("/w/{id}/settings"), saved, |_| None).into_response())
 }
 
 async fn member_add(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<String>,
-    Form(form): Form<MemberForm>,
+    Form(form): Form<AddMember>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::OWN).await?;
-    let Some(user) = app.control.find_user_by_username(&form.username).await? else {
-        return Ok(Redirect::to(&format!("/w/{id}/settings?error=no+such+user")).into_response());
-    };
-    app.control.set_member(&id, &user.id, form.role).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Member,
-            Some(ResourceKind::User.id(&user.id)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-    Ok(Redirect::to(&format!("/w/{id}/settings")).into_response())
+    let added = access.add_member(&app, &form).await;
+    Ok(Flash::after(format!("/w/{id}/settings"), added, |_| None).into_response())
 }
 
 async fn member_remove(
@@ -2059,17 +1758,8 @@ async fn member_remove(
     Path((id, user_id)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::OWN).await?;
-    app.control.remove_member(&id, &user_id).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Member,
-            Some(ResourceKind::User.id(&user_id)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-    Ok(Redirect::to(&format!("/w/{id}/settings")).into_response())
+    let removed = access.remove_member(&app, &user_id).await;
+    Ok(Flash::after(format!("/w/{id}/settings"), removed, |()| None).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2089,8 +1779,7 @@ async fn token_create(
     let access = access(&app, identity, &id, Need::OWN).await?;
     if app.local {
         return Ok(
-            Redirect::to(&format!("/w/{id}/settings?error=local+mode+has+no+users"))
-                .into_response(),
+            Flash::error(format!("/w/{id}/settings"), "local mode has no users").into_response(),
         );
     }
     let scopes = form.scopes;
@@ -2167,40 +1856,13 @@ async fn admin_users(
     })
 }
 
-#[derive(Deserialize)]
-struct UserForm {
-    username: String,
-    password: String,
-    #[serde(default)]
-    is_admin: bool,
-}
-
 async fn admin_user_add(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Form(form): Form<UserForm>,
+    Form(form): Form<CreateUser>,
 ) -> WebResult<Response> {
-    require_admin(&identity)?;
-    if app.local {
-        return Ok(Redirect::to("/admin/users?error=local+mode+has+no+users").into_response());
-    }
-    match app
-        .control
-        .create_user(&form.username, &form.password, form.is_admin)
-        .await
-    {
-        Ok(user) => {
-            let mut entry = identity.audit(AuditAction::Admin, Outcome::Allowed);
-            entry = entry.on(ResourceKind::User.id(&user.id));
-            app.control.record_audit(&entry).await?;
-            Ok(Redirect::to("/admin/users").into_response())
-        }
-        Err(e) => Ok(Redirect::to(&format!(
-            "/admin/users?error={}",
-            urlencoded(&e.to_string())
-        ))
-        .into_response()),
-    }
+    let created = identity.create_user(&app, &form).await;
+    Ok(Flash::after("/admin/users", created, |_| None).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2259,12 +1921,6 @@ async fn admin_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn urlencoded_escapes_reserved_bytes() {
-        assert_eq!(urlencoded("a b&c=d/é"), "a+b%26c%3Dd%2F%C3%A9");
-        assert_eq!(urlencoded("plain-text_1.2"), "plain-text_1.2");
-    }
 
     #[test]
     fn cells_render_strings_bare_and_null_empty() {
@@ -2520,28 +2176,25 @@ async fn graph_extract(
         .sample
         .as_deref()
         .and_then(|s| s.trim().parse::<u32>().ok());
-    let outcome = graph_api::start_extraction(
-        &app,
-        &access,
-        &id,
-        &graph_api::ExtractionPlan {
-            source: form.source.unwrap_or_default(),
-            sample,
-            reset: form.reset,
-        },
+    let started = access
+        .start_extraction(
+            &app,
+            &graph_api::ExtractionPlan {
+                source: form.source.unwrap_or_default(),
+                sample,
+                reset: form.reset,
+            },
+        )
+        .await;
+    Ok(
+        Flash::after(format!("/w/{id}/graph"), started, |started| match started {
+            ExtractionStarted::Running { .. } => Some(String::from(
+                "document extraction started in the background; this page shows the graph as it grows",
+            )),
+            ExtractionStarted::Done { .. } => None,
+        })
+        .into_response(),
     )
-    .await;
-    let target = match outcome {
-        Ok(body) if body.get("status").and_then(|s| s.as_str()) == Some("running") => format!(
-            "/w/{id}/graph?notice={}",
-            urlencoded(
-                "document extraction started in the background; this page shows the graph as it grows"
-            )
-        ),
-        Ok(_) => format!("/w/{id}/graph"),
-        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
 }
 
 async fn graph_revalidate(
@@ -2550,34 +2203,14 @@ async fn graph_revalidate(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    let outcome = with_db(db, graph_store::revalidate).await;
-    let target = match outcome {
-        Ok(r) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::GraphRevalidate,
-                    None,
-                    Outcome::Allowed,
-                    Some(serde_json::json!({
-                        "dropped_nodes": r.dropped_nodes,
-                        "dropped_edges": r.dropped_edges,
-                        "version": r.version,
-                    })),
-                )
-                .await?;
-            format!(
-                "/w/{id}/graph?notice={}",
-                urlencoded(&format!(
-                    "dropped {} nodes and {} edges",
-                    r.dropped_nodes, r.dropped_edges
-                ))
-            )
-        }
-        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let revalidated = access.revalidate_graph(&app).await;
+    Ok(Flash::after(format!("/w/{id}/graph"), revalidated, |r| {
+        Some(format!(
+            "dropped {} nodes and {} edges",
+            r.dropped_nodes, r.dropped_edges
+        ))
+    })
+    .into_response())
 }
 
 async fn graph_review(
@@ -2586,12 +2219,8 @@ async fn graph_review(
     Path(id): Path<String>,
 ) -> WebResult<Response> {
     let access = access(&app, identity, &id, Need::WRITE).await?;
-    let db = app.workspace_db(&id).await?;
-    with_db(db, graph_store::mark_reviewed).await?;
-    access
-        .audit(&app, AuditAction::GraphReview, None, Outcome::Allowed, None)
-        .await?;
-    Ok(Redirect::to(&format!("/w/{id}/graph")).into_response())
+    access.review_graph(&app).await?;
+    Ok(Flash::to(format!("/w/{id}/graph")).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2608,34 +2237,11 @@ async fn graph_merge_decide(
     let access = access(&app, identity, &id, Need::WRITE).await?;
     // Parsed rather than extracted, so a bad value comes back as a notice
     // on the page instead of an error page.
+    let back = format!("/w/{id}/graph");
     let decision = match form.action.parse::<MergeDecision>() {
         Ok(decision) => decision,
-        Err(e) => {
-            let target = format!("/w/{id}/graph?error={}", urlencoded(&e.to_string()));
-            return Ok(Redirect::to(&target).into_response());
-        }
+        Err(e) => return Ok(Flash::error(back, e.to_string()).into_response()),
     };
-    let db = app.workspace_db(&id).await?;
-    let author = access.identity.username.clone();
-    let merge_id = mid.clone();
-    let outcome = with_db(db, move |db| {
-        resolve::decide(db, &merge_id, decision, Some(&author))
-    })
-    .await;
-    let target = match outcome {
-        Ok(proposal) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::GraphMerge,
-                    Some(ResourceKind::GraphMerge.id(&mid)),
-                    Outcome::Allowed,
-                    Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
-                )
-                .await?;
-            format!("/w/{id}/graph")
-        }
-        Err(e) => format!("/w/{id}/graph?error={}", urlencoded(&e.message)),
-    };
-    Ok(Redirect::to(&target).into_response())
+    let decided = access.decide_merge(&app, &mid, decision).await;
+    Ok(Flash::after(back, decided, |_| None).into_response())
 }
