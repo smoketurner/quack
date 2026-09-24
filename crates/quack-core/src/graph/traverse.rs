@@ -4,9 +4,10 @@
 //! normalized label, then by label-embedding similarity, then by class.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 
-use super::store::{self, id_list};
-use super::{GraphOptions, GraphResult, Node};
+use super::store::{self, EdgeScope, IdList};
+use super::{GraphOptions, GraphResult, Node, NormalizedLabel, Properties};
 use crate::error::Result;
 use crate::ontology::Ontology;
 use crate::storage::workspace::WorkspaceDb;
@@ -57,14 +58,6 @@ impl std::fmt::Display for Hops {
 /// How far an embedding match may be from the query to count as the entity.
 const ENTRY_MAX_DISTANCE: f64 = 0.25;
 
-/// Properties past this many are counted rather than rendered: a node
-/// built from a wide mapped table carries one per column, and the tree has
-/// to stay readable inside a system prompt.
-const RENDERED_PROPERTIES: usize = 8;
-
-/// A rendered property value longer than this is cut, with an ellipsis.
-const PROPERTY_VALUE_CHARS: usize = 60;
-
 /// How many labels a lookup that matched nothing offers as alternatives.
 const SUGGESTION_LIMIT: u32 = 5;
 
@@ -94,7 +87,7 @@ pub fn resolve_entry(
     class_id: Option<&str>,
     query_embedding: Option<&[f32]>,
 ) -> Result<Vec<Node>> {
-    let normalized = super::normalize_label(entity);
+    let normalized = NormalizedLabel::new(entity);
     if normalized.is_empty() {
         return Ok(Vec::new());
     }
@@ -111,7 +104,7 @@ pub fn resolve_entry(
     ])?;
     let mut exact = Vec::new();
     while let Some(row) = rows.next()? {
-        exact.push(store::node_from_row(row)?);
+        exact.push(Node::try_from(row)?);
     }
     drop(rows);
     drop(stmt);
@@ -152,13 +145,13 @@ pub fn suggest_entities(
     class_id: Option<&str>,
     query_embedding: Option<&[f32]>,
 ) -> Result<Vec<String>> {
-    let normalized = super::normalize_label(entity);
+    let normalized = NormalizedLabel::new(entity);
     if normalized.is_empty() {
         return Ok(Vec::new());
     }
     let mut out: Vec<String> = Vec::new();
     let mut stmt = db.connection().prepare(
-        "SELECT label, class_id FROM _quack_graph_nodes \
+        "SELECT id, label, class_id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes \
          WHERE (contains(normalized_label, ?) OR contains(?, normalized_label) \
                 OR jaro_winkler_similarity(normalized_label, ?) >= ?) \
          AND (? IS NULL OR class_id = ?) \
@@ -175,11 +168,7 @@ pub fn suggest_entities(
         i64::from(SUGGESTION_LIMIT)
     ])?;
     while let Some(row) = rows.next()? {
-        out.push(format!(
-            "{} ({})",
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?
-        ));
+        out.push(Node::try_from(row)?.to_string());
     }
     drop(rows);
     drop(stmt);
@@ -188,7 +177,7 @@ pub fn suggest_entities(
             if distance > SUGGESTION_MAX_DISTANCE {
                 continue;
             }
-            let label = format!("{} ({})", node.label, node.class_id);
+            let label = node.to_string();
             if !out.contains(&label) {
                 out.push(label);
             }
@@ -233,7 +222,7 @@ pub fn neighborhood(
             break;
         }
         let mut next: Vec<String> = Vec::new();
-        let mut edges = store::edges_touching(db, &frontier)?;
+        let mut edges = store::edges(db, &frontier, EdgeScope::Touching)?;
         if let Some(relation) = relation {
             edges.retain(|e| e.relation_id == relation);
         }
@@ -300,7 +289,7 @@ pub fn path(
             break;
         }
         let current: Vec<String> = frontier.drain(..).collect();
-        let edges = store::edges_touching(db, &current)?;
+        let edges = store::edges(db, &current, EdgeScope::Touching)?;
         for edge in edges {
             let (here, there) = if current.contains(&edge.source_node_id) {
                 (edge.source_node_id.clone(), edge.target_node_id.clone())
@@ -336,7 +325,7 @@ pub fn path(
     node_ids.reverse();
     edge_ids.reverse();
     let nodes = store::nodes(db, &node_ids)?;
-    let all_edges = store::edges_among(db, &node_ids)?;
+    let all_edges = store::edges(db, &node_ids, EdgeScope::Among)?;
     let edges: Vec<_> = all_edges
         .into_iter()
         .filter(|e| edge_ids.contains(&e.id))
@@ -370,16 +359,12 @@ pub fn by_class(
     );
     // Counted before the cap applies: a listing that silently stopped at
     // `max_nodes` reads as the whole population of the class.
-    let total: u64 = db.connection().query_row(
-        "SELECT count(*) FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id)",
-        duckdb::params![id_list(&classes)],
-        |row| row.get(0),
-    )?;
+    let total = store::class_count(db, &classes)?;
     let mut stmt = db.connection().prepare(
         "SELECT id FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], class_id) ORDER BY label LIMIT ?",
     )?;
     let cap = i64::from(limit.min(options.max_nodes));
-    let mut rows = stmt.query(duckdb::params![id_list(&classes), cap])?;
+    let mut rows = stmt.query(duckdb::params![IdList::new(&classes), cap])?;
     let mut ids = Vec::new();
     while let Some(row) = rows.next()? {
         ids.push(row.get::<_, String>(0)?);
@@ -395,7 +380,7 @@ pub fn by_class(
 /// Nodes by id with the edges among them and everything's provenance.
 fn collect(db: &WorkspaceDb, ids: &[String]) -> Result<GraphResult> {
     let nodes = store::nodes(db, ids)?;
-    let edges = store::edges_among(db, ids)?;
+    let edges = store::edges(db, ids, EdgeScope::Among)?;
     let subjects: Vec<String> = nodes
         .iter()
         .map(|n| n.id.clone())
@@ -412,165 +397,115 @@ fn collect(db: &WorkspaceDb, ids: &[String]) -> Result<GraphResult> {
 }
 
 /// A depth-first text rendering: each root, then its neighbours indented
-/// with the relation, for the terminal and `quack graph`.
-#[must_use]
-pub fn render_tree(result: &GraphResult) -> String {
-    if result.nodes.is_empty() {
-        return String::from("No matching entities.");
-    }
-    let by_id: BTreeMap<&str, &Node> = result.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    let mut out = String::new();
-    let mut visited: BTreeSet<&str> = BTreeSet::new();
-    let roots: Vec<&str> = if result.roots.is_empty() {
-        result.nodes.iter().map(|n| n.id.as_str()).collect()
-    } else {
-        result.roots.iter().map(String::as_str).collect()
-    };
-    for root in roots {
-        let Some(node) = by_id.get(root) else {
-            continue;
-        };
-        if visited.contains(root) {
-            continue;
+/// with the relation, then a summary line. The terminal, `quack graph`,
+/// MCP, and the agent's graph tools all show this.
+impl fmt::Display for GraphResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.nodes.is_empty() {
+            return f.write_str("No matching entities.");
         }
-        walk(result, &by_id, node, 0, &mut visited, &mut out);
-    }
-    for node in &result.nodes {
-        if !visited.contains(node.id.as_str()) {
-            walk(result, &by_id, node, 0, &mut visited, &mut out);
-        }
-    }
-    out.push_str(&result.nodes.len().to_string());
-    if let Some(total) = result.total_nodes.filter(|_| result.truncated) {
-        out.push_str(" of ");
-        out.push_str(&total.to_string());
-        out.push_str(" matching");
-    }
-    out.push_str(" nodes, ");
-    out.push_str(&result.edges.len().to_string());
-    out.push_str(" edges, ");
-    out.push_str(&result.provenance.len().to_string());
-    out.push_str(" sources");
-    if result.nodes.iter().any(|n| n.provisional) {
-        out.push_str(" (provisional: built from an unreviewed ontology)");
-    }
-    if result.truncated {
-        // Without this the reader takes the cap for the population and
-        // answers "how many are there" with `max_nodes`.
-        out.push_str(match result.total_nodes {
-            Some(_) => {
-                " — cut off at the node limit, so this is not the whole class; count with \
-                 describe_class rather than by counting these lines"
-            }
-            None => " — cut off at the node limit, so entities further out are missing",
-        });
-    }
-    out.push('\n');
-    out
-}
-
-/// The properties of a node or edge as ` {key: value, key: value}`, empty
-/// when there are none. The ontology types them (6.3) and the extractors
-/// fill them in; without this the model only ever sees labels and classes.
-fn format_properties(properties: &serde_json::Value) -> String {
-    let Some(map) = properties.as_object() else {
-        return String::new();
-    };
-    let mut parts: Vec<String> = Vec::new();
-    let mut dropped: usize = 0;
-    for (key, value) in map {
-        let value = property_value(value);
-        if value.is_empty() {
-            continue;
-        }
-        if parts.len() >= RENDERED_PROPERTIES {
-            dropped = dropped.saturating_add(1);
-            continue;
-        }
-        parts.push(format!("{key}: {value}"));
-    }
-    if parts.is_empty() {
-        return String::new();
-    }
-    if dropped > 0 {
-        parts.push(format!("... {dropped} more"));
-    }
-    format!(" {{{}}}", parts.join(", "))
-}
-
-/// One property value, flattened and cut: arrays join their elements,
-/// strings lose their quotes, null and empty strings render as nothing so
-/// an unset property is left out rather than shown as noise.
-fn property_value(value: &serde_json::Value) -> String {
-    let text = match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(text) => text.trim().to_owned(),
-        serde_json::Value::Array(items) => {
-            let rendered: Vec<String> = items
-                .iter()
-                .map(property_value)
-                .filter(|item| !item.is_empty())
-                .collect();
-            rendered.join(", ")
-        }
-        other => other.to_string(),
-    };
-    if text.chars().count() > PROPERTY_VALUE_CHARS {
-        let mut cut: String = text.chars().take(PROPERTY_VALUE_CHARS).collect();
-        cut.push('\u{2026}');
-        return cut;
-    }
-    text
-}
-
-fn walk<'a>(
-    result: &'a GraphResult,
-    by_id: &BTreeMap<&'a str, &'a Node>,
-    node: &'a Node,
-    depth: usize,
-    visited: &mut BTreeSet<&'a str>,
-    out: &mut String,
-) {
-    visited.insert(node.id.as_str());
-    let indent = "  ".repeat(depth);
-    out.push_str(&indent);
-    out.push_str(&node.label);
-    out.push_str(" (");
-    out.push_str(&node.class_id);
-    out.push(')');
-    out.push_str(&format_properties(&node.properties));
-    out.push('\n');
-    for edge in &result.edges {
-        let (other, arrow) = if edge.source_node_id == node.id {
-            (edge.target_node_id.as_str(), "->")
-        } else if edge.target_node_id == node.id {
-            (edge.source_node_id.as_str(), "<-")
+        let mut tree = TreeWriter::new(self);
+        let roots: Vec<&Node> = if self.roots.is_empty() {
+            self.nodes.iter().collect()
         } else {
-            continue;
+            self.roots
+                .iter()
+                .filter_map(|id| tree.by_id.get(id.as_str()).copied())
+                .collect()
         };
-        let Some(next) = by_id.get(other) else {
-            continue;
-        };
-        if visited.contains(other) {
-            out.push_str(&indent);
-            out.push_str("  ");
-            out.push_str(arrow);
-            out.push(' ');
-            out.push_str(&edge.relation_id);
-            out.push_str(&format_properties(&edge.properties));
-            out.push(' ');
-            out.push_str(&next.label);
-            out.push('\n');
-            continue;
+        for node in roots.into_iter().chain(&self.nodes) {
+            if !tree.visited.contains(node.id.as_str()) {
+                tree.node(f, node, 0)?;
+            }
         }
-        out.push_str(&indent);
-        out.push_str("  ");
-        out.push_str(arrow);
-        out.push(' ');
-        out.push_str(&edge.relation_id);
-        out.push_str(&format_properties(&edge.properties));
-        out.push('\n');
-        walk(result, by_id, next, depth.saturating_add(2), visited, out);
+        write!(f, "{}", self.nodes.len())?;
+        if let Some(total) = self.total_nodes.filter(|_| self.truncated) {
+            write!(f, " of {total} matching")?;
+        }
+        write!(
+            f,
+            " nodes, {} edges, {} sources",
+            self.edges.len(),
+            self.provenance.len()
+        )?;
+        if self.nodes.iter().any(|n| n.provisional) {
+            f.write_str(" (provisional: built from an unreviewed ontology)")?;
+        }
+        if self.truncated {
+            // Without this the reader takes the cap for the population and
+            // answers "how many are there" with `max_nodes`.
+            f.write_str(match self.total_nodes {
+                Some(_) => {
+                    " — cut off at the node limit, so this is not the whole class; count with \
+                     describe_class rather than by counting these lines"
+                }
+                None => " — cut off at the node limit, so entities further out are missing",
+            })?;
+        }
+        f.write_str("\n")
+    }
+}
+
+/// The depth-first walk behind [`GraphResult`]'s rendering: every node
+/// once, each edge under the node it leaves or enters.
+struct TreeWriter<'a> {
+    edges: &'a [super::Edge],
+    by_id: BTreeMap<&'a str, &'a Node>,
+    visited: BTreeSet<&'a str>,
+}
+
+impl<'a> TreeWriter<'a> {
+    fn new(result: &'a GraphResult) -> Self {
+        Self {
+            edges: &result.edges,
+            by_id: result.nodes.iter().map(|n| (n.id.as_str(), n)).collect(),
+            visited: BTreeSet::new(),
+        }
+    }
+
+    fn node(&mut self, f: &mut fmt::Formatter<'_>, node: &'a Node, depth: usize) -> fmt::Result {
+        self.visited.insert(node.id.as_str());
+        let indent = "  ".repeat(depth);
+        writeln!(f, "{indent}{node}{}", Suffix(&node.properties))?;
+        for edge in self.edges {
+            let (other, arrow) = if edge.source_node_id == node.id {
+                (edge.target_node_id.as_str(), "->")
+            } else if edge.target_node_id == node.id {
+                (edge.source_node_id.as_str(), "<-")
+            } else {
+                continue;
+            };
+            let Some(next) = self.by_id.get(other).copied() else {
+                continue;
+            };
+            write!(
+                f,
+                "{indent}  {arrow} {}{}",
+                edge.relation_id,
+                Suffix(&edge.properties)
+            )?;
+            if self.visited.contains(other) {
+                writeln!(f, " {}", next.label)?;
+                continue;
+            }
+            writeln!(f)?;
+            self.node(f, next, depth.saturating_add(2))?;
+        }
+        Ok(())
+    }
+}
+
+/// Properties after a label or relation: a space and the rendering, or
+/// nothing when no property has a value.
+struct Suffix<'a>(&'a Properties);
+
+impl fmt::Display for Suffix<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = self.0.to_string();
+        if text.is_empty() {
+            return Ok(());
+        }
+        write!(f, " {text}")
     }
 }
 
@@ -597,56 +532,9 @@ mod tests {
             id: String::from(id),
             label: String::from(label),
             class_id: String::from("organization"),
-            properties,
+            properties: Properties::from(properties),
             provisional: false,
         }
-    }
-
-    #[test]
-    fn properties_render_sorted_and_flattened() {
-        let text = format_properties(&json!({
-            "status": "open",
-            "amount": 1200.5,
-            "aliases": ["Acme Ltd", "Acme"],
-            "closed": null,
-            "note": "  padded  ",
-        }));
-        assert_eq!(
-            text,
-            " {aliases: Acme Ltd, Acme, amount: 1200.5, note: padded, status: open}"
-        );
-    }
-
-    #[test]
-    fn properties_without_values_render_as_nothing() {
-        assert_eq!(format_properties(&json!({})), "");
-        assert_eq!(format_properties(&json!(null)), "");
-        assert_eq!(format_properties(&json!("not an object")), "");
-        assert_eq!(
-            format_properties(&json!({ "empty": "", "unset": null })),
-            ""
-        );
-    }
-
-    #[test]
-    fn a_long_value_is_cut_and_extra_properties_are_counted() {
-        let long = "x".repeat(PROPERTY_VALUE_CHARS + 10);
-        let text = format_properties(&json!({ "note": long }));
-        assert!(text.ends_with("\u{2026}}"), "{text}");
-        assert_eq!(
-            text.chars().count(),
-            // " {note: " + the cut value + the ellipsis + "}"
-            PROPERTY_VALUE_CHARS + 10
-        );
-
-        let mut wide = serde_json::Map::new();
-        for i in 0..(RENDERED_PROPERTIES + 3) {
-            wide.insert(format!("p{i:02}"), json!("v"));
-        }
-        let text = format_properties(&serde_json::Value::Object(wide));
-        assert!(text.contains("p00: v") && text.contains("p07: v"), "{text}");
-        assert!(!text.contains("p08"), "{text}");
-        assert!(text.ends_with("... 3 more}"), "{text}");
     }
 
     #[test]
@@ -662,20 +550,42 @@ mod tests {
                 target_node_id: String::from("b"),
                 relation_id: String::from("supplies"),
                 weight: 1.0,
-                properties: json!({ "since": "2020" }),
+                properties: Properties::from(json!({ "since": "2020" })),
                 provisional: false,
             }],
             provenance: Vec::new(),
             roots: vec![String::from("a")],
             ..GraphResult::default()
         };
-        let tree = render_tree(&result);
-        assert!(
-            tree.contains("Acme (organization) {founded: 1999}"),
-            "{tree}"
+        let tree = result.to_string();
+        assert_eq!(
+            tree,
+            "Acme (organization) {founded: 1999}\n  -> supplies {since: 2020}\n    \
+             Orgenics (organization)\n      <- supplies {since: 2020} Acme\n2 nodes, 1 edges, 0 sources\n"
         );
-        assert!(tree.contains("-> supplies {since: 2020}"), "{tree}");
-        // A node with no properties keeps the bare label and class.
-        assert!(tree.contains("Orgenics (organization)\n"), "{tree}");
+    }
+
+    #[test]
+    fn an_edge_back_to_a_visited_node_names_it_without_descending() {
+        let edge = |id: &str, from: &str, to: &str| Edge {
+            id: String::from(id),
+            source_node_id: String::from(from),
+            target_node_id: String::from(to),
+            relation_id: String::from("knows"),
+            weight: 1.0,
+            properties: Properties::default(),
+            provisional: false,
+        };
+        let result = GraphResult {
+            nodes: vec![node("a", "A", json!({})), node("b", "B", json!({}))],
+            edges: vec![edge("ab", "a", "b"), edge("ba", "b", "a")],
+            ..GraphResult::default()
+        };
+        assert_eq!(
+            result.to_string(),
+            "A (organization)\n  -> knows\n    B (organization)\n      <- knows A\n      -> knows A\n  \
+             <- knows B\n2 nodes, 2 edges, 0 sources\n"
+        );
+        assert_eq!(GraphResult::default().to_string(), "No matching entities.");
     }
 }

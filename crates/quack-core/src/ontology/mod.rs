@@ -13,10 +13,13 @@ pub mod induction;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 
-use serde::{Deserialize, Serialize};
+use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
+use induction::ItemKind;
 
 /// The implicit root class every class descends from.
 pub const ROOT_CLASS: &str = "entity";
@@ -87,8 +90,121 @@ impl std::fmt::Display for SnakeId {
         f.write_str(&self.0)
     }
 }
+
+/// An id that is already `snake_case`: a lowercase letter, then lowercase
+/// letters, digits, or underscores.
+impl TryFrom<&str> for SnakeId {
+    type Error = NotSnakeCase;
+
+    fn try_from(id: &str) -> std::result::Result<Self, NotSnakeCase> {
+        let mut chars = id.chars();
+        let valid = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if valid {
+            Ok(Self(id.to_owned()))
+        } else {
+            Err(NotSnakeCase(id.to_owned()))
+        }
+    }
+}
+
+/// An id [`SnakeId`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotSnakeCase(String);
+
+impl NotSnakeCase {
+    /// The refusal as the ontology error for an id of `kind`.
+    #[must_use]
+    pub fn for_item(self, kind: ItemKind) -> Error {
+        Error::Ontology(format!(
+            "{kind} id '{}' must be snake_case: a lowercase letter, then lowercase letters, digits, or underscores",
+            self.0
+        ))
+    }
+}
+
 /// The implicit relation from any entity to any entity.
 pub const MENTIONS_RELATION: &str = "mentions";
+
+/// A saved ontology version: the first save is 1 and each save counts up.
+/// An ontology not yet saved, and a graph never built, have none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OntologyVersion(NonZeroU32);
+
+impl OntologyVersion {
+    pub const FIRST: Self = Self(NonZeroU32::MIN);
+
+    /// `None` for 0, which no saved version has.
+    #[must_use]
+    pub fn new(version: u32) -> Option<Self> {
+        NonZeroU32::new(version).map(Self)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The version a save writes after `latest`.
+    #[must_use]
+    pub fn after(latest: Option<Self>) -> Self {
+        latest.map_or(Self::FIRST, |v| Self(v.0.saturating_add(1)))
+    }
+
+    /// The version before this one, if there is one.
+    #[must_use]
+    pub fn previous(self) -> Option<Self> {
+        Self::new(self.get().saturating_sub(1))
+    }
+
+    /// Reads a version field that older files and hand-written JSON may
+    /// give as `0` or `null` for "not saved".
+    fn zero_as_none<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Self>, D::Error> {
+        Ok(Option::<u32>::deserialize(deserializer)?.and_then(Self::new))
+    }
+}
+
+impl std::fmt::Display for OntologyVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A version typed at a prompt or in a URL.
+impl std::str::FromStr for OntologyVersion {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        text.trim()
+            .parse::<u32>()
+            .ok()
+            .and_then(Self::new)
+            .ok_or_else(|| {
+                Error::Ontology(format!(
+                    "'{text}' is not an ontology version: versions count from 1"
+                ))
+            })
+    }
+}
+
+impl duckdb::ToSql for OntologyVersion {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(i64::from(self.get())))
+    }
+}
+
+impl FromSql for OntologyVersion {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let version = i64::column_result(value)?;
+        u32::try_from(version)
+            .ok()
+            .and_then(Self::new)
+            .ok_or(FromSqlError::OutOfRange(i128::from(version)))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,9 +312,13 @@ impl Mapping {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ontology {
-    /// The stored version this was read from; `0` for one not yet saved.
-    #[serde(default)]
-    pub version: u32,
+    /// The stored version this was read from; `None` for one not yet saved.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "OntologyVersion::zero_as_none"
+    )]
+    pub version: Option<OntologyVersion>,
     #[serde(default)]
     pub classes: Vec<Class>,
     #[serde(default)]
@@ -207,12 +327,6 @@ pub struct Ontology {
     pub properties: Vec<Property>,
     #[serde(default)]
     pub mappings: Vec<Mapping>,
-}
-
-fn is_snake_case(id: &str) -> bool {
-    let mut chars = id.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 impl Ontology {
@@ -226,6 +340,20 @@ impl Ontology {
             .map_err(|e| Error::Ontology(format!("ontology does not parse: {e}")))?;
         ontology.validate()?;
         Ok(ontology)
+    }
+
+    /// The version this was read from. The graph records which version it
+    /// was built with, so it can only be built from a saved ontology.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an ontology that was never saved.
+    pub fn saved_version(&self) -> Result<OntologyVersion> {
+        self.version.ok_or_else(|| {
+            Error::Ontology(String::from(
+                "the ontology has not been saved, so it has no version",
+            ))
+        })
     }
 
     /// The JSON interchange form.
@@ -274,6 +402,21 @@ impl Ontology {
     #[must_use]
     pub fn is_subclass_of(&self, class_id: &str, ancestor: &str) -> bool {
         ancestor == ROOT_CLASS || self.ancestry(class_id).iter().any(|c| c == ancestor)
+    }
+
+    /// Whether an edge of `relation` from a `source_class` node to a
+    /// `target_class` node is valid: the relation exists (or is `mentions`)
+    /// and each end is its domain or range or descends from it.
+    #[must_use]
+    pub fn allows_edge(&self, relation: &str, source_class: &str, target_class: &str) -> bool {
+        if relation == MENTIONS_RELATION {
+            return true;
+        }
+        let Some(relation) = self.relation(relation) else {
+            return false;
+        };
+        self.is_subclass_of(source_class, &relation.domain)
+            && self.is_subclass_of(target_class, &relation.range)
     }
 
     /// The classes whose parent is this one, nearest first.
@@ -379,7 +522,7 @@ impl Ontology {
     fn validate_properties(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for property in &self.properties {
-            check_id("property", &property.id)?;
+            SnakeId::try_from(property.id.as_str()).map_err(|e| e.for_item(ItemKind::Property))?;
             if !seen.insert(property.id.as_str()) {
                 return Err(Error::Ontology(format!(
                     "property '{}' is declared twice",
@@ -409,7 +552,7 @@ impl Ontology {
     fn validate_classes(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for class in &self.classes {
-            check_id("class", &class.id)?;
+            SnakeId::try_from(class.id.as_str()).map_err(|e| e.for_item(ItemKind::Class))?;
             if class.id == ROOT_CLASS {
                 return Err(Error::Ontology(format!(
                     "'{ROOT_CLASS}' is the implicit root and cannot be declared"
@@ -458,7 +601,7 @@ impl Ontology {
     fn validate_relations(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for relation in &self.relations {
-            check_id("relation", &relation.id)?;
+            SnakeId::try_from(relation.id.as_str()).map_err(|e| e.for_item(ItemKind::Relation))?;
             if relation.id == MENTIONS_RELATION {
                 return Err(Error::Ontology(format!(
                     "'{MENTIONS_RELATION}' is implicit and cannot be declared"
@@ -572,7 +715,10 @@ impl Ontology {
     #[must_use]
     pub fn render_capped(&self, limit: usize) -> String {
         let mut lines = vec![
-            format!("Ontology (version {}):", self.version),
+            match self.version {
+                Some(version) => format!("Ontology (version {version}):"),
+                None => String::from("Ontology (unsaved):"),
+            },
             String::from("- classes (child: parent [key] {properties}):"),
         ];
         for class in self.classes.iter().take(limit) {
@@ -666,10 +812,10 @@ impl Ontology {
         OntologyDiff {
             from: older.version,
             to: this.version,
-            classes: changes(&older.classes, &this.classes, |c| c.id.as_str()),
-            relations: changes(&older.relations, &this.relations, |r| r.id.as_str()),
-            properties: changes(&older.properties, &this.properties, |p| p.id.as_str()),
-            mappings: changes(&older.mappings, &this.mappings, Mapping::id),
+            classes: Changes::between(&older.classes, &this.classes, |c| c.id.as_str()),
+            relations: Changes::between(&older.relations, &this.relations, |r| r.id.as_str()),
+            properties: Changes::between(&older.properties, &this.properties, |p| p.id.as_str()),
+            mappings: Changes::between(&older.mappings, &this.mappings, Mapping::id),
         }
     }
 
@@ -698,7 +844,7 @@ impl Ontology {
             values: Vec::new(),
         };
         Self {
-            version: 0,
+            version: None,
             classes: vec![
                 class("person", ROOT_CLASS, &["title", "email"]),
                 class("organization", ROOT_CLASS, &["industry", "country"]),
@@ -727,34 +873,6 @@ impl Ontology {
     }
 }
 
-fn check_id(kind: &str, id: &str) -> Result<()> {
-    if is_snake_case(id) {
-        Ok(())
-    } else {
-        Err(Error::Ontology(format!(
-            "{kind} id '{id}' must be snake_case: a lowercase letter, then lowercase letters, digits, or underscores"
-        )))
-    }
-}
-
-/// Added, removed, and changed ids between two lists of one kind.
-fn changes<T: PartialEq>(old: &[T], new: &[T], id: impl Fn(&T) -> &str) -> Changes {
-    let mut out = Changes::default();
-    for item in new {
-        match old.iter().find(|o| id(o) == id(item)) {
-            None => out.added.push(id(item).to_owned()),
-            Some(before) if before != item => out.changed.push(id(item).to_owned()),
-            Some(_) => {}
-        }
-    }
-    for item in old {
-        if !new.iter().any(|n| id(n) == id(item)) {
-            out.removed.push(id(item).to_owned());
-        }
-    }
-    out
-}
-
 /// Ids added, removed, or changed for one kind.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Changes {
@@ -764,6 +882,25 @@ pub struct Changes {
 }
 
 impl Changes {
+    /// Added, removed, and changed ids between two lists of one kind.
+    #[must_use]
+    pub fn between<T: PartialEq>(old: &[T], new: &[T], id: impl Fn(&T) -> &str) -> Self {
+        let mut out = Self::default();
+        for item in new {
+            match old.iter().find(|o| id(o) == id(item)) {
+                None => out.added.push(id(item).to_owned()),
+                Some(before) if before != item => out.changed.push(id(item).to_owned()),
+                Some(_) => {}
+            }
+        }
+        for item in old {
+            if !new.iter().any(|n| id(n) == id(item)) {
+                out.removed.push(id(item).to_owned());
+            }
+        }
+        out
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
@@ -773,8 +910,8 @@ impl Changes {
 /// The difference between two versions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct OntologyDiff {
-    pub from: u32,
-    pub to: u32,
+    pub from: Option<OntologyVersion>,
+    pub to: Option<OntologyVersion>,
     pub classes: Changes,
     pub relations: Changes,
     pub properties: Changes,
@@ -793,7 +930,10 @@ impl OntologyDiff {
 
 impl std::fmt::Display for OntologyDiff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "version {} -> {}", self.from, self.to)?;
+        let side = |version: Option<OntologyVersion>| {
+            version.map_or_else(|| String::from("unsaved"), |v| v.to_string())
+        };
+        writeln!(f, "version {} -> {}", side(self.from), side(self.to))?;
         if self.is_empty() {
             return writeln!(f, "  no changes");
         }
@@ -824,6 +964,65 @@ impl std::fmt::Display for OntologyDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_count_from_one() {
+        assert_eq!(OntologyVersion::new(0), None);
+        assert_eq!(OntologyVersion::after(None), OntologyVersion::FIRST);
+        let second = OntologyVersion::after(Some(OntologyVersion::FIRST));
+        assert_eq!(second.get(), 2);
+        assert_eq!(second.previous(), Some(OntologyVersion::FIRST));
+        assert_eq!(OntologyVersion::FIRST.previous(), None);
+        assert_eq!(
+            " 7 "
+                .parse::<OntologyVersion>()
+                .map(OntologyVersion::get)
+                .ok(),
+            Some(7)
+        );
+        for bad in ["0", "-1", "v2", ""] {
+            assert!(bad.parse::<OntologyVersion>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_unsaved_version_is_absent_in_json_and_read_from_zero_or_null() {
+        let json = Ontology::builtin_default().to_json().unwrap_or_default();
+        assert!(!json.contains("\"version\""), "{json}");
+        for version in ["0", "null"] {
+            let text = format!(r#"{{"version": {version}}}"#);
+            assert_eq!(
+                Ontology::from_json(&text).map(|o| o.version).ok(),
+                Some(None),
+                "{text}"
+            );
+        }
+        let saved = Ontology::from_json(r#"{"version": 3}"#)
+            .map(|o| o.version)
+            .ok();
+        assert_eq!(saved, Some(OntologyVersion::new(3)));
+        assert!(Ontology::from_json(r#"{"version": -1}"#).is_err());
+    }
+
+    #[test]
+    fn snake_ids_are_checked_not_repaired() {
+        assert_eq!(
+            SnakeId::try_from("ship_mode_2").map(SnakeId::into_string),
+            Ok(String::from("ship_mode_2"))
+        );
+        for bad in ["", "Ship", "2024", "_x", "ship mode", "ship-mode"] {
+            let refused =
+                SnakeId::try_from(bad).map_err(|e| e.for_item(ItemKind::Class).to_string());
+            assert_eq!(
+                refused,
+                Err(format!(
+                    "ontology error: class id '{bad}' must be snake_case: a lowercase letter, then \
+                     lowercase letters, digits, or underscores"
+                )),
+                "{bad}"
+            );
+        }
+    }
 
     fn err_of(json: &str) -> String {
         match Ontology::from_json(json) {
@@ -971,7 +1170,7 @@ mod tests {
     fn diff_reports_added_removed_and_changed_ids() {
         let base = Ontology::from_json(INSURANCE).unwrap_or_else(|e| fail(&e.to_string()));
         let mut next = base.clone();
-        next.version = 2;
+        next.version = OntologyVersion::new(2);
         next.classes.retain(|c| c.id != "vendor");
         next.classes.push(Class {
             id: String::from("adjuster"),

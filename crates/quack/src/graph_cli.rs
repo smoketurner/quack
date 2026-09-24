@@ -11,7 +11,6 @@ use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphResult, GraphStatus, extract, resolve, store as graph_store, tables,
-    traverse,
 };
 use quack_core::llm;
 use quack_core::ontology::store as ontology_store;
@@ -370,7 +369,7 @@ async fn run_extract(
             resolved.auto_merged, resolved.proposed
         )?;
     }
-    let version = ontology.version;
+    let version = ontology.saved_version()?;
     db.run(move |db| graph_store::set_built_with(db, version))
         .await?;
     write!(out, "{}", status_text(&db.run(graph_store::status).await?))?;
@@ -392,19 +391,24 @@ fn print_result(out: &mut impl Write, result: &GraphResult, json: bool) -> Resul
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(result)?)?;
     } else {
-        write!(out, "{}", traverse::render_tree(result))?;
+        write!(out, "{result}")?;
     }
     Ok(())
 }
 
 /// The status as `quack graph status` prints it.
 pub(crate) fn status_text(status: &GraphStatus) -> String {
+    let ontology_version = status
+        .ontology_version
+        .map_or_else(|| String::from("none"), |v| v.to_string());
+    let built_with = status.built_with_version.map_or_else(
+        || String::from("never built"),
+        |v| format!("built with {v}"),
+    );
     let mut lines = vec![format!(
-        "Graph: {} nodes, {} edges (ontology version {}, built with {}){}{}",
+        "Graph: {} nodes, {} edges (ontology version {ontology_version}, {built_with}){}{}",
         status.nodes,
         status.edges,
-        status.ontology_version,
-        status.built_with_version,
         if status.stale {
             "; stale: run `quack graph revalidate` or `quack graph extract`"
         } else {

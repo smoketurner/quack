@@ -48,7 +48,9 @@ joined identifier term (`pol8841` alongside `pol` and `8841` for `POL-8841`; iss
 version 8 tagged every stored vector with the embedding profile it was made under (the
 model the workspace had recorded, no prefixes), and version 9 marks documents still carrying
 the old `pending` default (or no status) as `error`, since a status is now read as one of
-`queued`, `processing`, `ready`, or `error` and those rows were never processed.
+`queued`, `processing`, `ready`, or `error` and those rows were never processed. Version 10
+adds `_quack_ontology_versions.acceptance` (`reviewed` or `auto`) and marks versions whose
+note starts `auto-accepted` as `auto`, which was the only record of an auto-accept before.
 Phrase search (`"..."` in a keyword query) needed no version bump: it post-filters
 candidates by substring rather than adding term positions to `_quack_terms`.
 

@@ -1251,6 +1251,7 @@ mod tests {
     use crate::analysis::chart::ChartKind;
     use crate::analysis::events::{self, AgentEvent};
     use crate::embedding::{Dimension, Profile, Prompts};
+    use crate::graph::Properties;
     use crate::graph::store::NewNode;
     use crate::llm::EmbedModel;
     use crate::ontology::Mapping;
@@ -1388,7 +1389,7 @@ mod tests {
         let node = |label: &str| NewNode {
             label: String::from(label),
             class_id: String::from("organization"),
-            properties: json!({}),
+            properties: Properties::default(),
             provisional: false,
         };
         let acme = graph::store::upsert_node(&db, &node("Acme"))
@@ -2338,7 +2339,7 @@ mod tests {
 
 use crate::error;
 use crate::graph::query::{GraphQuery, Listed, OntologyId, PathEnds, PathQuery, UnknownEntity};
-use crate::graph::{self, GraphResult};
+use crate::graph::{self, GraphResult, Origin};
 
 /// The graph results a turn produced, kept for the response.
 pub type GraphResults = Arc<Mutex<Vec<GraphResult>>>;
@@ -2667,7 +2668,7 @@ async fn format_graph_result(
     if result.nodes.is_empty() {
         return empty_graph_text(stripped_provisional, suggestions);
     }
-    let tree = graph::traverse::render_tree(result);
+    let tree = result.to_string();
     let mut out = if tree.chars().count() > MAX_GRAPH_TEXT_CHARS {
         trim_graph_text(&tree, MAX_GRAPH_TEXT_CHARS)
     } else {
@@ -2678,7 +2679,7 @@ async fn format_graph_result(
     let all_chunk_ids: std::collections::BTreeSet<String> = result
         .provenance
         .iter()
-        .filter_map(|p| p.chunk_id.clone())
+        .filter_map(|p| p.origin.chunk_id().map(str::to_owned))
         .collect();
     let hidden_chunks = all_chunk_ids.len().saturating_sub(MAX_GRAPH_SOURCES);
     let chunk_ids: Vec<String> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
@@ -2708,15 +2709,19 @@ async fn format_graph_result(
     let rows: std::collections::BTreeSet<String> = result
         .provenance
         .iter()
-        .filter_map(|p| {
-            Some(
+        .filter_map(|p| match &p.origin {
+            Origin::Row {
+                table_name,
+                row_key,
+            } => Some(
                 RowReference {
                     ontology: ontology.as_ref(),
-                    table: p.table_name.as_deref()?,
-                    row_key: p.row_key.as_deref(),
+                    table: table_name,
+                    row_key: Some(row_key),
                 }
                 .to_string(),
-            )
+            ),
+            Origin::Chunk { .. } => None,
         })
         .collect();
     if !rows.is_empty() {

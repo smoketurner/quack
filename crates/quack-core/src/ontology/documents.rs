@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::extraction::{
     Extract, Extracted, Passage, RunProgress, Tally, evenly_spaced, extractions,
 };
+use crate::graph::NormalizedLabel;
 use crate::llm::{Embeddings, name_similarity};
 use crate::progress::Progress;
 use crate::storage::workspace::{DocumentStatus, WorkspaceDb};
@@ -359,6 +360,7 @@ impl Vocabulary {
     }
 }
 
+#[derive(Default)]
 struct Support {
     occurrences: u32,
     documents: BTreeSet<String>,
@@ -366,13 +368,6 @@ struct Support {
 }
 
 impl Support {
-    fn new() -> Self {
-        Self {
-            occurrences: 0,
-            documents: BTreeSet::new(),
-            examples: Vec::new(),
-        }
-    }
     fn note(&mut self, observation: &Observation, example: serde_json::Value) {
         self.occurrences = self.occurrences.saturating_add(1);
         self.documents.insert(observation.document_id.clone());
@@ -393,6 +388,10 @@ impl Support {
         let by_docs = f64::from(docs.min(min_support.max(1))) / f64::from(min_support.max(1));
         0.5f64.mul_add(by_count, 0.5 * by_docs)
     }
+    /// Seen in fewer documents than a proposal needs to be shown.
+    fn is_low(&self, min_support_documents: u32) -> bool {
+        u32::try_from(self.documents.len()).unwrap_or(0) < min_support_documents
+    }
     fn evidence(&self, extra: serde_json::Value) -> serde_json::Value {
         let mut evidence = serde_json::json!({
             "occurrences": self.occurrences,
@@ -408,38 +407,130 @@ impl Support {
     }
 }
 
-fn infer_property_type(values: &[String]) -> PropertyType {
-    let trimmed: Vec<&str> = values
-        .iter()
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .collect();
-    if trimmed.is_empty() {
-        return PropertyType::String;
+impl PropertyType {
+    /// The type every non-blank value fits: boolean, number, date, else
+    /// string.
+    fn infer(values: &[String]) -> Self {
+        let trimmed: Vec<&str> = values
+            .iter()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if trimmed.is_empty() {
+            return Self::String;
+        }
+        if trimmed
+            .iter()
+            .all(|v| v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"))
+        {
+            return Self::Boolean;
+        }
+        if trimmed
+            .iter()
+            .all(|v| v.replace([',', '$', '%'], "").parse::<f64>().is_ok())
+        {
+            return Self::Number;
+        }
+        let looks_like_date = |value: &str| {
+            let digits = value.chars().filter(char::is_ascii_digit).count();
+            digits >= 4
+                && (value.contains('-') || value.contains('/') || value.contains(' '))
+                && value.len() <= 30
+        };
+        if trimmed.iter().all(|v| looks_like_date(v)) {
+            return Self::Date;
+        }
+        Self::String
     }
-    if trimmed
-        .iter()
-        .all(|v| v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"))
-    {
-        return PropertyType::Boolean;
-    }
-    if trimmed
-        .iter()
-        .all(|v| v.replace([',', '$', '%'], "").parse::<f64>().is_ok())
-    {
-        return PropertyType::Number;
-    }
-    if trimmed.iter().all(|v| looks_like_date(v)) {
-        return PropertyType::Date;
-    }
-    PropertyType::String
 }
 
-fn looks_like_date(value: &str) -> bool {
-    let digits = value.chars().filter(char::is_ascii_digit).count();
-    digits >= 4
-        && (value.contains('-') || value.contains('/') || value.contains(' '))
-        && value.len() <= 30
+/// One attribute of one class: how often documents gave it, and the
+/// values they gave.
+#[derive(Default)]
+struct AttributeStats {
+    support: Support,
+    values: Vec<String>,
+}
+
+/// Parents inferred from co-labelled mentions: a class whose entities are
+/// mostly also labelled with a bigger class gets it as parent (`vendor`
+/// under `organization`).
+struct Hierarchy(BTreeMap<String, String>);
+
+impl Hierarchy {
+    fn infer(
+        entity_types: &BTreeMap<NormalizedLabel, BTreeSet<String>>,
+        class_support: &BTreeMap<String, Support>,
+    ) -> Self {
+        let mut pairs: BTreeMap<(String, String), u32> = BTreeMap::new();
+        for classes in entity_types.values() {
+            for a in classes {
+                for b in classes {
+                    if a != b {
+                        let entry = pairs.entry((a.clone(), b.clone())).or_default();
+                        *entry = entry.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let size = |c: &str| class_support.get(c).map_or(0, |s| s.occurrences);
+        let entities_of = |c: &str| entity_types.values().filter(|set| set.contains(c)).count();
+        let mut parents = BTreeMap::new();
+        for ((child, parent), shared) in &pairs {
+            if size(child) >= size(parent) {
+                continue;
+            }
+            let child_entities = u32::try_from(entities_of(child)).unwrap_or(u32::MAX).max(1);
+            if f64::from(*shared) / f64::from(child_entities) >= 0.8 {
+                let better = parents
+                    .get(child)
+                    .is_none_or(|existing: &String| size(existing) < size(parent));
+                if better {
+                    parents.insert(child.clone(), parent.clone());
+                }
+            }
+        }
+        Self(parents)
+    }
+
+    fn parent(&self, class: &str) -> Option<&String> {
+        self.0.get(class)
+    }
+
+    /// The class and its inferred ancestors, nearest first.
+    fn ancestry(&self, class: &str) -> Vec<String> {
+        let mut out = vec![class.to_owned()];
+        let mut current = class;
+        while let Some(parent) = self.0.get(current) {
+            if out.contains(parent) {
+                break;
+            }
+            out.push(parent.clone());
+            current = parent;
+        }
+        out
+    }
+
+    /// The single most common endpoint class, or the nearest ancestor every
+    /// endpoint shares when they are mixed, or `entity`.
+    fn generalize(&self, counts: &Tally) -> String {
+        let total = counts.total();
+        let Some((top, n)) = counts.iter().max_by_key(|(_, n)| *n) else {
+            return String::from(ROOT_CLASS);
+        };
+        if total == 0 {
+            return String::from(ROOT_CLASS);
+        }
+        if f64::from(n) / f64::from(total) >= 0.8 {
+            return top.to_owned();
+        }
+        for ancestor in self.ancestry(top) {
+            if counts.names().all(|c| self.ancestry(c).contains(&ancestor)) {
+                return ancestor;
+            }
+        }
+        String::from(ROOT_CLASS)
+    }
 }
 
 /// Endpoint counts for one relation.
@@ -453,51 +544,50 @@ struct RelationStats {
 /// What the observations say, before it becomes candidates.
 struct Evidence {
     class_support: BTreeMap<String, Support>,
-    entity_class: BTreeMap<String, String>,
-    parents: BTreeMap<String, String>,
+    entity_class: BTreeMap<NormalizedLabel, String>,
+    hierarchy: Hierarchy,
     relations: Vocabulary,
 }
 
-fn gather(observations: &[Observation], similarity: Similarity<'_>) -> Evidence {
-    let mut type_counts = Tally::default();
-    let mut relation_counts = Tally::default();
-    for o in observations {
-        for e in &o.extraction.entities {
-            type_counts.bump(&e.type_name);
+impl Evidence {
+    fn gather(observations: &[Observation], similarity: Similarity<'_>) -> Self {
+        let mut type_counts = Tally::default();
+        let mut relation_counts = Tally::default();
+        for o in observations {
+            for e in &o.extraction.entities {
+                type_counts.bump(&e.type_name);
+            }
+            for r in &o.extraction.relations {
+                relation_counts.bump(&r.relation);
+            }
         }
-        for r in &o.extraction.relations {
-            relation_counts.bump(&r.relation);
-        }
-    }
-    let types = Vocabulary::build(&type_counts, similarity);
-    let relations = Vocabulary::build(&relation_counts, similarity);
-    let mut class_support: BTreeMap<String, Support> = BTreeMap::new();
-    let mut entity_types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut entity_class: BTreeMap<String, String> = BTreeMap::new();
-    for o in observations {
-        for e in &o.extraction.entities {
-            let class = types.id(&e.type_name);
-            class_support
-                .entry(class.clone())
-                .or_insert_with(Support::new)
-                .note(
+        let types = Vocabulary::build(&type_counts, similarity);
+        let relations = Vocabulary::build(&relation_counts, similarity);
+        let mut class_support: BTreeMap<String, Support> = BTreeMap::new();
+        let mut entity_types: BTreeMap<NormalizedLabel, BTreeSet<String>> = BTreeMap::new();
+        let mut entity_class: BTreeMap<NormalizedLabel, String> = BTreeMap::new();
+        for o in observations {
+            for e in &o.extraction.entities {
+                let class = types.id(&e.type_name);
+                class_support.entry(class.clone()).or_default().note(
                     o,
                     serde_json::json!({ "mention": e.name, "type": e.type_name }),
                 );
-            let key = e.name.trim().to_lowercase();
-            entity_types
-                .entry(key.clone())
-                .or_default()
-                .insert(class.clone());
-            entity_class.entry(key).or_insert(class);
+                let key = NormalizedLabel::new(&e.name);
+                entity_types
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(class.clone());
+                entity_class.entry(key).or_insert(class);
+            }
         }
-    }
-    let parents = infer_hierarchy(&entity_types, &class_support);
-    Evidence {
-        class_support,
-        entity_class,
-        parents,
-        relations,
+        let hierarchy = Hierarchy::infer(&entity_types, &class_support);
+        Self {
+            class_support,
+            entity_class,
+            hierarchy,
+            relations,
+        }
     }
 }
 
@@ -512,16 +602,12 @@ pub fn propose(
     options: &DocumentEvidenceOptions,
     similarity: Similarity<'_>,
 ) -> Vec<Candidate> {
-    let evidence = gather(observations, similarity);
+    let evidence = Evidence::gather(observations, similarity);
     let mut candidates = Vec::new();
     propose_classes(&evidence, current, options, &mut candidates);
     propose_relations(observations, &evidence, current, options, &mut candidates);
     propose_attributes(observations, &evidence, current, options, &mut candidates);
     candidates
-}
-
-fn low(support: &Support, options: &DocumentEvidenceOptions) -> bool {
-    u32::try_from(support.documents.len()).unwrap_or(0) < options.min_support_documents
 }
 
 fn propose_classes(
@@ -535,8 +621,8 @@ fn propose_classes(
             continue;
         }
         let parent = evidence
-            .parents
-            .get(class)
+            .hierarchy
+            .parent(class)
             .cloned()
             .unwrap_or_else(|| String::from(ROOT_CLASS));
         candidates.push(Candidate {
@@ -550,7 +636,7 @@ fn propose_classes(
             }),
             evidence: support.evidence(serde_json::json!({ "source": "documents" })),
             confidence: support.confidence(options.min_support_documents),
-            low_support: low(support, options),
+            low_support: support.is_low(options.min_support_documents),
         });
     }
 }
@@ -567,14 +653,14 @@ fn propose_relations(
         for r in &o.extraction.relations {
             let id = evidence.relations.id(&r.relation);
             let entry = stats.entry(id).or_default();
-            entry.support.get_or_insert_with(Support::new).note(
+            entry.support.get_or_insert_with(Support::default).note(
                 o,
                 serde_json::json!({ "subject": r.subject, "relation": r.relation, "object": r.object }),
             );
-            if let Some(c) = evidence.entity_class.get(&r.subject.trim().to_lowercase()) {
+            if let Some(c) = evidence.entity_class.get(&NormalizedLabel::new(&r.subject)) {
                 entry.domains.bump(c);
             }
-            if let Some(c) = evidence.entity_class.get(&r.object.trim().to_lowercase()) {
+            if let Some(c) = evidence.entity_class.get(&NormalizedLabel::new(&r.object)) {
                 entry.ranges.bump(c);
             }
         }
@@ -591,8 +677,8 @@ fn propose_relations(
                 id: id.clone(),
                 label: None,
                 description: None,
-                domain: generalize(&stat.domains, &evidence.parents),
-                range: generalize(&stat.ranges, &evidence.parents),
+                domain: evidence.hierarchy.generalize(&stat.domains),
+                range: evidence.hierarchy.generalize(&stat.ranges),
             }),
             evidence: support.evidence(serde_json::json!({
                 "source": "documents",
@@ -600,7 +686,7 @@ fn propose_relations(
                 "ranges": stat.ranges,
             })),
             confidence: support.confidence(options.min_support_documents),
-            low_support: low(support, options),
+            low_support: support.is_low(options.min_support_documents),
         });
     }
 }
@@ -612,24 +698,22 @@ fn propose_attributes(
     options: &DocumentEvidenceOptions,
     candidates: &mut Vec<Candidate>,
 ) {
-    let mut stats: BTreeMap<(String, String), (Support, Vec<String>)> = BTreeMap::new();
+    let mut stats: BTreeMap<(String, String), AttributeStats> = BTreeMap::new();
     for o in observations {
         for a in &o.extraction.attributes {
-            let Some(class) = evidence.entity_class.get(&a.entity.trim().to_lowercase()) else {
+            let Some(class) = evidence.entity_class.get(&NormalizedLabel::new(&a.entity)) else {
                 continue;
             };
             let property = SnakeId::from_name(&a.name).into_string();
-            let entry = stats
-                .entry((class.clone(), property))
-                .or_insert_with(|| (Support::new(), Vec::new()));
-            entry.0.note(
+            let entry = stats.entry((class.clone(), property)).or_default();
+            entry.support.note(
                 o,
                 serde_json::json!({ "entity": a.entity, "value": a.value }),
             );
-            entry.1.push(a.value.clone());
+            entry.values.push(a.value.clone());
         }
     }
-    for ((class, property), (support, values)) in &stats {
+    for ((class, property), AttributeStats { support, values }) in &stats {
         if support.occurrences < 2
             || current.is_some_and(|o| o.class_properties(class).contains(property))
         {
@@ -641,87 +725,15 @@ fn propose_attributes(
                 property: Property {
                     id: property.clone(),
                     label: None,
-                    kind: infer_property_type(values),
+                    kind: PropertyType::infer(values),
                     values: Vec::new(),
                 },
             },
             evidence: support.evidence(serde_json::json!({ "source": "documents" })),
             confidence: support.confidence(options.min_support_documents),
-            low_support: low(support, options),
+            low_support: support.is_low(options.min_support_documents),
         });
     }
-}
-
-/// A class whose entities are mostly also labelled with a bigger class
-/// gets it as parent (`vendor` under `organization`).
-fn infer_hierarchy(
-    entity_types: &BTreeMap<String, BTreeSet<String>>,
-    class_support: &BTreeMap<String, Support>,
-) -> BTreeMap<String, String> {
-    let mut pairs: BTreeMap<(String, String), u32> = BTreeMap::new();
-    for classes in entity_types.values() {
-        for a in classes {
-            for b in classes {
-                if a != b {
-                    let entry = pairs.entry((a.clone(), b.clone())).or_default();
-                    *entry = entry.saturating_add(1);
-                }
-            }
-        }
-    }
-    let size = |c: &str| class_support.get(c).map_or(0, |s| s.occurrences);
-    let entities_of = |c: &str| entity_types.values().filter(|set| set.contains(c)).count();
-    let mut parents = BTreeMap::new();
-    for ((child, parent), shared) in &pairs {
-        if size(child) >= size(parent) {
-            continue;
-        }
-        let child_entities = u32::try_from(entities_of(child)).unwrap_or(u32::MAX).max(1);
-        if f64::from(*shared) / f64::from(child_entities) >= 0.8 {
-            let better = parents
-                .get(child)
-                .is_none_or(|existing: &String| size(existing) < size(parent));
-            if better {
-                parents.insert(child.clone(), parent.clone());
-            }
-        }
-    }
-    parents
-}
-
-/// The single most common endpoint class, or the nearest common ancestor
-/// when the endpoints are mixed, or `entity`.
-fn generalize(counts: &Tally, parents: &BTreeMap<String, String>) -> String {
-    let total = counts.total();
-    let Some((top, n)) = counts.iter().max_by_key(|(_, n)| *n) else {
-        return String::from(ROOT_CLASS);
-    };
-    if total == 0 {
-        return String::from(ROOT_CLASS);
-    }
-    if f64::from(n) / f64::from(total) >= 0.8 {
-        return top.to_owned();
-    }
-    // Shared ancestor under the inferred hierarchy, if every endpoint has one.
-    let chain = |c: &str| {
-        let mut out = vec![c.to_owned()];
-        let mut cur = c.to_owned();
-        while let Some(p) = parents.get(&cur) {
-            if out.contains(p) {
-                break;
-            }
-            out.push(p.clone());
-            cur.clone_from(p);
-        }
-        out
-    };
-    let first = chain(top);
-    for ancestor in &first {
-        if counts.names().all(|c| chain(c).contains(ancestor)) {
-            return ancestor.clone();
-        }
-    }
-    String::from(ROOT_CLASS)
 }
 
 #[cfg(test)]
@@ -988,15 +1000,15 @@ mod tests {
             "type is required"
         );
         assert_eq!(
-            infer_property_type(&[String::from("2024-01-05"), String::from("3 May 2020")]),
+            PropertyType::infer(&[String::from("2024-01-05"), String::from("3 May 2020")]),
             PropertyType::Date
         );
         assert_eq!(
-            infer_property_type(&[String::from("$4,500"), String::from("12")]),
+            PropertyType::infer(&[String::from("$4,500"), String::from("12")]),
             PropertyType::Number
         );
         assert_eq!(
-            infer_property_type(&[String::from("true"), String::from("False")]),
+            PropertyType::infer(&[String::from("true"), String::from("False")]),
             PropertyType::Boolean
         );
     }

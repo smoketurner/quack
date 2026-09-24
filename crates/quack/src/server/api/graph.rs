@@ -25,7 +25,7 @@ use crate::server::run::{BackgroundRun, GraphReport, RunKind};
 use crate::server::state::{App, ExtractionSlot, with_db};
 use quack_core::analysis::tools::SharedDb;
 use quack_core::jobs::JobId;
-use quack_core::ontology::Ontology;
+use quack_core::ontology::{Ontology, OntologyVersion};
 use quack_core::progress::ChunkDone;
 
 #[derive(Deserialize, Default)]
@@ -215,6 +215,7 @@ impl Access {
             })
             .await?;
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
+        let version = ontology.saved_version()?;
         let options = app.config.graph.options();
         let embeddings = llm::optional_embedding_model(&app.config).await?;
         if reset {
@@ -231,7 +232,6 @@ impl Access {
             Vec::new()
         };
         if chunks.is_empty() {
-            let version = ontology.version;
             let summary = resolve::resolve(&db, embeddings.as_ref(), &options).await?;
             with_db(Arc::clone(&db), move |db| {
                 graph_store::set_built_with(db, version)
@@ -270,6 +270,7 @@ impl Access {
             chunks,
             extractor,
             ontology,
+            version,
             provisional,
             embeddings,
             slot,
@@ -322,6 +323,9 @@ struct DocumentJob {
     chunks: Vec<extract::ChunkText>,
     extractor: Box<dyn Extract<extract::Extraction>>,
     ontology: Ontology,
+    /// The ontology's saved version, which the graph records when the pass
+    /// ends.
+    version: OntologyVersion,
     provisional: bool,
     embeddings: Option<llm::Embeddings>,
     /// Freed when the pass ends.
@@ -341,6 +345,7 @@ impl DocumentJob {
                 chunks,
                 extractor,
                 ontology,
+                version,
                 provisional,
                 embeddings,
                 options,
@@ -366,7 +371,6 @@ impl DocumentJob {
                 &progress,
             )
             .await;
-            let version = ontology.version;
             let result = match outcome {
                 Ok(summary) => {
                     let resolution = resolve::resolve(&db, embeddings.as_ref(), &options).await;

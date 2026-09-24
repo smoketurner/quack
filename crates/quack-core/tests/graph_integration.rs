@@ -14,8 +14,10 @@ use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::NewNode;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    GraphOptions, GraphResult, Node, extract, resolve, store as graph_store, tables, traverse,
+    GraphOptions, GraphResult, Node, Origin, Properties, extract, resolve, store as graph_store,
+    tables, traverse,
 };
+use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
 use quack_core::storage::writer::Writer;
@@ -106,7 +108,7 @@ fn ontology() -> Ontology {
         range: range.to_owned(),
     };
     Ontology {
-        version: 0,
+        version: None,
         classes: vec![
             class("organization", ontology::ROOT_CLASS, None),
             class("vendor", "organization", Some("name")),
@@ -196,7 +198,12 @@ fn workspace() -> WorkspaceDb {
         embedding: None,
     })
     .unwrap();
-    store::save(&db, &ontology(), Some("test"), Some("fixture")).unwrap();
+    store::save(
+        &db,
+        &ontology(),
+        Revision::reviewed(Some("test"), Some("fixture")),
+    )
+    .unwrap();
     db
 }
 
@@ -237,7 +244,12 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
          FROM range({rows})"
     ))
     .unwrap();
-    store::save(&db, &ontology(), Some("test"), Some("fixture")).unwrap();
+    store::save(
+        &db,
+        &ontology(),
+        Revision::reviewed(Some("test"), Some("fixture")),
+    )
+    .unwrap();
     let current = store::current(&db).unwrap().unwrap();
     let summaries = tables::extract(&db, &current, false).unwrap();
     let first = summaries.first().unwrap();
@@ -309,7 +321,7 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     let node = |label: &str| NewNode {
         label: label.to_owned(),
         class_id: String::from("country"),
-        properties: serde_json::json!({}),
+        properties: Properties::default(),
         provisional: false,
     };
     // "Kenya" (from the table) and "Kenya Coast" embed identically under
@@ -398,7 +410,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     let node = |label: &str, class: &str| NewNode {
         label: label.to_owned(),
         class_id: class.to_owned(),
-        properties: serde_json::json!({}),
+        properties: Properties::default(),
         provisional: false,
     };
     let source = graph_store::Source::chunk("doc-2", "c3", 0.9);
@@ -411,7 +423,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         &orgenics,
         &nowhere,
         "ships_to",
-        &serde_json::json!({}),
+        &Properties::default(),
         false,
     )
     .unwrap();
@@ -427,7 +439,13 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         graph_store::provenance_of(&db, std::slice::from_ref(&orgenics))
             .unwrap()
             .iter()
-            .all(|p| p.document_id.is_none())
+            .all(|p| !matches!(
+                p.origin,
+                Origin::Chunk {
+                    document_id: Some(_),
+                    ..
+                }
+            ))
     );
 
     // The document that loaded the mapped table: the table drops, and
@@ -453,7 +471,14 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     let summaries = tables::extract(&db, &current, false).unwrap();
     assert_eq!(summaries.len(), 1);
     assert!(summaries.first().unwrap().skipped.is_some());
-    assert!(store::save(&db, &current, Some("test"), Some("still saves")).is_ok());
+    assert!(
+        store::save(
+            &db,
+            &current,
+            Revision::reviewed(Some("test"), Some("still saves"))
+        )
+        .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -541,12 +566,12 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
     assert!(
         hood.provenance
             .iter()
-            .any(|p| p.chunk_id.as_deref() == Some("c1"))
+            .any(|p| p.origin.chunk_id() == Some("c1"))
     );
     assert!(
-        hood.provenance
-            .iter()
-            .any(|p| p.table_name.as_deref() == Some("shipments"))
+        hood.provenance.iter().any(
+            |p| matches!(&p.origin, Origin::Row { table_name, .. } if table_name == "shipments")
+        )
     );
     let only =
         traverse::neighborhood(&db, &roots, Hops::new(2), Some("delivered_to"), &options).unwrap();
@@ -588,7 +613,7 @@ fn paths_merges_and_listing(
     // By class with subclass expansion: organizations include vendors.
     let orgs = traverse::by_class(db, Some(current), "organization", 50, options).unwrap();
     assert_eq!(orgs.nodes.len(), 3, "{orgs:?}");
-    let tree = traverse::render_tree(hood);
+    let tree = hood.to_string();
     assert!(
         tree.contains("Kenya (country)") && tree.contains("<- delivered_to"),
         "{tree}"
@@ -627,7 +652,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     let db = workspace();
     let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, true).unwrap();
-    graph_store::set_built_with(&db, current.version).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(status.provisional() && !status.stale);
 
@@ -651,13 +676,18 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     if let Some(mapping) = edited.mappings.first_mut() {
         mapping.relations.retain(|r| r.target_class != "country");
     }
-    let saved = store::save(&db, &edited, Some("test"), Some("drop countries")).unwrap();
+    let saved = store::save(
+        &db,
+        &edited,
+        Revision::reviewed(Some("test"), Some("drop countries")),
+    )
+    .unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(status.stale);
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 2, "Kenya and Uganda");
     assert_eq!(outcome.dropped_edges, 0, "their edges went with them");
-    assert_eq!(outcome.version, saved.version);
+    assert_eq!(Some(outcome.version), saved.version);
     let status = graph_store::status(&db).unwrap();
     assert_eq!(status.nodes, 5);
     assert_eq!(status.edges, 3);
@@ -666,7 +696,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     graph_store::clear(&db).unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(!status.enabled());
-    assert_eq!(status.built_with_version, 0);
+    assert_eq!(status.built_with_version, None);
 }
 
 #[test]
@@ -676,12 +706,16 @@ fn auto_accepted_ontologies_are_provisional_until_reviewed() {
     store::save(
         &db,
         &Ontology::builtin_default(),
-        None,
-        Some("auto-accepted 3 candidate(s)"),
+        Revision::auto(None, Some("auto-accepted 3 candidate(s)")),
     )
     .unwrap();
     assert!(store::current_is_auto_accepted(&db).unwrap());
-    store::save(&db, &Ontology::builtin_default(), None, Some("reviewed")).unwrap();
+    store::save(
+        &db,
+        &Ontology::builtin_default(),
+        Revision::reviewed(None, Some("reviewed")),
+    )
+    .unwrap();
     assert!(!store::current_is_auto_accepted(&db).unwrap());
 }
 
@@ -697,7 +731,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
             &NewNode {
                 label: format!("Country {i:02}"),
                 class_id: String::from("country"),
-                properties: serde_json::json!({}),
+                properties: Properties::default(),
                 provisional: false,
             },
         )
@@ -713,7 +747,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert_eq!(capped.nodes.len(), 5);
     assert_eq!(capped.total_nodes, Some(12));
     assert!(capped.truncated);
-    let tree = traverse::render_tree(&capped);
+    let tree = capped.to_string();
     assert!(tree.contains("5 of 12 matching nodes"), "{tree}");
     assert!(tree.contains("cut off at the node limit"), "{tree}");
 
@@ -721,7 +755,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
         traverse::by_class(&db, Some(&current), "country", 50, &GraphOptions::default()).unwrap();
     assert_eq!(whole.nodes.len(), 12);
     assert!(!whole.truncated);
-    assert!(!traverse::render_tree(&whole).contains("cut off"), "{tree}");
+    assert!(!whole.to_string().contains("cut off"), "{tree}");
 
     // The census counts the class and its subclasses without listing them.
     let (total, samples) = graph_store::class_census(&db, &[String::from("country")], 3).unwrap();
@@ -737,7 +771,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
 async fn provenance_maps_between_entities_and_chunks() {
     let db = workspace();
     let writer = writer_of(&db);
-    let current = ontology();
+    let current = store::current(&db).unwrap().unwrap();
     tables::extract(&db, &current, false).unwrap();
     let chunks = extract::chunks(&db, None).unwrap();
     extract::run(&writer, chunks, &Canned, &current, false, 2, &|_| {})
@@ -799,7 +833,7 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
             &NewNode {
                 label: String::from(label),
                 class_id: String::from(class_id),
-                properties: serde_json::json!({}),
+                properties: Properties::default(),
                 provisional: false,
             },
         )

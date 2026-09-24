@@ -65,7 +65,7 @@
 {% if let Some(o) = ontology %}
 <div class="mt-4 grid gap-6 md:grid-cols-2">
   <section>
-    <h2 class="text-sm font-semibold uppercase text-slate-500">Classes (version {{ o.version }})</h2>
+    <h2 class="text-sm font-semibold uppercase text-slate-500">Classes{% if let Some(v) = o.version %} (version {{ v }}){% endif %}</h2>
     <ul class="mt-2 space-y-1 text-sm">
       {% for c in classes %}<li style="padding-left: {{ c.depth * 16 }}px"><span class="font-mono">{{ c.id }}</span>{% if let Some(k) = c.key %} <span class="text-slate-500">key {{ k }}</span>{% endif %}{% if !c.properties.is_empty() %} <span class="text-slate-500">{ {{ c.properties }} }</span>{% endif %}</li>{% endfor %}
     </ul>
@@ -95,12 +95,12 @@
       </div>
     </form>
     {% if let Some(d) = diff %}
-    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Changes from version {{ d.from }}</h2>
+    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Changes from {% if let Some(v) = d.from %}version {{ v }}{% else %}the unsaved draft{% endif %}</h2>
     <pre class="mt-2 rounded border border-slate-200 bg-white p-3 font-mono text-xs">{{ d }}</pre>
     {% endif %}
     <h2 class="mt-6 text-sm font-semibold uppercase text-slate-500">Versions</h2>
     <table class="mt-2 w-full text-sm"><tbody>
-      {% for v in versions %}<tr class="border-b border-slate-200"><td class="py-1 font-mono">v{{ v.version }}</td><td class="text-slate-500">{{ v.created_at }}</td><td>{{ v.author.as_deref().unwrap_or("-") }}</td><td>{{ v.note.as_deref().unwrap_or("") }}</td><td class="text-right">{% if ws.can_write && v.version != o.version %}<form method="post" action="/w/{{ ws.id }}/ontology/{{ v.version }}/restore"><button class="text-blue-700 hover:underline">Restore</button></form>{% endif %}</td></tr>{% endfor %}
+      {% for v in versions %}<tr class="border-b border-slate-200"><td class="py-1 font-mono">v{{ v.version }}</td><td class="text-slate-500">{{ v.created_at }}</td><td>{{ v.author.as_deref().unwrap_or("-") }}</td><td>{{ v.note.as_deref().unwrap_or("") }}</td><td class="text-right">{% if ws.can_write && Some(v.version) != o.version.as_ref() %}<form method="post" action="/w/{{ ws.id }}/ontology/{{ v.version }}/restore"><button class="text-blue-700 hover:underline">Restore</button></form>{% endif %}</td></tr>{% endfor %}
     </tbody></table>
   </section>
 </div>

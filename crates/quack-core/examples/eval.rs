@@ -31,10 +31,12 @@ use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
 use quack_core::extraction::{Extract, ExtractFuture};
 use quack_core::graph::extract::{ChunkText, Extraction};
+use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, store};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
+use quack_core::ontology::store::{self as ontology_store, Revision};
 use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -741,7 +743,13 @@ async fn evaluate_graph(
     fixture_path: &Path,
 ) -> Result<GraphReport> {
     let fixture: GraphFixture = serde_json::from_str(&std::fs::read_to_string(fixture_path)?)?;
-    let ontology = Ontology::from_json(&fixture.ontology.to_string())?;
+    // Saved first, as a workspace's is: the graph records the version it
+    // was built with.
+    let ontology = ontology_store::save(
+        db,
+        &Ontology::from_json(&fixture.ontology.to_string())?,
+        Revision::reviewed(None, Some("graph fixture")),
+    )?;
 
     let mut answers = BTreeMap::new();
     let mut chunk_texts = Vec::with_capacity(fixture.chunks.len());
@@ -781,7 +789,7 @@ async fn evaluate_graph(
 
     let node_ids = store::all_node_ids(db)?;
     let nodes = store::nodes(db, &node_ids)?;
-    let edges = store::edges_among(db, &node_ids)?;
+    let edges = store::edges(db, &node_ids, EdgeScope::Among)?;
     let label_of: BTreeMap<String, String> = nodes
         .iter()
         .map(|n| (n.id.clone(), n.label.clone()))

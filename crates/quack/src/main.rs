@@ -25,6 +25,7 @@ use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::oauth::{self, LoginOptions, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
+use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, candidates, store as ontology_store};
 use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
@@ -1708,13 +1709,12 @@ fn restore_bundle_ontology(
     let restored = ontology_store::save(
         ws_db,
         &snapshot,
-        None,
-        Some(&format!("restored from {dir}")),
+        Revision::reviewed(None, Some(&format!("restored from {dir}"))),
     )?;
     writeln!(
         out,
         "Restored the bundle's ontology (version {} in this workspace).",
-        restored.version
+        restored.saved_version()?
     )?;
     Ok(Some(restored))
 }

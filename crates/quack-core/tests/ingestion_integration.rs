@@ -11,6 +11,7 @@ use quack_core::config::{
 use quack_core::embedding::refresh::{Plan, Retype};
 use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
 use quack_core::error::Error;
+use quack_core::graph::Properties;
 use quack_core::graph::store as graph_store;
 use quack_core::import::{ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
@@ -1067,7 +1068,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("9")
+        Some("10")
     );
     assert_eq!(
         db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
@@ -1210,7 +1211,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             &graph_store::NewNode {
                 label: String::from("Kenya"),
                 class_id: String::from("country"),
-                properties: serde_json::json!({}),
+                properties: Properties::default(),
                 provisional: false,
             },
         )
@@ -1583,7 +1584,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("9")
+        Some("10")
     );
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())

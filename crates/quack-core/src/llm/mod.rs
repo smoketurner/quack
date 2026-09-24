@@ -26,7 +26,7 @@ use crate::config::{
 use crate::embedding::{Embedder, Input, Profile};
 use crate::error::{Error, Record, Result};
 use crate::extraction::{Extract, ExtractFuture, parse_answer};
-use crate::graph::extract::{self as graph_extract, Extraction};
+use crate::graph::extract::Extraction;
 use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::{Priority, with_priority};
@@ -398,7 +398,7 @@ pub async fn graph_extractor(
     let chat = config.chat_model_ref()?;
     Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
         chat.model,
-        &graph_extract::prompt_for(ontology),
+        &ontology.extraction_prompt(),
         extraction_timeout(config),
         "graph extraction",
     )))
