@@ -10,6 +10,7 @@ mod graph_cli;
 mod mcp;
 mod ontology_cli;
 mod print;
+mod progress_line;
 mod server;
 mod stdio;
 mod terminal;
@@ -28,7 +29,6 @@ use quack_core::llm::Embeddings;
 use quack_core::llm::oauth::{LoginOptions, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{Ontology, candidates, store as ontology_store};
 use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
 use quack_core::storage::context;
@@ -44,19 +44,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::confirm::Confirm;
-use crate::stdio::StdioPath;
+use crate::stdio::{NamedInput, StdioPath};
 use crate::terminal::SessionSetup;
 
-/// Exit status for a usage error (bad flags, no terminal for the session).
-const EXIT_USAGE: u8 = 2;
-/// Exit status when the agent needed a write that was not permitted.
-const EXIT_WRITE_REFUSED: u8 = 3;
-/// Exit status when an OAuth provider needs `quack auth login` first.
-const EXIT_AUTH_REQUIRED: u8 = 4;
-/// Exit status when `quack config` finds a configuration every other
-/// command would refuse (the report is still printed), or `-p` has no chat
-/// model to answer with.
-const EXIT_BAD_CONFIG: u8 = 2;
+/// How a command ended when not plainly: the exit status scripts check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// A usage or configuration error: bad flags, no terminal for the
+    /// session, a configuration every other command refuses (`quack
+    /// config` still prints its report), or `-p` with no chat model.
+    Usage,
+    /// The agent needed a write that was not permitted.
+    WriteRefused,
+    /// An OAuth provider needs `quack auth login` first.
+    AuthRequired,
+}
+
+impl From<Exit> for ExitCode {
+    fn from(exit: Exit) -> Self {
+        Self::from(match exit {
+            Exit::Usage => 2,
+            Exit::WriteRefused => 3,
+            Exit::AuthRequired => 4,
+        })
+    }
+}
 
 /// `--version` names the crypto module as well, so an operator can tell a FIPS
 /// binary from a non-FIPS one without turning on `RUST_LOG=info`. `-V` stays
@@ -136,189 +148,203 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// List sessions in the workspace, most recent first
-    Sessions {
-        /// Emit one JSON object per session
-        #[arg(long)]
-        json: bool,
-
-        /// Maximum number of sessions to show
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-    },
+    Sessions(SessionsArgs),
 
     /// Export a session as a runnable .sql file or a Markdown transcript
-    Export {
-        /// Session id (prefixes accepted)
-        session_id: String,
-
-        #[command(flatten)]
-        flags: ExportFlags,
-    },
+    Export(ExportArgs),
 
     /// Ingest a file into a workspace
-    Ingest {
-        /// File path to ingest (use - for stdin)
-        file: StdioPath,
-
-        /// Override the filename (required when reading from stdin)
-        #[arg(long)]
-        filename: Option<String>,
-
-        /// Title to record; otherwise the first heading, when there is one
-        #[arg(long)]
-        title: Option<String>,
-
-        /// Skip embedding generation
-        #[arg(long)]
-        no_embed: bool,
-
-        /// Pin the document: its full text goes into every prompt
-        #[arg(long)]
-        pin: bool,
-    },
+    Ingest(IngestArgs),
 
     /// Show, edit, or move the workspace context (the owner's instructions
     /// and definitions for the agent)
-    Context {
-        #[command(subcommand)]
-        action: Option<ContextAction>,
-    },
+    Context(ContextArgs),
 
     /// Log in to an OAuth provider, show token state, or forget a token
-    Auth {
-        #[command(subcommand)]
-        action: AuthAction,
-    },
+    #[command(subcommand)]
+    Auth(AuthAction),
 
-    /// Server users: create one or list them
-    User {
-        #[command(subcommand)]
-        action: admin::UserAction,
-    },
-
-    /// API tokens scoped to a workspace: create, list, or revoke
-    Token {
-        #[command(subcommand)]
-        action: admin::TokenAction,
-    },
-
-    /// Workspace membership: add, remove, or list members
-    Member {
-        #[command(subcommand)]
-        action: admin::MemberAction,
-    },
-
-    /// Read the access audit log with filters
-    Audit(admin::AuditArgs),
+    #[command(flatten)]
+    Admin(admin::AdminCommand),
 
     /// Serve the REST API and web UI
-    Serve {
-        /// Listen address (default from `[server].bind`, or `QUACK_BIND`)
-        #[arg(long)]
-        bind: Option<String>,
-        /// No authentication, one implicit user; loopback only
-        #[arg(long)]
-        local: bool,
-    },
+    Serve(ServeArgs),
 
     /// Serve the workspace as an MCP server over stdio (for Claude Code
     /// and editors); logs go to stderr
-    Mcp {
-        /// Let the `sql` and `query` tools run statements that modify data
-        #[arg(long)]
-        allow_write: bool,
-    },
+    Mcp(McpArgs),
 
     /// Show, install, import, export, diff, or restore the ontology
-    Ontology {
-        #[command(subcommand)]
-        action: ontology_cli::OntologyAction,
-    },
+    #[command(subcommand)]
+    Ontology(ontology_cli::OntologyAction),
 
     /// Explore, build, revalidate, and review the knowledge graph
-    Graph {
-        #[command(subcommand)]
-        action: graph_cli::GraphAction,
-    },
+    #[command(subcommand)]
+    Graph(graph_cli::GraphAction),
 
     /// Pull rows from Postgres, SQLite, or a data file over HTTP(S) into
     /// a workspace table (the Rust-side replacement for ATTACH)
-    Import {
-        /// A Postgres URL (user, password, host, database), a SQLite path
-        /// as `sqlite:PATH`, or an http(s) URL of a data file
-        url: String,
-        /// The workspace table to create (replaced when it exists)
-        #[arg(long)]
-        table: String,
-        /// A query to run on the source
-        #[arg(long, conflicts_with = "from")]
-        query: Option<String>,
-        /// Pull a whole source table instead of a query
-        #[arg(long, value_name = "SOURCE_TABLE")]
-        from: Option<String>,
-        /// Rows to pull at most (capped by `[import].max_rows`)
-        #[arg(long)]
-        limit: Option<u64>,
-    },
+    Import(ImportArgs),
 
     /// Move the workspace as an Open Knowledge Format bundle
-    Okf {
-        #[command(subcommand)]
-        action: OkfAction,
-    },
+    #[command(subcommand)]
+    Okf(OkfAction),
 
     /// Show what this binary makes of config.toml: every setting it
     /// recognizes, the value in force and where it came from, and the
     /// keys in the file it does not recognize
-    Config {
-        /// Only the settings the file or the environment has a say in
-        #[arg(long)]
-        changed: bool,
-
-        /// Emit the whole report as one JSON document
-        #[arg(long)]
-        json: bool,
-    },
+    Config(ConfigArgs),
 
     /// Check the setup and say how to fix what is wrong: the config file,
     /// the data directory, the workspace, each model's provider (reached
     /// over the network), and the server's bind address
-    Doctor {
-        /// Skip the network probes
-        #[arg(long)]
-        offline: bool,
-
-        /// Emit the checks as one JSON document
-        #[arg(long)]
-        json: bool,
-    },
+    Doctor(DoctorArgs),
 
     /// List ingested documents, or pin and unpin one
-    Docs {
-        /// Pin a document by id (prefixes accepted)
-        #[arg(long, value_name = "DOCUMENT_ID", conflicts_with = "unpin")]
-        pin: Option<String>,
-
-        /// Unpin a document by id (prefixes accepted)
-        #[arg(long, value_name = "DOCUMENT_ID")]
-        unpin: Option<String>,
-
-        /// Delete a document by id (prefixes accepted), with its chunks and
-        /// the table it was loaded as
-        #[arg(long, value_name = "DOCUMENT_ID")]
-        delete: Option<String>,
-
-        /// Emit one JSON object per document
-        #[arg(long)]
-        json: bool,
-    },
+    Docs(DocsArgs),
 
     /// The workspace's vectors: refresh the ones made with another
     /// embedding model, width, or input prefixes
-    Embeddings {
-        #[command(subcommand)]
-        action: embeddings_cli::EmbeddingsAction,
-    },
+    #[command(subcommand)]
+    Embeddings(embeddings_cli::EmbeddingsAction),
+}
+
+#[derive(clap::Args)]
+struct SessionsArgs {
+    /// Emit one JSON object per session
+    #[arg(long)]
+    json: bool,
+
+    /// Maximum number of sessions to show
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
+}
+
+#[derive(clap::Args)]
+struct ExportArgs {
+    /// Session id (prefixes accepted)
+    session_id: String,
+
+    #[command(flatten)]
+    flags: ExportFlags,
+}
+
+#[derive(clap::Args)]
+struct IngestArgs {
+    /// File path to ingest (use - for stdin)
+    file: StdioPath,
+
+    /// Override the filename (required when reading from stdin)
+    #[arg(long)]
+    filename: Option<String>,
+
+    /// Title to record; otherwise the first heading, when there is one
+    #[arg(long)]
+    title: Option<String>,
+
+    /// Skip embedding generation
+    #[arg(long)]
+    no_embed: bool,
+
+    /// Pin the document: its full text goes into every prompt
+    #[arg(long)]
+    pin: bool,
+}
+
+#[derive(clap::Args)]
+struct ContextArgs {
+    #[command(subcommand)]
+    action: Option<ContextAction>,
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Listen address (default from `[server].bind`, or `QUACK_BIND`)
+    #[arg(long)]
+    bind: Option<String>,
+    /// No authentication, one implicit user; loopback only
+    #[arg(long)]
+    local: bool,
+}
+
+#[derive(clap::Args)]
+struct McpArgs {
+    /// Let the `sql` and `query` tools run statements that modify data
+    #[arg(long)]
+    allow_write: bool,
+}
+
+#[derive(clap::Args)]
+struct ImportArgs {
+    /// A Postgres URL (user, password, host, database), a SQLite path
+    /// as `sqlite:PATH`, or an http(s) URL of a data file
+    url: String,
+    /// The workspace table to create (replaced when it exists)
+    #[arg(long)]
+    table: String,
+    /// A query to run on the source
+    #[arg(long, conflicts_with = "from")]
+    query: Option<String>,
+    /// Pull a whole source table instead of a query
+    #[arg(long, value_name = "SOURCE_TABLE")]
+    from: Option<String>,
+    /// Rows to pull at most (capped by `[import].max_rows`)
+    #[arg(long)]
+    limit: Option<u64>,
+}
+
+impl From<ImportArgs> for ImportRequest {
+    fn from(args: ImportArgs) -> Self {
+        Self {
+            url: args.url.into(),
+            table: args.table,
+            query: args.query,
+            source_table: args.from,
+            limit: args.limit,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct ConfigArgs {
+    /// Only the settings the file or the environment has a say in
+    #[arg(long)]
+    changed: bool,
+
+    /// Emit the whole report as one JSON document
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct DoctorArgs {
+    /// Skip the network probes
+    #[arg(long)]
+    offline: bool,
+
+    /// Emit the checks as one JSON document
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct DocsArgs {
+    /// Pin a document by id (prefixes accepted)
+    #[arg(long, value_name = "DOCUMENT_ID", conflicts_with = "unpin")]
+    pin: Option<String>,
+
+    /// Unpin a document by id (prefixes accepted)
+    #[arg(long, value_name = "DOCUMENT_ID")]
+    unpin: Option<String>,
+
+    /// Delete a document by id (prefixes accepted), with its chunks and
+    /// the table it was loaded as
+    #[arg(long, value_name = "DOCUMENT_ID")]
+    delete: Option<String>,
+
+    /// Emit one JSON object per document
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -531,86 +557,48 @@ async fn run() -> Result<ExitCode> {
 /// dispatched by `main` itself.
 async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
     match command {
-        Commands::Sessions { json, limit } => run_sessions(cli, json, limit).await,
-        Commands::Export { session_id, flags } => {
-            run_export(cli, &session_id, flags.format()).await
-        }
-        Commands::Ingest {
-            file,
-            filename,
-            title,
-            no_embed,
-            pin,
-        } => {
+        Commands::Sessions(args) => run_sessions(cli, &args).await,
+        Commands::Export(args) => run_export(cli, &args.session_id, args.flags.format()).await,
+        Commands::Ingest(args) => {
             init_logging();
-            run_ingest(
-                &file,
-                cli.workspace.as_deref(),
-                filename.as_deref(),
-                title.as_deref(),
-                no_embed,
-                pin,
-            )
-            .await?;
+            run_ingest(cli, args).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Ontology { action } => run_ontology(cli, action).await,
-        Commands::Graph { action } => run_graph(cli, action).await,
-        Commands::Embeddings { action } => run_embeddings(cli, action).await,
-        Commands::Okf {
-            action: OkfAction::Export { dir },
-        } => run_okf_export(cli, &dir).await,
-        Commands::Import {
-            url,
-            table,
-            query,
-            from,
-            limit,
-        } => run_import(cli, url, table, query, from, limit).await,
-        Commands::Context { action } => {
+        Commands::Ontology(action) => run_on_writer(cli, action).await,
+        Commands::Graph(action) => run_on_writer(cli, action).await,
+        Commands::Embeddings(action) => run_on_writer(cli, action).await,
+        Commands::Okf(OkfAction::Export { dir }) => run_okf_export(cli, &dir).await,
+        Commands::Import(args) => run_import(cli, args).await,
+        Commands::Context(args) => {
             let ws_db = open_workspace(cli).await?;
-            run_context(&ws_db, action.unwrap_or(ContextAction::Show))?;
+            run_context(&ws_db, args.action.unwrap_or(ContextAction::Show))?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Auth { action } => {
+        Commands::Auth(action) => {
             init_logging();
             let config = Config::load().context("failed to load configuration")?;
             run_auth(&config, action).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Mcp { allow_write } => run_mcp(cli, allow_write).await,
-        Commands::Serve { bind, local } => {
+        Commands::Mcp(args) => run_mcp(cli, args.allow_write).await,
+        Commands::Serve(args) => {
             // The server logs each request at info; other commands stay quiet.
             init_logging_at("info,sqlx=warn,hyper=warn,h2=warn");
             let config = Config::load().context("failed to load configuration")?;
-            server::serve(config, bind, local).await?;
+            server::serve(config, args.bind, args.local).await?;
             Ok(ExitCode::SUCCESS)
         }
-        command @ (Commands::User { .. }
-        | Commands::Token { .. }
-        | Commands::Member { .. }
-        | Commands::Audit(_)) => {
+        Commands::Admin(command) => {
             init_logging();
             let config = Config::load().context("failed to load configuration")?;
-            run_admin(&config, cli.workspace.as_deref(), command).await?;
+            command.run(&config, cli.workspace.as_deref()).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Config { changed, json } => run_config(changed, json),
-        Commands::Doctor { offline, json } => run_doctor(cli, offline, json).await,
-        Commands::Docs {
-            pin,
-            unpin,
-            delete,
-            json,
-        } => {
+        Commands::Config(args) => run_config(&args),
+        Commands::Doctor(args) => run_doctor(cli, &args).await,
+        Commands::Docs(args) => {
             let ws_db = open_workspace(cli).await?;
-            run_docs(
-                &ws_db,
-                pin.as_deref(),
-                unpin.as_deref(),
-                delete.as_deref(),
-                json,
-            )?;
+            run_docs(&ws_db, &args)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -619,29 +607,29 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
 /// `quack config`: what this binary makes of `config.toml`. It reads the
 /// file outside `Config::load`, so it reports a file every other command
 /// refuses rather than failing the same way, and says so in its status.
-fn run_config(changed: bool, json: bool) -> Result<ExitCode> {
+fn run_config(args: &ConfigArgs) -> Result<ExitCode> {
     init_logging();
     let inspection = config::inspect::Inspection::load();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    let usable = config_cli::run(&mut out, &inspection, json, changed)?;
+    let usable = config_cli::run(&mut out, &inspection, args.json, args.changed)?;
     out.flush()?;
     Ok(if usable {
         ExitCode::SUCCESS
     } else {
-        ExitCode::from(EXIT_BAD_CONFIG)
+        ExitCode::from(Exit::Usage)
     })
 }
 
 /// `quack doctor`: like `quack config`, it inspects the file outside
 /// `Config::load`, so a file every other command refuses is a finding here
 /// rather than the error. Exits 1 when any check fails.
-async fn run_doctor(cli: &Cli, offline: bool, json: bool) -> Result<ExitCode> {
+async fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
     init_logging();
     let inspection = config::inspect::Inspection::load();
     let options = Options {
         workspace: cli.workspace.clone(),
-        probing: if offline {
+        probing: if args.offline {
             Probing::Offline
         } else {
             Probing::default()
@@ -650,7 +638,7 @@ async fn run_doctor(cli: &Cli, offline: bool, json: bool) -> Result<ExitCode> {
     let report = doctor::run(&inspection, &options).await;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    doctor_cli::write(&mut out, &report, json)?;
+    doctor_cli::write(&mut out, &report, args.json)?;
     out.flush()?;
     Ok(if report.has_failures() {
         ExitCode::FAILURE
@@ -667,34 +655,35 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         OutputFormat::Text => print::PromptFormat::Text,
         OutputFormat::Table | OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::Markdown => {
             tracing::error!("-p accepts only --format text or json");
-            return Ok(ExitCode::from(EXIT_USAGE));
+            return Ok(ExitCode::from(Exit::Usage));
         }
     };
-    let (config, workspace, workspace_name) = load_workspace(cli.workspace.as_deref()).await?;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let config = &opened.config;
     // Checked before the workspace opens, so a missing model is one line
     // on stderr rather than a failed turn, and leaves no session behind.
     if let Err(e) = config.chat_model_ref() {
         tracing::error!("{e}");
-        return Ok(ExitCode::from(EXIT_BAD_CONFIG));
+        return Ok(ExitCode::from(Exit::Usage));
     }
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    load_piped_stdin(&config, &ws_db, &workspace.id, cli.stdin).await?;
+    let ws_db = opened.open_db()?;
+    load_piped_stdin(config, &ws_db, &opened.workspace.id, cli.stdin).await?;
     if let Some(note) = ws_db.embedding_status()?.note() {
-        tracing::warn!("{note} Run `quack embeddings refresh -w {workspace_name}` to update them.");
+        tracing::warn!(
+            "{note} Run `quack embeddings refresh -w {}` to update them.",
+            opened.name
+        );
     }
     let session_id = resolve_session(
-        &config,
+        config,
         &ws_db,
         cli.continue_latest,
         cli.resume.as_deref(),
         cli.mode.map(ChatMode::from),
     )?;
-    let db: SharedDb =
-        Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
-    let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+    let (db, reader_db) = opened.shared(ws_db).await?;
     let outcome = print::run_prompt(
-        &config,
+        config,
         Arc::clone(&db),
         reader_db,
         &session_id,
@@ -710,7 +699,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     }
     let refused = outcome?;
     Ok(if refused {
-        ExitCode::from(EXIT_WRITE_REFUSED)
+        ExitCode::from(Exit::WriteRefused)
     } else {
         ExitCode::SUCCESS
     })
@@ -792,54 +781,15 @@ async fn stdin_has_data() -> Result<bool> {
 /// Logging, then the workspace database for the workspace-local subcommands.
 async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
     init_logging();
-    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
-    WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")
-}
-
-/// The workspace's connection on a writer thread of its own: the commands
-/// that run core's multi-step work (ingestion, import, graph and ontology
-/// commands) send it their steps exactly as the server and the terminal do.
-async fn open_writer(cli: &Cli) -> Result<Writer> {
-    init_logging();
-    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
-    spawn_writer(&config, &workspace.id)
-}
-
-/// Open workspace `id` and move its connection onto a writer thread.
-fn spawn_writer(config: &Config, id: &str) -> Result<Writer> {
-    let ws_db = WorkspaceDb::open(config, id).context("failed to open workspace database")?;
-    Writer::spawn(ws_db).context("failed to start the workspace writer")
-}
-
-/// `quack user|token|member|audit`: server administration from the shell.
-async fn run_admin(config: &Config, workspace: Option<&str>, command: Commands) -> Result<()> {
-    match command {
-        Commands::User { action } => admin::run_user(config, action).await,
-        Commands::Token { action } => admin::run_token(config, workspace, action).await,
-        Commands::Member { action } => admin::run_member(config, workspace, action).await,
-        Commands::Audit(args) => admin::run_audit(config, args).await,
-        Commands::Sessions { .. }
-        | Commands::Export { .. }
-        | Commands::Ingest { .. }
-        | Commands::Context { .. }
-        | Commands::Ontology { .. }
-        | Commands::Graph { .. }
-        | Commands::Okf { .. }
-        | Commands::Import { .. }
-        | Commands::Auth { .. }
-        | Commands::Serve { .. }
-        | Commands::Mcp { .. }
-        | Commands::Config { .. }
-        | Commands::Doctor { .. }
-        | Commands::Embeddings { .. }
-        | Commands::Docs { .. } => Ok(()),
-    }
+    OpenedWorkspace::resolve(cli.workspace.as_deref())
+        .await?
+        .open_db()
 }
 
 /// `quack sessions`: the session list.
-async fn run_sessions(cli: &Cli, json: bool, limit: u32) -> Result<ExitCode> {
+async fn run_sessions(cli: &Cli, args: &SessionsArgs) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
-    list_sessions(&ws_db, json, limit)?;
+    list_sessions(&ws_db, args.json, args.limit)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -850,89 +800,88 @@ async fn run_export(cli: &Cli, session_id: &str, format: ExportFormat) -> Result
     Ok(ExitCode::SUCCESS)
 }
 
-/// `quack graph ...`: the knowledge graph from the shell.
-async fn run_graph(cli: &Cli, action: graph_cli::GraphAction) -> Result<ExitCode> {
-    let ws_db = open_writer(cli).await?;
-    let config = Config::load().context("failed to load configuration")?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    graph_cli::run(
-        &config,
-        &ws_db,
-        action,
-        &mut out,
-        RunControl {
-            progress: &ontology_cli::chunk_progress,
-            cancel: None,
-        },
-    )
-    .await?;
-    Ok(ExitCode::SUCCESS)
+/// A subcommand whose steps run on the workspace writer and whose report
+/// goes to stdout: the graph, ontology, and embeddings commands.
+trait WriterCommand {
+    async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()>;
 }
 
-async fn run_embeddings(cli: &Cli, action: embeddings_cli::EmbeddingsAction) -> Result<ExitCode> {
-    let ws_db = open_writer(cli).await?;
-    let config = Config::load().context("failed to load configuration")?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    embeddings_cli::run(
-        &config,
-        &ws_db,
-        action,
-        &mut out,
-        RunControl {
-            progress: &embeddings_cli::print_progress,
-            cancel: None,
-        },
-    )
-    .await?;
-    Ok(ExitCode::SUCCESS)
+impl WriterCommand for graph_cli::GraphAction {
+    async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        graph_cli::run(config, db, self, out, control).await
+    }
 }
 
-async fn run_ontology(cli: &Cli, action: ontology_cli::OntologyAction) -> Result<ExitCode> {
-    let ws_db = open_writer(cli).await?;
-    let config = Config::load().context("failed to load configuration")?;
+impl WriterCommand for ontology_cli::OntologyAction {
+    async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        ontology_cli::run(config, db, self, out, control).await
+    }
+}
+
+impl WriterCommand for embeddings_cli::EmbeddingsAction {
+    async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        embeddings_cli::run(config, db, self, out, control).await
+    }
+}
+
+/// Run a writer command in the command line's workspace, its progress on
+/// stderr.
+async fn run_on_writer(cli: &Cli, command: impl WriterCommand) -> Result<ExitCode> {
+    init_logging();
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let db = opened.writer()?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    ontology_cli::run(
-        &config,
-        &ws_db,
-        action,
-        &mut out,
-        RunControl {
-            progress: &ontology_cli::chunk_progress,
-            cancel: None,
-        },
-    )
-    .await?;
+    command
+        .run(
+            &opened.config,
+            &db,
+            &mut out,
+            RunControl {
+                progress: &progress_line::to_stderr,
+                cancel: None,
+            },
+        )
+        .await?;
     Ok(ExitCode::SUCCESS)
 }
 
 /// `quack import URL --table NAME`: rows from an external source as a
 /// workspace table.
-async fn run_import(
-    cli: &Cli,
-    url: String,
-    table: String,
-    query: Option<String>,
-    from: Option<String>,
-    limit: Option<u64>,
-) -> Result<ExitCode> {
+async fn run_import(cli: &Cli, args: ImportArgs) -> Result<ExitCode> {
     init_logging();
-    let request = &ImportRequest {
-        url: url.into(),
-        table,
-        query,
-        source_table: from,
-        limit,
-    };
-    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
-    let ws_db = spawn_writer(&config, &workspace.id)?;
-    let embedding_model = Embeddings::from_config(&config).await?;
+    let request = &ImportRequest::from(args);
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let (config, ws_db) = (&opened.config, opened.writer()?);
+    let embedding_model = Embeddings::from_config(config).await?;
     let summary = import::Importing {
-        config: &config,
+        config,
         db: &ws_db,
-        workspace_id: &workspace.id,
+        workspace_id: &opened.workspace.id,
         request,
         policy: ImportPolicy::owner(),
         embedder: embedding_model.as_ref(),
@@ -959,10 +908,8 @@ async fn run_import(
 /// bundle, a directory of Markdown files or a tar on stdout.
 async fn run_okf_export(cli: &Cli, dir: &StdioPath) -> Result<ExitCode> {
     init_logging();
-    let (config, workspace, name) = load_workspace(cli.workspace.as_deref()).await?;
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    let bundle = okf::export(&ws_db, &name)?;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let bundle = okf::export(&opened.open_db()?, &opened.name)?;
     match dir {
         StdioPath::Stdio => {
             let mut out = std::io::stdout().lock();
@@ -982,12 +929,11 @@ async fn run_okf_export(cli: &Cli, dir: &StdioPath) -> Result<ExitCode> {
 /// `quack mcp`: the workspace as an MCP server on stdin and stdout.
 async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     init_logging();
-    let (config, workspace, _) = load_workspace(cli.workspace.as_deref()).await?;
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    let db: SharedDb =
-        Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
-    let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let (db, reader_db) = opened.shared(opened.open_db()?).await?;
+    let OpenedWorkspace {
+        config, workspace, ..
+    } = opened;
     let policy = if allow_write {
         WritePolicy::Allow
     } else {
@@ -1009,7 +955,7 @@ fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
                 Some(CoreError::AuthRequired { .. })
             )
         })
-        .then_some(ExitCode::from(EXIT_AUTH_REQUIRED))
+        .then_some(ExitCode::from(Exit::AuthRequired))
 }
 
 /// `quack auth login|status|logout`.
@@ -1020,7 +966,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             provider,
             device_code,
         } => {
-            let manager = oauth_manager(config, &provider)?;
+            let manager = TokenManager::for_provider(config, &provider)?;
             let options = LoginOptions {
                 device_code: device_code || !browser_can_open(),
             };
@@ -1056,7 +1002,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
                 writeln!(out, "No providers use auth = \"oauth\".")?;
             }
             for name in names {
-                let status = oauth_manager(config, name)?.status().await?;
+                let status = TokenManager::for_provider(config, name)?.status().await?;
                 let state = match status.expires_at {
                     Some(at) if status.logged_in => format!(
                         "logged in, token expires {at}{}",
@@ -1073,26 +1019,15 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             out.flush()?;
         }
         AuthAction::Logout { provider } => {
-            oauth_manager(config, &provider)?.logout().await?;
+            TokenManager::for_provider(config, &provider)?
+                .logout()
+                .await?;
             let mut out = stdout.lock();
             writeln!(out, "Logged out of '{provider}'.")?;
             out.flush()?;
         }
     }
     Ok(())
-}
-
-fn oauth_manager(config: &Config, name: &str) -> Result<Arc<TokenManager>> {
-    let (name, provider) = config.providers.get_key_value(name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "provider '{name}' is not configured; add [providers.{name}] with auth = \"oauth\""
-        )
-    })?;
-    let Some(oauth) = provider.auth.oauth() else {
-        anyhow::bail!("provider '{name}' does not use auth = \"oauth\"");
-    };
-    TokenManager::shared(&config.tokens_dir(), name, oauth)
-        .context("failed to prepare the OAuth token manager")
 }
 
 /// Print what the user must do for a login step. The browser prompt also
@@ -1173,24 +1108,26 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         tracing::error!(
             "the interactive session needs a terminal; use `quack -p PROMPT` or `quack -q SQL` in pipelines"
         );
-        return Ok(ExitCode::from(EXIT_USAGE));
+        return Ok(ExitCode::from(Exit::Usage));
     }
-    let (config, workspace, ws_name) = load_workspace(cli.workspace.as_deref()).await?;
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let ws_db = opened.open_db()?;
     let session_id = resolve_session(
-        &config,
+        &opened.config,
         &ws_db,
         cli.continue_latest,
         cli.resume.as_deref(),
         cli.mode.map(ChatMode::from),
     )?;
-    let db: SharedDb =
-        Arc::new(Writer::spawn(ws_db).context("failed to start the workspace writer")?);
-    let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+    let (db, reader_db) = opened.shared(ws_db).await?;
+    let OpenedWorkspace {
+        config,
+        workspace,
+        name,
+    } = opened;
     terminal::run(SessionSetup {
         config,
-        workspace_name: ws_name,
+        workspace_name: name,
         workspace_id: workspace.id,
         db,
         reader_db,
@@ -1314,28 +1251,22 @@ fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
 }
 
 /// `quack docs [--pin ID] [--unpin ID] [--delete ID]`: apply changes, then list.
-fn run_docs(
-    db: &WorkspaceDb,
-    pin: Option<&str>,
-    unpin: Option<&str>,
-    delete: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    if let Some(prefix) = pin {
+fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
+    if let Some(prefix) = args.pin.as_deref() {
         let id = find_document(db, prefix)?;
         db.set_document_pinned(&id, true)?;
     }
-    if let Some(prefix) = unpin {
+    if let Some(prefix) = args.unpin.as_deref() {
         let id = find_document(db, prefix)?;
         db.set_document_pinned(&id, false)?;
     }
-    if let Some(prefix) = delete {
+    if let Some(prefix) = args.delete.as_deref() {
         let id = find_document(db, prefix)?;
         db.delete_document(&id)?;
     }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    list_documents(db, json, &mut out)
+    list_documents(db, args.json, &mut out)
 }
 
 /// Resolve a full document id or a unique prefix.
@@ -1446,23 +1377,55 @@ fn init_logging_at(default: &str) {
     CryptoModule::linked().log();
 }
 
-/// The configuration and the workspace this command runs in: the named one,
+/// The configuration and the workspace a command runs in: the named one,
 /// or the default, created on first use.
-async fn load_workspace(workspace_name: Option<&str>) -> Result<(Config, WorkspaceRow, String)> {
-    let config = Config::load().context("failed to load configuration")?;
+struct OpenedWorkspace {
+    config: Config,
+    workspace: WorkspaceRow,
+    name: String,
+}
 
-    let control = ControlPlane::open(&config)
-        .await
-        .context("failed to open control plane")?;
+impl OpenedWorkspace {
+    async fn resolve(workspace_name: Option<&str>) -> Result<Self> {
+        let config = Config::load().context("failed to load configuration")?;
+        let control = ControlPlane::open(&config)
+            .await
+            .context("failed to open control plane")?;
+        let name =
+            workspace_name.map_or_else(|| config.general.default_workspace.clone(), str::to_owned);
+        let workspace = control
+            .find_or_create_workspace(&name)
+            .await
+            .context("failed to resolve workspace")?;
+        Ok(Self {
+            config,
+            workspace,
+            name,
+        })
+    }
 
-    let ws_name =
-        workspace_name.map_or_else(|| config.general.default_workspace.clone(), str::to_owned);
-    let workspace = control
-        .find_or_create_workspace(&ws_name)
-        .await
-        .context("failed to resolve workspace")?;
+    /// The workspace's connection.
+    fn open_db(&self) -> Result<WorkspaceDb> {
+        WorkspaceDb::open(&self.config, &self.workspace.id)
+            .context("failed to open workspace database")
+    }
 
-    Ok((config, workspace, ws_name))
+    /// The workspace's connection on a writer thread of its own: the
+    /// commands that run core's multi-step work (ingestion, import, graph
+    /// and ontology commands) send it their steps exactly as the server
+    /// and the terminal do.
+    fn writer(&self) -> Result<Writer> {
+        Writer::spawn(self.open_db()?).context("failed to start the workspace writer")
+    }
+
+    /// `db` moved onto its writer thread, and a reader pool over it, for
+    /// the commands that run agent turns.
+    async fn shared(&self, db: WorkspaceDb) -> Result<(SharedDb, ReaderDb)> {
+        let db: SharedDb =
+            Arc::new(Writer::spawn(db).context("failed to start the workspace writer")?);
+        let reader_db = ReaderDb::open(&db, self.config.analysis.reader_pool_size).await;
+        Ok((db, reader_db))
+    }
 }
 
 async fn run_query(
@@ -1471,11 +1434,9 @@ async fn run_query(
     format: OutputFormat,
     wait_for_stdin: bool,
 ) -> Result<()> {
-    let (config, workspace, _) = load_workspace(workspace_name).await?;
-
-    let ws_db =
-        WorkspaceDb::open(&config, &workspace.id).context("failed to open workspace database")?;
-    load_piped_stdin(&config, &ws_db, &workspace.id, wait_for_stdin).await?;
+    let opened = OpenedWorkspace::resolve(workspace_name).await?;
+    let ws_db = opened.open_db()?;
+    load_piped_stdin(&opened.config, &ws_db, &opened.workspace.id, wait_for_stdin).await?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
 
@@ -1494,29 +1455,33 @@ async fn run_query(
     Ok(())
 }
 
-async fn run_ingest(
-    file: &StdioPath,
-    workspace_name: Option<&str>,
-    filename_override: Option<&str>,
-    title: Option<&str>,
-    no_embed: bool,
-    pin: bool,
-) -> Result<()> {
-    let (config, workspace, _) = load_workspace(workspace_name).await?;
+async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
+    let IngestArgs {
+        file,
+        filename,
+        title,
+        no_embed,
+        pin,
+    } = args;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let config = &opened.config;
 
-    if let StdioPath::Path(dir) = file
+    if let StdioPath::Path(dir) = &file
         && dir.is_dir()
     {
-        return ingest_bundle(&config, &workspace.id, &dir.display().to_string(), no_embed).await;
+        return ingest_bundle(&opened, &dir.display().to_string(), no_embed).await;
     }
-    let (data, effective_filename) = read_input(file, filename_override)?;
+    let NamedInput {
+        name: effective_filename,
+        data,
+    } = file.read_named(filename.as_deref())?;
 
-    let ws_db = spawn_writer(&config, &workspace.id)?;
+    let ws_db = opened.writer()?;
 
     let embedding_model = if no_embed {
         None
     } else {
-        Embeddings::from_config(&config)
+        Embeddings::from_config(config)
             .await
             .context("failed to build embedding model")?
     };
@@ -1526,12 +1491,12 @@ async fn run_ingest(
         StdioPath::Path(_) => DocumentSource::Path,
     };
     let outcome = ingestion::ingest_file(
-        &config,
+        config,
         &ws_db,
-        &workspace.id,
+        &opened.workspace.id,
         &NewFile::new(&effective_filename, &data)
             .source(source)
-            .title(title),
+            .title(title.as_deref()),
         embedding_model.as_ref(),
     )
     .await
@@ -1601,14 +1566,10 @@ async fn run_ingest(
 /// `quack ingest DIR`: an OKF bundle. Every concept file becomes a
 /// Markdown document, its front matter and links feed the ontology review
 /// queue, and `index.md` is offered as the workspace context.
-async fn ingest_bundle(
-    config: &Config,
-    workspace_id: &str,
-    dir: &str,
-    no_embed: bool,
-) -> Result<()> {
+async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> Result<()> {
+    let (config, workspace_id) = (&opened.config, opened.workspace.id.as_str());
     let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
-    let ws_db = spawn_writer(config, workspace_id)?;
+    let ws_db = opened.writer()?;
     let embedding_model = if no_embed {
         None
     } else {
@@ -1651,12 +1612,27 @@ async fn ingest_bundle(
         .map(|index| okf::parse_front_matter(&index.content).1.trim().to_owned())
         .filter(|body| !body.is_empty());
     // The ontology, the review queue, and the current context: one step on
-    // the writer, its report rendered there.
-    let owned_dir = dir.to_owned();
+    // the writer.
+    let note = format!("restored from {dir}");
     let (report, existing) = ws_db
-        .run(move |db| Ok(restore_bundle(db, &bundle, &owned_dir)))
-        .await??;
-    out.write_all(&report)?;
+        .run(move |db| {
+            let report = bundle.restore_into(db, Revision::reviewed(None, Some(&note)))?;
+            Ok((report, context::current(db)?.map(|c| c.content)))
+        })
+        .await?;
+    if let Some(version) = report.restored {
+        writeln!(
+            out,
+            "Restored the bundle's ontology (version {version} in this workspace)."
+        )?;
+    }
+    if report.candidates > 0 {
+        writeln!(
+            out,
+            "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
+            report.candidates
+        )?;
+    }
     if let Some(body) = index_body {
         if existing.as_deref() == Some(body.as_str()) {
             writeln!(out, "index.md already is the workspace context.")?;
@@ -1682,81 +1658,6 @@ async fn ingest_bundle(
     }
     out.flush()?;
     Ok(())
-}
-
-/// A bundle's ontology and review candidates, applied on the writer: the
-/// report of what changed, and the workspace context now in force.
-fn restore_bundle(
-    ws_db: &WorkspaceDb,
-    bundle: &Bundle,
-    dir: &str,
-) -> Result<(Vec<u8>, Option<String>)> {
-    let mut out = Vec::new();
-    let current = restore_bundle_ontology(ws_db, bundle, dir, &mut out)?;
-    let candidates = okf::propose(bundle, current.as_ref());
-    if !candidates.is_empty() {
-        candidates::store_run(ws_db, &candidates)?;
-        writeln!(
-            out,
-            "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
-            candidates.len()
-        )?;
-    }
-    let existing = context::current(ws_db)?.map(|c| c.content);
-    Ok((out, existing))
-}
-
-/// quack's own export carries the ontology exactly: a workspace without
-/// one takes it back as it was; one that has an ontology reviews the
-/// bundle's types and links as candidates instead. Returns the ontology
-/// in force afterwards.
-fn restore_bundle_ontology(
-    ws_db: &WorkspaceDb,
-    bundle: &Bundle,
-    dir: &str,
-    out: &mut impl Write,
-) -> Result<Option<Ontology>> {
-    let current = ontology_store::current(ws_db)?;
-    if current.is_some() {
-        return Ok(current);
-    }
-    let Some(snapshot) = bundle.ontology()? else {
-        return Ok(None);
-    };
-    let restored = ontology_store::save(
-        ws_db,
-        &snapshot,
-        Revision::reviewed(None, Some(&format!("restored from {dir}"))),
-    )?;
-    writeln!(
-        out,
-        "Restored the bundle's ontology (version {} in this workspace).",
-        restored.saved_version()?
-    )?;
-    Ok(Some(restored))
-}
-
-fn read_input(file: &StdioPath, filename_override: Option<&str>) -> Result<(Vec<u8>, String)> {
-    match file {
-        StdioPath::Stdio => {
-            let filename = filename_override
-                .ok_or_else(|| anyhow::anyhow!("--filename is required when reading from stdin"))?
-                .to_owned();
-            let mut data = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut data)
-                .context("failed to read from stdin")?;
-            Ok((data, filename))
-        }
-        StdioPath::Path(path) => {
-            let data = std::fs::read(path).context("failed to read input file")?;
-            let filename = filename_override
-                .map(String::from)
-                .or_else(|| path.file_name().and_then(|n| n.to_str()).map(String::from))
-                .unwrap_or_else(|| String::from("unknown"));
-            Ok((data, filename))
-        }
-    }
 }
 
 #[cfg(test)]

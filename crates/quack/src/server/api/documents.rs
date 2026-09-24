@@ -22,7 +22,6 @@ use crate::server::queue::{MAX_WAITING_UPLOADS, UPLOAD_RETRY_SECONDS, UploadJob}
 use crate::server::state::{App, with_db};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{candidates, store as ontology_store};
 use quack_core::storage::workspace::{DocumentInfo, DocumentSource, WorkspaceDb};
 
 pub(crate) async fn list(
@@ -141,25 +140,11 @@ async fn import_bundle(
     let db = app.workspace_db(&access.workspace.id).await?;
     let for_candidates = bundle.clone();
     let author = access.identity.username.clone();
-    let (candidates, restored) = with_db(db, move |db| {
-        let mut current = ontology_store::current(db)?;
-        let mut restored = None;
-        if current.is_none()
-            && let Some(snapshot) = for_candidates.ontology()?
-        {
-            let saved = ontology_store::save(
-                db,
-                &snapshot,
-                Revision::reviewed(Some(&author), Some("restored from a bundle")),
-            )?;
-            restored = saved.version;
-            current = Some(saved);
-        }
-        let candidates = okf::propose(&for_candidates, current.as_ref());
-        if !candidates.is_empty() {
-            candidates::store_run(db, &candidates)?;
-        }
-        Ok((candidates.len(), restored))
+    let report = with_db(db, move |db| {
+        for_candidates.restore_into(
+            db,
+            Revision::reviewed(Some(&author), Some("restored from a bundle")),
+        )
     })
     .await?;
     let context = bundle
@@ -169,8 +154,8 @@ async fn import_bundle(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
             "documents": queued,
-            "candidates": candidates,
-            "ontology_version": restored,
+            "candidates": report.candidates,
+            "ontology_version": report.restored,
             "context": context,
         })),
     )

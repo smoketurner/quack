@@ -18,7 +18,7 @@ use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, ROOT_CLASS, candidates, documents, store};
-use quack_core::progress::{ChunkDone, RunControl};
+use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
@@ -462,24 +462,6 @@ async fn propose(
         )?;
     }
     Ok(())
-}
-
-/// One progress line per extracted chunk on stderr, for the ontology and
-/// graph document passes (issue #67): stdout keeps the summary.
-pub(crate) fn chunk_progress(done: ChunkDone) {
-    let failed = if done.failed > 0 {
-        format!(", {} failed", done.failed)
-    } else {
-        String::new()
-    };
-    drop(writeln!(
-        std::io::stderr(),
-        "chunk {}/{} done in {} s{failed}; {} s elapsed",
-        done.done,
-        done.total,
-        done.took.as_secs(),
-        done.elapsed.as_secs()
-    ));
 }
 
 /// Sample, extract with the chat model, and propose.

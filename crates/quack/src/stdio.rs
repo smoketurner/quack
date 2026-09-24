@@ -15,7 +15,45 @@ pub(crate) enum StdioPath {
     Path(PathBuf),
 }
 
+/// Bytes read for ingestion, and the file name they go in under.
+pub(crate) struct NamedInput {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
 impl StdioPath {
+    /// The whole input under a file name: `name` when given, else the
+    /// file's own name; standard input has none, so it needs `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input cannot be read, or standard input
+    /// comes without `name`.
+    pub(crate) fn read_named(&self, name: Option<&str>) -> Result<NamedInput> {
+        match self {
+            Self::Stdio => {
+                let name = name
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--filename is required when reading from stdin")
+                    })?
+                    .to_owned();
+                let mut data = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut data)
+                    .context("failed to read from stdin")?;
+                Ok(NamedInput { name, data })
+            }
+            Self::Path(path) => {
+                let data = std::fs::read(path).context("failed to read input file")?;
+                let name = name
+                    .map(String::from)
+                    .or_else(|| path.file_name().and_then(|n| n.to_str()).map(String::from))
+                    .unwrap_or_else(|| String::from("unknown"));
+                Ok(NamedInput { name, data })
+            }
+        }
+    }
+
     /// The whole text: standard input, or the file.
     ///
     /// # Errors

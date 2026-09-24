@@ -37,7 +37,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub use cache::{CachedToken, KeyLocation, KeySource, TokenCache};
 
-use crate::config::{OAuthConfig, ProviderName};
+use crate::config::{Config, OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
 
 /// Tokens with less than this left are refreshed before use.
@@ -128,6 +128,26 @@ impl std::fmt::Debug for TokenManager {
 }
 
 impl TokenManager {
+    /// The shared manager for the provider `config` names `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when no such provider is configured or it
+    /// does not use `auth = "oauth"`, or an error preparing the manager.
+    pub fn for_provider(config: &Config, name: &str) -> Result<Arc<Self>> {
+        let (name, provider) = config.providers.get_key_value(name).ok_or_else(|| {
+            Error::Config(format!(
+                "provider '{name}' is not configured; add [providers.{name}] with auth = \"oauth\""
+            ))
+        })?;
+        let Some(oauth) = provider.auth.oauth() else {
+            return Err(Error::Config(format!(
+                "provider '{name}' does not use auth = \"oauth\""
+            )));
+        };
+        Self::shared(&config.tokens_dir(), name, oauth)
+    }
+
     /// One manager per provider per process, shared across turns and (later)
     /// server requests so refreshes serialize.
     ///

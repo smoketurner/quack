@@ -14,6 +14,38 @@ use quack_core::storage::control::{
     Role, Scope, WorkspaceRow,
 };
 
+/// Server administration: users, tokens, membership, and the audit log.
+#[derive(Subcommand)]
+pub(crate) enum AdminCommand {
+    /// Server users: create one or list them
+    #[command(subcommand)]
+    User(UserAction),
+
+    /// API tokens scoped to a workspace: create, list, or revoke
+    #[command(subcommand)]
+    Token(TokenAction),
+
+    /// Workspace membership: add, remove, or list members
+    #[command(subcommand)]
+    Member(MemberAction),
+
+    /// Read the access audit log with filters
+    Audit(AuditArgs),
+}
+
+impl AdminCommand {
+    /// Run it against the control database; token and member commands
+    /// act on `workspace`.
+    pub(crate) async fn run(self, config: &Config, workspace: Option<&str>) -> Result<()> {
+        match self {
+            Self::User(action) => run_user(config, action).await,
+            Self::Token(action) => run_token(config, workspace, action).await,
+            Self::Member(action) => run_member(config, workspace, action).await,
+            Self::Audit(args) => run_audit(config, args).await,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum UserAction {
     /// Create a user; the password is read from the terminal without echo,
