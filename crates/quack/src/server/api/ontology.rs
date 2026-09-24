@@ -14,6 +14,7 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
 use quack_core::llm;
+use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, candidates, documents, store};
 use quack_core::progress::ChunkDone;
 
@@ -71,7 +72,7 @@ impl Access {
         let db = app.workspace_db(&self.workspace.id).await?;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| {
-            store::save(db, &ontology, Some(&author), Some(note))
+            store::save(db, &ontology, Revision::reviewed(Some(&author), Some(note)))
         })
         .await?;
         self.audit(
@@ -96,8 +97,7 @@ impl Access {
             store::save(
                 db,
                 &Ontology::builtin_default(),
-                Some(&author),
-                Some("built-in default"),
+                Revision::reviewed(Some(&author), Some("built-in default")),
             )
             .map(Some)
         })

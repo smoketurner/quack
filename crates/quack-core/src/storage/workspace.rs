@@ -12,6 +12,7 @@ use crate::embedding::{
 use crate::error::{Error, Record, Result};
 use crate::graph;
 use crate::ingestion::{self, parser};
+use crate::ontology::store::Acceptance;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -27,7 +28,7 @@ const PHRASE_CANDIDATE_CAP: u32 = 500;
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
 /// Schema version of the internal tables, recorded in `_quack_meta`.
-const WORKSPACE_SCHEMA_VERSION: &str = "9";
+const WORKSPACE_SCHEMA_VERSION: &str = "10";
 
 /// The keys of `_quack_meta`, the workspace's own settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +216,7 @@ const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontolo
                 note TEXT,
                 created_at TIMESTAMP DEFAULT now()
             );
+            ALTER TABLE _quack_ontology_versions ADD COLUMN IF NOT EXISTS acceptance TEXT DEFAULT 'reviewed';
             CREATE TABLE IF NOT EXISTS _quack_ontology_classes (
                 id TEXT PRIMARY KEY,
                 parent_id TEXT,
@@ -766,6 +768,14 @@ impl WorkspaceDb {
                  error_message = 'never finished processing; upload it again' \
                  WHERE status IS NULL OR status = 'pending'",
                 duckdb::params![DocumentStatus::Error],
+            )?;
+        }
+        // Version 10 records whether an ontology version was reviewed in its
+        // own column. Before it, `--auto-accept` said so only in the note.
+        if recorded < 10 {
+            self.conn.execute(
+                "UPDATE _quack_ontology_versions SET acceptance = ? WHERE note LIKE 'auto-accepted%'",
+                duckdb::params![Acceptance::Auto],
             )?;
         }
         Ok(())
@@ -4139,6 +4149,37 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(results.len(), 1);
         assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
+    }
+
+    /// Version 10 stores whether an ontology version was reviewed; a
+    /// workspace from before it said so only in the note, so opening it
+    /// marks those versions auto-accepted and leaves the others reviewed.
+    #[test]
+    fn opening_an_older_workspace_reads_auto_acceptance_from_the_note() {
+        use crate::ontology::Ontology;
+        use crate::ontology::store::{self, Revision};
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            for note in ["seeded", "auto-accepted 3 candidate(s)"] {
+                store::save(
+                    &db,
+                    &Ontology::builtin_default(),
+                    Revision::reviewed(None, Some(note)),
+                )
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            }
+            db.set_meta(MetaKey::SchemaVersion, "9")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let acceptance: Vec<Acceptance> = store::versions(&reopened, 10)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .into_iter()
+            .map(|v| v.acceptance)
+            .collect();
+        assert_eq!(acceptance, [Acceptance::Auto, Acceptance::Reviewed]);
     }
 
     /// Version 7 added joined identifier terms, so a workspace still

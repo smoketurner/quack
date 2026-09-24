@@ -2,7 +2,8 @@
 //! one or all at once, and applied as a new ontology version.
 
 use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
-use super::{Class, Ontology, ROOT_CLASS, store};
+use super::store::{self, Acceptance, Revision};
+use super::{Class, Ontology, ROOT_CLASS};
 use crate::error::{Error, Record, Result};
 use crate::prefix::PrefixMatch;
 use crate::storage::workspace::WorkspaceDb;
@@ -286,18 +287,14 @@ pub fn accept(
     decisions: &[(String, Decision)],
     decided_by: Option<&str>,
 ) -> Result<Ontology> {
-    accept_with_note(db, decisions, decided_by, "accepted")
+    accept_as(db, decisions, decided_by, Acceptance::Reviewed)
 }
 
-/// The note prefix a version written by `--auto-accept` carries; the graph
-/// built from such a version is provisional until someone reviews.
-pub const AUTO_ACCEPT_NOTE: &str = "auto-accepted";
-
-fn accept_with_note(
+fn accept_as(
     db: &WorkspaceDb,
     decisions: &[(String, Decision)],
     decided_by: Option<&str>,
-    verb: &str,
+    acceptance: Acceptance,
 ) -> Result<Ontology> {
     let mut resolved = Vec::with_capacity(decisions.len());
     for (id, decision) in decisions {
@@ -316,8 +313,20 @@ fn accept_with_note(
         .map(|(_, p, d)| (p.clone(), d.clone()))
         .collect();
     let next = apply(base.as_ref(), &proposals)?;
+    let verb = match acceptance {
+        Acceptance::Reviewed => "accepted",
+        Acceptance::Auto => "auto-accepted",
+    };
     let note = format!("{verb} {} candidate(s)", resolved.len());
-    let stored = store::save(db, &next, decided_by, Some(&note))?;
+    let stored = store::save(
+        db,
+        &next,
+        Revision {
+            author: decided_by,
+            note: Some(&note),
+            acceptance,
+        },
+    )?;
     for (id, _, _) in &resolved {
         db.connection().execute(
             "UPDATE _quack_ontology_candidates SET status = ?, decided_by = ?, decided_at = now() WHERE id = ?",
@@ -340,7 +349,7 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
     if ids.is_empty() {
         return Err(Error::Ontology(String::from("no pending candidates")));
     }
-    accept_with_note(db, &ids, decided_by, AUTO_ACCEPT_NOTE)
+    accept_as(db, &ids, decided_by, Acceptance::Auto)
 }
 
 #[cfg(test)]

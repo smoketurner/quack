@@ -11,6 +11,7 @@ use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::graph::Properties;
 use quack_core::graph::store as graph_store;
 use quack_core::graph::store::NewNode;
+use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
 use quack_core::storage::workspace::{DocumentStatus, NewDocument, WorkspaceDb};
@@ -26,7 +27,12 @@ fn main() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    ontology_store::save(&db, &Ontology::builtin_default(), Some("tester"), None).unwrap();
+    ontology_store::save(
+        &db,
+        &Ontology::builtin_default(),
+        Revision::reviewed(Some("tester"), None),
+    )
+    .unwrap();
     graph_store::upsert_node(
         &db,
         &NewNode {

@@ -436,6 +436,7 @@ mod tests {
     use crate::graph::Properties;
     use crate::graph::store::NewNode;
     use crate::ontology::Ontology;
+    use crate::ontology::store::Revision;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
     fn db() -> WorkspaceDb {
@@ -463,7 +464,12 @@ mod tests {
     fn the_graph_procedure_appears_only_once_the_graph_has_nodes() {
         const PROCEDURE: &str = "When answering questions about how entities relate";
         let db = db();
-        ontology_store::save(&db, &Ontology::builtin_default(), Some("tester"), None).unwrap();
+        ontology_store::save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(Some("tester"), None),
+        )
+        .unwrap();
 
         // An ontology alone registers no graph tools, so it gets no procedure.
         let without = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
@@ -515,7 +521,12 @@ mod tests {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        ontology_store::save(&db, &Ontology::builtin_default(), Some("tester"), None).unwrap();
+        ontology_store::save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(Some("tester"), None),
+        )
+        .unwrap();
         graph_store::upsert_node(
             &db,
             &NewNode {

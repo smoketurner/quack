@@ -182,16 +182,44 @@ pub async fn embed_nodes<M: EmbeddingModel>(
 /// and the proposals a big class can generate.
 const NEIGHBOURS_PER_NODE: u32 = 5;
 
+/// One node of a candidate pair.
+struct Side {
+    id: String,
+    label: String,
+    /// Whether the node comes from a keyed table row.
+    keyed: bool,
+}
+
 /// A pair worth looking at: close embeddings, same class.
 struct Candidate {
-    a_id: String,
-    a_label: String,
-    b_id: String,
-    b_label: String,
+    a: Side,
+    b: Side,
     distance: f64,
-    /// Whether each side comes from a keyed table row.
-    a_keyed: bool,
-    b_keyed: bool,
+}
+
+impl Candidate {
+    /// Whether both sides came from the model, the only pairs that may
+    /// merge without review.
+    fn extracted_only(&self) -> bool {
+        !self.a.keyed && !self.b.keyed
+    }
+
+    /// The node to keep and the one to fold into it: the keyed node, else
+    /// the one with more provenance, else the earlier id.
+    fn keep_and_drop(self, db: &WorkspaceDb) -> Result<(String, String)> {
+        let prefer_b = match (self.a.keyed, self.b.keyed) {
+            (false, true) => true,
+            (true, false) => false,
+            (true, true) | (false, false) => {
+                provenance_count(db, &self.b.id)? > provenance_count(db, &self.a.id)?
+            }
+        };
+        Ok(if prefer_b {
+            (self.b.id, self.a.id)
+        } else {
+            (self.a.id, self.b.id)
+        })
+    }
 }
 
 /// Compare every embedded node with its nearest same-class neighbours;
@@ -239,13 +267,17 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
         seen.insert(a_id.clone(), a_seen.saturating_add(1));
         seen.insert(b_id.clone(), b_seen.saturating_add(1));
         candidates.push(Candidate {
-            a_id,
-            a_label: row.get(1)?,
-            b_id,
-            b_label: row.get(3)?,
+            a: Side {
+                id: a_id,
+                label: row.get(1)?,
+                keyed: row.get(5)?,
+            },
+            b: Side {
+                id: b_id,
+                label: row.get(3)?,
+                keyed: row.get(6)?,
+            },
             distance: row.get(4)?,
-            a_keyed: row.get(5)?,
-            b_keyed: row.get(6)?,
         });
     }
     drop(rows);
@@ -254,26 +286,16 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
     let mut proposed = 0u32;
     let mut gone: BTreeSet<String> = BTreeSet::new();
     for candidate in candidates {
-        if gone.contains(&candidate.a_id)
-            || gone.contains(&candidate.b_id)
-            || !share_token(&candidate.a_label, &candidate.b_label)
+        if gone.contains(&candidate.a.id)
+            || gone.contains(&candidate.b.id)
+            || !share_token(&candidate.a.label, &candidate.b.label)
         {
             continue;
         }
-        // Keep the keyed node, else the one with more provenance, else
-        // the earlier id.
-        let prefer_b = match (candidate.a_keyed, candidate.b_keyed) {
-            (false, true) => true,
-            (true, false) => false,
-            _ => provenance_count(db, &candidate.b_id)? > provenance_count(db, &candidate.a_id)?,
-        };
-        let (keep, drop) = if prefer_b {
-            (candidate.b_id, candidate.a_id)
-        } else {
-            (candidate.a_id, candidate.b_id)
-        };
-        let extracted_only = !candidate.a_keyed && !candidate.b_keyed;
-        if extracted_only && candidate.distance <= options.auto_merge_threshold {
+        let distance = candidate.distance;
+        let auto_merge = candidate.extracted_only() && distance <= options.auto_merge_threshold;
+        let (keep, drop) = candidate.keep_and_drop(db)?;
+        if auto_merge {
             merge_nodes(db, &keep, &drop)?;
             gone.insert(drop);
             auto = auto.saturating_add(1);
@@ -289,7 +311,7 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
         }
         db.connection().execute(
             "INSERT INTO _quack_graph_merges (id, keep_node_id, drop_node_id, distance) VALUES (?, ?, ?, ?)",
-            duckdb::params![uuid::Uuid::now_v7().to_string(), keep, drop, candidate.distance],
+            duckdb::params![uuid::Uuid::now_v7().to_string(), keep, drop, distance],
         )?;
         proposed = proposed.saturating_add(1);
     }

@@ -18,6 +18,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
+use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
@@ -65,7 +66,12 @@ fn workspace() -> WorkspaceDb {
         ))
         .unwrap();
     }
-    ontology_store::save(&db, &Ontology::builtin_default(), Some("bench"), None).unwrap();
+    ontology_store::save(
+        &db,
+        &Ontology::builtin_default(),
+        Revision::reviewed(Some("bench"), None),
+    )
+    .unwrap();
     db
 }
 

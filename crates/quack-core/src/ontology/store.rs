@@ -8,12 +8,57 @@
 
 use std::collections::BTreeMap;
 
-use super::candidates::AUTO_ACCEPT_NOTE;
 use super::{
     Class, Mapping, MappingRelation, Ontology, Property, PropertyType, ROOT_CLASS, Relation,
 };
 use crate::error::{Error, Record, Result};
 use crate::storage::workspace::WorkspaceDb;
+
+/// Whether a person reviewed a version before it was saved. A graph
+/// built from an auto-accepted version is provisional until someone
+/// saves a reviewed one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Acceptance {
+    #[default]
+    Reviewed,
+    /// Written by `--auto-accept` from induced candidates nobody looked at.
+    Auto,
+}
+
+text_enum!(Acceptance, "acceptance", {
+    Reviewed => "reviewed",
+    Auto => "auto",
+});
+text_enum_sql!(Acceptance);
+
+/// Who saved a version, why, and whether anyone reviewed it.
+#[derive(Debug, Clone, Copy)]
+pub struct Revision<'a> {
+    pub author: Option<&'a str>,
+    pub note: Option<&'a str>,
+    pub acceptance: Acceptance,
+}
+
+impl<'a> Revision<'a> {
+    #[must_use]
+    pub fn reviewed(author: Option<&'a str>, note: Option<&'a str>) -> Self {
+        Self {
+            author,
+            note,
+            acceptance: Acceptance::Reviewed,
+        }
+    }
+
+    #[must_use]
+    pub fn auto(author: Option<&'a str>, note: Option<&'a str>) -> Self {
+        Self {
+            author,
+            note,
+            acceptance: Acceptance::Auto,
+        }
+    }
+}
 
 /// A stored version's header.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -21,6 +66,7 @@ pub struct VersionRow {
     pub version: u32,
     pub author: Option<String>,
     pub note: Option<String>,
+    pub acceptance: Acceptance,
     pub created_at: String,
 }
 
@@ -46,11 +92,9 @@ pub fn latest_version(db: &WorkspaceDb) -> Result<u32> {
 ///
 /// Returns an error if the query fails.
 pub fn current_is_auto_accepted(db: &WorkspaceDb) -> Result<bool> {
-    Ok(versions(db, 1)?.first().is_some_and(|v| {
-        v.note
-            .as_deref()
-            .is_some_and(|n| n.starts_with(AUTO_ACCEPT_NOTE))
-    }))
+    Ok(versions(db, 1)?
+        .first()
+        .is_some_and(|v| v.acceptance == Acceptance::Auto))
 }
 
 /// The live ontology, or `None` when no version has been saved.
@@ -171,8 +215,8 @@ pub fn version(db: &WorkspaceDb, version: u32) -> Result<Option<Ontology>> {
 /// Returns an error if the query fails.
 pub fn versions(db: &WorkspaceDb, limit: u32) -> Result<Vec<VersionRow>> {
     let mut stmt = db.connection().prepare(
-        "SELECT version, author, note, CAST(created_at AS VARCHAR) FROM _quack_ontology_versions \
-         ORDER BY version DESC LIMIT ?",
+        "SELECT version, author, note, acceptance, CAST(created_at AS VARCHAR) \
+         FROM _quack_ontology_versions ORDER BY version DESC LIMIT ?",
     )?;
     let mut rows = stmt.query(duckdb::params![i64::from(limit)])?;
     let mut out = Vec::new();
@@ -182,7 +226,8 @@ pub fn versions(db: &WorkspaceDb, limit: u32) -> Result<Vec<VersionRow>> {
             version: u32::try_from(version).unwrap_or(0),
             author: row.get(1)?,
             note: row.get(2)?,
-            created_at: row.get(3)?,
+            acceptance: row.get::<_, Option<Acceptance>>(3)?.unwrap_or_default(),
+            created_at: row.get(4)?,
         });
     }
     Ok(out)
@@ -195,12 +240,7 @@ pub fn versions(db: &WorkspaceDb, limit: u32) -> Result<Vec<VersionRow>> {
 ///
 /// Returns an error when the ontology is invalid, a mapping names a table
 /// or column the workspace lacks, or a write fails.
-pub fn save(
-    db: &WorkspaceDb,
-    ontology: &Ontology,
-    author: Option<&str>,
-    note: Option<&str>,
-) -> Result<Ontology> {
+pub fn save(db: &WorkspaceDb, ontology: &Ontology, revision: Revision<'_>) -> Result<Ontology> {
     ontology.validate()?;
     check_mappings(db, ontology)?;
     let previous = current(db)?;
@@ -210,7 +250,7 @@ pub fn save(
     stored.version = next;
     let snapshot = serde_json::to_string(&stored)?;
     conn.execute("BEGIN", [])?;
-    let outcome = write_version(conn, &stored, previous.as_ref(), &snapshot, author, note);
+    let outcome = write_version(conn, &stored, previous.as_ref(), &snapshot, revision);
     match outcome {
         Ok(()) => {
             conn.execute("COMMIT", [])?;
@@ -228,12 +268,18 @@ fn write_version(
     stored: &Ontology,
     previous: Option<&Ontology>,
     snapshot: &str,
-    author: Option<&str>,
-    note: Option<&str>,
+    revision: Revision<'_>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO _quack_ontology_versions (version, snapshot, author, note) VALUES (?, ?, ?, ?)",
-        duckdb::params![i64::from(stored.version), snapshot, author, note],
+        "INSERT INTO _quack_ontology_versions (version, snapshot, author, note, acceptance) \
+         VALUES (?, ?, ?, ?, ?)",
+        duckdb::params![
+            i64::from(stored.version),
+            snapshot,
+            revision.author,
+            revision.note,
+            revision.acceptance
+        ],
     )?;
     let prior_since = read_since(conn)?;
     // An item that already existed keeps the version it first appeared in.
@@ -399,8 +445,7 @@ pub fn restore(db: &WorkspaceDb, target: u32, author: Option<&str>) -> Result<On
     save(
         db,
         &snapshot,
-        author,
-        Some(&format!("restored version {target}")),
+        Revision::reviewed(author, Some(&format!("restored version {target}"))),
     )
 }
 
@@ -425,8 +470,7 @@ mod tests {
         let v1 = save(
             &db,
             &Ontology::builtin_default(),
-            Some("alice"),
-            Some("default"),
+            Revision::reviewed(Some("alice"), Some("default")),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(v1.version, 1);
@@ -450,7 +494,8 @@ mod tests {
             properties: Vec::new(),
         });
         edited.classes.retain(|c| c.id != "concept");
-        let v2 = save(&db, &edited, None, None).unwrap_or_else(|e| fail(&e.to_string()));
+        let v2 = save(&db, &edited, Revision::reviewed(None, None))
+            .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(v2.version, 2);
         let since: Vec<(String, i64)> = {
             let mut stmt = db.connection().prepare("SELECT id, since_version FROM _quack_ontology_classes WHERE id IN ('person', 'vendor') ORDER BY id").unwrap_or_else(|e| fail(&e.to_string()));
@@ -491,14 +536,19 @@ mod tests {
     #[test]
     fn a_saved_ontology_reloads_equal_and_diffs_empty() {
         let db = db();
-        let saved = save(&db, &Ontology::builtin_default(), None, None)
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        let saved = save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(None, None),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
         let live = current(&db)
             .unwrap_or_else(|e| fail(&e.to_string()))
             .unwrap_or_else(|| fail("no ontology"));
         assert_eq!(live, saved);
         assert!(live.diff(&Ontology::builtin_default()).is_empty());
-        let again = save(&db, &live, None, None).unwrap_or_else(|e| fail(&e.to_string()));
+        let again = save(&db, &live, Revision::reviewed(None, None))
+            .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(again.diff(&live).is_empty());
         let snapshot = version(&db, 1)
             .unwrap_or_else(|e| fail(&e.to_string()))
@@ -517,7 +567,8 @@ mod tests {
         );
         let json = r#"{"classes": [{"id": "claim", "key": "claim_id", "properties": ["claim_id", "amount"]}, {"id": "policy", "key": "policy_number", "properties": ["policy_number"]}], "relations": [{"id": "filed_against", "domain": "claim", "range": "policy"}], "properties": [{"id": "claim_id", "type": "string"}, {"id": "amount", "type": "number"}, {"id": "policy_number", "type": "string"}], "mappings": [{"table": "claims", "class": "claim", "key": "claim_id", "properties": {"amount": "amount"}, "relations": [{"relation": "filed_against", "column": "policy_id", "target_class": "policy", "target_key": "policy_number"}]}]}"#;
         let ontology = Ontology::from_json(json).unwrap_or_else(|e| fail(&e.to_string()));
-        let saved = save(&db, &ontology, None, None).unwrap_or_else(|e| fail(&e.to_string()));
+        let saved = save(&db, &ontology, Revision::reviewed(None, None))
+            .unwrap_or_else(|e| fail(&e.to_string()));
         let live = current(&db)
             .unwrap_or_else(|e| fail(&e.to_string()))
             .unwrap_or_else(|| fail("no ontology"));
@@ -531,13 +582,13 @@ mod tests {
             .mappings
             .iter_mut()
             .for_each(|m| m.table = String::from("nope"));
-        assert!(save(&db, &gone_table, None, None).is_ok());
+        assert!(save(&db, &gone_table, Revision::reviewed(None, None)).is_ok());
         let mut wrong_column = ontology;
         wrong_column
             .mappings
             .iter_mut()
             .for_each(|m| m.key = String::from("ghost"));
-        let wrong = save(&db, &wrong_column, None, None).err();
+        let wrong = save(&db, &wrong_column, Revision::reviewed(None, None)).err();
         assert!(wrong.is_some_and(|e| e.to_string().contains("column 'ghost'")));
         assert_eq!(
             latest_version(&db).unwrap_or(0),

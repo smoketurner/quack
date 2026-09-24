@@ -14,6 +14,7 @@ use crate::stdio::StdioPath;
 use quack_core::llm;
 use quack_core::ontology::candidates::{CandidateStatus, Queue};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
+use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, ROOT_CLASS, candidates, documents, store};
 use quack_core::progress::{ChunkDone, Progress};
 use quack_core::storage::workspace::WorkspaceDb;
@@ -142,8 +143,7 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
             let stored = store::save(
                 db,
                 &Ontology::builtin_default(),
-                None,
-                Some("built-in default"),
+                Revision::reviewed(None, Some("built-in default")),
             )?;
             writeln!(
                 out,
@@ -166,7 +166,11 @@ fn run_manage(db: &WorkspaceDb, action: OntologyAction, out: &mut impl Write) ->
         OntologyAction::Import { file } => {
             let text = file.read_to_string()?;
             let ontology = Ontology::from_json(&text)?;
-            let stored = store::save(db, &ontology, None, Some(&format!("imported from {file}")))?;
+            let stored = store::save(
+                db,
+                &ontology,
+                Revision::reviewed(None, Some(&format!("imported from {file}"))),
+            )?;
             writeln!(out, "ontology is now version {}", stored.version)?;
         }
         OntologyAction::Versions { limit } => {
@@ -355,7 +359,11 @@ fn seed(db: &WorkspaceDb, from: Option<&str>, out: &mut impl Write) -> Result<()
     };
     let text = std::fs::read_to_string(file).with_context(|| format!("failed to read {file}"))?;
     let ontology = Ontology::from_json(&text)?;
-    let stored = store::save(db, &ontology, None, Some(&format!("seeded from {file}")))?;
+    let stored = store::save(
+        db,
+        &ontology,
+        Revision::reviewed(None, Some(&format!("seeded from {file}"))),
+    )?;
     writeln!(out, "seeded version {} from {file}", stored.version)?;
     Ok(())
 }

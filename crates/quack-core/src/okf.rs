@@ -1101,6 +1101,7 @@ mod tests {
     use super::*;
     use crate::graph::Properties;
     use crate::ontology::induction::ItemKind;
+    use crate::ontology::store::Revision;
     use crate::storage::audit;
 
     #[test]
@@ -1189,7 +1190,7 @@ mod tests {
             domain: String::from("harbour"),
             range: String::from("harbour"),
         });
-        let saved = ontology_store::save(&db, &ontology, None, None)
+        let saved = ontology_store::save(&db, &ontology, Revision::reviewed(None, None))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         audit::record(
             &db,

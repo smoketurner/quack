@@ -17,6 +17,7 @@ use quack_core::graph::{
     GraphOptions, GraphResult, Node, Origin, Properties, extract, resolve, store as graph_store,
     tables, traverse,
 };
+use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
 use quack_core::storage::writer::Writer;
@@ -197,7 +198,12 @@ fn workspace() -> WorkspaceDb {
         embedding: None,
     })
     .unwrap();
-    store::save(&db, &ontology(), Some("test"), Some("fixture")).unwrap();
+    store::save(
+        &db,
+        &ontology(),
+        Revision::reviewed(Some("test"), Some("fixture")),
+    )
+    .unwrap();
     db
 }
 
@@ -238,7 +244,12 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
          FROM range({rows})"
     ))
     .unwrap();
-    store::save(&db, &ontology(), Some("test"), Some("fixture")).unwrap();
+    store::save(
+        &db,
+        &ontology(),
+        Revision::reviewed(Some("test"), Some("fixture")),
+    )
+    .unwrap();
     let current = store::current(&db).unwrap().unwrap();
     let summaries = tables::extract(&db, &current, false).unwrap();
     let first = summaries.first().unwrap();
@@ -460,7 +471,14 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     let summaries = tables::extract(&db, &current, false).unwrap();
     assert_eq!(summaries.len(), 1);
     assert!(summaries.first().unwrap().skipped.is_some());
-    assert!(store::save(&db, &current, Some("test"), Some("still saves")).is_ok());
+    assert!(
+        store::save(
+            &db,
+            &current,
+            Revision::reviewed(Some("test"), Some("still saves"))
+        )
+        .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -658,7 +676,12 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     if let Some(mapping) = edited.mappings.first_mut() {
         mapping.relations.retain(|r| r.target_class != "country");
     }
-    let saved = store::save(&db, &edited, Some("test"), Some("drop countries")).unwrap();
+    let saved = store::save(
+        &db,
+        &edited,
+        Revision::reviewed(Some("test"), Some("drop countries")),
+    )
+    .unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(status.stale);
     let outcome = graph_store::revalidate(&db).unwrap();
@@ -683,12 +706,16 @@ fn auto_accepted_ontologies_are_provisional_until_reviewed() {
     store::save(
         &db,
         &Ontology::builtin_default(),
-        None,
-        Some("auto-accepted 3 candidate(s)"),
+        Revision::auto(None, Some("auto-accepted 3 candidate(s)")),
     )
     .unwrap();
     assert!(store::current_is_auto_accepted(&db).unwrap());
-    store::save(&db, &Ontology::builtin_default(), None, Some("reviewed")).unwrap();
+    store::save(
+        &db,
+        &Ontology::builtin_default(),
+        Revision::reviewed(None, Some("reviewed")),
+    )
+    .unwrap();
     assert!(!store::current_is_auto_accepted(&db).unwrap());
 }
 

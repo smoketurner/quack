@@ -280,22 +280,23 @@ fn extract_rows(
             staged.summary.edges = staged.summary.edges.saturating_add(1);
         }
     }
-    write_staged(db, &mapping.table, provisional, &staged)?;
+    staged.write(db, &mapping.table, provisional)?;
     Ok((staged.summary, more))
 }
 
-/// Write a staged batch: four scratch tables filled through appenders,
-/// then one statement per kind. Nodes that exist keep their id and their
-/// own property values (incoming keys only fill gaps); edges that exist
-/// keep their id; provenance is `INSERT OR IGNORE`.
-fn write_staged(db: &WorkspaceDb, table: &str, provisional: bool, staged: &Staged) -> Result<()> {
-    fill_scratch_tables(db, staged)?;
-    merge_scratch_tables(db, table, provisional)
-}
+impl Staged {
+    /// Write a staged batch: four scratch tables filled through appenders,
+    /// then one statement per kind. Nodes that exist keep their id and their
+    /// own property values (incoming keys only fill gaps); edges that exist
+    /// keep their id; provenance is `INSERT OR IGNORE`.
+    fn write(&self, db: &WorkspaceDb, table: &str, provisional: bool) -> Result<()> {
+        self.fill_scratch_tables(db)?;
+        merge_scratch_tables(db, table, provisional)
+    }
 
-fn fill_scratch_tables(db: &WorkspaceDb, staged: &Staged) -> Result<()> {
-    let conn = db.connection();
-    conn.execute_batch(
+    fn fill_scratch_tables(&self, db: &WorkspaceDb) -> Result<()> {
+        let conn = db.connection();
+        conn.execute_batch(
         "CREATE OR REPLACE TABLE _quack_tmp_graph_nodes (
             id TEXT, label TEXT, normalized_label TEXT, class_id TEXT, properties TEXT);
          CREATE OR REPLACE TABLE _quack_tmp_graph_node_prov (
@@ -305,52 +306,53 @@ fn fill_scratch_tables(db: &WorkspaceDb, staged: &Staged) -> Result<()> {
          CREATE OR REPLACE TABLE _quack_tmp_graph_edge_prov (
             source_norm TEXT, source_class TEXT, target_norm TEXT, target_class TEXT, relation_id TEXT, row_key TEXT);",
     )?;
-    let mut nodes = conn.appender("_quack_tmp_graph_nodes")?;
-    for (key, node) in &staged.nodes {
-        nodes.append_row(duckdb::params![
-            node.id,
-            node.label,
-            key.normalized,
-            key.class_id,
-            serde_json::to_string(&node.properties)?
-        ])?;
+        let mut nodes = conn.appender("_quack_tmp_graph_nodes")?;
+        for (key, node) in &self.nodes {
+            nodes.append_row(duckdb::params![
+                node.id,
+                node.label,
+                key.normalized,
+                key.class_id,
+                serde_json::to_string(&node.properties)?
+            ])?;
+        }
+        nodes.flush()?;
+        let mut node_prov = conn.appender("_quack_tmp_graph_node_prov")?;
+        for source in &self.node_sources {
+            node_prov.append_row(duckdb::params![
+                source.subject.normalized,
+                source.subject.class_id,
+                source.row_key
+            ])?;
+        }
+        node_prov.flush()?;
+        let mut edges = conn.appender("_quack_tmp_graph_edges")?;
+        for (edge, id) in &self.edges {
+            edges.append_row(duckdb::params![
+                id,
+                edge.source.normalized,
+                edge.source.class_id,
+                edge.target.normalized,
+                edge.target.class_id,
+                edge.relation
+            ])?;
+        }
+        edges.flush()?;
+        let mut edge_prov = conn.appender("_quack_tmp_graph_edge_prov")?;
+        for source in &self.edge_sources {
+            let edge = &source.subject;
+            edge_prov.append_row(duckdb::params![
+                edge.source.normalized,
+                edge.source.class_id,
+                edge.target.normalized,
+                edge.target.class_id,
+                edge.relation,
+                source.row_key
+            ])?;
+        }
+        edge_prov.flush()?;
+        Ok(())
     }
-    nodes.flush()?;
-    let mut node_prov = conn.appender("_quack_tmp_graph_node_prov")?;
-    for source in &staged.node_sources {
-        node_prov.append_row(duckdb::params![
-            source.subject.normalized,
-            source.subject.class_id,
-            source.row_key
-        ])?;
-    }
-    node_prov.flush()?;
-    let mut edges = conn.appender("_quack_tmp_graph_edges")?;
-    for (edge, id) in &staged.edges {
-        edges.append_row(duckdb::params![
-            id,
-            edge.source.normalized,
-            edge.source.class_id,
-            edge.target.normalized,
-            edge.target.class_id,
-            edge.relation
-        ])?;
-    }
-    edges.flush()?;
-    let mut edge_prov = conn.appender("_quack_tmp_graph_edge_prov")?;
-    for source in &staged.edge_sources {
-        let edge = &source.subject;
-        edge_prov.append_row(duckdb::params![
-            edge.source.normalized,
-            edge.source.class_id,
-            edge.target.normalized,
-            edge.target.class_id,
-            edge.relation,
-            source.row_key
-        ])?;
-    }
-    edge_prov.flush()?;
-    Ok(())
 }
 
 fn merge_scratch_tables(db: &WorkspaceDb, table: &str, provisional: bool) -> Result<()> {
