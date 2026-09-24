@@ -178,15 +178,10 @@ mod tests {
     const SAMPLE: &str = "[general]\nchat_model = \"ollama/llama3.1:8b\"\n\
                           [providers.ollama]\ntype = \"ollama\"\n[retrieval]\ntop_k = 3\n";
 
-    fn report(contents: Option<&str>, json: bool, changed: bool) -> (String, bool) {
+    fn report(contents: Option<&str>, format: TextOrJson, filter: SettingFilter) -> (String, bool) {
         let inspection = Inspection::of(PathBuf::from("/tmp/config.toml"), contents);
         let mut out = Vec::new();
-        let filter = if changed {
-            SettingFilter::Changed
-        } else {
-            SettingFilter::All
-        };
-        let usable = run(&mut out, &inspection, TextOrJson::of(json), filter).unwrap();
+        let usable = run(&mut out, &inspection, format, filter).unwrap();
         (String::from_utf8(out).unwrap(), usable)
     }
 
@@ -199,7 +194,7 @@ mod tests {
 
     #[test]
     fn text_report_lists_every_setting_with_its_origin() {
-        let (text, usable) = report(Some(SAMPLE), false, false);
+        let (text, usable) = report(Some(SAMPLE), TextOrJson::Text, SettingFilter::All);
         assert!(usable);
         assert!(text.contains("[retrieval]"), "{text}");
 
@@ -221,14 +216,18 @@ mod tests {
 
     #[test]
     fn changed_report_leaves_out_untouched_defaults() {
-        let (text, _) = report(Some(SAMPLE), false, true);
+        let (text, _) = report(Some(SAMPLE), TextOrJson::Text, SettingFilter::Changed);
         assert!(text.contains("top_k"), "{text}");
         assert!(!text.contains("rrf_k"), "{text}");
     }
 
     #[test]
     fn an_unknown_key_is_named_with_what_it_resembles() {
-        let (text, usable) = report(Some("[retrieval]\ntopk = 3\n"), false, false);
+        let (text, usable) = report(
+            Some("[retrieval]\ntopk = 3\n"),
+            TextOrJson::Text,
+            SettingFilter::All,
+        );
         assert!(!usable, "a key no section knows is refused: {text}");
         assert!(text.contains("REJECTED"), "{text}");
         assert!(text.contains("retrieval.topk"), "{text}");
@@ -241,8 +240,8 @@ mod tests {
         // listing must not claim the file's values are the ones running.
         let (text, usable) = report(
             Some("[general]\nchat_model = \"missing/m\"\n"),
-            false,
-            false,
+            TextOrJson::Text,
+            SettingFilter::All,
         );
         assert!(!usable);
         assert!(text.contains("REJECTED"), "{text}");
@@ -256,7 +255,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_says_so_and_still_lists_the_settings() {
-        let (text, usable) = report(None, false, false);
+        let (text, usable) = report(None, TextOrJson::Text, SettingFilter::All);
         assert!(usable);
         assert!(text.contains("no file"), "{text}");
         assert!(text.contains("top_k"), "{text}");
@@ -264,7 +263,7 @@ mod tests {
 
     #[test]
     fn json_report_honors_changed() {
-        let (text, _) = report(Some(SAMPLE), true, true);
+        let (text, _) = report(Some(SAMPLE), TextOrJson::Json, SettingFilter::Changed);
         let value: Value = serde_json::from_str(&text).unwrap();
         let keys: Vec<&str> = value["settings"]
             .as_array()
@@ -278,7 +277,7 @@ mod tests {
 
     #[test]
     fn json_report_carries_the_same_facts() {
-        let (text, _) = report(Some(SAMPLE), true, false);
+        let (text, _) = report(Some(SAMPLE), TextOrJson::Json, SettingFilter::All);
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["config_file"]["state"], "loaded");
         let settings = value["settings"].as_array().unwrap();

@@ -4,23 +4,21 @@ use std::fmt;
 use std::io::Write;
 
 use anyhow::Result;
+use clap::ValueEnum;
 use serde::Serialize;
 
-/// How a command prints what it found: the text rendering, or JSON
-/// (`--json`, `--format json`): one pretty document for a single value,
-/// one object per line for a listing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a command prints what it found (`--format`): the text rendering,
+/// or JSON: one pretty document for a single value, one object per line
+/// for a listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum TextOrJson {
+    /// For a person
     Text,
+    /// For a program
     Json,
 }
 
 impl TextOrJson {
-    /// `--json` given, or not.
-    pub(crate) const fn of(json: bool) -> Self {
-        if json { Self::Json } else { Self::Text }
-    }
-
     /// `value` as its text rendering, or as one pretty JSON document.
     pub(crate) fn write<T: Serialize + fmt::Display>(
         self,

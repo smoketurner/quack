@@ -698,7 +698,7 @@ mod tests {
             "--yes is implied in the terminal"
         );
         assert!(words("/ontology propose --documents --d").is_empty());
-        assert_eq!(words("/graph extract --documents-only --s"), ["--sample"]);
+        assert_eq!(words("/graph extract --source documents --s"), ["--sample"]);
         assert!(
             words("/graph Alice").is_empty(),
             "an entity name gets nothing"
@@ -800,7 +800,7 @@ mod tests {
         assert!(parses("/path Alice -> Bob"));
         assert!(parses("/graph --class Person"));
         assert!(parses("/graph Alice 2"));
-        assert!(parses("/graph status --json"));
+        assert!(parses("/graph status --format json"));
         assert!(parses("/q"));
         assert!(parses("/? "));
         assert!(parses("/sql SELECT '-h' --help"), "free text keeps -h");

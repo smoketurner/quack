@@ -59,7 +59,7 @@ if [ ! -s "$cache/shipments.csv" ]; then
        { print }' "$cache/shipments-raw.csv" >"$cache/shipments.csv"
 fi
 
-present="$("$quack" docs -w "$workspace" --json 2>/dev/null || true)"
+present="$("$quack" docs -w "$workspace" --format json 2>/dev/null || true)"
 
 if [ "$reset" = 1 ] && [ -n "$present" ]; then
   echo "removing every document in '$workspace'"

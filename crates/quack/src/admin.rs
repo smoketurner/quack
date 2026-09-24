@@ -61,8 +61,9 @@ pub(crate) enum UserAction {
     },
     /// List users
     List {
-        #[arg(long)]
-        json: bool,
+        /// `json` prints one JSON object per row
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
     },
 }
 
@@ -85,8 +86,9 @@ pub(crate) enum TokenAction {
     },
     /// List the workspace's tokens
     List {
-        #[arg(long)]
-        json: bool,
+        /// `json` prints one JSON object per row
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
     },
     /// Revoke a token by its hash (prefixes accepted)
     Revoke { token_hash: String },
@@ -104,8 +106,9 @@ pub(crate) enum MemberAction {
     Remove { username: String },
     /// List members
     List {
-        #[arg(long)]
-        json: bool,
+        /// `json` prints one JSON object per row
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
     },
 }
 
@@ -171,10 +174,10 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
             )?;
             out.flush()?;
         }
-        UserAction::List { json } => {
+        UserAction::List { format } => {
             let users = control.list_users().await?;
             let mut out = std::io::BufWriter::new(stdout.lock());
-            TextOrJson::of(json).write_rows(
+            format.write_rows(
                 &mut out,
                 &users,
                 "No users yet. Run `quack user add NAME`.",
@@ -209,7 +212,7 @@ pub(crate) async fn run_token(
             scopes,
             expires,
         } => create_token(&control, &ws, &user, &name, &scopes, expires).await,
-        TokenAction::List { json } => list_tokens(&control, &ws, TextOrJson::of(json)).await,
+        TokenAction::List { format } => list_tokens(&control, &ws, format).await,
         TokenAction::Revoke { token_hash } => revoke_token(&control, &ws, &token_hash).await,
     }
 }
@@ -341,10 +344,10 @@ pub(crate) async fn run_member(
             }
             out.flush()?;
         }
-        MemberAction::List { json } => {
+        MemberAction::List { format } => {
             let members = control.list_members(&ws.id).await?;
             let mut out = std::io::BufWriter::new(stdout.lock());
-            TextOrJson::of(json).write_rows(
+            format.write_rows(
                 &mut out,
                 &members,
                 &format!("No members in '{}'.", ws.name),

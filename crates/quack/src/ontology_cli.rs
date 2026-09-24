@@ -28,9 +28,9 @@ use quack_core::storage::writer::Writer;
 pub(crate) enum OntologyAction {
     /// Print the current ontology: classes, relations, properties, mappings
     Show {
-        /// Print the JSON interchange form instead
-        #[arg(long)]
-        json: bool,
+        /// `json` prints the JSON interchange form
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
     },
     /// Install the built-in general ontology as version 1
     Init,
@@ -148,8 +148,7 @@ pub(crate) async fn run(
         OntologyAction::Propose(args) => {
             run_propose(config, db, args, confirm, out, control).await?;
         }
-        OntologyAction::Show { json } => {
-            let format = TextOrJson::of(json);
+        OntologyAction::Show { format } => {
             db.render(out, move |db, out| show(db, format, out)).await?;
         }
         OntologyAction::Init => db.render(out, init).await?,

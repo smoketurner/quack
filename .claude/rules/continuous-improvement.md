@@ -39,7 +39,7 @@ Workspace members are auto-detected from `Cargo.toml`. Track these logical subsy
 
 - Print mode: `cargo run --bin quack -- -p "question" [-f text|json]`; SQL: `-q "..." [-f ...]`
 - Ingest: `cargo run --bin quack -- ingest FILE`
-- Sessions: `cargo run --bin quack -- sessions [--json]`, `export ID [--sql|--markdown]`,
+- Sessions: `cargo run --bin quack -- sessions [--format json]`, `export ID [--sql|--markdown]`,
   `-p ... -c` / `-r ID`
 - TUI: `cargo run --bin quack -- -w <workspace>` (no arguments, needs a TTY)
 - Target (design doc section 11): `quack serve`, `quack mcp`, `quack desktop`

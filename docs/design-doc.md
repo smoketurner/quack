@@ -1536,10 +1536,10 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
-quack docs [--json] [--pin ID | --unpin ID | --delete ID]
+quack docs [--format json] [--pin ID | --unpin ID | --delete ID]
 quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
-            | path FROM TO [--max-hops N] | status | extract [--tables-only|--documents-only]
+            | path FROM TO [--max-hops N] | status | extract [--source all|tables|documents]
             [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | reject ID..
 quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
               [--auto-accept] [-y] | review [--low-support]
@@ -1548,15 +1548,15 @@ quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
 quack context show | edit | history | export FILE | import FILE
 # Commands that spend model calls ask first ([y/N]) on a terminal; with no
 # terminal the answer is no, and -y / --yes goes ahead.
-quack sessions [--json] [--limit N] | export SESSION [--sql|--markdown]
+quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
-quack config [--changed] [--json]
-quack doctor [-w NAME] [--offline] [--json]
+quack config [--changed] [--format json]
+quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]
 quack mcp [-w NAME] [--allow-write]
-quack user add [--admin] | list [--json] ; quack token create|list|revoke ;
+quack user add [--admin] | list [--format json] ; quack token create|list|revoke ;
 quack member add|remove|list ; quack audit [filters] [--format text|json|csv|ocsf]   (server admin)
 quack --version    version plus the AWS-LC module the binary links; -V is the bare version
 ```
@@ -1580,7 +1580,7 @@ overrides it), what the file says where that is not what is running, the keys in
 no section recognizes with the recognized key each resembles, and which of the
 environment variables the configuration reads are set — never their contents, since some
 of them hold credentials. `--changed` keeps only the settings the file or the environment
-has a say in; `--json` emits the whole report as one document. A rejected file exits 2
+has a say in; `--format json` emits the whole report as one document. A rejected file exits 2
 after printing the report.
 
 `quack doctor` troubleshoots the whole setup, one line per check with the fix under
@@ -1594,7 +1594,7 @@ pulled or listed), and `[server]` (a non-loopback bind warns, `local` off loopba
 no users yet is noted). With no chat model it looks for a local Ollama and suggests a
 `config.toml` snippet with the models that Ollama has. It creates nothing: a data
 directory, control database, or workspace that does not exist yet is reported as such.
-`--offline` skips the network; `--json` emits `{ok, failures, warnings, checks}`. Any
+`--offline` skips the network; `--format json` emits `{ok, failures, warnings, checks}`. Any
 failed check exits 1.
 
 No model is required to run quack. Without `[general].chat_model` the terminal session
