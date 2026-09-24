@@ -11,7 +11,7 @@ use super::store::{self, NewNode, Source};
 use super::{Drift, NormalizedLabel, Properties};
 use crate::error::{Error, Result};
 use crate::extraction::{Extracted, ExtractionRun, Passage, RunProgress, extractions};
-use crate::ids::{ChunkId, DocumentId};
+use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ontology::{self, Ontology, OntologyVersion};
 use crate::storage::workspace::{ChunkSearchResult, SamplePool, WorkspaceDb};
 use crate::storage::writer::Writer;
@@ -398,7 +398,7 @@ pub fn store_validated(
     source: &Source,
     provisional: bool,
 ) -> Result<(u32, u32)> {
-    let mut ids: BTreeMap<NormalizedLabel, String> = BTreeMap::new();
+    let mut ids: BTreeMap<NormalizedLabel, NodeId> = BTreeMap::new();
     let mut nodes = 0u32;
     for node in &validated.nodes {
         let id = store::upsert_node(

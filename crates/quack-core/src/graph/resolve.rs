@@ -11,6 +11,7 @@ use rig::embeddings::EmbeddingModel;
 use super::{GraphOptions, Node, store};
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Record, Result};
+use crate::ids::NodeId;
 use crate::prefix::PrefixMatch;
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{WorkspaceDb, tokenize};
@@ -184,7 +185,7 @@ const NEIGHBOURS_PER_NODE: u32 = 5;
 
 /// One node of a candidate pair.
 struct Side {
-    id: String,
+    id: NodeId,
     label: String,
     /// Whether the node comes from a keyed table row.
     keyed: bool,
@@ -206,7 +207,7 @@ impl Candidate {
 
     /// The node to keep and the one to fold into it: the keyed node, else
     /// the one with more provenance, else the earlier id.
-    fn keep_and_drop(self, db: &WorkspaceDb) -> Result<(String, String)> {
+    fn keep_and_drop(self, db: &WorkspaceDb) -> Result<(NodeId, NodeId)> {
         let prefer_b = match (self.a.keyed, self.b.keyed) {
             (false, true) => true,
             (true, false) => false,
@@ -254,10 +255,10 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
         options.merge_threshold
     ])?;
     let mut candidates: Vec<Candidate> = Vec::new();
-    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+    let mut seen: BTreeMap<NodeId, u32> = BTreeMap::new();
     while let Some(row) = rows.next()? {
-        let a_id: String = row.get(0)?;
-        let b_id: String = row.get(2)?;
+        let a_id: NodeId = row.get(0)?;
+        let b_id: NodeId = row.get(2)?;
         // Each node keeps its NEIGHBOURS_PER_NODE closest candidates.
         let a_seen = seen.get(&a_id).copied().unwrap_or(0);
         let b_seen = seen.get(&b_id).copied().unwrap_or(0);
@@ -284,7 +285,7 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<(u32, u32)
     drop(stmt);
     let mut auto = 0u32;
     let mut proposed = 0u32;
-    let mut gone: BTreeSet<String> = BTreeSet::new();
+    let mut gone: BTreeSet<NodeId> = BTreeSet::new();
     for candidate in candidates {
         if gone.contains(&candidate.a.id)
             || gone.contains(&candidate.b.id)
@@ -341,7 +342,7 @@ fn log_memory(db: &WorkspaceDb, moment: &str) {
     }
 }
 
-fn provenance_count(db: &WorkspaceDb, id: &str) -> Result<i64> {
+fn provenance_count(db: &WorkspaceDb, id: &NodeId) -> Result<i64> {
     Ok(db.connection().query_row(
         "SELECT count(*) FROM _quack_provenance WHERE subject_id = ?",
         duckdb::params![id],
@@ -369,7 +370,7 @@ pub fn share_token(a: &str, b: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error when either node is missing or a write fails.
-pub fn merge_nodes(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
+pub fn merge_nodes(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> {
     db.under_timeout(|db| {
         let tx = db.connection().unchecked_transaction()?;
         merge_nodes_in(db, keep, drop)?;
@@ -378,7 +379,7 @@ pub fn merge_nodes(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
     })
 }
 
-fn merge_nodes_in(db: &WorkspaceDb, keep: &str, drop: &str) -> Result<()> {
+fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> {
     let keep_node =
         store::node(db, keep)?.ok_or_else(|| Error::Analysis(format!("no node {keep}")))?;
     let drop_node =
@@ -460,7 +461,7 @@ pub fn pending(db: &WorkspaceDb) -> Result<Vec<MergeProposal>> {
          WHERE status = ? ORDER BY distance, id",
     )?;
     let mut rows = stmt.query([MergeStatus::Pending])?;
-    let mut raw: Vec<(String, String, String, f64, MergeStatus)> = Vec::new();
+    let mut raw: Vec<(String, NodeId, NodeId, f64, MergeStatus)> = Vec::new();
     while let Some(row) = rows.next()? {
         raw.push((
             row.get(0)?,

@@ -10,7 +10,7 @@ use crate::embedding::{
 };
 use crate::error::{Error, Record, Result};
 use crate::graph;
-use crate::ids::{ChunkId, DocumentId};
+use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{FileType, Load};
 use crate::ontology::store::Acceptance;
@@ -1552,8 +1552,8 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the vector does not fit the columns or the
     /// update fails.
-    pub fn set_node_embedding(&self, node_id: &str, embedding: &Vector) -> Result<()> {
-        self.set_vector(VectorTable::GraphNodes, node_id, embedding)
+    pub fn set_node_embedding(&self, node_id: &NodeId, embedding: &Vector) -> Result<()> {
+        self.set_vector(VectorTable::GraphNodes, node_id.as_str(), embedding)
     }
 
     fn set_vector(&self, table: VectorTable, id: &str, embedding: &Vector) -> Result<()> {

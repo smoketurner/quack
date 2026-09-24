@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::graph::Origin;
 use crate::graph::store::EdgeScope;
 use crate::graph::{self, store as graph_store};
-use crate::ids::DocumentId;
+use crate::ids::{DocumentId, NodeId};
 use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::store::Revision;
 use crate::ontology::{
@@ -756,8 +756,8 @@ impl Exporter<'_> {
         let edges = graph_store::edges(self.db, &ids, EdgeScope::Among)?;
         let subjects: Vec<String> = ids
             .iter()
-            .cloned()
-            .chain(edges.iter().map(|e| e.id.clone()))
+            .map(NodeId::to_string)
+            .chain(edges.iter().map(|e| e.id.to_string()))
             .collect();
         let provenance = graph_store::provenance_of(self.db, &subjects)?;
         // Every path is fixed before any file is written, so a link to a
@@ -771,7 +771,7 @@ impl Exporter<'_> {
                     "entities/{}/{}-{}.md",
                     slug(&node.class_id),
                     slug(&node.label),
-                    node.id.chars().rev().take(6).collect::<String>()
+                    node.id.as_str().chars().rev().take(6).collect::<String>()
                 );
                 seen.insert(path.clone());
             }
@@ -817,7 +817,7 @@ impl EntityExport<'_> {
     fn file(&self, node: &graph::Node, paths: &BTreeMap<&str, String>) -> Result<String> {
         let mut front = FrontMatter::of_type(&node.class_id)
             .field("generator", GENERATOR)
-            .field("id", node.id.clone())
+            .field("id", node.id.to_string())
             .field("title", node.label.clone());
         if node.provisional {
             front = front.tag("provisional");
@@ -864,7 +864,7 @@ impl EntityExport<'_> {
         let sources: Vec<String> = self
             .provenance
             .iter()
-            .filter(|p| p.subject_id == node.id)
+            .filter(|p| p.subject_id == node.id.as_str())
             .map(|p| match &p.origin {
                 Origin::Row {
                     table_name,

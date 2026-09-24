@@ -21,7 +21,7 @@ use axum_extra::extract::CookieJar;
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::citations::Citation;
-use quack_core::ids::{DocumentId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{DocumentId, NodeId, SessionId, UserId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
@@ -422,7 +422,7 @@ struct BulkDecideForm {
 
 /// One node as the graph page's inspector shows it.
 struct GraphNodeView {
-    id: String,
+    id: NodeId,
     label: String,
     class_id: String,
     provisional: bool,
@@ -2151,12 +2151,12 @@ impl GraphResultView {
             items.dedup();
             items.join(", ")
         };
-        let label_of = |id: &str| -> String {
+        let label_of = |id: &NodeId| -> String {
             result
                 .nodes
                 .iter()
-                .find(|n| n.id == id)
-                .map_or_else(|| id.get(..8).unwrap_or(id).to_owned(), |n| n.label.clone())
+                .find(|n| &n.id == id)
+                .map_or_else(|| id.short().to_owned(), |n| n.label.clone())
         };
         let nodes = result
             .nodes
@@ -2172,7 +2172,7 @@ impl GraphResultView {
                     .map(|(k, v)| format!("{k}: {}", JsonText(v)))
                     .collect::<Vec<_>>()
                     .join(" · "),
-                sources: sources_of(&n.id),
+                sources: sources_of(n.id.as_str()),
             })
             .collect();
         let edges = result
@@ -2182,7 +2182,7 @@ impl GraphResultView {
                 source: label_of(&e.source_node_id),
                 relation: e.relation_id.clone(),
                 target: label_of(&e.target_node_id),
-                sources: sources_of(&e.id),
+                sources: sources_of(e.id.as_str()),
             })
             .collect();
         Ok(Self {

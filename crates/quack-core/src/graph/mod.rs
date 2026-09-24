@@ -23,13 +23,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::embedding::{Dimension, Input};
 use crate::extraction::Tally;
-use crate::ids::{ChunkId, DocumentId};
+use crate::ids::{ChunkId, DocumentId, EdgeId, NodeId};
 use crate::ontology::OntologyVersion;
 
 /// A stored node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
-    pub id: String,
+    pub id: NodeId,
     pub label: String,
     pub class_id: String,
     #[serde(default)]
@@ -60,9 +60,9 @@ impl Node {
 /// A stored edge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edge {
-    pub id: String,
-    pub source_node_id: String,
-    pub target_node_id: String,
+    pub id: EdgeId,
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
     pub relation_id: String,
     pub weight: f64,
     #[serde(default)]
@@ -293,7 +293,7 @@ pub struct GraphResult {
     pub provenance: Vec<Provenance>,
     /// Ids of the nodes the query resolved its entry point to.
     #[serde(default)]
-    pub roots: Vec<String>,
+    pub roots: Vec<NodeId>,
     /// How many nodes matched before `max_nodes` applied, when the query
     /// could count them (a class listing). `None` for a walk, which stops
     /// at the cap without knowing what it did not visit.
@@ -326,8 +326,8 @@ impl GraphResult {
         let subjects: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
-            .map(|n| n.id.clone())
-            .chain(self.edges.iter().map(|e| e.id.clone()))
+            .map(|n| n.id.to_string())
+            .chain(self.edges.iter().map(|e| e.id.to_string()))
             .collect();
         self.provenance.retain(|p| subjects.contains(&p.subject_id));
         self.roots.retain(|r| kept.contains(r.as_str()));
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn provisional_results_are_dropped_with_their_edges_and_provenance() {
         let node = |id: &str, provisional: bool| Node {
-            id: id.to_owned(),
+            id: NodeId::from(id.to_owned()),
             label: id.to_owned(),
             class_id: String::from("entity"),
             properties: Properties::default(),
@@ -754,18 +754,18 @@ mod tests {
             nodes: vec![node("a", false), node("b", true), node("c", false)],
             edges: vec![
                 Edge {
-                    id: String::from("ab"),
-                    source_node_id: String::from("a"),
-                    target_node_id: String::from("b"),
+                    id: EdgeId::from("ab"),
+                    source_node_id: NodeId::from("a"),
+                    target_node_id: NodeId::from("b"),
                     relation_id: String::from("mentions"),
                     weight: 1.0,
                     properties: Properties::default(),
                     provisional: false,
                 },
                 Edge {
-                    id: String::from("ac"),
-                    source_node_id: String::from("a"),
-                    target_node_id: String::from("c"),
+                    id: EdgeId::from("ac"),
+                    source_node_id: NodeId::from("a"),
+                    target_node_id: NodeId::from("c"),
                     relation_id: String::from("mentions"),
                     weight: 1.0,
                     properties: Properties::default(),
@@ -794,7 +794,7 @@ mod tests {
                     confidence: 1.0,
                 },
             ],
-            roots: vec![String::from("a"), String::from("b")],
+            roots: vec![NodeId::from("a"), NodeId::from("b")],
             ..GraphResult::default()
         };
         let kept = result.without_provisional();
@@ -804,7 +804,7 @@ mod tests {
             ["ac"]
         );
         assert_eq!(kept.provenance.len(), 1);
-        assert_eq!(kept.roots, ["a"]);
+        assert_eq!(kept.roots, [NodeId::from("a")]);
     }
 
     #[test]
