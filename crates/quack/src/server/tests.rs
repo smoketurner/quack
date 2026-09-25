@@ -3194,6 +3194,35 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             .is_some_and(|c| c.iter().any(|x| x["id"] == "organization")),
         "{restored}"
     );
+    // The ontology `restore_into` seeded is audited as `ontology` (issue #71):
+    // the bundle seeded an ontology into an empty workspace, and the audit
+    // log records who did, with the version as the resource.
+    let ont = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws3.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        ont.len(),
+        1,
+        "one ontology audit row for the restore: {ont:?}"
+    );
+    assert_eq!(ont[0].resource_type.as_deref(), Some("ontology_version"));
+    assert_eq!(ont[0].resource_id.as_deref(), Some("1"));
+    assert_eq!(ont[0].outcome, Outcome::Allowed);
+    let proposed = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws3.clone()),
+            action: Some(String::from("propose")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        proposed.is_empty(),
+        "no propose row when nothing was proposed: {proposed:?}"
+    );
 
     // Import into a fresh workspace: concept files become documents, types
     // and links become candidates, index.md comes back as context.
@@ -3267,6 +3296,57 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         ids.contains(&"vendor") && ids.contains(&"vendor_links_country"),
         "{ids:?}"
     );
+    // The candidate run `restore_into` stored is audited as `propose` (issue
+    // #71), keyed by the run id the pending candidates carry, so the audit
+    // trail records who queued them and correlates with the review queue.
+    let proposed = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws2.clone()),
+            action: Some(String::from("propose")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        proposed.len(),
+        1,
+        "one propose audit row for the run: {proposed:?}"
+    );
+    assert_eq!(proposed[0].resource_type.as_deref(), Some("induction_run"));
+    assert_eq!(proposed[0].outcome, Outcome::Allowed);
+    let run_id = proposed[0].resource_id.clone().unwrap_or_default();
+    assert!(
+        !run_id.is_empty(),
+        "the run id is the audit resource: {proposed:?}"
+    );
+    assert!(
+        body["candidates"].as_array().is_some_and(|cs| cs
+            .iter()
+            .all(|c| c["proposed_by"].as_str() == Some(run_id.as_str()))),
+        "the candidates' proposed_by is the audited run id: {body}"
+    );
+    let ont = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws2.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        ont.is_empty(),
+        "no ontology audit row when the bundle carried no snapshot: {ont:?}"
+    );
+    let ingests = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws2.clone()),
+            action: Some(String::from("ingest")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        ingests.len(),
+        2,
+        "the two ingested documents are audited: {ingests:?}"
+    );
 
     // A body that is not a tar is a 400.
     let request = Request::builder()
@@ -3277,6 +3357,111 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         .unwrap_or_else(|e| fail(&e.to_string()));
     let (status, _, _) = h.send(request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_bundle_audits_both_the_ontology_restore_and_the_candidate_run() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "mix" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    // A bundle that carries an ontology snapshot (so it restores) and one
+    // foreign concept file (so it also proposes a class): one import does
+    // both writes, so it must record both audit rows.
+    let mut incoming = TarSink::new(Vec::new());
+    let snapshot = "---\ntype: ontology\ngenerator: quack\n---\n# Ontology\n\n```json\n{}\n```\n";
+    for (path, content) in [
+        ("ontology/ontology.md", snapshot),
+        (
+            "widgets/acme.md",
+            "---\ntype: Widget\ntitle: Acme\n---\nMade of steel.\n",
+        ),
+    ] {
+        incoming
+            .file(path, content)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws}/documents"))
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .body(Body::from(
+            incoming.finish().unwrap_or_else(|e| fail(&e.to_string())),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["ontology_version"], 1, "{body}");
+    assert_eq!(body["candidates"], 1, "{body}");
+    assert_eq!(
+        body["documents"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+
+    // The ontology restore is audited as `ontology`, keyed by the version.
+    let ont = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(ont.len(), 1, "one ontology audit row: {ont:?}");
+    assert_eq!(ont[0].resource_type.as_deref(), Some("ontology_version"));
+    assert_eq!(ont[0].resource_id.as_deref(), Some("1"));
+    assert_eq!(ont[0].outcome, Outcome::Allowed);
+
+    // The candidate run is audited as `propose`, keyed by the run id the
+    // pending candidate carries as `proposed_by`.
+    let proposed = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("propose")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(proposed.len(), 1, "one propose audit row: {proposed:?}");
+    assert_eq!(proposed[0].resource_type.as_deref(), Some("induction_run"));
+    assert_eq!(proposed[0].outcome, Outcome::Allowed);
+    let run_id = proposed[0].resource_id.clone().unwrap_or_default();
+    assert!(
+        !run_id.is_empty(),
+        "the run id is the audit resource: {proposed:?}"
+    );
+    let (_, body) = h
+        .get(&format!("/api/v1/workspaces/{ws}/ontology/candidates"), "")
+        .await;
+    assert_eq!(
+        body["candidates"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        body["candidates"][0]["proposed_by"].as_str(),
+        Some(run_id.as_str()),
+        "the candidate's proposed_by is the audited run id: {body}"
+    );
+
+    // The concept file was ingested as a document and that is audited too.
+    let ingests = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("ingest")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        ingests.len(),
+        1,
+        "the one ingested document is audited: {ingests:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

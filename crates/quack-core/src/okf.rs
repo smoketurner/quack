@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::graph;
-use crate::ids::{ClassId, RelationId};
+use crate::ids::{ClassId, RelationId, RunId};
 use crate::ontology::induction::{Candidate, Proposal};
 use crate::ontology::store::Revision;
 use crate::ontology::{
@@ -247,12 +247,15 @@ impl Bundle {
             current = Some(saved);
         }
         let candidates = propose(self, current.as_ref());
-        if !candidates.is_empty() {
-            candidates::store_run(db, &candidates)?;
-        }
+        let run = if candidates.is_empty() {
+            None
+        } else {
+            Some(candidates::store_run(db, &candidates)?)
+        };
         Ok(RestoreReport {
             restored,
             candidates: candidates.len(),
+            run,
         })
     }
 
@@ -276,13 +279,15 @@ impl Bundle {
 }
 
 /// What restoring a bundle did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreReport {
     /// The version the bundle's ontology was saved as, when the workspace
     /// had none and the bundle carried one.
     pub restored: Option<OntologyVersion>,
     /// Candidates the bundle's types and links queued for review.
     pub candidates: usize,
+    /// The run id the candidates were stored under, when any were.
+    pub run: Option<RunId>,
 }
 
 /// The `generator` front-matter value on every stub quack exports.
