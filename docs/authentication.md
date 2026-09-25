@@ -292,6 +292,19 @@ needs no login; its first request obtains a token, and `quack auth login` only c
 credentials. quack stores the token sealed in `control.db` (`provider_tokens`), so one login
 serves every later process that uses the same data directory, including `quack serve`.
 
+The renewal lock covers one process. Two processes that share a data directory, such as
+`quack serve` and a `quack -p` beside it, can both find the token expiring and both refresh
+it. Many issuers rotate refresh tokens: each refresh returns a new one and refuses the old.
+The process that refreshes second then presents a refresh token the first already used, and
+the issuer refuses it. On a refused refresh, quack reads the stored token again, and when
+another process has stored a different, unexpired token meanwhile, uses that one instead of
+asking for a login. This does not help with an issuer that treats the reuse of a refresh
+token as theft and revokes the whole token family, as Okta's and Auth0's refresh token
+rotation with reuse detection do: the reuse also revokes the token the first process just
+stored, and every process needs `quack auth login` again. With such an issuer, let one
+process do the refreshing: run the model calls through one long-lived process, such as
+`quack serve`, rather than several processes on one data directory.
+
 `client_auth` sets how quack presents its secret at the token endpoint. The default,
 `client_secret_post`, sends it in the request body, which Entra ID and Auth0 accept.
 `client_secret_basic` sends it in an HTTP Basic header, which Okta applications use by

@@ -556,13 +556,57 @@ impl TokenManager {
                 let Some(refresh) = cached.refresh_token.as_ref() else {
                     return Err(self.auth_required(AuthReason::ExpiredNoRefresh));
                 };
-                self.refresh(refresh).await?
+                match self.refresh(refresh).await {
+                    Ok(renewed) => renewed,
+                    Err(e) => {
+                        let Some(stored) = self.renewed_elsewhere(&cached).await else {
+                            return Err(e);
+                        };
+                        let access = stored.access_token.clone();
+                        *self.current.write().await = Some(stored);
+                        return Ok(access);
+                    }
+                }
             }
         };
         let access = renewed.access_token.clone();
         self.store.store(&renewed).await?;
         *self.current.write().await = Some(renewed);
         Ok(access)
+    }
+
+    /// After a refused refresh: the token another process sharing the data
+    /// directory stored meanwhile, when it differs from `tried` and is fresh.
+    ///
+    /// The refresh lock is per process, so two processes can both refresh
+    /// the same token. Where the issuer rotates refresh tokens, the one
+    /// that loses presents a refresh token the winner already used and is
+    /// refused, although the winner has stored a good token (#249). An
+    /// issuer that answers such reuse by revoking the whole token family
+    /// (Okta's and Auth0's reuse detection) leaves nothing to find here;
+    /// `docs/authentication.md` covers that case.
+    async fn renewed_elsewhere(&self, tried: &CachedToken) -> Option<CachedToken> {
+        let stored = match self.store.load().await {
+            Ok(stored) => stored?,
+            Err(e) => {
+                tracing::warn!(provider = %self.provider, error = %e, "re-reading the stored token after a refused refresh failed");
+                return None;
+            }
+        };
+        let changed = stored
+            .refresh_token
+            .as_ref()
+            .map(ExposeSecret::expose_secret)
+            != tried
+                .refresh_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret)
+            || stored.access_token.expose_secret() != tried.access_token.expose_secret();
+        let usable = changed && stored.is_fresh(Timestamp::now(), REUSE_MARGIN);
+        if usable {
+            tracing::info!(provider = %self.provider, "the refresh was refused, but another process has renewed the token; using it");
+        }
+        usable.then_some(stored)
     }
 
     async fn fresh_in_memory(&self) -> Option<SecretString> {
