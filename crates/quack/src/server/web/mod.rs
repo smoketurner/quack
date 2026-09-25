@@ -25,7 +25,7 @@ use quack_core::analysis::events::ToolStep;
 use quack_core::ids::{
     CandidateId, ClassId, DocumentId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
 };
-use quack_core::ontology::candidates::Queue;
+use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
     Ontology, OntologyDiff, OntologyVersion, candidates, store as ontology_store,
@@ -410,24 +410,10 @@ struct OntologyQuery {
     page: Option<usize>,
 }
 
-/// The review-queue bulk action: `accept`/`reject` the ticked candidates,
-/// or `accept_all`/`reject_all` to flush the whole pending queue at once.
-/// The whole-queue flush is a deliberate, visible counterpart to the
-/// per-run `--auto-accept`, which scopes its acceptance to one run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum BulkAction {
-    Accept,
-    Reject,
-    AcceptAll,
-    RejectAll,
-}
-
 #[derive(Deserialize)]
 struct BulkDecideForm {
-    /// `accept` or `reject` the ticked candidates, or `accept_all` /
-    /// `reject_all` to flush the whole pending queue.
-    bulk: BulkAction,
+    /// `accept` or `reject`.
+    bulk: CandidateAction,
     #[serde(default)]
     ids: Vec<String>,
     /// The queue to return to.
@@ -1378,8 +1364,7 @@ async fn ontology_page(
     })
 }
 
-/// Accept or reject every ticked candidate at once (issue #55), or flush the
-/// whole pending queue with `accept_all` / `reject_all`.
+/// Accept or reject every ticked candidate at once (issue #55).
 async fn ontology_decide_many(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1391,28 +1376,15 @@ async fn ontology_decide_many(
         Queue::LowSupport => format!("/w/{id}/ontology?status={}", Queue::LowSupport),
         Queue::Pending => format!("/w/{id}/ontology"),
     };
-    // `accept`/`reject` stay silent on success (the queue page shows the
-    // result); `accept_all`/`reject_all` confirm how many were decided,
-    // since accepting the whole queue is a larger, visible action.
-    let result: Result<Option<String>, ApiError> = match form.bulk {
-        BulkAction::Accept => access
-            .decide_candidates(&app, form.ids, Vec::new())
-            .await
-            .map(|_| None),
-        BulkAction::Reject => access
-            .decide_candidates(&app, Vec::new(), form.ids)
-            .await
-            .map(|_| None),
-        BulkAction::AcceptAll => access
-            .accept_all_pending(&app)
-            .await
-            .map(|a| Some(format!("accepted {} pending candidate(s)", a.accepted))),
-        BulkAction::RejectAll => access
-            .reject_all_pending(&app)
-            .await
-            .map(|n| Some(format!("rejected {n} pending candidate(s)"))),
+    let (accept, reject) = match form.bulk {
+        CandidateAction::Accept => (form.ids, Vec::new()),
+        CandidateAction::Reject => (Vec::new(), form.ids),
+        CandidateAction::Rename | CandidateAction::MergeInto | CandidateAction::Reparent => {
+            return Ok(Flash::error(back, "the bulk action is accept or reject").into_response());
+        }
     };
-    Ok(Flash::after(back, result, |notice| notice).into_response())
+    let decided = access.decide_candidates(&app, accept, reject).await;
+    Ok(Flash::after(back, decided, |_| None).into_response())
 }
 
 /// A review-queue row: what the candidate is and the evidence for it.
