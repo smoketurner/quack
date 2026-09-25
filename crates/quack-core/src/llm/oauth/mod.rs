@@ -9,15 +9,17 @@
 //! in with Authorization Code and PKCE through the browser and a loopback
 //! listener, or with the device-code flow where no browser can open, and a
 //! refresh token renews it; or quack authenticates as itself with the
-//! client-credentials grant, run again whenever the token runs out.
+//! client-credentials grant, run again whenever the token runs out. The
+//! token is kept in `control.db`, sealed by the vault (`store.rs`).
 
-mod cache;
 mod key_slot;
 mod keychain;
+mod store;
+mod token;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -39,10 +41,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
-pub(crate) use cache::Plaintext;
-pub use cache::{CachedToken, TokenCache};
 pub(crate) use key_slot::KeySlot;
 pub use key_slot::{KeyLocation, KeySource};
+use store::ProviderTokens;
+pub use token::CachedToken;
+pub(crate) use token::Plaintext;
 
 use crate::config::{Config, Grant, OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
@@ -193,10 +196,10 @@ pub enum LoginFlow {
 #[derive(Debug, Clone)]
 pub struct AuthStatus {
     pub provider: String,
-    /// The cached token, `None` when not logged in.
+    /// The stored token, `None` when not logged in.
     pub token: Option<TokenStatus>,
+    /// Where the vault key that seals it is.
     pub key_location: KeyLocation,
-    pub cache_path: PathBuf,
 }
 
 /// A cached token's lifetime, as `quack auth status` shows it.
@@ -227,11 +230,20 @@ impl std::fmt::Display for Renewal {
     }
 }
 
-/// One provider's OAuth state: the config, the cache, and the in-memory token.
+/// Which shared manager a provider gets: one per provider per data
+/// directory, since the directory's `control.db` holds its token.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ManagerKey {
+    data_dir: PathBuf,
+    provider: ProviderName,
+}
+
+/// One provider's OAuth state: the config, the stored token, and the
+/// in-memory one.
 pub struct TokenManager {
     provider: ProviderName,
     config: OAuthConfig,
-    cache: TokenCache,
+    store: ProviderTokens,
     http: OAuthHttp,
     endpoints: OnceCell<Endpoints>,
     current: RwLock<Option<CachedToken>>,
@@ -243,7 +255,7 @@ impl std::fmt::Debug for TokenManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenManager")
             .field("provider", &self.provider)
-            .field("cache", &self.cache)
+            .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
@@ -266,7 +278,7 @@ impl TokenManager {
                 "provider '{name}' does not use auth = \"oauth\""
             )));
         };
-        Self::shared(&config.tokens_dir(), name, oauth)
+        Self::shared(config, name, oauth)
     }
 
     /// One manager per provider per process, shared across turns and (later)
@@ -276,13 +288,13 @@ impl TokenManager {
     ///
     /// Returns an error when the provider is not configured for OAuth or the
     /// manager cannot be built.
-    pub fn shared(
-        tokens_dir: &Path,
-        name: &ProviderName,
-        oauth: &OAuthConfig,
-    ) -> Result<Arc<Self>> {
-        static MANAGERS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokenManager>>>> = OnceLock::new();
-        let key = tokens_dir.join(name.as_str());
+    pub fn shared(config: &Config, name: &ProviderName, oauth: &OAuthConfig) -> Result<Arc<Self>> {
+        static MANAGERS: OnceLock<StdMutex<HashMap<ManagerKey, Arc<TokenManager>>>> =
+            OnceLock::new();
+        let key = ManagerKey {
+            data_dir: config.data_dir().to_path_buf(),
+            provider: name.clone(),
+        };
         let mut managers = MANAGERS
             .get_or_init(|| StdMutex::new(HashMap::new()))
             .lock()
@@ -290,31 +302,27 @@ impl TokenManager {
         if let Some(existing) = managers.get(&key) {
             return Ok(Arc::clone(existing));
         }
-        let manager = Arc::new(Self::new(
-            tokens_dir,
-            name,
-            oauth.clone(),
-            KeySource::Keychain,
-        )?);
+        let manager = Arc::new(Self::new(config, name, oauth.clone(), KeySource::Keychain)?);
         managers.insert(key, Arc::clone(&manager));
         Ok(manager)
     }
 
-    /// A manager for `provider`, caching under `tokens_dir`.
+    /// A manager for `provider`, keeping its token in the `control.db` of
+    /// `config`'s data directory.
     ///
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be built.
     pub fn new(
-        tokens_dir: &Path,
+        config: &Config,
         provider: &ProviderName,
-        config: OAuthConfig,
+        oauth: OAuthConfig,
         key_source: KeySource,
     ) -> Result<Self> {
         Ok(Self {
             provider: provider.clone(),
-            config,
-            cache: TokenCache::new(tokens_dir, provider, key_source),
+            config: oauth,
+            store: ProviderTokens::new(config, provider, key_source),
             http: OAuthHttp::new()?,
             endpoints: OnceCell::new(),
             current: RwLock::new(None),
@@ -347,9 +355,10 @@ impl TokenManager {
         if let Some(token) = self.fresh_in_memory().await {
             return Ok(token);
         }
-        // Prefer the file: another process (a login, a refresh that rotated
-        // the refresh token) may have written it since this token was read.
-        let cached = match self.cache.load().await? {
+        // Prefer the stored token: another process (a login, a refresh that
+        // rotated the refresh token) may have written it since this one was
+        // read.
+        let cached = match self.store.load().await? {
             Some(token) => Some(token),
             None => self.current.read().await.clone(),
         };
@@ -371,7 +380,7 @@ impl TokenManager {
             }
         };
         let access = renewed.access_token.clone();
-        self.cache.store(&renewed).await?;
+        self.store.store(&renewed).await?;
         *self.current.write().await = Some(renewed);
         Ok(access)
     }
@@ -433,7 +442,7 @@ impl TokenManager {
             }
             (Grant::AuthorizationCode, LoginFlow::Configured) => self.login_browser(notify).await?,
         };
-        self.cache.store(&token).await?;
+        self.store.store(&token).await?;
         *self.current.write().await = Some(token.clone());
         tracing::info!(provider = %self.provider, expires_at = %token.expires_at, "login complete");
         Ok(token)
@@ -541,13 +550,13 @@ impl TokenManager {
         Ok(CachedToken::from_response(&response))
     }
 
-    /// Whether a token is cached, and its lifetime, without any network use.
+    /// Whether a token is stored, and its lifetime, without any network use.
     ///
     /// # Errors
     ///
-    /// Returns an error when the cache exists but cannot be read.
+    /// Returns an error when the stored token cannot be read.
     pub async fn status(&self) -> Result<AuthStatus> {
-        let cached = self.cache.load().await?;
+        let cached = self.store.load().await?;
         Ok(AuthStatus {
             provider: self.provider.to_string(),
             token: cached.map(|t| TokenStatus {
@@ -558,20 +567,19 @@ impl TokenManager {
                     (Grant::AuthorizationCode | Grant::DeviceCode, false) => Renewal::Relogin,
                 },
             }),
-            key_location: self.cache.key_location(),
-            cache_path: self.cache.path().to_path_buf(),
+            key_location: self.store.key_location(),
         })
     }
 
-    /// Forget the cached token and its key.
+    /// Forget the stored token.
     ///
     /// # Errors
     ///
-    /// Returns an error when the cache files cannot be removed.
+    /// Returns an error when it cannot be deleted.
     pub async fn logout(&self) -> Result<()> {
         let _refreshing = self.refresh_lock.lock().await;
         *self.current.write().await = None;
-        self.cache.clear().await
+        self.store.clear().await
     }
 
     fn scopes(&self) -> Vec<Scope> {

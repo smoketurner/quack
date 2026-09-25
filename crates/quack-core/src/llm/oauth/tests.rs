@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use std::path::Path;
+
 use super::*;
 
 /// What the mock issuer does and what it saw.
@@ -235,9 +237,17 @@ fn fail(msg: &str) -> ! {
     panic!("{msg}")
 }
 
+/// A config whose data directory is `dir`: the token lands in its
+/// `control.db`, sealed under its `vault.key`.
+fn config_at(dir: &Path) -> Config {
+    let mut config = Config::default();
+    config.general.data_dir = dir.to_path_buf();
+    config
+}
+
 fn manager(dir: &Path, idp: &MockIdp, grant: Grant) -> TokenManager {
     match TokenManager::new(
-        dir,
+        &config_at(dir),
         &name("p"),
         oauth_config(&idp.issuer, grant),
         KeySource::File,
@@ -263,7 +273,7 @@ async fn fresh_cached_token_is_reused_without_the_network() {
     let dir = temp();
     let m = manager(dir.path(), &idp, Grant::AuthorizationCode);
     assert!(
-        m.cache
+        m.store
             .store(&seed(SignedDuration::from_hours(1), Some("r")))
             .await
             .is_ok()
@@ -281,7 +291,7 @@ async fn expiring_token_is_refreshed_once_under_concurrency() {
     let dir = temp();
     let m = Arc::new(manager(dir.path(), &idp, Grant::AuthorizationCode));
     assert!(
-        m.cache
+        m.store
             .store(&seed(SignedDuration::from_secs(30), Some("r")))
             .await
             .is_ok()
@@ -297,7 +307,7 @@ async fn expiring_token_is_refreshed_once_under_concurrency() {
         assert!(result.is_ok_and(|r| r.is_ok_and(|t| t.expose_secret() == "refreshed-access")));
     }
     assert_eq!(idp.state.refresh_requests.load(Ordering::SeqCst), 1);
-    let stored = m.cache.load().await;
+    let stored = m.store.load().await;
     assert!(stored.is_ok_and(|t| t.is_some_and(|t| {
         t.access_token.expose_secret() == "refreshed-access"
             && t.refresh_token.as_ref().map(ExposeSecret::expose_secret)
@@ -334,7 +344,7 @@ async fn missing_cache_and_failed_refresh_both_require_a_login() {
     assert!(err.is_some_and(|e| e.to_string().contains("quack auth login p")));
 
     assert!(
-        m.cache
+        m.store
             .store(&seed(SignedDuration::from_secs(-5), Some("r")))
             .await
             .is_ok()
@@ -350,7 +360,7 @@ async fn missing_cache_and_failed_refresh_both_require_a_login() {
     )));
 
     assert!(
-        m.cache
+        m.store
             .store(&seed(SignedDuration::from_secs(-5), None))
             .await
             .is_ok()
@@ -430,7 +440,7 @@ async fn client_credentials_needs_no_login_and_runs_again_when_the_token_runs_ou
     let fresh = manager(dir.path(), &idp, Grant::ClientCredentials);
     assert!(
         fresh
-            .cache
+            .store
             .store(&seed(SignedDuration::from_secs(30), Some("r")))
             .await
             .is_ok()
@@ -467,7 +477,8 @@ async fn a_refused_client_secret_is_an_error_not_a_login_prompt() {
     let mut config = oauth_config(&idp.issuer, Grant::ClientCredentials);
     // Set by cargo for every test run, and not the secret the issuer expects.
     config.client_secret_env = Some(String::from("CARGO_PKG_VERSION"));
-    let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
+    let Ok(m) = TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+    else {
         fail("manager build failed");
     };
     let err = m.access_token().await.err();
@@ -560,14 +571,15 @@ async fn browser_login_reports_the_issuer_error() {
     assert!(sent.is_ok());
     let err = login.await.ok().and_then(std::result::Result::err);
     assert!(err.is_some_and(|e| e.to_string().contains("access_denied: nope")));
-    assert!(!m.cache.exists());
+    assert!(m.status().await.is_ok_and(|s| s.token.is_none()));
 }
 
 #[tokio::test]
 async fn device_login_without_a_device_endpoint_is_an_error() {
     let dir = temp();
     let config = oauth_config("http://127.0.0.1:9", Grant::DeviceCode);
-    let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
+    let Ok(m) = TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+    else {
         fail("manager build failed");
     };
     let endpoints = Endpoints {
@@ -586,11 +598,12 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
 async fn discovery_failure_is_reported_with_the_url() {
     let dir = temp();
     let config = oauth_config("http://127.0.0.1:9", Grant::AuthorizationCode);
-    let Ok(m) = TokenManager::new(dir.path(), &name("p"), config, KeySource::File) else {
+    let Ok(m) = TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+    else {
         fail("manager build failed");
     };
     assert!(
-        m.cache
+        m.store
             .store(&seed(SignedDuration::from_secs(-5), Some("r")))
             .await
             .is_ok()
@@ -603,10 +616,10 @@ async fn discovery_failure_is_reported_with_the_url() {
 fn shared_manager_is_one_per_provider() {
     let dir = temp();
     let oauth = oauth_config("http://127.0.0.1:9", Grant::AuthorizationCode);
-    let a = TokenManager::shared(dir.path(), &name("shared"), &oauth);
-    let b = TokenManager::shared(dir.path(), &name("shared"), &oauth);
+    let a = TokenManager::shared(&config_at(dir.path()), &name("shared"), &oauth);
+    let b = TokenManager::shared(&config_at(dir.path()), &name("shared"), &oauth);
     assert!(matches!((&a, &b), (Ok(a), Ok(b)) if Arc::ptr_eq(a, b)));
-    let other = TokenManager::shared(dir.path(), &name("other"), &oauth);
+    let other = TokenManager::shared(&config_at(dir.path()), &name("other"), &oauth);
     assert!(matches!((&a, &other), (Ok(a), Ok(o)) if !Arc::ptr_eq(a, o)));
 }
 
@@ -618,4 +631,33 @@ fn random_tokens_are_unique_and_url_safe() {
         t.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }));
+}
+
+#[tokio::test]
+async fn a_login_is_sealed_in_control_db_and_outlives_the_process() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = manager(dir.path(), &idp, Grant::ClientCredentials);
+    assert!(m.login(LoginFlow::Configured, &|_| {}).await.is_ok());
+
+    // A new manager is what a new `quack` process builds.
+    let later = manager(dir.path(), &idp, Grant::ClientCredentials);
+    assert!(
+        later
+            .access_token()
+            .await
+            .is_ok_and(|t| t.expose_secret() == "service-access")
+    );
+    assert_eq!(
+        idp.state.client_credentials_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert!(dir.path().join("control.db").exists());
+    assert!(dir.path().join("vault.key").exists());
+    assert!(!dir.path().join("tokens").exists());
+
+    assert!(later.logout().await.is_ok());
+    assert!(m.status().await.is_ok_and(|s| s.token.is_none()));
+    // The vault key stays: other tokens are sealed with it.
+    assert!(dir.path().join("vault.key").exists());
 }

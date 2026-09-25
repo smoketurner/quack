@@ -160,8 +160,8 @@ it. `--allow-write` lets the agent run mutating SQL without asking; otherwise th
 prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
 clients themselves. OAuth providers (`quack_core::llm::oauth`) hand out a bearer through
 one shared `TokenManager` per provider: PKCE or device-code login via `quack auth` (or the
-client-credentials grant, which needs no login), an
-AES-256-GCM cache under `<data_dir>/tokens/` keyed from the OS keychain or a 0600 key file,
+client-credentials grant, which needs no login), the token sealed by `quack_core::vault` in
+`control.db` (`provider_tokens`; the vault key in the OS keychain or a 0600 `vault.key`),
 silent refresh, and `Error::AuthRequired` (exit 4 from every command that reaches a provider) when no flow can run.
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
 labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `session_id`); a write refused

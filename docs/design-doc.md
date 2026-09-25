@@ -551,6 +551,15 @@ CREATE TABLE workspaces (
     updated_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- a model provider's OAuth token (`quack auth login`), HPKE-sealed by the vault; section 10.2
+CREATE TABLE provider_tokens (
+    provider   TEXT PRIMARY KEY,           -- [providers.NAME]
+    key_id     TEXT NOT NULL,
+    enc        BLOB NOT NULL,
+    ciphertext BLOB NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- a signed-in user's identity-provider token, HPKE-sealed under the server's key
 -- (the vault key: the OS keychain or <data_dir>/vault.key, never here); section 12
 CREATE TABLE user_tokens (
@@ -1331,7 +1340,7 @@ pub struct OAuthConfig {
 pub struct TokenManager {
     provider: String,
     config: OAuthConfig,
-    cache: TokenCache,               // <data_dir>/tokens/<provider>.json, mode 0600
+    store: ProviderTokens,           // control.db provider_tokens, sealed by the vault
     http: reqwest::Client,
     endpoints: OnceCell<Endpoints>,  // discovered once from the issuer
     current: RwLock<Option<CachedToken>>,
@@ -1354,14 +1363,17 @@ refresh failure; in print, ingest, and server modes, where no flow can run, fail
 the first request runs the grant, a token with 60 s or less left is replaced by running it
 again under the same lock (a refresh token is never used), and a refused secret is an error
 naming the grant rather than a login prompt. `quack auth login` on such a provider runs the
-grant once to check the credentials. The cache and key files are named after the provider,
-so a `[providers.NAME]` key is checked when the config is read (`config::ProviderName`: ASCII
-letters, digits, `_`, `-`, `.`, not starting with `.`, at most 64) and cannot point outside
-`<data_dir>/tokens/`. Cache encrypted (AES-256-GCM, the provider name as
-associated data) with a key in the OS keychain where available (macOS Keychain, the Linux
-kernel keyring via `keyutils`, which is always present but in-memory, so a reboot needs a
-new login; Windows Credential Manager), else a 0600 key file. `quack auth status` and
-`logout`. The `oauth2` crate is used without its bundled HTTP client (that would pull
+grant once to check the credentials. The token is kept in `control.db` (`provider_tokens`,
+one row per provider), sealed by the vault (section 10.3) for the `provider-token` purpose
+with the provider name as the subject, so a row copied under another provider's name does
+not open; `control.db` is opened the first time a token is read or written, so a command
+that never reaches the provider never opens it. The vault key is in the OS keychain where
+available (macOS Keychain, the Linux kernel keyring via `keyutils`, which is always
+present but in-memory, so a reboot needs a new login; Windows Credential Manager), else
+`<data_dir>/vault.key` (0600). A `[providers.NAME]` key is checked when the config is read
+(`config::ProviderName`: ASCII letters, digits, `_`, `-`, `.`, not starting with `.`, at
+most 64). `quack auth status` and `logout`; logout deletes the row and keeps the vault key,
+which other tokens use. The `oauth2` crate is used without its bundled HTTP client (that would pull
 `ring`); requests go through the same rustls + aws-lc-rs `reqwest` as rig. Scopes must
 include `offline_access` where the issuer needs it to return a refresh token.
 
@@ -1675,8 +1687,8 @@ failed check exits 1.
 No model is required to run quack. Without `[general].chat_model` the terminal session
 opens, runs typed SQL and every slash command, and answers a question with how to set a
 model up; `-q`, ingest, import, and the server's SQL and table pages work as before. A data
-directory quack creates is `0700` on Unix, since it holds every workspace's content and
-the OAuth token caches.
+directory quack creates is `0700` on Unix, since it holds every workspace's content,
+`control.db`, and, where there is no OS keychain, the vault key file.
 
 ### 11.6 Desktop window (`quack desktop`)
 

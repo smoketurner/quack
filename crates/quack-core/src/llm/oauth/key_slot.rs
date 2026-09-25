@@ -113,29 +113,6 @@ impl KeySlot {
         write_private(&self.file, key.as_bytes())?;
         Ok(key)
     }
-
-    /// Remove the key wherever it is.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the key file cannot be removed.
-    pub(crate) async fn delete(&self) -> Result<()> {
-        remove_if_present(&self.file)?;
-        if self.source == KeySource::Keychain
-            && let Err(e) = self.keychain().delete().await
-        {
-            tracing::warn!(account = %self.account, error = %e, "keychain entry not removed");
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn remove_if_present(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
 }
 
 /// Write a file readable only by its owner.
@@ -180,7 +157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_slot_makes_its_key_once_and_forgets_it_on_delete() {
+    async fn a_file_slot_makes_its_key_once() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let slot = KeySlot::new(
             String::from("test"),
@@ -193,8 +170,5 @@ mod tests {
         let again = slot.read_or_create(|| Ok(String::from("second"))).await;
         assert!(again.is_ok_and(|k| k == "first"));
         assert_eq!(slot.location(), KeyLocation::File);
-        assert!(slot.delete().await.is_ok());
-        assert!(slot.read().await.is_ok_and(|k| k.is_none()));
-        assert!(slot.delete().await.is_ok());
     }
 }

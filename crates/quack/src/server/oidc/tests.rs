@@ -20,7 +20,7 @@ use quack_core::config::{Config, OidcConfig};
 use quack_core::ids::UserId;
 use quack_core::llm::oauth::KeySource;
 use quack_core::oidc::OidcSubject;
-use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome};
+use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome, SealedOwner};
 use quack_core::vault::Vault;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -327,7 +327,7 @@ impl Harness {
     async fn has_token(&self, user: &UserId) -> bool {
         self.app
             .control
-            .sealed_token(user)
+            .sealed(SealedOwner::User(user))
             .await
             .is_ok_and(|t| t.is_some())
     }

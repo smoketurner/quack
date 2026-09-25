@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::llm::oauth::KeySource;
 use crate::oidc::OidcSubject;
+use crate::storage::control::SealedOwner;
 
 #[expect(clippy::panic, reason = "test failure path")]
 fn fail(msg: &str) -> ! {
@@ -58,10 +59,15 @@ async fn a_token_round_trips_and_a_moved_row_does_not_open() {
                 .is_some_and(|r| r.expose_secret() == "ada-access-refresh")
     })));
 
-    let Ok(Some(row)) = control.sealed_token(&ada).await else {
+    let Ok(Some(row)) = control.sealed(SealedOwner::User(&ada)).await else {
         fail("no row");
     };
-    assert!(control.put_sealed_token(&bob, &row).await.is_ok());
+    assert!(
+        control
+            .put_sealed(SealedOwner::User(&bob), &row)
+            .await
+            .is_ok()
+    );
     assert!(matches!(
         tokens.load(&control, &bob).await,
         Err(Error::Vault(_))
