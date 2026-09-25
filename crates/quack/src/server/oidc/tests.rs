@@ -16,12 +16,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jiff::{SignedDuration, Timestamp};
 use quack_core::config::{Config, OidcConfig};
 use quack_core::ids::UserId;
-use quack_core::llm::oauth::KeySource;
+use quack_core::llm::oauth::{CachedToken, KeySource};
 use quack_core::oidc::OidcSubject;
 use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome, SealedOwner};
 use quack_core::vault::Vault;
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -561,6 +563,78 @@ async fn logging_out_of_the_last_session_forgets_the_token() {
             .iter()
             .all(|(outcome, who)| *outcome == Outcome::Allowed && who.as_ref() == Some(&user.id))
     );
+}
+
+/// A sign-in that arrives while the last logout is forgetting the user's
+/// token keeps the token it stores: the logout's check and delete, and the
+/// sign-in's store and session, run under one per-user lock, so the sign-in
+/// waits for the delete instead of landing between the check and it (#241).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
+    let h = Harness::new().await;
+    let cookie = h.sign_in("sub-ray", "ray").await;
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-ray"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"))
+        .id;
+    // The logout has closed the user's last session.
+    let session = cookie
+        .strip_prefix(&format!("{}=", crate::server::auth::SESSION_COOKIE))
+        .unwrap_or_else(|| fail("not a session cookie"));
+    h.app.sessions.close(session);
+    assert!(h.has_token(&user).await);
+
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let mut signing_in = None;
+    let forgotten = oidc
+        .subjects
+        .forget_unless(&user, || {
+            // A new sign-in starts right after the logout found no session:
+            // under the old order it stored its token and opened its session
+            // here, and the delete below removed that token.
+            let app = Arc::clone(&h.app);
+            let who = user.clone();
+            signing_in = Some(tokio::spawn(async move {
+                let token = CachedToken {
+                    access_token: SecretString::from(String::from("fresh")),
+                    expires_at: Timestamp::now()
+                        .checked_add(SignedDuration::from_hours(1))
+                        .unwrap_or_else(|e| fail(&e.to_string())),
+                    refresh_token: None,
+                };
+                let oidc = app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+                oidc.keep_and_open(&app.sessions, &who, &token).await
+            }));
+            // Give the sign-in every chance to run ahead of the delete.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            h.app.sessions.has_sessions(&user)
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(forgotten, "no session was open when the logout checked");
+    let opened = signing_in
+        .unwrap_or_else(|| fail("the sign-in never started"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(opened.is_ok(), "the sign-in failed");
+    assert!(h.app.sessions.has_sessions(&user));
+    assert!(
+        h.has_token(&user).await,
+        "the logout deleted the token of the sign-in that followed it"
+    );
+
+    // With that session open, logging out another one leaves the token.
+    let dropped = oidc
+        .forget_unless_signed_in(&h.app.sessions, &user)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(!dropped);
+    assert!(h.has_token(&user).await);
 }
 
 /// An issuer's access token is not a session: logging out with it closes
