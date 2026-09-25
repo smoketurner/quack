@@ -1102,6 +1102,122 @@ async fn a_failed_first_turn_leaves_no_empty_session_behind() {
     assert_eq!(errors.first().map(|r| r.outcome.as_str()), Some("error"));
 }
 
+/// An authorized search whose embedding provider is unreachable still writes
+/// an `AuditAction::Search` row with `Outcome::Error` and an OCSF `Search`
+/// Failure event — the same way `execute_sql` records a failed statement:
+/// the post-authorization failure is audited before the error is propagated.
+/// Regression test for the `?`-before-audit ordering in the `search` handler.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_authorized_search_is_audited_as_error() {
+    let config = Config::parse(
+        "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 768\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Local, config).await;
+    let (status, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "w" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+
+    // Authorized search whose embeddings call fails post-authorization:
+    // READ is granted, but `embed_interactive` cannot reach the provider.
+    let (status, _body) = h
+        .call(
+            Method::GET,
+            &format!("/api/v1/workspaces/{ws}/search?query=hello"),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        status.is_server_error(),
+        "expected 5xx from the unreachable provider, got {status}"
+    );
+
+    // The failure is audited as a Search row with Outcome::Error — the row
+    // that the bug dropped entirely by propagating the error before auditing.
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("search")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        rows.iter().any(|r| r.outcome == Outcome::Error),
+        "expected an Outcome::Error Search row for the failed authorized search, got {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.request_id.is_some()),
+        "the row carries the request id, like the sql rows"
+    );
+
+    // That row renders as an OCSF API Read Failure (type_uid 600302), the
+    // event SIEM consumers key on for a failed read of this class.
+    let events = rows
+        .iter()
+        .map(AuditRow::to_ocsf)
+        .collect::<quack_core::error::Result<Vec<_>>>()
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type_uid"] == 600_302 && e["status"] == "Failure"),
+        "expected a Search Failure OCSF event, got {events:?}"
+    );
+}
+
+/// The other post-authorization failure family for `search`: a `DuckDB` error
+/// during retrieval. With no embedding model the handler runs the keyword
+/// path; dropping the terms table the search SQL joins on makes
+/// `search_keyword_chunks` error inside the reader transaction. The row is
+/// audited as `Outcome::Error` before the 5xx is returned — the DB leg of the
+/// same fix, driven end to end through the real HTTP route.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_authorized_search_on_a_db_error_is_audited_as_error() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("searchdb", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| db.execute_statement("DROP TABLE _quack_terms"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    let (status, _body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/search?query=hello"),
+            &token,
+        )
+        .await;
+    assert!(
+        status.is_server_error(),
+        "expected 5xx from the broken terms table, got {status}"
+    );
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("search")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        rows.iter().any(|r| r.outcome == Outcome::Error),
+        "expected an Outcome::Error Search row for the failed DB search, got {rows:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_are_deleted_by_their_creator_or_an_owner() {
     use quack_core::storage::sessions::{ChatMode, create_session};
@@ -2686,6 +2802,133 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
             .filter(|r| r.outcome == Outcome::Denied)
             .count(),
         1
+    );
+}
+
+/// An authorized MCP `search` whose embedding provider is unreachable
+/// returns a structured tool `failure` to the client (MCP's normal
+/// tool-failure semantics) AND writes an `AuditAction::Search` row with
+/// `Outcome::Error` over HTTP — the row the bug dropped by returning the
+/// embedding/DB failures before the auditor ever ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_authorized_mcp_search_is_audited_as_error() {
+    let config = Config::parse(
+        "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 768\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("search", &owner).await;
+    let read_token = h
+        .app
+        .control
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .await
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
+    let session = mcp_session(&h, &ws, &read_token).await;
+    let (status, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(
+            2,
+            "tools/call",
+            &serde_json::json!({ "name": "search", "arguments": { "query": "hello" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // MCP keeps tool failures as normal results the client model can read.
+    assert_eq!(body["result"]["isError"], true, "{body}");
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("search")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        rows.iter().any(|r| r.outcome == Outcome::Error),
+        "expected an Outcome::Error Search row for the failed authorized MCP search, got {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.channel == Channel::Mcp),
+        "the MCP search rows are audited on the mcp channel, {rows:?}"
+    );
+}
+
+/// A successful MCP `search` over HTTP returns the chunks as a structured
+/// tool result and writes an `Outcome::Allowed` `Search` audit row on the mcp
+/// channel — the success-path counterpart to the failure test above, so the
+/// refactor does not regress the path that already worked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_mcp_search_is_audited_as_allowed() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("mcpok", &owner).await;
+    let read_token = h
+        .app
+        .control
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .await
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
+    let owner_token = h.login("owner").await;
+    // Ingest a document so a keyword search has something to find (no
+    // embedding model is configured, so this is the keyword-only path).
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/documents"),
+            &owner_token,
+            serde_json::json!({ "text": "Flood damage is excluded.", "title": "policy" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let doc = body["documents"][0]["id"].as_str().unwrap_or_default();
+    h.wait_ready(&ws, doc, &owner_token).await;
+
+    let session = mcp_session(&h, &ws, &read_token).await;
+    let (status, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&read_token),
+        Some(&session),
+        rpc(
+            2,
+            "tools/call",
+            &serde_json::json!({ "name": "search", "arguments": { "query": "flood" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    assert_eq!(
+        body["result"]["structuredContent"]["chunks"][0]["filename"],
+        "policy.md",
+        "{body}"
+    );
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("search")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        rows.iter().any(|r| r.outcome == Outcome::Allowed),
+        "expected an Outcome::Allowed Search row for the successful MCP search, got {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.channel == Channel::Mcp),
+        "the MCP search rows are audited on the mcp channel, {rows:?}"
     );
 }
 

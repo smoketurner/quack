@@ -447,17 +447,22 @@ impl McpServer {
             .unwrap_or(self.inner.config.retrieval.top_k)
             .clamp(1, 100);
         let rrf_k = self.inner.config.retrieval.rrf_k;
-        let embedding = match Embeddings::from_config(&self.inner.config).await {
-            Ok(Some(model)) => match model.embed_interactive(&Input::Query(query.clone())).await {
-                Ok(vector) => Some(vector),
-                Err(e) => return Ok(failure(format!("embedding failed: {e}"))),
-            },
-            Ok(None) => None,
-            Err(e) => return Ok(failure(format!("embedding provider unavailable: {e}"))),
-        };
-        let text = query.clone();
-        let hits = self
-            .reader_db(move |db| {
+        // Run the search, audit its outcome, then answer — the way the `sql`
+        // tool does, so a post-authorization failure is recorded instead of
+        // dropped, while tool failures stay normal tool results.
+        let result: Result<Vec<_>, McpError> = async {
+            let embedding = match Embeddings::from_config(&self.inner.config).await {
+                Ok(Some(model)) => {
+                    match model.embed_interactive(&Input::Query(query.clone())).await {
+                        Ok(vector) => Some(vector),
+                        Err(e) => return Err(internal(format!("embedding failed: {e}"))),
+                    }
+                }
+                Ok(None) => None,
+                Err(e) => return Err(internal(format!("embedding provider unavailable: {e}"))),
+            };
+            let text = query.clone();
+            self.reader_db(move |db| {
                 let scope = ChunkScope::all();
                 match embedding.as_ref() {
                     Some(vector) => db.search_hybrid_chunks(
@@ -469,16 +474,27 @@ impl McpServer {
                     None => db.search_keyword_chunks(&text, top_k, &scope),
                 }
             })
-            .await?;
+            .await
+        }
+        .await;
+        let outcome = if result.is_ok() {
+            Outcome::Allowed
+        } else {
+            Outcome::Error
+        };
         self.inner
             .auditor
             .record(
                 AuditAction::Search,
                 None,
-                Outcome::Allowed,
+                outcome,
                 Some(serde_json::json!({ "q": query })),
             )
             .await?;
+        let hits = match result {
+            Ok(hits) => hits,
+            Err(e) => return Ok(failure(e.message)),
+        };
         Ok(CallToolResult::structured(
             serde_json::json!({ "chunks": hits }),
         ))
