@@ -17,8 +17,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
-use quack_core::config::{Config, OidcConfig};
+use quack_core::config::{ClientAuth, Config, OidcConfig};
 use quack_core::ids::UserId;
+use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::llm::oauth::{CachedToken, KeySource};
 use quack_core::oidc::OidcSubject;
 use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome, SealedOwner};
@@ -190,6 +191,7 @@ impl Harness {
             issuer_url: base,
             client_id: String::from("quack"),
             client_secret_env: None,
+            client_auth: ClientAuth::default(),
             scopes: OidcConfig::default_scopes(),
             redirect_uri: format!("{origin}{}", OidcConfig::CALLBACK_PATH),
             audience: audience.map(str::to_owned),
@@ -202,6 +204,7 @@ impl Harness {
             &oidc_config,
             Vault::new(dir.path(), KeySource::File),
             control.clone(),
+            ClientKeys::with_control(&config, KeySource::File, control.clone()),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
         config.server.oidc = Some(oidc_config);
@@ -964,7 +967,7 @@ async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
 /// A token for an on-behalf-of provider at the mock issuer, as the request's
 /// caller: what a turn's model request would send.
 async fn obo_token(app: &App) -> Result<String, crate::server::error::ApiError> {
-    use quack_core::config::{ClientAuth, Exchange, Grant, OAuthConfig};
+    use quack_core::config::{Exchange, Grant, OAuthConfig};
     use quack_core::llm::oauth::TokenManager;
     use secrecy::ExposeSecret;
     let issuer = app

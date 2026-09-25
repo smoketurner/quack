@@ -38,6 +38,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::KeySource;
+use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::storage::control::ControlPlane;
 use quack_core::vault::Vault;
 use state::{App, AppState, ServeMode};
@@ -344,6 +345,7 @@ pub(crate) async fn serve(
                 oidc,
                 Vault::new(config.data_dir(), KeySource::Keychain),
                 control.clone(),
+                ClientKeys::with_control(&config, KeySource::Keychain, control.clone()),
             )
             .context("failed to set up [server.oidc] sign-in")?,
         ),

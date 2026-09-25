@@ -16,6 +16,7 @@ use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::CachedToken;
+use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::oidc::{
     Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
 };
@@ -65,8 +66,9 @@ impl Oidc {
         config: &OidcConfig,
         vault: Vault,
         control: ControlPlane,
+        client_keys: ClientKeys,
     ) -> CoreResult<Self> {
-        let sign_in = Arc::new(SignIn::new(config.clone())?);
+        let sign_in = Arc::new(SignIn::new(config.clone(), client_keys)?);
         Ok(Self {
             subjects: Arc::new(SubjectTokens::new(
                 Arc::clone(&sign_in),

@@ -18,10 +18,10 @@ use oauth2::basic::{
 };
 use oauth2::url::Url;
 use oauth2::{
-    AuthType, AuthUrl, AuthorizationCode, Client, ClientId, ClientSecret, CsrfToken,
-    EndpointNotSet, EndpointSet, ExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, RefreshToken, RequestTokenError, Scope, StandardRevocableToken,
-    StandardTokenResponse, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, Client, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
+    ExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
+    RequestTokenError, Scope, StandardRevocableToken, StandardTokenResponse, TokenResponse,
+    TokenUrl,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -31,9 +31,10 @@ use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{AlgorithmFamily, DecodingKey, Validation};
 use tokio::sync::{OnceCell, RwLock};
 
-use crate::config::OidcConfig;
+use crate::config::{ClientAuth, OidcConfig};
 use crate::error::{Error, Result};
-use crate::llm::oauth::{CachedToken, Endpoints, OAuthHttp, random_token};
+use crate::llm::oauth::client_key::ClientKeys;
+use crate::llm::oauth::{CachedToken, Credential, Endpoints, OAuthHttp, credential, random_token};
 
 /// How far past `exp` an ID token is still accepted, for clock skew.
 const CLOCK_LEEWAY: SignedDuration = SignedDuration::from_secs(60);
@@ -295,6 +296,8 @@ fn sign_in_error(message: impl Into<String>) -> Error {
 /// The server's sign-in client for one issuer.
 pub struct SignIn {
     config: OidcConfig,
+    /// The key `client_auth = "private_key_jwt"` signs with.
+    client_keys: ClientKeys,
     http: OAuthHttp,
     endpoints: OnceCell<Endpoints>,
     /// The issuer's signing keys, for access tokens presented as bearers.
@@ -339,14 +342,16 @@ impl std::fmt::Debug for SignIn {
 }
 
 impl SignIn {
-    /// A client for `config`; the issuer is contacted on first use.
+    /// A client for `config`; the issuer is contacted on first use, and
+    /// `client_keys` holds the key a `private_key_jwt` client signs with.
     ///
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be built.
-    pub fn new(config: OidcConfig) -> Result<Self> {
+    pub fn new(config: OidcConfig, client_keys: ClientKeys) -> Result<Self> {
         Ok(Self {
             config,
+            client_keys,
             http: OAuthHttp::new()?,
             endpoints: OnceCell::new(),
             keys: RwLock::new(None),
@@ -376,6 +381,16 @@ impl SignIn {
             .await
     }
 
+    /// Read the issuer's discovery document, for `quack doctor`: nothing
+    /// is signed, stored, or pushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery fails or names another issuer.
+    pub async fn discover(&self) -> Result<()> {
+        self.endpoints().await.map(drop)
+    }
+
     /// Check the callback's `iss` against the issuer (RFC 9207).
     ///
     /// # Errors
@@ -388,13 +403,44 @@ impl SignIn {
             .map_err(sign_in_error)
     }
 
-    async fn client(&self) -> Result<(OidcClient, String)> {
+    /// How quack authenticates as the sign-in client: its key's assertions,
+    /// its secret, or nothing but its `client_id`.
+    async fn credential(&self) -> Result<Credential> {
+        let secret = match &self.config.client_secret_env {
+            Some(var) => Some(std::env::var(var).map_err(|_| {
+                Error::Config(format!(
+                    "[server.oidc] needs the client secret in environment variable {var}, which is not set"
+                ))
+            })?),
+            None => None,
+        };
+        let audience = match self.config.client_auth {
+            ClientAuth::PrivateKeyJwt => self.endpoints().await?.issuer.clone(),
+            ClientAuth::ClientSecretPost | ClientAuth::ClientSecretBasic => None,
+        };
+        Credential::of(
+            credential::Registration {
+                auth: self.config.client_auth,
+                client_id: &self.config.client_id,
+                issuer_url: &self.config.issuer_url,
+                audience: audience.as_deref(),
+                secret,
+            },
+            &self.client_keys,
+        )
+        .await
+    }
+
+    /// The `oauth2` crate's client, the issuer identifier, and the
+    /// credential its requests must be sent with (`OAuthHttp::sender`).
+    async fn client(&self) -> Result<(OidcClient, String, Credential)> {
+        let credential = self.credential().await?;
         let endpoints = self.endpoints().await?;
         let parse = |what: &str, url: &str| {
             Url::parse(url).map_err(|e| sign_in_error(format!("{what} '{url}' is not a URL: {e}")))
         };
         let mut client = UnconfiguredClient::new(ClientId::new(self.config.client_id.clone()))
-            .set_auth_type(AuthType::RequestBody)
+            .set_auth_type(credential.auth_type())
             .set_auth_uri(AuthUrl::from_url(parse(
                 "authorization_endpoint",
                 &endpoints.authorization,
@@ -407,16 +453,11 @@ impl SignIn {
                 "redirect_uri",
                 &self.config.redirect_uri,
             )?));
-        if let Some(var) = &self.config.client_secret_env {
-            let secret = std::env::var(var).map_err(|_| {
-                Error::Config(format!(
-                    "[server.oidc] needs the client secret in environment variable {var}, which is not set"
-                ))
-            })?;
-            client = client.set_client_secret(ClientSecret::new(secret));
+        if let Some(secret) = credential.client_secret() {
+            client = client.set_client_secret(secret);
         }
         let issuer = endpoints.issuer.clone().unwrap_or_default();
-        Ok((client, issuer))
+        Ok((client, issuer, credential))
     }
 
     /// Start a sign-in: the URL to send the browser to, and what the
@@ -426,7 +467,7 @@ impl SignIn {
     ///
     /// Returns an error when discovery fails or randomness is unavailable.
     pub async fn begin(&self) -> Result<(String, Pending)> {
-        let (client, _) = self.client().await?;
+        let (client, _, _) = self.client().await?;
         let verifier = PkceCodeVerifier::new(random_token()?);
         let challenge = PkceCodeChallenge::from_code_verifier_sha256(&verifier);
         let state = random_token()?;
@@ -454,13 +495,13 @@ impl SignIn {
     /// Returns [`Error::SignIn`] when the exchange is refused or the ID token
     /// is missing or fails a check, and an error for transport failures.
     pub async fn finish(&self, code: &str, pending: Pending) -> Result<SignedIn> {
-        let (client, issuer) = self.client().await?;
+        let (client, issuer, credential) = self.client().await?;
         let response = client
             .exchange_code(AuthorizationCode::new(code.to_owned()))
             .set_pkce_verifier(PkceCodeVerifier::new(
                 pending.verifier.expose_secret().to_owned(),
             ))
-            .request_async(&self.http.sender())
+            .request_async(&self.http.sender(&credential))
             .await
             .map_err(|e| sign_in_error(format!("the code exchange failed: {e}")))?;
         let id_token = response.extra_fields().id_token.as_deref().ok_or_else(|| {
@@ -499,10 +540,10 @@ impl SignIn {
     /// reason that is not about this user (a misconfigured client); a
     /// refusal of the grant itself is [`Renewal::Revoked`].
     pub async fn renew(&self, refresh: &SecretString) -> Result<Renewal> {
-        let (client, _) = self.client().await?;
+        let (client, _, credential) = self.client().await?;
         let outcome = client
             .exchange_refresh_token(&RefreshToken::new(refresh.expose_secret().to_owned()))
-            .request_async(&self.http.sender())
+            .request_async(&self.http.sender(&credential))
             .await;
         match outcome {
             Ok(response) => {

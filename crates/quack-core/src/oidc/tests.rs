@@ -43,6 +43,8 @@ struct IssuerState {
 struct MockIssuer {
     url: String,
     state: Arc<Mutex<IssuerState>>,
+    /// The data directory the sign-in's client key is kept in.
+    dir: tempfile::TempDir,
 }
 
 impl MockIssuer {
@@ -62,7 +64,15 @@ impl MockIssuer {
                 tokio::spawn(async move { serve(stream, &base, &served).await });
             }
         });
-        Self { url, state }
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        Self { url, state, dir }
+    }
+
+    /// The client keys of this issuer's data directory.
+    fn keys(&self) -> ClientKeys {
+        let mut config = crate::config::Config::default();
+        config.general.data_dir = self.dir.path().to_path_buf();
+        ClientKeys::new(&config, crate::llm::oauth::KeySource::File)
     }
 
     fn with(&self, change: impl FnOnce(&mut IssuerState)) {
@@ -84,12 +94,13 @@ impl MockIssuer {
             issuer_url: self.url.clone(),
             client_id: String::from("quack"),
             client_secret_env: None,
+            client_auth: ClientAuth::default(),
             scopes: OidcConfig::default_scopes(),
             redirect_uri: format!("https://quack.example.com{}", OidcConfig::CALLBACK_PATH),
             audience: Some(String::from(AUDIENCE)),
             subject_claim: String::from("sub"),
         };
-        SignIn::new(config).unwrap_or_else(|e| fail(&e.to_string()))
+        SignIn::new(config, self.keys()).unwrap_or_else(|e| fail(&e.to_string()))
     }
 
     fn jwks_fetches(&self) -> usize {
@@ -571,7 +582,8 @@ async fn without_an_audience_no_bearer_is_accepted_and_oid_can_name_the_person()
 
     let mut config = issuer.sign_in().config;
     config.audience = None;
-    let closed = SignIn::new(config.clone()).unwrap_or_else(|e| fail(&e.to_string()));
+    let closed =
+        SignIn::new(config.clone(), issuer.keys()).unwrap_or_else(|e| fail(&e.to_string()));
     assert!(matches!(
         closed.verify_bearer(&token).await,
         Err(Error::Bearer(_))
@@ -580,7 +592,7 @@ async fn without_an_audience_no_bearer_is_accepted_and_oid_can_name_the_person()
 
     config.audience = Some(String::from(AUDIENCE));
     config.subject_claim = String::from("oid");
-    let entra = SignIn::new(config).unwrap_or_else(|e| fail(&e.to_string()));
+    let entra = SignIn::new(config, issuer.keys()).unwrap_or_else(|e| fail(&e.to_string()));
     assert!(
         entra
             .verify_bearer(&token)

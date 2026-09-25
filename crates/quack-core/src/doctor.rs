@@ -23,7 +23,8 @@ use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::OllamaRunningModels;
-use crate::llm::oauth::TokenManager;
+use crate::llm::oauth::client_key::ClientKeys;
+use crate::llm::oauth::{KeySource, TokenManager};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -1078,7 +1079,7 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         ));
         return;
     }
-    let sign_in = match SignIn::new(oidc.clone()) {
+    let sign_in = match SignIn::new(oidc.clone(), ClientKeys::new(config, KeySource::Keychain)) {
         Ok(sign_in) => sign_in,
         Err(e) => {
             report.push(Check::new(
@@ -1093,8 +1094,8 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         Some(_) => sign_in.published_keys().await.map(Some),
         None => Ok(None),
     };
-    report.push(match (sign_in.begin().await, keys) {
-        (Ok(_), Ok(keys)) => Check::new(
+    report.push(match (sign_in.discover().await, keys) {
+        (Ok(()), Ok(keys)) => Check::new(
             Area::Server,
             Status::Ok,
             match (keys, oidc.audience.as_deref()) {
