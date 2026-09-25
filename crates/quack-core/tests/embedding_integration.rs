@@ -471,3 +471,122 @@ async fn a_model_answering_with_the_wrong_width_fails_the_document_with_the_fix(
     let documents = db.list_documents().unwrap();
     assert_eq!(documents.first().map(|d| d.status.as_str()), Some("error"));
 }
+
+/// A node added by a path that never embeds (text-to-SQL analysis) sits at
+/// `embedding IS NULL`. `Plan.nodes` must count it alongside any stale
+/// node, matching what `run` actually embeds into `Summary.nodes`.
+#[tokio::test]
+async fn plan_nodes_match_summary_nodes_when_never_embedded_nodes_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let gemma = config(dir.path(), "embeddinggemma", 4, "");
+    {
+        let db = WorkspaceDb::open(&gemma, "ws").unwrap();
+        seed(&db, 3, 4);
+        // A node that gets an embedding, then is made stale by make_legacy.
+        let embedded = graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from("Acme"),
+                class_id: ClassId::from("organization"),
+                properties: Properties::default(),
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap();
+        let vector = Vector::new(vec![1.0; 4], Dimension::new(4)).unwrap();
+        db.set_node_embedding(&embedded, &vector).unwrap();
+        // A node that never gets an embedding at all (like text-to-SQL nodes).
+        let _never = graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from("Globex"),
+                class_id: ClassId::from("organization"),
+                properties: Properties::default(),
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap();
+        make_legacy(&db, "embeddinggemma");
+    }
+    let db = WorkspaceDb::open(&gemma, "ws").unwrap();
+    let status = db.embedding_status().unwrap();
+    // stale_nodes counts only the embedded-then-stale Acme node; the
+    // never-embedded Globex node is not stale (it has no vector).
+    assert_eq!(status.stale_nodes, 1);
+    // nodes_needing_embedding counts both: the stale Acme node and the
+    // never-embedded Globex node.
+    assert_eq!(status.nodes_needing_embedding, 2);
+    let plan = Plan::from_status(&status);
+    assert_eq!(
+        plan.nodes, 2,
+        "Plan.nodes counts both the stale Acme node and the never-embedded Globex node"
+    );
+    let summary = refresh::run(
+        &writer_of(&db),
+        &embedder(&gemma, Tape::new(4)),
+        8,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.nodes, 2);
+    assert_eq!(
+        plan.nodes, summary.nodes,
+        "Plan.nodes must match Summary.nodes; the preview must not undercount the run"
+    );
+}
+
+/// A workspace whose chunks are all current but holds a never-embedded
+/// node still has work to do: `is_empty()` must be `false` so the CLI and
+/// the API actually run the refresh and embed the node.
+#[tokio::test]
+async fn is_empty_is_false_when_only_never_embedded_nodes_remain() {
+    let dir = tempfile::tempdir().unwrap();
+    let gemma = config(dir.path(), "embeddinggemma", 4, "");
+    {
+        let db = WorkspaceDb::open(&gemma, "ws").unwrap();
+        seed(&db, 3, 4);
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from("Globex"),
+                class_id: ClassId::from("organization"),
+                properties: Properties::default(),
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap();
+    }
+    let db = WorkspaceDb::open(&gemma, "ws").unwrap();
+    let status = db.embedding_status().unwrap();
+    // Only the node needs embedding; every chunk is current.
+    assert_eq!(status.current_chunks, 3);
+    assert_eq!(status.stale_chunks(), 0);
+    assert_eq!(status.missing_chunks, 0);
+    assert_eq!(status.stale_nodes, 0);
+    assert_eq!(status.nodes_needing_embedding, 1);
+    let plan = Plan::from_status(&status);
+    assert!(
+        !plan.is_empty(),
+        "is_empty() must be false when a never-embedded node exists"
+    );
+    assert_eq!(plan.nodes, 1);
+    assert_eq!(graph_store::count_nodes_needing_embedding(&db).unwrap(), 1);
+    // Running the refresh embeds the node and leaves nothing to do.
+    let summary = refresh::run(
+        &writer_of(&db),
+        &embedder(&gemma, Tape::new(4)),
+        8,
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((summary.chunks, summary.nodes), (0, 1));
+    assert_eq!(
+        graph_store::count_nodes_needing_embedding(&db).unwrap(),
+        0,
+        "the never-embedded node now has a vector"
+    );
+    let after = db.embedding_status().unwrap();
+    assert!(Plan::from_status(&after).is_empty());
+}

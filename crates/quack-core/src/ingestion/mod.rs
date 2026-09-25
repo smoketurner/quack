@@ -536,7 +536,16 @@ impl WorkbookLoad {
     /// Every data sheet as its own table: `<stem>` for a single sheet,
     /// `<stem>_<sheet>` otherwise. The sheets pass through `files/` as CSV
     /// for `DuckDB`'s reader (the `excel` extension is not in the static
-    /// binary).
+    /// binary). Two sheets that sanitize to the same `<stem>_<sheet>`
+    /// name cannot share a table (`CREATE OR REPLACE` would silently drop
+    /// one sheet's rows), so the load refuses them before any table is
+    /// created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ingestion` error when two of the workbook's sheet names
+    /// collide on the same sanitized table name, or `TableTaken` when a
+    /// table another document owns is in the way.
     fn load(self, db: &WorkspaceDb) -> Result<Vec<String>> {
         std::fs::create_dir_all(&self.files_dir)?;
         let stem = TableName::of_file(&self.filename);
@@ -552,7 +561,22 @@ impl WorkbookLoad {
                 }
             })
             .collect();
-        for name in &names {
+        // Two distinct sheet names can sanitize to one table name (spaces
+        // and hyphens both become `_`); `check_free` cannot see in-flight
+        // tables, so catch an intra-workbook collision before any file or
+        // table is written, else the second sheet's `CREATE OR REPLACE` would
+        // silently overwrite the first.
+        let mut first_sheet_for: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (sheet, name) in self.sheets.iter().zip(&names) {
+            if let Some(first) = first_sheet_for.get(name.as_str()) {
+                return Err(Error::Ingestion(format!(
+                    "workbook sheets `{first}` and `{sheet}` both produce table `{name}` after \
+                     name sanitization; rename one of the sheets",
+                    sheet = sheet.sheet
+                )));
+            }
+            first_sheet_for.insert(name.as_str().to_owned(), sheet.sheet.clone());
             name.check_free(db, Some(&self.doc_id))?;
         }
         let mut tables = Vec::with_capacity(self.sheets.len());
@@ -900,6 +924,26 @@ mod tests {
                 .with_sheet("Q1 2024")
                 .as_str(),
             "book_Q1_2024"
+        );
+    }
+
+    #[test]
+    fn colliding_sheet_names_sanitize_to_one_table_name() {
+        // Sanitization is not injective: spaces and hyphens both become `_`,
+        // so two distinct sheet names target the same table. `WorkbookLoad`
+        // must reject this rather than let `CREATE OR REPLACE` overwrite one.
+        let stem = TableName::of_file("Region Sales.xlsx");
+        assert_eq!(
+            stem.with_sheet("Sales Q1").as_str(),
+            stem.with_sheet("Sales-Q1").as_str()
+        );
+        assert_eq!(
+            stem.with_sheet("Sales Q1").as_str(),
+            "Region_Sales_Sales_Q1"
+        );
+        assert_eq!(
+            stem.with_sheet("Sheet 1").as_str(),
+            stem.with_sheet("Sheet_1").as_str()
         );
     }
 }
