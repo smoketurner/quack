@@ -127,6 +127,7 @@ impl Chunker {
                 continue;
             }
             if !tokens.is_empty() {
+                page_starts.push((tokens.len(), page.page));
                 tokens.extend_from_slice(&separator);
             }
             page_starts.push((tokens.len(), page.page));
@@ -379,6 +380,71 @@ mod section_tests {
             );
             assert!(!chunk.content.starts_with('\n'));
         }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn page_lookup_skips_separator_to_following_page() {
+        let enc = tiktoken::get_encoding("cl100k_base").unwrap();
+        let chunk_size: u32 = 512;
+        let overlap: u32 = 64;
+        let step: usize = 448; // chunk_size - overlap, the shipped config step
+        let mut words1 = 1_usize;
+        while !enc.encode(&page(1, words1).text).len().is_multiple_of(step) {
+            words1 = words1.saturating_add(1);
+        }
+        let pages = vec![page(1, words1), page(2, 512)];
+        let chunks = Chunker::new(chunk_size, overlap, "cl100k_base")
+            .and_then(|c| c.pages(&pages, Some("Doc")))
+            .unwrap();
+        let boundary = chunks
+            .iter()
+            .find(|c| c.content.starts_with("p2w0"))
+            .unwrap();
+        assert_eq!(
+            boundary.page,
+            Some(2),
+            "boundary chunk labelled {:?}, expected Some(2): {:?}",
+            boundary.page,
+            boundary
+                .content
+                .get(..40)
+                .unwrap_or(boundary.content.as_str())
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn page_lookup_across_skipped_pages_points_to_kept_page() {
+        let enc = tiktoken::get_encoding("cl100k_base").unwrap();
+        let chunk_size: u32 = 512;
+        let overlap: u32 = 64;
+        let step: usize = 448; // chunk_size - overlap, the shipped config step
+        let mut words1 = 1_usize;
+        while !enc.encode(&page(1, words1).text).len().is_multiple_of(step) {
+            words1 = words1.saturating_add(1);
+        }
+        // Sections exactly as `extract_pdf_pages` emits after skipping pages
+        // 2-4: `page` keeps the original PDF number, skipped pages produce no
+        // section, so the page gap carries through to the citation locator.
+        let pages = vec![page(1, words1), page(5, 512)];
+        let chunks = Chunker::new(chunk_size, overlap, "cl100k_base")
+            .and_then(|c| c.pages(&pages, Some("Doc")))
+            .unwrap();
+        let boundary = chunks
+            .iter()
+            .find(|c| c.content.starts_with("p5w0"))
+            .unwrap();
+        assert_eq!(
+            boundary.page,
+            Some(5),
+            "skipped-page boundary chunk labelled {:?}, expected Some(5): {:?}",
+            boundary.page,
+            boundary
+                .content
+                .get(..40)
+                .unwrap_or(boundary.content.as_str())
+        );
     }
 
     #[test]
