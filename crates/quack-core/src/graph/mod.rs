@@ -413,7 +413,7 @@ impl fmt::Display for GraphStatus {
             .ontology_version
             .map_or_else(|| String::from("none"), |v| v.to_string());
         let built_with = self.built_with_version.map_or_else(
-            || String::from("never built"),
+            || String::from("never built; run `quack graph extract`"),
             |v| format!("built with {v}"),
         );
         writeln!(

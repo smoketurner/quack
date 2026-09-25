@@ -822,6 +822,62 @@ fn paths_merges_and_listing(
     assert!(resolve::decide(db, proposal.id.as_str(), MergeDecision::Accept, None).is_err());
 }
 
+/// A graph with nodes but no recorded build version is never built, not stale:
+/// `None < Some(_)` used to label mid-extraction and crashed-extraction graphs
+/// stale via `Option` ordering. The never-built state carries its own
+/// remediation (`run quack graph extract`); the `stale` suffix, which names
+/// `revalidate`/`extract` for a *recorded* version that lags, must not fire.
+#[test]
+fn status_is_not_stale_when_built_with_version_is_none() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Provisional).unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert!(status.nodes > 0, "extraction should have inserted nodes");
+    assert_eq!(status.built_with_version, None);
+    assert!(
+        !status.stale,
+        "never-built graph is not stale; Display would print: {status}"
+    );
+    let display = format!("{status}");
+    assert!(
+        display.contains("never built; run `quack graph extract`"),
+        "missing the never-built extract hint: {display}"
+    );
+    assert!(
+        !display.contains("stale"),
+        "a never-built graph must not be labelled stale: {display}"
+    );
+}
+
+/// An empty graph is not stale even when its recorded build version lags
+/// the ontology: there is nothing built for the new version to invalidate.
+#[test]
+fn status_is_not_stale_when_the_built_graph_is_empty() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let saved = store::save(
+        &db,
+        &current,
+        Revision::reviewed(Some("test"), Some("advance the ontology")),
+    )
+    .unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.nodes, 0);
+    assert_eq!(status.built_with_version, current.saved_version().ok());
+    assert_eq!(status.ontology_version, saved.version);
+    assert!(
+        status.built_with_version < status.ontology_version,
+        "the ontology advanced past the recorded build"
+    );
+    assert!(!status.stale, "an empty graph is not stale: {status}");
+    assert!(
+        !format!("{status}").contains("stale"),
+        "an empty graph must not be labelled stale: {status}"
+    );
+}
+
 #[tokio::test]
 async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     let db = workspace();
@@ -859,6 +915,11 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     .unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(status.stale);
+    assert!(
+        format!("{status}")
+            .contains("stale: run `quack graph revalidate` or `quack graph extract`"),
+        "a genuinely stale graph keeps the stale suffix: {status}"
+    );
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 2, "Kenya and Uganda");
     assert_eq!(outcome.dropped_edges, 0, "their edges went with them");

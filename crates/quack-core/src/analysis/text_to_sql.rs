@@ -811,4 +811,90 @@ mod tests {
         let prompt = SystemPrompt::build(&db(), &options(ChatMode::Chat, 100)).unwrap();
         assert!(prompt.contains("No tables or documents have been ingested yet"));
     }
+
+    /// A graph with nodes but no recorded build version is never built, not
+    /// stale: `None < Some(_)` used to label it stale via `Option` ordering,
+    /// leaking `(stale: the ontology changed since it was built)` into the
+    /// analysis agent's prompt — a falsehood, since no build happened. After
+    /// the fix the parenthetical must stay out of the prompt.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn the_stale_parenthetical_does_not_leak_for_a_never_built_graph() {
+        const STALE: &str = "(stale: the ontology changed since it was built)";
+        let db = db();
+        ontology_store::save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(Some("tester"), None),
+        )
+        .unwrap();
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from("Acme"),
+                class_id: ClassId::from("organization"),
+                properties: Properties::default(),
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap();
+        let status = graph_store::status(&db).unwrap();
+        assert!(status.nodes > 0);
+        assert_eq!(status.built_with_version, None);
+        assert!(!status.stale, "a never-built graph is not stale: {status}");
+        let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+        assert!(
+            !prompt.contains(STALE),
+            "the stale parenthetical reached the prompt for a never-built graph:\n{prompt}"
+        );
+    }
+
+    /// A graph stamped with an older ontology version than the current one is
+    /// genuinely stale: the parenthetical that tells the analysis agent the
+    /// ontology changed since it was built must still reach the prompt. This
+    /// guards the real stale path against the never-built fix over-correcting.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn the_stale_parenthetical_fires_for_a_genuinely_stale_graph() {
+        const STALE: &str = "(stale: the ontology changed since it was built)";
+        let db = db();
+        ontology_store::save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(Some("tester"), None),
+        )
+        .unwrap();
+        let first = ontology_store::latest_version(&db).unwrap().unwrap();
+        graph_store::set_built_with(&db, first).unwrap();
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from("Acme"),
+                class_id: ClassId::from("organization"),
+                properties: Properties::default(),
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap();
+        // Saving the ontology again advances the version; the graph stays
+        // stamped at `first`, so `built_with_version < ontology_version`.
+        ontology_store::save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(Some("tester"), None),
+        )
+        .unwrap();
+        let status = graph_store::status(&db).unwrap();
+        assert_eq!(status.built_with_version, Some(first));
+        assert!(
+            status.ontology_version.unwrap() > first,
+            "ontology should have advanced past the build version: {status}"
+        );
+        assert!(status.stale, "a genuinely stale graph is stale: {status}");
+        let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+        assert!(
+            prompt.contains(STALE),
+            "the stale parenthetical is missing for a genuinely stale graph:\n{prompt}"
+        );
+    }
 }
