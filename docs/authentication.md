@@ -349,7 +349,7 @@ it expires.
   `audience`, and `resource` when they are set. quack also sends its own client-credentials
   token as `actor_token`, so the issued token names the person as its subject (`sub`) and
   quack as the party acting for them (`act`). Setting `actor = false` omits the actor token
-  for an issuer that does not accept one.
+  for an issuer that does not accept one, such as Vouch (see below).
 - `entra` is Microsoft Entra ID's On-Behalf-Of flow: the `jwt-bearer` grant with the
   person's token as `assertion` and `requested_token_use=on_behalf_of`. Entra's flow has no
   actor token, so quack ignores `actor`.
@@ -458,11 +458,18 @@ MCP client, can use it with quack. For on-behalf-of, turn on On-Behalf-Of Token 
 quack's own client (the one that performs the exchange) and set `audience` to the
 downstream API's identifier.
 
-**Vouch** ([vouch.sh](https://vouch.sh)). Vouch binds every token to the client's key with
-DPoP (RFC 9449), which quack does not yet support (#216). Vouch offers only the `openid` and
-`email` scopes, so set `scopes = ["openid", "email"]`. It issues no refresh tokens, so a
-sign-in lasts for Vouch's session. Its token exchange accepts only tokens Vouch issued,
-which matches on-behalf-of once DPoP support exists.
+**Vouch** ([vouch.sh](https://vouch.sh)). Register quack as an ordinary client, not a FAPI
+(Financial-grade API) client. Vouch requires a DPoP (RFC 9449) proof only from FAPI clients;
+it gives every other client plain bearer tokens, which is what quack sends and what model
+APIs accept. Vouch offers only the `openid` and `email` scopes, so set
+`scopes = ["openid", "email"]`. It issues no refresh tokens, so a sign-in lasts for Vouch's
+session. For on-behalf-of, use `exchange = "token-exchange"` and set `actor = false`. Vouch
+accepts an actor token only when it belongs to a Vouch user, and quack's own
+client-credentials token names quack's client, not a user, so Vouch refuses the exchange
+with "Actor token user not found". Without the actor token, the issued token names the
+person as its subject, and Vouch still records quack's `client_id` on it. Vouch's exchange
+accepts only tokens Vouch issued as the subject, so the person must have signed in to quack
+through Vouch.
 
 ## Troubleshooting
 
@@ -510,6 +517,9 @@ it sees the user who submitted the job. With any other grant, it sees quack.
 for on-behalf-of expects to see individual users. Sending some requests as quack would make
 its logs, quotas, and access policies wrong without anyone noticing.
 
-**What does DPoP change, and when will quack support it?** DPoP (RFC 9449) binds a token to
-a key the client holds, so a stolen token is useless on its own. Vouch requires it. Issue
-#216 tracks the work; it has no date.
+**Does quack support DPoP?** No. DPoP (RFC 9449) binds a token to a key the client holds, so
+a stolen token is useless on its own. quack sends and accepts bearer tokens only. A token
+bound with DPoP must be presented with a fresh proof on every request, and model APIs accept
+bearer tokens, so a bound on-behalf-of token would be refused by the provider it is for.
+Issuers that support DPoP, Vouch among them, still issue bearer tokens to a client that sends
+no proof. quack accepting DPoP-bound tokens from its own clients is tracked in #216.
