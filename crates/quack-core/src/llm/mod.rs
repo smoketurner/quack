@@ -4,6 +4,7 @@
 //! `PROVIDER/MODEL` reference into a rig client lives here, so the interfaces
 //! never build providers themselves.
 
+pub mod bedrock;
 pub mod oauth;
 
 use rig::client::EmbeddingsClient;
@@ -21,8 +22,8 @@ use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
-    BaseUrl, Config, ModelRef, ProviderAuth, ProviderConfig, ProviderName, ProviderType,
-    config_file_path,
+    BaseUrl, BedrockApi, Config, ModelRef, ProviderAuth, ProviderConfig, ProviderName,
+    ProviderType, config_file_path,
 };
 use crate::embedding::{Embedder, Profile};
 use crate::error::{Error, Record, Result};
@@ -44,6 +45,8 @@ pub use limit::LimitedHttp;
 type OllamaClient = rig::providers::ollama::Client<LimitedHttp>;
 type OpenAiClient = rig::providers::openai::CompletionsClient<LimitedHttp>;
 type AnthropicClient = rig::providers::anthropic::Client<LimitedHttp>;
+/// The `OpenAI` Responses API client (Bedrock's `api = "responses"`).
+type ResponsesClient = rig::providers::openai::Client<LimitedHttp>;
 type OpenAiEmbeddingModel = rig::providers::openai::GenericEmbeddingModel<
     rig::providers::openai::OpenAICompletionsExt,
     LimitedHttp,
@@ -169,6 +172,7 @@ pub enum EmbedModel {
     Ollama(OllamaEmbedder),
     OpenAi(OpenAiEmbeddingModel),
     OpenAiOAuth(OAuthEmbedding),
+    Bedrock(rig::bedrock::embedding::EmbeddingModel),
 }
 
 /// An OpenAI-compatible embedding endpoint behind OAuth: the bearer can
@@ -237,6 +241,12 @@ impl EmbedModel {
             ProviderType::Anthropic => Err(Error::Config(format!(
                 "embedding_model '{model}': anthropic does not serve embeddings"
             ))),
+            ProviderType::Bedrock | ProviderType::BedrockMantle => Ok(Self::Bedrock(
+                bedrock::session(name, provider)
+                    .await?
+                    .converse(name)?
+                    .embedding_model_with_ndims(model.model, ndims),
+            )),
         }
     }
 }
@@ -290,6 +300,7 @@ impl EmbeddingModel for EmbedModel {
             Self::Ollama(m) => m.ndims(),
             Self::OpenAi(m) => m.ndims(),
             Self::OpenAiOAuth(oauth) => oauth.ndims,
+            Self::Bedrock(m) => m.ndims(),
         }
     }
 
@@ -305,6 +316,9 @@ impl EmbeddingModel for EmbedModel {
             Self::Ollama(m) => m.embed_texts(texts).await,
             Self::OpenAi(m) => m.embed_texts(texts).await,
             Self::OpenAiOAuth(oauth) => oauth.model().await?.embed_texts(texts).await,
+            // Boxed: the AWS SDK's request future is ~25 KB, which every
+            // caller's future would otherwise carry.
+            Self::Bedrock(m) => Box::pin(m.embed_texts(texts)).await,
         }
     }
 }
@@ -315,6 +329,11 @@ enum ChatClient {
     Ollama(OllamaClient),
     OpenAi(OpenAiClient),
     Anthropic(AnthropicClient),
+    /// Bedrock's Converse API through the AWS SDK. Bedrock's Chat
+    /// Completions is [`Self::OpenAi`] over a signing client.
+    Bedrock(bedrock::BedrockClient),
+    /// Bedrock's OpenAI-compatible Responses API, signed.
+    Responses(ResponsesClient),
 }
 
 impl ChatClient {
@@ -330,6 +349,38 @@ impl ChatClient {
             ProviderType::Anthropic => {
                 Self::Anthropic(build_anthropic_client(config, name, provider).await?)
             }
+            ProviderType::Bedrock | ProviderType::BedrockMantle => {
+                Self::bedrock(&*bedrock::session(name, provider).await?, name, provider)?
+            }
+        })
+    }
+
+    /// The client for a Bedrock provider's API on its endpoint.
+    fn bedrock(
+        session: &bedrock::Session,
+        name: &ProviderName,
+        provider: &ProviderConfig,
+    ) -> Result<Self> {
+        Ok(match session.api() {
+            BedrockApi::Converse => Self::Bedrock(session.converse(name)?),
+            BedrockApi::ChatCompletions => Self::OpenAi(openai_client_with_key(
+                name,
+                Some(&session.openai_base()),
+                SIGNED_PLACEHOLDER_KEY,
+                session.http(name, provider),
+            )?),
+            BedrockApi::Responses => Self::Responses(
+                rig::providers::openai::Client::builder()
+                    .api_key(SIGNED_PLACEHOLDER_KEY)
+                    .http_client(session.http(name, provider))
+                    .base_url(session.openai_base())
+                    .build()
+                    .map_err(|e| {
+                        Error::Llm(format!(
+                            "failed to build Responses client for '{name}': {e}"
+                        ))
+                    })?,
+            ),
         })
     }
 
@@ -350,7 +401,72 @@ impl ChatClient {
             Self::Anthropic(client) => {
                 OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
             }
+            Self::Bedrock(client) => {
+                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
+            }
+            Self::Responses(client) => OneShotAgent::new(
+                Unstored(client.completion_model(model)),
+                preamble,
+                timeout,
+                label,
+            ),
         }
+    }
+}
+
+/// The key rig's `OpenAI` clients are built with when [`bedrock::Signer`]
+/// replaces their `Authorization` header with a `SigV4` one.
+const SIGNED_PLACEHOLDER_KEY: &str = "sigv4";
+
+/// A Responses API model asked to keep nothing: every request carries
+/// `store: false`, so Bedrock retains no copy of the conversation (it keeps
+/// one for 30 days by default) and no workspace content leaves the
+/// workspace file's boundary to be stored (design doc section 5). quack
+/// replays history itself and never uses `previous_response_id`.
+#[derive(Clone)]
+struct Unstored<M>(M);
+
+impl<M> Unstored<M> {
+    fn request(
+        mut request: rig::completion::CompletionRequest,
+    ) -> rig::completion::CompletionRequest {
+        let mut params = match request.additional_params.take() {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        params.insert(String::from("store"), serde_json::Value::Bool(false));
+        request.additional_params = Some(serde_json::Value::Object(params));
+        request
+    }
+}
+
+impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for Unstored<M> {
+    fn completion(
+        &self,
+        request: rig::completion::CompletionRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            rig::completion::CompletionResponse,
+            rig::completion::CompletionError,
+        >,
+    > + Send {
+        self.0.completion(Self::request(request))
+    }
+
+    fn stream(
+        &self,
+        request: rig::completion::CompletionRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            rig::streaming::StreamingCompletionResponse,
+            rig::completion::CompletionError,
+        >,
+    > + Send {
+        self.0.stream(Self::request(request))
+    }
+
+    fn capabilities(&self) -> rig::completion::ProviderCapabilities {
+        self.0.capabilities()
     }
 }
 
@@ -481,7 +597,8 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
 impl ProviderAuth {
     /// The bearer credential provider `name` is called with: none, the key
     /// from the environment, or the current OAuth access token. A key
-    /// variable that is unset or blank is an error, not an empty key.
+    /// variable that is unset or blank is an error, not an empty key. `None`
+    /// for `auth = "aws"`, whose requests the AWS SDK signs itself.
     ///
     /// # Errors
     ///
@@ -489,7 +606,7 @@ impl ProviderAuth {
     /// [`Error::AuthRequired`] when an OAuth provider has no login.
     pub async fn credential(&self, config: &Config, name: &ProviderName) -> Result<Option<String>> {
         match self {
-            Self::None => Ok(None),
+            Self::None | Self::Aws { .. } => Ok(None),
             Self::ApiKey { env } => match std::env::var(env) {
                 Ok(key) if !key.trim().is_empty() => Ok(Some(key)),
                 Ok(_) | Err(_) => Err(Error::Config(format!(
@@ -867,6 +984,12 @@ async fn dispatch(
                 .run(client.completion_model(chat.model), sink)
                 .await
         }
+        ChatClient::Bedrock(client) => {
+            Box::pin(analysis.run(client.completion_model(chat.model), sink)).await
+        }
+        ChatClient::Responses(client) => {
+            Box::pin(analysis.run(Unstored(client.completion_model(chat.model)), sink)).await
+        }
     }
 }
 
@@ -892,6 +1015,151 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// One request's head and body, read off a loopback socket that
+    /// answers 400 (the call itself is not the point).
+    async fn capture_one() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let seen = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return String::new();
+            };
+            let mut read = Vec::new();
+            let mut buf = [0_u8; 8192];
+            // Until the body the Content-Length names has arrived.
+            while let Ok(n) = socket.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                read.extend_from_slice(buf.get(..n).unwrap_or_default());
+                let text = String::from_utf8_lossy(&read).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or_default())
+                        })
+                        .unwrap_or_default();
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+            }
+            drop(
+                socket
+                    .write_all(
+                        b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                    )
+                    .await,
+            );
+            String::from_utf8_lossy(&read).to_string()
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The whole chat path for Bedrock's OpenAI-compatible APIs, up to the
+    /// wire: the endpoint's path, a `SigV4` header for its service in place
+    /// of rig's bearer, and, for Responses, `store: false`.
+    #[tokio::test]
+    async fn bedrock_openai_apis_send_signed_requests_to_the_endpoint_path() {
+        for (provider_type, api, path, service) in [
+            (
+                ProviderType::BedrockMantle,
+                BedrockApi::Responses,
+                "POST /v1/responses ",
+                "/bedrock-mantle/aws4_request",
+            ),
+            (
+                ProviderType::BedrockMantle,
+                BedrockApi::ChatCompletions,
+                "POST /v1/chat/completions ",
+                "/bedrock-mantle/aws4_request",
+            ),
+            (
+                ProviderType::Bedrock,
+                BedrockApi::Responses,
+                "POST /openai/v1/responses ",
+                "/us-west-2/bedrock/aws4_request",
+            ),
+        ] {
+            let (root, seen) = capture_one().await;
+            let bedrock = crate::config::BedrockConfig { api, region: None };
+            let provider = ProviderConfig {
+                bedrock: Some(bedrock.clone()),
+                ..ProviderConfig::new(provider_type)
+            };
+            let Some(endpoint) = provider_type.bedrock_endpoint() else {
+                fail("a Bedrock type")
+            };
+            let name: ProviderName = "wire-test"
+                .parse()
+                .unwrap_or_else(|e: Error| fail(&e.to_string()));
+            let session = bedrock::Session::for_test(endpoint, bedrock, &root, "us-west-2");
+            let client = ChatClient::bedrock(&session, &name, &provider)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let answer = client
+                .one_shot(
+                    "openai.gpt-oss-120b",
+                    "Answer.",
+                    Duration::from_secs(10),
+                    "wire test",
+                )
+                .answer("hello")
+                .await;
+            assert!(answer.is_err(), "the server answers 400");
+            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+            assert!(request.starts_with(path), "{api}: {request}");
+            let lower = request.to_ascii_lowercase();
+            assert!(
+                lower.contains("authorization: aws4-hmac-sha256 credential=akidexample/"),
+                "{request}"
+            );
+            assert!(request.contains(service), "{request}");
+            assert!(!lower.contains("bearer"), "{request}");
+            assert!(request.contains("openai.gpt-oss-120b"), "{request}");
+            if api == BedrockApi::Responses {
+                assert!(request.contains(r#""store":false"#), "{request}");
+            }
+        }
+    }
+
+    #[test]
+    fn responses_requests_ask_bedrock_to_store_nothing() {
+        let request = |params: Option<serde_json::Value>| rig::completion::CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: Vec::new(),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: params,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        let sent = Unstored::<()>::request(request(None)).additional_params;
+        assert_eq!(sent, Some(serde_json::json!({ "store": false })));
+        // Whatever else was asked is kept, and store is forced off.
+        let sent = Unstored::<()>::request(request(Some(serde_json::json!({
+            "store": true,
+            "reasoning": { "effort": "low" }
+        }))))
+        .additional_params;
+        assert_eq!(
+            sent,
+            Some(serde_json::json!({ "store": false, "reasoning": { "effort": "low" } }))
+        );
     }
 
     #[test]

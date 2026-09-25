@@ -84,8 +84,26 @@ type = "ollama"
 embedding_dimension = 1024
 ```
 
-quack supports Ollama, OpenAI-compatible endpoints, and Anthropic, with no auth, an API
-key, or OAuth. `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data directories.
+quack supports Ollama, OpenAI-compatible endpoints, Anthropic, and Amazon Bedrock, with no
+auth, an API key, or OAuth, and for Bedrock whatever the AWS CLI would use (environment,
+`aws_profile` or `AWS_PROFILE`, `aws sso login`, instance roles):
+
+```toml
+[general]
+chat_model = "bedrock/us.anthropic.claude-sonnet-5"   # or "mantle/openai.gpt-oss-120b"
+
+[providers.bedrock]              # bedrock-runtime: Converse (default), chat-completions, or responses
+type = "bedrock"
+aws_profile = "my-sso-profile"   # optional
+region = "us-east-1"             # optional
+
+[providers.mantle]               # bedrock-mantle: responses (default) or chat-completions
+type = "bedrock-mantle"
+aws_profile = "my-sso-profile"
+# base_url = "https://vpce-0123456789abcdef0.bedrock-mantle.us-east-1.vpce.amazonaws.com"   # a VPC endpoint without private DNS
+```
+
+ `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data directories.
 `embedding_dimension` must be the width your embedding model produces; `quack doctor`
 checks it. quack adds the query and document prefixes each known embedding model was
 trained with (`[embedding]` overrides them). After you change the embedding model, its

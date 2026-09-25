@@ -21,8 +21,8 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    AuthMode, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant, ModelSpec,
-    OAuthConfig, OidcConfig, Overrides, config_file_path,
+    AuthMode, AwsRegion, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant,
+    ModelSpec, OAuthConfig, OidcConfig, Overrides, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -398,6 +398,9 @@ const PROVIDER_KEYS: &[&str] = &[
     "auth",
     "base_url",
     "api_key_env",
+    "aws_profile",
+    "api",
+    "region",
     "embedding_dimension",
     "max_concurrent_requests",
     "oauth",
@@ -480,7 +483,7 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             s.text(
                 "auth",
                 &provider.auth.mode().to_string(),
-                &AuthMode::default().to_string(),
+                &provider.provider_type.default_auth().to_string(),
                 None,
             );
             s.optional_text(
@@ -489,6 +492,22 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 None,
             );
             s.optional_text("api_key_env", provider.auth.api_key_env(), None);
+            s.optional_text("aws_profile", provider.auth.aws_profile(), None);
+            if let (Some(bedrock), Some(endpoint)) =
+                (&provider.bedrock, provider.provider_type.bedrock_endpoint())
+            {
+                s.text(
+                    "api",
+                    bedrock.api.as_str(),
+                    endpoint.default_api().as_str(),
+                    None,
+                );
+                s.optional_text(
+                    "region",
+                    bedrock.region.as_ref().map(AwsRegion::as_str),
+                    None,
+                );
+            }
             s.optional(
                 "embedding_dimension",
                 provider.embedding_dimension.map(|d| d.to_string()),
@@ -828,6 +847,23 @@ impl EnvVar {
                     secret,
                     &format!("[providers.{name}.oauth].client_secret_env"),
                 ));
+            }
+        }
+        if config
+            .providers
+            .values()
+            .any(|p| p.auth.mode() == AuthMode::Aws)
+        {
+            // What the AWS SDK's chain reads first for a Bedrock provider.
+            for (var, purpose) in [
+                ("AWS_PROFILE", "the AWS profile when aws_profile is unset"),
+                ("AWS_REGION", "the AWS region when region is unset"),
+                (
+                    "AWS_ACCESS_KEY_ID",
+                    "static AWS credentials, ahead of any profile",
+                ),
+            ] {
+                vars.push(Self::new(var, purpose));
             }
         }
         vars
@@ -1280,8 +1316,20 @@ top_k = 3
              [providers.p.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n",
         );
         let listed: BTreeSet<String> = inspection.settings.iter().map(Setting::path).collect();
-        for key in PROVIDER_KEYS.iter().filter(|k| **k != "oauth") {
+        let bedrock_only = ["api", "region"];
+        for key in PROVIDER_KEYS
+            .iter()
+            .filter(|k| **k != "oauth" && !bedrock_only.contains(*k))
+        {
             assert!(listed.contains(&format!("providers.p.{key}")), "{key}");
+        }
+        let bedrock = inspect("[providers.b]\ntype = \"bedrock-mantle\"\n");
+        let listed_bedrock: BTreeSet<String> = bedrock.settings.iter().map(Setting::path).collect();
+        for key in bedrock_only {
+            assert!(
+                listed_bedrock.contains(&format!("providers.b.{key}")),
+                "{key}"
+            );
         }
         for key in OAUTH_KEYS {
             assert!(

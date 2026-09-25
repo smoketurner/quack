@@ -31,9 +31,20 @@ build, and no ambiguity about which backend rustls picks at runtime.
   label keys on; it is resolved from the headers at build time, so the log line asks
   `CryptoProvider::fips()` instead for what rustls actually installed.
 - Features: `reqwest` and `rig` with `rustls`, `sqlx` with `tls-rustls-aws-lc-rs` (the
-  Postgres import). SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
+  Postgres import), and the AWS SDK behind the Bedrock provider (`aws-config` and
+  `aws-sdk-bedrockruntime` with `default-https-client`) on `aws-smithy-http-client`'s
+  `rustls-aws-lc`, plus `rustls-aws-lc-fips` on Linux, where `llm::bedrock` selects
+  `CryptoMode::AwsLcFips`. Bedrock's OpenAI-compatible APIs go through `reqwest` like every
+  other provider. SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
   AES-256-GCM for the provider OAuth token cache from `aws_lc_rs::aead`, HPKE for the vault
   from `rustls` (below).
+- **Exception: SigV4.** Bedrock requests are authenticated with AWS SigV4, an HMAC-SHA256
+  over the request. Both the AWS SDK (Converse, embeddings) and quack's own signer
+  (`llm::bedrock::Signer`, the OpenAI-compatible APIs) compute it with `aws-sigv4`, which
+  uses the RustCrypto `hmac` and `sha2` crates rather than aws-lc-rs, so that MAC is not
+  computed inside the FIPS-validated module even on Linux. The TLS connection it travels
+  over is. Neither crate is `ring` or OpenSSL, so the gates pass; a deployment that must keep
+  every primitive inside the validated module should not configure a Bedrock provider.
 - `quack_core::vault` seals data at rest with HPKE (RFC 9180, base mode):
   DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM, from rustls's
   `crypto::aws_lc_rs::hpke` (`DH_KEM_P256_HKDF_SHA256_AES_256`), which is aws-lc-rs

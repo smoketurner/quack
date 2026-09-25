@@ -16,7 +16,8 @@ use std::time::Duration;
 use crate::config;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{
-    BaseUrl, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName, ProviderType,
+    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName,
+    ProviderType,
 };
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
@@ -527,7 +528,7 @@ async fn check_embedding_model(
                     .provider
                     .base_url
                     .clone()
-                    .unwrap_or_else(|| ProviderType::Ollama.default_base_url());
+                    .unwrap_or(ProviderType::OLLAMA_BASE_URL);
                 let show = OllamaShow::fetch(http, &base, model.model).await;
                 if let Some(check) = width_check(model, configured, show) {
                     report.push(check);
@@ -658,10 +659,14 @@ async fn check_model(
 ) {
     let provider = model.provider;
     let name = model.provider_name;
-    let base = provider
+    let Some(base) = provider
         .base_url
         .clone()
-        .unwrap_or_else(|| provider.provider_type.default_base_url());
+        .or_else(|| provider.provider_type.default_base_url())
+    else {
+        report.push(check_bedrock(area, model, http.is_some()).await);
+        return;
+    };
 
     let credential = match model_credential(area, config, model).await {
         Ok(credential) => credential,
@@ -694,6 +699,90 @@ async fn check_model(
     report.push(listing_check(area, model, &base, listing));
 }
 
+/// Whether the AWS SDK finds a region and credentials for a Bedrock
+/// provider, where its endpoint is, and, on bedrock-mantle (the endpoint
+/// that lists its models), whether the model is there. On bedrock-runtime
+/// the model's access is only known from a model call.
+async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
+    let (name, provider) = (model.provider_name, model.provider);
+    let Some(bedrock) = provider.bedrock.as_ref() else {
+        return Check::new(
+            area,
+            Status::Fail,
+            format!("{model}: not a Bedrock provider"),
+        );
+    };
+    let Some(endpoint) = provider.provider_type.bedrock_endpoint() else {
+        return Check::new(
+            area,
+            Status::Fail,
+            format!("{model}: not a Bedrock provider"),
+        );
+    };
+    let surface = format!("{endpoint}, api {}", bedrock.api);
+    if !probe {
+        return Check::new(
+            area,
+            Status::Ok,
+            format!("{model}: {surface} (not probed: --offline)"),
+        );
+    }
+    let session = match crate::llm::bedrock::session(name, provider).await {
+        Ok(session) => session,
+        Err(e) => {
+            return Check::new(area, Status::Fail, format!("{model}: {e}")).fix(
+                match provider.auth.aws_profile() {
+                    Some(profile) => format!(
+                        "aws sso login --profile {profile}, or check [profile {profile}] in \
+                         ~/.aws/config"
+                    ),
+                    None => format!(
+                        "set aws_profile (and region) under [providers.{name}], or export \
+                         AWS_PROFILE, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+                    ),
+                },
+            );
+        }
+    };
+    let found = format!(
+        "{model}: AWS credentials found; {surface} at {} ({})",
+        session.root(),
+        session.region()
+    );
+    if endpoint == BedrockEndpoint::Runtime {
+        return Check::new(
+            area,
+            Status::Ok,
+            format!(
+                "{found}; bedrock-runtime lists no models, so access is checked on the first call"
+            ),
+        );
+    }
+    let Ok(base) = BaseUrl::try_from(session.root().to_owned()) else {
+        return Check::new(area, Status::Ok, found);
+    };
+    let listing = session
+        .models(name, provider)
+        .await
+        .map(Listing::Ids)
+        .map_err(|e| match e {
+            rig::http_client::Error::InvalidStatusCode(status)
+            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
+            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. }
+                if matches!(status.as_u16(), 401 | 403) =>
+            {
+                Probe::Rejected(status.as_u16())
+            }
+            rig::http_client::Error::InvalidStatusCode(status)
+            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
+            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. } => {
+                Probe::Unexpected(format!("HTTP {}", status.as_u16()))
+            }
+            other => Probe::Unreachable(ErrorChain(&other).to_string()),
+        });
+    listing_check(area, model, &base, listing)
+}
+
 /// The credential a model's provider is called with, or the failed check
 /// saying why there is none.
 async fn model_credential(
@@ -704,6 +793,8 @@ async fn model_credential(
     let provider = model.provider;
     let name = model.provider_name;
     Ok(match &provider.auth {
+        // The AWS SDK signs Bedrock's requests; `check_bedrock` covers it.
+        ProviderAuth::Aws { .. } => None,
         ProviderAuth::None => {
             if provider.provider_type != ProviderType::Ollama {
                 return Err(Box::new(
@@ -771,6 +862,20 @@ fn listing_check(
         )
         .fix(match provider.auth {
             ProviderAuth::Oauth(_) => format!("quack auth login {name}"),
+            // 401: the credentials themselves; 403: what they may do.
+            ProviderAuth::Aws { .. } if status == 403 => String::from(
+                "grant the credentials' IAM principal bedrock-mantle:CreateInference (and allow \
+                 it in the VPC endpoint's policy, when base_url is one)",
+            ),
+            ProviderAuth::Aws { .. } => match provider.auth.aws_profile() {
+                Some(profile) => format!(
+                    "check the credentials with `aws sts get-caller-identity --profile {profile}`, \
+                     or sign in again (`aws sso login --profile {profile}`)"
+                ),
+                None => String::from(
+                    "check the credentials with `aws sts get-caller-identity`, or sign in again",
+                ),
+            },
             ProviderAuth::None | ProviderAuth::ApiKey { .. } => {
                 String::from("check the key in the environment variable")
             }
@@ -837,7 +942,7 @@ async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
         Some(http) => match Listing::fetch(
             http,
             ProviderType::Ollama,
-            &ProviderType::Ollama.default_base_url(),
+            &ProviderType::OLLAMA_BASE_URL,
             None,
         )
         .await
@@ -860,7 +965,7 @@ async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
     match pulled.first() {
         Some(first) => format!(
             "Ollama is running at {} with {}; {}",
-            ProviderType::Ollama.default_base_url(),
+            ProviderType::OLLAMA_BASE_URL,
             pulled.join(", "),
             snippet(first)
         ),
@@ -1061,6 +1166,12 @@ impl Listing {
                     None => request,
                 }
             }
+            // `check_bedrock` asks the AWS SDK instead.
+            ProviderType::Bedrock | ProviderType::BedrockMantle => {
+                return Err(Probe::Unexpected(String::from(
+                    "Bedrock is not probed over plain HTTP",
+                )));
+            }
         };
         let response = request.send().await.map_err(Probe::from)?;
         let status = response.status();
@@ -1075,11 +1186,12 @@ impl Listing {
             ProviderType::Ollama => serde_json::from_slice::<OllamaRunningModels>(&bytes)
                 .map(Self::Ollama)
                 .map_err(|e| Probe::Unexpected(e.to_string())),
-            ProviderType::Openai | ProviderType::Anthropic => {
-                serde_json::from_slice::<IdList>(&bytes)
-                    .map(|list| Self::Ids(list.data.into_iter().map(|e| e.id).collect()))
-                    .map_err(|e| Probe::Unexpected(e.to_string()))
-            }
+            ProviderType::Openai
+            | ProviderType::Anthropic
+            | ProviderType::Bedrock
+            | ProviderType::BedrockMantle => serde_json::from_slice::<IdList>(&bytes)
+                .map(|list| Self::Ids(list.data.into_iter().map(|e| e.id).collect()))
+                .map_err(|e| Probe::Unexpected(e.to_string())),
         }
     }
 }
