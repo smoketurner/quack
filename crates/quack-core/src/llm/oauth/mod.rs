@@ -2,11 +2,14 @@
 //!
 //! A provider with `auth = "oauth"` uses an access token from its identity
 //! provider as the bearer for its endpoint. [`TokenManager`] hands out that
-//! token: reusing it while more than a minute remains, refreshing it under
-//! one lock when it is about to expire, and otherwise failing with
+//! token: reusing it while more than a minute remains, renewing it under one
+//! lock when it is about to expire, and otherwise failing with
 //! [`Error::AuthRequired`] so the interface can name `quack auth login`.
-//! Login is Authorization Code with PKCE through the browser and a loopback
-//! listener, or the device-code flow where no browser can open.
+//! The provider's [`Grant`] decides how a token is obtained: a person signs
+//! in with Authorization Code and PKCE through the browser and a loopback
+//! listener, or with the device-code flow where no browser can open, and a
+//! refresh token renews it; or quack authenticates as itself with the
+//! client-credentials grant, run again whenever the token runs out.
 
 mod cache;
 mod keychain;
@@ -37,7 +40,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub use cache::{CachedToken, KeyLocation, KeySource, TokenCache};
 
-use crate::config::{Config, OAuthConfig, ProviderName};
+use crate::config::{Config, Grant, OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
 
 /// Tokens with less than this left are refreshed before use.
@@ -162,8 +165,9 @@ pub enum LoginFlow {
     /// when it is set, else the browser.
     #[default]
     Configured,
-    /// The device-code flow whatever the config says (no browser, an SSH
-    /// session).
+    /// The device-code flow for a provider that signs a person in, whatever
+    /// its grant says (no browser, an SSH session). A client-credentials
+    /// provider signs nobody in and ignores it.
     DeviceCode,
 }
 
@@ -191,6 +195,8 @@ pub enum Renewal {
     Refreshable,
     /// There is no refresh token: `quack auth login` again.
     Relogin,
+    /// The client-credentials grant runs again.
+    Regrant,
 }
 
 impl std::fmt::Display for Renewal {
@@ -198,6 +204,7 @@ impl std::fmt::Display for Renewal {
         f.write_str(match self {
             Self::Refreshable => "refreshable",
             Self::Relogin => "no refresh token",
+            Self::Regrant => "renewed by the client-credentials grant",
         })
     }
 }
@@ -302,6 +309,11 @@ impl TokenManager {
         &self.provider
     }
 
+    #[must_use]
+    pub const fn grant(&self) -> Grant {
+        self.config.grant
+    }
+
     /// A bearer token with more than a minute of life left.
     ///
     /// # Errors
@@ -323,21 +335,26 @@ impl TokenManager {
             Some(token) => Some(token),
             None => self.current.read().await.clone(),
         };
-        let Some(cached) = cached else {
-            return Err(self.auth_required(AuthReason::NoToken));
+        let renewed = match (cached, self.config.grant) {
+            (Some(cached), _) if cached.is_fresh(Timestamp::now(), REUSE_MARGIN) => {
+                let access = cached.access_token.clone();
+                *self.current.write().await = Some(cached);
+                return Ok(access);
+            }
+            (_, Grant::ClientCredentials) => self.client_credentials().await?,
+            (None, Grant::AuthorizationCode | Grant::DeviceCode) => {
+                return Err(self.auth_required(AuthReason::NoToken));
+            }
+            (Some(cached), Grant::AuthorizationCode | Grant::DeviceCode) => {
+                let Some(refresh) = cached.refresh_token.as_ref() else {
+                    return Err(self.auth_required(AuthReason::ExpiredNoRefresh));
+                };
+                self.refresh(refresh).await?
+            }
         };
-        if cached.is_fresh(Timestamp::now(), REUSE_MARGIN) {
-            let access = cached.access_token.clone();
-            *self.current.write().await = Some(cached);
-            return Ok(access);
-        }
-        let Some(refresh) = cached.refresh_token.as_ref() else {
-            return Err(self.auth_required(AuthReason::ExpiredNoRefresh));
-        };
-        let refreshed = self.refresh(refresh).await?;
-        let access = refreshed.access_token.clone();
-        self.cache.store(&refreshed).await?;
-        *self.current.write().await = Some(refreshed);
+        let access = renewed.access_token.clone();
+        self.cache.store(&renewed).await?;
+        *self.current.write().await = Some(renewed);
         Ok(access)
     }
 
@@ -374,6 +391,8 @@ impl TokenManager {
 
     /// Run a login flow and cache the result. `notify` receives what the
     /// user must do; the call returns once the issuer has granted a token.
+    /// A client-credentials provider needs nobody, so this checks its
+    /// credentials by requesting a token.
     ///
     /// # Errors
     ///
@@ -386,11 +405,15 @@ impl TokenManager {
         notify: &(dyn Fn(LoginPrompt) + Sync),
     ) -> Result<CachedToken> {
         let _logging_in = self.refresh_lock.lock().await;
-        let token = match (flow, self.config.device_code) {
-            (LoginFlow::DeviceCode, _) | (LoginFlow::Configured, true) => {
+        let token = match (self.config.grant, flow) {
+            (Grant::ClientCredentials, LoginFlow::Configured | LoginFlow::DeviceCode) => {
+                self.client_credentials().await?
+            }
+            (Grant::DeviceCode, LoginFlow::Configured | LoginFlow::DeviceCode)
+            | (Grant::AuthorizationCode, LoginFlow::DeviceCode) => {
                 self.login_device_code(notify).await?
             }
-            (LoginFlow::Configured, false) => self.login_browser(notify).await?,
+            (Grant::AuthorizationCode, LoginFlow::Configured) => self.login_browser(notify).await?,
         };
         self.cache.store(&token).await?;
         *self.current.write().await = Some(token.clone());
@@ -448,6 +471,24 @@ impl TokenManager {
         Ok(CachedToken::from_response(&response))
     }
 
+    async fn client_credentials(&self) -> Result<CachedToken> {
+        tracing::info!(provider = %self.provider, "requesting a token with the client-credentials grant");
+        let client = self.client().await?;
+        let http = self.http.sender();
+        let response = client
+            .exchange_client_credentials()
+            .add_scopes(self.scopes())
+            .request_async(&http)
+            .await
+            .map_err(|e| {
+                Error::Llm(format!(
+                    "provider '{}': the client-credentials grant failed: {e}",
+                    self.provider
+                ))
+            })?;
+        Ok(CachedToken::from_response(&response))
+    }
+
     async fn login_device_code(
         &self,
         notify: &(dyn Fn(LoginPrompt) + Sync),
@@ -493,10 +534,10 @@ impl TokenManager {
             provider: self.provider.to_string(),
             token: cached.map(|t| TokenStatus {
                 expires_at: t.expires_at,
-                renewal: if t.refresh_token.is_some() {
-                    Renewal::Refreshable
-                } else {
-                    Renewal::Relogin
+                renewal: match (self.config.grant, t.refresh_token.is_some()) {
+                    (Grant::ClientCredentials, _) => Renewal::Regrant,
+                    (Grant::AuthorizationCode | Grant::DeviceCode, true) => Renewal::Refreshable,
+                    (Grant::AuthorizationCode | Grant::DeviceCode, false) => Renewal::Relogin,
                 },
             }),
             key_location: self.cache.key_location(),

@@ -240,8 +240,29 @@ text_enum!(AuthMode, "auth mode", {
     Oauth => "oauth",
 });
 
-/// `[providers.NAME.oauth]`: Authorization Code with PKCE, or the device-code
-/// flow, against an `OpenID` Connect issuer.
+/// How a provider's token is obtained from its issuer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Grant {
+    /// A person signs in through the browser (Authorization Code with PKCE).
+    #[default]
+    AuthorizationCode,
+    /// A person signs in by entering a code on another device (headless
+    /// hosts, SSH).
+    DeviceCode,
+    /// quack authenticates as itself with its client id and secret; nobody
+    /// signs in, and a token is requested again whenever one runs out.
+    ClientCredentials,
+}
+
+text_enum!(Grant, "grant", {
+    AuthorizationCode => "authorization-code",
+    DeviceCode => "device-code",
+    ClientCredentials => "client-credentials",
+});
+
+/// `[providers.NAME.oauth]`: the issuer, the client, and the grant that
+/// obtains the token quack sends to the provider's endpoint.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuthConfig {
@@ -258,11 +279,10 @@ pub struct OAuthConfig {
     /// Loopback redirect for the browser flow.
     #[serde(default = "OAuthConfig::default_redirect_uri")]
     pub redirect_uri: String,
-    /// Always use the device-code flow (headless hosts, SSH, servers).
     #[serde(default)]
-    pub device_code: bool,
-    /// Environment variable holding a client secret: the server as a
-    /// confidential client.
+    pub grant: Grant,
+    /// Environment variable holding the client secret: quack as a
+    /// confidential client. `grant = "client-credentials"` requires it.
     pub client_secret_env: Option<String>,
 }
 
@@ -454,6 +474,11 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
                 if oauth.issuer_url.is_empty() || oauth.client_id.is_empty() {
                     return Err(Error::Config(String::from(
                         "the oauth section needs issuer_url and client_id",
+                    )));
+                }
+                if oauth.grant == Grant::ClientCredentials && oauth.client_secret_env.is_none() {
+                    return Err(Error::Config(String::from(
+                        "grant = \"client-credentials\" needs client_secret_env",
                     )));
                 }
                 ProviderAuth::Oauth(oauth)
@@ -1665,6 +1690,34 @@ rerank = "model"
     }
 
     #[test]
+    fn the_grant_is_named_and_client_credentials_needs_a_secret() {
+        let section = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n";
+        let grant_of = |extra: &str| {
+            Config::parse(&format!("{section}{extra}"))
+                .ok()
+                .and_then(|c| {
+                    c.providers
+                        .get("o")
+                        .and_then(|p| p.auth.oauth().map(|o| o.grant))
+                })
+        };
+        assert_eq!(
+            grant_of("grant = \"device-code\"\n"),
+            Some(Grant::DeviceCode)
+        );
+        assert_eq!(
+            grant_of("grant = \"client-credentials\"\nclient_secret_env = \"S\"\n"),
+            Some(Grant::ClientCredentials)
+        );
+        assert!(
+            err_of(&format!("{section}grant = \"client-credentials\"\n"))
+                .contains("needs client_secret_env")
+        );
+        assert!(err_of(&format!("{section}grant = \"password\"\n")).contains("password"));
+        assert!(err_of(&format!("{section}device_code = true\n")).contains("device_code"));
+    }
+
+    #[test]
     fn oauth_section_defaults_and_fields_parse() {
         let config = Config::parse(
             "[providers.azure]\ntype = \"openai\"\nauth = \"oauth\"\nbase_url = \"https://r.openai.azure.com/openai/deployments/d\"\n[providers.azure.oauth]\nissuer_url = \"https://login.microsoftonline.com/t/v2.0\"\nclient_id = \"abc\"\nscopes = [\"https://cognitiveservices.azure.com/.default\", \"offline_access\"]\nclient_secret_env = \"AZURE_CLIENT_SECRET\"\n",
@@ -1675,7 +1728,7 @@ rerank = "model"
         let oauth = config.providers.get("azure").and_then(|p| p.auth.oauth());
         assert!(oauth.is_some_and(|o| {
             o.redirect_uri == "http://127.0.0.1:19876/callback"
-                && !o.device_code
+                && o.grant == Grant::AuthorizationCode
                 && o.scopes.len() == 2
                 && o.client_secret_env.as_deref() == Some("AZURE_CLIENT_SECRET")
         }));

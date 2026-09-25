@@ -151,7 +151,8 @@ started/finished with timing, permission requests, turn complete. Every interfac
 it. `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
 prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
 clients themselves. OAuth providers (`quack_core::llm::oauth`) hand out a bearer through
-one shared `TokenManager` per provider: PKCE or device-code login via `quack auth`, an
+one shared `TokenManager` per provider: PKCE or device-code login via `quack auth` (or the
+client-credentials grant, which needs no login), an
 AES-256-GCM cache under `<data_dir>/tokens/` keyed from the OS keychain or a 0600 key file,
 silent refresh, and `Error::AuthRequired` (exit 4 from every command that reaches a provider) when no flow can run.
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
