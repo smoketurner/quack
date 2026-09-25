@@ -12,6 +12,7 @@
 //! client-credentials grant, run again whenever the token runs out. The
 //! token is kept in `control.db`, sealed by the vault (`store.rs`).
 
+pub mod client_key;
 mod key_slot;
 mod keychain;
 mod store;

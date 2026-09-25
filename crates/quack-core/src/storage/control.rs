@@ -19,8 +19,8 @@ use std::str::FromStr;
 use jiff::{SignedDuration, Timestamp};
 
 use super::queries::{
-    ApiTokens, AuditLog, Bound, Members, ProviderTokens, SealedColumns, UserTokens, Users,
-    Workspaces,
+    ApiTokens, AuditLog, Bound, ClientKeys, Members, ProviderTokens, SealedColumns, UserTokens,
+    Users, Workspaces,
 };
 use crate::config::{Config, ProviderName};
 use crate::error::{Error, Result};
@@ -783,21 +783,33 @@ pub enum SealedOwner<'a> {
     /// client-credentials grant (`provider_tokens`;
     /// `vault::Purpose::ProviderToken`).
     Provider(&'a ProviderName),
+    /// An OAuth client's `private_key_jwt` signing key, by key name
+    /// (`<issuer> <client_id>`; `client_keys`; `vault::Purpose::ClientKey`).
+    ClientKey(&'a str),
 }
 
 impl SealedOwner<'_> {
-    /// The table, its key column, and this owner's key.
-    fn row(self) -> (DynIden, DynIden, String) {
+    /// The table, its key column, this owner's key, and the column that
+    /// records when the row was written.
+    fn row(self) -> (DynIden, DynIden, String, DynIden) {
         match self {
             Self::User(user) => (
                 UserTokens::Table.into_iden(),
                 UserTokens::UserId.into_iden(),
                 user.to_string(),
+                SealedColumns::UpdatedAt.into_iden(),
             ),
             Self::Provider(provider) => (
                 ProviderTokens::Table.into_iden(),
                 ProviderTokens::Provider.into_iden(),
                 provider.to_string(),
+                SealedColumns::UpdatedAt.into_iden(),
+            ),
+            Self::ClientKey(name) => (
+                ClientKeys::Table.into_iden(),
+                ClientKeys::Name.into_iden(),
+                name.to_owned(),
+                ClientKeys::CreatedAt.into_iden(),
             ),
         }
     }
@@ -1257,7 +1269,7 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn sealed(&self, owner: SealedOwner<'_>) -> Result<Option<Sealed>> {
-        let (table, key, id) = owner.row();
+        let (table, key, id, _) = owner.row();
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -1278,16 +1290,48 @@ impl ControlPlane {
     /// Returns an error if the owner cannot hold one (a user that does not
     /// exist) or the write fails.
     pub async fn put_sealed(&self, owner: SealedOwner<'_>, sealed: &Sealed) -> Result<()> {
-        let (table, key, id) = owner.row();
+        self.insert_sealed(owner, sealed, true).await.map(drop)
+    }
+
+    /// Keep `owner`'s sealed value only when it has none yet; whether this
+    /// one was kept. Two processes making the same key at once both call
+    /// this, and both then use whichever row won.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owner cannot hold one or the write fails.
+    pub async fn add_sealed(&self, owner: SealedOwner<'_>, sealed: &Sealed) -> Result<bool> {
+        self.insert_sealed(owner, sealed, false).await
+    }
+
+    async fn insert_sealed(
+        &self,
+        owner: SealedOwner<'_>,
+        sealed: &Sealed,
+        replace: bool,
+    ) -> Result<bool> {
+        let (table, key, id, stamp) = owner.row();
+        let conflict = if replace {
+            OnConflict::column(key.clone())
+                .update_columns([
+                    SealedColumns::KeyId.into_iden(),
+                    SealedColumns::Enc.into_iden(),
+                    SealedColumns::Ciphertext.into_iden(),
+                    stamp.clone(),
+                ])
+                .to_owned()
+        } else {
+            OnConflict::column(key.clone()).do_nothing().to_owned()
+        };
         let bound = Bound::new(
             Query::insert()
                 .into_table(table)
                 .columns([
-                    key.clone(),
+                    key,
                     SealedColumns::KeyId.into_iden(),
                     SealedColumns::Enc.into_iden(),
                     SealedColumns::Ciphertext.into_iden(),
-                    SealedColumns::UpdatedAt.into_iden(),
+                    stamp,
                 ])
                 .values([
                     id.into(),
@@ -1296,19 +1340,10 @@ impl ControlPlane {
                     sealed.ciphertext.clone().into(),
                     Expr::current_timestamp(),
                 ])?
-                .on_conflict(
-                    OnConflict::column(key)
-                        .update_columns([
-                            SealedColumns::KeyId,
-                            SealedColumns::Enc,
-                            SealedColumns::Ciphertext,
-                            SealedColumns::UpdatedAt,
-                        ])
-                        .to_owned(),
-                ),
+                .on_conflict(conflict),
         )?;
-        bound.query().execute(&self.pool).await?;
-        Ok(())
+        let done = bound.query().execute(&self.pool).await?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// Forget `owner`'s sealed token; one without is already done.
@@ -1317,7 +1352,7 @@ impl ControlPlane {
     ///
     /// Returns an error if the delete fails.
     pub async fn delete_sealed(&self, owner: SealedOwner<'_>) -> Result<()> {
-        let (table, key, id) = owner.row();
+        let (table, key, id, _) = owner.row();
         let bound = Bound::new(
             Query::delete()
                 .from_table(table)
@@ -2120,6 +2155,47 @@ mod tests {
                 .is_ok_and(|t| t.is_none())
         );
         assert!(cp.delete_sealed(SealedOwner::User(&user.id)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_client_key_row_is_added_once_replaced_in_place_and_deleted_by_name() {
+        let (_dir, cp) = open().await;
+        let sealed = |id: &str| Sealed {
+            key_id: id.to_owned(),
+            enc: vec![1],
+            ciphertext: vec![2, 3],
+        };
+        let owner = SealedOwner::ClientKey("https://i c");
+        assert!(
+            cp.add_sealed(owner, &sealed("k1"))
+                .await
+                .is_ok_and(|kept| kept)
+        );
+        // A second process's key loses to the first.
+        assert!(
+            cp.add_sealed(owner, &sealed("k2"))
+                .await
+                .is_ok_and(|kept| !kept)
+        );
+        assert!(
+            cp.sealed(owner)
+                .await
+                .is_ok_and(|t| t == Some(sealed("k1")))
+        );
+        assert!(cp.put_sealed(owner, &sealed("k3")).await.is_ok());
+        assert!(
+            cp.sealed(owner)
+                .await
+                .is_ok_and(|t| t == Some(sealed("k3")))
+        );
+        // Another client's key is another row.
+        assert!(
+            cp.sealed(SealedOwner::ClientKey("https://i other"))
+                .await
+                .is_ok_and(|t| t.is_none())
+        );
+        assert!(cp.delete_sealed(owner).await.is_ok());
+        assert!(cp.sealed(owner).await.is_ok_and(|t| t.is_none()));
     }
 
     #[tokio::test]
