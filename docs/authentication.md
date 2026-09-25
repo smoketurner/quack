@@ -96,8 +96,9 @@ The session cookie carries `HttpOnly`, `SameSite=Lax`, and `Path=/`. It also car
 `Secure` unless the request arrived from loopback. A session ends 12 hours after login
 (`[server].session_max_age_hours`) or 120 minutes after its last request
 (`[server].session_idle_minutes`), whichever comes first. The two login routes accept 2
-requests per second from one client, with bursts of up to 10, in addition to the
-server-wide rate limit. `POST /logout` (web) and `POST /api/v1/auth/logout` (API) end a
+requests per second from one peer address, with bursts of up to 10, in addition to the
+server-wide rate limit, which is also per address. Neither limit looks at the
+`Authorization` header, so a client cannot buy a fresh budget by changing it. `POST /logout` (web) and `POST /api/v1/auth/logout` (API) end a
 session.
 
 ### API tokens

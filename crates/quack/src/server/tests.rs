@@ -4244,6 +4244,75 @@ async fn the_login_form_is_rate_limited_and_healthz_is_not() {
     }
 }
 
+/// Issue #237: the limiters key on the peer address, never on a header the
+/// caller writes. A fresh random `Authorization` on every attempt once
+/// bought a fresh bucket, so the login limiter never refused anyone who
+/// bothered to rotate it, while a second address keeps its own budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_the_authorization_header_does_not_escape_the_login_limit() {
+    let h = harness(ServeMode::Login).await;
+    h.user("root", UserKind::Admin).await;
+    let attempt = |n: u32, peer: &'static str| {
+        let addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|e| fail(&format!("{e}")));
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer rotated-{n}"))
+            .body(Body::from(
+                serde_json::json!({ "username": "nobody", "password": "wrong" }).to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        h.send(request)
+    };
+    // Concurrent, for the reason the login form test gives.
+    let attempts = (0..(super::LOGIN_RATE_BURST + 4)).map(|n| attempt(n, "203.0.113.7:51000"));
+    let refused = futures::future::join_all(attempts)
+        .await
+        .into_iter()
+        .filter(|(status, _, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        refused >= 3,
+        "{refused} of {} attempts were refused; a rotated Authorization header bought a fresh bucket",
+        super::LOGIN_RATE_BURST + 4
+    );
+
+    // Another address is another caller, with its budget untouched.
+    let (status, body, _) = attempt(0, "198.51.100.9:52000").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // The general limiter keys the same way: unvalidated bearers do not buy
+    // an address more than its one budget anywhere else either.
+    let peer: std::net::SocketAddr = "192.0.2.44:53000"
+        .parse()
+        .unwrap_or_else(|e| fail(&format!("{e}")));
+    let requests = (0..(super::RATE_BURST + 4)).map(|n| {
+        let mut request = Request::builder()
+            .uri("/api/v1/workspaces")
+            .header(header::AUTHORIZATION, format!("Bearer qk_rotated-{n}"))
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        h.send(request)
+    });
+    let refused = futures::future::join_all(requests)
+        .await
+        .into_iter()
+        .filter(|(status, _, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        refused >= 3,
+        "{refused} of {} requests were refused; rotated bearers escaped the general limiter",
+        super::RATE_BURST + 4
+    );
+}
+
 // --- jobs ----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
