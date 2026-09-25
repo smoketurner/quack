@@ -532,6 +532,47 @@ async fn logging_out_of_the_last_session_forgets_the_token() {
     assert!(h.has_token(&user.id).await);
     assert_eq!(h.send(log_out(second)).await.status, StatusCode::NO_CONTENT);
     assert!(!h.has_token(&user.id).await);
+    let logouts = h.audit("logout").await;
+    assert_eq!(logouts.len(), 2, "{logouts:?}");
+    assert!(
+        logouts
+            .iter()
+            .all(|(outcome, who)| *outcome == Outcome::Allowed && who.as_ref() == Some(&user.id))
+    );
+}
+
+/// An issuer's access token is not a session: logging out with it closes
+/// nothing, records no `logout`, and keeps the user's stored sign-in token
+/// even while they have no session open (#223).
+#[tokio::test]
+async fn a_bearer_logout_keeps_the_stored_token_and_audits_nothing() {
+    let (h, key, issuer) = Harness::resource().await;
+    let cookie = h.sign_in("sub-kay", "kay").await;
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-kay"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"));
+    // The browser session ends without a logout (a restart, an expiry), so
+    // the stored token outlives every session.
+    let session = cookie
+        .strip_prefix(&format!("{}=", crate::server::auth::SESSION_COOKIE))
+        .unwrap_or_else(|| fail("not a session cookie"));
+    h.app.sessions.close(session);
+    assert!(h.has_token(&user.id).await);
+
+    let token = key.token(&issuer, "sub-kay", AUDIENCE);
+    let request = Request::post("/api/v1/auth/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let reply = h.send(request).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.body);
+    assert!(h.has_token(&user.id).await, "a bearer ends no sign-in");
+    assert!(h.audit("logout").await.is_empty());
 }
 
 #[tokio::test]

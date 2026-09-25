@@ -112,13 +112,7 @@ impl AuditRow {
     /// Returns an error if the stored timestamp does not parse.
     pub fn to_ocsf(&self) -> Result<Value> {
         let action = self.action.parse::<AuditAction>().ok();
-        let mut class = EventClass::of(action, self.outcome);
-        // A logout by a token-bearer caller closes no session: rendering it as
-        // Authentication / Logoff (a terminated logon session) would be false.
-        // Reclassify it as API Activity carrying the raw `logout` action.
-        if matches!(action, Some(AuditAction::Logout)) && self.token_hash.is_some() {
-            class = EventClass::Api(ApiActivity::Other);
-        }
+        let class = EventClass::of(action, self.outcome);
         let (class_uid, class_name, category_uid, category_name) = class.class();
         let (activity_id, known_activity) = class.activity();
         let activity_name = match class {
@@ -243,15 +237,6 @@ mod tests {
         }
     }
 
-    /// `row`, but attributed to a minted API token (a non-null `token_hash`).
-    fn row_with_token(action: &str, outcome: Outcome) -> AuditRow {
-        let mut row = row(action, outcome);
-        row.token_hash = Some(String::from(
-            "a78d5c73d957668ff8e2ead70b6d306990bd3e1c3835f9c099d0794bee4f4fd0",
-        ));
-        row
-    }
-
     fn render(row: &AuditRow) -> Value {
         row.to_ocsf().unwrap_or_else(|e| panic_with(&e.to_string()))
     }
@@ -370,60 +355,5 @@ mod tests {
         let mut broken = row("open", Outcome::Allowed);
         broken.timestamp = String::from("yesterday");
         assert!(broken.to_ocsf().is_err());
-    }
-
-    #[test]
-    fn token_bearer_logout_is_api_activity_not_a_logoff() {
-        // A token-bearer logout closes no session, so it must not render as a
-        // Logoff (OCSF: "A logon session was terminated and no longer
-        // exists"); it lands in API Activity carrying the raw `logout`
-        // action, with the token hash still preserved in `unmapped`.
-        let mut token = row("logout", Outcome::Allowed);
-        token.token_hash = Some(String::from(
-            "a78d5c73d957668ff8e2ead70b6d306990bd3e1c3835f9c099d0794bee4f4fd0",
-        ));
-        let event = render(&token);
-        assert_required(&event);
-        assert_eq!(event["class_uid"], 6003, "{event}");
-        assert_eq!(event["activity_id"], 99, "{event}");
-        assert_eq!(event["activity_name"], "logout", "{event}");
-        assert_eq!(event["type_uid"], 600_399, "{event}");
-        assert_eq!(event["api"]["operation"], "logout", "{event}");
-        assert_eq!(event["actor"]["user"]["uid"], "u1", "{event}");
-        assert_eq!(
-            event["unmapped"]["token_hash"],
-            "a78d5c73d957668ff8e2ead70b6d306990bd3e1c3835f9c099d0794bee4f4fd0",
-            "{event}"
-        );
-        assert!(
-            event.get("user").is_none(),
-            "an API event has no `user`: {event}"
-        );
-        assert!(
-            event.get("service").is_none(),
-            "no Authentication `service`: {event}"
-        );
-        assert!(!event["resources"].is_null(), "{event}");
-
-        // A failed token-bearer logout is still API Activity, now a Failure.
-        let event = render(&row_with_token("logout", Outcome::Error));
-        assert_eq!(event["class_uid"], 6003, "{event}");
-        assert_eq!(event["status_id"], 2, "{event}");
-        assert_eq!(event["status"], "Failure", "{event}");
-
-        // A session logout (no token hash) is still a real Logoff: unchanged.
-        let session = render(&row("logout", Outcome::Allowed));
-        assert_required(&session);
-        assert_eq!(session["class_uid"], 3002, "{session}");
-        assert_eq!(session["activity_id"], 2, "{session}");
-        assert_eq!(session["activity_name"], "Logoff", "{session}");
-        assert_eq!(session["type_uid"], 300_202, "{session}");
-        assert_eq!(session["user"]["uid"], "u1", "{session}");
-        assert_eq!(session["service"]["name"], "quack", "{session}");
-        assert!(session["unmapped"].get("token_hash").is_none(), "{session}");
-        assert!(
-            session.get("api").is_none(),
-            "no API fields on a Logoff: {session}"
-        );
     }
 }
