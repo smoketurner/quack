@@ -38,14 +38,14 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::KeySource;
-use quack_core::storage::control::{ControlPlane, sha256_hex};
+use quack_core::storage::control::ControlPlane;
 use quack_core::vault::Vault;
 use state::{App, AppState, ServeMode};
 
 /// How long one request may take. Agent turns can be slow.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Rate limit per caller: sustained rate and burst.
+/// Rate limit per peer address ([`CallerKey`]): sustained rate and burst.
 const RATE_PER_SECOND: u64 = 1;
 const RATE_BURST: u32 = 120;
 
@@ -93,26 +93,30 @@ impl MakeRequestId for RequestIdV7 {
     }
 }
 
-/// Rate-limit key: the bearer token when there is one, else the peer
-/// address, else one shared bucket.
+/// Rate-limit key: the peer address, else one shared bucket.
+///
+/// Never anything the request says about itself. Keying on the
+/// `Authorization` header, as this once did, let a caller pick its own
+/// bucket before anything had checked the header: a fresh random bearer on
+/// every request was a fresh budget, from the login limiter and the general
+/// one alike (issue #237). The peer address is the one thing a caller cannot
+/// choose per request. The price is that everyone behind one address (a NAT,
+/// or a reverse proxy in front of quack) shares one budget.
 #[derive(Clone)]
 struct CallerKey;
 
 impl KeyExtractor for CallerKey {
-    type Key = String;
+    type Key = std::net::IpAddr;
 
     fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
-        if let Some(token) = req
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-        {
-            return Ok(sha256_hex(token.as_bytes()));
-        }
+        // No `ConnectInfo` only happens in the `oneshot` tests: the server
+        // always serves with it. They share the unspecified address.
         Ok(req
             .extensions()
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
-            .map_or_else(|| String::from("anonymous"), |c| c.0.ip().to_string()))
+            .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |c| {
+                c.0.ip()
+            }))
     }
 }
 

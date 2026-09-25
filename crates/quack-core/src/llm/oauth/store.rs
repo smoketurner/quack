@@ -49,8 +49,12 @@ impl ProviderTokens {
     }
 
     /// Where the vault key is.
-    pub(super) fn key_location(&self) -> KeyLocation {
-        self.vault.key_location()
+    ///
+    /// # Errors
+    ///
+    /// As [`Vault::key_location`].
+    pub(super) async fn key_location(&self) -> Result<KeyLocation> {
+        self.vault.key_location().await
     }
 
     /// The stored token, or `None` when there is none or the key that sealed

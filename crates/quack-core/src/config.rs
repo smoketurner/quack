@@ -955,6 +955,8 @@ pub struct ServerConfig {
     pub session_max_age_hours: u32,
     /// How long a browser session survives with no request on it.
     pub session_idle_minutes: u32,
+    /// When the session and sign-in cookies carry `Secure`.
+    pub secure_cookies: SecureCookies,
     /// Sign-in through the organization's `OpenID` Connect issuer, beside
     /// password login.
     pub oidc: Option<OidcConfig>,
@@ -1013,6 +1015,12 @@ impl OidcConfig {
             .strip_suffix(Self::CALLBACK_PATH)
             .unwrap_or(&self.redirect_uri)
             .to_owned()
+    }
+
+    /// Whether `redirect_uri`, and so the server's public URL, is https.
+    #[must_use]
+    pub fn is_https(&self) -> bool {
+        oauth2::url::Url::parse(&self.redirect_uri).is_ok_and(|url| url.scheme() == "https")
     }
 
     /// The scopes requested when `scopes` is unset.
@@ -1103,6 +1111,7 @@ impl Default for ServerConfig {
             workers_per_workspace: 1,
             session_max_age_hours: 12,
             session_idle_minutes: 120,
+            secure_cookies: SecureCookies::Auto,
             oidc: None,
         }
     }
@@ -1120,7 +1129,40 @@ impl ServerConfig {
     pub fn session_idle(&self) -> Duration {
         Duration::from_secs(u64::from(self.session_idle_minutes).saturating_mul(60))
     }
+
+    /// Whether a cookie set on a request that arrived on loopback must
+    /// still carry `Secure`. Off loopback it always does. On loopback it
+    /// does when the operator said so, or when the server's public URL is
+    /// known to be https: a TLS-terminating proxy on the same host connects
+    /// over loopback, and the browser behind it is on https. Nothing the
+    /// request says about itself (`X-Forwarded-Proto`) is trusted for this.
+    #[must_use]
+    pub fn secure_cookies_on_loopback(&self) -> bool {
+        match self.secure_cookies {
+            SecureCookies::Always => true,
+            SecureCookies::Auto => self.oidc.as_ref().is_some_and(OidcConfig::is_https),
+        }
+    }
 }
+
+/// `[server].secure_cookies`: when the session cookie and the sign-in
+/// state cookie carry `Secure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecureCookies {
+    /// Unless the request arrived on loopback and no https public URL is
+    /// configured (`[server.oidc].redirect_uri`): plain HTTP on a laptop
+    /// keeps working.
+    Auto,
+    /// On every cookie, for a same-host TLS proxy the server cannot
+    /// otherwise tell apart from a local browser.
+    Always,
+}
+
+text_enum!(SecureCookies, "secure_cookies value", {
+    Auto => "auto",
+    Always => "always",
+});
 
 /// Workspace context (the owner-written instructions) settings.
 #[derive(Debug, Clone, Deserialize)]
@@ -1618,6 +1660,30 @@ rerank = "model"
         let ok = Config::parse("[server]\nbind = \"0.0.0.0:9000\"\nlocal = true\n");
         assert!(ok.is_ok_and(|c| c.server.bind == "0.0.0.0:9000" && c.server.local));
         assert!(err_of("[server]\nport = 1\n").contains("port"));
+    }
+
+    /// Issue #246: loopback cookies are plain unless the public URL is https
+    /// or the operator asked for `Secure` everywhere.
+    #[test]
+    fn secure_cookies_on_loopback_follow_the_setting_and_the_public_url() {
+        let default = Config::parse("");
+        assert!(default.is_ok_and(|c| {
+            c.server.secure_cookies == SecureCookies::Auto && !c.server.secure_cookies_on_loopback()
+        }));
+        let always = Config::parse("[server]\nsecure_cookies = \"always\"\n");
+        assert!(always.is_ok_and(|c| c.server.secure_cookies_on_loopback()));
+        assert!(err_of("[server]\nsecure_cookies = \"never\"\n").contains("never"));
+        let oidc = |origin: &str| {
+            format!(
+                "[server.oidc]\nissuer_url = \"https://idp\"\nclient_id = \"q\"\n\
+                 redirect_uri = \"{origin}{}\"\n",
+                OidcConfig::CALLBACK_PATH
+            )
+        };
+        let https = Config::parse(&oidc("https://quack.example.com"));
+        assert!(https.is_ok_and(|c| c.server.secure_cookies_on_loopback()));
+        let http = Config::parse(&oidc("http://127.0.0.1:8080"));
+        assert!(http.is_ok_and(|c| !c.server.secure_cookies_on_loopback()));
     }
 
     #[test]

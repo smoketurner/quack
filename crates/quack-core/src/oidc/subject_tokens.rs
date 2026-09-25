@@ -68,26 +68,46 @@ impl SubjectTokens {
         Arc::clone(locks.entry(user.clone()).or_default())
     }
 
-    /// Keep a person's token from a sign-in, replacing the one before.
+    /// Keep a person's token from a sign-in, replacing the one before, and
+    /// run `then` (opening the session that uses it) under the same per-user
+    /// lock. A [`Self::forget_unless`] therefore sees neither or both: it
+    /// never deletes a token whose session is about to open (issue #241).
     ///
     /// # Errors
     ///
-    /// Returns an error when sealing or the write fails.
-    pub async fn keep(&self, user: &UserId, token: &CachedToken) -> Result<()> {
+    /// Returns an error when sealing or the write fails; `then` does not run.
+    pub async fn keep_then<T>(
+        &self,
+        user: &UserId,
+        token: &CachedToken,
+        then: impl FnOnce() -> T,
+    ) -> Result<T> {
         let lock = self.lock_for(user);
         let _renewing = lock.lock().await;
-        self.tokens.store(&self.control, user, token).await
+        self.tokens.store(&self.control, user, token).await?;
+        Ok(then())
     }
 
-    /// Forget a person's stored token.
+    /// Forget a person's stored token unless `in_use` (asked under the
+    /// per-user lock, after any sign-in in progress has stored its token and
+    /// opened its session) says something still needs it. Returns whether
+    /// it was forgotten.
     ///
     /// # Errors
     ///
     /// Returns an error if the delete fails.
-    pub async fn forget(&self, user: &UserId) -> Result<()> {
+    pub async fn forget_unless(
+        &self,
+        user: &UserId,
+        in_use: impl FnOnce() -> bool,
+    ) -> Result<bool> {
         let lock = self.lock_for(user);
         let _renewing = lock.lock().await;
-        self.tokens.clear(&self.control, user).await
+        if in_use() {
+            return Ok(false);
+        }
+        self.tokens.clear(&self.control, user).await?;
+        Ok(true)
     }
 
     /// The person's stored sign-in, renewed first when it is due.

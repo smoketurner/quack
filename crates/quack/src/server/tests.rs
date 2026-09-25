@@ -3169,6 +3169,111 @@ async fn a_successful_mcp_search_is_audited_as_allowed() {
     );
 }
 
+/// Concurrent MCP calls by one user with two tokens share one transport
+/// (same workspace, user, and write permission), yet each call's audit row
+/// carries the token and request id of the request that made it: the
+/// `Access` travels with the HTTP request, not on the shared server
+/// (issue #245).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_mcp_calls_by_one_user_audit_their_own_token_and_request_id() {
+    const CALLS: usize = 8;
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("mcpconc", &owner).await;
+    let issue = |name: &'static str| {
+        let h = &h;
+        let ws = &ws;
+        let owner = &owner;
+        async move {
+            h.app
+                .control
+                .create_token(ws, owner, name, &[Scope::Read], None)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        }
+    };
+    let first = issue("first").await;
+    let second = issue("second").await;
+    let tokens = [
+        (
+            first.secret.expose().to_owned(),
+            first.row.token_hash.clone(),
+        ),
+        (
+            second.secret.expose().to_owned(),
+            second.row.token_hash.clone(),
+        ),
+    ];
+    let session = mcp_session(&h, &ws, &tokens[0].0).await;
+
+    let calls = (0..CALLS).flat_map(|n| {
+        tokens
+            .iter()
+            .enumerate()
+            .map(move |(which, (secret, _))| (n, which, secret))
+    });
+    let responses = futures::future::join_all(calls.map(|(n, which, secret)| {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/mcp/v1/{ws}"))
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header("mcp-session-id", &session)
+            .header(super::auth::REQUEST_ID_HEADER, format!("req-{which}-{n}"))
+            .body(Body::from(
+                rpc(
+                    u32::try_from(n * 2 + which + 10).unwrap_or(u32::MAX),
+                    "tools/call",
+                    &serde_json::json!({ "name": "list_tables", "arguments": {} }),
+                )
+                .to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        h.send(request)
+    }))
+    .await;
+    for (status, body, _) in &responses {
+        assert_eq!(*status, StatusCode::OK, "{body}");
+    }
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("list")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(rows.len(), CALLS * 2, "one row per call, {rows:?}");
+    for row in &rows {
+        assert_eq!(row.channel, Channel::Mcp, "{row:?}");
+        let request_id = row.request_id.as_deref().unwrap_or_default();
+        let which = match request_id.split('-').nth(1) {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => fail(&format!("unexpected request id in {row:?}")),
+        };
+        let expected = tokens.get(which).map(|(_, hash)| hash.as_str());
+        assert_eq!(
+            row.token_hash.as_deref(),
+            expected,
+            "request {request_id} was audited with another request's token"
+        );
+    }
+    let mut ids: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.request_id.as_deref())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        CALLS * 2,
+        "every request id appears once, {ids:?}"
+    );
+}
+
 /// Every allowed workspace read writes its access row and its detail row
 /// under one id, and a table name never reaches control.db (issue #54).
 #[tokio::test(flavor = "multi_thread")]
@@ -4186,6 +4291,25 @@ async fn the_session_cookie_is_secure_off_loopback_and_carries_max_age() {
     assert!(remote.contains("Max-Age=43200"), "{remote}");
 }
 
+/// Issue #246: with `[server].secure_cookies = "always"` the session cookie
+/// carries `Secure` on loopback too, for a same-host TLS proxy the server
+/// cannot otherwise tell from a local browser; the default leaves loopback
+/// plain (the test above).
+#[tokio::test(flavor = "multi_thread")]
+async fn secure_cookies_always_marks_loopback_cookies_secure() {
+    let mut config = Config::default();
+    config.server.secure_cookies = quack_core::config::SecureCookies::Always;
+    let h = harness_with(ServeMode::Login, config).await;
+    h.user("root", UserKind::Admin).await;
+    let (status, _, headers) = h
+        .form_from("/login", "127.0.0.1:51000", "username=root&password=pw")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = set_cookie(&headers);
+    assert!(cookie.contains("quack_session="), "{cookie}");
+    assert!(cookie.contains("Secure"), "{cookie}");
+}
+
 /// The limiters' per-key state is swept on a loop rather than once: without
 /// it governor keeps one entry per caller for the life of the process.
 #[tokio::test(flavor = "multi_thread")]
@@ -4242,6 +4366,75 @@ async fn the_login_form_is_rate_limited_and_healthz_is_not() {
         let (status, body) = h.call(Method::GET, "/healthz", None, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
+}
+
+/// Issue #237: the limiters key on the peer address, never on a header the
+/// caller writes. A fresh random `Authorization` on every attempt once
+/// bought a fresh bucket, so the login limiter never refused anyone who
+/// bothered to rotate it, while a second address keeps its own budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_the_authorization_header_does_not_escape_the_login_limit() {
+    let h = harness(ServeMode::Login).await;
+    h.user("root", UserKind::Admin).await;
+    let attempt = |n: u32, peer: &'static str| {
+        let addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|e| fail(&format!("{e}")));
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer rotated-{n}"))
+            .body(Body::from(
+                serde_json::json!({ "username": "nobody", "password": "wrong" }).to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        h.send(request)
+    };
+    // Concurrent, for the reason the login form test gives.
+    let attempts = (0..(super::LOGIN_RATE_BURST + 4)).map(|n| attempt(n, "203.0.113.7:51000"));
+    let refused = futures::future::join_all(attempts)
+        .await
+        .into_iter()
+        .filter(|(status, _, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        refused >= 3,
+        "{refused} of {} attempts were refused; a rotated Authorization header bought a fresh bucket",
+        super::LOGIN_RATE_BURST + 4
+    );
+
+    // Another address is another caller, with its budget untouched.
+    let (status, body, _) = attempt(0, "198.51.100.9:52000").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // The general limiter keys the same way: unvalidated bearers do not buy
+    // an address more than its one budget anywhere else either.
+    let peer: std::net::SocketAddr = "192.0.2.44:53000"
+        .parse()
+        .unwrap_or_else(|e| fail(&format!("{e}")));
+    let requests = (0..(super::RATE_BURST + 4)).map(|n| {
+        let mut request = Request::builder()
+            .uri("/api/v1/workspaces")
+            .header(header::AUTHORIZATION, format!("Bearer qk_rotated-{n}"))
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        h.send(request)
+    });
+    let refused = futures::future::join_all(requests)
+        .await
+        .into_iter()
+        .filter(|(status, _, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        refused >= 3,
+        "{refused} of {} requests were refused; rotated bearers escaped the general limiter",
+        super::RATE_BURST + 4
+    );
 }
 
 // --- jobs ----------------------------------------------------------------------

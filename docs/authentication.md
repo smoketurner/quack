@@ -93,11 +93,17 @@ and open a session. A session token is `qs_` followed by 32 random bytes. quack 
 sessions in memory only, so a restart signs every user out.
 
 The session cookie carries `HttpOnly`, `SameSite=Lax`, and `Path=/`. It also carries
-`Secure` unless the request arrived from loopback. A session ends 12 hours after login
+`Secure` unless the request arrived from loopback. A TLS-terminating proxy on the same host
+also connects over loopback, so on loopback the cookie still carries `Secure` when
+`[server.oidc].redirect_uri` is an https URL, or when `[server].secure_cookies = "always"`
+(the default is `"auto"`). Set `"always"` behind a same-host proxy that serves https
+without `[server.oidc]`. quack never reads `X-Forwarded-Proto` for this, since any client
+can send it. The sign-in state cookie of `[server.oidc]` follows the same rule. A session ends 12 hours after login
 (`[server].session_max_age_hours`) or 120 minutes after its last request
 (`[server].session_idle_minutes`), whichever comes first. The two login routes accept 2
-requests per second from one client, with bursts of up to 10, in addition to the
-server-wide rate limit. `POST /logout` (web) and `POST /api/v1/auth/logout` (API) end a
+requests per second from one peer address, with bursts of up to 10, in addition to the
+server-wide rate limit, which is also per address. Neither limit looks at the
+`Authorization` header, so a client cannot buy a fresh budget by changing it. `POST /logout` (web) and `POST /api/v1/auth/logout` (API) end a
 session.
 
 ### API tokens
@@ -286,6 +292,19 @@ needs no login; its first request obtains a token, and `quack auth login` only c
 credentials. quack stores the token sealed in `control.db` (`provider_tokens`), so one login
 serves every later process that uses the same data directory, including `quack serve`.
 
+The renewal lock covers one process. Two processes that share a data directory, such as
+`quack serve` and a `quack -p` beside it, can both find the token expiring and both refresh
+it. Many issuers rotate refresh tokens: each refresh returns a new one and refuses the old.
+The process that refreshes second then presents a refresh token the first already used, and
+the issuer refuses it. On a refused refresh, quack reads the stored token again, and when
+another process has stored a different, unexpired token meanwhile, uses that one instead of
+asking for a login. This does not help with an issuer that treats the reuse of a refresh
+token as theft and revokes the whole token family, as Okta's and Auth0's refresh token
+rotation with reuse detection do: the reuse also revokes the token the first process just
+stored, and every process needs `quack auth login` again. With such an issuer, let one
+process do the refreshing: run the model calls through one long-lived process, such as
+`quack serve`, rather than several processes on one data directory.
+
 `client_auth` sets how quack presents its secret at the token endpoint. The default,
 `client_secret_post`, sends it in the request body, which Entra ID and Auth0 accept.
 `client_secret_basic` sends it in an HTTP Basic header, which Okta applications use by
@@ -382,6 +401,16 @@ HKDF-SHA256, AES-256-GCM: a P-256 elliptic-curve key exchange, a SHA-256 key der
 AES-256 encryption with authentication. It binds each value to its purpose and its owner, so
 a sealed row copied to another user or provider fails to open. The vault key never sits in
 the database it protects.
+
+quack looks for the vault key in the keychain first and then in `vault.key`, and `quack auth
+status` reports the location in the same order. It writes `vault.key` only when the host has
+no usable keychain: no store can be installed, or, as under Docker's seccomp profile, no
+entry can be addressed. A keychain that exists but refuses access, because it is locked or
+quack is denied, is an error that names the keychain. quack does not fall back to the file
+in that case. The keychain may hold the key that sealed the stored tokens, so those would
+not open under a new key; and tokens sealed under a new key in `vault.key` would not open
+once the keychain answered again, since its key comes first. Either way people would have
+to sign in again. Unlock the keychain, or grant quack access, and retry.
 
 Three operational consequences follow. First, Linux keeps the kernel keyring in memory, so
 after a reboot the vault key is gone: users must sign in again, and each OAuth provider

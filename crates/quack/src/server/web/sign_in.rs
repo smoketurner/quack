@@ -55,7 +55,7 @@ pub(super) async fn begin(
         // The issuer's redirect back is a top-level GET from another site,
         // which `Lax` still sends the cookie with.
         .same_site(SameSite::Lax)
-        .secure(peer.needs_secure());
+        .secure(peer.needs_secure(&app.config.server));
     let cookie = match PENDING_TTL.try_into() {
         Ok(max_age) => cookie.max_age(max_age).build(),
         Err(_) => cookie.build(),
@@ -148,11 +148,17 @@ pub(super) async fn finish(
         .control
         .oidc_user(&signed_in.subject, &signed_in.username)
         .await?;
-    let renew_at = oidc.keep(&user.id, &signed_in.token).await?;
+    // The token and the session it serves appear together (issue #241).
+    let token = oidc
+        .keep_and_open(&app.sessions, &user.id, &signed_in.token)
+        .await?;
     entry.outcome = Outcome::Allowed;
     entry.user_id = Some(user.id.clone());
-    app.control.record_audit(&entry).await?;
-    let token = app.sessions.open(&user.id, renew_at)?;
+    // Nothing unaudited stands: the session the row failed for is closed.
+    app.control
+        .record_audit(&entry)
+        .await
+        .inspect_err(|_| app.sessions.close(token.as_str()))?;
     Ok((
         jar.add(SessionCookie::issue(&app, peer, token)),
         Redirect::to("/workspaces"),

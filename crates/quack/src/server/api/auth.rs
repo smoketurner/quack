@@ -61,11 +61,11 @@ impl Identity {
         };
         app.sessions.close(token.as_str());
         // A signed-in user's token is kept for their sessions; the last one
-        // closing is the end of quack's use for it.
-        if let Some(oidc) = &app.oidc
-            && !app.sessions.has_sessions(&self.user_id)
-        {
-            oidc.forget(&self.user_id).await?;
+        // closing is the end of quack's use for it. Checked under the user's
+        // lock, so a sign-in in progress keeps the token it stored.
+        if let Some(oidc) = &app.oidc {
+            oidc.forget_unless_signed_in(&app.sessions, &self.user_id)
+                .await?;
         }
         let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
         app.control.record_audit(&entry).await?;

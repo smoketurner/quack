@@ -31,7 +31,12 @@ struct MockState {
     named_issuer: StdMutex<Option<String>>,
     /// `grant_types_supported`, when listed.
     grants: StdMutex<Option<Vec<String>>>,
+    /// Run once before a refused refresh is answered: another process
+    /// finishing its own refresh of the same token meanwhile.
+    before_refusal: tokio::sync::Mutex<Option<BeforeRefusal>>,
 }
+
+type BeforeRefusal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 struct MockIdp {
     issuer: String,
@@ -113,6 +118,13 @@ async fn serve(mut stream: tokio::net::TcpStream, base: &str, state: &MockState)
                     .map(|(_, v)| v.trim().to_owned())
             })
             .unwrap_or_default();
+    }
+    if target == "/token"
+        && form(&body, "grant_type").as_deref() == Some("refresh_token")
+        && state.refresh_fails.load(Ordering::SeqCst)
+        && let Some(meanwhile) = state.before_refusal.lock().await.take()
+    {
+        meanwhile.await;
     }
     let (status, json) = route(&target, &body, base, state);
     let response = format!(
@@ -441,6 +453,86 @@ async fn missing_cache_and_failed_refresh_both_require_a_login() {
     );
     let err = m.access_token().await.err();
     assert!(err.is_some_and(|e| e.to_string().contains("no refresh token")));
+}
+
+#[tokio::test]
+async fn a_refresh_lost_to_another_process_uses_the_token_it_stored() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let loser = manager(dir.path(), &idp, Grant::AuthorizationCode);
+    // A second manager on the same data directory is another process.
+    let winner = Arc::new(manager(dir.path(), &idp, Grant::AuthorizationCode));
+    assert!(
+        loser
+            .store
+            .store(&seed(SignedDuration::from_secs(-5), Some("r1")))
+            .await
+            .is_ok()
+    );
+    // The issuer rotates refresh tokens: by the time the loser presents
+    // `r1`, the winner has used it and stored what it got back.
+    idp.state.refresh_fails.store(true, Ordering::SeqCst);
+    let newer = CachedToken {
+        access_token: SecretString::from(String::from("winner-access")),
+        expires_at: Timestamp::now()
+            .checked_add(SignedDuration::from_hours(1))
+            .unwrap_or(Timestamp::MAX),
+        refresh_token: Some(SecretString::from(String::from("r2"))),
+    };
+    let stores = Arc::clone(&winner);
+    *idp.state.before_refusal.lock().await = Some(Box::pin(async move {
+        assert!(stores.store.store(&newer).await.is_ok());
+    }));
+
+    let token = loser.access_token().await;
+    assert!(token.is_ok_and(|t| t.expose_secret() == "winner-access"));
+    assert_eq!(idp.state.refresh_requests.load(Ordering::SeqCst), 1);
+    // Kept in memory: the next call needs neither the issuer nor the store.
+    assert!(
+        loser
+            .access_token()
+            .await
+            .is_ok_and(|t| t.expose_secret() == "winner-access")
+    );
+    assert_eq!(idp.state.refresh_requests.load(Ordering::SeqCst), 1);
+    // The loser did not overwrite what the winner stored.
+    assert!(winner.store.load().await.is_ok_and(|t| t.is_some_and(|t| {
+        t.refresh_token.as_ref().map(ExposeSecret::expose_secret) == Some("r2")
+    })));
+}
+
+#[tokio::test]
+async fn a_refused_refresh_with_nothing_newer_stored_still_requires_a_login() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = manager(dir.path(), &idp, Grant::AuthorizationCode);
+    let other = Arc::new(manager(dir.path(), &idp, Grant::AuthorizationCode));
+    assert!(
+        m.store
+            .store(&seed(SignedDuration::from_secs(-5), Some("r1")))
+            .await
+            .is_ok()
+    );
+    idp.state.refresh_fails.store(true, Ordering::SeqCst);
+    // Another process stored a different token meanwhile, but an expired one.
+    let stale = CachedToken {
+        access_token: SecretString::from(String::from("other-access")),
+        expires_at: Timestamp::now()
+            .checked_sub(SignedDuration::from_secs(5))
+            .unwrap_or(Timestamp::MIN),
+        refresh_token: Some(SecretString::from(String::from("r2"))),
+    };
+    *idp.state.before_refusal.lock().await = Some(Box::pin(async move {
+        assert!(other.store.store(&stale).await.is_ok());
+    }));
+    let err = m.access_token().await.err();
+    assert!(err.is_some_and(|e| matches!(
+        &e,
+        Error::AuthRequired {
+            reason: AuthReason::RefreshFailed(_),
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

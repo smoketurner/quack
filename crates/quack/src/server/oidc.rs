@@ -23,7 +23,7 @@ use quack_core::storage::control::{AuditEntry, ControlPlane, UserRow};
 use quack_core::vault::Vault;
 
 use super::error::{ApiError, ApiResult};
-use super::state::{AppState, WebSessions};
+use super::state::{AppState, SessionToken, WebSessions};
 
 /// The cookie that ties a callback to the browser that started the sign-in,
 /// so a callback link someone else started cannot sign this browser in.
@@ -125,14 +125,19 @@ impl Oidc {
     }
 
     /// Keep a signed-in user's token, replacing the one from an earlier
-    /// sign-in, and return when the session opened on it must renew it.
-    pub(crate) async fn keep(
+    /// sign-in, and open the session that uses it, both under the user's
+    /// lock, so a logout of their last other session cannot forget the new
+    /// token in between (issue #241).
+    pub(crate) async fn keep_and_open(
         &self,
+        sessions: &WebSessions,
         user: &UserId,
         token: &CachedToken,
-    ) -> ApiResult<Option<Timestamp>> {
-        self.subjects.keep(user, token).await?;
-        Ok(Self::renewal_time(token))
+    ) -> ApiResult<SessionToken> {
+        let renew_at = Self::renewal_time(token);
+        self.subjects
+            .keep_then(user, token, || sessions.open(user, renew_at))
+            .await?
     }
 
     /// When a session on `token` renews it: shortly before it expires, or
@@ -219,10 +224,20 @@ impl Oidc {
         Ok(user)
     }
 
-    /// Drop a user's stored token, once they have no session left to use it.
-    pub(crate) async fn forget(&self, user: &UserId) -> ApiResult<()> {
-        self.subjects.forget(user).await?;
-        Ok(())
+    /// Drop a user's stored token once they have no session left to use it.
+    /// The check and the delete happen under the user's lock, the one a
+    /// sign-in holds while it stores its token and opens its session, so a
+    /// sign-in racing a logout keeps its token (issue #241). Returns whether
+    /// the token was dropped.
+    pub(crate) async fn forget_unless_signed_in(
+        &self,
+        sessions: &WebSessions,
+        user: &UserId,
+    ) -> ApiResult<bool> {
+        Ok(self
+            .subjects
+            .forget_unless(user, || sessions.has_sessions(user))
+            .await?)
     }
 }
 

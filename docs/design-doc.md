@@ -1554,10 +1554,10 @@ GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal
 
 Uploads, extraction, and proposals return `202` with a `job` id and run on the work queue
 (section 4.1); clients poll the resource or the job. Agent turns run there too, in their
-session's lane. Rate limiting per token via `tower_governor`. A field that names one of a
-fixed set (`mode`, `role`, `scopes`, an audit `outcome`, a merge or candidate `action`, an
-extraction `source`) is read as that value: an unknown one is refused while the request is
-read, 422 for a JSON body and 400 for a query string, with the accepted values in the
+session's lane. Rate limiting per peer address via `tower_governor` (section 12). A field
+that names one of a fixed set (`mode`, `role`, `scopes`, an audit `outcome`, a merge or
+candidate `action`, an extraction `source`) is read as that value: an unknown one is
+refused while the request is read, 422 for a JSON body and 400 for a query string, with the accepted values in the
 message. A session, document, ontology version, merge proposal, or candidate that does not
 exist is 404; a provider that needs `quack auth login` or a workspace another process holds
 is 503; a question with no chat model configured is 400.
@@ -1817,15 +1817,22 @@ How to configure each way in is in `docs/authentication.md`.
   expired` and audited as a denied `session` action. Expiry is measured with a monotonic
   clock, so moving the system clock cannot extend a session. The cookie is `HttpOnly`,
   `SameSite=Lax`, carries a `Max-Age` matching the absolute lifetime, and carries `Secure`
-  whenever the request did not arrive on loopback — so a cookie minted behind a
-  TLS-terminating proxy is never sent back over a plaintext downgrade, while plain HTTP on
-  a laptop keeps working.
+  whenever the request did not arrive on loopback, and on loopback too when the server
+  knows its public URL is https (`[server.oidc].redirect_uri`) or `[server].secure_cookies`
+  is `always` — so a cookie minted behind a TLS-terminating proxy, including one on the
+  same host that connects over loopback, is never sent back over a plaintext downgrade,
+  while plain HTTP on a laptop keeps working. The sign-in state cookie follows the same
+  rule. `X-Forwarded-Proto` is not trusted for this (issue #246).
 - **Rate limiting covers everything a caller can reach**, not just the API: one
-  `tower_governor` limiter over the web UI, the REST API, and MCP, keyed by bearer token
-  when there is one and peer address otherwise. The two endpoints that check a password
-  (`POST /login` and `POST /api/v1/auth/login`) carry a second, tighter limiter, because
+  `tower_governor` limiter over the web UI, the REST API, and MCP, keyed by the peer
+  address. The two endpoints that check a password (`POST /login` and
+  `POST /api/v1/auth/login`) carry a second, tighter limiter, keyed the same way, because
   the general budget is sized for a browsing session and is far too loose to make guessing
-  expensive. `/healthz` sits outside every limiter, since a throttled health check reads as
+  expensive. No limiter keys on anything the request says about itself: keyed on the
+  `Authorization` header, which nothing has validated when the limiter runs, a fresh random
+  bearer per request was a fresh bucket (issue #237). Everyone behind one address (a NAT,
+  or a reverse proxy on the same host) therefore shares one budget; `X-Forwarded-For` is
+  not trusted, since any client can write it. `/healthz` sits outside every limiter, since a throttled health check reads as
   a dead server to whatever is watching it. Each limiter's per-key state is swept once a
   minute: governor holds one entry per caller until something drops it, so an unswept
   limiter grows by one entry for every address that ever connected.
@@ -1983,6 +1990,7 @@ local = false
 workers_per_workspace = 1               # uploads processed at once per workspace (a lane)
 session_max_age_hours = 12              # a browser session dies this long after login
 session_idle_minutes = 120              # ... or this long after its last request
+secure_cookies = "auto"                 # "always": Secure cookies on loopback too (same-host TLS proxy)
 
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"

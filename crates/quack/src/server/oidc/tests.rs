@@ -16,12 +16,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jiff::{SignedDuration, Timestamp};
 use quack_core::config::{Config, OidcConfig};
 use quack_core::ids::UserId;
-use quack_core::llm::oauth::KeySource;
+use quack_core::llm::oauth::{CachedToken, KeySource};
 use quack_core::oidc::OidcSubject;
 use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome, SealedOwner};
 use quack_core::vault::Vault;
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -173,6 +175,12 @@ impl Harness {
     /// A harness whose `[server.oidc].audience` is `audience`: set, the API
     /// and MCP accept the issuer's access tokens.
     async fn with_audience(audience: Option<&str>) -> Self {
+        Self::build(audience, "https://quack.example.com").await
+    }
+
+    /// A harness whose public URL (the origin of `redirect_uri`) is
+    /// `origin`.
+    async fn build(audience: Option<&str>, origin: &str) -> Self {
         let issuer = start_issuer().await;
         let base = issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -183,7 +191,7 @@ impl Harness {
             client_id: String::from("quack"),
             client_secret_env: None,
             scopes: OidcConfig::default_scopes(),
-            redirect_uri: format!("https://quack.example.com{}", OidcConfig::CALLBACK_PATH),
+            redirect_uri: format!("{origin}{}", OidcConfig::CALLBACK_PATH),
             audience: audience.map(str::to_owned),
             subject_claim: String::from(OidcConfig::DEFAULT_SUBJECT_CLAIM),
         };
@@ -221,6 +229,22 @@ impl Harness {
         let request = request
             .body(Body::empty())
             .unwrap_or_else(|e| fail(&e.to_string()));
+        self.send(request).await
+    }
+
+    /// A GET that arrives from `peer`, as the real server records it.
+    async fn get_from(&self, uri: &str, cookie: Option<&str>, peer: &str) -> Reply {
+        let mut request = Request::get(uri);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        let mut request = request
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|e| fail(&format!("{e}")));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
         self.send(request).await
     }
 
@@ -539,6 +563,78 @@ async fn logging_out_of_the_last_session_forgets_the_token() {
             .iter()
             .all(|(outcome, who)| *outcome == Outcome::Allowed && who.as_ref() == Some(&user.id))
     );
+}
+
+/// A sign-in that arrives while the last logout is forgetting the user's
+/// token keeps the token it stores: the logout's check and delete, and the
+/// sign-in's store and session, run under one per-user lock, so the sign-in
+/// waits for the delete instead of landing between the check and it (#241).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
+    let h = Harness::new().await;
+    let cookie = h.sign_in("sub-ray", "ray").await;
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-ray"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"))
+        .id;
+    // The logout has closed the user's last session.
+    let session = cookie
+        .strip_prefix(&format!("{}=", crate::server::auth::SESSION_COOKIE))
+        .unwrap_or_else(|| fail("not a session cookie"));
+    h.app.sessions.close(session);
+    assert!(h.has_token(&user).await);
+
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let mut signing_in = None;
+    let forgotten = oidc
+        .subjects
+        .forget_unless(&user, || {
+            // A new sign-in starts right after the logout found no session:
+            // under the old order it stored its token and opened its session
+            // here, and the delete below removed that token.
+            let app = Arc::clone(&h.app);
+            let who = user.clone();
+            signing_in = Some(tokio::spawn(async move {
+                let token = CachedToken {
+                    access_token: SecretString::from(String::from("fresh")),
+                    expires_at: Timestamp::now()
+                        .checked_add(SignedDuration::from_hours(1))
+                        .unwrap_or_else(|e| fail(&e.to_string())),
+                    refresh_token: None,
+                };
+                let oidc = app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+                oidc.keep_and_open(&app.sessions, &who, &token).await
+            }));
+            // Give the sign-in every chance to run ahead of the delete.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            h.app.sessions.has_sessions(&user)
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(forgotten, "no session was open when the logout checked");
+    let opened = signing_in
+        .unwrap_or_else(|| fail("the sign-in never started"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(opened.is_ok(), "the sign-in failed");
+    assert!(h.app.sessions.has_sessions(&user));
+    assert!(
+        h.has_token(&user).await,
+        "the logout deleted the token of the sign-in that followed it"
+    );
+
+    // With that session open, logging out another one leaves the token.
+    let dropped = oidc
+        .forget_unless_signed_in(&h.app.sessions, &user)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(!dropped);
+    assert!(h.has_token(&user).await);
 }
 
 /// An issuer's access token is not a session: logging out with it closes
@@ -1034,4 +1130,85 @@ async fn a_callback_naming_another_issuer_is_refused() {
         reply.location
     );
     assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+}
+
+/// Issue #246: a TLS-terminating proxy on the same host reaches quack over
+/// loopback, so the peer alone cannot say the browser is on https. An https
+/// `redirect_uri` can, and then the state cookie and the session cookie
+/// both carry `Secure` on loopback too.
+#[tokio::test]
+async fn an_https_public_url_makes_loopback_cookies_secure() {
+    let h = Harness::new().await;
+    let loopback = "127.0.0.1:51000";
+    let started = h.get_from(OidcConfig::START_PATH, None, loopback).await;
+    assert_eq!(started.status, StatusCode::SEE_OTHER, "{}", started.body);
+    let state_cookie = started
+        .cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{}=", super::STATE_COOKIE)))
+        .cloned()
+        .unwrap_or_else(|| fail("no state cookie"));
+    assert!(state_cookie.contains("Secure"), "{state_cookie}");
+
+    let state = started.cookie(super::STATE_COOKIE).unwrap_or_default();
+    let nonce = started
+        .location
+        .parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|uri| axum::extract::Query::<HashMap<String, String>>::try_from_uri(&uri).ok())
+        .and_then(|axum::extract::Query(q)| q.get("nonce").cloned())
+        .unwrap_or_default();
+    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    h.issuer(|s| {
+        s.id_claims = json!({
+            "iss": base, "sub": "sub-ada", "aud": "quack",
+            "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+            "nonce": nonce, "preferred_username": "ada",
+        });
+    });
+    let reply = h
+        .get_from(
+            &format!("{}?code=c&state={state}", OidcConfig::CALLBACK_PATH),
+            Some(&format!("{}={state}", super::STATE_COOKIE)),
+            loopback,
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let session = reply
+        .cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{}=", crate::server::auth::SESSION_COOKIE)))
+        .cloned()
+        .unwrap_or_else(|| fail("no session cookie"));
+    assert!(session.contains("Secure"), "{session}");
+}
+
+/// Without an https public URL, loopback keeps the plain-HTTP local case:
+/// no `Secure`, or the browser would never send the cookie back.
+#[tokio::test]
+async fn an_http_public_url_leaves_loopback_cookies_plain() {
+    let h = Harness::build(None, "http://127.0.0.1:8080").await;
+    let started = h
+        .get_from(OidcConfig::START_PATH, None, "127.0.0.1:51000")
+        .await;
+    assert_eq!(started.status, StatusCode::SEE_OTHER, "{}", started.body);
+    assert!(
+        started.cookie(super::STATE_COOKIE).is_some(),
+        "{:?}",
+        started.cookies
+    );
+    assert!(
+        started.cookies.iter().all(|c| !c.contains("Secure")),
+        "{:?}",
+        started.cookies
+    );
+    // Off loopback it is still set, whatever the public URL says.
+    let remote = h
+        .get_from(OidcConfig::START_PATH, None, "203.0.113.7:51000")
+        .await;
+    assert!(
+        remote.cookies.iter().any(|c| c.contains("Secure")),
+        "{:?}",
+        remote.cookies
+    );
 }

@@ -70,7 +70,7 @@ pub(crate) struct AppState {
     pub jobs: JobQueue,
     /// One MCP transport per workspace, user, and write permission; each
     /// carries its own MCP sessions. See `server::mcp_http`.
-    mcp: tokio::sync::Mutex<HashMap<McpKey, McpEntry>>,
+    mcp: tokio::sync::Mutex<HashMap<McpKey, McpTransport>>,
     /// Workspaces with a graph extraction in flight: one at a time each,
     /// so a reset cannot clear a run part way (issue #48).
     extractions: Mutex<HashSet<WorkspaceId>>,
@@ -128,13 +128,6 @@ pub(crate) struct McpKey {
     pub policy: WritePolicy,
 }
 
-/// An MCP transport and the server behind it.
-#[derive(Clone)]
-pub(crate) struct McpEntry {
-    pub transport: McpTransport,
-    pub server: McpServer,
-}
-
 pub(crate) type App = Arc<AppState>;
 
 impl AppState {
@@ -184,15 +177,14 @@ impl AppState {
         &self,
         key: McpKey,
         make: impl FnOnce() -> McpServer,
-    ) -> McpEntry {
+    ) -> McpTransport {
         let mut open = self.mcp.lock().await;
-        if let Some(entry) = open.get(&key) {
-            return entry.clone();
+        if let Some(transport) = open.get(&key) {
+            return transport.clone();
         }
         let server = make();
-        let factory = server.clone();
         let transport = StreamableHttpService::new(
-            move || Ok(factory.clone()),
+            move || Ok(server.clone()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 // The server may sit behind any host name; bearer auth,
@@ -200,9 +192,8 @@ impl AppState {
                 .with_allowed_hosts(Vec::<String>::new())
                 .with_json_response(true),
         );
-        let entry = McpEntry { transport, server };
-        open.insert(key, entry.clone());
-        entry
+        open.insert(key, transport.clone());
+        transport
     }
 
     /// The writer and reader for a workspace, opening the file and building

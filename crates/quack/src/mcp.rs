@@ -12,7 +12,9 @@
 //! Over HTTP every call is audited through the request's `Access`, like
 //! the REST API; over stdio nothing is audited, like the CLI.
 
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
+
+use axum::http::request::Parts;
 
 use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events;
@@ -34,9 +36,10 @@ use quack_core::storage::workspace::{
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ListResourceTemplatesResult, ListResourcesResult,
-    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-    Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig,
+    CallToolResult, ContentBlock, Extensions, Implementation, ListResourceTemplatesResult,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, ServerCapabilities,
+    ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -52,19 +55,31 @@ use quack_core::graph::query::{GraphQuery, PathQuery};
 /// server's access log and the workspace detail table for HTTP.
 pub(crate) enum Auditor {
     None,
-    Server(Box<ServerAuditor>),
+    Server(App),
 }
 
-/// The server's audit path: the app for `control.db` and the caller's
-/// `Access` for the identity and workspace. The transport outlives one
-/// request, so `access` is replaced on every request (issue #54): the
-/// rows carry the token and address that made the call.
-pub(crate) struct ServerAuditor {
-    pub app: App,
-    pub access: std::sync::Mutex<Access>,
+/// Who made one MCP request over HTTP: the `Access` `/mcp/v1/{workspace}`
+/// resolved for that request, and whom its model requests act for. The
+/// endpoint puts it in the HTTP request's extensions, and rmcp hands the
+/// request's `http::request::Parts` to the tool call, so every call audits
+/// and acts as the request that made it. The transport and server are
+/// shared by every request of one user (issue #245): nothing per-request
+/// lives on them.
+#[derive(Clone)]
+pub(crate) struct McpCaller {
+    pub access: Access,
+    pub acting: Option<Acting>,
 }
 
-impl Auditor {
+/// The caller of one tool call or resource read.
+enum Caller {
+    /// Stdio: nobody to audit or act for.
+    Unaudited,
+    /// HTTP: the request's own caller, and the app to audit through.
+    Audited { app: App, caller: Box<McpCaller> },
+}
+
+impl Caller {
     /// Write the audit rows; a failed write fails the call, so nothing
     /// audited proceeds unlogged.
     async fn record(
@@ -74,16 +89,12 @@ impl Auditor {
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> Result<(), McpError> {
-        let Self::Server(server) = self else {
+        let Self::Audited { app, caller } = self else {
             return Ok(());
         };
-        let access = server
+        caller
             .access
-            .lock()
-            .map_err(|e| internal(format!("auditor poisoned: {e}")))?
-            .clone();
-        access
-            .audit(&server.app, action, resource, outcome, detail)
+            .audit(app, action, resource, outcome, detail)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e.message, %action, "audit write failed");
@@ -96,13 +107,17 @@ impl Auditor {
     /// server user's over HTTP.
     fn session_viewer(&self) -> SessionViewer {
         match self {
-            Self::None => SessionViewer::All,
-            // Panics abort, so no holder ever poisons the lock.
-            Self::Server(server) => server
-                .access
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .session_viewer(),
+            Self::Unaudited => SessionViewer::All,
+            Self::Audited { caller, .. } => caller.access.session_viewer(),
+        }
+    }
+
+    /// Whom model requests are made for (over HTTP, the request's user at
+    /// an on-behalf-of provider; over stdio, nobody).
+    fn acting(&self) -> Option<Acting> {
+        match self {
+            Self::Unaudited => None,
+            Self::Audited { caller, .. } => caller.acting.clone(),
         }
     }
 }
@@ -118,10 +133,6 @@ pub(crate) struct McpSetup {
     pub policy: WritePolicy,
     pub user_id: Option<UserId>,
     pub auditor: Auditor,
-    /// Whom model requests are made for (`quack serve`: the transport's
-    /// user; stdio: nobody). Tool calls run in the MCP session's own task,
-    /// outside the HTTP request, so it is carried here.
-    pub acting: Option<Acting>,
 }
 
 /// One MCP server over one workspace. The tool router comes from the
@@ -297,13 +308,21 @@ impl McpServer {
         }
     }
 
-    /// Point the auditor at the request now being served.
-    pub(crate) fn set_access(&self, access: Access) {
-        if let Auditor::Server(server) = &self.inner.auditor
-            && let Ok(mut current) = server.access.lock()
-        {
-            *current = access;
-        }
+    /// The caller of the request `extensions` came with. Over HTTP it must
+    /// be there: a call without one fails rather than run unaudited.
+    fn caller(&self, extensions: &Extensions) -> Result<Caller, McpError> {
+        let Auditor::Server(app) = &self.inner.auditor else {
+            return Ok(Caller::Unaudited);
+        };
+        let caller = extensions
+            .get::<Parts>()
+            .and_then(|parts| parts.extensions.get::<McpCaller>())
+            .cloned()
+            .ok_or_else(|| internal("the MCP request carries no authorized caller"))?;
+        Ok(Caller::Audited {
+            app: Arc::clone(app),
+            caller: Box::new(caller),
+        })
     }
 
     async fn db<T, F>(&self, f: F) -> Result<T, McpError>
@@ -336,14 +355,16 @@ impl McpServer {
     async fn query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
         // Boxed: an agent turn's future is large (clippy::large_futures).
-        Box::pin(Acting::scope(self.inner.acting.clone(), self.ask(args))).await
+        Box::pin(Acting::scope(caller.acting(), self.ask(args, &caller))).await
     }
 
-    /// `query`, acting for the transport's user: its model requests reach an
+    /// `query`, acting for the request's user: its model requests reach an
     /// on-behalf-of provider as them.
-    async fn ask(&self, args: QueryArgs) -> Result<CallToolResult, McpError> {
+    async fn ask(&self, args: QueryArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
         if question.is_empty() {
             return Ok(failure("question must not be empty"));
@@ -355,11 +376,12 @@ impl McpServer {
                 Err(e) => return Ok(failure(e.to_string())),
             },
         };
-        let (session_id, created) = match self.resolve_session(args.session_id, mode).await? {
-            TurnSession::Existing(id) => (id, false),
-            TurnSession::Created(id) => (id, true),
-            TurnSession::NotFound => return Ok(failure("that session does not exist")),
-        };
+        let (session_id, created) =
+            match self.resolve_session(caller, args.session_id, mode).await? {
+                TurnSession::Existing(id) => (id, false),
+                TurnSession::Created(id) => (id, true),
+                TurnSession::NotFound => return Ok(failure("that session does not exist")),
+            };
         let (sink, mut events) = events::channel();
         // Nothing renders the stream here; drain it so the turn never
         // blocks on a full channel.
@@ -379,8 +401,7 @@ impl McpServer {
         let detail = serde_json::json!({ "prompt": question, "session_id": session_id });
         match outcome {
             Ok(response) => {
-                self.inner
-                    .auditor
+                caller
                     .record(
                         AuditAction::Query,
                         Some(ResourceKind::Session.id(&session_id)),
@@ -403,8 +424,7 @@ impl McpServer {
                 Ok(result)
             }
             Err(e) => {
-                self.inner
-                    .auditor
+                caller
                     .record(
                         AuditAction::Query,
                         Some(ResourceKind::Session.id(&session_id)),
@@ -431,13 +451,19 @@ impl McpServer {
     async fn search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        Acting::scope(self.inner.acting.clone(), self.retrieve(args)).await
+        let caller = self.caller(&extensions)?;
+        Acting::scope(caller.acting(), self.retrieve(args, &caller)).await
     }
 
-    /// `search`, acting for the transport's user: embedding the query is a
+    /// `search`, acting for the request's user: embedding the query is a
     /// model request too.
-    async fn retrieve(&self, args: SearchArgs) -> Result<CallToolResult, McpError> {
+    async fn retrieve(
+        &self,
+        args: SearchArgs,
+        caller: &Caller,
+    ) -> Result<CallToolResult, McpError> {
         let query = args.query.trim().to_owned();
         if query.is_empty() {
             return Ok(failure("query must not be empty"));
@@ -482,8 +508,7 @@ impl McpServer {
         } else {
             Outcome::Error
         };
-        self.inner
-            .auditor
+        caller
             .record(
                 AuditAction::Search,
                 None,
@@ -506,7 +531,12 @@ impl McpServer {
         name = "sql",
         description = "Run one DuckDB SQL statement over the workspace tables and return the rows. Reads always run; statements that modify data need write permission on this connection."
     )]
-    async fn sql(&self, Parameters(args): Parameters<SqlArgs>) -> Result<CallToolResult, McpError> {
+    async fn sql(
+        &self,
+        Parameters(args): Parameters<SqlArgs>,
+        extensions: Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
         let statement = args.sql.trim().to_owned();
         if statement.is_empty() {
             return Ok(failure("sql must not be empty"));
@@ -522,15 +552,13 @@ impl McpServer {
             Err(message) => return Ok(failure(message)),
         };
         if is_write && creates_temp_object(&statement) {
-            self.inner
-                .auditor
+            caller
                 .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
             return Ok(failure(TEMP_OBJECT_REFUSED));
         }
         if is_write && self.inner.policy != WritePolicy::Allow {
-            self.inner
-                .auditor
+            caller
                 .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
             return Ok(failure(
@@ -561,8 +589,7 @@ impl McpServer {
         } else {
             Outcome::Error
         };
-        self.inner
-            .auditor
+        caller
             .record(AuditAction::Sql, None, outcome, Some(detail))
             .await?;
         let capped = match result {
@@ -581,10 +608,10 @@ impl McpServer {
         name = "list_tables",
         description = "List the tables in the workspace."
     )]
-    async fn list_tables(&self) -> Result<CallToolResult, McpError> {
+    async fn list_tables(&self, extensions: Extensions) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
         let tables = self.reader_db(WorkspaceDb::list_tables).await;
-        self.inner
-            .auditor
+        caller
             .record(
                 AuditAction::List,
                 None,
@@ -605,12 +632,13 @@ impl McpServer {
     async fn describe_table(
         &self,
         Parameters(args): Parameters<DescribeTableArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
         let name = args.table.trim().to_owned();
         match self.describe(&name).await? {
             Some(description) => {
-                self.inner
-                    .auditor
+                caller
                     .record(
                         AuditAction::Open,
                         None,
@@ -631,7 +659,9 @@ impl McpServer {
     async fn search_graph(
         &self,
         Parameters(args): Parameters<SearchGraphArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
         let query = match GraphQuery::new(
             args.entity.as_deref(),
             args.class.as_deref(),
@@ -655,8 +685,7 @@ impl McpServer {
                 .await
         }
         .await;
-        self.inner
-            .auditor
+        caller
             .record(AuditAction::Graph, None, Outcome::of(&result), Some(detail))
             .await?;
         let result = match result {
@@ -675,7 +704,9 @@ impl McpServer {
     async fn find_path(
         &self,
         Parameters(args): Parameters<FindPathArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
         let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
@@ -694,8 +725,7 @@ impl McpServer {
                 .await
         }
         .await;
-        self.inner
-            .auditor
+        caller
             .record(AuditAction::Graph, None, Outcome::of(&result), Some(detail))
             .await?;
         let result = match result {
@@ -716,10 +746,10 @@ impl McpServer {
         name = "list_documents",
         description = "List the ingested documents with their status, title, and source."
     )]
-    async fn list_documents(&self) -> Result<CallToolResult, McpError> {
+    async fn list_documents(&self, extensions: Extensions) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
         let documents = self.reader_db(WorkspaceDb::list_documents).await;
-        self.inner
-            .auditor
+        caller
             .record(
                 AuditAction::List,
                 None,
@@ -747,11 +777,12 @@ impl McpServer {
     /// by the server user when there is one.
     async fn resolve_session(
         &self,
+        caller: &Caller,
         requested: Option<String>,
         mode: Option<ChatMode>,
     ) -> Result<TurnSession, McpError> {
         let user = self.inner.user_id.clone();
-        let viewer = self.inner.auditor.session_viewer();
+        let viewer = caller.session_viewer();
         if let Some(id) = requested
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty())
@@ -900,11 +931,11 @@ impl ServerHandler for McpServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
+        let caller = self.caller(&context.extensions)?;
         let uri = request.uri;
-        self.inner
-            .auditor
+        caller
             .record(
                 AuditAction::Open,
                 Some(ResourceKind::Resource.id(&uri)),
@@ -944,7 +975,6 @@ pub(crate) async fn serve_stdio(
         policy,
         user_id: None,
         auditor: Auditor::None,
-        acting: None,
     });
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
@@ -989,7 +1019,6 @@ mod tests {
             },
             policy,
             user_id: None,
-            acting: None,
             auditor: Auditor::None,
         })
     }
@@ -1017,44 +1046,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let read_only = server(dir.path(), WritePolicy::Deny);
         let denied = read_only
-            .sql(Parameters(SqlArgs {
-                sql: String::from("CREATE TABLE t AS SELECT 1 AS n"),
-            }))
+            .sql(
+                Parameters(SqlArgs {
+                    sql: String::from("CREATE TABLE t AS SELECT 1 AS n"),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&denied).contains("cannot write"));
         let internal = read_only
-            .sql(Parameters(SqlArgs {
-                sql: String::from("SELECT * FROM _quack_documents"),
-            }))
+            .sql(
+                Parameters(SqlArgs {
+                    sql: String::from("SELECT * FROM _quack_documents"),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&internal).contains("internal tables"));
         let bad = read_only
-            .sql(Parameters(SqlArgs {
-                sql: String::from("SELEC 1"),
-            }))
+            .sql(
+                Parameters(SqlArgs {
+                    sql: String::from("SELEC 1"),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(bad.is_error, Some(true));
 
         let writer = server(dir.path(), WritePolicy::Allow);
         let created = writer
-            .sql(Parameters(SqlArgs {
-                sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
-            }))
+            .sql(
+                Parameters(SqlArgs {
+                    sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(created.is_error, Some(false));
         let tables = writer
-            .list_tables()
+            .list_tables(Extensions::default())
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(field(&tables, "tables"), serde_json::json!(["t"]));
         let described = writer
-            .describe_table(Parameters(DescribeTableArgs {
-                table: String::from("t"),
-            }))
+            .describe_table(
+                Parameters(DescribeTableArgs {
+                    table: String::from("t"),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(field(&described, "row_count"), 2);
@@ -1065,22 +1109,28 @@ mod tests {
             Some(&serde_json::json!("n"))
         );
         let missing = writer
-            .describe_table(Parameters(DescribeTableArgs {
-                table: String::from("zz"),
-            }))
+            .describe_table(
+                Parameters(DescribeTableArgs {
+                    table: String::from("zz"),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&missing).contains("no table"));
         let documents = writer
-            .list_documents()
+            .list_documents(Extensions::default())
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(field(&documents, "documents"), serde_json::json!([]));
         let empty = writer
-            .search(Parameters(SearchArgs {
-                query: String::from("  "),
-                top_k: None,
-            }))
+            .search(
+                Parameters(SearchArgs {
+                    query: String::from("  "),
+                    top_k: None,
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(empty.is_error, Some(true));
@@ -1113,7 +1163,6 @@ mod tests {
             },
             policy: WritePolicy::Deny,
             user_id: None,
-            acting: None,
             auditor: Auditor::None,
         });
         let ask = |session_id: Option<&str>, mode: Option<&str>| {
@@ -1132,7 +1181,7 @@ mod tests {
 
         for _ in 0..2 {
             let failed = server
-                .query(ask(None, None))
+                .query(ask(None, None), Extensions::default())
                 .await
                 .unwrap_or_else(|e| fail(&e.message));
             let text = error_text(&failed);
@@ -1142,7 +1191,7 @@ mod tests {
         }
 
         let bad_mode = server
-            .query(ask(None, Some("loud")))
+            .query(ask(None, Some("loud")), Extensions::default())
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(
@@ -1152,7 +1201,7 @@ mod tests {
         );
 
         let unknown = server
-            .query(ask(Some("nope"), None))
+            .query(ask(Some("nope"), None), Extensions::default())
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&unknown).contains("does not exist"));
@@ -1163,7 +1212,10 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()))
             .id;
         let failed = server
-            .query(ask(Some(existing.as_str()), Some("query")))
+            .query(
+                ask(Some(existing.as_str()), Some("query")),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert!(error_text(&failed).contains("the agent turn failed"));
@@ -1180,9 +1232,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let writer = server(dir.path(), WritePolicy::Allow);
         let created = writer
-            .sql(Parameters(SqlArgs {
-                sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
-            }))
+            .sql(
+                Parameters(SqlArgs {
+                    sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(created.is_error, Some(false));

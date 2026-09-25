@@ -354,6 +354,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "workers_per_workspace",
             "session_max_age_hours",
             "session_idle_minutes",
+            "secure_cookies",
         ],
     ),
     (
@@ -739,6 +740,12 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "session_idle_minutes",
         server.session_idle_minutes,
         default.session_idle_minutes,
+    );
+    s.text(
+        "secure_cookies",
+        server.secure_cookies.as_str(),
+        default.secure_cookies.as_str(),
+        None,
     );
     let Some(oidc) = &server.oidc else {
         return;
