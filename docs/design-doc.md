@@ -505,7 +505,7 @@ until `quack embeddings refresh` (terminal `/embeddings refresh`, `POST .../embe
 Documents page's button) embeds them again, and the terminal, print mode, `quack doctor`, and the
 Documents page say how many there are. When the configured width differs from the stored
 one, the workspace keeps the old columns and vectors rather than discarding them on open
-(a mistyped `embedding_dimension` must not cost a workspace its embeddings): new chunks are
+(a mistyped `[embedding].dimension` must not cost a workspace its embeddings): new chunks are
 stored without vectors, and the refresh retypes the `embedding` columns of `_quack_chunks`
 and `_quack_graph_nodes` through NULL before embedding everything. With no chunk vector
 stored, open adopts the new width at once. Schema version 8 tags vectors made before
@@ -709,7 +709,7 @@ E5, BGE, mxbai, Snowflake Arctic; none for all-MiniLM, BGE-M3, granite, or OpenA
 role overridable under `[embedding]` (section 13). A document prefix with a `{title}` slot
 gets the chunk's heading there (`none` without one); otherwise the heading leads the text.
 Every call goes through `Embedder`, whose `Input` names the role, and every vector that
-comes back is a `Vector` checked against the profile's `Dimension` (`embedding_dimension`),
+comes back is a `Vector` checked against the profile's `Dimension` (`[embedding].dimension`),
 so a mismatched model fails with the fix rather than a cast error; clippy's
 `disallowed_methods` keeps raw embedding calls out.
 The model, its width, and its prefixes are the embedding profile.
@@ -1262,7 +1262,7 @@ rendering.
 | `bedrock` | yes | yes | Amazon Bedrock's `bedrock-runtime` endpoint: `api = "converse"` (default, rig-bedrock over the AWS SDK), `"chat-completions"`, or `"responses"` (OpenAI-compatible, `/openai/v1`). Embeddings are InvokeModel in Titan Text Embeddings V2's request shape. `region`, `aws_profile`, `base_url` (VPC endpoint) optional |
 | `bedrock-mantle` | yes | no | Amazon Bedrock's `bedrock-mantle` endpoint: `api = "responses"` (default) or `"chat-completions"` (`/v1`). Same `region`, `aws_profile`, `base_url` |
 
-`[general].chat_model` and `[general].embedding_model` name `PROVIDER/MODEL` each; a
+`[general].chat_model` and `[embedding].model` name `PROVIDER/MODEL` each; a
 workspace's `allowed_providers` filters the choice; the session records the model it used.
 Changing the embedding model, its width, or its prefixes leaves a workspace's vectors
 stale rather than wrong: they are not searched, their chunks are found by keyword, and
@@ -1863,14 +1863,12 @@ settings live in `_quack_meta`.
 [general]
 data_dir = "~/.local/share/quack"       # QUACK_DATA_DIR
 chat_model = "ollama/llama3.1:8b"       # QUACK_MODEL
-embedding_model = "ollama/nomic-embed-text"
 default_workspace = "default"
 
 [providers.ollama]
 type = "ollama"
 auth = "none"
 base_url = "http://localhost:11434"
-embedding_dimension = 768
 # max_concurrent_requests = 1          # model requests in flight at once; default 1 for Ollama, 8 otherwise
 
 [providers.anthropic]
@@ -1883,7 +1881,7 @@ type = "bedrock"                       # auth = "aws" (the default): the AWS SDK
 # api = "converse"                     # runtime: converse (default), chat-completions, responses
 # aws_profile = "my-sso-profile"       # else AWS_PROFILE, else default
 # region = "us-east-1"                 # else base_url's, AWS_REGION, or the profile's region
-# embedding_dimension = 1024           # for amazon.titan-embed-text-v2:0 (runtime only)
+
 
 [providers.mantle]
 type = "bedrock-mantle"                # api = "responses" (default) or "chat-completions"
@@ -1894,7 +1892,7 @@ type = "bedrock-mantle"                # api = "responses" (default) or "chat-co
 type = "openai"
 auth = "oauth"
 base_url = "https://{resource}.openai.azure.com/openai/deployments/{deployment}"
-embedding_dimension = 1536
+
 [providers.azure.oauth]
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
@@ -1908,7 +1906,11 @@ redirect_uri = "http://127.0.0.1:19876/callback"
 # resource = "https://model.example.com"      # on-behalf-of: RFC 8707 resource
 # actor = true                                # on-behalf-of: send quack's own token as actor_token
 
-[embedding]              # input prefixes per role; unset keeps the model family's built-in one
+[embedding]
+model = "ollama/nomic-embed-text"        # PROVIDER/MODEL; unset stores documents without vectors
+dimension = 768                          # the width of its vectors (1024 for Bedrock's amazon.titan-embed-text-v2:0)
+# input prefixes per role; unset keeps the model family's built-in one
+
 # query_prefix = "task: search result | query: "
 # document_prefix = "title: {title} | text: "    # {title}: the chunk's heading, or "none"
 # similarity_prefix = "task: sentence similarity | query: "

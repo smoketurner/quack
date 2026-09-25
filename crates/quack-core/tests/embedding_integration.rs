@@ -77,12 +77,12 @@ impl EmbeddingModel for Tape {
 }
 
 /// A config whose embedding model is `mock/MODEL`, `dimension` wide, with
-/// `extra` TOML appended.
+/// `extra` TOML appended to its `[embedding]` table.
 fn config(dir: &Path, model: &str, dimension: u32, extra: &str) -> Config {
     let text = format!(
-        "[general]\ndata_dir = {:?}\nembedding_model = \"mock/{model}\"\n\
+        "[general]\ndata_dir = {:?}\n\
          [providers.mock]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n\
-         embedding_dimension = {dimension}\n{extra}",
+         [embedding]\nmodel = \"mock/{model}\"\ndimension = {dimension}\n{extra}",
         dir.display().to_string()
     );
     let config: Config = toml::from_str(&text).unwrap();
@@ -307,7 +307,7 @@ async fn a_configured_prefix_change_makes_vectors_stale() {
         dir.path(),
         "nomic-embed-text",
         4,
-        "[embedding]\ndocument_prefix = \"\"\n",
+        "document_prefix = \"\"\n",
     );
     let db = WorkspaceDb::open(&after, "ws").unwrap();
     let status = db.embedding_status().unwrap();
@@ -464,8 +464,8 @@ async fn a_model_answering_with_the_wrong_width_fails_the_document_with_the_fix(
     .to_string();
     assert!(
         err.contains("returned 6-dimensional vectors")
-            && err.contains("embedding_dimension is 4")
-            && err.contains("embedding_dimension = 6"),
+            && err.contains("[embedding].dimension is 4")
+            && err.contains("dimension = 6 under [embedding]"),
         "{err}"
     );
     let documents = db.list_documents().unwrap();

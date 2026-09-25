@@ -3007,7 +3007,8 @@ mod tests {
         // session opens.
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = Config::default();
-        config.general.embedding_model = Some(
+        config.embedding.dimension = Some(Dimension::new(4));
+        config.embedding.model = Some(
             "ollama/embeddinggemma"
                 .parse()
                 .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
@@ -3021,7 +3022,6 @@ mod tests {
                     BaseUrl::try_from(String::from("http://127.0.0.1:9"))
                         .unwrap_or_else(|e| fail(&e.to_string())),
                 ),
-                embedding_dimension: Some(Dimension::new(4)),
                 ..ProviderConfig::new(ProviderType::Ollama)
             },
         );

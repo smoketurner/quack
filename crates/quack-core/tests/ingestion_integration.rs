@@ -153,7 +153,6 @@ fn test_config(data_dir: &Path) -> Config {
         "mock".parse().unwrap(),
         ProviderConfig {
             base_url: Some(BaseUrl::try_from(String::from("http://localhost:9999")).unwrap()),
-            embedding_dimension: Some(Dimension::new(TEST_DIM_U32)),
             ..ProviderConfig::new(ProviderType::Ollama)
         },
     );
@@ -162,7 +161,6 @@ fn test_config(data_dir: &Path) -> Config {
             data_dir: data_dir.to_path_buf(),
             default_workspace: "test".into(),
             chat_model: None,
-            embedding_model: Some("mock/mock-model".parse().unwrap()),
         },
         providers,
         ingestion: IngestionConfig {
@@ -173,7 +171,11 @@ fn test_config(data_dir: &Path) -> Config {
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
         },
-        embedding: EmbeddingConfig::default(),
+        embedding: EmbeddingConfig {
+            model: Some("mock/mock-model".parse().unwrap()),
+            dimension: Some(Dimension::new(TEST_DIM_U32)),
+            ..EmbeddingConfig::default()
+        },
         retrieval: RetrievalConfig::default(),
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),
@@ -191,7 +193,6 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
             data_dir: data_dir.to_path_buf(),
             default_workspace: "test".into(),
             chat_model: None,
-            embedding_model: None,
         },
         providers: BTreeMap::new(),
         ingestion: IngestionConfig::default(),
@@ -1160,10 +1161,8 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
         .unwrap();
     }
     let mut changed = test_config(dir.path());
-    if let Some(p) = changed.providers.get_mut("mock") {
-        p.embedding_dimension = Some(Dimension::new(8));
-    }
-    changed.general.embedding_model = Some("mock/other-model".parse().unwrap());
+    changed.embedding.dimension = Some(Dimension::new(8));
+    changed.embedding.model = Some("mock/other-model".parse().unwrap());
     // Opening still works: the old vectors stay, at their width, unsearched.
     let db = WorkspaceDb::open(&changed, "ws-mismatch").unwrap();
     assert_eq!(db.embedding_dimension(), Dimension::new(4));
@@ -1258,9 +1257,7 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         );
     }
     let mut changed = test_config(dir.path());
-    if let Some(p) = changed.providers.get_mut("mock") {
-        p.embedding_dimension = Some(Dimension::new(8));
-    }
+    changed.embedding.dimension = Some(Dimension::new(8));
     let db = WorkspaceDb::open(&changed, "ws-adopt").unwrap();
     assert_eq!(db.embedding_dimension(), Dimension::new(8));
     let unembedded = graph_store::nodes_needing_embedding(&db, 10).unwrap();

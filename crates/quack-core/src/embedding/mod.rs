@@ -169,7 +169,7 @@ impl Profile {
         let Some(model) = config.embedding_model_ref()? else {
             return Ok(None);
         };
-        let dimension = model.dimension()?;
+        let dimension = config.embedding_dimension()?;
         let resolved = ResolvedPrompts::for_model(config, model.model);
         Ok(Some(Self::new(model.model, dimension, resolved.prompts)))
     }
@@ -430,8 +430,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("768-dimensional"), "{err}");
-        assert!(err.contains("embedding_dimension is 1024"), "{err}");
-        assert!(err.contains("embedding_dimension = 768"), "{err}");
+        assert!(err.contains("[embedding].dimension is 1024"), "{err}");
+        assert!(err.contains("dimension = 768 under [embedding]"), "{err}");
     }
 
     #[tokio::test]
@@ -484,20 +484,19 @@ mod tests {
 
     #[test]
     fn config_overrides_one_role_and_keeps_the_family_for_the_rest() {
-        let base = "[general]\nembedding_model = \"o/embeddinggemma\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 768\n";
+        let base = "[providers.o]\ntype = \"ollama\"\n[embedding]\nmodel = \"o/embeddinggemma\"\ndimension = 768\n";
         let resolved = ResolvedPrompts::for_model(&config(base), "embeddinggemma");
         assert_eq!(resolved.prompts, gemma());
         assert!(matches!(resolved.source, PromptSource::Family(f) if f.name == "EmbeddingGemma"));
 
-        let with =
-            format!("{base}[embedding]\nquery_prefix = \"task: question answering | query: \"\n");
+        let with = format!("{base}query_prefix = \"task: question answering | query: \"\n");
         let resolved = ResolvedPrompts::for_model(&config(&with), "embeddinggemma");
         assert_eq!(resolved.prompts.query, "task: question answering | query: ");
         assert_eq!(resolved.prompts.document, gemma().document);
         assert_eq!(resolved.source, PromptSource::Config);
 
         let off = format!(
-            "{base}[embedding]\nquery_prefix = \"\"\ndocument_prefix = \"\"\nsimilarity_prefix = \"\"\n"
+            "{base}query_prefix = \"\"\ndocument_prefix = \"\"\nsimilarity_prefix = \"\"\n"
         );
         assert!(
             ResolvedPrompts::for_model(&config(&off), "embeddinggemma")
@@ -513,7 +512,7 @@ mod tests {
     #[test]
     fn from_config_builds_the_profile_in_force() {
         let c = config(
-            "[general]\nembedding_model = \"o/embeddinggemma:latest\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 768\n",
+            "[embedding]\nmodel = \"o/embeddinggemma:latest\"\ndimension = 768\n[providers.o]\ntype = \"ollama\"\n",
         );
         let profile = Profile::from_config(&c).unwrap().unwrap();
         assert_eq!(

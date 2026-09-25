@@ -54,9 +54,6 @@ pub struct GeneralConfig {
     pub default_workspace: String,
     /// `PROVIDER/MODEL` used for chat and tool calling. Override: `QUACK_MODEL`.
     pub chat_model: Option<ModelSpec>,
-    /// `PROVIDER/MODEL` used for embeddings. Unset means documents are stored
-    /// without vectors and `search_documents` is unavailable.
-    pub embedding_model: Option<ModelSpec>,
 }
 
 /// A `PROVIDER/MODEL` reference, split once when the config is read.
@@ -120,7 +117,6 @@ impl Default for GeneralConfig {
             data_dir: default_data_dir(),
             default_workspace: String::from("default"),
             chat_model: None,
-            embedding_model: None,
         }
     }
 }
@@ -599,8 +595,6 @@ pub struct ProviderConfig {
     /// The endpoint, API, and region of a `type = "bedrock"` provider; set
     /// for that type and no other.
     pub bedrock: Option<BedrockConfig>,
-    /// Width of the vectors this provider's embedding models produce.
-    pub embedding_dimension: Option<Dimension>,
     /// Model requests in flight to this provider at once, across the whole
     /// process; the rest wait their turn (design doc 4.1). Unset: 1 for
     /// Ollama, which serves one request per model unless
@@ -621,7 +615,7 @@ struct RawProviderConfig {
     aws_profile: Option<String>,
     api: Option<BedrockApi>,
     region: Option<AwsRegion>,
-    embedding_dimension: Option<Dimension>,
+
     max_concurrent_requests: Option<RequestLimit>,
     oauth: Option<OAuthConfig>,
 }
@@ -708,7 +702,7 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
             auth,
             base_url: raw.base_url,
             bedrock: bedrock_config,
-            embedding_dimension: raw.embedding_dimension,
+
             max_concurrent_requests: raw.max_concurrent_requests,
         })
     }
@@ -731,7 +725,6 @@ impl ProviderConfig {
                     api: endpoint.default_api(),
                     region: None,
                 }),
-            embedding_dimension: None,
             max_concurrent_requests: None,
         }
     }
@@ -767,23 +760,6 @@ pub struct ModelRef<'a> {
 impl std::fmt::Display for ModelRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.provider_name, self.model)
-    }
-}
-
-impl ModelRef<'_> {
-    /// The width its provider's embeddings have: `validate` requires it of
-    /// an embedding model's provider.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the provider declares no `embedding_dimension`.
-    pub fn dimension(&self) -> Result<Dimension> {
-        self.provider.embedding_dimension.ok_or_else(|| {
-            Error::Config(format!(
-                "provider '{}' is used for embeddings but has no embedding_dimension",
-                self.provider_name
-            ))
-        })
     }
 }
 
@@ -1162,18 +1138,21 @@ impl Default for ContextConfig {
     }
 }
 
-/// Overrides for the input prefixes the embedding model gets for each role
-/// (`quack_core::embedding`). Unset keeps the built-in prefix for the
-/// model's family; an empty string sends that role unprefixed. Changing
-/// one changes the embedding profile: stored vectors stop being searched
-/// until `quack embeddings refresh` brings them up to date.
+/// The embedding model, the width of its vectors, and overrides for the
+/// input prefixes it gets for each role (`quack_core::embedding`). An unset
+/// prefix keeps the built-in one for the model's family; an empty string
+/// sends that role unprefixed. Changing the model, the width, or a prefix
+/// changes the embedding profile: stored vectors stop being searched until
+/// `quack embeddings refresh` brings them up to date.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "the field names are the config keys, which read as `query_prefix = ...`"
-)]
 pub struct EmbeddingConfig {
+    /// `PROVIDER/MODEL` used for embeddings. Unset means documents are stored
+    /// without vectors and `search_documents` is unavailable.
+    pub model: Option<ModelSpec>,
+    /// Width of the vectors `model` produces; required with it.
+    pub dimension: Option<Dimension>,
+
     /// Before a search query.
     pub query_prefix: Option<String>,
     /// Before a document chunk; `{title}` is replaced by the chunk's
@@ -1428,16 +1407,16 @@ impl Config {
         if let Some(embed) = self.embedding_model_ref()? {
             if embed.provider.provider_type == ProviderType::Anthropic {
                 return Err(Error::Config(format!(
-                    "embedding_model '{embed}': anthropic does not serve embeddings"
+                    "[embedding].model '{embed}': anthropic does not serve embeddings"
                 )));
             }
             if embed.provider.provider_type == ProviderType::BedrockMantle {
                 return Err(Error::Config(format!(
-                    "embedding_model '{embed}': bedrock-mantle serves no embeddings; use a \
+                    "[embedding].model '{embed}': bedrock-mantle serves no embeddings; use a \
                      type = \"bedrock\" provider"
                 )));
             }
-            embed.dimension()?;
+            self.embedding_dimension()?;
         }
         // Unlike the other [analysis] numbers, this one allocates OS-level
         // DuckDB connections at workspace open, one spawn_blocking round
@@ -1499,13 +1478,28 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if `embedding_model` names an unknown provider.
+    /// Returns an error if `[embedding].model` names an unknown provider.
     pub fn embedding_model_ref(&self) -> Result<Option<ModelRef<'_>>> {
-        self.general
-            .embedding_model
+        self.embedding
+            .model
             .as_ref()
-            .map(|spec| self.resolve_model("embedding_model", spec))
+            .map(|spec| self.resolve_model("[embedding].model", spec))
             .transpose()
+    }
+
+    /// The width of the embedding model's vectors: `validate` requires it
+    /// whenever a model is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `[embedding].dimension` is unset.
+    pub fn embedding_dimension(&self) -> Result<Dimension> {
+        self.embedding.dimension.ok_or_else(|| {
+            Error::Config(String::from(
+                "[embedding].model is set but [embedding].dimension is not; set it to the \
+                 width of the model's vectors",
+            ))
+        })
     }
 
     #[must_use]
@@ -1564,12 +1558,16 @@ mod tests {
     const FULL: &str = r#"
 [general]
 chat_model = "ollama/llama3.1:8b"
-embedding_model = "ollama/nomic-embed-text"
+
+[embedding]
+model = "ollama/nomic-embed-text"
+dimension = 768
+
 
 [providers.ollama]
 type = "ollama"
 base_url = "http://localhost:11434"
-embedding_dimension = 768
+
 
 [providers.anthropic]
 type = "anthropic"
@@ -1634,10 +1632,7 @@ rerank = "model"
         assert_eq!(chat.to_string(), "ollama/llama3.1:8b");
         let embed = config.embedding_model_ref().unwrap().unwrap();
         assert_eq!(embed.model, "nomic-embed-text");
-        assert_eq!(
-            embed.provider.embedding_dimension,
-            Some(Dimension::new(768))
-        );
+        assert_eq!(config.embedding_dimension().ok(), Some(Dimension::new(768)));
         assert_eq!(config.retrieval.top_k, 3);
         assert_eq!(config.retrieval.rerank, RerankMode::Model);
         let anthropic = config.providers.get("anthropic");
@@ -1936,8 +1931,8 @@ rerank = "model"
         );
         assert!(
             err_of(
-                "[general]\nembedding_model = \"m/amazon.titan-embed-text-v2:0\"\n\
-                 [providers.m]\ntype = \"bedrock-mantle\"\nembedding_dimension = 1024\n"
+                "[embedding]\nmodel = \"m/amazon.titan-embed-text-v2:0\"\ndimension = 1024\n\
+                 [providers.m]\ntype = \"bedrock-mantle\"\n"
             )
             .contains("serves no embeddings")
         );
@@ -1947,9 +1942,8 @@ rerank = "model"
     fn runtime_and_mantle_are_two_providers_sharing_a_profile() {
         let config = Config::parse(
             "[general]\nchat_model = \"mantle/openai.gpt-oss-120b\"\n\
-             embedding_model = \"bedrock/amazon.titan-embed-text-v2:0\"\n\
+             [embedding]\nmodel = \"bedrock/amazon.titan-embed-text-v2:0\"\ndimension = 1024\n\
              [providers.bedrock]\ntype = \"bedrock\"\naws_profile = \"sso\"\nregion = \"us-east-1\"\n\
-             embedding_dimension = 1024\n\
              [providers.mantle]\ntype = \"bedrock-mantle\"\naws_profile = \"sso\"\n\
              base_url = \"https://vpce-0abc.bedrock-mantle.us-east-1.vpce.amazonaws.com\"\n",
         );
@@ -2176,10 +2170,10 @@ rerank = "model"
     }
 
     #[test]
-    fn embedding_provider_needs_dimension_and_cannot_be_anthropic() {
-        let no_dim = "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\n";
-        assert!(err_of(no_dim).contains("embedding_dimension"));
-        let anthropic = "[general]\nembedding_model = \"a/e\"\n[providers.a]\ntype = \"anthropic\"\nauth = \"api-key\"\napi_key_env = \"K\"\nembedding_dimension = 1\n";
+    fn embedding_model_needs_dimension_and_cannot_be_anthropic() {
+        let no_dim = "[embedding]\nmodel = \"o/e\"\n[providers.o]\ntype = \"ollama\"\n";
+        assert!(err_of(no_dim).contains("[embedding].dimension"));
+        let anthropic = "[embedding]\nmodel = \"a/e\"\ndimension = 1\n[general]\n[providers.a]\ntype = \"anthropic\"\nauth = \"api-key\"\napi_key_env = \"K\"\n";
         assert!(err_of(anthropic).contains("does not serve embeddings"));
     }
 

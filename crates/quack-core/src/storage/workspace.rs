@@ -1001,7 +1001,7 @@ impl WorkspaceDb {
     /// Bring the vector columns to the configured profile's width when no
     /// chunk vector would be lost doing it. When chunk vectors of another
     /// width exist they stay as they are, unsearched, until `refresh`
-    /// retypes the columns: a mistyped `embedding_dimension` must not
+    /// retypes the columns: a mistyped `[embedding].dimension` must not
     /// discard a workspace's embeddings.
     fn reconcile_dimension(&self) -> Result<()> {
         let Some(profile) = &self.vectors.profile else {

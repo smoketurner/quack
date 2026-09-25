@@ -3,12 +3,15 @@
 
 [general]
 chat_model = "ollama/gpt-oss:20b"
-embedding_model = "ollama/qwen3-embedding:0.6b"
+
+[embedding]
+model = "ollama/qwen3-embedding:0.6b"
+dimension = 1024
 
 [providers.ollama]
 type = "ollama"
 base_url = "http://ollama:11434"
-embedding_dimension = 1024
+
 
 [server]
 bind = "0.0.0.0:8080"

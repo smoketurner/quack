@@ -20,7 +20,7 @@ pub struct EmbeddingStatus {
     /// `None` without an embedding model.
     pub profile: Option<Profile>,
     /// Width of the stored vectors, which differs from the profile's
-    /// until `quack embeddings refresh` runs after an `embedding_dimension` change.
+    /// until `quack embeddings refresh` runs after an `[embedding].dimension` change.
     pub column_dimension: Dimension,
     /// Chunks searchable by vector now.
     pub current_chunks: u64,
