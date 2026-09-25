@@ -703,6 +703,34 @@ fn status_is_not_stale_when_built_with_version_is_none() {
     );
 }
 
+/// An empty graph is not stale even when its recorded build version lags
+/// the ontology: there is nothing built for the new version to invalidate.
+#[test]
+fn status_is_not_stale_when_the_built_graph_is_empty() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let saved = store::save(
+        &db,
+        &current,
+        Revision::reviewed(Some("test"), Some("advance the ontology")),
+    )
+    .unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.nodes, 0);
+    assert_eq!(status.built_with_version, current.saved_version().ok());
+    assert_eq!(status.ontology_version, saved.version);
+    assert!(
+        status.built_with_version < status.ontology_version,
+        "the ontology advanced past the recorded build"
+    );
+    assert!(!status.stale, "an empty graph is not stale: {status}");
+    assert!(
+        !format!("{status}").contains("stale"),
+        "an empty graph must not be labelled stale: {status}"
+    );
+}
+
 #[tokio::test]
 async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     let db = workspace();
