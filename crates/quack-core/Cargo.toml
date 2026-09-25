@@ -11,7 +11,14 @@ workspace = true
 
 [dependencies]
 argon2        = { workspace = true, features = ["alloc", "password-hash", "getrandom"] }
+aws-config    = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest", "sso"] }
+aws-credential-types = { workspace = true }
 aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
+aws-sdk-bedrockruntime = { workspace = true, features = ["rt-tokio", "default-https-client"] }
+aws-sigv4     = { workspace = true, features = ["sign-http", "http1"] }
+aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x"] }
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
 base64        = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 calamine      = { workspace = true }
@@ -21,13 +28,14 @@ duckdb        = { workspace = true, features = ["bundled", "json"] }
 ego-tree      = { workspace = true }
 futures       = { workspace = true, features = ["std"] }
 http          = { workspace = true, features = ["std"] }
+http-body     = { workspace = true }
 jiff          = { workspace = true, features = ["std", "serde"] }
 keyring-core  = { workspace = true }
 oauth2        = { workspace = true }
 pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
-rig           = { workspace = true, features = ["agent", "derive", "rustls"] }
+rig           = { workspace = true, features = ["agent", "bedrock", "derive", "rustls"] }
 rust-stemmers = { workspace = true }
 rustls        = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
@@ -54,6 +62,7 @@ apple-native-keyring-store = { workspace = true, features = ["keychain"] }
 # family where aws-lc-fips-sys links statically (docs/crypto.md).
 [target.'cfg(target_os = "linux")'.dependencies]
 aws-lc-rs                    = { workspace = true, features = ["fips"] }
+aws-smithy-http-client       = { workspace = true, features = ["rustls-aws-lc-fips"] }
 linux-keyutils-keyring-store = { workspace = true }
 rustls                       = { workspace = true, features = ["fips"] }
 
