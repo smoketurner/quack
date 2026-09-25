@@ -19,6 +19,7 @@ aws-sigv4     = { workspace = true, features = ["sign-http", "http1"] }
 aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x"] }
 aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
+aws-types        = { workspace = true }
 base64        = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 calamine      = { workspace = true }

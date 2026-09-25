@@ -21,6 +21,15 @@
 //! else the one AWS publishes for the region: the runtime's from the AWS
 //! SDK's own resolver, which honours `use_fips_endpoint` and
 //! `use_dualstack_endpoint`, the mantle's `bedrock-mantle.{region}.api.aws`.
+//!
+//! On the runtime endpoint, when `base_url` is unset the same AWS endpoint-URL
+//! overrides the SDK's own client honours apply here too — `AWS_ENDPOINT_URL`,
+//! the service-specific `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, and the matching
+//! `[default]` / `[bedrock runtime]` profile `endpoint_url` keys — resolved the
+//! way `Builder::from(&sdk)` resolves them, so the OpenAI-compatible transports
+//! (`chat-completions`, `responses`) and the Converse / `InvokeModel` client
+//! never split across two hosts. The mantle endpoint has no SDK client, so it
+//! is unaffected.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -278,6 +287,10 @@ async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session
         .await
         .map_err(|e| no_credentials(name, provider, &e))?;
     let converse = (endpoint == BedrockEndpoint::Runtime).then(|| {
+        // `Builder::from(&sdk)` inherits the AWS endpoint-URL overrides the SDK
+        // loads (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, the
+        // profile keys); `root()` mirrors that resolution for the
+        // OpenAI-compatible transports, so chat and embeddings send to one host.
         let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk);
         if let Some(base_url) = &provider.base_url {
             // On the Bedrock client only: SSO and STS keep their own endpoints.
@@ -296,9 +309,14 @@ async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session
     })
 }
 
-/// The endpoint's root: `base_url`, else the one AWS publishes for
-/// `region`, FIPS and dual-stack as the SDK's settings ask
-/// (`AWS_USE_FIPS_ENDPOINT`, `use_fips_endpoint` in the profile).
+/// The endpoint's root: `base_url`, else — on the runtime endpoint — any AWS
+/// endpoint-URL override the SDK honours (`AWS_ENDPOINT_URL`,
+/// `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, or the profile equivalents), else the
+/// one AWS publishes for `region`, FIPS and dual-stack as the SDK's settings
+/// ask (`AWS_USE_FIPS_ENDPOINT`, `use_fips_endpoint` in the profile). The
+/// override, like `base_url`, is taken as given and is not checked for FIPS:
+/// the Converse client does not check either, and a check here would only
+/// split chat and embeddings again (chat refused, embeddings served).
 async fn root(
     name: &ProviderName,
     provider: &ProviderConfig,
@@ -325,6 +343,13 @@ async fn root(
             &crate::config::AwsRegion::try_from(region.to_owned())?,
         )),
         BedrockEndpoint::Runtime => {
+            // An endpoint-URL override the AWS SDK honours (the same
+            // `Builder::from(&sdk)` resolves for the Converse client): honor it
+            // here too, so the OpenAI-compatible transport at this root and the
+            // Converse / InvokeModel client cannot resolve to different hosts.
+            if let Some(override_url) = runtime_endpoint_override(sdk) {
+                return Ok(override_url.trim_end_matches('/').to_owned());
+            }
             let params = Params::builder()
                 .region(region)
                 .use_fips(fips)
@@ -342,6 +367,40 @@ async fn root(
             Ok(endpoint.url().trim_end_matches('/').to_owned())
         }
     }
+}
+
+/// The bedrock-runtime endpoint-URL override `root()` honors — resolved the
+/// same way `aws_sdk_bedrockruntime::config::Builder::from(&sdk)` (the
+/// `From<&SdkConfig>` impl) resolves it — so the OpenAI-compatible transports
+/// and the Converse client never diverge.
+///
+/// Mirrors the two branches `Builder::from(&sdk)` reads:
+///
+/// - When `sdk.endpoint_url()` was set programmatically (origin
+///   `client_config`), the SDK ignores the service-specific value and uses
+///   only the global one.
+/// - Otherwise the service-specific value comes first —
+///   `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` or the `[bedrock runtime]` profile
+///   `endpoint_url` — then the global one (`AWS_ENDPOINT_URL` or `[default]`'s
+///   `endpoint_url`) as a fallback. `sdk_config()` never sets `endpoint_url`
+///   programmatically, so this is the branch a quack operator hits; the first
+///   is carried for parity, so a future programmatic loader keeps the two
+///   transports aligned.
+fn runtime_endpoint_override(sdk: &SdkConfig) -> Option<String> {
+    use aws_types::service_config::ServiceConfigKey;
+    if sdk.get_origin("endpoint_url").is_client_config() {
+        return sdk.endpoint_url().map(str::to_owned);
+    }
+    let service_specific = sdk.service_config().and_then(|conf| {
+        ServiceConfigKey::builder()
+            .service_id("Bedrock Runtime")
+            .env("AWS_ENDPOINT_URL")
+            .profile("endpoint_url")
+            .build()
+            .ok()
+            .and_then(|key| conf.load_config(key))
+    });
+    service_specific.or_else(|| sdk.endpoint_url().map(str::to_owned))
 }
 
 /// The SDK configuration the AWS CLI would use for this provider: its
@@ -578,6 +637,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ProviderType, RequestLimit};
+    use aws_types::service_config::{LoadServiceConfig, ServiceConfigKey};
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -801,6 +861,307 @@ mod tests {
             root_of(BedrockEndpoint::Runtime, true, Some(fips_vpce))
                 .await
                 .is_ok()
+        );
+    }
+
+    /// The `[services]` block the SDK would load, faked for the test: returns
+    /// its value for the Bedrock Runtime `endpoint_url` key and nothing else.
+    #[derive(Debug)]
+    struct BedrockRuntimeServiceConfig(Option<String>);
+
+    impl LoadServiceConfig for BedrockRuntimeServiceConfig {
+        fn load_config(&self, key: ServiceConfigKey<'_>) -> Option<String> {
+            if key.service_id() == "Bedrock Runtime" && key.env() == "AWS_ENDPOINT_URL" {
+                self.0.clone()
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_endpoint_override_is_none_with_nothing_set() {
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(runtime_endpoint_override(&sdk), None);
+    }
+
+    #[test]
+    fn runtime_endpoint_override_reads_the_service_specific_value() {
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .service_config(BedrockRuntimeServiceConfig(Some(String::from(
+                "https://runtime-override.example/",
+            ))))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(
+            runtime_endpoint_override(&sdk).as_deref(),
+            Some("https://runtime-override.example/")
+        );
+    }
+
+    #[test]
+    fn runtime_endpoint_override_falls_back_to_the_global_value() {
+        // No service-specific value and no programmatic origin: the global one
+        // is the fallback, the path `AWS_ENDPOINT_URL` takes through the loader.
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://global-override.example")
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(
+            runtime_endpoint_override(&sdk).as_deref(),
+            Some("https://global-override.example")
+        );
+    }
+
+    #[test]
+    fn runtime_endpoint_override_service_specific_wins_over_global() {
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://global-override.example")
+            .service_config(BedrockRuntimeServiceConfig(Some(String::from(
+                "https://runtime-override.example",
+            ))))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(
+            runtime_endpoint_override(&sdk).as_deref(),
+            Some("https://runtime-override.example")
+        );
+    }
+
+    #[test]
+    fn runtime_endpoint_override_programmatic_origin_ignores_service_specific() {
+        // A `client_config` origin mirrors what the aws-config loader does for
+        // `.endpoint_url(...)`: it wins and the service-specific value is
+        // ignored, exactly as `Builder::from(&sdk)` does.
+        let mut builder = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://programmatic.example")
+            .service_config(BedrockRuntimeServiceConfig(Some(String::from(
+                "https://runtime-override.example",
+            ))));
+        builder.insert_origin("endpoint_url", aws_types::origin::Origin::shared_config());
+        let sdk = builder.behavior_version(BehaviorVersion::latest()).build();
+        assert_eq!(
+            runtime_endpoint_override(&sdk).as_deref(),
+            Some("https://programmatic.example")
+        );
+    }
+
+    async fn root_of_with_sdk(endpoint: BedrockEndpoint, sdk: &SdkConfig) -> Result<String> {
+        let provider = provider_with(endpoint, None);
+        let name: ProviderName = "root-test"
+            .parse()
+            .unwrap_or_else(|e: Error| fail(&e.to_string()));
+        root(&name, &provider, endpoint, sdk, "us-west-2").await
+    }
+
+    #[tokio::test]
+    async fn runtime_root_honors_the_global_endpoint_url_override() {
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://global-override.example/")
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        // A trailing slash is trimmed, so chat and embeddings get the bare root.
+        assert_eq!(
+            root_of_with_sdk(BedrockEndpoint::Runtime, &sdk)
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://global-override.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_root_honors_the_service_specific_override() {
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .service_config(BedrockRuntimeServiceConfig(Some(String::from(
+                "https://runtime-override.example",
+            ))))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(
+            root_of_with_sdk(BedrockEndpoint::Runtime, &sdk)
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://runtime-override.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_root_without_an_override_keeps_the_aws_host() {
+        // The override is additive: with neither it nor `base_url`, the
+        // AWS-published host and FIPS/dual-stack resolution are unchanged.
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .use_fips(true)
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(
+            root_of_with_sdk(BedrockEndpoint::Runtime, &sdk)
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://bedrock-runtime-fips.us-west-2.amazonaws.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn base_url_beats_the_endpoint_url_override() {
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://override.example")
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let provider = provider_with(
+            BedrockEndpoint::Runtime,
+            Some("https://vpce-0abc.bedrock-runtime.us-west-2.vpce.amazonaws.com"),
+        );
+        let name: ProviderName = "root-test"
+            .parse()
+            .unwrap_or_else(|e: Error| fail(&e.to_string()));
+        let root = root(
+            &name,
+            &provider,
+            BedrockEndpoint::Runtime,
+            &sdk,
+            "us-west-2",
+        )
+        .await;
+        assert_eq!(
+            root.ok().as_deref(),
+            Some("https://vpce-0abc.bedrock-runtime.us-west-2.vpce.amazonaws.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn mantle_root_ignores_the_endpoint_url_override() {
+        // The override is a bedrock-runtime concern (the SDK client); the
+        // mantle endpoint has no SDK client and stays at its published host.
+        let sdk = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://override.example")
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(
+            root_of_with_sdk(BedrockEndpoint::Mantle, &sdk)
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://bedrock-mantle.us-west-2.api.aws")
+        );
+    }
+
+    /// An HTTPS client that records the URI of every request and answers each
+    /// with a 200 and a placeholder body, so the resolved host is observable
+    /// without a real Bedrock response.
+    #[derive(Debug, Clone)]
+    struct RecordingHttp {
+        uris: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HttpClient for RecordingHttp {
+        fn http_connector(
+            &self,
+            _settings: &HttpConnectorSettings,
+            _components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(RecordingConnector {
+                uris: Arc::clone(&self.uris),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingConnector {
+        uris: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HttpConnector for RecordingConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let uri = request.uri().to_string();
+            self.uris
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(uri);
+            HttpConnectorFuture::new(async move {
+                Ok(HttpResponse::new(
+                    200_u16.try_into().unwrap_or_else(|_| fail("status")),
+                    SdkBody::from("{}"),
+                ))
+            })
+        }
+    }
+
+    /// Chat (OpenAI-compatible, at `root()`) and embeddings (the Converse
+    /// client) send to one host: with `base_url` unset and an endpoint-URL
+    /// override in place, the real AWS SDK client — built the way `build()`
+    /// builds it — sends to the same host `root()` resolves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chat_and_embeddings_send_to_one_host_under_an_endpoint_override() {
+        let uris = Arc::new(Mutex::new(Vec::new()));
+        let sdk = aws_config::defaults(BehaviorVersion::latest())
+            .http_client(SharedHttpClient::new(RecordingHttp {
+                uris: Arc::clone(&uris),
+            }))
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                "AKIDEXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                None,
+                None,
+                "test",
+            )))
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://gateway.example")
+            .load()
+            .await;
+        let provider = provider_with(BedrockEndpoint::Runtime, None);
+        let name: ProviderName = "endpoint-override-e2e"
+            .parse()
+            .unwrap_or_else(|e: Error| fail(&e.to_string()));
+        let root = root(
+            &name,
+            &provider,
+            BedrockEndpoint::Runtime,
+            &sdk,
+            "us-west-2",
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(root, "https://gateway.example");
+
+        // The Converse / InvokeModel client, built the same way `build()` does.
+        let client = aws_sdk_bedrockruntime::Client::new(&sdk);
+        // The response is a placeholder; the point is the URI the orchestrator
+        // resolved, recorded before the call returns.
+        let _send_result = client
+            .invoke_model()
+            .model_id("amazon.titan-embed-text-v2:0")
+            .body(aws_smithy_types::Blob::new(b"{}".to_vec()))
+            .send()
+            .await;
+        let captured = uris.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !captured.is_empty(),
+            "the SDK client made no request; signing or build failed: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|uri| uri.starts_with("https://gateway.example/")),
+            "{captured:?}"
+        );
+        assert!(
+            captured.iter().any(|uri| uri.contains("/model/")),
+            "{captured:?}"
         );
     }
 
