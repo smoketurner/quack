@@ -255,22 +255,17 @@ pub fn save(db: &WorkspaceDb, ontology: &Ontology, revision: Revision<'_>) -> Re
     check_mappings(db, ontology)?;
     let previous = current(db)?;
     let next = OntologyVersion::after(latest_version(db)?);
-    let conn = db.connection();
     let mut stored = ontology.normalized();
     stored.version = Some(next);
     let snapshot = serde_json::to_string(&stored)?;
-    conn.execute("BEGIN", [])?;
-    let outcome = write_version(conn, next, &stored, previous.as_ref(), &snapshot, revision);
-    match outcome {
-        Ok(()) => {
-            conn.execute("COMMIT", [])?;
-            Ok(stored)
-        }
-        Err(e) => {
-            drop(conn.execute("ROLLBACK", []));
-            Err(e)
-        }
-    }
+    // One transaction via the RAII guard: it rolls back on drop, so a panic
+    // or an `?` return between BEGIN and COMMIT cannot leave the writer's
+    // one connection inside an open transaction.
+    db.write_transaction(|db| {
+        let conn = db.connection();
+        write_version(conn, next, &stored, previous.as_ref(), &snapshot, revision)?;
+        Ok(stored)
+    })
 }
 
 fn write_version(
