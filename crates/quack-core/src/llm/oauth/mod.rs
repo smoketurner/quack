@@ -757,7 +757,7 @@ impl TokenManager {
                     (Grant::AuthorizationCode | Grant::DeviceCode, false) => Renewal::Relogin,
                 },
             }),
-            key_location: self.store.key_location(),
+            key_location: self.store.key_location().await?,
         })
     }
 

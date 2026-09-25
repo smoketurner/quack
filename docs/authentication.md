@@ -389,6 +389,16 @@ AES-256 encryption with authentication. It binds each value to its purpose and i
 a sealed row copied to another user or provider fails to open. The vault key never sits in
 the database it protects.
 
+quack looks for the vault key in the keychain first and then in `vault.key`, and `quack auth
+status` reports the location in the same order. It writes `vault.key` only when the host has
+no usable keychain: no store can be installed, or, as under Docker's seccomp profile, no
+entry can be addressed. A keychain that exists but refuses access, because it is locked or
+quack is denied, is an error that names the keychain. quack does not fall back to the file
+in that case. The keychain may hold the key that sealed the stored tokens, so those would
+not open under a new key; and tokens sealed under a new key in `vault.key` would not open
+once the keychain answered again, since its key comes first. Either way people would have
+to sign in again. Unlock the keychain, or grant quack access, and retry.
+
 Three operational consequences follow. First, Linux keeps the kernel keyring in memory, so
 after a reboot the vault key is gone: users must sign in again, and each OAuth provider
 needs `quack auth login` again. Second, Docker's default seccomp profile (the system-call

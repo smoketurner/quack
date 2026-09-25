@@ -9,8 +9,6 @@ use std::sync::{Arc, OnceLock};
 
 use keyring_core::{CredentialStore, Entry};
 
-use crate::error::{Error, Result};
-
 const SERVICE: &str = "quack";
 
 fn platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
@@ -49,8 +47,104 @@ fn ensure_store() -> keyring_core::Result<()> {
     .map_err(keyring_core::Error::BadStoreFormat)
 }
 
+/// Why the keychain could not be used. The two cases call for opposite
+/// responses, so they are kept apart (#226).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeychainError {
+    /// This host has no keychain to talk to: no store could be installed,
+    /// or an entry cannot even be addressed (Docker's seccomp profile
+    /// blocks the Linux keyring syscalls). The key file stands in for it.
+    Unavailable(String),
+    /// A keychain exists but refused or failed the operation: locked,
+    /// access denied, or an error of its own. It may hold the key, so the
+    /// key file must not stand in for it: a key made there would be
+    /// shadowed by the keychain's once it answers again.
+    Refused(String),
+}
+
+impl std::fmt::Display for KeychainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(e) => write!(f, "no usable keychain: {e}"),
+            Self::Refused(e) => write!(f, "the keychain refused: {e}"),
+        }
+    }
+}
+
+/// Sort a keychain failure. Only a missing store is `Unavailable`: an
+/// error from an entry the store did build is the store refusing.
+fn classify(e: &keyring_core::Error, stage: Stage) -> KeychainError {
+    let unavailable = match stage {
+        Stage::Store | Stage::Entry => true,
+        Stage::Operation => matches!(
+            e,
+            keyring_core::Error::NoDefaultStore | keyring_core::Error::NotSupportedByStore(_)
+        ),
+    };
+    if unavailable {
+        KeychainError::Unavailable(e.to_string())
+    } else {
+        KeychainError::Refused(e.to_string())
+    }
+}
+
+/// How far a keychain call got before it failed.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    /// Installing the platform store.
+    Store,
+    /// Addressing the entry; on Linux this already talks to the kernel.
+    Entry,
+    /// Reading or writing the entry.
+    Operation,
+}
+
+/// Where keys are kept: the OS keychain, or (in tests) a fake one.
+#[derive(Debug, Clone)]
+pub(super) enum Keychain {
+    Os,
+    #[cfg(test)]
+    Fake(std::sync::Arc<fake::FakeKeychain>),
+}
+
+impl Keychain {
+    /// The key stored under `account`, or `None` when there is no entry.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when this host has no keychain, `Refused` when the
+    /// keychain would not answer.
+    pub(super) async fn get(&self, account: &str) -> Result<Option<String>, KeychainError> {
+        match self {
+            Self::Os => {
+                KeychainEntry::new(account.to_owned())
+                    .run(KeychainOp::Read)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Fake(fake) => fake.get(account),
+        }
+    }
+
+    /// Store `key` under `account`, replacing any previous one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get`].
+    pub(super) async fn set(&self, account: &str, key: &str) -> Result<(), KeychainError> {
+        match self {
+            Self::Os => KeychainEntry::new(account.to_owned())
+                .run(KeychainOp::Write(key.to_owned()))
+                .await
+                .map(drop),
+            #[cfg(test)]
+            Self::Fake(fake) => fake.set(account, key),
+        }
+    }
+}
+
 /// A keychain entry under the `quack` service, named by its account.
-pub(super) struct KeychainEntry(String);
+struct KeychainEntry(String);
 
 /// What is done to an entry.
 enum KeychainOp {
@@ -68,51 +162,115 @@ impl KeychainOp {
 }
 
 impl KeychainEntry {
-    pub(super) const fn new(account: String) -> Self {
+    const fn new(account: String) -> Self {
         Self(account)
     }
 
     /// Do `op` on the blocking pool, since the stores talk to the OS
     /// synchronously. A read of a missing entry is `None`.
-    async fn run(&self, op: KeychainOp) -> Result<Option<String>> {
+    async fn run(&self, op: KeychainOp) -> Result<Option<String>, KeychainError> {
         let account = self.0.clone();
         tokio::task::spawn_blocking(move || {
             let verb = op.verb();
             let outcome = ensure_store()
-                .and_then(|()| Entry::new(SERVICE, &account))
-                .and_then(|entry| match op {
-                    KeychainOp::Read => entry.get_password().map(Some),
-                    KeychainOp::Write(key) => entry.set_password(&key).map(|()| None),
+                .map_err(|e| classify(&e, Stage::Store))
+                .and_then(|()| {
+                    Entry::new(SERVICE, &account).map_err(|e| classify(&e, Stage::Entry))
+                })
+                .and_then(|entry| {
+                    match op {
+                        KeychainOp::Read => entry.get_password().map(Some),
+                        KeychainOp::Write(key) => entry.set_password(&key).map(|()| None),
+                    }
+                    .or_else(|e| match e {
+                        keyring_core::Error::NoEntry => Ok(None),
+                        e => Err(classify(&e, Stage::Operation)),
+                    })
                 });
-            match outcome {
-                Ok(found) => Ok(found),
-                Err(keyring_core::Error::NoEntry) => Ok(None),
-                Err(e) => Err(Error::Llm(format!(
-                    "keychain {verb} of '{account}' failed: {e}"
-                ))),
-            }
+            outcome.map_err(|e| match e {
+                KeychainError::Unavailable(m) => {
+                    KeychainError::Unavailable(format!("keychain {verb} of '{account}': {m}"))
+                }
+                KeychainError::Refused(m) => {
+                    KeychainError::Refused(format!("keychain {verb} of '{account}': {m}"))
+                }
+            })
         })
         .await
-        .map_err(|e| Error::Llm(format!("keychain task failed: {e}")))?
+        .map_err(|e| KeychainError::Refused(format!("keychain task failed: {e}")))?
+    }
+}
+
+/// An in-memory keychain whose availability a test controls.
+#[cfg(test)]
+pub(super) mod fake {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::KeychainError;
+
+    /// How the fake keychain answers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::llm::oauth) enum Mode {
+        /// Reads and writes work.
+        Open,
+        /// The host has no keychain at all.
+        Absent,
+        /// The keychain is there but locked: every call is refused.
+        Locked,
     }
 
-    /// The stored key, or `None` when the keychain has no entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the keychain itself is unavailable or refuses
-    /// the read; callers fall back to the key file on that.
-    pub(super) async fn get(&self) -> Result<Option<String>> {
-        self.run(KeychainOp::Read).await
+    #[derive(Debug)]
+    pub(in crate::llm::oauth) struct FakeKeychain {
+        state: Mutex<(Mode, HashMap<String, String>)>,
     }
 
-    /// Store the key, replacing any previous one.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the keychain is unavailable or refuses the
-    /// write.
-    pub(super) async fn set(&self, key: &str) -> Result<()> {
-        self.run(KeychainOp::Write(key.to_owned())).await.map(drop)
+    impl FakeKeychain {
+        pub(in crate::llm::oauth) fn new(mode: Mode) -> Self {
+            Self {
+                state: Mutex::new((mode, HashMap::new())),
+            }
+        }
+
+        pub(in crate::llm::oauth) fn set_mode(&self, mode: Mode) {
+            if let Ok(mut state) = self.state.lock() {
+                state.0 = mode;
+            }
+        }
+
+        /// The stored entry, whatever the mode (what the OS holds).
+        pub(in crate::llm::oauth) fn peek(&self, account: &str) -> Option<String> {
+            self.state
+                .lock()
+                .ok()
+                .and_then(|state| state.1.get(account).cloned())
+        }
+
+        fn gate(mode: Mode) -> Result<(), KeychainError> {
+            match mode {
+                Mode::Open => Ok(()),
+                Mode::Absent => Err(KeychainError::Unavailable(String::from("no store"))),
+                Mode::Locked => Err(KeychainError::Refused(String::from("locked"))),
+            }
+        }
+
+        pub(super) fn get(&self, account: &str) -> Result<Option<String>, KeychainError> {
+            let state = self
+                .state
+                .lock()
+                .map_err(|e| KeychainError::Refused(e.to_string()))?;
+            Self::gate(state.0)?;
+            Ok(state.1.get(account).cloned())
+        }
+
+        pub(super) fn set(&self, account: &str, key: &str) -> Result<(), KeychainError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|e| KeychainError::Refused(e.to_string()))?;
+            Self::gate(state.0)?;
+            state.1.insert(account.to_owned(), key.to_owned());
+            Ok(())
+        }
     }
 }

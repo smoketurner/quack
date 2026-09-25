@@ -151,10 +151,15 @@ impl Vault {
         }
     }
 
-    /// Where the key is: the key file when there is one, else the keychain.
-    #[must_use]
-    pub fn key_location(&self) -> KeyLocation {
-        self.slot.location()
+    /// Where the key is, found in the order opening looks: the keychain's
+    /// entry, else the key file; where a new key would go when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the keychain refuses (locked or denied) or the
+    /// key file cannot be read.
+    pub async fn key_location(&self) -> Result<KeyLocation> {
+        self.slot.location().await
     }
 
     /// The key, made and stored the first time something is sealed.
