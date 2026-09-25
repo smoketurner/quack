@@ -3083,8 +3083,14 @@ fn json_of(value: duckdb::types::Value) -> serde_json::Value {
         Value::Double(f) => serde_json::Number::from_f64(f).map_or(Json::Null, Json::Number),
         Value::Decimal(d) => {
             let text = d.to_string();
-            text.parse::<serde_json::Number>()
-                .map_or(Json::String(text), Json::Number)
+            match text.parse::<serde_json::Number>() {
+                // Only keep the value as a JSON number when it round-trips to
+                // the exact digit string; `serde_json` is built without
+                // `arbitrary_precision`, so fractional decimals parse to an
+                // `f64`-backed `Number` that silently drops digits and scale.
+                Ok(n) if n.to_string() == text => Json::Number(n),
+                _ => Json::String(text),
+            }
         }
         Value::Timestamp(unit, n) => Json::String(timestamp_text(unit, n)),
         Value::Date32(days) => Json::String(date_text(days)),
@@ -3847,6 +3853,108 @@ mod tests {
             7
         ]);
         assert_eq!(serde_json::Value::Array(row.clone()), expected);
+    }
+
+    /// `DECIMAL` cells keep their exact digit string when the value would
+    /// not round-trip through a `serde_json` number (high precision, wide
+    /// scale, or a declared scale with trailing zeros); a scale-0 integer
+    /// that fits stays a JSON number. Guards the `json_of` docstring
+    /// contract; the previous code parsed every fractional decimal to an
+    /// `f64`-backed `Number` and discarded the digits.
+    #[test]
+    fn decimal_cells_keep_exact_digits() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement(
+            "CREATE TABLE d (hi DECIMAL(20,2), wide DECIMAL(38,10), scaled DECIMAL(3,2), int DECIMAL(5,0))",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement(
+            "INSERT INTO d VALUES (123456789012345678.99, 99999999999999999999.1234567890, 1.50, 42)",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let results = db
+            .execute_query("SELECT hi, wide, scaled, int FROM d")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let row = results.rows.first().unwrap_or_else(|| fail("no row"));
+
+        // High precision, wide scale, and trailing-zero scale all keep their
+        // exact digit strings as JSON text; the scale-0 integer stays a
+        // JSON number.
+        assert_eq!(
+            serde_json::Value::Array(row.clone()),
+            serde_json::json!([
+                "123456789012345678.99",
+                "99999999999999999999.1234567890",
+                "1.50",
+                42
+            ])
+        );
+        // The row is not the f64 approximation the bug produced: the
+        // high-precision and wide cells lost their digits to scientific
+        // notation and the trailing-zero scale was normalised away.
+        assert_ne!(
+            serde_json::Value::Array(row.clone()),
+            serde_json::json!([1.234_567_890_123_456_6e+17, 1e20, 1.5, 42])
+        );
+    }
+
+    /// The exact `DECIMAL` digits survive every output sink: the JSON
+    /// serializers (REST `/sql`, MCP `sql`, `quack -q` JSON/NdJSON) quote the
+    /// strings, and the text paths (table, CSV, markdown) keep the raw
+    /// digits via `display_json_value`. Before the fix every sink showed
+    /// the `f64` approximation.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn decimal_digits_survive_every_output_sink() {
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+        db.execute_statement("CREATE TABLE d (hi DECIMAL(20,2), scaled DECIMAL(3,2))")
+            .unwrap();
+        db.execute_statement("INSERT INTO d VALUES (123456789012345678.99, 1.50)")
+            .unwrap();
+        let results = db.execute_query("SELECT hi, scaled FROM d").unwrap();
+
+        // NdJSON: the lossy cells are now quoted JSON strings, not numbers.
+        let mut buf = Vec::new();
+        results.write_ndjson(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "{\"hi\":\"123456789012345678.99\",\"scaled\":\"1.50\"}\n"
+        );
+
+        // JSON array: the cells serialize as quoted strings.
+        let mut buf = Vec::new();
+        results.write_json(&mut buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([{ "hi": "123456789012345678.99", "scaled": "1.50" }])
+        );
+
+        // CSV: the text path keeps the digits, unquoted.
+        let mut buf = Vec::new();
+        results.write_csv(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "hi,scaled\n123456789012345678.99,1.50\n"
+        );
+
+        // Markdown: the text path keeps the digits verbatim.
+        let mut buf = Vec::new();
+        results.write_markdown(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "| hi | scaled |\n| --- | --- |\n| 123456789012345678.99 | 1.50 |\n"
+        );
+
+        // Table: the aligned text path keeps the digits and never shows
+        // the `f64` approximation.
+        let mut buf = Vec::new();
+        results.write_table(&mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(table.contains("123456789012345678.99"), "{table}");
+        assert!(table.contains("1.50"), "{table}");
+        assert!(!table.contains("1.2345678901234566e+17"), "{table}");
     }
 
     #[test]
