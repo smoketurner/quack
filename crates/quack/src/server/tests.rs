@@ -4234,3 +4234,235 @@ async fn local_mode_refuses_new_users_from_the_api() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+/// A minted API token reaching the logout endpoint closes no session, so the
+/// OCSF renderer must not export it as `Authentication / Logoff` (OCSF: "a
+/// logon session was terminated and no longer exists") — that would be false.
+/// The handler keeps its `204` no-op contract and the raw audit row (so the
+/// admin audit page still shows the attempt); the renderer reclassifies only
+/// the OCSF export into API Activity carrying the raw `logout` action. A
+/// genuine session logout still exports as `Authentication / Logoff`.
+#[tokio::test(flavor = "multi_thread")]
+async fn minted_api_token_logout_is_a_no_op_exported_as_api_activity_not_logoff() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let alice = h.user("alice", UserKind::Standard).await;
+    h.user("root", UserKind::Admin).await;
+    let root = h.login("root").await;
+    let ws = h.workspace("a", &owner).await;
+    let IssuedToken {
+        secret: api_token,
+        row: token_row,
+    } = h
+        .app
+        .control
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let api_token = api_token.expose().to_owned();
+
+    // The minted API token authenticates as a Token credential.
+    let (status, body) = h.get("/api/v1/auth/me", &api_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["via"], "token");
+
+    // POST /auth/logout with the API token → 204 (no-op: no session to close).
+    let (status, _) = h
+        .call(Method::POST, "/api/v1/auth/logout", Some(&api_token), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The API token is still valid after "logout": the handler gates its only
+    // state change on `Credential::Session`, so a Token bearer is untouched.
+    // The fix is in the renderer, not the handler — the 204 contract holds.
+    let (status, body) = h.get("/api/v1/auth/me", &api_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["via"], "token");
+
+    // A genuine session logout still exports as a real Logoff (no regression).
+    let alice_session = h.login("alice").await;
+    let (status, _) = h
+        .call(
+            Method::POST,
+            "/api/v1/auth/logout",
+            Some(&alice_session),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = h.get("/api/v1/auth/me", &alice_session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // The OCSF audit export: the token-bearer row carries the token's hash.
+    let (status, ocsf) = h
+        .get("/api/v1/admin/audit?action=logout&format=ocsf", &root)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ocsf}");
+    let events = ocsf["audit"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| fail("audit is not an array"));
+    let token_event = events
+        .iter()
+        .find(|e| e["unmapped"]["token_hash"].as_str() == Some(token_row.token_hash.as_str()))
+        .unwrap_or_else(|| fail(&format!("no logout event carries the token hash: {ocsf}")));
+
+    // The fix: a token-bearer logout is API Activity, not a Logoff.
+    assert_eq!(token_event["class_uid"], 6003, "{token_event}");
+    assert_eq!(token_event["activity_id"], 99, "{token_event}");
+    assert_eq!(token_event["activity_name"], "logout", "{token_event}");
+    assert_eq!(token_event["type_uid"], 600_399, "{token_event}");
+    assert_eq!(token_event["api"]["operation"], "logout", "{token_event}");
+    assert_eq!(
+        token_event["actor"]["user"]["uid"],
+        owner.as_str(),
+        "{token_event}"
+    );
+    assert_eq!(token_event["status_id"], 1, "{token_event}");
+    assert_eq!(token_event["status"], "Success", "{token_event}");
+    assert_eq!(token_event["unmapped"]["channel"], "api", "{token_event}");
+    assert!(
+        token_event.get("user").is_none(),
+        "an API Activity event has no `user` field: {token_event}"
+    );
+    assert!(
+        token_event.get("service").is_none(),
+        "no Authentication `service` on an API event: {token_event}"
+    );
+
+    // No Logoff/Success event carries the token's hash — the bug is gone.
+    let spurious_logoff = events.iter().find(|e| {
+        e["class_uid"] == 3002
+            && e["activity_id"] == 2
+            && e["status_id"] == 1
+            && e["unmapped"]["token_hash"].as_str() == Some(token_row.token_hash.as_str())
+    });
+    assert!(
+        spurious_logoff.is_none(),
+        "a token-bearer logout must not be exported as Logoff/Success: {ocsf}"
+    );
+
+    // The genuine session logout is still a real Logoff/Success: the fix
+    // leaves the session-credential path (no token hash) untouched.
+    let session_logoff = events
+        .iter()
+        .find(|e| e["unmapped"]["token_hash"].as_str().is_none())
+        .unwrap_or_else(|| fail(&format!("no session logout event: {ocsf}")));
+    assert_eq!(session_logoff["class_uid"], 3002, "{session_logoff}");
+    assert_eq!(session_logoff["activity_id"], 2, "{session_logoff}");
+    assert_eq!(
+        session_logoff["activity_name"], "Logoff",
+        "{session_logoff}"
+    );
+    assert_eq!(session_logoff["type_uid"], 300_202, "{session_logoff}");
+    assert_eq!(session_logoff["status_id"], 1, "{session_logoff}");
+    assert_eq!(session_logoff["status"], "Success", "{session_logoff}");
+    assert_eq!(
+        session_logoff["user"]["uid"],
+        alice.as_str(),
+        "{session_logoff}"
+    );
+    assert_eq!(
+        session_logoff["unmapped"]["channel"], "web",
+        "{session_logoff}"
+    );
+    assert!(
+        session_logoff.get("api").is_none(),
+        "no API fields on a Logoff: {session_logoff}"
+    );
+
+    // The raw audit row is preserved for the admin audit page: a `logout`
+    // action, allowed, attributed to the owner, on the api channel — only the
+    // OCSF rendering changed, the stored row did not.
+    let logouts = h
+        .audit(AuditFilter {
+            action: Some(String::from("logout")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(logouts.len(), 2, "the token-bearer and session logouts");
+    assert!(
+        logouts.iter().any(|r| {
+            r.token_hash.as_deref() == Some(token_row.token_hash.as_str())
+                && r.action.as_str() == "logout"
+                && r.outcome == Outcome::Allowed
+                && r.channel == Channel::Api
+        }),
+        "raw token-bearer logout row preserved: {logouts:?}"
+    );
+    assert!(
+        logouts
+            .iter()
+            .any(|r| r.token_hash.is_none() && r.channel == Channel::Web),
+        "raw session logout row preserved: {logouts:?}"
+    );
+}
+
+/// The web `/logout` route accepts the same `Identity` extractor, so a minted
+/// API token reaches the same `log_out` from there too. It must also export
+/// as API Activity, not a Logoff — the fix is in the renderer, which both
+/// routes feed, but this confirms the web plumbing produces the same row.
+#[tokio::test(flavor = "multi_thread")]
+async fn web_logout_with_a_token_bearer_exports_as_api_activity_not_logoff() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    h.user("root", UserKind::Admin).await;
+    let root = h.login("root").await;
+    let ws = h.workspace("a", &owner).await;
+    let IssuedToken {
+        secret: api_token,
+        row: token_row,
+    } = h
+        .app
+        .control
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let api_token = api_token.expose().to_owned();
+
+    // The token is a valid Token credential.
+    let (status, body) = h.get("/api/v1/auth/me", &api_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["via"], "token");
+
+    // POST /logout (the web route) with the API token as a bearer: the
+    // handler runs the same `log_out` (a no-op for a Token credential) and
+    // redirects to the login page.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {api_token}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, headers) = h.send(request).await;
+    assert!(
+        status.is_redirection(),
+        "the web logout redirects: {status}"
+    );
+    assert_eq!(location(&headers), "/login");
+
+    // The token is unaffected (the fix is renderer-only).
+    let (status, body) = h.get("/api/v1/auth/me", &api_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, ocsf) = h
+        .get("/api/v1/admin/audit?action=logout&format=ocsf", &root)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ocsf}");
+    let events = ocsf["audit"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| fail("audit is not an array"));
+    let token_event = events
+        .iter()
+        .find(|e| e["unmapped"]["token_hash"].as_str() == Some(token_row.token_hash.as_str()))
+        .unwrap_or_else(|| fail(&format!("no token-bearer logout event: {ocsf}")));
+    assert_eq!(token_event["class_uid"], 6003, "{token_event}");
+    assert_eq!(token_event["activity_name"], "logout", "{token_event}");
+    assert_eq!(token_event["type_uid"], 600_399, "{token_event}");
+    assert_eq!(token_event["unmapped"]["channel"], "api", "{token_event}");
+    assert!(
+        !(token_event["class_uid"] == 3002 && token_event["activity_id"] == 2),
+        "the web-route token-bearer logout must not be a Logoff: {token_event}"
+    );
+}
