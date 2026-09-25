@@ -522,4 +522,4 @@ a stolen token is useless on its own. quack sends and accepts bearer tokens only
 bound with DPoP must be presented with a fresh proof on every request, and model APIs accept
 bearer tokens, so a bound on-behalf-of token would be refused by the provider it is for.
 Issuers that support DPoP, Vouch among them, still issue bearer tokens to a client that sends
-no proof. quack accepting DPoP-bound tokens from its own clients is tracked in #216.
+no proof, so quack works with them unchanged.
