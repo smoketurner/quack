@@ -1144,7 +1144,6 @@ impl App {
                 }
             }
             AgentEvent::ToolStarted { tool, detail } if visible => {
-                turn.streaming = None;
                 self.post(Message::step_started(tool, detail));
                 turn.open_step = Some(self.messages.len().saturating_sub(1));
             }
@@ -1202,7 +1201,6 @@ impl App {
     /// Queue a turn's write request as a prompt; one from a session not on
     /// screen says whose it is.
     fn ask_for_turn(&mut self, turn: &mut Turn, visible: bool, request: PermissionRequest) {
-        turn.streaming = None;
         let whose = if visible {
             String::from("The agent")
         } else {
@@ -2768,6 +2766,162 @@ mod tests {
         app.turns.clear();
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(app.quit, Quit::Now, "Ctrl+C with nothing running quits");
+    }
+
+    /// Text streamed before a tool call, then more text after it, must end as
+    /// one assistant message holding the validated full answer: the
+    /// pre-tool preamble is not left behind as an orphaned partial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_with_text_then_a_tool_then_text_keeps_one_assistant_message() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let mut turn = waiting_turn(&mut app);
+
+        // The common preamble before the first tool call.
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::TextDelta(String::from("Let me look up the data.")),
+        );
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::ToolStarted {
+                tool: ToolName::RunSql,
+                detail: String::from("SELECT 1"),
+            },
+        );
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::ToolFinished(ToolStep {
+                tool: ToolName::RunSql,
+                detail: String::new(),
+                summary: String::from("1 rows"),
+                rows: Some(1),
+                duration_ms: 1,
+            }),
+        );
+        // More text streams after the tool returns.
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::TextDelta(String::from(" The result is 1.")),
+        );
+        // The agent core returns the whole turn's accumulated, validated answer.
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::TurnComplete(AgentResponse {
+                content: String::from("Let me look up the data. The result is 1."),
+                ..AgentResponse::default()
+            }),
+        );
+
+        let assistants = app
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Assistant)
+            .count();
+        assert_eq!(
+            assistants, 1,
+            "one assistant message per turn, but the transcript was {:?}",
+            app.messages
+        );
+        let assistant = app
+            .messages
+            .iter()
+            .find(|m| m.kind == MessageKind::Assistant)
+            .unwrap_or_else(|| fail("no assistant message"));
+        assert_eq!(
+            assistant.content,
+            "Let me look up the data. The result is 1."
+        );
+        // The tool call is still its own neighboring step message.
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|m| m.kind == MessageKind::Step)
+                .count(),
+            1
+        );
+        assert!(turn.streaming.is_none(), "the turn stopped streaming");
+        app.turns.clear();
+    }
+
+    /// A write tool pauses on `PermissionRequired` between its `ToolStarted`
+    /// and `ToolFinished`; the streaming target must survive both the tool
+    /// start and the permission prompt so the turn still ends with one
+    /// assistant message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_with_text_then_a_write_permission_then_text_keeps_one_assistant_message() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let mut turn = waiting_turn(&mut app);
+
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::TextDelta(String::from("Let me update the table.")),
+        );
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::ToolStarted {
+                tool: ToolName::RunSql,
+                detail: String::from("DELETE FROM t"),
+            },
+        );
+        // A real `PermissionRequired` from a `TurnRecorder` so its answer
+        // oneshot is live and the terminal's `y` resolves it.
+        let (sink, mut rx) = quack_core::analysis::events::channel();
+        let recorder = quack_core::analysis::events::TurnRecorder::new(sink);
+        let pending = tokio::spawn(async move { recorder.ask_permission("DELETE FROM t").await });
+        let request = match rx
+            .recv()
+            .await
+            .unwrap_or_else(|| fail("no permission event"))
+        {
+            AgentEvent::PermissionRequired(request) => request,
+            other => fail(&format!("expected PermissionRequired, got {other:?}")),
+        };
+        app.handle_turn_event(&mut turn, AgentEvent::PermissionRequired(request));
+        assert!(app.awaiting_permission(), "the write prompt is on screen");
+        app.handle_permission_key(KeyCode::Char('y'));
+        assert!(!app.awaiting_permission());
+        let allowed = pending.await.unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(allowed, "the recorder saw the user's `yes`");
+
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::ToolFinished(ToolStep {
+                tool: ToolName::RunSql,
+                detail: String::new(),
+                summary: String::from("1 rows"),
+                rows: Some(1),
+                duration_ms: 1,
+            }),
+        );
+        app.handle_turn_event(&mut turn, AgentEvent::TextDelta(String::from(" Done.")));
+        app.handle_turn_event(
+            &mut turn,
+            AgentEvent::TurnComplete(AgentResponse {
+                content: String::from("Let me update the table. Done."),
+                ..AgentResponse::default()
+            }),
+        );
+
+        let assistants = app
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Assistant)
+            .count();
+        assert_eq!(
+            assistants, 1,
+            "one assistant message after a write tool, but the transcript was {:?}",
+            app.messages
+        );
+        let assistant = app
+            .messages
+            .iter()
+            .find(|m| m.kind == MessageKind::Assistant)
+            .unwrap_or_else(|| fail("no assistant message"));
+        assert_eq!(assistant.content, "Let me update the table. Done.");
+        assert!(turn.streaming.is_none());
+        app.turns.clear();
     }
 
     #[tokio::test(flavor = "multi_thread")]
