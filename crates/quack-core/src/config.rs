@@ -128,8 +128,9 @@ impl Default for GeneralConfig {
 /// A `[providers.NAME]` key. It is typed on the command line (`quack auth
 /// login NAME`), keys the provider's sealed token in `control.db`, and is
 /// the subject that token is sealed for, so it is checked when the config is
-/// read: ASCII letters, digits, `_`, `-`, and `.`, not starting with `.`, at
-/// most 64 characters.
+/// read: ASCII letters, digits, `_`, and `-`, at most 64 characters. No `.`:
+/// in TOML, `[providers.a.b]` is a table `b` inside provider `a`, so a dotted
+/// name would only work quoted.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ProviderName(String);
@@ -147,15 +148,11 @@ impl TryFrom<String> for ProviderName {
     type Error = Error;
 
     fn try_from(name: String) -> Result<Self> {
-        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
-        if name.is_empty()
-            || name.len() > Self::MAX_LEN
-            || name.starts_with('.')
-            || !name.chars().all(allowed)
-        {
+        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
+        if name.is_empty() || name.len() > Self::MAX_LEN || !name.chars().all(allowed) {
             return Err(Error::Config(format!(
-                "provider name '{name}' must be 1 to {} ASCII letters, digits, '_', '-', or '.', \
-                 not starting with '.'",
+                "provider name '{name}' must be 1 to {} ASCII letters, digits, '_', or '-' \
+                 (no '.': TOML reads [providers.a.b] as a table inside provider 'a')",
                 Self::MAX_LEN
             )));
         }
@@ -1699,17 +1696,20 @@ rerank = "model"
 
     #[test]
     fn provider_names_outside_the_allowed_characters_are_rejected() {
-        for bad in ["../evil", ".hidden", "a/b", "a\\\\b", "", "sp ace"] {
+        for bad in ["../evil", ".hidden", "a/b", "a\\\\b", "", "sp ace", "azure.openai"] {
             let toml_text = format!("[providers.\"{bad}\"]\ntype = \"ollama\"\n");
             assert!(err_of(&toml_text).contains("provider name"), "{bad:?}");
         }
         let long = "p".repeat(65);
         assert!(long.parse::<ProviderName>().is_err());
-        for good in ["ollama", "azure.openai", "corp-gw_2", &"p".repeat(64)] {
+        for good in ["ollama", "azure-openai", "corp-gw_2", &"p".repeat(64)] {
             assert!(good.parse::<ProviderName>().is_ok(), "{good}");
         }
-        let config = Config::parse("[providers.\"azure.openai\"]\ntype = \"openai\"\n");
-        assert!(config.is_ok_and(|c| c.providers.contains_key("azure.openai")));
+        // Unquoted, the dotted form is a table inside provider "azure".
+        assert!(
+            err_of("[providers.azure.openai]\ntype = \"openai\"\n").contains("openai"),
+            "a dotted header is not one provider"
+        );
     }
 
     #[test]
