@@ -202,9 +202,12 @@ pub enum ProviderType {
     #[serde(alias = "openai-compat")]
     Openai,
     Anthropic,
-    /// Amazon Bedrock, on its runtime or mantle endpoint, signed with
-    /// credentials from the AWS SDK's default chain.
+    /// Amazon Bedrock's `bedrock-runtime` endpoint, signed with credentials
+    /// from the AWS SDK's default chain.
     Bedrock,
+    /// Amazon Bedrock's `bedrock-mantle` endpoint, which hosts other models
+    /// and APIs (`config::bedrock`), signed the same way.
+    BedrockMantle,
 }
 
 text_enum!(ProviderType, "provider type", {
@@ -212,6 +215,7 @@ text_enum!(ProviderType, "provider type", {
     Openai => "openai",
     Anthropic => "anthropic",
     Bedrock => "bedrock",
+    BedrockMantle => "bedrock-mantle",
 });
 
 impl ProviderType {
@@ -227,16 +231,27 @@ impl ProviderType {
             Self::Ollama => Some(Self::OLLAMA_BASE_URL),
             Self::Openai => Some(BaseUrl(Cow::Borrowed("https://api.openai.com/v1"))),
             Self::Anthropic => Some(BaseUrl(Cow::Borrowed("https://api.anthropic.com"))),
-            Self::Bedrock => None,
+            Self::Bedrock | Self::BedrockMantle => None,
         }
     }
 
     /// The `auth` a provider of this type has when the file names none.
     #[must_use]
     pub const fn default_auth(self) -> AuthMode {
+        match self.bedrock_endpoint() {
+            Some(_) => AuthMode::Aws,
+            None => AuthMode::None,
+        }
+    }
+
+    /// The Bedrock endpoint a provider of this type calls; `None` for the
+    /// types that are not Bedrock.
+    #[must_use]
+    pub const fn bedrock_endpoint(self) -> Option<BedrockEndpoint> {
         match self {
-            Self::Bedrock => AuthMode::Aws,
-            Self::Ollama | Self::Openai | Self::Anthropic => AuthMode::None,
+            Self::Bedrock => Some(BedrockEndpoint::Runtime),
+            Self::BedrockMantle => Some(BedrockEndpoint::Mantle),
+            Self::Ollama | Self::Openai | Self::Anthropic => None,
         }
     }
 }
@@ -502,7 +517,6 @@ struct RawProviderConfig {
     base_url: Option<BaseUrl>,
     api_key_env: Option<String>,
     aws_profile: Option<String>,
-    endpoint: Option<BedrockEndpoint>,
     api: Option<BedrockApi>,
     region: Option<AwsRegion>,
     embedding_dimension: Option<Dimension>,
@@ -515,28 +529,31 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
 
     fn try_from(raw: RawProviderConfig) -> Result<Self> {
         let mode = raw.auth.unwrap_or_else(|| raw.provider_type.default_auth());
-        let bedrock = raw.provider_type == ProviderType::Bedrock;
-        if bedrock != (mode == AuthMode::Aws) {
-            return Err(Error::Config(String::from(if bedrock {
-                "type = \"bedrock\" signs with AWS credentials; use auth = \"aws\" or leave auth unset"
-            } else {
-                "auth = \"aws\" is only for type = \"bedrock\""
-            })));
+        let endpoint = raw.provider_type.bedrock_endpoint();
+        if endpoint.is_some() != (mode == AuthMode::Aws) {
+            return Err(Error::Config(match endpoint {
+                Some(endpoint) => format!(
+                    "type = \"{endpoint}\" signs with AWS credentials; use auth = \"aws\" or \
+                     leave auth unset"
+                ),
+                None => String::from(
+                    "auth = \"aws\" is only for type = \"bedrock\" and \"bedrock-mantle\"",
+                ),
+            }));
         }
-        let bedrock_config = if bedrock {
-            Some(BedrockConfig::new(
-                raw.endpoint,
+        let bedrock_config = match endpoint {
+            Some(endpoint) => Some(BedrockConfig::new(
+                endpoint,
                 raw.api,
                 raw.region,
                 raw.base_url.as_ref(),
-            )?)
-        } else {
-            if raw.endpoint.is_some() || raw.api.is_some() || raw.region.is_some() {
+            )?),
+            None if raw.api.is_some() || raw.region.is_some() => {
                 return Err(Error::Config(String::from(
-                    "endpoint, api, and region are only for type = \"bedrock\"",
+                    "api and region are only for type = \"bedrock\" and \"bedrock-mantle\"",
                 )));
             }
-            None
+            None => None,
         };
         if raw.aws_profile.is_some() && mode != AuthMode::Aws {
             return Err(Error::Config(String::from(
@@ -615,11 +632,12 @@ impl ProviderConfig {
                 AuthMode::None | AuthMode::ApiKey | AuthMode::Oauth => ProviderAuth::None,
             },
             base_url: None,
-            bedrock: (provider_type == ProviderType::Bedrock).then(|| BedrockConfig {
-                endpoint: BedrockEndpoint::Runtime,
-                api: BedrockEndpoint::Runtime.default_api(),
-                region: None,
-            }),
+            bedrock: provider_type
+                .bedrock_endpoint()
+                .map(|endpoint| BedrockConfig {
+                    api: endpoint.default_api(),
+                    region: None,
+                }),
             embedding_dimension: None,
             max_concurrent_requests: None,
         }
@@ -630,9 +648,10 @@ impl ProviderConfig {
     pub const fn default_request_limit(&self) -> RequestLimit {
         RequestLimit(match self.provider_type {
             ProviderType::Ollama => NonZeroU32::MIN,
-            ProviderType::Openai | ProviderType::Anthropic | ProviderType::Bedrock => {
-                NonZeroU32::MIN.saturating_add(7)
-            }
+            ProviderType::Openai
+            | ProviderType::Anthropic
+            | ProviderType::Bedrock
+            | ProviderType::BedrockMantle => NonZeroU32::MIN.saturating_add(7),
         })
     }
 
@@ -1180,15 +1199,10 @@ impl Config {
                     "embedding_model '{embed}': anthropic does not serve embeddings"
                 )));
             }
-            if embed
-                .provider
-                .bedrock
-                .as_ref()
-                .is_some_and(|b| b.endpoint == BedrockEndpoint::Mantle)
-            {
+            if embed.provider.provider_type == ProviderType::BedrockMantle {
                 return Err(Error::Config(format!(
                     "embedding_model '{embed}': bedrock-mantle serves no embeddings; use a \
-                     provider with endpoint = \"runtime\""
+                     type = \"bedrock\" provider"
                 )));
             }
             embed.dimension()?;
@@ -1614,7 +1628,6 @@ rerank = "model"
                     && p.auth.aws_profile() == Some("dev-sso")
                     && p.bedrock.as_ref().is_some_and(|b| {
                         b.region.as_ref().map(AwsRegion::as_str) == Some("us-west-2")
-                            && b.endpoint == BedrockEndpoint::Runtime
                             && b.api == BedrockApi::Converse
                     })
                     && p.request_limit().get() == 8
@@ -1633,6 +1646,17 @@ rerank = "model"
             AuthMode::Aws
         );
         assert!(ProviderType::Bedrock.default_base_url().is_none());
+        assert_eq!(
+            ProviderType::Bedrock.bedrock_endpoint(),
+            Some(BedrockEndpoint::Runtime)
+        );
+        let mantle = ProviderConfig::new(ProviderType::BedrockMantle);
+        assert_eq!(mantle.auth.mode(), AuthMode::Aws);
+        assert_eq!(mantle.bedrock.map(|b| b.api), Some(BedrockApi::Responses));
+        assert_eq!(
+            mantle.provider_type.bedrock_endpoint(),
+            Some(BedrockEndpoint::Mantle)
+        );
     }
 
     #[test]
@@ -1659,20 +1683,24 @@ rerank = "model"
             err_of("[providers.b]\ntype = \"bedrock\"\nregion = \"us east\"\n").contains("region")
         );
         assert!(err_of("[providers.b]\ntype = \"bedrock\"\nregion = \"\"\n").contains("region"));
+        assert!(err_of("[providers.o]\ntype = \"ollama\"\napi = \"responses\"\n").contains("api"));
+        // The endpoint is the type, never a key of its own.
         assert!(
-            err_of("[providers.o]\ntype = \"ollama\"\nendpoint = \"mantle\"\n")
+            err_of("[providers.b]\ntype = \"bedrock\"\nendpoint = \"mantle\"\n")
                 .contains("endpoint")
         );
         assert!(
-            err_of(
-                "[providers.b]\ntype = \"bedrock\"\nendpoint = \"mantle\"\napi = \"converse\"\n"
-            )
-            .contains("not served")
+            err_of("[providers.m]\ntype = \"bedrock-mantle\"\napi = \"converse\"\n")
+                .contains("not served")
+        );
+        assert!(
+            err_of("[providers.m]\ntype = \"bedrock-mantle\"\nauth = \"none\"\n")
+                .contains("bedrock-mantle")
         );
         assert!(
             err_of(
                 "[general]\nembedding_model = \"m/amazon.titan-embed-text-v2:0\"\n\
-                 [providers.m]\ntype = \"bedrock\"\nendpoint = \"mantle\"\nembedding_dimension = 1024\n"
+                 [providers.m]\ntype = \"bedrock-mantle\"\nembedding_dimension = 1024\n"
             )
             .contains("serves no embeddings")
         );
@@ -1685,7 +1713,7 @@ rerank = "model"
              embedding_model = \"bedrock/amazon.titan-embed-text-v2:0\"\n\
              [providers.bedrock]\ntype = \"bedrock\"\naws_profile = \"sso\"\nregion = \"us-east-1\"\n\
              embedding_dimension = 1024\n\
-             [providers.mantle]\ntype = \"bedrock\"\naws_profile = \"sso\"\nendpoint = \"mantle\"\n\
+             [providers.mantle]\ntype = \"bedrock-mantle\"\naws_profile = \"sso\"\n\
              base_url = \"https://vpce-0abc.bedrock-mantle.us-east-1.vpce.amazonaws.com\"\n",
         );
         let Ok(config) = config else {
@@ -1698,7 +1726,6 @@ rerank = "model"
         assert_eq!(
             mantle,
             Some(BedrockConfig {
-                endpoint: BedrockEndpoint::Mantle,
                 api: BedrockApi::Responses,
                 region: AwsRegion::try_from(String::from("us-east-1")).ok(),
             })

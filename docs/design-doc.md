@@ -1240,7 +1240,8 @@ rendering.
 | `ollama` | yes | yes | Offline default. `base_url` defaults to `http://localhost:11434` |
 | `openai` | yes | yes | Also OpenAI-compatible endpoints via `base_url` (vLLM, LiteLLM, Azure OpenAI) |
 | `anthropic` | yes | no | Native Messages API with tool use |
-| `bedrock` | yes | runtime only | Amazon Bedrock. `endpoint = "runtime"` (default): `api = "converse"` (rig-bedrock over the AWS SDK), `"chat-completions"`, or `"responses"` (OpenAI-compatible, `/openai/v1`); `endpoint = "mantle"`: `"responses"` (default) or `"chat-completions"` (`/v1`). Embeddings are the runtime's InvokeModel in Titan Text Embeddings V2's request shape. `region`, `aws_profile`, `base_url` (VPC endpoint) optional |
+| `bedrock` | yes | yes | Amazon Bedrock's `bedrock-runtime` endpoint: `api = "converse"` (default, rig-bedrock over the AWS SDK), `"chat-completions"`, or `"responses"` (OpenAI-compatible, `/openai/v1`). Embeddings are InvokeModel in Titan Text Embeddings V2's request shape. `region`, `aws_profile`, `base_url` (VPC endpoint) optional |
+| `bedrock-mantle` | yes | no | Amazon Bedrock's `bedrock-mantle` endpoint: `api = "responses"` (default) or `"chat-completions"` (`/v1`). Same `region`, `aws_profile`, `base_url` |
 
 `[general].chat_model` and `[general].embedding_model` name `PROVIDER/MODEL` each; a
 workspace's `allowed_providers` filters the choice; the session records the model it used.
@@ -1260,7 +1261,7 @@ are forbidden). The oauth section's `grant` says how the token is obtained:
 authenticates as itself with `client_id` and the secret in `client_secret_env`, which that
 grant requires; nobody signs in, and the grant runs again whenever the token runs out).
 
-`bedrock` takes a fourth mode, `aws`, and only that one (it is its default): the AWS SDK
+`bedrock` and `bedrock-mantle` take a fourth mode, `aws`, and only that one (it is its default): the AWS SDK
 (`aws-config` with `sso`) signs each request with credentials from its default chain, as
 the AWS CLI finds them: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`,
 the profile named by `aws_profile` (else `AWS_PROFILE`, else `default`) in
@@ -1274,11 +1275,12 @@ Bedrock serves inference on two endpoints with different models and APIs: `bedro
 `/openai/v1`, cross-region inference profiles, a FIPS endpoint, embeddings) and
 `bedrock-mantle` (`bedrock-mantle.{region}.api.aws`, Chat Completions and Responses under
 `/v1`, and the models and Responses features only it has, such as Responses for GPT OSS).
-A provider entry names one `endpoint` and one `api`; a model on the other endpoint is
-reached through a second entry sharing the profile, and the model reference picks it
-(`bedrock/us.anthropic.claude-sonnet-5`, `mantle/openai.gpt-oss-120b`), as LiteLLM's
-separate `bedrock` and `bedrock_mantle` providers do. An API the endpoint does not serve
-(`converse` on mantle) and embeddings on mantle are refused when the config is read.
+Each endpoint is a provider type of its own, `bedrock` and `bedrock-mantle`, as LiteLLM's
+`bedrock` and `bedrock_mantle` providers are, and an entry names one `api` on it; a model on
+the other endpoint is reached through a second entry sharing the profile, and the model
+reference picks it (`bedrock/us.anthropic.claude-sonnet-5`, `mantle/openai.gpt-oss-120b`).
+An API the endpoint does not serve (`converse` on `bedrock-mantle`) and embeddings on
+`bedrock-mantle` are refused when the config is read.
 
 The endpoint's root is `base_url` when set, else the one AWS publishes for the region: the
 runtime's from the SDK's own endpoint resolver, so `use_fips_endpoint` /
@@ -1767,15 +1769,13 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 [providers.bedrock]
 type = "bedrock"                       # auth = "aws" (the default): the AWS SDK's credential chain
-# endpoint = "runtime"                 # the default; or "mantle"
 # api = "converse"                     # runtime: converse (default), chat-completions, responses
 # aws_profile = "my-sso-profile"       # else AWS_PROFILE, else default
 # region = "us-east-1"                 # else base_url's, AWS_REGION, or the profile's region
 # embedding_dimension = 1024           # for amazon.titan-embed-text-v2:0 (runtime only)
 
 [providers.mantle]
-type = "bedrock"
-endpoint = "mantle"                    # api = "responses" (default) or "chat-completions"
+type = "bedrock-mantle"                # api = "responses" (default) or "chat-completions"
 # aws_profile = "my-sso-profile"
 # base_url = "https://vpce-0123456789abcdef0.bedrock-mantle.us-east-1.vpce.amazonaws.com"  # VPC endpoint without private DNS
 
@@ -2206,7 +2206,7 @@ design to the tracker and is updated as issues close. Ordered by risk.
 - Workspace context stored and versioned inside the boundary, Markdown import and export
 - Sessions with resume, sharing, export
 - Charts: one spec, rendered everywhere
-- Providers: ollama, openai (and compatible), anthropic, bedrock; auth none / api-key / OAuth PKCE
+- Providers: ollama, openai (and compatible), anthropic, bedrock, bedrock-mantle; auth none / api-key / OAuth PKCE
   / the AWS SDK's credential chain (profiles, SSO, instance roles) for Bedrock
   with device code, encrypted cache, confidential-client mode for the server
 - Interfaces, all in one binary: web UI, REST API, MCP (stdio and streamable HTTP), TUI,

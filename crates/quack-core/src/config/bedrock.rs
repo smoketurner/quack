@@ -1,22 +1,23 @@
-//! The settings only a `type = "bedrock"` provider has: which of Bedrock's
-//! two inference endpoints it calls, which API on that endpoint, and the
-//! region requests are signed for.
+//! The settings only Bedrock providers have: which API on the endpoint the
+//! type names, and the region requests are signed for.
 //!
 //! Bedrock serves inference on two endpoints that host different models
-//! and APIs (docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html):
+//! and APIs (docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html),
+//! so each is a provider type of its own, as `LiteLLM`'s `bedrock` and
+//! `bedrock_mantle` are:
 //!
-//! | `endpoint` | host | `api` |
+//! | `type` | host | `api` |
 //! |---|---|---|
-//! | `runtime` | `bedrock-runtime.{region}.amazonaws.com` | `converse` (default), and `chat-completions` / `responses` under `/openai/v1` |
-//! | `mantle` | `bedrock-mantle.{region}.api.aws` | `responses` (default) and `chat-completions` under `/v1` |
+//! | `bedrock` | `bedrock-runtime.{region}.amazonaws.com` | `converse` (default), and `chat-completions` / `responses` under `/openai/v1` |
+//! | `bedrock-mantle` | `bedrock-mantle.{region}.api.aws` | `responses` (default) and `chat-completions` under `/v1` |
 //!
-//! A provider entry names one endpoint; a model that lives on the other is
-//! reached through a second entry (`bedrock/...` and `mantle/...`), the way
-//! the model reference already names its provider.
+//! A model that lives on the other endpoint is reached through a second
+//! provider entry (`bedrock/...` and `mantle/...`), the way the model
+//! reference already names its provider.
 //!
 //! `base_url` replaces the endpoint's root, for an interface VPC endpoint
 //! without private DNS (`https://vpce-….bedrock-mantle.us-east-1.vpce.amazonaws.com`)
-//! or a proxy in front of Bedrock. It is checked against `endpoint` when its
+//! or a proxy in front of Bedrock. It is checked against the type when its
 //! host is an AWS one, and a region in that host is the signing region.
 
 use serde::Deserialize;
@@ -24,23 +25,24 @@ use serde::Deserialize;
 use super::BaseUrl;
 use crate::error::{Error, Result};
 
-/// Which Bedrock inference endpoint a provider calls.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// Which Bedrock inference endpoint a provider calls: named by its
+/// provider type (`ProviderType::bedrock_endpoint`), never by a key of its
+/// own. Its text is that type's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BedrockEndpoint {
-    /// `bedrock-runtime`: the AWS SDK's Converse and `InvokeModel`, and the
-    /// OpenAI-compatible APIs under `/openai/v1`; the only one with
-    /// embeddings, cross-region inference profiles, and a FIPS endpoint.
-    #[default]
+    /// `type = "bedrock"`, `bedrock-runtime`: the AWS SDK's Converse and
+    /// `InvokeModel`, and the OpenAI-compatible APIs under `/openai/v1`; the
+    /// only one with embeddings, cross-region inference profiles, and a
+    /// FIPS endpoint.
     Runtime,
-    /// `bedrock-mantle`: the OpenAI-compatible APIs under `/v1`, with the
-    /// models and Responses features only it has.
+    /// `type = "bedrock-mantle"`: the OpenAI-compatible APIs under `/v1`,
+    /// with the models and Responses features only it has.
     Mantle,
 }
 
 text_enum!(BedrockEndpoint, "Bedrock endpoint", {
-    Runtime => "runtime",
-    Mantle => "mantle",
+    Runtime => "bedrock",
+    Mantle => "bedrock-mantle",
 });
 
 impl BedrockEndpoint {
@@ -166,11 +168,10 @@ impl std::fmt::Display for AwsRegion {
     }
 }
 
-/// A Bedrock provider's endpoint, API, and region, checked against each
-/// other and against `base_url`.
+/// A Bedrock provider's API and region, checked against the endpoint its
+/// type names and against `base_url`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BedrockConfig {
-    pub endpoint: BedrockEndpoint,
     pub api: BedrockApi,
     /// The region requests are signed for: `region`, else the one
     /// `base_url`'s host names; unset, the AWS SDK's chain decides
@@ -183,20 +184,19 @@ impl BedrockConfig {
     ///
     /// # Errors
     ///
-    /// Returns a `Config` error for an API the endpoint does not serve, a
+    /// Returns a `Config` error for an API `endpoint` does not serve, a
     /// `base_url` that points at another AWS service or endpoint or
     /// carries the API's path, or a region that disagrees with it.
     pub(super) fn new(
-        endpoint: Option<BedrockEndpoint>,
+        endpoint: BedrockEndpoint,
         api: Option<BedrockApi>,
         region: Option<AwsRegion>,
         base_url: Option<&BaseUrl>,
     ) -> Result<Self> {
-        let endpoint = endpoint.unwrap_or_default();
         let api = api.unwrap_or_else(|| endpoint.default_api());
         if !api.served_by(endpoint) {
             return Err(Error::Config(format!(
-                "api = \"{api}\" is not served by endpoint = \"{endpoint}\"; bedrock-mantle serves \
+                "api = \"{api}\" is not served by type = \"{endpoint}\"; bedrock-mantle serves \
                  \"responses\" and \"chat-completions\""
             )));
         }
@@ -214,11 +214,7 @@ impl BedrockConfig {
                 _ => {}
             }
         }
-        Ok(Self {
-            endpoint,
-            api,
-            region,
-        })
+        Ok(Self { api, region })
     }
 }
 
@@ -241,7 +237,7 @@ impl AwsHost {
         if path.ends_with("/v1") {
             return Err(Error::Config(format!(
                 "base_url {url} is the endpoint's root, without the API's path: quack adds \
-                 {} itself for endpoint = \"{endpoint}\"",
+                 {} itself for type = \"{endpoint}\"",
                 endpoint.openai_path()
             )));
         }
@@ -257,7 +253,7 @@ impl AwsHost {
         };
         if !endpoint.host_services().contains(&service) {
             return Err(Error::Config(format!(
-                "base_url {url} is a {service} endpoint, but endpoint = \"{endpoint}\" calls {}",
+                "base_url {url} is a {service} endpoint, but type = \"{endpoint}\" calls {}",
                 endpoint.host_services().join(" or ")
             )));
         }
@@ -308,17 +304,13 @@ mod tests {
 
     #[test]
     fn each_endpoint_has_its_default_api_and_refuses_what_it_does_not_serve() {
-        let runtime = BedrockConfig::new(None, None, None, None);
-        assert!(
-            runtime.is_ok_and(
-                |c| c.endpoint == BedrockEndpoint::Runtime && c.api == BedrockApi::Converse
-            )
-        );
-        let mantle = BedrockConfig::new(Some(BedrockEndpoint::Mantle), None, None, None);
+        let runtime = BedrockConfig::new(BedrockEndpoint::Runtime, None, None, None);
+        assert!(runtime.is_ok_and(|c| c.api == BedrockApi::Converse));
+        let mantle = BedrockConfig::new(BedrockEndpoint::Mantle, None, None, None);
         assert!(mantle.is_ok_and(|c| c.api == BedrockApi::Responses));
         assert!(
             err_of(BedrockConfig::new(
-                Some(BedrockEndpoint::Mantle),
+                BedrockEndpoint::Mantle,
                 Some(BedrockApi::Converse),
                 None,
                 None
@@ -327,7 +319,7 @@ mod tests {
         );
         for api in [BedrockApi::ChatCompletions, BedrockApi::Responses] {
             for endpoint in [BedrockEndpoint::Runtime, BedrockEndpoint::Mantle] {
-                assert!(BedrockConfig::new(Some(endpoint), Some(api), None, None).is_ok());
+                assert!(BedrockConfig::new(endpoint, Some(api), None, None).is_ok());
             }
         }
     }
@@ -335,16 +327,14 @@ mod tests {
     #[test]
     fn a_vpc_endpoint_names_its_service_and_region() {
         let vpce = url("https://vpce-0abc123-4xyz.bedrock-mantle.eu-west-1.vpce.amazonaws.com");
-        let config = BedrockConfig::new(Some(BedrockEndpoint::Mantle), None, None, Some(&vpce));
+        let config = BedrockConfig::new(BedrockEndpoint::Mantle, None, None, Some(&vpce));
         assert!(config.is_ok_and(|c| c.region == Some(region("eu-west-1"))));
         // The runtime's, FIPS or not, is not the mantle's.
         let runtime = url("https://vpce-0abc.bedrock-runtime-fips.us-east-1.vpce.amazonaws.com");
-        assert!(
-            BedrockConfig::new(Some(BedrockEndpoint::Runtime), None, None, Some(&runtime)).is_ok()
-        );
+        assert!(BedrockConfig::new(BedrockEndpoint::Runtime, None, None, Some(&runtime)).is_ok());
         assert!(
             err_of(BedrockConfig::new(
-                Some(BedrockEndpoint::Mantle),
+                BedrockEndpoint::Mantle,
                 None,
                 None,
                 Some(&runtime)
@@ -354,7 +344,7 @@ mod tests {
         // A region that disagrees with the host would sign for the wrong one.
         assert!(
             err_of(BedrockConfig::new(
-                Some(BedrockEndpoint::Mantle),
+                BedrockEndpoint::Mantle,
                 None,
                 Some(region("us-east-1")),
                 Some(&vpce)
@@ -364,7 +354,7 @@ mod tests {
         // The control plane is not an inference endpoint.
         assert!(
             err_of(BedrockConfig::new(
-                None,
+                BedrockEndpoint::Runtime,
                 None,
                 None,
                 Some(&url("https://bedrock.us-east-1.amazonaws.com"))
@@ -373,7 +363,7 @@ mod tests {
         );
         assert!(
             err_of(BedrockConfig::new(
-                None,
+                BedrockEndpoint::Runtime,
                 None,
                 None,
                 Some(&url("https://sts.us-east-1.amazonaws.com"))
@@ -386,7 +376,7 @@ mod tests {
     fn base_url_is_the_root_and_a_proxy_is_taken_as_given() {
         assert!(
             err_of(BedrockConfig::new(
-                Some(BedrockEndpoint::Mantle),
+                BedrockEndpoint::Mantle,
                 None,
                 None,
                 Some(&url("https://bedrock-mantle.us-east-1.api.aws/v1"))
@@ -395,7 +385,7 @@ mod tests {
         );
         assert!(
             err_of(BedrockConfig::new(
-                None,
+                BedrockEndpoint::Runtime,
                 Some(BedrockApi::Responses),
                 None,
                 Some(&url(
@@ -405,7 +395,7 @@ mod tests {
             .contains("/openai/v1")
         );
         let proxy = BedrockConfig::new(
-            Some(BedrockEndpoint::Mantle),
+            BedrockEndpoint::Mantle,
             None,
             None,
             Some(&url("https://llm-gateway.internal.example/bedrock")),

@@ -60,6 +60,8 @@ pub type BedrockClient = rig::bedrock::client::Client;
 /// and, on the runtime endpoint, the AWS SDK client for Converse and
 /// embeddings. Built once per provider and process ([`session`]).
 pub(crate) struct Session {
+    /// The endpoint the provider's type names.
+    endpoint: BedrockEndpoint,
     bedrock: BedrockConfig,
     /// The region requests are signed for.
     region: String,
@@ -88,7 +90,7 @@ impl Session {
     /// Where the OpenAI-compatible APIs are: the root plus `/openai/v1`
     /// (runtime) or `/v1` (mantle).
     pub(crate) fn openai_base(&self) -> String {
-        format!("{}{}", self.root, self.bedrock.endpoint.openai_path())
+        format!("{}{}", self.root, self.endpoint.openai_path())
     }
 
     /// The limited HTTP client for provider `name`, signing every request
@@ -107,7 +109,7 @@ impl Session {
         self.converse.clone().ok_or_else(|| {
             Error::Config(format!(
                 "provider '{name}' is on the bedrock-mantle endpoint, which serves neither \
-                 Converse nor InvokeModel (embeddings); use a provider with endpoint = \"runtime\""
+                 Converse nor InvokeModel (embeddings); use a type = \"bedrock\" provider"
             ))
         })
     }
@@ -116,9 +118,14 @@ impl Session {
 impl Session {
     /// A session sending to `root`, signing with fixed example credentials.
     #[cfg(test)]
-    pub(crate) fn for_test(bedrock: BedrockConfig, root: &str, region: &str) -> Self {
-        let service = bedrock.endpoint.signing_name();
+    pub(crate) fn for_test(
+        endpoint: BedrockEndpoint,
+        bedrock: BedrockConfig,
+        root: &str,
+        region: &str,
+    ) -> Self {
         Self {
+            endpoint,
             bedrock,
             region: region.to_owned(),
             root: root.to_owned(),
@@ -131,7 +138,7 @@ impl Session {
                     "test",
                 )),
                 region.to_owned(),
-                service,
+                endpoint.signing_name(),
             )),
             converse: None,
         }
@@ -179,6 +186,7 @@ impl Session {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
     name: ProviderName,
+    endpoint: Option<BedrockEndpoint>,
     profile: Option<String>,
     bedrock: Option<BedrockConfig>,
     base_url: Option<BaseUrl>,
@@ -188,6 +196,7 @@ impl SessionKey {
     fn of(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
             name: name.clone(),
+            endpoint: provider.provider_type.bedrock_endpoint(),
             profile: provider.auth.aws_profile().map(str::to_owned),
             bedrock: provider.bedrock.clone(),
             base_url: provider.base_url.clone(),
@@ -235,7 +244,10 @@ pub(crate) async fn session(
 }
 
 async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session> {
-    let Some(bedrock) = provider.bedrock.clone() else {
+    let (Some(endpoint), Some(bedrock)) = (
+        provider.provider_type.bedrock_endpoint(),
+        provider.bedrock.clone(),
+    ) else {
         return Err(Error::Config(format!(
             "provider '{name}' ({}) is not a Bedrock provider",
             provider.provider_type
@@ -244,11 +256,11 @@ async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session
     let sdk = sdk_config(name, provider).await;
     let region = sdk.region().map(ToString::to_string).ok_or_else(|| {
         Error::Config(format!(
-            "provider '{name}' (bedrock) has no AWS region: set region = \"us-east-1\" (or \
+            "provider '{name}' ({endpoint}) has no AWS region: set region = \"us-east-1\" (or \
                  another) under [providers.{name}], export AWS_REGION, or give the profile a region"
         ))
     })?;
-    let root = root(name, provider, &bedrock, &sdk, &region).await?;
+    let root = root(name, provider, endpoint, &sdk, &region).await?;
     let Some(credentials) = sdk.credentials_provider() else {
         return Err(no_credentials(
             name,
@@ -259,13 +271,13 @@ async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session
     let signer = Arc::new(Signer::new(
         credentials,
         region.clone(),
-        bedrock.endpoint.signing_name(),
+        endpoint.signing_name(),
     ));
     signer
         .credentials()
         .await
         .map_err(|e| no_credentials(name, provider, &e))?;
-    let converse = (bedrock.endpoint == BedrockEndpoint::Runtime).then(|| {
+    let converse = (endpoint == BedrockEndpoint::Runtime).then(|| {
         let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk);
         if let Some(base_url) = &provider.base_url {
             // On the Bedrock client only: SSO and STS keep their own endpoints.
@@ -273,8 +285,9 @@ async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session
         }
         BedrockClient::from(aws_sdk_bedrockruntime::Client::from_conf(conf.build()))
     });
-    tracing::info!(provider = %name, endpoint = %bedrock.endpoint, api = %bedrock.api, %region, %root, "Bedrock provider ready");
+    tracing::info!(provider = %name, %endpoint, api = %bedrock.api, %region, %root, "Bedrock provider ready");
     Ok(Session {
+        endpoint,
         bedrock,
         region,
         root,
@@ -289,7 +302,7 @@ async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session
 async fn root(
     name: &ProviderName,
     provider: &ProviderConfig,
-    bedrock: &BedrockConfig,
+    endpoint: BedrockEndpoint,
     sdk: &SdkConfig,
     region: &str,
 ) -> Result<String> {
@@ -303,10 +316,10 @@ async fn root(
         }
         return Ok(base_url.trimmed().to_owned());
     }
-    match bedrock.endpoint {
+    match endpoint {
         BedrockEndpoint::Mantle if fips => Err(Error::Config(format!(
             "provider '{name}': FIPS endpoints are required (use_fips_endpoint), and \
-             bedrock-mantle has none; use endpoint = \"runtime\""
+             bedrock-mantle has none; use a type = \"bedrock\" provider"
         ))),
         BedrockEndpoint::Mantle => Ok(BedrockEndpoint::mantle_root(
             &crate::config::AwsRegion::try_from(region.to_owned())?,
@@ -363,9 +376,10 @@ fn no_credentials(name: &ProviderName, provider: &ProviderConfig, reason: &str) 
         None => String::from("`aws sso login`"),
     };
     Error::Config(format!(
-        "provider '{name}' (bedrock) found no usable AWS credentials ({reason}); sign in with \
+        "provider '{name}' ({}) found no usable AWS credentials ({reason}); sign in with \
          {login} for an IAM Identity Center profile, or configure credentials as the AWS CLI \
-         reads them (`aws configure`, AWS_PROFILE, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)"
+         reads them (`aws configure`, AWS_PROFILE, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)",
+        provider.provider_type
     ))
 }
 
@@ -716,12 +730,15 @@ mod tests {
         );
     }
 
-    fn provider_with(bedrock: BedrockConfig, base_url: Option<&str>) -> ProviderConfig {
+    fn provider_with(endpoint: BedrockEndpoint, base_url: Option<&str>) -> ProviderConfig {
+        let provider_type = match endpoint {
+            BedrockEndpoint::Runtime => ProviderType::Bedrock,
+            BedrockEndpoint::Mantle => ProviderType::BedrockMantle,
+        };
         ProviderConfig {
             base_url: base_url
                 .map(|u| BaseUrl::try_from(u.to_owned()).unwrap_or_else(|e| fail(&e.to_string()))),
-            bedrock: Some(bedrock),
-            ..ProviderConfig::new(ProviderType::Bedrock)
+            ..ProviderConfig::new(provider_type)
         }
     }
 
@@ -730,12 +747,7 @@ mod tests {
         fips: bool,
         base_url: Option<&str>,
     ) -> Result<String> {
-        let bedrock = BedrockConfig {
-            endpoint,
-            api: endpoint.default_api(),
-            region: None,
-        };
-        let provider = provider_with(bedrock.clone(), base_url);
+        let provider = provider_with(endpoint, base_url);
         let sdk = SdkConfig::builder()
             .region(Region::new("us-west-2"))
             .use_fips(fips)
@@ -744,7 +756,7 @@ mod tests {
         let name: ProviderName = "root-test"
             .parse()
             .unwrap_or_else(|e: Error| fail(&e.to_string()));
-        root(&name, &provider, &bedrock, &sdk, "us-west-2").await
+        root(&name, &provider, endpoint, &sdk, "us-west-2").await
     }
 
     #[tokio::test]

@@ -710,7 +710,14 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
             format!("{model}: not a Bedrock provider"),
         );
     };
-    let surface = format!("bedrock-{}, api {}", bedrock.endpoint, bedrock.api);
+    let Some(endpoint) = provider.provider_type.bedrock_endpoint() else {
+        return Check::new(
+            area,
+            Status::Fail,
+            format!("{model}: not a Bedrock provider"),
+        );
+    };
+    let surface = format!("{endpoint}, api {}", bedrock.api);
     if !probe {
         return Check::new(
             area,
@@ -740,7 +747,7 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
         session.root(),
         session.region()
     );
-    if bedrock.endpoint == BedrockEndpoint::Runtime {
+    if endpoint == BedrockEndpoint::Runtime {
         return Check::new(
             area,
             Status::Ok,
@@ -1095,7 +1102,7 @@ impl Listing {
                 }
             }
             // `check_bedrock` asks the AWS SDK instead.
-            ProviderType::Bedrock => {
+            ProviderType::Bedrock | ProviderType::BedrockMantle => {
                 return Err(Probe::Unexpected(String::from(
                     "Bedrock is not probed over plain HTTP",
                 )));
@@ -1114,11 +1121,12 @@ impl Listing {
             ProviderType::Ollama => serde_json::from_slice::<OllamaRunningModels>(&bytes)
                 .map(Self::Ollama)
                 .map_err(|e| Probe::Unexpected(e.to_string())),
-            ProviderType::Openai | ProviderType::Anthropic | ProviderType::Bedrock => {
-                serde_json::from_slice::<IdList>(&bytes)
-                    .map(|list| Self::Ids(list.data.into_iter().map(|e| e.id).collect()))
-                    .map_err(|e| Probe::Unexpected(e.to_string()))
-            }
+            ProviderType::Openai
+            | ProviderType::Anthropic
+            | ProviderType::Bedrock
+            | ProviderType::BedrockMantle => serde_json::from_slice::<IdList>(&bytes)
+                .map(|list| Self::Ids(list.data.into_iter().map(|e| e.id).collect()))
+                .map_err(|e| Probe::Unexpected(e.to_string())),
         }
     }
 }

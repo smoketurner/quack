@@ -21,8 +21,8 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    AuthMode, AwsRegion, BaseUrl, BedrockEndpoint, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR,
-    ENV_MODEL, Grant, ModelSpec, OAuthConfig, Overrides, config_file_path,
+    AuthMode, AwsRegion, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant,
+    ModelSpec, OAuthConfig, Overrides, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -399,7 +399,6 @@ const PROVIDER_KEYS: &[&str] = &[
     "base_url",
     "api_key_env",
     "aws_profile",
-    "endpoint",
     "api",
     "region",
     "embedding_dimension",
@@ -485,17 +484,13 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             );
             s.optional_text("api_key_env", provider.auth.api_key_env(), None);
             s.optional_text("aws_profile", provider.auth.aws_profile(), None);
-            if let Some(bedrock) = &provider.bedrock {
-                s.text(
-                    "endpoint",
-                    bedrock.endpoint.as_str(),
-                    BedrockEndpoint::default().as_str(),
-                    None,
-                );
+            if let (Some(bedrock), Some(endpoint)) =
+                (&provider.bedrock, provider.provider_type.bedrock_endpoint())
+            {
                 s.text(
                     "api",
                     bedrock.api.as_str(),
-                    bedrock.endpoint.default_api().as_str(),
+                    endpoint.default_api().as_str(),
                     None,
                 );
                 s.optional_text(
@@ -1255,14 +1250,14 @@ top_k = 3
              [providers.p.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n",
         );
         let listed: BTreeSet<String> = inspection.settings.iter().map(Setting::path).collect();
-        let bedrock_only = ["endpoint", "api", "region"];
+        let bedrock_only = ["api", "region"];
         for key in PROVIDER_KEYS
             .iter()
             .filter(|k| **k != "oauth" && !bedrock_only.contains(*k))
         {
             assert!(listed.contains(&format!("providers.p.{key}")), "{key}");
         }
-        let bedrock = inspect("[providers.b]\ntype = \"bedrock\"\nendpoint = \"mantle\"\n");
+        let bedrock = inspect("[providers.b]\ntype = \"bedrock-mantle\"\n");
         let listed_bedrock: BTreeSet<String> = bedrock.settings.iter().map(Setting::path).collect();
         for key in bedrock_only {
             assert!(

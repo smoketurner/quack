@@ -241,7 +241,7 @@ impl EmbedModel {
             ProviderType::Anthropic => Err(Error::Config(format!(
                 "embedding_model '{model}': anthropic does not serve embeddings"
             ))),
-            ProviderType::Bedrock => Ok(Self::Bedrock(
+            ProviderType::Bedrock | ProviderType::BedrockMantle => Ok(Self::Bedrock(
                 bedrock::session(name, provider)
                     .await?
                     .converse(name)?
@@ -349,7 +349,7 @@ impl ChatClient {
             ProviderType::Anthropic => {
                 Self::Anthropic(build_anthropic_client(config, name, provider).await?)
             }
-            ProviderType::Bedrock => {
+            ProviderType::Bedrock | ProviderType::BedrockMantle => {
                 Self::bedrock(&*bedrock::session(name, provider).await?, name, provider)?
             }
         })
@@ -1072,40 +1072,39 @@ mod tests {
     /// of rig's bearer, and, for Responses, `store: false`.
     #[tokio::test]
     async fn bedrock_openai_apis_send_signed_requests_to_the_endpoint_path() {
-        for (endpoint, api, path, service) in [
+        for (provider_type, api, path, service) in [
             (
-                crate::config::BedrockEndpoint::Mantle,
+                ProviderType::BedrockMantle,
                 BedrockApi::Responses,
                 "POST /v1/responses ",
                 "/bedrock-mantle/aws4_request",
             ),
             (
-                crate::config::BedrockEndpoint::Mantle,
+                ProviderType::BedrockMantle,
                 BedrockApi::ChatCompletions,
                 "POST /v1/chat/completions ",
                 "/bedrock-mantle/aws4_request",
             ),
             (
-                crate::config::BedrockEndpoint::Runtime,
+                ProviderType::Bedrock,
                 BedrockApi::Responses,
                 "POST /openai/v1/responses ",
                 "/us-west-2/bedrock/aws4_request",
             ),
         ] {
             let (root, seen) = capture_one().await;
-            let bedrock = crate::config::BedrockConfig {
-                endpoint,
-                api,
-                region: None,
-            };
+            let bedrock = crate::config::BedrockConfig { api, region: None };
             let provider = ProviderConfig {
                 bedrock: Some(bedrock.clone()),
-                ..ProviderConfig::new(ProviderType::Bedrock)
+                ..ProviderConfig::new(provider_type)
+            };
+            let Some(endpoint) = provider_type.bedrock_endpoint() else {
+                fail("a Bedrock type")
             };
             let name: ProviderName = "wire-test"
                 .parse()
                 .unwrap_or_else(|e: Error| fail(&e.to_string()));
-            let session = bedrock::Session::for_test(bedrock, &root, "us-west-2");
+            let session = bedrock::Session::for_test(endpoint, bedrock, &root, "us-west-2");
             let client = ChatClient::bedrock(&session, &name, &provider)
                 .unwrap_or_else(|e| fail(&e.to_string()));
             let answer = client

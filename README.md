@@ -98,8 +98,7 @@ aws_profile = "my-sso-profile"   # optional
 region = "us-east-1"             # optional
 
 [providers.mantle]               # bedrock-mantle: responses (default) or chat-completions
-type = "bedrock"
-endpoint = "mantle"
+type = "bedrock-mantle"
 aws_profile = "my-sso-profile"
 # base_url = "https://vpce-0123456789abcdef0.bedrock-mantle.us-east-1.vpce.amazonaws.com"   # a VPC endpoint without private DNS
 ```
