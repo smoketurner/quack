@@ -14,6 +14,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use quack_core::config::ServerConfig;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::storage::audit::AuditDetail;
@@ -129,10 +130,12 @@ impl Peer {
     /// Whether a cookie set on this response must carry `Secure`. Anything
     /// that did not come from loopback may have crossed a network, including
     /// the hop in front of a TLS-terminating proxy, so the cookie must never
-    /// go back in the clear. Loopback is the plain-HTTP local case, and an
-    /// unknown peer is treated the same way.
-    pub(crate) fn needs_secure(self) -> bool {
-        self.0.is_some_and(|addr| !addr.ip().is_loopback())
+    /// go back in the clear. Loopback (and an unknown peer, treated the same
+    /// way) is the plain-HTTP local case, unless the server knows its public
+    /// URL is https or was told to always set it: a proxy on the same host
+    /// also arrives on loopback (issue #246).
+    pub(crate) fn needs_secure(self, server: &ServerConfig) -> bool {
+        self.0.is_some_and(|addr| !addr.ip().is_loopback()) || server.secure_cookies_on_loopback()
     }
 
     pub(crate) fn ip(self) -> Option<String> {
@@ -179,7 +182,7 @@ impl SessionCookie {
             .path("/")
             .http_only(true)
             .same_site(SameSite::Lax)
-            .secure(peer.needs_secure());
+            .secure(peer.needs_secure(&app.config.server));
         match app.config.server.session_max_age().try_into() {
             Ok(max_age) => cookie.max_age(max_age).build(),
             // Out of range only for a lifetime no operator can configure. A

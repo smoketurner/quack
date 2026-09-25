@@ -4186,6 +4186,25 @@ async fn the_session_cookie_is_secure_off_loopback_and_carries_max_age() {
     assert!(remote.contains("Max-Age=43200"), "{remote}");
 }
 
+/// Issue #246: with `[server].secure_cookies = "always"` the session cookie
+/// carries `Secure` on loopback too, for a same-host TLS proxy the server
+/// cannot otherwise tell from a local browser; the default leaves loopback
+/// plain (the test above).
+#[tokio::test(flavor = "multi_thread")]
+async fn secure_cookies_always_marks_loopback_cookies_secure() {
+    let mut config = Config::default();
+    config.server.secure_cookies = quack_core::config::SecureCookies::Always;
+    let h = harness_with(ServeMode::Login, config).await;
+    h.user("root", UserKind::Admin).await;
+    let (status, _, headers) = h
+        .form_from("/login", "127.0.0.1:51000", "username=root&password=pw")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = set_cookie(&headers);
+    assert!(cookie.contains("quack_session="), "{cookie}");
+    assert!(cookie.contains("Secure"), "{cookie}");
+}
+
 /// The limiters' per-key state is swept on a loop rather than once: without
 /// it governor keeps one entry per caller for the life of the process.
 #[tokio::test(flavor = "multi_thread")]

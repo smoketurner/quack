@@ -173,6 +173,12 @@ impl Harness {
     /// A harness whose `[server.oidc].audience` is `audience`: set, the API
     /// and MCP accept the issuer's access tokens.
     async fn with_audience(audience: Option<&str>) -> Self {
+        Self::build(audience, "https://quack.example.com").await
+    }
+
+    /// A harness whose public URL (the origin of `redirect_uri`) is
+    /// `origin`.
+    async fn build(audience: Option<&str>, origin: &str) -> Self {
         let issuer = start_issuer().await;
         let base = issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -183,7 +189,7 @@ impl Harness {
             client_id: String::from("quack"),
             client_secret_env: None,
             scopes: OidcConfig::default_scopes(),
-            redirect_uri: format!("https://quack.example.com{}", OidcConfig::CALLBACK_PATH),
+            redirect_uri: format!("{origin}{}", OidcConfig::CALLBACK_PATH),
             audience: audience.map(str::to_owned),
             subject_claim: String::from(OidcConfig::DEFAULT_SUBJECT_CLAIM),
         };
@@ -221,6 +227,22 @@ impl Harness {
         let request = request
             .body(Body::empty())
             .unwrap_or_else(|e| fail(&e.to_string()));
+        self.send(request).await
+    }
+
+    /// A GET that arrives from `peer`, as the real server records it.
+    async fn get_from(&self, uri: &str, cookie: Option<&str>, peer: &str) -> Reply {
+        let mut request = Request::get(uri);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        let mut request = request
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let addr: std::net::SocketAddr = peer.parse().unwrap_or_else(|e| fail(&format!("{e}")));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
         self.send(request).await
     }
 
@@ -1034,4 +1056,85 @@ async fn a_callback_naming_another_issuer_is_refused() {
         reply.location
     );
     assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+}
+
+/// Issue #246: a TLS-terminating proxy on the same host reaches quack over
+/// loopback, so the peer alone cannot say the browser is on https. An https
+/// `redirect_uri` can, and then the state cookie and the session cookie
+/// both carry `Secure` on loopback too.
+#[tokio::test]
+async fn an_https_public_url_makes_loopback_cookies_secure() {
+    let h = Harness::new().await;
+    let loopback = "127.0.0.1:51000";
+    let started = h.get_from(OidcConfig::START_PATH, None, loopback).await;
+    assert_eq!(started.status, StatusCode::SEE_OTHER, "{}", started.body);
+    let state_cookie = started
+        .cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{}=", super::STATE_COOKIE)))
+        .cloned()
+        .unwrap_or_else(|| fail("no state cookie"));
+    assert!(state_cookie.contains("Secure"), "{state_cookie}");
+
+    let state = started.cookie(super::STATE_COOKIE).unwrap_or_default();
+    let nonce = started
+        .location
+        .parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|uri| axum::extract::Query::<HashMap<String, String>>::try_from_uri(&uri).ok())
+        .and_then(|axum::extract::Query(q)| q.get("nonce").cloned())
+        .unwrap_or_default();
+    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    h.issuer(|s| {
+        s.id_claims = json!({
+            "iss": base, "sub": "sub-ada", "aud": "quack",
+            "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+            "nonce": nonce, "preferred_username": "ada",
+        });
+    });
+    let reply = h
+        .get_from(
+            &format!("{}?code=c&state={state}", OidcConfig::CALLBACK_PATH),
+            Some(&format!("{}={state}", super::STATE_COOKIE)),
+            loopback,
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let session = reply
+        .cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{}=", crate::server::auth::SESSION_COOKIE)))
+        .cloned()
+        .unwrap_or_else(|| fail("no session cookie"));
+    assert!(session.contains("Secure"), "{session}");
+}
+
+/// Without an https public URL, loopback keeps the plain-HTTP local case:
+/// no `Secure`, or the browser would never send the cookie back.
+#[tokio::test]
+async fn an_http_public_url_leaves_loopback_cookies_plain() {
+    let h = Harness::build(None, "http://127.0.0.1:8080").await;
+    let started = h
+        .get_from(OidcConfig::START_PATH, None, "127.0.0.1:51000")
+        .await;
+    assert_eq!(started.status, StatusCode::SEE_OTHER, "{}", started.body);
+    assert!(
+        started.cookie(super::STATE_COOKIE).is_some(),
+        "{:?}",
+        started.cookies
+    );
+    assert!(
+        started.cookies.iter().all(|c| !c.contains("Secure")),
+        "{:?}",
+        started.cookies
+    );
+    // Off loopback it is still set, whatever the public URL says.
+    let remote = h
+        .get_from(OidcConfig::START_PATH, None, "203.0.113.7:51000")
+        .await;
+    assert!(
+        remote.cookies.iter().any(|c| c.contains("Secure")),
+        "{:?}",
+        remote.cookies
+    );
 }

@@ -93,7 +93,12 @@ and open a session. A session token is `qs_` followed by 32 random bytes. quack 
 sessions in memory only, so a restart signs every user out.
 
 The session cookie carries `HttpOnly`, `SameSite=Lax`, and `Path=/`. It also carries
-`Secure` unless the request arrived from loopback. A session ends 12 hours after login
+`Secure` unless the request arrived from loopback. A TLS-terminating proxy on the same host
+also connects over loopback, so on loopback the cookie still carries `Secure` when
+`[server.oidc].redirect_uri` is an https URL, or when `[server].secure_cookies = "always"`
+(the default is `"auto"`). Set `"always"` behind a same-host proxy that serves https
+without `[server.oidc]`. quack never reads `X-Forwarded-Proto` for this, since any client
+can send it. The sign-in state cookie of `[server.oidc]` follows the same rule. A session ends 12 hours after login
 (`[server].session_max_age_hours`) or 120 minutes after its last request
 (`[server].session_idle_minutes`), whichever comes first. The two login routes accept 2
 requests per second from one peer address, with bursts of up to 10, in addition to the

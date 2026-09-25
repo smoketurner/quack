@@ -1817,9 +1817,12 @@ How to configure each way in is in `docs/authentication.md`.
   expired` and audited as a denied `session` action. Expiry is measured with a monotonic
   clock, so moving the system clock cannot extend a session. The cookie is `HttpOnly`,
   `SameSite=Lax`, carries a `Max-Age` matching the absolute lifetime, and carries `Secure`
-  whenever the request did not arrive on loopback — so a cookie minted behind a
-  TLS-terminating proxy is never sent back over a plaintext downgrade, while plain HTTP on
-  a laptop keeps working.
+  whenever the request did not arrive on loopback, and on loopback too when the server
+  knows its public URL is https (`[server.oidc].redirect_uri`) or `[server].secure_cookies`
+  is `always` — so a cookie minted behind a TLS-terminating proxy, including one on the
+  same host that connects over loopback, is never sent back over a plaintext downgrade,
+  while plain HTTP on a laptop keeps working. The sign-in state cookie follows the same
+  rule. `X-Forwarded-Proto` is not trusted for this (issue #246).
 - **Rate limiting covers everything a caller can reach**, not just the API: one
   `tower_governor` limiter over the web UI, the REST API, and MCP, keyed by the peer
   address. The two endpoints that check a password (`POST /login` and
@@ -1987,6 +1990,7 @@ local = false
 workers_per_workspace = 1               # uploads processed at once per workspace (a lane)
 session_max_age_hours = 12              # a browser session dies this long after login
 session_idle_minutes = 120              # ... or this long after its last request
+secure_cookies = "auto"                 # "always": Secure cookies on loopback too (same-host TLS proxy)
 
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
