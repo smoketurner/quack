@@ -434,6 +434,11 @@ struct Inner {
     registry: Mutex<Registry>,
     history: usize,
     events: broadcast::Sender<JobInfo>,
+    /// Cleanup waiters for [`JobQueue::when_ended`]: `finish` hands the job's
+    /// final snapshot directly to the waiter through this map, so the callback
+    /// runs even if the job is dropped from the history ring in the same
+    /// `finish` call that announced its end (or the broadcast channel lags).
+    ended_waiters: Mutex<HashMap<JobId, oneshot::Sender<JobInfo>>>,
 }
 
 impl Inner {
@@ -458,36 +463,56 @@ impl Inner {
     }
 
     /// Record the job's end and drop the oldest finished jobs past the
-    /// history bound.
+    /// history bound. The finished snapshot is captured before any eviction
+    /// and handed to any [`JobQueue::when_ended`] waiter, so cleanup runs
+    /// even for a job this call drops from the history ring.
     fn finish(&self, id: JobId, state: JobState, outcome: Option<String>) {
         self.update(id, |info| {
             info.state = state;
             info.outcome = outcome;
             info.finished_at = Some(Timestamp::now());
         });
-        let mut registry = self.registry();
-        let finished = registry
-            .jobs
-            .values()
-            .filter(|e| e.info.state.is_finished())
-            .count();
-        let mut excess = finished.saturating_sub(self.history);
-        if excess == 0 {
-            return;
-        }
-        let Registry { order, jobs, .. } = &mut *registry;
-        order.retain(|id| {
-            let drop_it = excess > 0 && jobs.get(id).is_none_or(|e| e.info.state.is_finished());
-            if drop_it {
-                excess = excess.saturating_sub(1);
-                jobs.remove(id);
+        let snapshot = {
+            let mut registry = self.registry();
+            let snapshot = registry.jobs.get(&id).map(|e| e.info.clone());
+            let finished = registry
+                .jobs
+                .values()
+                .filter(|e| e.info.state.is_finished())
+                .count();
+            let mut excess = finished.saturating_sub(self.history);
+            if excess > 0 {
+                let Registry { order, jobs, .. } = &mut *registry;
+                order.retain(|jid| {
+                    let drop_it =
+                        excess > 0 && jobs.get(jid).is_none_or(|e| e.info.state.is_finished());
+                    if drop_it {
+                        excess = excess.saturating_sub(1);
+                        jobs.remove(jid);
+                    }
+                    !drop_it
+                });
             }
-            !drop_it
-        });
+            snapshot
+        };
+        // Deliver the finished snapshot to any registered waiter. The
+        // snapshot was captured before eviction, so a job dropped from the
+        // history ring above still reaches its cleanup callback.
+        if let Some(info) = snapshot
+            && let Some(tx) = self.ended_waiters().remove(&id)
+        {
+            drop(tx.send(info));
+        }
     }
 
     fn lanes(&self) -> std::sync::MutexGuard<'_, HashMap<String, LaneState>> {
         self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn ended_waiters(&self) -> std::sync::MutexGuard<'_, HashMap<JobId, oneshot::Sender<JobInfo>>> {
+        self.ended_waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Take the job's place in its lane, synchronously at submit: a free
@@ -593,6 +618,7 @@ impl JobQueue {
                 registry: Mutex::new(Registry::default()),
                 history: usize::try_from(history.max(1)).unwrap_or(usize::MAX),
                 events,
+                ended_waiters: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -777,15 +803,54 @@ impl JobQueue {
 
     /// Run `record` with the job's final snapshot once it ends, on a task
     /// of its own: for what the work would have recorded itself had it run
-    /// to its end (a job cancelled while queued never runs it).
+    /// to its end (a job cancelled while queued never runs it). The snapshot
+    /// is delivered by [`Inner::finish`] directly through a oneshot, so
+    /// `record` runs even if the job is dropped from the history ring or the
+    /// broadcast channel has lagged past the finished event. A job that
+    /// ended and was evicted before this is called has no snapshot left to
+    /// deliver, so `record` does not run; the two real callers register
+    /// immediately after [`JobQueue::submit`], so the job is never ended by
+    /// then.
     pub fn when_ended<F, Fut>(&self, id: JobId, record: F)
     where
         F: FnOnce(JobInfo) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let queue = self.clone();
+        let (tx, rx) = oneshot::channel();
+        self.inner.ended_waiters().insert(id, tx);
+        // The job may have already finished (and possibly been evicted)
+        // before this call. `finish` only delivers through the oneshot if it
+        // runs after this insert, so resolve the race here so `record` runs
+        // exactly once.
+        match self.get(id) {
+            Some(info) if info.state.is_finished() => {
+                // Still in the history and finished. If `finish` ran before we
+                // inserted, it did not see our waiter: take it and deliver
+                // `record(info)` ourselves. If `finish` ran after we inserted,
+                // it took the waiter and sent the snapshot to `rx` already --
+                // fall through to await it.
+                if self.inner.ended_waiters().remove(&id).is_some() {
+                    tokio::spawn(async move {
+                        record(info).await;
+                    });
+                    return;
+                }
+            }
+            Some(_) => {
+                // Still queued or running; `finish` will deliver via `rx`.
+            }
+            None => {
+                // Evicted or unknown. If we still hold the waiter, the job
+                // ended and was evicted before this call (no snapshot left):
+                // drop the waiter and do nothing. If `finish` already took it
+                // and sent, fall through to await `rx`.
+                if self.inner.ended_waiters().remove(&id).is_some() {
+                    return;
+                }
+            }
+        }
         tokio::spawn(async move {
-            if let Some(ended) = queue.wait(id).await {
+            if let Ok(ended) = rx.await {
                 record(ended).await;
             }
         });
@@ -901,6 +966,7 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -1240,6 +1306,350 @@ mod tests {
                 .parse::<JobId>()
                 .ok(),
             listed.first().map(|j| j.id)
+        );
+    }
+
+    /// `when_ended`'s cleanup must run even when the job is evicted from the
+    /// history ring in its own `finish` call. `a` queues behind a held job in
+    /// a serial lane, so it is submitted before 100 lane-less jobs that all
+    /// finish first; when `a` is then cancelled it is the oldest-by-submission
+    /// finished job and is evicted in the very `finish` that announced its end.
+    #[tokio::test(flavor = "current_thread")]
+    async fn when_ended_runs_for_a_job_evicted_in_its_own_finish() {
+        let queue = JobQueue::new(100);
+        let lane_key = LaneKey::Session(SessionId::from("z"));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_work = Arc::clone(&gate);
+        let held = queue
+            .submit(
+                JobSpec::new(JobKind::Chat, "held").lane(Lane::serial(&lane_key)),
+                move |_| async move {
+                    gate_for_work.notified().await;
+                    Ok(String::new())
+                },
+            )
+            .id;
+        let a = queue
+            .submit(
+                JobSpec::new(JobKind::Chat, "a").lane(Lane::serial(&lane_key)),
+                |_| async { Ok(String::new()) },
+            )
+            .id;
+        for n in 0..100_u32 {
+            let id = queue
+                .submit(JobSpec::new(JobKind::Sql, format!("b{n}")), |_| async {
+                    Ok(String::new())
+                })
+                .id;
+            finished(&queue, id).await;
+        }
+
+        let done = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(None::<JobInfo>));
+        let done_for_record = Arc::clone(&done);
+        let seen_for_record = Arc::clone(&seen);
+        queue.when_ended(a, move |ended| {
+            let done = Arc::clone(&done_for_record);
+            let seen = Arc::clone(&seen_for_record);
+            async move {
+                *seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(ended);
+                done.notify_one();
+            }
+        });
+
+        let wait_for_record = tokio::time::timeout(Duration::from_secs(5), done.notified());
+        queue.cancel(a);
+        match wait_for_record.await {
+            Ok(()) => {}
+            Err(_) => fail("when_ended record never ran at default history"),
+        }
+
+        gate.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), queue.wait(held))
+                .await
+                .is_ok(),
+            "held did not settle"
+        );
+
+        let Some(ended) = seen.lock().unwrap_or_else(PoisonError::into_inner).clone() else {
+            fail("no snapshot captured")
+        };
+        assert_eq!(ended.state, JobState::Cancelled);
+        assert!(
+            ended.never_started(),
+            "evicted job's cleanup got its snapshot"
+        );
+        assert!(queue.get(a).is_none(), "a was evicted yet record still ran");
+    }
+
+    /// The same eviction shape as above, on the production multi-threaded
+    /// runtime. The evicting thread is strongly favored to re-lock before a
+    /// broadcast-woken watcher resumes, so the bug fires consistently here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn when_ended_runs_for_a_job_evicted_on_a_multi_threaded_runtime() {
+        let history = 100;
+        let queue = JobQueue::new(history);
+        let lane_key = LaneKey::Session(SessionId::from("m"));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_work = Arc::clone(&gate);
+        let holder = queue
+            .submit(
+                JobSpec::new(JobKind::Chat, "holder").lane(Lane::serial(&lane_key)),
+                move |_| async move {
+                    gate_for_work.notified().await;
+                    Ok(String::new())
+                },
+            )
+            .id;
+        let a = queue
+            .submit(
+                JobSpec::new(JobKind::Chat, "a").lane(Lane::serial(&lane_key)),
+                |_| async { Ok(String::new()) },
+            )
+            .id;
+        for n in 0..history {
+            let id = queue
+                .submit(JobSpec::new(JobKind::Sql, format!("b{n}")), |_| async {
+                    Ok(String::new())
+                })
+                .id;
+            finished(&queue, id).await;
+        }
+
+        let done = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(None::<JobInfo>));
+        let done_for_record = Arc::clone(&done);
+        let seen_for_record = Arc::clone(&seen);
+        queue.when_ended(a, move |ended| {
+            let done = Arc::clone(&done_for_record);
+            let seen = Arc::clone(&seen_for_record);
+            async move {
+                *seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(ended);
+                done.notify_one();
+            }
+        });
+
+        let wait_for_record = tokio::time::timeout(Duration::from_secs(5), done.notified());
+        queue.cancel(a);
+        match wait_for_record.await {
+            Ok(()) => {}
+            Err(_) => fail("when_ended record never ran on multi_thread"),
+        }
+
+        gate.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), queue.wait(holder))
+                .await
+                .is_ok(),
+            "holder did not settle"
+        );
+
+        let Some(ended) = seen.lock().unwrap_or_else(PoisonError::into_inner).clone() else {
+            fail("no snapshot captured")
+        };
+        assert_eq!(ended.state, JobState::Cancelled);
+        assert!(ended.never_started());
+        assert!(queue.get(a).is_none(), "a was evicted yet record still ran");
+    }
+
+    /// Many jobs sharing one serial lane, all queued behind a held job, each
+    /// with a `when_ended` watcher registered while queued. As they finish in
+    /// order the oldest are evicted past a small history bound; every watcher
+    /// must run its `record` exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn when_ended_runs_record_exactly_once_per_job_under_eviction() {
+        let history = 8;
+        let queue = JobQueue::new(history);
+        let lane_key = LaneKey::Session(SessionId::from("race"));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_work = Arc::clone(&gate);
+        let _holder = queue
+            .submit(
+                JobSpec::new(JobKind::Chat, "holder").lane(Lane::serial(&lane_key)),
+                move |_| async move {
+                    gate_for_work.notified().await;
+                    Ok(String::new())
+                },
+            )
+            .id;
+        let n = 64_u32;
+        let called = Arc::new(AtomicUsize::new(0));
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let info = queue.submit(
+                JobSpec::new(JobKind::Chat, format!("j{i}")).lane(Lane::serial(&lane_key)),
+                |_| async { Ok(String::new()) },
+            );
+            let id = info.id;
+            let called_for_record = Arc::clone(&called);
+            queue.when_ended(id, move |_ended| {
+                let called = Arc::clone(&called_for_record);
+                async move {
+                    called.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            ids.push(id);
+        }
+        gate.notify_one();
+        for id in &ids {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), queue.wait(*id))
+                    .await
+                    .is_ok(),
+                "a watched job did not settle"
+            );
+        }
+        let want = usize::try_from(n).unwrap_or(usize::MAX);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if called.load(Ordering::SeqCst) == want {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| fail("not all when_ended records ran"));
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            want,
+            "each when_ended ran its record exactly once"
+        );
+        // Most watched jobs were evicted while their watcher was registered.
+        let evicted = ids.iter().filter(|id| queue.get(**id).is_none()).count();
+        let kept_bound = usize::try_from(history).unwrap_or(want);
+        assert!(
+            evicted >= want.saturating_sub(kept_bound),
+            "test exercised eviction: only {evicted} of {want} were evicted"
+        );
+    }
+
+    /// `when_ended` registered after the job has already finished but is still
+    /// in the history: the fast path delivers `record` from the current
+    /// snapshot.
+    #[tokio::test]
+    async fn when_ended_runs_when_registered_after_finish_while_still_in_history() {
+        let queue = JobQueue::new(100);
+        let job = queue
+            .submit(JobSpec::new(JobKind::Sql, "ok"), |_| async {
+                Ok(String::from("2 rows"))
+            })
+            .id;
+        let finished_info = finished(&queue, job).await;
+        assert_eq!(finished_info.state, JobState::Succeeded);
+
+        let done = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(None::<JobInfo>));
+        let done_for_record = Arc::clone(&done);
+        let seen_for_record = Arc::clone(&seen);
+        queue.when_ended(job, move |ended| {
+            let done = Arc::clone(&done_for_record);
+            let seen = Arc::clone(&seen_for_record);
+            async move {
+                *seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(ended);
+                done.notify_one();
+            }
+        });
+        match tokio::time::timeout(Duration::from_secs(5), done.notified()).await {
+            Ok(()) => {}
+            Err(_) => fail("when_ended did not run for an already-finished job"),
+        }
+        let Some(ended) = seen.lock().unwrap_or_else(PoisonError::into_inner).clone() else {
+            fail("no snapshot captured")
+        };
+        assert_eq!(ended.state, JobState::Succeeded);
+        assert_eq!(ended.outcome.as_deref(), Some("2 rows"));
+    }
+
+    /// `when_ended` for a job that ended and was evicted before the call has
+    /// no snapshot left to deliver: `record` must not run, and the call must
+    /// not leave a task parked on a oneshot that is never sent to.
+    #[tokio::test]
+    async fn when_ended_does_not_run_or_hang_after_the_job_was_evicted() {
+        let queue = JobQueue::new(1);
+        let first = queue
+            .submit(JobSpec::new(JobKind::Sql, "first"), |_| async {
+                Ok(String::new())
+            })
+            .id;
+        let second = queue
+            .submit(JobSpec::new(JobKind::Sql, "second"), |_| async {
+                Ok(String::new())
+            })
+            .id;
+        finished(&queue, second).await;
+        assert!(
+            queue.get(first).is_none(),
+            "first was evicted (history = 1)"
+        );
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_record = Arc::clone(&called);
+        // Wrap the call in a timeout to prove it returns promptly rather than
+        // parking a task on a oneshot that nothing will ever send to.
+        let spawn = tokio::spawn(async move {
+            queue.when_ended(first, move |_ended| {
+                let called = Arc::clone(&called_for_record);
+                async move {
+                    called.store(true, Ordering::SeqCst);
+                }
+            });
+        });
+        match tokio::time::timeout(Duration::from_secs(5), spawn).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => fail("when_ended task panicked"),
+            Err(_) => fail("when_ended hung for an evicted job"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "record must not run for an already-evicted job with no snapshot"
+        );
+    }
+
+    /// The snapshot `when_ended` delivers is the actual finished snapshot
+    /// (state, outcome, `finished_at`), not a stale one, even when the job is
+    /// evicted by a later `finish` before the watcher resumes.
+    #[tokio::test]
+    async fn when_ended_delivers_the_actual_finished_snapshot_for_an_evicted_job() {
+        let queue = JobQueue::new(1);
+        let done = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(None::<JobInfo>));
+        let watched = queue
+            .submit(JobSpec::new(JobKind::Sql, "watched"), |_| async {
+                Ok(String::from("summary-xyz"))
+            })
+            .id;
+        let done_for_record = Arc::clone(&done);
+        let seen_for_record = Arc::clone(&seen);
+        queue.when_ended(watched, move |ended| {
+            let done = Arc::clone(&done_for_record);
+            let seen = Arc::clone(&seen_for_record);
+            async move {
+                *seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(ended);
+                done.notify_one();
+            }
+        });
+        let later = queue
+            .submit(JobSpec::new(JobKind::Sql, "later"), |_| async {
+                Ok(String::new())
+            })
+            .id;
+        let _ = finished(&queue, later).await;
+        match tokio::time::timeout(Duration::from_secs(5), done.notified()).await {
+            Ok(()) => {}
+            Err(_) => fail("when_ended did not run for an evicted job"),
+        }
+        let Some(ended) = seen.lock().unwrap_or_else(PoisonError::into_inner).clone() else {
+            fail("no snapshot captured")
+        };
+        assert_eq!(ended.state, JobState::Succeeded);
+        assert_eq!(ended.outcome.as_deref(), Some("summary-xyz"));
+        assert!(ended.finished_at.is_some());
+        assert!(
+            queue.get(watched).is_none(),
+            "watched was evicted but its snapshot was still delivered"
         );
     }
 }

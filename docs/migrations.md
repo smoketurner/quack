@@ -51,6 +51,10 @@ the old `pending` default (or no status) as `error`, since a status is now read 
 `queued`, `processing`, `ready`, or `error` and those rows were never processed. Version 10
 adds `_quack_ontology_versions.acceptance` (`reviewed` or `auto`) and marks versions whose
 note starts `auto-accepted` as `auto`, which was the only record of an auto-accept before.
+Version 11 collapses opposing-orientation rows in `_quack_graph_merges`: before the dedup
+recognized a node pair in either orientation, a pair whose provenance flipped between
+resolution passes could land twice (`(keep, drop)` and `(drop, keep)`); on open each pair is
+reduced to one row, keeping the more-decided one so a reviewer's rejection survives.
 Phrase search (`"..."` in a keyword query) needed no version bump: it post-filters
 candidates by substring rather than adding term positions to `_quack_terms`.
 

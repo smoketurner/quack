@@ -73,7 +73,7 @@ impl Plan {
                 .stale_chunks()
                 .saturating_add(status.missing_chunks)
                 .saturating_add(rewritten),
-            nodes: status.stale_nodes,
+            nodes: status.nodes_needing_embedding,
             retype,
         }
     }
@@ -295,6 +295,7 @@ mod tests {
                 }]
             },
             stale_nodes: 0,
+            nodes_needing_embedding: 0,
         }
     }
 
@@ -335,6 +336,7 @@ mod tests {
                 chunks: 40,
             }],
             stale_nodes: 3,
+            nodes_needing_embedding: 3,
         })
         .to_string();
         assert_eq!(
