@@ -1856,6 +1856,123 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn propose_with_auto_accept_builds_a_version_scoped_to_this_run() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "p" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    for sql in [
+        "CREATE TABLE vendors (vendor_id INTEGER, name TEXT)",
+        "INSERT INTO vendors SELECT i, 'V' || i FROM range(30) t(i)",
+        "CREATE TABLE orders (order_id INTEGER, vendor_id INTEGER, mode TEXT)",
+        "INSERT INTO orders SELECT i, i % 30, CASE WHEN i % 2 = 0 THEN 'air' ELSE 'sea' END FROM range(60) t(i)",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let base = format!("/api/v1/workspaces/{ws}/ontology");
+
+    // An earlier plain propose leaves its run's candidates pending.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let earlier = body["candidates"].as_u64().unwrap_or(0);
+    assert!(earlier > 0, "the earlier run queued candidates: {body}");
+    let earlier_run = body["run"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        body["version"].is_null(),
+        "no version without auto-accept: {body}"
+    );
+
+    // A later run supersedes the pending candidates it proposes again, so
+    // drop `orders`: the next run no longer proposes it, and the earlier
+    // run's `orders` candidates stay pending beside it.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            None,
+            Some(serde_json::json!({ "sql": "DROP TABLE orders" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // `auto_accept` queues this run's candidates and accepts them in one
+    // call. Scoping acceptance to this run means the version contains
+    // exactly what was queued, so the reported count matches the version.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "auto_accept": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let queued = body["candidates"].as_u64().unwrap_or(0);
+    assert!(queued > 0, "candidates queued and accepted: {body}");
+    assert_eq!(body["version"], 1, "auto-accept built a version: {body}");
+    assert!(
+        body["run"].as_str().is_some(),
+        "the run id is returned: {body}"
+    );
+
+    let (status, body) = h.call(Method::GET, &base, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 1, "{body}");
+
+    // Only this run's candidates were accepted: the earlier run's stay
+    // pending, untouched (issue #233).
+    let (_, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    let pending = body["candidates"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !pending.is_empty() && u64::try_from(pending.len()).unwrap_or(u64::MAX) < earlier,
+        "the earlier run's orders candidates are still pending: {body}"
+    );
+    assert!(
+        pending
+            .iter()
+            .all(|c| c["proposed_by"].as_str() == Some(earlier_run.as_str())),
+        "every pending candidate is the earlier run's: {body}"
+    );
+
+    // A second auto-accept over the now-covered tables finds nothing new.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "auto_accept": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["candidates"], 0, "nothing new to propose: {body}");
+    assert!(body["version"].is_null(), "no version built: {body}");
+    assert!(body["run"].is_null(), "no run queued: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_endpoints_manage_users_and_read_the_audit() {
     let h = harness(ServeMode::Login).await;
     h.user("root", UserKind::Admin).await;

@@ -311,7 +311,9 @@ impl Access {
             }
             let run = candidates::store_run(db, &proposals)?;
             let version = if auto_accept {
-                candidates::accept_all(db, Some(&author))?.version
+                candidates::accept_run(db, &run, Some(&author))?
+                    .ontology
+                    .version
             } else {
                 None
             };
