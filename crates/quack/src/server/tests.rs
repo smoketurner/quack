@@ -1826,6 +1826,19 @@ async fn propose_with_auto_accept_builds_a_version_scoped_to_this_run() {
         "no version without auto-accept: {body}"
     );
 
+    // A later run supersedes the pending candidates it proposes again, so
+    // drop `orders`: the next run no longer proposes it, and the earlier
+    // run's `orders` candidates stay pending beside it.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            None,
+            Some(serde_json::json!({ "sql": "DROP TABLE orders" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
     // `auto_accept` queues this run's candidates and accepts them in one
     // call. Scoping acceptance to this run means the version contains
     // exactly what was queued, so the reported count matches the version.
@@ -1856,10 +1869,9 @@ async fn propose_with_auto_accept_builds_a_version_scoped_to_this_run() {
         .call(Method::GET, &format!("{base}/candidates"), None, None)
         .await;
     let pending = body["candidates"].as_array().cloned().unwrap_or_default();
-    assert_eq!(
-        u64::try_from(pending.len()).unwrap_or(u64::MAX),
-        earlier,
-        "the earlier run's candidates are still pending: {body}"
+    assert!(
+        !pending.is_empty() && u64::try_from(pending.len()).unwrap_or(u64::MAX) < earlier,
+        "the earlier run's orders candidates are still pending: {body}"
     );
     assert!(
         pending
