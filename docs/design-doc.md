@@ -1380,8 +1380,8 @@ that never reaches the provider never opens it. The vault key is in the OS keych
 available (macOS Keychain, the Linux kernel keyring via `keyutils`, which is always
 present but in-memory, so a reboot needs a new login; Windows Credential Manager), else
 `<data_dir>/vault.key` (0600). A `[providers.NAME]` key is checked when the config is read
-(`config::ProviderName`: ASCII letters, digits, `_`, `-`, `.`, not starting with `.`, at
-most 64). `quack auth status` and `logout`; logout deletes the row and keeps the vault key,
+(`config::ProviderName`: ASCII letters, digits, `_`, and `-`, at most 64; no `.`, since TOML
+reads `[providers.a.b]` as a table inside provider `a`). `quack auth status` and `logout`; logout deletes the row and keeps the vault key,
 which other tokens use. The `oauth2` crate is used without its bundled HTTP client (that would pull
 `ring`); requests go through the same rustls + aws-lc-rs `reqwest` as rig. Scopes must
 include `offline_access` where the issuer needs it to return a refresh token.
