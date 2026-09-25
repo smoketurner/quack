@@ -23,6 +23,7 @@ use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::OllamaRunningModels;
 use crate::llm::oauth::TokenManager;
+use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::Count;
@@ -198,6 +199,7 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
     check_chat_model(&mut report, config, http.as_ref()).await;
     check_embedding_model(&mut report, config, http.as_ref()).await;
     check_server(&mut report, config, control.as_ref()).await;
+    check_sign_in(&mut report, config, options.probing).await;
     report
 }
 
@@ -919,6 +921,69 @@ async fn check_server(report: &mut Report, config: &Config, control: Option<&Con
     }
 }
 
+/// `[server.oidc]`: the secret it names is set, and online, the issuer
+/// answers discovery under the configured name.
+async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
+    let Some(oidc) = &config.server.oidc else {
+        return;
+    };
+    let issuer = &oidc.issuer_url;
+    if config.server.local {
+        report.push(
+            Check::new(
+                Area::Server,
+                Status::Warn,
+                format!("[server.oidc] ({issuer}) is ignored: [server].local has no login"),
+            )
+            .fix("turn local off to offer sign-in, or remove [server.oidc]"),
+        );
+        return;
+    }
+    if let Some(var) = &oidc.client_secret_env
+        && std::env::var_os(var).is_none()
+    {
+        report.push(
+            Check::new(
+                Area::Server,
+                Status::Fail,
+                format!("sign-in with {issuer}: the client secret variable {var} is not set"),
+            )
+            .fix(format!(
+                "export {var} before `quack serve`, or remove client_secret_env for a public client"
+            )),
+        );
+        return;
+    }
+    if probing == Probing::Offline {
+        report.push(Check::new(
+            Area::Server,
+            Status::Ok,
+            format!("sign-in with {issuer}: configured (not probed: --offline)"),
+        ));
+        return;
+    }
+    let begun = match SignIn::new(oidc.clone()) {
+        Ok(sign_in) => sign_in.begin().await.map(drop),
+        Err(e) => Err(e),
+    };
+    report.push(match begun {
+        Ok(()) => Check::new(
+            Area::Server,
+            Status::Ok,
+            format!(
+                "sign-in with {issuer}: the issuer answers discovery; callback {}",
+                oidc.redirect_uri
+            ),
+        ),
+        Err(e) => Check::new(
+            Area::Server,
+            Status::Fail,
+            format!("sign-in with {issuer}: {e}"),
+        )
+        .fix("check [server.oidc].issuer_url, and that this host can reach the issuer"),
+    });
+}
+
 enum Listing {
     Ollama(OllamaRunningModels),
     Ids(Vec<String>),
@@ -1109,6 +1174,41 @@ mod tests {
 
     fn find(report: &Report, area: Area) -> Vec<&Check> {
         report.checks.iter().filter(|c| c.area == area).collect()
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn sign_in_is_checked_for_its_secret_and_local_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let oidc = "[server.oidc]\nissuer_url = \"https://login.example.com\"\nclient_id = \"quack\"\nredirect_uri = \"https://q.example.com/login/oidc/callback\"\n";
+        let mut found = Vec::new();
+        for extra in [
+            "",
+            "client_secret_env = \"QUACK_TEST_UNSET_OIDC_SECRET\"\n",
+            "[server]\nlocal = true\n",
+        ] {
+            let toml = format!("{oidc}{extra}");
+            let report = run(&inspection(dir.path(), Some(&toml)), &offline()).await;
+            let checks: Vec<(Status, String)> = find(&report, Area::Server)
+                .into_iter()
+                .filter(|c| c.summary.contains("login.example.com"))
+                .map(|c| (c.status, c.summary.clone()))
+                .collect();
+            found.push(checks);
+        }
+        let [plain, secret, local]: [Vec<(Status, String)>; 3] = found.try_into().unwrap();
+        assert!(
+            matches!(plain.as_slice(), [(Status::Ok, s)] if s.contains("not probed")),
+            "{plain:?}"
+        );
+        assert!(
+            matches!(secret.as_slice(), [(Status::Fail, s)] if s.contains("QUACK_TEST_UNSET_OIDC_SECRET")),
+            "{secret:?}"
+        );
+        assert!(
+            matches!(local.as_slice(), [(Status::Warn, s)] if s.contains("ignored")),
+            "{local:?}"
+        );
     }
 
     #[tokio::test]

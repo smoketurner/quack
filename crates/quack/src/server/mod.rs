@@ -5,6 +5,7 @@ mod api;
 pub(crate) mod auth;
 mod error;
 mod mcp_http;
+pub(crate) mod oidc;
 mod queue;
 mod run;
 pub(crate) mod state;
@@ -33,7 +34,10 @@ use tower_http::request_id::{
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
+use oidc::Oidc;
+use quack_core::llm::oauth::KeySource;
 use quack_core::storage::control::{ControlPlane, sha256_hex};
+use quack_core::vault::Vault;
 use state::{App, AppState, ServeMode};
 
 /// How long one request may take. Agent turns can be slow.
@@ -246,7 +250,13 @@ impl fmt::Display for Banner<'_> {
         };
         let mode = match mode {
             ServeMode::Local => String::from("local: no login, one implicit owner"),
-            ServeMode::Login => format!("password and token login, {users} user(s)"),
+            ServeMode::Login => match &config.server.oidc {
+                Some(oidc) => format!(
+                    "password and token login, sign-in with {}, {users} user(s)",
+                    oidc.issuer_url
+                ),
+                None => format!("password and token login, {users} user(s)"),
+            },
         };
         write!(
             f,
@@ -305,6 +315,17 @@ pub(crate) async fn serve(
             "no users exist; nobody can log in until `quack user add NAME --admin` runs"
         );
     }
+    let oidc = match (&config.server.oidc, mode) {
+        (Some(oidc), ServeMode::Login) => Some(
+            Oidc::new(oidc, Vault::new(config.data_dir(), KeySource::Keychain))
+                .context("failed to set up [server.oidc] sign-in")?,
+        ),
+        (Some(_), ServeMode::Local) => {
+            tracing::warn!("[server.oidc] is ignored in local mode, which has no login");
+            None
+        }
+        (None, _) => None,
+    };
     {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
@@ -318,7 +339,7 @@ pub(crate) async fn serve(
         write!(out, "{banner}")?;
         out.flush()?;
     }
-    let app = Arc::new(AppState::new(config, control, mode));
+    let app = Arc::new(AppState::new(config, control, mode, oidc));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;

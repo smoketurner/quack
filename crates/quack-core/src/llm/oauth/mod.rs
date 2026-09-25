@@ -12,6 +12,7 @@
 //! client-credentials grant, run again whenever the token runs out.
 
 mod cache;
+mod key_slot;
 mod keychain;
 
 use std::collections::HashMap;
@@ -38,7 +39,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
-pub use cache::{CachedToken, KeyLocation, KeySource, TokenCache};
+pub(crate) use cache::Plaintext;
+pub use cache::{CachedToken, TokenCache};
+pub(crate) use key_slot::KeySlot;
+pub use key_slot::{KeyLocation, KeySource};
 
 use crate::config::{Config, Grant, OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
@@ -55,24 +59,92 @@ type OAuthClient =
 
 /// The endpoints an issuer advertises in its `OpenID` Connect discovery document.
 #[derive(Debug, Clone, Deserialize)]
-struct Endpoints {
+pub(crate) struct Endpoints {
+    /// The issuer identifier ID tokens must carry; `OpenID` Connect requires
+    /// it, plain OAuth servers may leave it out.
+    pub(crate) issuer: Option<String>,
     #[serde(rename = "authorization_endpoint")]
-    authorization: String,
+    pub(crate) authorization: String,
     #[serde(rename = "token_endpoint")]
-    token: String,
+    pub(crate) token: String,
     #[serde(rename = "device_authorization_endpoint")]
     device_authorization: Option<String>,
 }
 
+/// The HTTP client OAuth requests go through: rustls with aws-lc-rs, no
+/// redirects followed, so a token endpoint cannot bounce credentials
+/// elsewhere.
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthHttp(reqwest::Client);
+
+impl OAuthHttp {
+    /// # Errors
+    ///
+    /// Returns an error when the HTTP client cannot be built.
+    pub(crate) fn new() -> Result<Self> {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map(Self)
+            .map_err(|e| Error::Llm(format!("failed to build the OAuth HTTP client: {e}")))
+    }
+
+    /// Bridge from the `oauth2` crate's request type to this client; the
+    /// crate's own client would pull in `ring`.
+    pub(crate) fn sender(&self) -> impl Fn(oauth2::HttpRequest) -> HttpFuture + use<> {
+        let client = self.0.clone();
+        move |request| {
+            let client = client.clone();
+            Box::pin(async move {
+                let request = reqwest::Request::try_from(request)?;
+                let response = client.execute(request).await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.bytes().await?.to_vec();
+                let mut out = http::Response::builder().status(status).body(body)?;
+                *out.headers_mut() = headers;
+                Ok(out)
+            })
+        }
+    }
+
+    /// Read `{issuer_url}/.well-known/openid-configuration`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document cannot be fetched or lacks the
+    /// endpoints.
+    pub(crate) async fn discover(&self, issuer_url: &str) -> Result<Endpoints> {
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer_url.trim_end_matches('/')
+        );
+        tracing::debug!(url = %url, "discovering OAuth endpoints");
+        let response = self
+            .0
+            .get(&url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| Error::Llm(format!("OpenID discovery at {url} failed: {e}")))?;
+        response.json::<Endpoints>().await.map_err(|e| {
+            Error::Llm(format!(
+                "OpenID discovery at {url} returned no usable document: {e}"
+            ))
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-enum HttpError {
+pub(crate) enum HttpError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
     Http(#[from] http::Error),
 }
 
-type HttpFuture =
+pub(crate) type HttpFuture =
     Pin<Box<dyn Future<Output = std::result::Result<oauth2::HttpResponse, HttpError>> + Send>>;
 
 /// What the interface must show the user during a login.
@@ -146,7 +218,7 @@ pub struct TokenManager {
     provider: ProviderName,
     config: OAuthConfig,
     cache: TokenCache,
-    http: reqwest::Client,
+    http: OAuthHttp,
     endpoints: OnceCell<Endpoints>,
     current: RwLock<Option<CachedToken>>,
     /// One refresh or login at a time; others await it and reuse the result.
@@ -214,27 +286,6 @@ impl TokenManager {
         Ok(manager)
     }
 
-    /// Bridge from the `oauth2` crate's request type to the rustls + aws-lc-rs
-    /// reqwest client the rest of the crate uses. Redirects are refused, as the
-    /// crate's own client does, so a token endpoint cannot bounce credentials
-    /// elsewhere.
-    fn oauth_http(&self) -> impl Fn(oauth2::HttpRequest) -> HttpFuture + use<> {
-        let client = self.http.clone();
-        move |request| {
-            let client = client.clone();
-            Box::pin(async move {
-                let request = reqwest::Request::try_from(request)?;
-                let response = client.execute(request).await?;
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body = response.bytes().await?.to_vec();
-                let mut out = http::Response::builder().status(status).body(body)?;
-                *out.headers_mut() = headers;
-                Ok(out)
-            })
-        }
-    }
-
     /// A manager for `provider`, caching under `tokens_dir`.
     ///
     /// # Errors
@@ -246,16 +297,11 @@ impl TokenManager {
         config: OAuthConfig,
         key_source: KeySource,
     ) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Llm(format!("failed to build the OAuth HTTP client: {e}")))?;
         Ok(Self {
             provider: provider.clone(),
             config,
             cache: TokenCache::new(tokens_dir, provider, key_source),
-            http,
+            http: OAuthHttp::new()?,
             endpoints: OnceCell::new(),
             current: RwLock::new(None),
             refresh_lock: Mutex::new(()),
@@ -334,7 +380,7 @@ impl TokenManager {
     async fn refresh(&self, refresh: &SecretString) -> Result<CachedToken> {
         tracing::info!(provider = %self.provider, "refreshing the OAuth access token");
         let client = self.client().await?;
-        let http = self.oauth_http();
+        let http = self.http.sender();
         let response = client
             .exchange_refresh_token(&RefreshToken::new(refresh.expose_secret().to_owned()))
             .request_async(&http)
@@ -419,7 +465,7 @@ impl TokenManager {
             ))
         })??;
 
-        let http = self.oauth_http();
+        let http = self.http.sender();
         let response = client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(verifier)
@@ -432,7 +478,7 @@ impl TokenManager {
     async fn client_credentials(&self) -> Result<CachedToken> {
         tracing::info!(provider = %self.provider, "requesting a token with the client-credentials grant");
         let client = self.client().await?;
-        let http = self.oauth_http();
+        let http = self.http.sender();
         let response = client
             .exchange_client_credentials()
             .add_scopes(self.scopes())
@@ -452,7 +498,7 @@ impl TokenManager {
         notify: &(dyn Fn(LoginPrompt) + Sync),
     ) -> Result<CachedToken> {
         let client = self.client().await?;
-        let http = self.oauth_http();
+        let http = self.http.sender();
         let details: StandardDeviceAuthorizationResponse = client
             .exchange_device_code()
             .map_err(|_| {
@@ -521,7 +567,7 @@ impl TokenManager {
     async fn client(&self) -> Result<OAuthClient> {
         let endpoints = self
             .endpoints
-            .get_or_try_init(|| self.discover())
+            .get_or_try_init(|| self.http.discover(&self.config.issuer_url))
             .await?
             .clone();
         let parse = |what: &str, url: String| {
@@ -563,32 +609,12 @@ impl TokenManager {
         }
         Ok(client)
     }
-
-    async fn discover(&self) -> Result<Endpoints> {
-        let url = format!(
-            "{}/.well-known/openid-configuration",
-            self.config.issuer_url.trim_end_matches('/')
-        );
-        tracing::debug!(provider = %self.provider, url = %url, "discovering OAuth endpoints");
-        let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| Error::Llm(format!("OpenID discovery at {url} failed: {e}")))?;
-        response.json::<Endpoints>().await.map_err(|e| {
-            Error::Llm(format!(
-                "OpenID discovery at {url} returned no usable document: {e}"
-            ))
-        })
-    }
 }
 
 impl CachedToken {
     /// The token a token endpoint answered with; an answer without a
     /// lifetime gets the default one.
-    fn from_response<T: TokenResponse>(response: &T) -> Self {
+    pub(crate) fn from_response<T: TokenResponse>(response: &T) -> Self {
         let lifetime = response
             .expires_in()
             .and_then(|d| SignedDuration::try_from(d).ok())
@@ -607,7 +633,7 @@ impl CachedToken {
 
 /// 32 bytes of aws-lc-rs randomness as URL-safe base64: a PKCE verifier or
 /// a state value.
-fn random_token() -> Result<String> {
+pub(crate) fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     aws_lc_rs::rand::fill(&mut bytes)
         .map_err(|_| Error::Llm(String::from("random token generation failed")))?;

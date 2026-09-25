@@ -1,10 +1,9 @@
 //! The encrypted on-disk token cache: `<data_dir>/tokens/<provider>.json`.
 //!
-//! The file holds AES-256-GCM ciphertext under a 32-byte key that lives in
-//! the OS keychain (`keychain.rs`) or, when no keychain is usable, in a
-//! `<provider>.key` file beside the cache with mode 0600. The provider name is
-//! the associated data, so a cache copied under another provider's name does
-//! not decrypt.
+//! The file holds AES-256-GCM ciphertext under a 32-byte key in the
+//! provider's [`KeySlot`]: the OS keychain, or a `<provider>.key` file beside
+//! the cache with mode 0600. The provider name is the associated data, so a
+//! cache copied under another provider's name does not decrypt.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +14,7 @@ use jiff::Timestamp;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use super::keychain::KeychainEntry;
+use super::key_slot::{KeyLocation, KeySlot, KeySource, remove_if_present, write_private};
 use crate::config::ProviderName;
 use crate::error::{Error, Result};
 
@@ -54,15 +53,6 @@ impl CacheKey {
     }
 }
 
-/// Whether a missing key is made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyLookup {
-    /// Reading: no key means no token.
-    Existing,
-    /// Writing: a missing key is generated and stored.
-    CreateIfMissing,
-}
-
 /// A token as the cache holds it.
 #[derive(Clone)]
 pub struct CachedToken {
@@ -88,8 +78,9 @@ impl std::fmt::Debug for CachedToken {
     }
 }
 
+/// A token as it is serialized before sealing.
 #[derive(Serialize, Deserialize)]
-struct Plaintext {
+pub(crate) struct Plaintext {
     access_token: String,
     expires_at: Timestamp,
     refresh_token: Option<String>,
@@ -125,38 +116,12 @@ struct Envelope {
     ciphertext: String,
 }
 
-/// Where the cache's encryption key may be kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeySource {
-    /// The OS keychain, falling back to the key file when it is unusable.
-    Keychain,
-    /// Only the `<provider>.key` file (tests, and hosts with no keychain).
-    File,
-}
-
-/// Where a cache's key turned out to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyLocation {
-    Keychain,
-    File,
-}
-
-impl std::fmt::Display for KeyLocation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Keychain => "keychain",
-            Self::File => "key file",
-        })
-    }
-}
-
 /// One provider's cache file and its key.
 #[derive(Debug, Clone)]
 pub struct TokenCache {
     provider: ProviderName,
     path: PathBuf,
-    key_path: PathBuf,
-    key_source: KeySource,
+    key: KeySlot,
 }
 
 impl TokenCache {
@@ -165,8 +130,11 @@ impl TokenCache {
         Self {
             provider: provider.clone(),
             path: tokens_dir.join(format!("{provider}.json")),
-            key_path: tokens_dir.join(format!("{provider}.key")),
-            key_source,
+            key: KeySlot::new(
+                format!("oauth:{provider}"),
+                tokens_dir.join(format!("{provider}.key")),
+                key_source,
+            ),
         }
     }
 
@@ -184,15 +152,7 @@ impl TokenCache {
     /// keychain.
     #[must_use]
     pub fn key_location(&self) -> KeyLocation {
-        if self.key_path.exists() {
-            KeyLocation::File
-        } else {
-            KeyLocation::Keychain
-        }
-    }
-
-    fn keychain(&self) -> KeychainEntry {
-        KeychainEntry::new(&self.provider)
+        self.key.location()
     }
 
     /// Read and decrypt the cached token, or `None` when there is no cache or
@@ -208,13 +168,14 @@ impl TokenCache {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let Some(key) = self.key(KeyLookup::Existing).await? else {
+        let Some(key) = self.key.read().await? else {
             tracing::warn!(
                 provider = %self.provider,
                 "token cache exists but its encryption key is gone; a new login is needed"
             );
             return Ok(None);
         };
+        let key = CacheKey::decode(&key)?;
         let envelope: Envelope = serde_json::from_slice(&bytes)?;
         if envelope.version != FORMAT_VERSION {
             return Err(Error::Llm(format!(
@@ -258,9 +219,10 @@ impl TokenCache {
     /// file cannot be written.
     pub async fn store(&self, token: &CachedToken) -> Result<()> {
         let key = self
-            .key(KeyLookup::CreateIfMissing)
-            .await?
-            .ok_or_else(|| Error::Llm(String::from("token cache key could not be created")))?;
+            .key
+            .read_or_create(|| CacheKey::generate().map(|k| k.encode()))
+            .await?;
+        let key = CacheKey::decode(&key)?;
         let mut in_out = serde_json::to_vec(&Plaintext::from(token))?;
         let nonce = key
             .aead()?
@@ -281,91 +243,11 @@ impl TokenCache {
     ///
     /// # Errors
     ///
-    /// Returns an error when a file or keychain entry cannot be removed.
+    /// Returns an error when a file cannot be removed.
     pub async fn clear(&self) -> Result<()> {
         remove_if_present(&self.path)?;
-        remove_if_present(&self.key_path)?;
-        if self.key_source == KeySource::Keychain
-            && let Err(e) = self.keychain().delete().await
-        {
-            tracing::warn!(provider = %self.provider, error = %e, "keychain entry not removed");
-        }
-        Ok(())
+        self.key.delete().await
     }
-
-    /// The key, from the keychain when configured and usable, else the key
-    /// file.
-    async fn key(&self, lookup: KeyLookup) -> Result<Option<CacheKey>> {
-        if self.key_source == KeySource::Keychain {
-            match self.keychain_key(lookup).await {
-                Ok(key) => return Ok(key),
-                Err(e) => {
-                    tracing::warn!(provider = %self.provider, error = %e, "keychain unavailable; using the key file");
-                }
-            }
-        }
-        self.file_key(lookup)
-    }
-
-    async fn keychain_key(&self, lookup: KeyLookup) -> Result<Option<CacheKey>> {
-        let keychain = self.keychain();
-        if let Some(encoded) = keychain.get().await? {
-            return CacheKey::decode(&encoded).map(Some);
-        }
-        if lookup == KeyLookup::Existing {
-            return Ok(None);
-        }
-        let key = CacheKey::generate()?;
-        keychain.set(&key.encode()).await?;
-        Ok(Some(key))
-    }
-
-    fn file_key(&self, lookup: KeyLookup) -> Result<Option<CacheKey>> {
-        match std::fs::read_to_string(&self.key_path) {
-            Ok(encoded) => CacheKey::decode(&encoded).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if lookup == KeyLookup::Existing {
-                    return Ok(None);
-                }
-                let key = CacheKey::generate()?;
-                if let Some(dir) = self.key_path.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                write_private(&self.key_path, key.encode().as_bytes())?;
-                Ok(Some(key))
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-fn remove_if_present(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Write a file readable only by its owner.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(bytes)?;
-    file.flush()?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -416,17 +298,6 @@ mod tests {
         }));
         let raw = std::fs::read_to_string(cache.path());
         assert!(raw.is_ok_and(|r| !r.contains("at\"") && r.contains("ciphertext")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn private_files_are_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = temp();
-        let path = dir.path().join("k");
-        assert!(write_private(&path, b"x").is_ok());
-        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
-        assert!(mode.is_ok_and(|m| m == 0o600));
     }
 
     #[tokio::test]

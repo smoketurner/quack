@@ -42,8 +42,9 @@ and code — this file is the gate, the doc is the detail.
       reveal workspace content (documents, chunks, graph, ontology, context, sessions,
       messages, audit detail) lives in that file with a `_quack_` prefix, never in
       `control.db` (design doc section 5).
-- [ ] `control.db` holds only users, workspaces (name and label), membership, tokens, and
-      the access `audit_log`. `audit_log` is append-only: no `UPDATE`/`DELETE` path.
+- [ ] `control.db` holds only users, workspaces (name and label), membership, tokens
+      (API token hashes, and signed-in users' HPKE-sealed identity-provider tokens, whose
+      key is never in the database), and the access `audit_log`. `audit_log` is append-only: no `UPDATE`/`DELETE` path.
 - [ ] Every request that touches a workspace writes an `audit_log` row, including denied
       ones, and a `_quack_audit` detail row inside the workspace under the same UUID v7.
 - [ ] DuckDB internal statements use `duckdb::params!`; identifiers go through

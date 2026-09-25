@@ -55,6 +55,13 @@ impl Identity {
         if let Credential::Session(token) = &self.credential {
             app.sessions.close(token.as_str());
         }
+        // A signed-in user's token is kept for their sessions; the last one
+        // closing is the end of quack's use for it.
+        if let Some(oidc) = &app.oidc
+            && !app.sessions.has_sessions(&self.user_id)
+        {
+            oidc.forget(&app.control, &self.user_id).await?;
+        }
         let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
         app.control.record_audit(&entry).await?;
         Ok(jar.remove(SessionCookie::clear()))
