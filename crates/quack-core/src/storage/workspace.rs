@@ -1645,15 +1645,18 @@ impl WorkspaceDb {
                 })
             })?
             .collect::<duckdb::Result<Vec<_>>>()?;
-        let stale_nodes: u64 = if self.table_exists("_quack_graph_nodes")? {
+        let (stale_nodes, nodes_needing_embedding): (u64, u64) = if self
+            .table_exists("_quack_graph_nodes")?
+        {
             self.conn.query_row(
-                "SELECT count(*) FROM _quack_graph_nodes \
-                 WHERE embedding IS NOT NULL AND embedding_profile IS DISTINCT FROM ?",
-                duckdb::params![current],
-                |row| row.get(0),
+                "SELECT count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_profile IS DISTINCT FROM ?), \
+                        count(*) FILTER (WHERE embedding IS NULL OR embedding_profile IS DISTINCT FROM ?) \
+                 FROM _quack_graph_nodes",
+                duckdb::params![current, current],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?
         } else {
-            0
+            (0, 0)
         };
         Ok(EmbeddingStatus {
             profile: self.vectors.profile.clone(),
@@ -1662,6 +1665,7 @@ impl WorkspaceDb {
             missing_chunks,
             stale,
             stale_nodes,
+            nodes_needing_embedding,
         })
     }
 

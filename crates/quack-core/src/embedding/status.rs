@@ -32,6 +32,11 @@ pub struct EmbeddingStatus {
     pub stale: Vec<StaleVectors>,
     /// Graph nodes whose label vector is from another profile.
     pub stale_nodes: u64,
+    /// Graph nodes whose label vector needs re-embedding: missing
+    /// (`embedding IS NULL`, as `upsert_node` leaves a freshly-added node)
+    /// or made under another profile. The count `run` embeds, matching
+    /// what `count_nodes_needing_embedding` returns.
+    pub nodes_needing_embedding: u64,
 }
 
 impl EmbeddingStatus {
