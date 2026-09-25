@@ -211,8 +211,8 @@ impl OAuthEmbedding {
 impl EmbedModel {
     /// The client for `model`, whose provider must serve embeddings.
     async fn build(config: &Config, model: ModelRef<'_>) -> Result<Self> {
-        let ndims = usize::try_from(model.dimension()?.get())
-            .map_err(|e| Error::Config(format!("embedding_dimension overflow: {e}")))?;
+        let ndims = usize::try_from(config.embedding_dimension()?.get())
+            .map_err(|e| Error::Config(format!("[embedding].dimension overflow: {e}")))?;
         let (name, provider) = (model.provider_name, model.provider);
         match provider.provider_type {
             ProviderType::Ollama => Ok(Self::Ollama(OllamaEmbedder {
@@ -240,7 +240,7 @@ impl EmbedModel {
                     .embedding_model_with_ndims(model.model, ndims),
             )),
             ProviderType::Anthropic => Err(Error::Config(format!(
-                "embedding_model '{model}': anthropic does not serve embeddings"
+                "[embedding].model '{model}': anthropic does not serve embeddings"
             ))),
             ProviderType::Bedrock | ProviderType::BedrockMantle => Ok(Self::Bedrock(
                 bedrock::session(name, provider)
@@ -254,7 +254,7 @@ impl EmbedModel {
 
 impl Embeddings {
     /// The configured embedding model, or `None` when
-    /// `[general].embedding_model` is unset.
+    /// `[embedding].model` is unset.
     ///
     /// # Errors
     ///
@@ -277,11 +277,11 @@ impl Embeddings {
     ///
     /// # Errors
     ///
-    /// Returns an error if `[general].embedding_model` is unset or invalid.
+    /// Returns an error if `[embedding].model` is unset or invalid.
     pub async fn require(config: &Config) -> Result<Self> {
         Self::from_config(config).await?.ok_or_else(|| {
             Error::Config(format!(
-                "no embedding model configured — set [general].embedding_model = \"PROVIDER/MODEL\" in {}",
+                "no embedding model configured — set [embedding].model = \"PROVIDER/MODEL\" in {}",
                 config_file_path().display()
             ))
         })
@@ -1182,13 +1182,13 @@ mod tests {
     #[tokio::test]
     async fn required_embedding_model_errors_when_unset() {
         let err = Embeddings::require(&Config::default()).await.err();
-        assert!(err.is_some_and(|e| e.to_string().contains("embedding_model")));
+        assert!(err.is_some_and(|e| e.to_string().contains("[embedding].model")));
     }
 
     #[tokio::test]
     async fn api_key_mode_requires_the_env_var_to_be_set() {
         let config = parse(
-            "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"QUACK_TEST_KEY_THAT_IS_UNSET\"\nembedding_dimension = 4\n",
+            "[embedding]\nmodel = \"o/e\"\ndimension = 4\n[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"QUACK_TEST_KEY_THAT_IS_UNSET\"\n",
         );
         let err = Embeddings::require(&config).await.err();
         assert!(err.is_some_and(|e| e.to_string().contains("QUACK_TEST_KEY_THAT_IS_UNSET")));
@@ -1197,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn ollama_embedding_model_builds_without_a_key() {
         let config = parse(
-            "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n",
+            "[embedding]\nmodel = \"o/nomic\"\ndimension = 4\n[providers.o]\ntype = \"ollama\"\n",
         );
         let model = Embeddings::require(&config).await;
         assert!(model.is_ok_and(|m| m.profile().dimension == Dimension::new(4)));
@@ -1206,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn ollama_embed_requests_carry_a_bounded_window_and_keep_alive() {
         let config = parse(
-            "[general]\nembedding_model = \"o/nomic\"\n[providers.o]\ntype = \"ollama\"\nembedding_dimension = 4\n[ingestion]\nchunk_size_tokens = 3000\n",
+            "[embedding]\nmodel = \"o/nomic\"\ndimension = 4\n[providers.o]\ntype = \"ollama\"\n[ingestion]\nchunk_size_tokens = 3000\n",
         );
         let model = Embeddings::require(&config).await;
         let Some(EmbedModel::Ollama(embedder)) = model.as_ref().ok().map(Embedder::model) else {
@@ -1254,7 +1254,7 @@ mod tests {
     async fn oauth_provider_without_a_login_needs_auth_for_embeddings_and_chat() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = parse(
-            "[general]\nchat_model = \"az/gpt\"\nembedding_model = \"az/emb\"\n[providers.az]\ntype = \"openai\"\nauth = \"oauth\"\nembedding_dimension = 4\n[providers.az.oauth]\nissuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n",
+            "[embedding]\nmodel = \"az/emb\"\ndimension = 4\n[general]\nchat_model = \"az/gpt\"\n[providers.az]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.az.oauth]\nissuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n",
         );
         config.general.data_dir = dir.path().to_path_buf();
         let err = Embeddings::require(&config).await.err();
@@ -1277,7 +1277,7 @@ mod tests {
     async fn cancelled_turns_are_recorded_and_completed() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = parse(
-            "[general]\nchat_model = \"o/m\"\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 4\n",
+            "[embedding]\nmodel = \"o/e\"\ndimension = 4\n[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
         );
         config.general.data_dir = dir.path().to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));

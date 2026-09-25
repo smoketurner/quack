@@ -5,11 +5,30 @@ programs prove to `quack serve` who they are. Outbound, quack proves to each mod
 who is calling: quack itself, or the person who made the request. An operator configures
 the two directions separately. `[server]` and `[server.oidc]` control inbound
 authentication, and `[providers.NAME]` controls outbound. The two directions can share one
-identity provider (the organization's OpenID Connect or OAuth server, such as Microsoft
-Entra ID, Okta, or Auth0), but neither requires the other.
+identity provider, but neither requires the other.
 
 Design doc sections 10.2 and 12 record why quack works this way. [`crypto.md`](crypto.md)
 covers the cryptography.
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| Identity provider, issuer | The organization's sign-in service, such as Microsoft Entra ID, Okta, or Auth0. It issues tokens. |
+| OAuth 2.0 | The standard protocol for issuing access tokens. |
+| OpenID Connect (OIDC) | A sign-in layer on OAuth 2.0 that adds the ID token. |
+| Access token | A short-lived credential that lets its holder call an API (application programming interface). |
+| ID token | A signed statement of who signed in, for the application the person signed in to. |
+| Refresh token | A longer-lived credential that obtains new access tokens without a new sign-in. |
+| Bearer | A token sent in the HTTP (Hypertext Transfer Protocol) `Authorization: Bearer` header; whoever holds it can use it. |
+| JWT (JSON Web Token) | A signed token format with readable claims such as `iss` (issuer), `sub` (subject), `aud` (audience), and `exp` (expiry). |
+| JWKS (JSON Web Key Set) | The public keys an issuer publishes at its `jwks_uri` so others can check its JWT signatures. |
+| PKCE (Proof Key for Code Exchange) | A secret the client proves at the token endpoint, so a stolen sign-in code is useless. |
+| MCP (Model Context Protocol) | The protocol that AI clients such as Claude Code use to call tools; quack serves it at `/mcp/v1/{workspace}`. |
+| RFC (Request for Comments) | A standard from the Internet Engineering Task Force, cited here by number. |
+| HPKE (Hybrid Public Key Encryption) | The encryption scheme the vault uses for stored tokens (RFC 9180). |
+| DPoP (Demonstrating Proof of Possession) | A scheme that binds a token to a key its client holds (RFC 9449). |
+| SigV4 | The AWS (Amazon Web Services) request-signing scheme. |
 
 | Direction | Mode | What the caller presents | How to turn it on |
 |---|---|---|---|
@@ -30,9 +49,9 @@ covers the cryptography.
 
 Only `quack serve` authenticates callers. The terminal session, print mode (`-p` and `-q`),
 `quack ingest`, and `quack mcp` on stdio run as the operating-system user who starts them.
-Anyone who can run the binary against a data directory can read everything in it, so quack
-creates that directory with mode `0700`, and `quack doctor` warns when other users can read
-it. `control.db` does not audit these interfaces.
+Anyone who can run the binary against a data directory can read everything in it. quack
+therefore creates that directory with mode `0700`, and `quack doctor` warns when other users
+can read it. `control.db` does not audit these interfaces.
 
 `quack serve --local` turns authentication off. One implicit owner holds every workspace,
 and the server refuses to bind any address other than loopback. This mode serves one person
@@ -41,8 +60,8 @@ who wants the browser on their own machine.
 ### How `quack serve` decides who is calling
 
 One extractor, `server::auth`, handles every request to the REST API, the MCP endpoint, and
-the web UI. It reads the bearer from the `Authorization: Bearer` header, or else the
-`quack_session` cookie, and tries three kinds of credential in this order:
+the web user interface (UI). It reads the bearer from the `Authorization: Bearer` header, or
+else the `quack_session` cookie, and tries three kinds of credential in this order:
 
 1. A session (`qs_…`), which a password login or an OpenID Connect sign-in opened.
 2. An identity-provider access token, when `[server.oidc].audience` is set and the bearer
@@ -68,10 +87,10 @@ quack user add alice            # prompts for the password; reads stdin when it 
 quack user add admin --admin
 ```
 
-quack hashes passwords with argon2id. The web form (`POST /login`) and the API
-(`POST /api/v1/auth/login`) both check the password and open a session. A session token is
-`qs_` followed by 32 random bytes. quack holds sessions in memory only, so a restart signs
-every user out.
+quack hashes passwords with argon2id, a password-hashing function built to resist guessing.
+The web form (`POST /login`) and the API (`POST /api/v1/auth/login`) both check the password
+and open a session. A session token is `qs_` followed by 32 random bytes. quack holds
+sessions in memory only, so a restart signs every user out.
 
 The session cookie carries `HttpOnly`, `SameSite=Lax`, and `Path=/`. It also carries
 `Secure` unless the request arrived from loopback. A session ends 12 hours after login
@@ -125,19 +144,19 @@ sequenceDiagram
 ```
 
 The callback must come from the browser that started the sign-in. quack compares the
-callback's `state` with a cookie it set on that browser when the sign-in began, so a
-callback link that someone else started cannot sign this browser in. A pending sign-in
+callback's `state` with a cookie it set on that browser when the sign-in began. A callback
+link that someone else started therefore cannot sign this browser in. A pending sign-in
 expires after 10 minutes, quack accepts each `state` once, and quack holds at most 10,000
 pending sign-ins at a time. When the redirect names an issuer in its `iss` parameter, that
 issuer must be the configured one; an issuer that advertises
 `authorization_response_iss_parameter_supported` must always send it (RFC 9207). This check
 stops a response from one server from passing as another's.
 
-The ID token arrives directly from the token endpoint over TLS. OpenID Connect Core 3.1.3.7
-accepts that channel in place of a signature check, so quack verifies the claims instead:
-`iss` must match the discovery document, `aud` and `azp` must name quack's client, `exp`
-must not have passed (with 60 seconds of leeway), and `nonce` must equal the value quack
-sent.
+The ID token arrives from the token endpoint over TLS (Transport Layer Security). OpenID
+Connect Core 3.1.3.7 accepts that channel in place of a signature check. quack checks four
+claims instead. `iss` must match the discovery document. `aud` and `azp` must name quack's
+client. `exp` must not have passed, with 60 seconds of leeway. `nonce` must equal the value
+quack sent.
 
 The claim named by `subject_claim` identifies the person. The default is `sub`. Entra ID
 gives one person a different `sub` in every application, so Entra deployments set `oid`.
@@ -171,14 +190,14 @@ audience = "api://quack"   # the aud of access tokens for quack; see the provide
 quack verifies each token with `jsonwebtoken` on aws-lc-rs, against the keys published at
 the issuer's `jwks_uri`. It caches those keys for one hour. A token signed with an unknown
 key causes one fetch, at most once a minute, which covers key rotation without letting
-invalid tokens flood the issuer. quack accepts asymmetric signature algorithms only, and
-requires `iss` to be the issuer, `aud` to be the configured audience, and `exp` to be in the
-future (with 60 seconds of leeway). The token must also carry a `scp` or `scope` claim. An
-ID token can carry the same `aud` as an access token but carries no scope, so this rule
+invalid tokens flood the issuer. quack accepts asymmetric signature algorithms only. It
+requires `iss` to be the issuer and `aud` to be the configured audience. `exp` must be in
+the future, with 60 seconds of leeway. The token must also carry a `scp` or `scope` claim.
+An ID token can carry the same `aud` as an access token but carries no scope, so this rule
 refuses ID tokens.
 
-The token identifies its user through `subject_claim`, exactly as a sign-in does, so one
-person maps to one quack user however they arrive. quack creates a person it has not seen
+The token identifies its user through `subject_claim`, as a sign-in does. One person
+therefore maps to one quack user however they arrive. quack creates a person it has not seen
 before with no access, and the token then carries that user's own memberships. quack answers
 a refused token with `401` and audits it as a denied `token`.
 
@@ -232,8 +251,8 @@ bearer. The `grant` setting decides how quack obtains it:
 
 | `grant` | Who signs in | How the token renews |
 |---|---|---|
-| `authorization-code` (the default) | A person, in a browser. quack runs PKCE and catches the redirect on a loopback listener at `redirect_uri`. | Silently, with the refresh token. |
-| `device-code` | A person, who enters a code on another device (useful over SSH, or without a browser). | Silently, with the refresh token. |
+| `authorization-code` (the default) | A person, in a browser. quack runs PKCE and catches the redirect on a loopback listener at `redirect_uri`. | With the refresh token, without a new sign-in. |
+| `device-code` | A person, who enters a code on another device (for SSH sessions, or hosts without a browser). | With the refresh token, without a new sign-in. |
 | `client-credentials` | Nobody. quack authenticates as itself with `client_id` and the secret in `client_secret_env`. | quack runs the grant again. |
 
 ```toml
@@ -258,10 +277,11 @@ quack auth status           # each OAuth provider: when its token expires, how i
 quack auth logout azure
 ```
 
-quack reuses a token while more than 60 seconds remain, then renews it under one lock, so
-concurrent requests share one renewal. When a person must sign in and cannot, because the
-caller is a server or print mode, quack fails with "needs a login; run `quack auth login
-NAME`": exit code 4 from the CLI, `503` from the server. A `client-credentials` provider
+quack reuses a token while more than 60 seconds remain. It then renews the token under one
+lock, so concurrent requests share one renewal. Sometimes a person must sign in and cannot,
+because the caller is a server or print mode. quack then fails with "needs a login; run
+`quack auth login NAME`". The command-line interface (CLI) exits with code 4, and the
+server answers `503`. A `client-credentials` provider
 needs no login; its first request obtains a token, and `quack auth login` only checks the
 credentials. quack stores the token sealed in `control.db` (`provider_tokens`), so one login
 serves every later process that uses the same data directory, including `quack serve`.
@@ -333,12 +353,15 @@ configured exchange.
 
 ### AWS (Bedrock)
 
-`bedrock` and `bedrock-mantle` providers sign requests with the AWS SDK's default
-credential chain, the same chain the AWS CLI uses. The chain checks environment variables;
-then the profile named by `aws_profile` (else `AWS_PROFILE`, else `default`), including
-`role_arn`, `source_profile`, `credential_process`, and IAM Identity Center
-(`aws sso login`); then EKS web identity; then ECS and EC2 instance roles. quack stores
-nothing, and the SDK caches and refreshes the credentials. Design doc 10.2 has the details.
+`bedrock` and `bedrock-mantle` providers sign requests with the default credential chain of
+the AWS SDK (software development kit), the same chain the AWS CLI uses. The chain checks
+four places in order. First come environment variables. Next comes the profile named by
+`aws_profile` (else `AWS_PROFILE`, else `default`), with its `role_arn`, `source_profile`,
+`credential_process`, and IAM (Identity and Access Management) Identity Center (`aws sso
+login`) settings. Then comes web identity on EKS (Elastic Kubernetes Service). Last come the
+instance roles of ECS (Elastic Container Service) and EC2 (Elastic Compute Cloud). quack
+stores nothing; the SDK caches and refreshes the credentials. Design doc 10.2 has the
+details.
 
 ## Where quack keeps secrets
 
@@ -354,17 +377,19 @@ nothing, and the SDK caches and refreshes the credentials. Design doc 10.2 has t
 | Client secrets and API keys | the environment variables the config names | the process environment |
 | AWS credentials | the AWS SDK's own locations | the SDK |
 
-The vault seals each value with HPKE (RFC 9180), using DHKEM(P-256, HKDF-SHA256),
-HKDF-SHA256, and AES-256-GCM. It binds each value to its purpose and its owner, so a sealed
-row copied to another user or provider fails to open. The vault key never sits in the
-database it protects.
+The vault seals each value with HPKE, using the suite DHKEM(P-256, HKDF-SHA256),
+HKDF-SHA256, AES-256-GCM: a P-256 elliptic-curve key exchange, a SHA-256 key derivation, and
+AES-256 encryption with authentication. It binds each value to its purpose and its owner, so
+a sealed row copied to another user or provider fails to open. The vault key never sits in
+the database it protects.
 
 Three operational consequences follow. First, Linux keeps the kernel keyring in memory, so
-after a reboot the vault key is gone: users must sign in again, and each OAuth provider needs
-`quack auth login` again. Second, Docker's default seccomp profile blocks the keyring, so in
-a container quack writes the key to `vault.key` on the data volume. Third, a backup of
-`control.db` without the vault key cannot open the tokens in it, which is intended; restore
-the key with the database, or plan for every user to sign in again.
+after a reboot the vault key is gone: users must sign in again, and each OAuth provider
+needs `quack auth login` again. Second, Docker's default seccomp profile (the system-call
+filter on containers) blocks the keyring, so in a container quack writes the key to
+`vault.key` on the data volume. Third, a backup of `control.db` without the vault key cannot
+open the tokens in it, by design. Restore the key with the database, or plan for every user
+to sign in again.
 
 ## Provider notes
 
@@ -376,14 +401,14 @@ yet been tested against a live tenant of any of them.
 `https://<server>/auth/oidc/callback` as a Web redirect URI, create a client secret for
 `client_secret_env`, and set `subject_claim = "oid"`, because Entra gives one person a
 different `sub` in each application. To accept access tokens, expose an API on the app
-registration and set `requestedAccessTokenVersion` to `2` in its manifest (older manifests
-call the setting `accessTokenAcceptedVersion`); v1.0 tokens carry the issuer
+registration. Set `requestedAccessTokenVersion` to `2` in its manifest; older manifests call
+the setting `accessTokenAcceptedVersion`. Version 1.0 tokens carry the issuer
 `https://sts.windows.net/{tenant_id}/`, which does not match. Set `audience` to the API's
-client ID, a GUID, because a v2.0 token's `aud` is always the client ID and never the
-Application ID URI. Entra access tokens carry `scp`. For on-behalf-of, set
-`exchange = "entra"` and list the downstream API's scope, for example
-`scopes = ["https://cognitiveservices.azure.com/.default"]`. The person's token must be an
-access token for quack's own API, so add that API's scope (for example
+client ID, a GUID (globally unique identifier). A version 2.0 token's `aud` is always the
+client ID, never the Application ID URI. Entra access tokens carry `scp`. For on-behalf-of,
+set `exchange = "entra"` and list the downstream API's scope, for example `scopes =
+["https://cognitiveservices.azure.com/.default"]`. The person's token must be an access
+token for quack's own API, so add that API's scope (for example
 `api://<quack-client-id>/access_as_user`) to `[server.oidc].scopes`.
 
 **Okta.** Use a custom authorization server, such as `https://{domain}/oauth2/default`. The
@@ -391,24 +416,24 @@ org authorization server issues access tokens only for Okta's own APIs. Enable t
 Token grant on the application so `offline_access` returns a refresh token. Set `audience`
 to the authorization server's Audience; for `default`, that is `api://default`. Okta access
 tokens carry `scp` as an array. For on-behalf-of, create an API Services application with
-the Token Exchange grant, set `client_auth = "client_secret_basic"` to match Okta's
-default, and set `audience` to the downstream authorization server's audience. Token
-exchange across two authorization servers requires Okta's trusted servers and an NHI
-subscription bought or renewed on or after August 14, 2026.
+the Token Exchange grant, set `client_auth = "client_secret_basic"` to match Okta's default,
+and set `audience` to the downstream authorization server's audience. Token exchange across
+two authorization servers requires Okta's trusted servers. It also requires an NHI
+(non-human identity) subscription bought or renewed on or after August 14, 2026.
 
 **Auth0.** Set `issuer_url` to `https://{tenant}.auth0.com/` or to your custom domain. Set
 `audience` to the API's Identifier, and enable "Allow Offline Access" on the API for refresh
-tokens. Auth0 issues a JWT access token only when the client asks for an audience; quack's
-own sign-in cannot ask for one yet, but a client that obtains its own token, such as an MCP
-client, can use it with quack. For on-behalf-of, turn on On-Behalf-Of Token Exchange on
+tokens. Auth0 issues a JWT access token only when the client asks for an audience.
+quack's own sign-in cannot ask for one yet. A client that obtains its own token, such as an
+MCP client, can use it with quack. For on-behalf-of, turn on On-Behalf-Of Token Exchange on
 quack's own client (the one that performs the exchange) and set `audience` to the
 downstream API's identifier.
 
 **Vouch** ([vouch.sh](https://vouch.sh)). Vouch binds every token to the client's key with
 DPoP (RFC 9449), which quack does not yet support (#216). Vouch offers only the `openid` and
 `email` scopes, so set `scopes = ["openid", "email"]`. It issues no refresh tokens, so a
-sign-in lasts for Vouch's session. Its token exchange accepts only tokens Vouch issued, which
-matches on-behalf-of once DPoP support exists.
+sign-in lasts for Vouch's session. Its token exchange accepts only tokens Vouch issued,
+which matches on-behalf-of once DPoP support exists.
 
 ## Troubleshooting
 
@@ -420,12 +445,12 @@ under its configured name, and, with `audience`, how many signing keys the issue
 `--offline` skips every network check. `quack config` lists every setting in force and where
 each value came from.
 
-The following errors come up most often:
+Six errors and their fixes:
 
-- "provider 'X' needs a login" (exit 4, or `503` from the server): run
-  `quack auth login X` as the operating-system user the server runs as, on the same data
+- "provider 'X' needs a login" (exit 4, or `503` from the server). Run
+  `quack auth login X` as the operating-system user the server runs as. Use the same data
   directory.
-- "provider 'X' acts on behalf of the signed-in person and could not": the request came from
+- "provider 'X' acts on behalf of the signed-in person and could not". The request came from
   the CLI, the terminal, local mode, or a user with no current identity-provider token. Sign
   in through the issuer, or use a provider that does not act on behalf of users.
 - "access token refused: InvalidAudience": the token's `aud` differs from
@@ -443,7 +468,8 @@ The following errors come up most often:
 ## FAQ
 
 **Can password users and signed-in users coexist?** Yes. Both kinds of login open the same
-kind of session. On-behalf-of providers serve only users who have an identity-provider token.
+kind of session. On-behalf-of providers serve only users who have an identity-provider
+token.
 
 **Do users need a quack API token to use MCP?** Not when `[server.oidc].audience` is set. An
 MCP client can sign the user in with the identity provider and present that access token.

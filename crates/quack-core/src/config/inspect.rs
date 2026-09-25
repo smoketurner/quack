@@ -297,15 +297,7 @@ pub struct ConfigFile<'a> {
 /// through serde and compares the field names it reports with this list,
 /// so the two cannot drift.
 const SECTIONS: &[(&str, &[&str])] = &[
-    (
-        "general",
-        &[
-            "data_dir",
-            "default_workspace",
-            "chat_model",
-            "embedding_model",
-        ],
-    ),
+    ("general", &["data_dir", "default_workspace", "chat_model"]),
     (
         "ingestion",
         &[
@@ -319,7 +311,13 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "embedding",
-        &["query_prefix", "document_prefix", "similarity_prefix"],
+        &[
+            "model",
+            "dimension",
+            "query_prefix",
+            "document_prefix",
+            "similarity_prefix",
+        ],
     ),
     (
         "retrieval",
@@ -401,7 +399,6 @@ const PROVIDER_KEYS: &[&str] = &[
     "aws_profile",
     "api",
     "region",
-    "embedding_dimension",
     "max_concurrent_requests",
     "oauth",
 ];
@@ -474,8 +471,6 @@ fn general(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     );
     let chat_model = general.chat_model.as_ref().map(ModelSpec::to_string);
     s.optional_text("chat_model", chat_model.as_deref(), Some(ENV_MODEL));
-    let embedding_model = general.embedding_model.as_ref().map(ModelSpec::to_string);
-    s.optional_text("embedding_model", embedding_model.as_deref(), None);
 }
 
 /// One section per configured provider, and one more for its `oauth`
@@ -515,11 +510,7 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                     None,
                 );
             }
-            s.optional(
-                "embedding_dimension",
-                provider.embedding_dimension.map(|d| d.to_string()),
-                None,
-            );
+
             s.optional(
                 "max_concurrent_requests",
                 provider.max_concurrent_requests.map(|n| n.to_string()),
@@ -608,17 +599,22 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
     );
 }
 
-/// The prefix in force for each role: the file's, else the built-in one
-/// for the configured model's family, which is also the default shown.
+/// The model, its width, and the prefix in force for each role: the
+/// file's, else the built-in one for the model's family, which is also the
+/// default shown.
 fn embedding(inventory: &mut Inventory<'_>, config: &Config) {
-    let model = config
-        .general
-        .embedding_model
-        .as_ref()
-        .map_or("", ModelSpec::model);
+    let spec = config.embedding.model.as_ref();
+    let model = spec.map_or("", ModelSpec::model);
     let prompts = ResolvedPrompts::for_model(config, model).prompts;
     let builtin = Family::of(model).map(Family::prompts);
     let mut s = inventory.section("embedding");
+    let spec = spec.map(ModelSpec::to_string);
+    s.optional_text("model", spec.as_deref(), None);
+    s.optional(
+        "dimension",
+        config.embedding.dimension.map(|d| d.to_string()),
+        None,
+    );
     for (key, value, default) in [
         (
             "query_prefix",
@@ -1151,7 +1147,10 @@ chat_model = "ollama/llama3.1:8b"
 [providers.ollama]
 type = "ollama"
 base_url = "http://localhost:11434"
-embedding_dimension = 768
+
+[embedding]
+model = "ollama/nomic-embed-text"
+dimension = 768
 
 [retrieval]
 top_k = 3
@@ -1288,7 +1287,10 @@ top_k = 3
             found.contains(&("analysis.top_k", Some("[retrieval].top_k"))),
             "{found:?}"
         );
-        assert!(found.contains(&("providers.o.model", None)), "{found:?}");
+        assert!(
+            found.contains(&("providers.o.model", Some("[embedding].model"))),
+            "{found:?}"
+        );
         assert!(
             found.contains(&("providers.o.oauth.tenant", None)),
             "{found:?}"
@@ -1341,7 +1343,7 @@ top_k = 3
     fn every_provider_key_has_a_setting() {
         let inspection = inspect(
             "[providers.p]\ntype = \"openai\"\nauth = \"oauth\"\n\
-             base_url = \"https://e\"\nembedding_dimension = 1536\n\
+             base_url = \"https://e\"\n\
              [providers.p.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n",
         );
         let listed: BTreeSet<String> = inspection.settings.iter().map(Setting::path).collect();

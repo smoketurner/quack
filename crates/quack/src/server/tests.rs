@@ -3843,7 +3843,8 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
     // An embedding model the job cannot reach: the refresh starts, then
     // fails in the background with the provider's error.
     let mut config = Config::default();
-    config.general.embedding_model = Some(
+    config.embedding.dimension = Some(Dimension::new(4));
+    config.embedding.model = Some(
         "ollama/embeddinggemma"
             .parse()
             .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
@@ -3857,7 +3858,6 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
                 BaseUrl::try_from(String::from("http://127.0.0.1:9"))
                     .unwrap_or_else(|e| fail(&e.to_string())),
             ),
-            embedding_dimension: Some(Dimension::new(4)),
             ..ProviderConfig::new(ProviderType::Ollama)
         },
     );

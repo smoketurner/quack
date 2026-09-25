@@ -512,8 +512,8 @@ async fn check_embedding_model(
                  documents ingested now are stored without vectors",
             )
             .fix(
-                "for semantic search set [general].embedding_model, e.g. \
-                 \"ollama/nomic-embed-text\" with embedding_dimension = 768 on the provider",
+                "for semantic search set model and dimension under [embedding], e.g. \
+                 model = \"ollama/nomic-embed-text\" and dimension = 768",
             ),
         ),
         Ok(Some(model)) => {
@@ -522,7 +522,7 @@ async fn check_embedding_model(
             if let (Some(http), ProviderType::Ollama, Some(configured)) = (
                 http,
                 model.provider.provider_type,
-                model.provider.embedding_dimension,
+                config.embedding.dimension,
             ) {
                 let base = model
                     .provider
@@ -631,21 +631,18 @@ fn width_check(
         Check::new(
             Area::Embeddings,
             Status::Ok,
-            format!("{model}: makes {reported}-dimensional vectors, as embedding_dimension says"),
+            format!("{model}: makes {reported}-dimensional vectors, as [embedding].dimension says"),
         )
     } else {
         Check::new(
             Area::Embeddings,
             Status::Fail,
             format!(
-                "{model}: makes {reported}-dimensional vectors but embedding_dimension is \
+                "{model}: makes {reported}-dimensional vectors but [embedding].dimension is \
                  {configured}; every embedding call fails until they agree"
             ),
         )
-        .fix(format!(
-            "set embedding_dimension = {reported} under [providers.{}]",
-            model.provider_name
-        ))
+        .fix(format!("set dimension = {reported} under [embedding]"))
     })
 }
 
@@ -1235,8 +1232,8 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test")]
     fn embedding_config(model: &str, extra: &str) -> Config {
         let config: Config = toml::from_str(&format!(
-            "[general]\nembedding_model = \"o/{model}\"\n[providers.o]\ntype = \"ollama\"\n\
-             embedding_dimension = 1024\n{extra}"
+            "[providers.o]\ntype = \"ollama\"\n\
+             [embedding]\nmodel = \"o/{model}\"\ndimension = 1024\n{extra}"
         ))
         .unwrap();
         config
@@ -1265,7 +1262,7 @@ mod tests {
         );
         assert_eq!(
             wrong.fix.as_deref(),
-            Some("set embedding_dimension = 768 under [providers.o]")
+            Some("set dimension = 768 under [embedding]")
         );
         assert_eq!(
             width_check(model, Dimension::new(768), Ok(gemma()))
@@ -1290,7 +1287,7 @@ mod tests {
             ("all-minilm", "", Status::Ok, "takes no input prefixes"),
             (
                 "embeddinggemma",
-                "[embedding]\nquery_prefix = \"q: \"\n",
+                "query_prefix = \"q: \"\n",
                 Status::Ok,
                 "from [embedding]",
             ),

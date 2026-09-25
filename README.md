@@ -77,11 +77,13 @@ with Ollama:
 ```toml
 [general]
 chat_model = "ollama/gpt-oss:20b"
-embedding_model = "ollama/qwen3-embedding:0.6b"
+
+[embedding]
+model = "ollama/qwen3-embedding:0.6b"
+dimension = 1024
 
 [providers.ollama]
 type = "ollama"
-embedding_dimension = 1024
 ```
 
 quack supports Ollama, OpenAI-compatible endpoints, Anthropic, and Amazon Bedrock, with no
@@ -106,7 +108,7 @@ aws_profile = "my-sso-profile"
 ```
 
  `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data directories.
-`embedding_dimension` must be the width your embedding model produces; `quack doctor`
+`[embedding].dimension` must be the width your embedding model produces; `quack doctor`
 checks it. quack adds the query and document prefixes each known embedding model was
 trained with (`[embedding]` overrides them). After you change the embedding model, its
 width, or those prefixes, `quack embeddings refresh -w NAME` updates each workspace's vectors. Until

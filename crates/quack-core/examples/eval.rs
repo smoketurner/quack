@@ -137,23 +137,20 @@ async fn run() -> Result<Report> {
 
 fn eval_config(data_dir: &Path) -> Result<Config> {
     let mut providers = BTreeMap::new();
-    providers.insert(
-        "eval".parse()?,
-        ProviderConfig {
-            embedding_dimension: Some(Dimension::new(HASH_DIM_U32)),
-            ..ProviderConfig::new(ProviderType::Ollama)
-        },
-    );
+    providers.insert("eval".parse()?, ProviderConfig::new(ProviderType::Ollama));
     Ok(Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
             default_workspace: String::from("eval"),
             chat_model: None,
-            embedding_model: Some("eval/hash-embedder".parse()?),
         },
         providers,
         ingestion: IngestionConfig::default(),
-        embedding: EmbeddingConfig::default(),
+        embedding: EmbeddingConfig {
+            model: Some("eval/hash-embedder".parse()?),
+            dimension: Some(Dimension::new(HASH_DIM_U32)),
+            ..EmbeddingConfig::default()
+        },
         retrieval: RetrievalConfig::default(),
         context: ContextConfig::default(),
         analysis: AnalysisConfig::default(),

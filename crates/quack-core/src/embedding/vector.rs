@@ -54,8 +54,8 @@ impl WidthMismatch {
     pub fn for_model(self, model: &str) -> Error {
         let Self { expected, actual } = self;
         Error::Config(format!(
-            "{model} returned {actual}-dimensional vectors but its provider's \
-             embedding_dimension is {expected}; set embedding_dimension = {actual}"
+            "{model} returned {actual}-dimensional vectors but [embedding].dimension \
+             is {expected}; set dimension = {actual} under [embedding]"
         ))
     }
 }
