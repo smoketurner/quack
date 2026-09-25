@@ -217,7 +217,7 @@ impl EmbedModel {
                 num_ctx: OllamaEmbedder::context_window(config.ingestion.chunk_size_tokens),
             })),
             ProviderType::Openai if let Some(oauth) = provider.auth.oauth() => {
-                let manager = oauth::TokenManager::shared(&config.tokens_dir(), name, oauth)?;
+                let manager = oauth::TokenManager::shared(config, name, oauth)?;
                 // Fail here, typed, when no login exists; later batches
                 // refresh on their own.
                 drop(manager.access_token().await?);
@@ -497,7 +497,7 @@ impl ProviderAuth {
                 ))),
             },
             Self::Oauth(oauth) => {
-                let manager = oauth::TokenManager::shared(&config.tokens_dir(), name, oauth)?;
+                let manager = oauth::TokenManager::shared(config, name, oauth)?;
                 let token = manager.access_token().await?;
                 Ok(Some(token.expose_secret().to_owned()))
             }

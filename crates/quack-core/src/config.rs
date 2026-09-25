@@ -122,10 +122,11 @@ impl Default for GeneralConfig {
     }
 }
 
-/// A `[providers.NAME]` key. It names the provider's OAuth cache and key
-/// files, so it is checked when the config is read: ASCII letters, digits,
-/// `_`, `-`, and `.`, not starting with `.`, at most 64 characters. Nothing
-/// it names can leave the tokens directory.
+/// A `[providers.NAME]` key. It is typed on the command line (`quack auth
+/// login NAME`), keys the provider's sealed token in `control.db`, and is
+/// the subject that token is sealed for, so it is checked when the config is
+/// read: ASCII letters, digits, `_`, `-`, and `.`, not starting with `.`, at
+/// most 64 characters.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ProviderName(String);
@@ -1246,12 +1247,6 @@ impl Config {
             .transpose()
     }
 
-    /// Directory holding the encrypted OAuth token caches, one per provider.
-    #[must_use]
-    pub fn tokens_dir(&self) -> PathBuf {
-        self.general.data_dir.join("tokens")
-    }
-
     #[must_use]
     pub fn control_db_path(&self) -> PathBuf {
         self.general.data_dir.join("control.db")
@@ -1275,7 +1270,7 @@ impl Config {
     /// Ensure the data directory and its subdirectories exist. A data
     /// directory this call creates is private to the user (0700 on Unix):
     /// it holds every workspace's content, the control database, and the
-    /// OAuth token caches. An existing one keeps its mode, which
+    /// vault key file. An existing one keeps its mode, which
     /// `quack doctor` reports when others can read it.
     ///
     /// # Errors
@@ -1534,7 +1529,7 @@ rerank = "model"
     }
 
     #[test]
-    fn provider_names_that_could_leave_the_tokens_directory_are_rejected() {
+    fn provider_names_outside_the_allowed_characters_are_rejected() {
         for bad in ["../evil", ".hidden", "a/b", "a\\\\b", "", "sp ace"] {
             let toml_text = format!("[providers.\"{bad}\"]\ntype = \"ollama\"\n");
             assert!(err_of(&toml_text).contains("provider name"), "{bad:?}");
@@ -1732,7 +1727,6 @@ rerank = "model"
                 && o.scopes.len() == 2
                 && o.client_secret_env.as_deref() == Some("AZURE_CLIENT_SECRET")
         }));
-        assert_eq!(config.tokens_dir(), config.general.data_dir.join("tokens"));
     }
 
     #[test]
