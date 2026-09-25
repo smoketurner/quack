@@ -92,6 +92,7 @@ impl From<CoreError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+            CoreError::SignIn(_) => StatusCode::UNAUTHORIZED,
             CoreError::Config(_)
             | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }
@@ -107,6 +108,7 @@ impl From<CoreError> for ApiError {
             | CoreError::DuckDb(_)
             | CoreError::Embedding(_)
             | CoreError::Llm(_)
+            | CoreError::Vault(_)
             | CoreError::Ingestion(_)
             | CoreError::Io(_)
             | CoreError::TomlParse(_)

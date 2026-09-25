@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
+
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
@@ -17,6 +19,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
+use super::oidc::Oidc;
 use crate::mcp::McpServer;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::storage::control::{ControlPlane, random_bytes};
@@ -54,6 +57,9 @@ pub(crate) struct AppState {
         tokio::sync::Mutex<HashMap<WorkspaceId, Arc<tokio::sync::OnceCell<WorkspaceHandle>>>>,
     /// Browser and API-login sessions.
     pub sessions: WebSessions,
+    /// Sign-in through `[server.oidc]`'s issuer, when configured and not in
+    /// local mode.
+    pub oidc: Option<Oidc>,
     /// Every background job: uploads, extraction and proposal runs, agent
     /// turns. Its registry is in memory, so workspace content in a job's
     /// label never reaches `control.db`.
@@ -74,12 +80,18 @@ struct WebSession {
     started: Instant,
     /// The last request that presented it, against `session_idle`.
     last_seen: Instant,
+    /// When the identity provider's token behind a sign-in must be renewed,
+    /// which is when the issuer is next asked whether the person may still
+    /// be signed in. `None` for a password login, or a sign-in the issuer
+    /// gave no refresh token for. Wall-clock, since the issuer's expiry is.
+    renew_at: Option<Timestamp>,
 }
 
 /// What a presented session token resolved to.
 pub(crate) enum SessionLookup {
-    /// A live session, belonging to this user id.
-    Active(UserId),
+    /// A live session, belonging to this user id; `renewal_due` when its
+    /// sign-in must be renewed before the request goes on.
+    Active { user_id: UserId, renewal_due: bool },
     /// The token named a session that had outlived one of its bounds. It is
     /// gone now; the caller must log in again.
     Expired,
@@ -122,7 +134,12 @@ pub(crate) struct McpEntry {
 pub(crate) type App = Arc<AppState>;
 
 impl AppState {
-    pub(crate) fn new(config: Config, control: ControlPlane, mode: ServeMode) -> Self {
+    pub(crate) fn new(
+        config: Config,
+        control: ControlPlane,
+        mode: ServeMode,
+        oidc: Option<Oidc>,
+    ) -> Self {
         let sessions = WebSessions::new(
             config.server.session_max_age(),
             config.server.session_idle(),
@@ -134,6 +151,7 @@ impl AppState {
             mode,
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
             sessions,
+            oidc,
             mcp: tokio::sync::Mutex::new(HashMap::new()),
             extractions: Mutex::new(HashSet::new()),
         }
@@ -323,8 +341,13 @@ impl WebSessions {
         }
     }
 
-    /// Start a session for the user and return its token.
-    pub(crate) fn open(&self, user_id: &UserId) -> ApiResult<SessionToken> {
+    /// Start a session for the user and return its token; `renew_at` is when
+    /// a sign-in's token must first be renewed.
+    pub(crate) fn open(
+        &self,
+        user_id: &UserId,
+        renew_at: Option<Timestamp>,
+    ) -> ApiResult<SessionToken> {
         let token = SessionToken::generate()?;
         let now = Instant::now();
         let mut live = self
@@ -341,6 +364,7 @@ impl WebSessions {
                 user_id: user_id.clone(),
                 started: now,
                 last_seen: now,
+                renew_at,
             },
         );
         Ok(token)
@@ -373,7 +397,36 @@ impl WebSessions {
             return SessionLookup::Unknown;
         };
         session.last_seen = now;
-        SessionLookup::Active(session.user_id.clone())
+        SessionLookup::Active {
+            user_id: session.user_id.clone(),
+            renewal_due: session.renew_at.is_some_and(|at| at <= Timestamp::now()),
+        }
+    }
+
+    /// Set when a session's sign-in is next renewed.
+    pub(crate) fn renew_at(&self, token: &str, at: Option<Timestamp>) {
+        if let Ok(mut live) = self.live.lock()
+            && let Some(session) = live.get_mut(token)
+        {
+            session.renew_at = at;
+        }
+    }
+
+    /// Whether the user still has a session that has not expired.
+    pub(crate) fn has_sessions(&self, user_id: &UserId) -> bool {
+        let now = Instant::now();
+        self.live.lock().is_ok_and(|live| {
+            live.values()
+                .any(|session| &session.user_id == user_id && !self.expired(session, now))
+        })
+    }
+
+    /// End every session of a user, once the issuer no longer vouches for
+    /// them.
+    pub(crate) fn close_user(&self, user_id: &UserId) {
+        if let Ok(mut live) = self.live.lock() {
+            live.retain(|_, session| &session.user_id != user_id);
+        }
     }
 
     /// End a session; an unknown token is already ended.

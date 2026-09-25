@@ -9,7 +9,6 @@ use std::sync::{Arc, OnceLock};
 
 use keyring_core::{CredentialStore, Entry};
 
-use crate::config::ProviderName;
 use crate::error::{Error, Result};
 
 const SERVICE: &str = "quack";
@@ -50,7 +49,7 @@ fn ensure_store() -> keyring_core::Result<()> {
     .map_err(keyring_core::Error::BadStoreFormat)
 }
 
-/// A provider's keychain entry, `quack` / `oauth:<provider>`.
+/// A keychain entry under the `quack` service, named by its account.
 pub(super) struct KeychainEntry(String);
 
 /// What is done to an entry.
@@ -71,19 +70,19 @@ impl KeychainOp {
 }
 
 impl KeychainEntry {
-    pub(super) fn new(provider: &ProviderName) -> Self {
-        Self(provider.as_str().to_owned())
+    pub(super) const fn new(account: String) -> Self {
+        Self(account)
     }
 
     /// Do `op` on the blocking pool, since the stores talk to the OS
     /// synchronously. A read of a missing entry is `None`; deleting one is
     /// not an error.
     async fn run(&self, op: KeychainOp) -> Result<Option<String>> {
-        let provider = self.0.clone();
+        let account = self.0.clone();
         tokio::task::spawn_blocking(move || {
             let verb = op.verb();
             let outcome = ensure_store()
-                .and_then(|()| Entry::new(SERVICE, &format!("oauth:{provider}")))
+                .and_then(|()| Entry::new(SERVICE, &account))
                 .and_then(|entry| match op {
                     KeychainOp::Read => entry.get_password().map(Some),
                     KeychainOp::Write(key) => entry.set_password(&key).map(|()| None),
@@ -93,7 +92,7 @@ impl KeychainEntry {
                 Ok(found) => Ok(found),
                 Err(keyring_core::Error::NoEntry) => Ok(None),
                 Err(e) => Err(Error::Llm(format!(
-                    "keychain {verb} for provider '{provider}' failed: {e}"
+                    "keychain {verb} of '{account}' failed: {e}"
                 ))),
             }
         })

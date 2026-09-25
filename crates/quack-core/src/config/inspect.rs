@@ -22,7 +22,7 @@ use crate::embedding::presets::Family;
 
 use super::{
     AuthMode, AwsRegion, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant,
-    ModelSpec, OAuthConfig, Overrides, config_file_path,
+    ModelSpec, OAuthConfig, OidcConfig, Overrides, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -406,6 +406,15 @@ const PROVIDER_KEYS: &[&str] = &[
     "oauth",
 ];
 
+/// The keys a `[server.oidc]` table accepts.
+const OIDC_KEYS: &[&str] = &[
+    "issuer_url",
+    "client_id",
+    "client_secret_env",
+    "scopes",
+    "redirect_uri",
+];
+
 /// The keys a `[providers.NAME.oauth]` table accepts.
 const OAUTH_KEYS: &[&str] = &[
     "issuer_url",
@@ -713,6 +722,19 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         server.session_idle_minutes,
         default.session_idle_minutes,
     );
+    let Some(oidc) = &server.oidc else {
+        return;
+    };
+    let mut s = inventory.section(String::from("server.oidc"));
+    s.required_text("issuer_url", &oidc.issuer_url);
+    s.required_text("client_id", &oidc.client_id);
+    s.optional_text("client_secret_env", oidc.client_secret_env.as_deref(), None);
+    s.optional(
+        "scopes",
+        Some(render_list(&oidc.scopes)),
+        Some(render_list(&OidcConfig::default_scopes())),
+    );
+    s.required_text("redirect_uri", &oidc.redirect_uri);
 }
 
 fn jobs(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
@@ -804,6 +826,14 @@ impl EnvVar {
             Self::new(ENV_MODEL, "overrides [general].chat_model"),
             Self::new(ENV_BIND, "overrides [server].bind"),
         ];
+        if let Some(secret) = config
+            .server
+            .oidc
+            .as_ref()
+            .and_then(|o| o.client_secret_env.as_ref())
+        {
+            vars.push(Self::new(secret, "[server.oidc].client_secret_env"));
+        }
         for (name, provider) in &config.providers {
             if let Some(key) = provider.auth.api_key_env() {
                 vars.push(Self::new(key, &format!("[providers.{name}].api_key_env")));
@@ -894,8 +924,20 @@ impl UnknownKey {
                 continue;
             };
             for key in table.keys() {
+                if name == "server" && key == "oidc" {
+                    continue;
+                }
                 if !keys.contains(&key.as_str()) {
                     unknown.push(Self::new(name, key, keys));
+                }
+            }
+            if name == "server"
+                && let Some(oidc) = table.get("oidc").and_then(TomlValue::as_table)
+            {
+                for key in oidc.keys() {
+                    if !OIDC_KEYS.contains(&key.as_str()) {
+                        unknown.push(Self::new("server.oidc", key, OIDC_KEYS));
+                    }
                 }
             }
         }
@@ -1243,6 +1285,30 @@ top_k = 3
     }
 
     #[test]
+    fn every_oidc_key_has_a_setting_and_strays_are_named() {
+        let inspection = inspect(
+            "[server.oidc]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n\
+             client_secret_env = \"S\"\nredirect_uri = \"https://q/login/oidc/callback\"\n",
+        );
+        let listed: BTreeSet<String> = inspection.settings.iter().map(Setting::path).collect();
+        for key in OIDC_KEYS {
+            assert!(listed.contains(&format!("server.oidc.{key}")), "{key}");
+        }
+        let scopes = setting(&inspection, "server.oidc.scopes");
+        assert_eq!(scopes.origin, Origin::Default);
+        assert!(inspection.environment.iter().any(|v| v.name == "S"));
+
+        let file = "[server.oidc]\nissuer = \"x\"\n".parse::<Table>();
+        let unknown = file.map(|f| UnknownKey::find_in(&f)).unwrap_or_default();
+        assert!(
+            unknown.iter().any(|u| u.path == "server.oidc.issuer"),
+            "{:?}",
+            unknown.iter().map(|u| &u.path).collect::<Vec<_>>()
+        );
+        assert!(!unknown.iter().any(|u| u.path == "server.oidc"));
+    }
+
+    #[test]
     fn every_provider_key_has_a_setting() {
         let inspection = inspect(
             "[providers.p]\ntype = \"openai\"\nauth = \"oauth\"\n\
@@ -1296,9 +1362,15 @@ top_k = 3
     #[test]
     fn the_key_list_matches_the_config_structs() {
         for (section, keys) in SECTIONS {
-            let declared: BTreeSet<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+            let mut declared: BTreeSet<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+            // A nested table, checked on its own below.
+            if *section == "server" {
+                declared.insert(String::from("oidc"));
+            }
             assert_eq!(fields_of(&format!("[{section}]")), declared, "[{section}]");
         }
+        let oidc: BTreeSet<String> = OIDC_KEYS.iter().map(|k| (*k).to_owned()).collect();
+        assert_eq!(fields_of("[server.oidc]"), oidc, "[server.oidc]");
         let providers: BTreeSet<String> = PROVIDER_KEYS.iter().map(|k| (*k).to_owned()).collect();
         assert_eq!(
             fields_of("[providers.p]\ntype = \"ollama\""),
