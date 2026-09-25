@@ -517,7 +517,10 @@ pub(crate) fn router() -> Router<App> {
             get(login_page).merge(super::throttled_login(post(login_submit))),
         )
         .route("/logout", post(logout))
-        .route("/login/oidc", super::throttled_login(get(sign_in::begin)))
+        .route(
+            OidcConfig::START_PATH,
+            super::throttled_login(get(sign_in::begin)),
+        )
         .route(
             OidcConfig::CALLBACK_PATH,
             super::throttled_login(get(sign_in::finish)),

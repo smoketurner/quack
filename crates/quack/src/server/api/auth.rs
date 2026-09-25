@@ -77,6 +77,7 @@ pub(crate) async fn me(identity: Identity) -> Json<serde_json::Value> {
             Credential::Local => "local",
             Credential::Session(_) => "session",
             Credential::Token(_) => "token",
+            Credential::IdentityProvider => "identity-provider",
         },
     }))
 }

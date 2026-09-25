@@ -20,6 +20,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
+use super::resource::ProtectedResource;
 use crate::mcp::McpServer;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::storage::control::{ControlPlane, random_bytes};
@@ -60,6 +61,9 @@ pub(crate) struct AppState {
     /// Sign-in through `[server.oidc]`'s issuer, when configured and not in
     /// local mode.
     pub oidc: Option<Oidc>,
+    /// What quack publishes as a protected resource, when it accepts the
+    /// issuer's access tokens (`[server.oidc].audience`).
+    pub resource: Option<ProtectedResource>,
     /// Every background job: uploads, extraction and proposal runs, agent
     /// turns. Its registry is in memory, so workspace content in a job's
     /// label never reaches `control.db`.
@@ -144,6 +148,7 @@ impl AppState {
             config.server.session_max_age(),
             config.server.session_idle(),
         );
+        let resource = ProtectedResource::of(&config, mode);
         Self {
             jobs: JobQueue::from_config(&config.jobs),
             config,
@@ -151,6 +156,7 @@ impl AppState {
             mode,
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
             sessions,
+            resource,
             oidc,
             mcp: tokio::sync::Mutex::new(HashMap::new()),
             extractions: Mutex::new(HashSet::new()),

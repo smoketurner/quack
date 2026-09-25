@@ -11,7 +11,14 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+
 use super::*;
+
+/// The `aud` the test sign-in accepts on access tokens.
+const AUDIENCE: &str = "api://quack";
 
 #[expect(clippy::panic, reason = "test failure path")]
 fn fail(msg: &str) -> ! {
@@ -28,6 +35,9 @@ struct IssuerState {
     /// The `error` a refresh is refused with; a new token when unset.
     refresh_error: Option<&'static str>,
     token_bodies: Vec<String>,
+    /// The JWK set `/jwks` serves.
+    jwks: Vec<Value>,
+    jwks_fetches: usize,
 }
 
 struct MockIssuer {
@@ -76,8 +86,17 @@ impl MockIssuer {
             client_secret_env: None,
             scopes: OidcConfig::default_scopes(),
             redirect_uri: format!("https://quack.example.com{}", OidcConfig::CALLBACK_PATH),
+            audience: Some(String::from(AUDIENCE)),
+            subject_claim: String::from("sub"),
         };
         SignIn::new(config).unwrap_or_else(|e| fail(&e.to_string()))
+    }
+
+    fn jwks_fetches(&self) -> usize {
+        self.state
+            .lock()
+            .map(|s| s.jwks_fetches)
+            .unwrap_or_default()
     }
 }
 
@@ -137,8 +156,13 @@ fn answer(
                 "issuer": state.named_issuer.clone().unwrap_or_else(|| base.to_owned()),
                 "authorization_endpoint": format!("{base}/authorize"),
                 "token_endpoint": format!("{base}/token"),
+                "jwks_uri": format!("{base}/jwks"),
             }),
         ),
+        "/jwks" => {
+            state.jwks_fetches = state.jwks_fetches.saturating_add(1);
+            ("200 OK", json!({ "keys": state.jwks }))
+        }
         "/token" => {
             state.token_bodies.push(body.to_owned());
             let form: HashMap<String, String> =
@@ -342,19 +366,29 @@ fn the_id_token_checks_follow_core_3_1_3_7() {
         })
         .is_err()
     );
-    assert!(check(&|v| v["sub"] = json!("")).is_err());
 }
 
 #[test]
-fn the_username_falls_back_from_preferred_username_to_email_to_subject() {
-    let mut value = json!({ "iss": "i", "sub": "s-1", "aud": "a", "exp": 0 });
-    assert_eq!(claims(&value).username(), "s-1");
+fn the_subject_is_the_configured_claim_and_the_username_falls_back() {
+    let mut value = json!({ "iss": "i", "sub": "s-1", "oid": "o-1", "aud": "a", "exp": 0 });
+    let person = |value: &Value| claims(value).person;
+    let subject = person(&value).subject("sub");
+    assert_eq!(subject, Some(OidcSubject::from("s-1")));
+    assert_eq!(
+        person(&value).subject("oid"),
+        Some(OidcSubject::from("o-1"))
+    );
+    assert_eq!(person(&value).subject("tid"), None);
+    let s1 = OidcSubject::from("s-1");
+    assert_eq!(person(&value).username(&s1), "s-1");
     value["email"] = json!("ada@example.com");
-    assert_eq!(claims(&value).username(), "ada@example.com");
+    assert_eq!(person(&value).username(&s1), "ada@example.com");
     value["preferred_username"] = json!("  ");
-    assert_eq!(claims(&value).username(), "ada@example.com");
+    assert_eq!(person(&value).username(&s1), "ada@example.com");
     value["preferred_username"] = json!("ada");
-    assert_eq!(claims(&value).username(), "ada");
+    assert_eq!(person(&value).username(&s1), "ada");
+    value["sub"] = json!(" ");
+    assert_eq!(person(&value).subject("sub"), None);
 }
 
 #[test]
@@ -369,4 +403,190 @@ fn a_malformed_id_token_is_a_sign_in_error() {
             "{token}"
         );
     }
+}
+
+/// A P-256 signing key and its public JWK, as an issuer publishes it.
+struct TestKey {
+    kid: String,
+    encoding: EncodingKey,
+    jwk: Value,
+}
+
+impl TestKey {
+    fn new(kid: &str) -> Self {
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let point = pair.public_key().as_ref();
+        let (Some(x), Some(y)) = (point.get(1..33), point.get(33..65)) else {
+            fail("not an uncompressed P-256 point");
+        };
+        Self {
+            kid: kid.to_owned(),
+            encoding: EncodingKey::from_ec_der(pkcs8.as_ref()),
+            jwk: json!({
+                "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": kid,
+                "x": URL_SAFE_NO_PAD.encode(x), "y": URL_SAFE_NO_PAD.encode(y),
+            }),
+        }
+    }
+
+    fn sign(&self, claims: &Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(self.kid.clone());
+        jsonwebtoken::encode(&header, claims, &self.encoding)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    }
+}
+
+/// Claims of a valid access token for `issuer`, changed by `change`.
+fn access_claims(issuer: &str, change: impl FnOnce(&mut Value)) -> Value {
+    let mut claims = json!({
+        "iss": issuer, "aud": AUDIENCE, "sub": "person-1", "oid": "object-1",
+        "exp": in_an_hour(), "scp": "quack.use", "preferred_username": "ada",
+    });
+    change(&mut claims);
+    claims
+}
+
+#[tokio::test]
+async fn an_access_token_signed_by_the_issuer_names_the_person() {
+    let issuer = MockIssuer::start().await;
+    let key = TestKey::new("k1");
+    issuer.with(|s| s.jwks = vec![key.jwk.clone()]);
+    let sign_in = issuer.sign_in();
+
+    let bearer = sign_in
+        .verify_bearer(&key.sign(&access_claims(&issuer.url, |_| {})))
+        .await;
+    assert_eq!(
+        bearer.ok(),
+        Some(Bearer {
+            subject: OidcSubject::from("person-1"),
+            username: String::from("ada"),
+        })
+    );
+    // A second token uses the cached keys; Okta's array `scp` counts too.
+    let array_scope = access_claims(&issuer.url, |c| c["scp"] = json!(["quack.use"]));
+    assert!(sign_in.verify_bearer(&key.sign(&array_scope)).await.is_ok());
+    assert_eq!(issuer.jwks_fetches(), 1);
+}
+
+#[tokio::test]
+async fn tokens_that_fail_a_check_are_refused_as_bearer_errors() {
+    let issuer = MockIssuer::start().await;
+    let key = TestKey::new("k1");
+    issuer.with(|s| s.jwks = vec![key.jwk.clone()]);
+    let sign_in = issuer.sign_in();
+    let url = issuer.url.clone();
+    let refused = |token: String, why: &'static str| {
+        let sign_in = &sign_in;
+        async move {
+            let outcome = sign_in.verify_bearer(&token).await;
+            assert!(
+                matches!(outcome, Err(Error::Bearer(_))),
+                "{why}: {outcome:?}"
+            );
+        }
+    };
+
+    refused(
+        key.sign(&access_claims(&url, |c| c["aud"] = json!("api://other"))),
+        "audience",
+    )
+    .await;
+    refused(
+        key.sign(&access_claims(&url, |c| c["iss"] = json!("https://evil"))),
+        "issuer",
+    )
+    .await;
+    refused(
+        key.sign(&access_claims(&url, |c| {
+            c["exp"] = json!(Timestamp::now().as_second().saturating_sub(7200));
+        })),
+        "expired",
+    )
+    .await;
+    refused(
+        key.sign(&access_claims(&url, |c| {
+            if let Some(map) = c.as_object_mut() {
+                map.remove("scp");
+            }
+        })),
+        "an ID token has no scope",
+    )
+    .await;
+    refused(
+        key.sign(&access_claims(&url, |c| c["sub"] = json!(""))),
+        "no subject",
+    )
+    .await;
+    let hmac = jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        &access_claims(&url, |_| {}),
+        &EncodingKey::from_secret(b"shared"),
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    refused(hmac, "shared-secret algorithm").await;
+    let stranger = TestKey::new("k1");
+    refused(
+        stranger.sign(&access_claims(&url, |_| {})),
+        "same kid, other key",
+    )
+    .await;
+    refused(String::from("not.a.jwt"), "garbage").await;
+}
+
+#[tokio::test]
+async fn an_unknown_key_is_fetched_again_but_at_most_once_a_minute() {
+    let issuer = MockIssuer::start().await;
+    let (old, new) = (TestKey::new("old"), TestKey::new("new"));
+    issuer.with(|s| s.jwks = vec![old.jwk.clone()]);
+    let sign_in = issuer.sign_in();
+    let claims = access_claims(&issuer.url, |_| {});
+    assert!(sign_in.verify_bearer(&old.sign(&claims)).await.is_ok());
+
+    // The issuer rotates; right after a fetch, an unknown kid is refused
+    // without asking again.
+    issuer.with(|s| s.jwks = vec![old.jwk.clone(), new.jwk.clone()]);
+    assert!(sign_in.verify_bearer(&new.sign(&claims)).await.is_err());
+    assert_eq!(issuer.jwks_fetches(), 1);
+
+    // A minute later, the unknown kid sends quack back for the keys.
+    if let Some(keys) = sign_in.keys.write().await.as_mut() {
+        keys.fetched = Instant::now()
+            .checked_sub(KEYS_REFETCH)
+            .unwrap_or_else(Instant::now);
+    }
+    assert!(sign_in.verify_bearer(&new.sign(&claims)).await.is_ok());
+    assert_eq!(issuer.jwks_fetches(), 2);
+}
+
+#[tokio::test]
+async fn without_an_audience_no_bearer_is_accepted_and_oid_can_name_the_person() {
+    let issuer = MockIssuer::start().await;
+    let key = TestKey::new("k1");
+    issuer.with(|s| s.jwks = vec![key.jwk.clone()]);
+    let token = key.sign(&access_claims(&issuer.url, |_| {}));
+
+    let mut config = issuer.sign_in().config;
+    config.audience = None;
+    let closed = SignIn::new(config.clone()).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(matches!(
+        closed.verify_bearer(&token).await,
+        Err(Error::Bearer(_))
+    ));
+    assert_eq!(issuer.jwks_fetches(), 0);
+
+    config.audience = Some(String::from(AUDIENCE));
+    config.subject_claim = String::from("oid");
+    let entra = SignIn::new(config).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        entra
+            .verify_bearer(&token)
+            .await
+            .is_ok_and(|b| b.subject == OidcSubject::from("object-1"))
+    );
 }

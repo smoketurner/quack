@@ -72,6 +72,8 @@ pub(crate) struct Endpoints {
     pub(crate) token: String,
     #[serde(rename = "device_authorization_endpoint")]
     device_authorization: Option<String>,
+    /// Where the issuer publishes the keys its tokens are signed with.
+    pub(crate) jwks_uri: Option<String>,
 }
 
 /// The HTTP client OAuth requests go through: rustls with aws-lc-rs, no
@@ -124,18 +126,30 @@ impl OAuthHttp {
             issuer_url.trim_end_matches('/')
         );
         tracing::debug!(url = %url, "discovering OAuth endpoints");
+        self.fetch_json(&url, "OpenID discovery").await
+    }
+
+    /// GET a JSON document; `what` names it in errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the body is not a `T`.
+    pub(crate) async fn fetch_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        what: &str,
+    ) -> Result<T> {
         let response = self
             .0
-            .get(&url)
+            .get(url)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| Error::Llm(format!("OpenID discovery at {url} failed: {e}")))?;
-        response.json::<Endpoints>().await.map_err(|e| {
-            Error::Llm(format!(
-                "OpenID discovery at {url} returned no usable document: {e}"
-            ))
-        })
+            .map_err(|e| Error::Llm(format!("{what} at {url} failed: {e}")))?;
+        response
+            .json::<T>()
+            .await
+            .map_err(|e| Error::Llm(format!("{what} at {url} returned no usable document: {e}")))
     }
 }
 

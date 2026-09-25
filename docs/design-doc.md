@@ -1719,11 +1719,11 @@ roadmap and may never be built.
   a session cookie; API tokens (`quack token create` or the admin UI) as bearer tokens
   scoped to a workspace with `read` / `write` / `admin` scopes.
 - **Sign-in through the organization's identity provider** (`[server.oidc]`, beside the
-  password form). The login page's "Sign in with <issuer>" goes to `GET /login/oidc`, which
+  password form). The login page's "Sign in with <issuer>" goes to `GET /auth/oidc`, which
   starts Authorization Code with PKCE, a `state`, and a `nonce`; the pending sign-in waits
   in memory for ten minutes (at most 10,000 at once), and an `HttpOnly` state cookie scoped
   to the callback ties the return to the browser that left, so a callback link someone else
-  started cannot sign this browser in. `GET /login/oidc/callback` exchanges the code, reads
+  started cannot sign this browser in. `GET /auth/oidc/callback` exchanges the code, reads
   the ID token straight from the token endpoint over TLS (OpenID Connect Core 3.1.3.7: no
   signature check, so no JWT library, but `iss`, `aud`, `azp`, `exp`, and the nonce are
   checked), and finds the user by `sub` (`oidc_subject`). A first sign-in creates the user
@@ -1747,6 +1747,26 @@ roadmap and may never be built.
   session removes the stored token. On Linux the keychain key is in memory, so after a
   reboot everyone signs in again. The stored token is what on-behalf-of calls to model
   providers will exchange (#211).
+- **quack is an OAuth protected resource** (RFC 9728) when `[server.oidc].audience` is set.
+  The API and MCP then accept the issuer's access tokens as bearers, beside sessions and
+  quack's API tokens: a bearer shaped like a JWT is verified with `jsonwebtoken` (its
+  aws-lc-rs backend) against the keys at the issuer's `jwks_uri` (cached an hour, fetched
+  again for an unknown `kid` at most once a minute), with an asymmetric algorithm only,
+  `iss` the issuer, `aud` the configured audience, and `exp` checked with a minute's leeway.
+  A token without `scp` or `scope` is refused, since an ID token can carry the same `aud`.
+  The token names its user through `subject_claim` (default `sub`; Entra deployments set
+  `oid`, since Entra's `sub` differs per application, and set the API's
+  `accessTokenAcceptedVersion` to 2 so its tokens carry the v2 issuer), found or created
+  with no access as a sign-in would, and carries that user's own access (`Credential::
+  IdentityProvider`, channel `api`). A refused token is audited as a denied `token`.
+  `/.well-known/oauth-protected-resource` describes the server (`resource` is the origin
+  of `redirect_uri`), `/.well-known/oauth-protected-resource/mcp/v1/{workspace}` each MCP
+  endpoint, and `/.well-known/oauth-protected-resource/api/v1` the API, each naming the
+  issuer in `authorization_servers`. Every 401 from the API or MCP carries
+  `WWW-Authenticate: Bearer resource_metadata="..."` for its resource, with
+  `error="invalid_token"` when a credential was presented and refused, so an MCP client
+  can find the issuer and sign the user in itself (the MCP authorization specification).
+  Without an audience nothing is published and a JWT is just an unknown API token.
 - **A browser session is bounded at both ends** (issue #73). It dies
   `[server].session_max_age_hours` after login however much it is used, and
   `[server].session_idle_minutes` after its last request, whichever comes first; the
@@ -1917,9 +1937,11 @@ session_idle_minutes = 120              # ... or this long after its last reques
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
-redirect_uri = "https://quack.example.com/login/oidc/callback"   # this server's URL
+redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's URL
 # client_secret_env = "QUACK_OIDC_SECRET"      # confidential client
 # scopes = ["openid", "profile", "email", "offline_access"]
+# audience = "api://quack"                     # accept the issuer's access tokens (RFC 9728)
+# subject_claim = "sub"                        # "oid" for Entra
 ```
 
 Every section sets `deny_unknown_fields`, so a key that is not in this list is a startup

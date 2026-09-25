@@ -27,6 +27,12 @@ pub enum Error {
     #[error("sealed data error: {0}")]
     Vault(String),
 
+    /// An identity-provider access token presented as a bearer was refused:
+    /// not signed by the issuer, for another audience, expired, or not an
+    /// access token.
+    #[error("access token refused: {0}")]
+    Bearer(String),
+
     /// A sign-in through the server's `OpenID` Connect issuer was refused or
     /// could not be verified.
     #[error("sign-in failed: {0}")]

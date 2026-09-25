@@ -413,6 +413,8 @@ const OIDC_KEYS: &[&str] = &[
     "client_secret_env",
     "scopes",
     "redirect_uri",
+    "audience",
+    "subject_claim",
 ];
 
 /// The keys a `[providers.NAME.oauth]` table accepts.
@@ -735,6 +737,13 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         Some(render_list(&OidcConfig::default_scopes())),
     );
     s.required_text("redirect_uri", &oidc.redirect_uri);
+    s.optional_text("audience", oidc.audience.as_deref(), None);
+    s.text(
+        "subject_claim",
+        &oidc.subject_claim,
+        OidcConfig::DEFAULT_SUBJECT_CLAIM,
+        None,
+    );
 }
 
 fn jobs(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
@@ -1288,7 +1297,7 @@ top_k = 3
     fn every_oidc_key_has_a_setting_and_strays_are_named() {
         let inspection = inspect(
             "[server.oidc]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n\
-             client_secret_env = \"S\"\nredirect_uri = \"https://q/login/oidc/callback\"\n",
+             client_secret_env = \"S\"\nredirect_uri = \"https://q/auth/oidc/callback\"\n",
         );
         let listed: BTreeSet<String> = inspection.settings.iter().map(Setting::path).collect();
         for key in OIDC_KEYS {

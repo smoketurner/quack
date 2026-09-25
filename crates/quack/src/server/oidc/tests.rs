@@ -40,6 +40,8 @@ struct IssuerState {
     id_claims: Value,
     /// `expires_in` of the tokens it issues.
     lifetime: i64,
+    /// The JWK set `/jwks` serves.
+    jwks: Vec<Value>,
     refresh_error: Option<&'static str>,
     refreshes: usize,
 }
@@ -52,7 +54,13 @@ async fn discovery(State(issuer): State<Issuer>) -> Json<Value> {
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/token"),
+        "jwks_uri": format!("{base}/jwks"),
     }))
+}
+
+async fn jwks(State(issuer): State<Issuer>) -> Json<Value> {
+    let keys = issuer.lock().map(|s| s.jwks.clone()).unwrap_or_default();
+    Json(json!({ "keys": keys }))
 }
 
 async fn token(
@@ -112,6 +120,7 @@ async fn start_issuer() -> Issuer {
     let routes = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/token", post(token))
+        .route("/jwks", get(jwks))
         .with_state(Arc::clone(&issuer));
     tokio::spawn(async move { axum::serve(listener, routes).await });
     issuer
@@ -129,6 +138,8 @@ struct Reply {
     status: StatusCode,
     location: String,
     cookies: Vec<String>,
+    /// `WWW-Authenticate`.
+    challenge: String,
     body: String,
 }
 
@@ -145,6 +156,12 @@ impl Reply {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_audience(None).await
+    }
+
+    /// A harness whose `[server.oidc].audience` is `audience`: set, the API
+    /// and MCP accept the issuer's access tokens.
+    async fn with_audience(audience: Option<&str>) -> Self {
         let issuer = start_issuer().await;
         let base = issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -156,6 +173,8 @@ impl Harness {
             client_secret_env: None,
             scopes: OidcConfig::default_scopes(),
             redirect_uri: format!("https://quack.example.com{}", OidcConfig::CALLBACK_PATH),
+            audience: audience.map(str::to_owned),
+            subject_claim: String::from(OidcConfig::DEFAULT_SUBJECT_CLAIM),
         };
         let oidc = Oidc::new(&oidc_config, Vault::new(dir.path(), KeySource::File))
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -208,6 +227,7 @@ impl Harness {
         };
         let location = header_text(header::LOCATION).join("");
         let cookies = header_text(header::SET_COOKIE);
+        let challenge = header_text(header::WWW_AUTHENTICATE).join("");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -215,6 +235,7 @@ impl Harness {
             status,
             location,
             cookies,
+            challenge,
             body: String::from_utf8_lossy(&bytes).into_owned(),
         }
     }
@@ -222,7 +243,7 @@ impl Harness {
     /// Start a sign-in: the `state` and `nonce` the issuer was sent, and the
     /// state cookie the browser got.
     async fn start(&self) -> (String, String, String) {
-        let reply = self.get("/login/oidc", None).await;
+        let reply = self.get(OidcConfig::START_PATH, None).await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
         let query: HashMap<String, String> = reply
             .location
@@ -318,6 +339,13 @@ async fn a_first_sign_in_creates_a_user_with_no_access_and_a_session() {
     let login = h.get("/login", None).await;
     assert!(
         login.body.contains("Sign in with 127.0.0.1"),
+        "{}",
+        login.body
+    );
+    assert!(
+        login
+            .body
+            .contains(&format!("href=\"{}\"", OidcConfig::START_PATH)),
         "{}",
         login.body
     );
@@ -503,7 +531,7 @@ async fn without_oidc_there_is_no_button_and_no_route() {
     let router = crate::server::router(app);
     for (uri, status) in [
         ("/login", StatusCode::OK),
-        ("/login/oidc", StatusCode::NOT_FOUND),
+        (OidcConfig::START_PATH, StatusCode::NOT_FOUND),
     ] {
         let response = router
             .clone()
@@ -520,4 +548,261 @@ async fn without_oidc_there_is_no_button_and_no_route() {
             .unwrap_or_default();
         assert!(!String::from_utf8_lossy(&bytes).contains("Sign in with"));
     }
+}
+
+// --- access tokens as bearers (RFC 9728) -----------------------------------
+
+/// The audience the resource tests configure.
+const AUDIENCE: &str = "api://quack";
+
+/// A P-256 key an issuer signs with, and its published JWK.
+struct IssuerKey {
+    encoding: jsonwebtoken::EncodingKey,
+    jwk: Value,
+}
+
+impl IssuerKey {
+    fn new() -> Self {
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &aws_lc_rs::rand::SystemRandom::new(),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let point = pair.public_key().as_ref();
+        let (Some(x), Some(y)) = (point.get(1..33), point.get(33..65)) else {
+            fail("not an uncompressed P-256 point");
+        };
+        Self {
+            encoding: jsonwebtoken::EncodingKey::from_ec_der(pkcs8.as_ref()),
+            jwk: json!({
+                "kty": "EC", "crv": "P-256", "alg": "ES256", "kid": "k1",
+                "x": URL_SAFE_NO_PAD.encode(x), "y": URL_SAFE_NO_PAD.encode(y),
+            }),
+        }
+    }
+
+    /// An access token for `subject` from `issuer`, with `aud` as given.
+    fn token(&self, issuer: &str, subject: &str, aud: &str) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(String::from("k1"));
+        let claims = json!({
+            "iss": issuer, "aud": aud, "sub": subject, "scp": "quack.use",
+            "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+            "preferred_username": subject,
+        });
+        jsonwebtoken::encode(&header, &claims, &self.encoding)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    }
+}
+
+impl Harness {
+    /// A harness that accepts access tokens, and the key its issuer signs
+    /// them with.
+    async fn resource() -> (Self, IssuerKey, String) {
+        let h = Self::with_audience(Some(AUDIENCE)).await;
+        let key = IssuerKey::new();
+        let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+        h.issuer(|s| s.jwks = vec![key.jwk.clone()]);
+        (h, key, base)
+    }
+
+    async fn with_bearer(&self, uri: &str, token: &str) -> Reply {
+        let request = Request::get(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        self.send(request).await
+    }
+}
+
+#[tokio::test]
+async fn an_access_token_from_the_issuer_is_the_user_it_names() {
+    let (h, key, issuer) = Harness::resource().await;
+    let token = key.token(&issuer, "sub-mcp", AUDIENCE);
+
+    let reply = h.with_bearer("/api/v1/auth/me", &token).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let me: Value = serde_json::from_str(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(me["username"], "sub-mcp");
+    assert_eq!(me["via"], "identity-provider");
+    assert_eq!(me["is_admin"], false);
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-mcp"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user for the subject"));
+    assert!(
+        h.app
+            .control
+            .workspaces_for_user(&user.id)
+            .await
+            .is_ok_and(|w| w.is_empty())
+    );
+    // The same token again is the same user.
+    let again = h.with_bearer("/api/v1/auth/me", &token).await;
+    let again: Value = serde_json::from_str(&again.body).unwrap_or(Value::Null);
+    assert_eq!(again["id"], user.id.to_string());
+}
+
+#[tokio::test]
+async fn a_401_says_where_to_get_a_token_and_a_refused_one_is_invalid_token() {
+    let (h, key, issuer) = Harness::resource().await;
+    let metadata = "https://quack.example.com/.well-known/oauth-protected-resource";
+
+    let anonymous = h.get("/api/v1/auth/me", None).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        anonymous.challenge,
+        format!("Bearer resource_metadata=\"{metadata}\"")
+    );
+
+    let mcp = h.get("/mcp/v1/ws1", None).await;
+    assert_eq!(mcp.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        mcp.challenge,
+        format!("Bearer resource_metadata=\"{metadata}/mcp/v1/ws1\"")
+    );
+
+    let other_audience = key.token(&issuer, "sub-x", "api://someone-else");
+    let refused = h.with_bearer("/api/v1/auth/me", &other_audience).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+    assert!(
+        refused.body.contains("access token refused"),
+        "{}",
+        refused.body
+    );
+    assert_eq!(
+        refused.challenge,
+        format!("Bearer resource_metadata=\"{metadata}\", error=\"invalid_token\"")
+    );
+    assert!(
+        h.app
+            .control
+            .find_user_by_oidc_subject(&OidcSubject::from("sub-x"))
+            .await
+            .is_ok_and(|u| u.is_none())
+    );
+    let denied = h.audit("token").await;
+    assert_eq!(denied, vec![(Outcome::Denied, None)]);
+}
+
+#[tokio::test]
+async fn the_metadata_names_each_resource_and_its_issuer() {
+    let (h, _, issuer) = Harness::resource().await;
+    let document =
+        |reply: &Reply| serde_json::from_str::<Value>(&reply.body).unwrap_or(Value::Null);
+
+    let root = h.get("/.well-known/oauth-protected-resource", None).await;
+    assert_eq!(root.status, StatusCode::OK, "{}", root.body);
+    let root = document(&root);
+    assert_eq!(root["resource"], "https://quack.example.com");
+    assert_eq!(root["authorization_servers"], json!([issuer]));
+    assert_eq!(root["bearer_methods_supported"], json!(["header"]));
+    // Only sign-in scopes are configured, so none are advertised.
+    assert!(root.get("scopes_supported").is_none());
+
+    let mcp = h
+        .get("/.well-known/oauth-protected-resource/mcp/v1/ws1", None)
+        .await;
+    assert_eq!(
+        document(&mcp)["resource"],
+        "https://quack.example.com/mcp/v1/ws1"
+    );
+    let api = h
+        .get("/.well-known/oauth-protected-resource/api/v1", None)
+        .await;
+    assert_eq!(
+        document(&api)["resource"],
+        "https://quack.example.com/api/v1"
+    );
+    for unknown in [
+        "/.well-known/oauth-protected-resource/etc/passwd",
+        "/.well-known/oauth-protected-resource/mcp/v1/a/b",
+    ] {
+        assert_eq!(
+            h.get(unknown, None).await.status,
+            StatusCode::NOT_FOUND,
+            "{unknown}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_an_audience_nothing_is_published_or_accepted() {
+    let h = Harness::new().await;
+    let key = IssuerKey::new();
+    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    h.issuer(|s| s.jwks = vec![key.jwk.clone()]);
+
+    let metadata = h.get("/.well-known/oauth-protected-resource", None).await;
+    assert_eq!(metadata.status, StatusCode::NOT_FOUND);
+    let anonymous = h.get("/api/v1/auth/me", None).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+    assert!(anonymous.challenge.is_empty());
+    // A well-formed token is an unknown API token here, not a user.
+    let token = key.token(&base, "sub-y", AUDIENCE);
+    assert_eq!(
+        h.with_bearer("/api/v1/auth/me", &token).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
+    use quack_core::storage::control::Role;
+    let (h, key, issuer) = Harness::resource().await;
+    let token = key.token(&issuer, "sub-claude", AUDIENCE);
+    let ws = h
+        .app
+        .control
+        .create_workspace("w")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .id;
+    let initialize = |token: &str| {
+        Request::post(format!("/mcp/v1/{ws}"))
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+
+    // Known now, but not a member: authenticated, then refused.
+    let outsider = h.send(initialize(&token)).await;
+    assert_eq!(outsider.status, StatusCode::FORBIDDEN, "{}", outsider.body);
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-claude"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"));
+    assert!(
+        h.app
+            .control
+            .set_member(&ws, &user.id, Role::Viewer)
+            .await
+            .is_ok()
+    );
+    let member = h.send(initialize(&token)).await;
+    assert_eq!(member.status, StatusCode::OK, "{}", member.body);
+    assert!(member.body.contains("\"serverInfo\""), "{}", member.body);
 }

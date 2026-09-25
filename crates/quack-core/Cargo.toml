@@ -30,6 +30,7 @@ futures       = { workspace = true, features = ["std"] }
 http          = { workspace = true, features = ["std"] }
 http-body     = { workspace = true }
 jiff          = { workspace = true, features = ["std", "serde"] }
+jsonwebtoken  = { workspace = true, features = ["aws_lc_rs"] }
 keyring-core  = { workspace = true }
 oauth2        = { workspace = true }
 pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }

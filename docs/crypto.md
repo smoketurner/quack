@@ -56,11 +56,18 @@ build, and no ambiguity about which backend rustls picks at runtime.
   two purposes, both in `control.db`: signed-in users' identity-provider tokens
   (`user_tokens`) and model providers' OAuth tokens from `quack auth login`
   (`provider_tokens`).
+- `jsonwebtoken` verifies identity-provider access tokens presented to `quack serve` (RFC
+  9728, design doc 12). It is pinned with `default-features = false` and only its
+  `aws_lc_rs` feature, so its signature checks run on the same aws-lc-rs as everything else
+  (and on the FIPS module on Linux); its `rust_crypto` backend is never enabled, and with
+  exactly one backend it selects its provider itself, with nothing to install. Its
+  `signature` dependency is RustCrypto's trait crate, with no algorithms in it.
 - `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
   (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`
   to both — Cargo unions the feature sets, so Linux gets FIPS and nothing else changes.
-  `crates/quack` declares neither: it installs the provider through `quack_core::crypto`
-  and uses no rustls API of its own.
+  `crates/quack` declares neither at runtime: it installs the provider through
+  `quack_core::crypto` and uses no rustls API of its own. Its tests sign access tokens the
+  way an issuer would, with `aws-lc-rs` and `jsonwebtoken` as dev-dependencies only.
 - `rustls` carries `prefer-post-quantum`, so `X25519MLKEM768` leads the key exchange list
   instead of trailing it. It survives the FIPS build too: that hybrid sends the ML-KEM
   share first (`post_quantum_first: true`), and rustls's `fips()` for a hybrid defers to

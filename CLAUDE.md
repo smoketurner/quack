@@ -269,7 +269,10 @@ The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `s
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;
 `quack mcp` serves it on stdio (unaudited, like the CLI) and `server/mcp_http.rs` serves it
 at `/mcp/v1/{workspace}` behind `Access::resolve`, one transport per workspace, user, and write
-permission, audited with channel `mcp`.
+permission, audited with channel `mcp`. With `[server.oidc].audience` set, the API and MCP also
+accept the issuer's access tokens (`SignIn::verify_bearer`, `jsonwebtoken` on aws-lc-rs), publish
+`/.well-known/oauth-protected-resource` (`server::resource`), and send `WWW-Authenticate:
+Bearer resource_metadata=...` on 401, so MCP clients can sign users in themselves.
 
 External data comes in through `quack_core::import` (`quack import`, `POST .../import`, the
 Tables page form, `/import` in the terminal): a Postgres or SQLite query runs on the source
