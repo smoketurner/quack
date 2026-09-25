@@ -1110,7 +1110,7 @@ async fn a_failed_first_turn_leaves_no_empty_session_behind() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_authorized_search_is_audited_as_error() {
     let config = Config::parse(
-        "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 768\n",
+        "[embedding]\nmodel = \"o/e\"\ndimension = 768\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
     )
     .unwrap_or_else(|e| fail(&e.to_string()));
     let h = harness_with(ServeMode::Local, config).await;
@@ -1215,6 +1215,50 @@ async fn a_failed_authorized_search_on_a_db_error_is_audited_as_error() {
     assert!(
         rows.iter().any(|r| r.outcome == Outcome::Error),
         "expected an Outcome::Error Search row for the failed DB search, got {rows:?}"
+    );
+}
+
+/// A graph search or path that fails after authorization is audited as a
+/// `Graph` row with `Outcome::Error` before the 5xx is returned, the same
+/// ordering as `search`. Dropping the nodes table makes resolving the entry
+/// point fail inside the reader transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_authorized_graph_search_is_audited_as_error() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("graphdb", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| db.execute_statement("DROP TABLE _quack_graph_nodes"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    for uri in [
+        format!("/api/v1/workspaces/{ws}/graph/search?entity=acme"),
+        format!("/api/v1/workspaces/{ws}/graph/path?from=acme&to=globex"),
+    ] {
+        let (status, body) = h.get(&uri, &token).await;
+        assert!(
+            status.is_server_error(),
+            "expected 5xx from the missing nodes table for {uri}, got {status}: {body}"
+        );
+    }
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("graph")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        rows.iter().filter(|r| r.outcome == Outcome::Error).count(),
+        2,
+        "expected an Outcome::Error Graph row for each failed request, got {rows:?}"
     );
 }
 
@@ -2813,7 +2857,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_authorized_mcp_search_is_audited_as_error() {
     let config = Config::parse(
-        "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 768\n",
+        "[embedding]\nmodel = \"o/e\"\ndimension = 768\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
     )
     .unwrap_or_else(|e| fail(&e.to_string()));
     let h = harness_with(ServeMode::Login, config).await;
@@ -2910,8 +2954,7 @@ async fn a_successful_mcp_search_is_audited_as_allowed() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["isError"], false, "{body}");
     assert_eq!(
-        body["result"]["structuredContent"]["chunks"][0]["filename"],
-        "policy.md",
+        body["result"]["structuredContent"]["chunks"][0]["filename"], "policy.md",
         "{body}"
     );
 

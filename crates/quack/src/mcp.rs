@@ -582,16 +582,17 @@ impl McpServer {
         description = "List the tables in the workspace."
     )]
     async fn list_tables(&self) -> Result<CallToolResult, McpError> {
+        let tables = self.reader_db(WorkspaceDb::list_tables).await;
         self.inner
             .auditor
             .record(
                 AuditAction::List,
                 None,
-                Outcome::Allowed,
+                Outcome::of(&tables),
                 Some(serde_json::json!({ "what": "tables" })),
             )
             .await?;
-        let tables = self.reader_db(WorkspaceDb::list_tables).await?;
+        let tables = tables?;
         Ok(CallToolResult::structured(
             serde_json::json!({ "tables": tables }),
         ))
@@ -640,26 +641,28 @@ impl McpServer {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let embedding = query
-            .embedding(self.embedder().await?.as_ref())
-            .await
-            .map_err(internal)?;
         let options = self.inner.config.graph.options();
         let detail = serde_json::to_value(&query).map_err(internal)?;
-        let result = match self
-            .inner
-            .reader
-            .with_db(move |db| query.run(db, embedding.as_ref(), &options))
-            .await
-        {
-            Ok(result) => result,
+        // Run, audit the outcome, then answer, the way `sql` does, so a
+        // failure after authorization is recorded rather than dropped.
+        let result = async {
+            let embedding = query
+                .embedding(self.embedder().await?.as_ref())
+                .await
+                .map_err(internal)?;
             // An unknown class or relation id names the real ones.
-            Err(e) => return Ok(failure(e.to_string())),
-        };
+            self.reader_db(move |db| query.run(db, embedding.as_ref(), &options))
+                .await
+        }
+        .await;
         self.inner
             .auditor
-            .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
+            .record(AuditAction::Graph, None, Outcome::of(&result), Some(detail))
             .await?;
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => return Ok(failure(e.message)),
+        };
         let mut out = CallToolResult::structured(serde_json::to_value(&result).map_err(internal)?);
         out.content = vec![ContentBlock::text(result.to_string())];
         Ok(out)
@@ -677,27 +680,28 @@ impl McpServer {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let ends = query
-            .embeddings(self.embedder().await?.as_ref())
-            .await
-            .map_err(internal)?;
         let options = self.inner.config.graph.options();
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let PathQuery { from, to, max_hops } = query.clone();
-        let result = match self
-            .inner
-            .reader
-            .with_db(move |db| query.run(db, &ends, &options))
-            .await
-        {
-            Ok(result) => result,
+        // Run, audit the outcome, then answer (see `search_graph`).
+        let result = async {
+            let ends = query
+                .embeddings(self.embedder().await?.as_ref())
+                .await
+                .map_err(internal)?;
             // An end that names no entity comes back with the closest labels.
-            Err(e) => return Ok(failure(e.to_string())),
-        };
+            self.reader_db(move |db| query.run(db, &ends, &options))
+                .await
+        }
+        .await;
         self.inner
             .auditor
-            .record(AuditAction::Graph, None, Outcome::Allowed, Some(detail))
+            .record(AuditAction::Graph, None, Outcome::of(&result), Some(detail))
             .await?;
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => return Ok(failure(e.message)),
+        };
         if result.is_empty() {
             return Ok(failure(format!(
                 "no path connects {from} and {to} within {max_hops} hops"
@@ -713,16 +717,17 @@ impl McpServer {
         description = "List the ingested documents with their status, title, and source."
     )]
     async fn list_documents(&self) -> Result<CallToolResult, McpError> {
+        let documents = self.reader_db(WorkspaceDb::list_documents).await;
         self.inner
             .auditor
             .record(
                 AuditAction::List,
                 None,
-                Outcome::Allowed,
+                Outcome::of(&documents),
                 Some(serde_json::json!({ "what": "documents" })),
             )
             .await?;
-        let documents = self.reader_db(WorkspaceDb::list_documents).await?;
+        let documents = documents?;
         Ok(CallToolResult::structured(
             serde_json::json!({ "documents": documents }),
         ))
