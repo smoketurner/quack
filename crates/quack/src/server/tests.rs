@@ -4497,6 +4497,61 @@ async fn local_mode_refuses_new_users_from_the_api() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// Logout ends a session and nothing else: an API token presented to either
+/// logout route is a no-op success that records no `logout` row, while a
+/// session's logout closes it and is audited (#223).
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_session_logout_is_audited_as_a_logout() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("a", &owner).await;
+    let IssuedToken { secret, .. } = h
+        .app
+        .control
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let api_token = secret.expose().to_owned();
+    let logouts = || {
+        h.audit(AuditFilter {
+            action: Some(String::from("logout")),
+            ..AuditFilter::default()
+        })
+    };
+
+    let (status, _) = h
+        .call(Method::POST, "/api/v1/auth/logout", Some(&api_token), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let web = Request::builder()
+        .method(Method::POST)
+        .uri("/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {api_token}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, headers) = h.send(web).await;
+    assert!(status.is_redirection(), "{status}");
+    assert_eq!(location(&headers), "/login");
+    assert!(logouts().await.is_empty(), "a token ends no session");
+    let (status, _) = h.get("/api/v1/auth/me", &api_token).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let session = h.login("owner").await;
+    let (status, _) = h
+        .call(Method::POST, "/api/v1/auth/logout", Some(&session), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h.get("/api/v1/auth/me", &session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let rows = logouts().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|r| r.token_hash.is_none() && r.outcome == Outcome::Allowed),
+        "{rows:?}"
+    );
+}
+
 /// `list`'s token branch filters out a removed non-admin member's workspace,
 /// so `list` agrees with `show` for the same still-valid token, while
 /// preserving the admin-without-membership path (role `null`) and the

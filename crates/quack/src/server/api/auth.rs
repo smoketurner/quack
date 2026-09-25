@@ -50,11 +50,16 @@ pub(crate) async fn logout(
 
 impl Identity {
     /// End this login, from the API or the web console: the session is
-    /// closed, the logout audited, and the session cookie cleared.
+    /// closed, the logout audited, and the session cookie cleared. Only a
+    /// session is a login that can end; for any other credential (an API
+    /// token, an issuer's bearer, local mode) this succeeds and does nothing,
+    /// so no `logout` row claims a session ended and a signed-in user's
+    /// stored token is not dropped by a caller that never held a session.
     pub(crate) async fn log_out(&self, app: &App, jar: CookieJar) -> ApiResult<CookieJar> {
-        if let Credential::Session(token) = &self.credential {
-            app.sessions.close(token.as_str());
-        }
+        let Credential::Session(token) = &self.credential else {
+            return Ok(jar);
+        };
+        app.sessions.close(token.as_str());
         // A signed-in user's token is kept for their sessions; the last one
         // closing is the end of quack's use for it.
         if let Some(oidc) = &app.oidc
