@@ -552,31 +552,35 @@ fn read_hidden_line() -> Result<String> {
 /// while typing a password can never silently corrupt the stored credential.
 /// `Ctrl-C` still cancels, and `Shift` is unaffected so capital letters typed
 /// with `Shift` are still appended.
+///
+/// On Windows, AltGr is reported as CONTROL and ALT together, and it is how
+/// `@`, `{`, or `€` are typed on many layouts, so a character with both is
+/// kept. Windows also reports key releases; only presses count, or every
+/// character and every backspace would happen twice.
 fn read_hidden_line_from<F>(mut next: F) -> Result<String>
 where
     F: FnMut() -> std::io::Result<crossterm::event::Event>,
 {
-    use crossterm::event::{Event, KeyCode, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     let mut password = String::new();
     loop {
-        if let Event::Key(key) = next()? {
-            match key.code {
-                KeyCode::Enter => return Ok(password),
-                KeyCode::Backspace => {
-                    password.pop();
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    anyhow::bail!("cancelled");
-                }
-                KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // crossterm 0.29 reports Ctrl-letter combos (Ctrl-A, Ctrl-D,
-                    // Ctrl-E, Ctrl-U, Ctrl-W, ...) as `Char(letter)` with
-                    // `KeyModifiers::CONTROL`; the letter is not part of the
-                    // password and must not be appended to the buffer.
-                }
-                KeyCode::Char(c) => password.push(c),
-                _ => {}
+        let Event::Key(key) = next()? else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        // Control without Alt: CONTROL|ALT is AltGr on Windows, a character.
+        let control = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Enter => return Ok(password),
+            KeyCode::Backspace => {
+                password.pop();
             }
+            KeyCode::Char('c') if control => anyhow::bail!("cancelled"),
+            // A Ctrl combo is not part of the password.
+            KeyCode::Char(_) if control => {}
+            KeyCode::Char(c) => password.push(c),
+            _ => {}
         }
     }
 }
@@ -584,7 +588,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     #[derive(clap::Parser)]
     #[command(no_binary_name = true)]
@@ -745,6 +749,52 @@ mod tests {
         assert_eq!(
             drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
             "acc"
+        );
+    }
+
+    /// AltGr on Windows is CONTROL|ALT, and it types characters such as
+    /// `@` and `€` on many layouts: those are kept, not taken for Ctrl combos.
+    #[test]
+    fn altgr_characters_are_kept() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let events = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char('@'), altgr),
+            key(KeyCode::Char('€'), altgr),
+            key(KeyCode::Char('{'), altgr),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        assert_eq!(
+            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
+            "a@€{"
+        );
+    }
+
+    /// Windows reports key releases too: only presses type, so a character
+    /// or a backspace does not happen twice.
+    #[test]
+    fn key_releases_are_ignored() {
+        let release = |code| {
+            Event::Key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ))
+        };
+        let events = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            release(KeyCode::Char('a')),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            release(KeyCode::Char('b')),
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            release(KeyCode::Backspace),
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+            release(KeyCode::Char('c')),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        assert_eq!(
+            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
+            "ac"
         );
     }
 
