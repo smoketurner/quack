@@ -296,12 +296,54 @@ pub enum Grant {
     /// quack authenticates as itself with its client id and secret; nobody
     /// signs in, and a token is requested again whenever one runs out.
     ClientCredentials,
+    /// Each request reaches the provider as the person who made it: quack
+    /// exchanges that person's own token for one to this provider (`quack
+    /// serve` only; see [`Exchange`]).
+    OnBehalfOf,
 }
+
+/// The wire form of an on-behalf-of exchange.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Exchange {
+    /// RFC 8693 token exchange (Okta, Auth0, Vouch): the user's token as
+    /// `subject_token`, and quack's own token as `actor_token` unless `actor`
+    /// is off.
+    #[default]
+    TokenExchange,
+    /// Microsoft Entra ID's On-Behalf-Of flow: the `jwt-bearer` grant with
+    /// `requested_token_use=on_behalf_of`. It has no actor token.
+    Entra,
+}
+
+text_enum!(Exchange, "exchange", {
+    TokenExchange => "token-exchange",
+    Entra => "entra",
+});
+
+/// How quack authenticates itself at a token endpoint with its client
+/// secret (RFC 6749 2.3.1; the names are RFC 8414's).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum ClientAuth {
+    /// In the request body (Entra, Auth0's default).
+    #[default]
+    #[serde(rename = "client_secret_post")]
+    ClientSecretPost,
+    /// In an HTTP Basic `Authorization` header (Okta's default).
+    #[serde(rename = "client_secret_basic")]
+    ClientSecretBasic,
+}
+
+text_enum!(ClientAuth, "client authentication", {
+    ClientSecretPost => "client_secret_post",
+    ClientSecretBasic => "client_secret_basic",
+});
 
 text_enum!(Grant, "grant", {
     AuthorizationCode => "authorization-code",
     DeviceCode => "device-code",
     ClientCredentials => "client-credentials",
+    OnBehalfOf => "on-behalf-of",
 });
 
 /// `[providers.NAME.oauth]`: the issuer, the client, and the grant that
@@ -325,8 +367,25 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub grant: Grant,
     /// Environment variable holding the client secret: quack as a
-    /// confidential client. `grant = "client-credentials"` requires it.
+    /// confidential client. `client-credentials` and `on-behalf-of` require
+    /// it.
     pub client_secret_env: Option<String>,
+    /// How the secret is presented at the token endpoint.
+    #[serde(default)]
+    pub client_auth: ClientAuth,
+    /// `on-behalf-of`: the exchange's wire form.
+    #[serde(default)]
+    pub exchange: Exchange,
+    /// `on-behalf-of`: the RFC 8693 `audience` of the token to obtain (Okta,
+    /// Auth0).
+    pub audience: Option<String>,
+    /// `on-behalf-of`: the RFC 8707 `resource` of the token to obtain.
+    pub resource: Option<String>,
+    /// `on-behalf-of` with `token-exchange`: send quack's own
+    /// client-credentials token as the `actor_token`, so the issued token
+    /// names quack as the actor (`act`) beside the user (`sub`).
+    #[serde(default = "OAuthConfig::default_actor")]
+    pub actor: bool,
 }
 
 impl OAuthConfig {
@@ -335,6 +394,51 @@ impl OAuthConfig {
 
     fn default_redirect_uri() -> String {
         String::from(Self::DEFAULT_REDIRECT_URI)
+    }
+
+    const fn default_actor() -> bool {
+        true
+    }
+
+    /// The grant's name in an issuer's `grant_types_supported`.
+    #[must_use]
+    pub const fn grant_type(&self) -> &'static str {
+        match (self.grant, self.exchange) {
+            (Grant::AuthorizationCode, _) => "authorization_code",
+            (Grant::DeviceCode, _) => "urn:ietf:params:oauth:grant-type:device_code",
+            (Grant::ClientCredentials, _) => "client_credentials",
+            (Grant::OnBehalfOf, Exchange::TokenExchange) => {
+                "urn:ietf:params:oauth:grant-type:token-exchange"
+            }
+            (Grant::OnBehalfOf, Exchange::Entra) => "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        }
+    }
+
+    /// The rules between the section's keys that the parser cannot check.
+    fn check(&self) -> Result<()> {
+        if self.issuer_url.is_empty() || self.client_id.is_empty() {
+            return Err(Error::Config(String::from(
+                "the oauth section needs issuer_url and client_id",
+            )));
+        }
+        if matches!(self.grant, Grant::ClientCredentials | Grant::OnBehalfOf)
+            && self.client_secret_env.is_none()
+        {
+            return Err(Error::Config(format!(
+                "grant = \"{}\" needs client_secret_env",
+                self.grant
+            )));
+        }
+        if self.grant != Grant::OnBehalfOf
+            && (self.exchange != Exchange::default()
+                || self.audience.is_some()
+                || self.resource.is_some())
+        {
+            return Err(Error::Config(String::from(
+                "exchange, audience, and resource apply only to grant = \"on-behalf-of\"",
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -573,16 +677,7 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
             (AuthMode::None, None, None) => ProviderAuth::None,
             (AuthMode::ApiKey, Some(env), None) => ProviderAuth::ApiKey { env },
             (AuthMode::Oauth, None, Some(oauth)) => {
-                if oauth.issuer_url.is_empty() || oauth.client_id.is_empty() {
-                    return Err(Error::Config(String::from(
-                        "the oauth section needs issuer_url and client_id",
-                    )));
-                }
-                if oauth.grant == Grant::ClientCredentials && oauth.client_secret_env.is_none() {
-                    return Err(Error::Config(String::from(
-                        "grant = \"client-credentials\" needs client_secret_env",
-                    )));
-                }
+                oauth.check()?;
                 ProviderAuth::Oauth(oauth)
             }
             (AuthMode::None, Some(_), _) => {
@@ -2018,6 +2113,41 @@ rerank = "model"
         );
         assert!(err_of(&format!("{section}grant = \"password\"\n")).contains("password"));
         assert!(err_of(&format!("{section}device_code = true\n")).contains("device_code"));
+        let obo = |extra: &str| {
+            Config::parse(&format!(
+                "{section}grant = \"on-behalf-of\"\nclient_secret_env = \"S\"\n{extra}"
+            ))
+            .ok()
+            .and_then(|c| c.providers.get("o").and_then(|p| p.auth.oauth().cloned()))
+        };
+        let entra = obo("exchange = \"entra\"\nclient_auth = \"client_secret_basic\"\n");
+        assert!(entra.is_some_and(|o| o.grant == Grant::OnBehalfOf
+            && o.exchange == Exchange::Entra
+            && o.client_auth == ClientAuth::ClientSecretBasic
+            && o.actor));
+        let okta = obo("audience = \"api://gw\"\nactor = false\n");
+        assert!(okta.is_some_and(|o| o.exchange == Exchange::TokenExchange
+            && o.audience.as_deref() == Some("api://gw")
+            && !o.actor
+            && o.client_auth == ClientAuth::ClientSecretPost));
+        assert!(
+            err_of(&format!("{section}grant = \"on-behalf-of\"\n"))
+                .contains("grant = \"on-behalf-of\" needs client_secret_env")
+        );
+        assert!(
+            err_of(&format!("{section}audience = \"api://gw\"\n"))
+                .contains("apply only to grant = \"on-behalf-of\"")
+        );
+        assert!(err_of(&format!("{section}client_auth = \"mtls\"\n")).contains("mtls"));
+        let named = |extra: &str| obo(extra).map(|o| o.grant_type());
+        assert_eq!(
+            named(""),
+            Some("urn:ietf:params:oauth:grant-type:token-exchange")
+        );
+        assert_eq!(
+            named("exchange = \"entra\"\n"),
+            Some("urn:ietf:params:oauth:grant-type:jwt-bearer")
+        );
     }
 
     #[test]

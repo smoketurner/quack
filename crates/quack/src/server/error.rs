@@ -115,6 +115,8 @@ impl From<CoreError> for ApiError {
             }
             CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
             CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
+            // The caller is known; this provider cannot act for them.
+            CoreError::Delegation { .. } => StatusCode::FORBIDDEN,
             CoreError::Config(_)
             | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }

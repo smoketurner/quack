@@ -41,7 +41,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `config::inspect` | the same file read outside `Config::load`: every recognized setting with the value in force and its origin, the file's unrecognized keys, the environment variables read (`quack config`) | 13 |
 | `crypto` | installs the aws-lc-rs provider once | 14 |
 | `vault` | data at rest sealed with HPKE under one key in the OS keychain, per purpose and subject; callers store the `Sealed` value | 10.3, 12 |
-| `oidc` | server sign-in through an OpenID Connect issuer (`SignIn`), verification of the issuer's access tokens presented as bearers (`SignIn::verify_bearer`), and signed-in users' tokens sealed in `control.db` (`UserTokens`) | 12 |
+| `oidc` | server sign-in through an OpenID Connect issuer (`SignIn`), verification of the issuer's access tokens presented as bearers (`SignIn::verify_bearer`), signed-in users' tokens sealed in `control.db` (`UserTokens`), and each person's own token for session renewal and on-behalf-of exchanges (`SubjectTokens`) | 10.2, 12 |
 | `doctor` | `quack doctor`'s checks over a `config::inspect` result: config file, crypto module, data directory mode, `control.db`, the workspace, each model's credential and a model-list probe of its provider, the server bind; creates nothing | 11.5 |
 | `error` | the `thiserror` enum every layer returns | |
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |
@@ -61,7 +61,7 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | `extraction` | what both extraction runs share: the `Extract` trait, lenient JSON answers, concurrent calls with per-chunk progress (`RunProgress`), even sampling across documents, name counts (`Tally`) | 6.4, 6.5 |
 | `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
 | `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots | 4.1 |
-| `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `OneShotAgent` (one tool-less prompt, streamed: extraction and reranking), OAuth token management (`oauth`), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
+| `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `OneShotAgent` (one tool-less prompt, streamed: extraction and reranking), OAuth token management (`oauth`), the person an on-behalf-of provider acts for (`acting`, a task-local), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
 
 ## `quack`
 

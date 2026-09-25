@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::config::JobsConfig;
 use crate::ids::{SessionId, UserId, WorkspaceId};
+use crate::llm::acting::Acting;
 use crate::priority::Priority;
 
 /// Snapshots the broadcast channel holds for a slow subscriber before it
@@ -662,6 +663,10 @@ impl JobQueue {
 
         // The lane place is taken now, so the lane runs in submission order.
         let ticket = spec.lane.as_ref().map(|lane| self.inner.enter_lane(lane));
+        // The job acts for whoever submitted it: its model requests reach an
+        // on-behalf-of provider as that person, not as whoever runs next.
+        let acting = Acting::current();
+        let work = move |ctx: JobContext| Acting::scope(acting, work(ctx));
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             let ctx = JobContext {
@@ -962,6 +967,32 @@ mod tests {
         })
         .await
         .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_job_acts_for_whoever_submitted_it() {
+        use crate::llm::acting::Acting;
+        let queue = JobQueue::new(10);
+        let submit = |label: &str| {
+            queue.submit(JobSpec::new(JobKind::Ingest, label), |_| async {
+                Ok(Acting::current()
+                    .map_or_else(|| String::from("nobody"), |a| a.user().to_string()))
+            })
+        };
+        let ada = Acting::request(async {
+            Acting::fixed(UserId::from("ada"), Err("unused")).enter();
+            submit("ada's upload")
+        })
+        .await;
+        let anonymous = submit("the CLI's upload");
+        assert_eq!(
+            finished(&queue, ada.id).await.outcome.as_deref(),
+            Some("ada")
+        );
+        assert_eq!(
+            finished(&queue, anonymous.id).await.outcome.as_deref(),
+            Some("nobody")
+        );
     }
 
     #[tokio::test]

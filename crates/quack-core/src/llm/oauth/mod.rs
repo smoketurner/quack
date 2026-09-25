@@ -27,7 +27,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
-use oauth2::basic::BasicClient;
+use oauth2::basic::{BasicClient, BasicTokenResponse};
 use oauth2::url::Url;
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
@@ -47,8 +47,31 @@ use store::ProviderTokens;
 pub use token::CachedToken;
 pub(crate) use token::Plaintext;
 
-use crate::config::{Config, Grant, OAuthConfig, ProviderName};
+use crate::config::{ClientAuth, Config, Exchange, Grant, OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
+use crate::ids::UserId;
+use crate::llm::acting::Acting;
+
+/// RFC 7523's grant, which Entra's On-Behalf-Of flow uses.
+const JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+/// RFC 8693's grant and its access-token type identifier.
+const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+/// An OAuth error response (RFC 6749 5.2), as far as quack reports it.
+#[derive(Debug, Default, Deserialize)]
+struct TokenRefusal {
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// quack's client credentials for a token request it builds itself.
+#[derive(Clone, Copy)]
+pub(crate) struct TokenClient<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) secret: &'a str,
+    pub(crate) auth: ClientAuth,
+}
 
 /// Tokens with less than this left are refreshed before use.
 const REUSE_MARGIN: SignedDuration = SignedDuration::from_secs(60);
@@ -63,8 +86,8 @@ type OAuthClient =
 /// The endpoints an issuer advertises in its `OpenID` Connect discovery document.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Endpoints {
-    /// The issuer identifier ID tokens must carry; `OpenID` Connect requires
-    /// it, plain OAuth servers may leave it out.
+    /// The issuer identifier, which must be the configured issuer (`OpenID`
+    /// Connect Discovery 4.3, RFC 8414 3.3) and which tokens carry.
     pub(crate) issuer: Option<String>,
     #[serde(rename = "authorization_endpoint")]
     pub(crate) authorization: String,
@@ -74,6 +97,48 @@ pub(crate) struct Endpoints {
     device_authorization: Option<String>,
     /// Where the issuer publishes the keys its tokens are signed with.
     pub(crate) jwks_uri: Option<String>,
+    /// The grants the issuer supports, when it says.
+    pub(crate) grant_types_supported: Option<Vec<String>>,
+    /// Whether every authorization redirect carries `iss` (RFC 9207).
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
+}
+
+impl Endpoints {
+    /// Where RFC 8414 puts an OAuth server's metadata: the well-known
+    /// segment inserted between the host and the issuer's path.
+    fn oauth_metadata_url(issuer: &str) -> Result<String> {
+        let url = Url::parse(issuer)
+            .map_err(|e| Error::Config(format!("issuer '{issuer}' is not a URL: {e}")))?;
+        let path = url.path().trim_end_matches('/');
+        Ok(format!(
+            "{}/.well-known/oauth-authorization-server{path}",
+            url.origin().ascii_serialization()
+        ))
+    }
+
+    /// The redirect's `iss` against this issuer (RFC 9207): when present it
+    /// must match, and an issuer that promises one must send it, so a
+    /// response from another server cannot pass for this one's.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the redirect cannot be from this issuer.
+    pub(crate) fn check_response_issuer(
+        &self,
+        iss: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        match (iss, self.issuer.as_deref()) {
+            (Some(iss), Some(issuer)) if iss == issuer => Ok(()),
+            (Some(iss), _) => Err(format!(
+                "the redirect names issuer '{iss}', not this one (RFC 9207)"
+            )),
+            (None, _) if self.authorization_response_iss_parameter_supported => Err(String::from(
+                "the issuer promises an iss on its redirects and this one has none (RFC 9207)",
+            )),
+            (None, _) => Ok(()),
+        }
+    }
 }
 
 /// The HTTP client OAuth requests go through: rustls with aws-lc-rs, no
@@ -121,12 +186,92 @@ impl OAuthHttp {
     /// Returns an error when the document cannot be fetched or lacks the
     /// endpoints.
     pub(crate) async fn discover(&self, issuer_url: &str) -> Result<Endpoints> {
-        let url = format!(
-            "{}/.well-known/openid-configuration",
-            issuer_url.trim_end_matches('/')
-        );
+        let issuer = issuer_url.trim_end_matches('/');
+        let url = format!("{issuer}/.well-known/openid-configuration");
         tracing::debug!(url = %url, "discovering OAuth endpoints");
-        self.fetch_json(&url, "OpenID discovery").await
+        let endpoints = match self.fetch_json::<Endpoints>(&url, "OpenID discovery").await {
+            Ok(endpoints) => endpoints,
+            // A plain OAuth server publishes RFC 8414 metadata instead.
+            Err(openid) => {
+                let metadata = Endpoints::oauth_metadata_url(issuer)?;
+                self.fetch_json(&metadata, "OAuth server metadata")
+                    .await
+                    .map_err(|_| openid)?
+            }
+        };
+        let named = endpoints.issuer.as_deref().map(|i| i.trim_end_matches('/'));
+        if named != Some(issuer) {
+            return Err(Error::Llm(format!(
+                "the discovery document for {issuer} names issuer {named:?}, not '{issuer}'"
+            )));
+        }
+        Ok(endpoints)
+    }
+
+    /// POST a token request built by hand (the `oauth2` crate has no token
+    /// exchange), authenticating the client as `client.auth` says: HTTP
+    /// Basic with both halves form-encoded (RFC 6749 2.3.1), or in the body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be sent or read; a refusal
+    /// is a status, returned with its body.
+    pub(crate) async fn post_form(
+        &self,
+        url: &str,
+        client: TokenClient<'_>,
+        form: &[(&str, String)],
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+        let mut basic = None;
+        let body = {
+            let mut body = oauth2::url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in form {
+                body.append_pair(key, value);
+            }
+            match client.auth {
+                ClientAuth::ClientSecretPost => {
+                    body.append_pair("client_id", client.id);
+                    body.append_pair("client_secret", client.secret);
+                }
+                ClientAuth::ClientSecretBasic => {
+                    let encode = |part: &str| {
+                        oauth2::url::form_urlencoded::byte_serialize(part.as_bytes())
+                            .collect::<String>()
+                    };
+                    basic = Some(base64::engine::general_purpose::STANDARD.encode(format!(
+                        "{}:{}",
+                        encode(client.id),
+                        encode(client.secret)
+                    )));
+                }
+            }
+            body.finish()
+        };
+        let mut request = self
+            .0
+            .post(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            );
+        if let Some(credentials) = basic {
+            request = request.header(
+                reqwest::header::AUTHORIZATION,
+                format!("Basic {credentials}"),
+            );
+        }
+        let response = request
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Llm(format!("the token request to {url} failed: {e}")))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Llm(format!("the token response from {url} was cut short: {e}")))?;
+        Ok((status, bytes.to_vec()))
     }
 
     /// GET a JSON document; `what` names it in errors.
@@ -249,6 +394,9 @@ pub struct TokenManager {
     current: RwLock<Option<CachedToken>>,
     /// One refresh or login at a time; others await it and reuse the result.
     refresh_lock: Mutex<()>,
+    /// `on-behalf-of`: each person's exchanged token, in memory only, behind
+    /// a lock of its own so one person's exchange never waits on another's.
+    delegated: StdMutex<HashMap<UserId, Arc<Mutex<Option<CachedToken>>>>>,
 }
 
 impl std::fmt::Debug for TokenManager {
@@ -327,6 +475,7 @@ impl TokenManager {
             endpoints: OnceCell::new(),
             current: RwLock::new(None),
             refresh_lock: Mutex::new(()),
+            delegated: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -348,6 +497,37 @@ impl TokenManager {
     /// refresh token, or the refresh is refused; other errors are transport
     /// or cache failures.
     pub async fn access_token(&self) -> Result<SecretString> {
+        match self.config.grant {
+            Grant::OnBehalfOf => self.on_behalf_of().await,
+            Grant::AuthorizationCode | Grant::DeviceCode | Grant::ClientCredentials => {
+                self.service_token().await
+            }
+        }
+    }
+
+    /// Whether the issuer lists the configured grant in
+    /// `grant_types_supported`; `None` when it lists none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery fails.
+    pub async fn issuer_supports_grant(&self) -> Result<Option<bool>> {
+        let grant = self.config.grant_type();
+        Ok(self
+            .endpoints()
+            .await?
+            .grant_types_supported
+            .as_ref()
+            .map(|grants| grants.iter().any(|g| g == grant)))
+    }
+
+    /// quack's own token for this provider: the one every grant but
+    /// `on-behalf-of` hands out, and that grant's actor token.
+    ///
+    /// # Errors
+    ///
+    /// As [`TokenManager::access_token`].
+    pub async fn service_token(&self) -> Result<SecretString> {
         if let Some(token) = self.fresh_in_memory().await {
             return Ok(token);
         }
@@ -368,7 +548,7 @@ impl TokenManager {
                 *self.current.write().await = Some(cached);
                 return Ok(access);
             }
-            (_, Grant::ClientCredentials) => self.client_credentials().await?,
+            (_, Grant::ClientCredentials | Grant::OnBehalfOf) => self.client_credentials().await?,
             (None, Grant::AuthorizationCode | Grant::DeviceCode) => {
                 return Err(self.auth_required(AuthReason::NoToken));
             }
@@ -441,6 +621,12 @@ impl TokenManager {
                 self.login_device_code(notify).await?
             }
             (Grant::AuthorizationCode, LoginFlow::Configured) => self.login_browser(notify).await?,
+            (Grant::OnBehalfOf, LoginFlow::Configured | LoginFlow::DeviceCode) => {
+                return Err(Error::Config(format!(
+                    "provider '{}' acts on behalf of each person signed in to quack serve; there is no login",
+                    self.provider
+                )));
+            }
         };
         self.store.store(&token).await?;
         *self.current.write().await = Some(token.clone());
@@ -476,7 +662,7 @@ impl TokenManager {
             url: url.to_string(),
         });
 
-        let code = tokio::time::timeout(
+        let redirected = tokio::time::timeout(
             BROWSER_TIMEOUT,
             wait_for_callback(&listener, redirect.path(), csrf.secret()),
         )
@@ -488,9 +674,13 @@ impl TokenManager {
             ))
         })??;
 
+        self.endpoints()
+            .await?
+            .check_response_issuer(redirected.iss.as_deref())
+            .map_err(|e| Error::Llm(format!("provider '{}': {e}", self.provider)))?;
         let http = self.http.sender();
         let response = client
-            .exchange_code(AuthorizationCode::new(code))
+            .exchange_code(AuthorizationCode::new(redirected.code))
             .set_pkce_verifier(verifier)
             .request_async(&http)
             .await
@@ -562,7 +752,7 @@ impl TokenManager {
             token: cached.map(|t| TokenStatus {
                 expires_at: t.expires_at,
                 renewal: match (self.config.grant, t.refresh_token.is_some()) {
-                    (Grant::ClientCredentials, _) => Renewal::Regrant,
+                    (Grant::ClientCredentials | Grant::OnBehalfOf, _) => Renewal::Regrant,
                     (Grant::AuthorizationCode | Grant::DeviceCode, true) => Renewal::Refreshable,
                     (Grant::AuthorizationCode | Grant::DeviceCode, false) => Renewal::Relogin,
                 },
@@ -586,12 +776,129 @@ impl TokenManager {
         self.config.scopes.iter().cloned().map(Scope::new).collect()
     }
 
-    async fn client(&self) -> Result<OAuthClient> {
-        let endpoints = self
-            .endpoints
+    async fn endpoints(&self) -> Result<&Endpoints> {
+        self.endpoints
             .get_or_try_init(|| self.http.discover(&self.config.issuer_url))
-            .await?
-            .clone();
+            .await
+    }
+
+    /// The client secret from its environment variable, when one is named.
+    fn client_secret(&self) -> Result<Option<String>> {
+        self.config
+            .client_secret_env
+            .as_ref()
+            .map(|var| {
+                std::env::var(var).map_err(|_| {
+                    Error::Config(format!(
+                        "provider '{}' needs the client secret in environment variable {var}, which is not set",
+                        self.provider
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    fn delegation(&self, reason: impl Into<String>) -> Error {
+        Error::Delegation {
+            provider: self.provider.to_string(),
+            reason: reason.into(),
+        }
+    }
+
+    /// `on-behalf-of`: the acting person's token for this provider, reused
+    /// while fresh, else exchanged for their own token.
+    async fn on_behalf_of(&self) -> Result<SecretString> {
+        let Some(acting) = Acting::current() else {
+            return Err(self.delegation(
+                "no signed-in person is behind this request (the CLI, the terminal, or local mode)",
+            ));
+        };
+        let entry = {
+            let mut delegated = self
+                .delegated
+                .lock()
+                .map_err(|e| Error::Llm(format!("delegated tokens poisoned: {e}")))?;
+            Arc::clone(delegated.entry(acting.user().clone()).or_default())
+        };
+        let mut held = entry.lock().await;
+        if let Some(token) = held
+            .as_ref()
+            .filter(|t| t.is_fresh(Timestamp::now(), REUSE_MARGIN))
+        {
+            return Ok(token.access_token.clone());
+        }
+        let subject = acting
+            .subject_token()
+            .await
+            .map_err(|reason| self.delegation(reason))?;
+        let token = self.exchange(&subject).await?;
+        tracing::info!(provider = %self.provider, user = %acting.user(), "exchanged a token on behalf of a user");
+        let access = token.access_token.clone();
+        *held = Some(token);
+        Ok(access)
+    }
+
+    /// Exchange `subject` (the person's access token for quack) for a token
+    /// to this provider, in the configured wire form.
+    async fn exchange(&self, subject: &SecretString) -> Result<CachedToken> {
+        let endpoints = self.endpoints().await?;
+        let secret = self
+            .client_secret()?
+            .ok_or_else(|| self.delegation("no client_secret_env is configured"))?;
+        let scope = self.config.scopes.join(" ");
+        let mut form: Vec<(&str, String)> = Vec::new();
+        match self.config.exchange {
+            Exchange::Entra => {
+                form.push(("grant_type", String::from(JWT_BEARER)));
+                form.push(("assertion", subject.expose_secret().to_owned()));
+                form.push(("requested_token_use", String::from("on_behalf_of")));
+                form.push(("scope", scope));
+            }
+            Exchange::TokenExchange => {
+                form.push(("grant_type", String::from(TOKEN_EXCHANGE)));
+                form.push(("subject_token", subject.expose_secret().to_owned()));
+                form.push(("subject_token_type", String::from(ACCESS_TOKEN_TYPE)));
+                form.push(("requested_token_type", String::from(ACCESS_TOKEN_TYPE)));
+                if !scope.is_empty() {
+                    form.push(("scope", scope));
+                }
+                if let Some(audience) = &self.config.audience {
+                    form.push(("audience", audience.clone()));
+                }
+                if let Some(resource) = &self.config.resource {
+                    form.push(("resource", resource.clone()));
+                }
+                if self.config.actor {
+                    let actor = self.service_token().await?;
+                    form.push(("actor_token", actor.expose_secret().to_owned()));
+                    form.push(("actor_token_type", String::from(ACCESS_TOKEN_TYPE)));
+                }
+            }
+        }
+        let client = TokenClient {
+            id: &self.config.client_id,
+            secret: &secret,
+            auth: self.config.client_auth,
+        };
+        let (status, body) = self.http.post_form(&endpoints.token, client, &form).await?;
+        if status.is_success() {
+            let response: BasicTokenResponse = serde_json::from_slice(&body).map_err(|e| {
+                self.delegation(format!("the issuer's answer is not a token response: {e}"))
+            })?;
+            return Ok(CachedToken::from_response(&response));
+        }
+        let refusal: TokenRefusal = serde_json::from_slice(&body).unwrap_or_default();
+        Err(self.delegation(format!(
+            "the issuer refused the exchange ({status}): {}{}",
+            refusal.error.as_deref().unwrap_or("no error code"),
+            refusal
+                .error_description
+                .map_or(String::new(), |d| format!(" ({d})"))
+        )))
+    }
+
+    async fn client(&self) -> Result<OAuthClient> {
+        let endpoints = self.endpoints().await?.clone();
         let parse = |what: &str, url: String| {
             Url::parse(&url).map_err(|e| {
                 Error::Llm(format!(
@@ -605,8 +912,12 @@ impl TokenManager {
             .map(|u| parse("device_authorization_endpoint", u))
             .transpose()?
             .map(DeviceAuthorizationUrl::from_url);
+        let auth_type = match self.config.client_auth {
+            ClientAuth::ClientSecretPost => AuthType::RequestBody,
+            ClientAuth::ClientSecretBasic => AuthType::BasicAuth,
+        };
         let mut client = BasicClient::new(ClientId::new(self.config.client_id.clone()))
-            .set_auth_type(AuthType::RequestBody)
+            .set_auth_type(auth_type)
             .set_auth_uri(AuthUrl::from_url(parse(
                 "authorization_endpoint",
                 endpoints.authorization,
@@ -620,13 +931,7 @@ impl TokenManager {
                 "redirect_uri",
                 self.config.redirect_uri.clone(),
             )?));
-        if let Some(var) = &self.config.client_secret_env {
-            let secret = std::env::var(var).map_err(|_| {
-                Error::Config(format!(
-                    "provider '{}' needs the client secret in environment variable {var}, which is not set",
-                    self.provider
-                ))
-            })?;
+        if let Some(secret) = self.client_secret()? {
             client = client.set_client_secret(ClientSecret::new(secret));
         }
         Ok(client)
@@ -665,11 +970,18 @@ pub(crate) fn random_token() -> Result<String> {
 /// Serve the loopback redirect until a request carries the expected state,
 /// returning the authorization code. Other requests (a favicon probe) get a
 /// 404 and the wait continues.
+/// What the browser's redirect brought back: the code, and the issuer it
+/// names (RFC 9207) when it names one.
+struct Redirected {
+    code: String,
+    iss: Option<String>,
+}
+
 async fn wait_for_callback(
     listener: &TcpListener,
     path: &str,
     expected_state: &str,
-) -> Result<String> {
+) -> Result<Redirected> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let mut buf = Vec::with_capacity(2048);
@@ -733,7 +1045,10 @@ async fn wait_for_callback(
             "Login complete. You can close this window and return to quack.",
         )
         .await;
-        return Ok(code.clone());
+        return Ok(Redirected {
+            code: code.clone(),
+            iss: params.get("iss").cloned(),
+        });
     }
 }
 

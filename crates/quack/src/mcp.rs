@@ -21,6 +21,7 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::embedding::Input;
 use quack_core::ids::{SessionId, UserId};
+use quack_core::llm::acting::Acting;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -117,6 +118,10 @@ pub(crate) struct McpSetup {
     pub policy: WritePolicy,
     pub user_id: Option<UserId>,
     pub auditor: Auditor,
+    /// Whom model requests are made for (`quack serve`: the transport's
+    /// user; stdio: nobody). Tool calls run in the MCP session's own task,
+    /// outside the HTTP request, so it is carried here.
+    pub acting: Option<Acting>,
 }
 
 /// One MCP server over one workspace. The tool router comes from the
@@ -332,6 +337,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<QueryArgs>,
     ) -> Result<CallToolResult, McpError> {
+        // Boxed: an agent turn's future is large (clippy::large_futures).
+        Box::pin(Acting::scope(self.inner.acting.clone(), self.ask(args))).await
+    }
+
+    /// `query`, acting for the transport's user: its model requests reach an
+    /// on-behalf-of provider as them.
+    async fn ask(&self, args: QueryArgs) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
         if question.is_empty() {
             return Ok(failure("question must not be empty"));
@@ -420,6 +432,12 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
+        Acting::scope(self.inner.acting.clone(), self.retrieve(args)).await
+    }
+
+    /// `search`, acting for the transport's user: embedding the query is a
+    /// model request too.
+    async fn retrieve(&self, args: SearchArgs) -> Result<CallToolResult, McpError> {
         let query = args.query.trim().to_owned();
         if query.is_empty() {
             return Ok(failure("query must not be empty"));
@@ -905,6 +923,7 @@ pub(crate) async fn serve_stdio(
         policy,
         user_id: None,
         auditor: Auditor::None,
+        acting: None,
     });
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
@@ -949,6 +968,7 @@ mod tests {
             },
             policy,
             user_id: None,
+            acting: None,
             auditor: Auditor::None,
         })
     }
@@ -1072,6 +1092,7 @@ mod tests {
             },
             policy: WritePolicy::Deny,
             user_id: None,
+            acting: None,
             auditor: Auditor::None,
         });
         let ask = |session_id: Option<&str>, mode: Option<&str>| {

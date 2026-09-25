@@ -4,6 +4,7 @@
 //! `PROVIDER/MODEL` reference into a rig client lives here, so the interfaces
 //! never build providers themselves.
 
+pub mod acting;
 pub mod bedrock;
 pub mod oauth;
 

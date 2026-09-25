@@ -1359,7 +1359,13 @@ pub struct CachedToken {
 
 Lifecycle: acquire via `quack auth login PROVIDER` (browser PKCE, or device code when
 `grant = "device-code"`, no browser, or `SSH_CONNECTION` is set; endpoints from
-`{issuer_url}/.well-known/openid-configuration`; verifier from aws-lc-rs randomness);
+`{issuer_url}/.well-known/openid-configuration`, else RFC 8414's
+`/.well-known/oauth-authorization-server` inserted before the issuer's path, and either way
+the document must name the configured issuer; the redirect's `iss` must match it when
+present, and must be present when the issuer advertises
+`authorization_response_iss_parameter_supported` (RFC 9207); verifier from aws-lc-rs
+randomness; the client secret goes in the body or, with `client_auth =
+"client_secret_basic"`, in HTTP Basic);
 reuse while more than 60 s remain; refresh silently under `refresh_lock`; restart on
 refresh failure; in print, ingest, and server modes, where no flow can run, fail with exit
 4 / HTTP 503 naming the command to run. A `client-credentials` provider needs no login:
@@ -1383,6 +1389,27 @@ include `offline_access` where the issuer needs it to return a refresh token.
 The server holds one `TokenManager` per OAuth provider, shared across requests. A server
 that reaches Azure OpenAI this way is a confidential client and should be registered as
 such with a client secret or certificate; `client_secret_env` is honored when set.
+
+**On behalf of each person** (`grant = "on-behalf-of"`, `quack serve` only). Each request,
+and each background job, reaches the provider as the person who made it: quack exchanges
+that person's own access token for quack (their stored sign-in, section 12, renewed when
+due, else the identity-provider token they presented as a bearer) for a token to this
+provider, kept per person in memory. `exchange` picks the wire form:
+`token-exchange` (RFC 8693, the default: `subject_token` of type `access_token`,
+`requested_token_type` `access_token`, `scope`, `audience`, and `resource` when set; Okta,
+Auth0, Vouch) or `entra` (the `jwt-bearer` grant with `assertion` and
+`requested_token_use=on_behalf_of`). With `token-exchange`, quack also sends its own
+client-credentials token as `actor_token` (`actor = true`, the default) so the issued
+token names quack as the actor beside the person; Entra's form has no actor. The grant
+needs `client_secret_env`. A request with no signed-in person behind it (the CLI, the
+terminal, local mode) or whose person has no current identity-provider token is refused
+with `Error::Delegation` (HTTP 403, exit 4): nothing reaches such a provider as quack
+itself. The acting person travels in a task-local (`llm::acting::Acting`): the server
+scopes an empty slot around each request, the identity extractor fills it, the job queue
+carries the submitter's into every job, and MCP's `query` and `search` carry the
+transport's user, since they run in the MCP session's task. `quack auth login` refuses the
+grant; `quack doctor` checks quack's own token (the actor) and, when the issuer lists
+`grant_types_supported`, that it lists the configured grant.
 
 ### 10.3 Crypto
 
@@ -1750,8 +1777,8 @@ How to configure each way in is in `docs/authentication.md`.
   reached is asked again a minute later while the session goes on. A sign-in the issuer
   gave no refresh token for lives by quack's own session bounds. Logging out of the last
   session removes the stored token. On Linux the keychain key is in memory, so after a
-  reboot everyone signs in again. The stored token is what on-behalf-of calls to model
-  providers will exchange (#211).
+  reboot everyone signs in again. The stored token is what an on-behalf-of provider
+  exchanges for this person (section 10.2).
 - **quack is an OAuth protected resource** (RFC 9728) when `[server.oidc].audience` is set.
   The API and MCP then accept the issuer's access tokens as bearers, beside sessions and
   quack's API tokens: a bearer shaped like a JWT is verified with `jsonwebtoken` (its
@@ -1873,8 +1900,13 @@ issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
 scopes = ["https://cognitiveservices.azure.com/.default", "offline_access"]
 redirect_uri = "http://127.0.0.1:19876/callback"
-# grant = "authorization-code"                # or "device-code", "client-credentials"
-# client_secret_env = "AZURE_CLIENT_SECRET"   # confidential client; client-credentials needs it
+# grant = "authorization-code"                # or "device-code", "client-credentials", "on-behalf-of"
+# client_secret_env = "AZURE_CLIENT_SECRET"   # confidential client; client-credentials and on-behalf-of need it
+# client_auth = "client_secret_post"          # or "client_secret_basic" (Okta's default)
+# exchange = "entra"                          # on-behalf-of: "token-exchange" (default) or "entra"
+# audience = "api://model"                    # on-behalf-of: RFC 8693 audience (Okta, Auth0)
+# resource = "https://model.example.com"      # on-behalf-of: RFC 8707 resource
+# actor = true                                # on-behalf-of: send quack's own token as actor_token
 
 [embedding]              # input prefixes per role; unset keeps the model family's built-in one
 # query_prefix = "task: search result | query: "

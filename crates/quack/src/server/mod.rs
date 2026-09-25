@@ -36,6 +36,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
 use oidc::Oidc;
+use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::KeySource;
 use quack_core::storage::control::{ControlPlane, sha256_hex};
 use quack_core::vault::Vault;
@@ -166,7 +167,11 @@ pub(crate) fn router(app: App) -> Router {
         spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
         limited = limited.layer(GovernorLayer::new(config));
     }
-    let limited = limited.layer(axum::middleware::map_response(no_store));
+    let limited = limited
+        .layer(axum::middleware::map_response(no_store))
+        // Every request gets an empty acting slot, which the identity
+        // extractor fills once it knows the caller.
+        .layer(axum::middleware::from_fn(acting_slot));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(limited)
@@ -291,6 +296,14 @@ impl fmt::Display for Banner<'_> {
     }
 }
 
+/// Run the rest of the request with an acting slot of its own.
+async fn acting_slot(
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    Acting::request(next.run(request)).await
+}
+
 /// Bind and serve until Ctrl-C.
 pub(crate) async fn serve(
     config: Config,
@@ -323,8 +336,12 @@ pub(crate) async fn serve(
     }
     let oidc = match (&config.server.oidc, mode) {
         (Some(oidc), ServeMode::Login) => Some(
-            Oidc::new(oidc, Vault::new(config.data_dir(), KeySource::Keychain))
-                .context("failed to set up [server.oidc] sign-in")?,
+            Oidc::new(
+                oidc,
+                Vault::new(config.data_dir(), KeySource::Keychain),
+                control.clone(),
+            )
+            .context("failed to set up [server.oidc] sign-in")?,
         ),
         (Some(_), ServeMode::Local) => {
             tracing::warn!("[server.oidc] is ignored in local mode, which has no login");
