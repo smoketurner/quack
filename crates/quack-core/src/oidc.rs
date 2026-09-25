@@ -638,10 +638,10 @@ fn bearer_error(message: impl Into<String>) -> Error {
     Error::Bearer(message.into())
 }
 
-mod people;
+mod subject_tokens;
 mod tokens;
 
-pub use people::{PersonTokens, RENEW_MARGIN, Stored};
+pub use subject_tokens::{RENEW_MARGIN, Stored, SubjectTokens};
 pub use tokens::UserTokens;
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use secrecy::SecretString;
 
 use crate::ids::UserId;
-use crate::oidc::PersonTokens;
+use crate::oidc::SubjectTokens;
 
 /// The person model requests are made for.
 #[derive(Clone)]
@@ -25,8 +25,8 @@ pub struct Acting {
 /// Where the person's own token comes from.
 #[derive(Clone)]
 enum Subject {
-    /// `quack serve`'s signed-in people.
-    People(Arc<PersonTokens>),
+    /// `quack serve`'s signed-in users.
+    Signed(Arc<SubjectTokens>),
     /// A token fixed by a test, or the reason there is none.
     #[cfg(test)]
     Fixed(std::result::Result<&'static str, &'static str>),
@@ -51,10 +51,10 @@ tokio::task_local! {
 impl Acting {
     /// `user`, whose own token `tokens` keeps.
     #[must_use]
-    pub const fn new(user: UserId, tokens: Arc<PersonTokens>) -> Self {
+    pub const fn new(user: UserId, tokens: Arc<SubjectTokens>) -> Self {
         Self {
             user,
-            tokens: Subject::People(tokens),
+            tokens: Subject::Signed(tokens),
         }
     }
 
@@ -82,7 +82,7 @@ impl Acting {
     /// Returns why, when there is no current token for them.
     pub async fn subject_token(&self) -> std::result::Result<SecretString, String> {
         match &self.tokens {
-            Subject::People(people) => people.subject_token(&self.user).await,
+            Subject::Signed(tokens) => tokens.subject_token(&self.user).await,
             #[cfg(test)]
             Subject::Fixed(token) => token
                 .map(|t| SecretString::from(t.to_owned()))

@@ -1,7 +1,7 @@
 //! Sign-in through the organization's `OpenID` Connect issuer: the sign-ins
 //! in flight, and each signed-in user's token.
 //!
-//! A user's token is kept by core's `oidc::PersonTokens`, sealed in
+//! A user's token is kept by core's `oidc::SubjectTokens`, sealed in
 //! `control.db`. Its refresh token is what ties a quack session to the
 //! issuer: when the token runs out, the first request that finds it renews
 //! it, and a refusal ends every session the user has.
@@ -16,7 +16,9 @@ use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::CachedToken;
-use quack_core::oidc::{Pending, PersonTokens, RENEW_MARGIN, SignIn, SignedIn, Stored, UserTokens};
+use quack_core::oidc::{
+    Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
+};
 use quack_core::storage::control::{AuditEntry, ControlPlane, UserRow};
 use quack_core::vault::Vault;
 
@@ -51,8 +53,8 @@ pub(crate) struct Oidc {
     sign_in: Arc<SignIn>,
     /// By `state`: the sign-in and when it began.
     pending: Mutex<HashMap<String, (Pending, Instant)>>,
-    /// Each signed-in person's own token.
-    people: Arc<PersonTokens>,
+    /// Each signed-in user's own token (the on-behalf-of subject).
+    subjects: Arc<SubjectTokens>,
 }
 
 impl Oidc {
@@ -66,7 +68,7 @@ impl Oidc {
     ) -> CoreResult<Self> {
         let sign_in = Arc::new(SignIn::new(config.clone())?);
         Ok(Self {
-            people: Arc::new(PersonTokens::new(
+            subjects: Arc::new(SubjectTokens::new(
                 Arc::clone(&sign_in),
                 UserTokens::new(vault),
                 control,
@@ -83,7 +85,7 @@ impl Oidc {
     /// The acting person for a request by `user`: model requests to an
     /// on-behalf-of provider exchange their own token.
     pub(crate) fn acting(&self, user: &UserId) -> Acting {
-        Acting::new(user.clone(), Arc::clone(&self.people))
+        Acting::new(user.clone(), Arc::clone(&self.subjects))
     }
 
     /// Begin a sign-in: the issuer URL to send the browser to, and the
@@ -129,7 +131,7 @@ impl Oidc {
         user: &UserId,
         token: &CachedToken,
     ) -> ApiResult<Option<Timestamp>> {
-        self.people.keep(user, token).await?;
+        self.subjects.keep(user, token).await?;
         Ok(Self::renewal_time(token))
     }
 
@@ -154,7 +156,7 @@ impl Oidc {
         user: &UserId,
         session: &str,
     ) -> ApiResult<Standing> {
-        Ok(match self.people.refreshed(user).await? {
+        Ok(match self.subjects.refreshed(user).await? {
             Stored::Current(token) => {
                 sessions.renew_at(session, Self::renewal_time(&token));
                 Standing::Current
@@ -212,14 +214,14 @@ impl Oidc {
     ) -> CoreResult<UserRow> {
         let bearer = self.sign_in.verify_bearer(token).await?;
         let user = control.oidc_user(&bearer.subject, &bearer.username).await?;
-        self.people
+        self.subjects
             .remember_presented(&user.id, token, bearer.expires_at);
         Ok(user)
     }
 
     /// Drop a user's stored token, once they have no session left to use it.
     pub(crate) async fn forget(&self, user: &UserId) -> ApiResult<()> {
-        self.people.forget(user).await?;
+        self.subjects.forget(user).await?;
         Ok(())
     }
 }

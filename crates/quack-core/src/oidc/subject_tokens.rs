@@ -1,7 +1,8 @@
-//! Each signed-in person's own access token for quack: their stored sign-in,
+//! Each signed-in user's own access token for quack: the `subject_token` an
+//! on-behalf-of exchange trades (RFC 8693). It is their stored sign-in,
 //! renewed when it is due, or else the access token they last presented as
-//! a bearer. Session renewal and on-behalf-of exchanges both read it here,
-//! under one lock per person, so two renewals never spend one refresh token.
+//! a bearer. Session renewal reads the stored sign-in here too, under the
+//! same lock per user, so two renewals never spend one refresh token.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,8 +34,8 @@ pub enum Stored {
     Revoked,
 }
 
-/// Every signed-in person's token, for `quack serve`.
-pub struct PersonTokens {
+/// Every signed-in user's own token, for `quack serve`.
+pub struct SubjectTokens {
     sign_in: Arc<SignIn>,
     tokens: UserTokens,
     control: ControlPlane,
@@ -44,13 +45,13 @@ pub struct PersonTokens {
     presented: Mutex<HashMap<UserId, CachedToken>>,
 }
 
-impl std::fmt::Debug for PersonTokens {
+impl std::fmt::Debug for SubjectTokens {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PersonTokens").finish_non_exhaustive()
+        f.debug_struct("SubjectTokens").finish_non_exhaustive()
     }
 }
 
-impl PersonTokens {
+impl SubjectTokens {
     #[must_use]
     pub fn new(sign_in: Arc<SignIn>, tokens: UserTokens, control: ControlPlane) -> Self {
         Self {
