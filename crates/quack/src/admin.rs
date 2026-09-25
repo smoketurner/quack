@@ -537,10 +537,29 @@ fn read_password(prompt: &str) -> Result<String> {
 }
 
 fn read_hidden_line() -> Result<String> {
-    use crossterm::event::{Event, KeyCode, KeyModifiers, read};
+    read_hidden_line_from(crossterm::event::read)
+}
+
+/// Read one line of input without echo until Enter. `next` is the source of
+/// keyboard events: production passes `crossterm::event::read`, and tests feed
+/// scripted events so the control-key handling can be exercised without a real
+/// terminal.
+///
+/// Control-letter combos (Ctrl-A, Ctrl-D, Ctrl-E, Ctrl-U, Ctrl-W, ...) arrive
+/// from crossterm 0.29 on Unix as `KeyCode::Char(letter)` with
+/// `KeyModifiers::CONTROL`, not as a distinct keycode. They are intentionally
+/// ignored here rather than appended to the buffer, so an incidental Ctrl-combo
+/// while typing a password can never silently corrupt the stored credential.
+/// `Ctrl-C` still cancels, and `Shift` is unaffected so capital letters typed
+/// with `Shift` are still appended.
+fn read_hidden_line_from<F>(mut next: F) -> Result<String>
+where
+    F: FnMut() -> std::io::Result<crossterm::event::Event>,
+{
+    use crossterm::event::{Event, KeyCode, KeyModifiers};
     let mut password = String::new();
     loop {
-        if let Event::Key(key) = read()? {
+        if let Event::Key(key) = next()? {
             match key.code {
                 KeyCode::Enter => return Ok(password),
                 KeyCode::Backspace => {
@@ -548,6 +567,12 @@ fn read_hidden_line() -> Result<String> {
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     anyhow::bail!("cancelled");
+                }
+                KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // crossterm 0.29 reports Ctrl-letter combos (Ctrl-A, Ctrl-D,
+                    // Ctrl-E, Ctrl-U, Ctrl-W, ...) as `Char(letter)` with
+                    // `KeyModifiers::CONTROL`; the letter is not part of the
+                    // password and must not be appended to the buffer.
                 }
                 KeyCode::Char(c) => password.push(c),
                 _ => {}
@@ -559,6 +584,7 @@ fn read_hidden_line() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     #[derive(clap::Parser)]
     #[command(no_binary_name = true)]
@@ -609,5 +635,132 @@ mod tests {
             .is_err()
         );
         assert!(parse(&["audit", "--outcome", "maybe"]).is_err());
+    }
+
+    // --- read_hidden_line: control-key handling --------------------------------
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}");
+    }
+
+    /// A single key press with the given modifiers. `KeyEvent::new` defaults to
+    /// `KeyEventKind::Press`, which is what crossterm reports on Unix without
+    /// keyboard-enhancement flags — the regime `read_password` runs in.
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    /// Plain typing: one `Char(c)` press with no modifiers per character.
+    fn typed(s: &str) -> Vec<Event> {
+        s.chars()
+            .map(|c| key(KeyCode::Char(c), KeyModifiers::NONE))
+            .collect()
+    }
+
+    /// Drive `read_hidden_line_from` with `events` in order, until Enter returns
+    /// or Ctrl-C bails. Exhausting the script without Enter returns an
+    /// `UnexpectedEof` error, so a forgotten terminator can never hang a test.
+    fn drive(events: &[Event]) -> Result<String> {
+        let mut idx = 0_usize;
+        let len = events.len();
+        let next = || {
+            let i = idx;
+            idx = i.saturating_add(1);
+            events.get(i).cloned().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("scripted events exhausted at index {i} of {len}"),
+                )
+            })
+        };
+        read_hidden_line_from(next)
+    }
+
+    /// The happy path: a typed password is assembled verbatim and returned on
+    /// Enter.
+    #[test]
+    fn read_hidden_line_assembles_a_plain_password_verbatim() {
+        let mut events = typed("hunter2");
+        events.push(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
+            "hunter2"
+        );
+    }
+
+    /// The reported bug: a Ctrl-D inserted while typing must not append `'d'`
+    /// to the password (crossterm 0.29 parses `0x04` as `Char('d')` + CONTROL).
+    #[test]
+    fn ctrl_d_inserted_while_typing_is_ignored() {
+        let mut events = typed("hunter2");
+        events.push(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        events.push(key(KeyCode::Enter, KeyModifiers::NONE));
+        // Before the fix this returned "hunter2d".
+        assert_eq!(
+            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
+            "hunter2"
+        );
+    }
+
+    /// Non-letter control bytes — Ctrl-Space (`0x00` -> `Char(' ')` + CONTROL)
+    /// and Ctrl-4 (`0x1C` -> `Char('4')` + CONTROL) — also arrive as `Char(_)`
+    /// with CONTROL and must be ignored.
+    #[test]
+    fn ctrl_space_and_ctrl_4_are_ignored() {
+        let mut events = typed("pw");
+        events.push(key(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        events.push(key(KeyCode::Char('4'), KeyModifiers::CONTROL));
+        events.push(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
+            "pw"
+        );
+    }
+
+    /// Ctrl-C still cancels the prompt, surfacing the `cancelled` error that
+    /// `read_password` propagates after restoring the cooked terminal mode.
+    #[test]
+    fn ctrl_c_cancels_with_the_cancelled_message() {
+        let events = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ];
+        let err = drive(&events)
+            .err()
+            .unwrap_or_else(|| fail("expected Ctrl-C to cancel the read"));
+        assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    /// A literal lowercase `'c'` typed without Control is still appended; only
+    /// the Ctrl-C combo cancels, so the new guard must not swallow plain 'c'.
+    #[test]
+    fn a_plain_c_without_control_is_appended() {
+        let events = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        assert_eq!(
+            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
+            "acc"
+        );
+    }
+
+    /// Regression guard: filtering must not eat `Shift`. crossterm pairs an
+    /// uppercase `Char` with `KeyModifiers::SHIFT`, so capital letters typed
+    /// with `Shift` are still appended verbatim.
+    #[test]
+    fn uppercase_typed_with_shift_is_kept() {
+        let events = vec![
+            key(KeyCode::Char('H'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        assert_eq!(
+            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
+            "Hi"
+        );
     }
 }
