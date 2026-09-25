@@ -551,6 +551,16 @@ CREATE TABLE workspaces (
     updated_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- a signed-in user's identity-provider token, HPKE-sealed under the server's key
+-- (the vault key: the OS keychain or <data_dir>/vault.key, never here); section 12
+CREATE TABLE user_tokens (
+    user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    key_id     TEXT NOT NULL,              -- which server key sealed it
+    enc        BLOB NOT NULL,              -- HPKE encapsulated key
+    ciphertext BLOB NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE members (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1320,6 +1330,14 @@ feature a build error. macOS and Windows install the aws-lc-sys provider, becaus
 build links statically only on Linux. `--version` names the module it linked and
 `CryptoModule::log` logs it once a subscriber exists (`docs/crypto.md`).
 
+Data at rest that must stay unreadable without the machine's key goes through
+`quack_core::vault`: HPKE (RFC 9180) with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and
+AES-256-GCM, from rustls's aws-lc-rs HPKE (a FIPS-kept suite), one key pair per data
+directory in the OS keychain or a 0600 `vault.key`. Each value is sealed for a purpose (the
+HPKE `info`) and a subject (the associated data) and records its key id; the caller stores
+the sealed value wherever its classification says (signed-in users' tokens: `control.db`,
+section 12).
+
 SHA-256, AES-256-GCM and randomness come from aws-lc-rs; password hashing is the RustCrypto
 `argon2` crate, salted from `getrandom`. No runtime code links OpenSSL or `ring`:
 `deny.toml` bans `openssl`, `openssl-sys` and `native-tls` outright and allows `ring` only
@@ -1653,10 +1671,12 @@ roadmap and may never be built.
   else `sub`, suffixed when another user has it, so a sign-in never takes over an account
   by name. Both outcomes are audited as `login`. Both routes share the login rate limit.
 - **A sign-in stays tied to the issuer.** The user's token (with its refresh token) is kept
-  in `<data_dir>/tokens/users/<user-id>.json`, AES-256-GCM under one key every user shares
-  (`users.key` beside it, or the OS keychain entry `oidc:users`), the user id as associated
-  data; one key, not one keychain entry per user, because the Linux kernel keyring's
-  default per-user quota (200 keys, 20 KB) would cap the server at a few dozen users. The
+  in `control.db` (`user_tokens`, one row per user, deleted with the user), sealed by the
+  vault (`quack_core::vault`, section 10.3) for the `user-token` purpose with the user id as
+  the subject, so a row copied to another user does not open. The vault's one key, not one
+  keychain entry per user, because the Linux kernel keyring's default per-user quota (200
+  keys, 20 KB) would cap the server at a few dozen users. A row sealed under a key the
+  vault no longer has reads as no token. The
   session records when that token must be renewed; the first request after that renews it
   under a per-user lock (a token another session already renewed is reused). A refusal
   (`invalid_grant`: revoked, expired, the account disabled) removes the stored token, ends

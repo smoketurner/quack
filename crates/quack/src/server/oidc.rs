@@ -1,14 +1,12 @@
 //! Sign-in through the organization's `OpenID` Connect issuer: the sign-ins
 //! in flight, and each signed-in user's token.
 //!
-//! A user's token is kept in `<data_dir>/tokens/users/<user-id>.json`,
-//! sealed under the one key every user shares (in the OS keychain where
-//! there is one). Its refresh token is what ties a quack session to the
-//! issuer: when the token runs out, the first request that finds it renews
-//! it, and a refusal ends every session the user has.
+//! A user's token is kept in `control.db`, sealed with HPKE under the
+//! server's key (`oidc::UserTokens` over `vault::Vault`). Its refresh token is what ties a quack
+//! session to the issuer: when the token runs out, the first request that
+//! finds it renews it, and a refusal ends every session the user has.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,12 +14,13 @@ use jiff::{SignedDuration, Timestamp};
 use quack_core::config::OidcConfig;
 use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
-use quack_core::llm::oauth::{CachedToken, KeySource, TokenCache};
-use quack_core::oidc::{Pending, Renewal, SignIn, SignedIn};
-use quack_core::storage::control::AuditEntry;
+use quack_core::llm::oauth::CachedToken;
+use quack_core::oidc::{Pending, Renewal, SignIn, SignedIn, UserTokens};
+use quack_core::storage::control::{AuditEntry, ControlPlane};
+use quack_core::vault::Vault;
 
 use super::error::{ApiError, ApiResult};
-use super::state::{AppState, WebSessions};
+use super::state::AppState;
 
 /// The cookie that ties a callback to the browser that started the sign-in,
 /// so a callback link someone else started cannot sign this browser in.
@@ -57,25 +56,19 @@ pub(crate) struct Oidc {
     /// One renewal per user at a time, so two requests that both find the
     /// token expired do not both spend the refresh token.
     renewing: Mutex<HashMap<UserId, Arc<tokio::sync::Mutex<()>>>>,
-    tokens_dir: PathBuf,
-    key_source: KeySource,
+    tokens: UserTokens,
 }
 
 impl Oidc {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be built.
-    pub(crate) fn new(
-        config: &OidcConfig,
-        tokens_dir: PathBuf,
-        key_source: KeySource,
-    ) -> CoreResult<Self> {
+    pub(crate) fn new(config: &OidcConfig, vault: Vault) -> CoreResult<Self> {
         Ok(Self {
             sign_in: SignIn::new(config.clone())?,
             pending: Mutex::new(HashMap::new()),
             renewing: Mutex::new(HashMap::new()),
-            tokens_dir,
-            key_source,
+            tokens: UserTokens::new(vault),
         })
     }
 
@@ -114,14 +107,6 @@ impl Oidc {
         self.sign_in.finish(code, pending).await
     }
 
-    fn cache(&self, user: &UserId) -> ApiResult<TokenCache> {
-        Ok(TokenCache::for_user(
-            &self.tokens_dir,
-            user,
-            self.key_source,
-        )?)
-    }
-
     fn lock_for(&self, user: &UserId) -> ApiResult<Arc<tokio::sync::Mutex<()>>> {
         let mut locks = self
             .renewing
@@ -134,12 +119,13 @@ impl Oidc {
     /// sign-in, and return when the session opened on it must renew it.
     pub(crate) async fn keep(
         &self,
+        control: &ControlPlane,
         user: &UserId,
         token: &CachedToken,
     ) -> ApiResult<Option<Timestamp>> {
         let lock = self.lock_for(user)?;
         let _renewing = lock.lock().await;
-        self.cache(user)?.store(token).await?;
+        self.tokens.store(control, user, token).await?;
         Ok(Self::renewal_time(token))
     }
 
@@ -160,14 +146,14 @@ impl Oidc {
     /// session goes on meanwhile.
     pub(crate) async fn renew(
         &self,
-        sessions: &WebSessions,
+        app: &AppState,
         user: &UserId,
         session: &str,
     ) -> ApiResult<Standing> {
+        let (sessions, control) = (&app.sessions, &app.control);
         let lock = self.lock_for(user)?;
         let _renewing = lock.lock().await;
-        let cache = self.cache(user)?;
-        let Some(token) = cache.load().await? else {
+        let Some(token) = self.tokens.load(control, user).await? else {
             tracing::info!(user = %user, "no stored sign-in for the session; ending it");
             sessions.close_user(user);
             return Ok(Standing::Ended);
@@ -183,13 +169,13 @@ impl Oidc {
         };
         match self.sign_in.renew(refresh).await {
             Ok(Renewal::Renewed(renewed)) => {
-                cache.store(&renewed).await?;
+                self.tokens.store(control, user, &renewed).await?;
                 sessions.renew_at(session, Self::renewal_time(&renewed));
                 Ok(Standing::Current)
             }
             Ok(Renewal::Revoked(reason)) => {
                 tracing::info!(user = %user, %reason, "the issuer ended the sign-in");
-                cache.clear().await?;
+                self.tokens.clear(control, user).await?;
                 sessions.close_user(user);
                 Ok(Standing::Ended)
             }
@@ -211,7 +197,7 @@ impl Oidc {
         session: &str,
         mut denied: AuditEntry,
     ) -> ApiResult<()> {
-        match self.renew(&app.sessions, user, session).await? {
+        match self.renew(app, user, session).await? {
             Standing::Current => Ok(()),
             Standing::Ended => {
                 denied.user_id = Some(user.clone());
@@ -224,10 +210,10 @@ impl Oidc {
     }
 
     /// Drop a user's stored token, once they have no session left to use it.
-    pub(crate) async fn forget(&self, user: &UserId) -> ApiResult<()> {
+    pub(crate) async fn forget(&self, control: &ControlPlane, user: &UserId) -> ApiResult<()> {
         let lock = self.lock_for(user)?;
         let _renewing = lock.lock().await;
-        self.cache(user)?.clear().await?;
+        self.tokens.clear(control, user).await?;
         Ok(())
     }
 }

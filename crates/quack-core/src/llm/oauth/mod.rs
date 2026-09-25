@@ -12,6 +12,7 @@
 //! client-credentials grant, run again whenever the token runs out.
 
 mod cache;
+mod key_slot;
 mod keychain;
 
 use std::collections::HashMap;
@@ -38,7 +39,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
-pub use cache::{CachedToken, KeyLocation, KeySource, TokenCache};
+pub(crate) use cache::Plaintext;
+pub use cache::{CachedToken, TokenCache};
+pub(crate) use key_slot::KeySlot;
+pub use key_slot::{KeyLocation, KeySource};
 
 use crate::config::{Config, Grant, OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};

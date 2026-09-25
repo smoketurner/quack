@@ -60,7 +60,7 @@ impl Identity {
         if let Some(oidc) = &app.oidc
             && !app.sessions.has_sessions(&self.user_id)
         {
-            oidc.forget(&self.user_id).await?;
+            oidc.forget(&app.control, &self.user_id).await?;
         }
         let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
         app.control.record_audit(&entry).await?;

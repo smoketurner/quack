@@ -21,6 +21,7 @@ use quack_core::ids::UserId;
 use quack_core::llm::oauth::KeySource;
 use quack_core::oidc::OidcSubject;
 use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome};
+use quack_core::vault::Vault;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -156,7 +157,7 @@ impl Harness {
             scopes: OidcConfig::default_scopes(),
             redirect_uri: format!("https://quack.example.com{}", OidcConfig::CALLBACK_PATH),
         };
-        let oidc = Oidc::new(&oidc_config, config.tokens_dir(), KeySource::File)
+        let oidc = Oidc::new(&oidc_config, Vault::new(dir.path(), KeySource::File))
             .unwrap_or_else(|e| fail(&e.to_string()));
         config.server.oidc = Some(oidc_config);
         let control = ControlPlane::open(&config)
@@ -301,12 +302,13 @@ impl Harness {
             .unwrap_or_default()
     }
 
-    fn token_file(&self, user: &UserId) -> std::path::PathBuf {
-        self.dir
-            .path()
-            .join("tokens")
-            .join("users")
-            .join(format!("{user}.json"))
+    /// Whether the user's sealed token is in `control.db`.
+    async fn has_token(&self, user: &UserId) -> bool {
+        self.app
+            .control
+            .sealed_token(user)
+            .await
+            .is_ok_and(|t| t.is_some())
     }
 }
 
@@ -342,7 +344,10 @@ async fn a_first_sign_in_creates_a_user_with_no_access_and_a_session() {
             .await
             .is_ok_and(|w| w.is_empty())
     );
-    assert!(h.token_file(&user.id).exists());
+    assert!(h.has_token(&user.id).await);
+    // One vault key on disk (no keychain in tests), and no file per user.
+    assert!(h.dir.path().join("vault.key").exists());
+    assert!(!h.dir.path().join("tokens").exists());
     let logins = h.audit("login").await;
     assert!(
         logins.contains(&(Outcome::Allowed, Some(user.id.clone()))),
@@ -441,7 +446,7 @@ async fn an_expiring_sign_in_is_renewed_and_a_revoked_one_ends_every_session() {
         .ok()
         .flatten()
         .unwrap_or_else(|| fail("no user"));
-    assert!(!h.token_file(&user.id).exists());
+    assert!(!h.has_token(&user.id).await);
     let ended = h.audit("session").await;
     assert!(
         ended.contains(&(Outcome::Denied, Some(user.id))),
@@ -481,9 +486,9 @@ async fn logging_out_of_the_last_session_forgets_the_token() {
             .unwrap_or_else(|e| fail(&e.to_string()))
     };
     assert_eq!(h.send(log_out(first)).await.status, StatusCode::NO_CONTENT);
-    assert!(h.token_file(&user.id).exists());
+    assert!(h.has_token(&user.id).await);
     assert_eq!(h.send(log_out(second)).await.status, StatusCode::NO_CONTENT);
-    assert!(!h.token_file(&user.id).exists());
+    assert!(!h.has_token(&user.id).await);
 }
 
 #[tokio::test]

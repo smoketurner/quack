@@ -108,6 +108,7 @@ impl From<CoreError> for ApiError {
             | CoreError::DuckDb(_)
             | CoreError::Embedding(_)
             | CoreError::Llm(_)
+            | CoreError::Vault(_)
             | CoreError::Ingestion(_)
             | CoreError::Io(_)
             | CoreError::TomlParse(_)

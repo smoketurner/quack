@@ -15,7 +15,7 @@ impl Bound {
     /// # Errors
     ///
     /// Returns an error for a value of a type `control.db` never stores (a
-    /// float, bytes, a date), which binding does not cover.
+    /// float, a date), which binding does not cover.
     pub fn new(statement: &impl QueryStatementWriter) -> sqlx::Result<Self> {
         let (sql, values) = statement.build(SqliteQueryBuilder);
         let mut arguments = SqliteArguments::default();
@@ -32,6 +32,7 @@ impl Bound {
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 ),
                 Value::String(v) => arguments.add(v),
+                Value::Bytes(v) => arguments.add(v),
                 other => {
                     return Err(sqlx::Error::Encode(
                         format!("control.db does not bind {other:?}").into(),
@@ -69,6 +70,16 @@ pub enum Users {
     OidcSubject,
     IsAdmin,
     CreatedAt,
+}
+
+#[derive(Iden)]
+pub enum UserTokens {
+    Table,
+    UserId,
+    KeyId,
+    Enc,
+    Ciphertext,
+    UpdatedAt,
 }
 
 #[derive(Iden)]

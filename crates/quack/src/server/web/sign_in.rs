@@ -140,7 +140,7 @@ pub(super) async fn finish(
         .control
         .oidc_user(&signed_in.subject, &signed_in.username)
         .await?;
-    let renew_at = oidc.keep(&user.id, &signed_in.token).await?;
+    let renew_at = oidc.keep(&app.control, &user.id, &signed_in.token).await?;
     entry.outcome = Outcome::Allowed;
     entry.user_id = Some(user.id.clone());
     app.control.record_audit(&entry).await?;

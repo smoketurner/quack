@@ -8,7 +8,7 @@
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use sea_query::{Cond, Expr, ExprTrait, Order, Query};
+use sea_query::{Cond, Expr, ExprTrait, OnConflict, Order, Query};
 use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{FromRow, Row, SqlitePool};
@@ -18,11 +18,12 @@ use std::str::FromStr;
 
 use jiff::{SignedDuration, Timestamp};
 
-use super::queries::{ApiTokens, AuditLog, Bound, Members, Users, Workspaces};
+use super::queries::{ApiTokens, AuditLog, Bound, Members, UserTokens, Users, Workspaces};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
 use crate::oidc::OidcSubject;
+use crate::vault::Sealed;
 
 /// The `control.db` schema, as plain SQL files embedded at compile time.
 ///
@@ -769,6 +770,17 @@ impl StoredPasswordHash {
     }
 }
 
+/// A user token row: the sealed value, as `vault::Sealed` is.
+impl FromRow<'_, SqliteRow> for Sealed {
+    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            key_id: r.try_get("key_id")?,
+            enc: r.try_get("enc")?,
+            ciphertext: r.try_get("ciphertext")?,
+        })
+    }
+}
+
 /// Manages the SQLite control plane database.
 pub struct ControlPlane {
     pool: SqlitePool,
@@ -852,6 +864,13 @@ impl ControlPlane {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(found.is_some())
+    }
+
+    /// The newest schema version this binary carries: the version an open
+    /// database reaches.
+    #[must_use]
+    pub fn latest_schema_version() -> i64 {
+        MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0)
     }
 
     /// Highest applied schema version.
@@ -1196,6 +1215,75 @@ impl ControlPlane {
         Err(Error::Config(format!(
             "no free username for '{username}'; both it and its suffixed form are taken"
         )))
+    }
+
+    /// The sealed identity-provider token of a signed-in user
+    /// (`vault::Purpose::UserToken`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn sealed_token(&self, user: &UserId) -> Result<Option<Sealed>> {
+        let bound = Bound::new(
+            Query::select()
+                .columns([UserTokens::KeyId, UserTokens::Enc, UserTokens::Ciphertext])
+                .from(UserTokens::Table)
+                .and_where(Expr::col(UserTokens::UserId).eq(user)),
+        )?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
+    }
+
+    /// Keep a user's sealed token, replacing the one before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the user does not exist or the write fails.
+    pub async fn put_sealed_token(&self, user: &UserId, sealed: &Sealed) -> Result<()> {
+        let bound = Bound::new(
+            Query::insert()
+                .into_table(UserTokens::Table)
+                .columns([
+                    UserTokens::UserId,
+                    UserTokens::KeyId,
+                    UserTokens::Enc,
+                    UserTokens::Ciphertext,
+                    UserTokens::UpdatedAt,
+                ])
+                .values([
+                    user.into(),
+                    sealed.key_id.as_str().into(),
+                    sealed.enc.clone().into(),
+                    sealed.ciphertext.clone().into(),
+                    Expr::current_timestamp(),
+                ])?
+                .on_conflict(
+                    OnConflict::column(UserTokens::UserId)
+                        .update_columns([
+                            UserTokens::KeyId,
+                            UserTokens::Enc,
+                            UserTokens::Ciphertext,
+                            UserTokens::UpdatedAt,
+                        ])
+                        .to_owned(),
+                ),
+        )?;
+        bound.query().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Forget a user's sealed token; a user without one is already done.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete_sealed_token(&self, user: &UserId) -> Result<()> {
+        let bound = Bound::new(
+            Query::delete()
+                .from_table(UserTokens::Table)
+                .and_where(Expr::col(UserTokens::UserId).eq(user)),
+        )?;
+        bound.query().execute(&self.pool).await?;
+        Ok(())
     }
 
     /// Check a password login. Returns the user on success; `None` for an
@@ -1737,7 +1825,11 @@ mod tests {
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
 
-        assert!(cp.schema_version().await.is_ok_and(|v| v == 4));
+        assert!(
+            cp.schema_version()
+                .await
+                .is_ok_and(|v| v == ControlPlane::latest_schema_version())
+        );
         // Replaying v2 would have dropped and recreated audit_log.
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
             .fetch_one(&cp.pool)
@@ -1795,9 +1887,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_reach_v4_and_rerun_idempotently() {
+    async fn migrations_reach_the_latest_version_and_rerun_idempotently() {
         let (dir, cp) = open().await;
-        assert!(cp.schema_version().await.is_ok_and(|v| v == 4));
+        assert!(
+            cp.schema_version()
+                .await
+                .is_ok_and(|v| v == ControlPlane::latest_schema_version())
+        );
         drop(cp);
         let mut config = Config::default();
         config.general.data_dir = dir.path().to_path_buf();
@@ -1939,6 +2035,38 @@ mod tests {
                 .await
                 .is_ok_and(|u| u.is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn a_sealed_token_is_replaced_in_place_and_goes_with_its_user() {
+        let (_dir, cp) = open().await;
+        let user = cp
+            .oidc_user(&OidcSubject::from("s"), "ada")
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let sealed = |id: &str| Sealed {
+            key_id: id.to_owned(),
+            enc: vec![4, 1, 2],
+            ciphertext: vec![9, 8, 7],
+        };
+        assert!(cp.put_sealed_token(&user.id, &sealed("k1")).await.is_ok());
+        assert!(cp.put_sealed_token(&user.id, &sealed("k2")).await.is_ok());
+        assert!(
+            cp.sealed_token(&user.id)
+                .await
+                .is_ok_and(|t| t == Some(sealed("k2")))
+        );
+        assert!(
+            cp.put_sealed_token(&UserId::from("nobody"), &sealed("k1"))
+                .await
+                .is_err()
+        );
+        sqlx::query("DELETE FROM users")
+            .execute(&cp.pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(cp.sealed_token(&user.id).await.is_ok_and(|t| t.is_none()));
+        assert!(cp.delete_sealed_token(&user.id).await.is_ok());
     }
 
     #[tokio::test]

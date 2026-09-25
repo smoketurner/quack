@@ -37,6 +37,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use oidc::Oidc;
 use quack_core::llm::oauth::KeySource;
 use quack_core::storage::control::{ControlPlane, sha256_hex};
+use quack_core::vault::Vault;
 use state::{App, AppState, ServeMode};
 
 /// How long one request may take. Agent turns can be slow.
@@ -316,7 +317,7 @@ pub(crate) async fn serve(
     }
     let oidc = match (&config.server.oidc, mode) {
         (Some(oidc), ServeMode::Login) => Some(
-            Oidc::new(oidc, config.tokens_dir(), KeySource::Keychain)
+            Oidc::new(oidc, Vault::new(config.data_dir(), KeySource::Keychain))
                 .context("failed to set up [server.oidc] sign-in")?,
         ),
         (Some(_), ServeMode::Local) => {

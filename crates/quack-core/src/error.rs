@@ -23,6 +23,10 @@ pub enum Error {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    /// A value sealed at rest could not be sealed or opened.
+    #[error("sealed data error: {0}")]
+    Vault(String),
+
     /// A sign-in through the server's `OpenID` Connect issuer was refused or
     /// could not be verified.
     #[error("sign-in failed: {0}")]

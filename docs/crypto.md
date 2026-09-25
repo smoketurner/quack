@@ -32,7 +32,18 @@ build, and no ambiguity about which backend rustls picks at runtime.
   `CryptoProvider::fips()` instead for what rustls actually installed.
 - Features: `reqwest` and `rig` with `rustls`, `sqlx` with `tls-rustls-aws-lc-rs` (the
   Postgres import). SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
-  AES-256-GCM for the OAuth token cache from `aws_lc_rs::aead`.
+  AES-256-GCM for the provider OAuth token cache from `aws_lc_rs::aead`, HPKE for the vault
+  from `rustls` (below).
+- `quack_core::vault` seals data at rest with HPKE (RFC 9180, base mode):
+  DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM, from rustls's
+  `crypto::aws_lc_rs::hpke` (`DH_KEM_P256_HKDF_SHA256_AES_256`), which is aws-lc-rs
+  underneath and one of the suites rustls keeps under its `fips` feature; X25519 and
+  ChaCha20-Poly1305 suites are not, so the suite must not change to them. One key pair per
+  data directory, in the OS keychain (entry `vault`) or `<data_dir>/vault.key` (0600). Each
+  value is sealed for a `vault::Purpose` (the HPKE `info`, `quack vault v1 <purpose>`) and
+  a subject (the associated data), and records the key id that sealed it. A `Sealed` value
+  is stored by its caller, on the right side of the classification boundary; today that is
+  one purpose, signed-in users' identity-provider tokens in `control.db` (`user_tokens`).
 - `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
   (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`
   to both — Cargo unions the feature sets, so Linux gets FIPS and nothing else changes.

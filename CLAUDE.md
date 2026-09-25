@@ -274,7 +274,8 @@ ingestion path as a document with source `import` and the redacted URL as title.
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`
 (with `[server.oidc]`, people can also sign in through the organization's issuer:
 `quack_core::oidc::SignIn`, `server::oidc`, and `web::sign_in`; a first sign-in creates a
-user with no memberships, the user's refresh token is kept under one shared keychain key,
+user with no memberships, the user's refresh token is kept HPKE-sealed in `control.db`
+(`oidc::UserTokens` over `quack_core::vault`, whose HPKE key is in the keychain),
 and a session whose token has run out renews it or ends when the issuer refuses),
 and `Access::resolve` resolves the workspace, checks role and token scope, and writes the denied
 audit row itself, so a handler holding an `Access` is already authorized. Both login paths
