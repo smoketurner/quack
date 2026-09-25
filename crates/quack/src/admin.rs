@@ -553,7 +553,7 @@ fn read_hidden_line() -> Result<String> {
 /// `Ctrl-C` still cancels, and `Shift` is unaffected so capital letters typed
 /// with `Shift` are still appended.
 ///
-/// On Windows, AltGr is reported as CONTROL and ALT together, and it is how
+/// On Windows, `AltGr` is reported as CONTROL and ALT together, and it is how
 /// `@`, `{`, or `€` are typed on many layouts, so a character with both is
 /// kept. Windows also reports key releases; only presses count, or every
 /// character and every backspace would happen twice.
@@ -752,7 +752,7 @@ mod tests {
         );
     }
 
-    /// AltGr on Windows is CONTROL|ALT, and it types characters such as
+    /// `AltGr` on Windows is CONTROL|ALT, and it types characters such as
     /// `@` and `€` on many layouts: those are kept, not taken for Ctrl combos.
     #[test]
     fn altgr_characters_are_kept() {
