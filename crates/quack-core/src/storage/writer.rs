@@ -171,6 +171,14 @@ impl Writer {
     ) -> Result<()> {
         let job: Job = Box::new(move |db| {
             let outcome = catch_unwind(AssertUnwindSafe(|| f(db))).unwrap_or_else(|panic| {
+                // A closure that opened its transaction with a raw `BEGIN`
+                // (no RAII guard) leaves this one connection inside it when
+                // it panics; roll it back so the next job does not start in
+                // a leaked, aborted transaction. RAII callers have already
+                // rolled back during unwinding, so this errors (ignored) for them.
+                if let Err(e) = db.connection().execute("ROLLBACK", []) {
+                    tracing::trace!(error = %e, "defensive rollback after a panicked write found no open transaction");
+                }
                 let what = panic
                     .downcast_ref::<&str>()
                     .map(|s| (*s).to_owned())
@@ -309,6 +317,49 @@ mod tests {
             |e| matches!(&e, Error::WritePanicked(what) if what.contains("mid-write"))
         ));
         assert!(writer.run(WorkspaceDb::list_tables).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_raw_begin_that_panics_does_not_wedge_the_writer() {
+        let writer = writer();
+        // Job 1: open a raw `BEGIN` (no RAII guard) and panic mid-transaction.
+        #[expect(clippy::panic, reason = "the panic under test")]
+        let first = writer
+            .run(|db| -> Result<()> {
+                db.execute_with_params("BEGIN", [])?;
+                db.execute_with_params("CREATE TABLE wedge (a INTEGER)", [])?;
+                panic!("wedge");
+            })
+            .await;
+        assert!(
+            first
+                .as_ref()
+                .is_err_and(|e| matches!(e, Error::WritePanicked(what) if what.contains("wedge")))
+        );
+        // Job 2: a conforming `write_transaction`, which issues its own
+        // `BEGIN` — it must not run inside the leaked transaction.
+        let second = writer
+            .run(|db| {
+                db.write_transaction(|db| db.execute_with_params("CREATE TABLE t2 (a INTEGER)", []))
+            })
+            .await;
+        // Job 3: a plain read routed through the writer.
+        let tables = writer.run(WorkspaceDb::list_tables).await;
+        assert!(
+            second.is_ok(),
+            "writer wedged after raw-BEGIN panic: {second:?}"
+        );
+        assert!(
+            tables.is_ok(),
+            "reader wedged after raw-BEGIN panic: {tables:?}"
+        );
+        // The panicked `CREATE TABLE wedge` rolled back; only `t2` committed.
+        assert!(
+            tables
+                .as_ref()
+                .is_ok_and(|names| names == &vec![String::from("t2")]),
+            "the wedging table should have rolled back: {tables:?}"
+        );
     }
 
     #[tokio::test]
