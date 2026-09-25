@@ -190,14 +190,17 @@ impl SourceUrl {
     /// longer leaks its suffix, and an `@` in the path or query of a URL
     /// with no user info no longer inserts a spurious `:***`. URLs with no
     /// user info (sqlite paths, plain `https://host/file`) are returned
-    /// verbatim, and anything `Url::parse` rejects is returned verbatim
-    /// too, so the redacted value is never a worse disclosure than the
-    /// input.
+    /// verbatim. Anything `Url::parse` rejects (a raw `/`, `?`, or `#` in
+    /// the password, an invalid port) never comes back verbatim: everything
+    /// between `://` and the last `@` of the whole string is masked, keeping
+    /// only a username that is plainly one (see `mask_userinfo`), so the
+    /// redacted value never carries the password into audit rows, titles,
+    /// or logs.
     #[must_use]
     pub fn redacted(&self) -> String {
         let url = self.0.as_str();
         let Ok(mut parsed) = reqwest::Url::parse(url) else {
-            return url.to_owned();
+            return mask_userinfo(url);
         };
         if parsed.username().is_empty() && parsed.password().is_none() {
             // No credentials to redact: keep the URL verbatim so sqlite
@@ -222,7 +225,7 @@ impl SourceUrl {
         if parsed.set_password(Some("***")).is_ok() {
             return parsed.to_string();
         }
-        url.to_owned()
+        mask_userinfo(url)
     }
 
     /// The file a `sqlite:` URL names: the scheme and any `//` stripped,
@@ -258,9 +261,34 @@ fn drop_userinfo(rendered: &str) -> String {
         return rendered.to_owned();
     };
     let Some((_userinfo, tail)) = rest.split_once('@') else {
-        return rendered.to_owned();
+        return mask_userinfo(rendered);
     };
     format!("{scheme}://{tail}")
+}
+
+/// Mask the credentials of a URL no parser accepted, so none of it can leak.
+///
+/// Without a parse there is no telling where a password with a raw `/`, `?`,
+/// `#`, or `@` ends, so everything between `://` and the *last* `@` of the
+/// whole string is treated as user info: it may over-mask a path or query
+/// that holds an `@`, but it never leaves a password fragment behind. The
+/// username is kept only when the text before the first `:` is non-empty and
+/// holds none of `/?#@` (so it cannot be the tail of a password or a path);
+/// otherwise the whole user info becomes `***`. A string with no `://` or no
+/// `@` after it carries no user info and is returned unchanged.
+fn mask_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let Some((userinfo, host)) = rest.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+    if user.is_empty() || user.contains(['/', '?', '#', '@']) {
+        format!("{scheme}://***@{host}")
+    } else {
+        format!("{scheme}://{user}:***@{host}")
+    }
 }
 
 /// What a source yielded, ready to load: the staging file's name and
@@ -756,6 +784,71 @@ mod tests {
             SourceUrl::from("sqlite://a/b.db?x=1").redacted(),
             "sqlite://a/b.db?x=1"
         );
+    }
+
+    /// URLs `Url::parse` rejects never come back verbatim: a raw `/`, `?`, or
+    /// `#` in the password, or an invalid port, is masked from `://` to the
+    /// last `@`, and no fragment of the password survives.
+    #[test]
+    fn unparseable_urls_never_leak_the_password() {
+        for (url, password, expected) in [
+            (
+                "postgres://user:pa/ss@host/db",
+                "pa/ss",
+                "postgres://user:***@host/db",
+            ),
+            (
+                "postgres://user:pa?ss@host/db",
+                "pa?ss",
+                "postgres://user:***@host/db",
+            ),
+            (
+                "postgres://user:pa#ss@host/db",
+                "pa#ss",
+                "postgres://user:***@host/db",
+            ),
+            (
+                "postgres://user:s3cr3t@host:99999/db",
+                "s3cr3t",
+                "postgres://user:***@host:99999/db",
+            ),
+            (
+                "postgres://user:s3cr3t@host:port/db",
+                "s3cr3t",
+                "postgres://user:***@host:port/db",
+            ),
+            (
+                "postgres://:pa/ss@host/db",
+                "pa/ss",
+                "postgres://***@host/db",
+            ),
+            (
+                "postgres://user:pa/ss@p@host:1/db",
+                "pa/ss@p",
+                "postgres://user:***@host:1/db",
+            ),
+        ] {
+            assert!(reqwest::Url::parse(url).is_err(), "{url} should not parse");
+            let red = SourceUrl::from(url).redacted();
+            assert_eq!(red, expected, "{url}");
+            for fragment in [password, "pa", "ss", "s3cr3t"] {
+                assert!(
+                    !red.contains(fragment),
+                    "{url}: password fragment {fragment:?} leaked into {red}"
+                );
+            }
+        }
+    }
+
+    /// The fallback leaves strings with no user info alone.
+    #[test]
+    fn masking_leaves_strings_without_user_info_unchanged() {
+        assert_eq!(mask_userinfo("not a url"), "not a url");
+        assert_eq!(
+            mask_userinfo("postgres://host:99999/db"),
+            "postgres://host:99999/db"
+        );
+        assert_eq!(mask_userinfo("sqlite:/tmp/a@b.db"), "sqlite:/tmp/a@b.db");
     }
 
     /// The redacted value holds none of the password and reparses to the
