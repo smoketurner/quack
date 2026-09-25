@@ -11,9 +11,10 @@
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
@@ -25,6 +26,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
+use super::oidc::Oidc;
 use super::state::{App, ServeMode, SessionLookup, SessionToken};
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
@@ -44,6 +46,9 @@ pub(crate) enum Credential {
     Session(SessionToken),
     /// An API token; the row carries its workspace and scopes.
     Token(TokenRow),
+    /// An access token from `[server.oidc]`'s issuer, presented as a bearer
+    /// (RFC 9728); it carries the user's own access, like a session.
+    IdentityProvider,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +67,7 @@ pub(crate) struct Identity {
 impl Identity {
     pub(crate) fn channel(&self) -> Channel {
         self.channel.unwrap_or(match self.credential {
-            Credential::Token(_) => Channel::Api,
+            Credential::Token(_) | Credential::IdentityProvider => Channel::Api,
             Credential::Local | Credential::Session(_) => Channel::Web,
         })
     }
@@ -70,7 +75,7 @@ impl Identity {
     fn token_hash(&self) -> Option<String> {
         match &self.credential {
             Credential::Token(t) => Some(t.token_hash.clone()),
-            Credential::Local | Credential::Session(_) => None,
+            Credential::Local | Credential::Session(_) | Credential::IdentityProvider => None,
         }
     }
 
@@ -89,7 +94,7 @@ impl Identity {
     pub(crate) fn lacks_scope(&self, scope: Scope) -> bool {
         match &self.credential {
             Credential::Token(t) => !t.has_scope(scope) && !t.has_scope(Scope::Admin),
-            Credential::Local | Credential::Session(_) => false,
+            Credential::Local | Credential::Session(_) | Credential::IdentityProvider => false,
         }
     }
 }
@@ -247,7 +252,25 @@ pub(crate) struct Login {
 impl FromRequestParts<App> for Identity {
     type Rejection = ApiError;
 
+    /// Who is calling. When quack is a protected resource, a 401 says where
+    /// to get a token, and `invalid_token` when one was presented.
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        Self::resolve(parts, app)
+            .await
+            .map_err(|e| match &app.resource {
+                Some(resource) if e.status == StatusCode::UNAUTHORIZED => {
+                    let refused = parts.headers.contains_key(header::AUTHORIZATION)
+                        || SessionCookie::read(&parts.headers).is_some();
+                    let challenge = resource.challenge(parts.uri.path(), refused);
+                    e.with_challenge(challenge)
+                }
+                _ => e,
+            })
+    }
+}
+
+impl Identity {
+    async fn resolve(parts: &Parts, app: &App) -> ApiResult<Self> {
         let client_addr = Peer::of(parts).ip();
         let RequestId(request_id) = RequestId::of(&parts.headers);
         if app.mode == ServeMode::Local {
@@ -314,6 +337,22 @@ impl FromRequestParts<App> for Identity {
             SessionLookup::Unknown => {}
         }
 
+        if let Some(oidc) = app.oidc.as_ref().filter(|o| o.accepts_bearers())
+            && presented.split('.').count() == 3
+        {
+            return Self::from_access_token(app, oidc, &presented, client_addr, request_id).await;
+        }
+
+        Self::from_api_token(app, &presented, client_addr, request_id).await
+    }
+
+    /// A bearer that is one of quack's API tokens.
+    async fn from_api_token(
+        app: &App,
+        presented: &str,
+        client_addr: Option<String>,
+        request_id: Option<String>,
+    ) -> ApiResult<Self> {
         let hash = sha256_hex(presented.as_bytes());
         let Some(token) = app.control.find_token(&hash).await? else {
             let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
@@ -347,6 +386,39 @@ impl FromRequestParts<App> for Identity {
             request_id,
             channel: None,
         })
+    }
+
+    /// A bearer that is an access token from the issuer: verified, and the
+    /// user it names found or created with no access, as a sign-in would.
+    async fn from_access_token(
+        app: &App,
+        oidc: &Oidc,
+        token: &str,
+        client_addr: Option<String>,
+        request_id: Option<String>,
+    ) -> ApiResult<Self> {
+        match oidc.bearer_user(&app.control, token).await {
+            Ok(user) => Ok(Self {
+                user_id: user.id,
+                username: user.username,
+                is_admin: user.is_admin,
+                credential: Credential::IdentityProvider,
+                client_addr,
+                request_id,
+                channel: None,
+            }),
+            Err(CoreError::Bearer(reason)) => {
+                tracing::info!(%reason, "access token refused");
+                let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
+                entry.client_addr = client_addr;
+                entry.request_id = request_id;
+                app.control.record_audit(&entry).await?;
+                Err(ApiError::unauthorized(format!(
+                    "access token refused: {reason}"
+                )))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

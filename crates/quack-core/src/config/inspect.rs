@@ -413,6 +413,8 @@ const OIDC_KEYS: &[&str] = &[
     "client_secret_env",
     "scopes",
     "redirect_uri",
+    "audience",
+    "subject_claim",
 ];
 
 /// The keys a `[providers.NAME.oauth]` table accepts.
@@ -735,6 +737,13 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         Some(render_list(&OidcConfig::default_scopes())),
     );
     s.required_text("redirect_uri", &oidc.redirect_uri);
+    s.optional_text("audience", oidc.audience.as_deref(), None);
+    s.text(
+        "subject_claim",
+        &oidc.subject_claim,
+        OidcConfig::DEFAULT_SUBJECT_CLAIM,
+        None,
+    );
 }
 
 fn jobs(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {

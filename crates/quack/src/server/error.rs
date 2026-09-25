@@ -13,6 +13,9 @@ pub(crate) struct ApiError {
     pub message: String,
     /// Seconds for a `Retry-After` header, on a 503 that is only busy.
     pub retry_after: Option<u32>,
+    /// A `WWW-Authenticate` value, on a 401 that tells the client where to
+    /// get a token (RFC 6750, RFC 9728).
+    pub challenge: Option<String>,
 }
 
 impl ApiError {
@@ -21,6 +24,16 @@ impl ApiError {
             status,
             message: message.into(),
             retry_after: None,
+            challenge: None,
+        }
+    }
+
+    /// The same error, with a `WWW-Authenticate` challenge.
+    #[must_use]
+    pub(crate) fn with_challenge(self, challenge: String) -> Self {
+        Self {
+            challenge: Some(challenge),
+            ..self
         }
     }
 
@@ -73,6 +86,15 @@ impl IntoResponse for ApiError {
             Json(serde_json::json!({ "error": self.message })),
         )
             .into_response();
+        if let Some(challenge) = self
+            .challenge
+            .as_deref()
+            .and_then(|c| axum::http::HeaderValue::from_str(c).ok())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::WWW_AUTHENTICATE, challenge);
+        }
         if let Some(seconds) = self.retry_after {
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
@@ -92,7 +114,7 @@ impl From<CoreError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
-            CoreError::SignIn(_) => StatusCode::UNAUTHORIZED,
+            CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
             CoreError::Config(_)
             | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }

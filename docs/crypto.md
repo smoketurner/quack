@@ -55,6 +55,12 @@ build, and no ambiguity about which backend rustls picks at runtime.
   a subject (the associated data), and records the key id that sealed it. A `Sealed` value
   is stored by its caller, on the right side of the classification boundary; today that is
   one purpose, signed-in users' identity-provider tokens in `control.db` (`user_tokens`).
+- `jsonwebtoken` verifies identity-provider access tokens presented to `quack serve` (RFC
+  9728, design doc 12). It is pinned with `default-features = false` and only its
+  `aws_lc_rs` feature, so its signature checks run on the same aws-lc-rs as everything else
+  (and on the FIPS module on Linux); its `rust_crypto` backend is never enabled, and with
+  exactly one backend it selects its provider itself, with nothing to install. Its
+  `signature` dependency is RustCrypto's trait crate, with no algorithms in it.
 - `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
   (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`
   to both — Cargo unions the feature sets, so Linux gets FIPS and nothing else changes.

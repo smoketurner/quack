@@ -7,6 +7,7 @@ mod error;
 mod mcp_http;
 pub(crate) mod oidc;
 mod queue;
+mod resource;
 mod run;
 pub(crate) mod state;
 #[cfg(test)]
@@ -153,6 +154,11 @@ pub(crate) fn router(app: App) -> Router {
     // server to whatever is watching it.
     let mut limited = Router::new()
         .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
+        .route(resource::METADATA_PATH, get(resource::metadata))
+        .route(
+            &format!("{}/{{*path}}", resource::METADATA_PATH),
+            get(resource::metadata_for),
+        )
         .nest("/api/v1", api::router())
         .merge(web::router());
     if let Some(config) = governor {

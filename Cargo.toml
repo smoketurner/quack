@@ -70,6 +70,7 @@ http-body            = { version = "=1.1.0", default-features = false } # a Bedr
 i18n-embed           = { version = "=0.16.0", default-features = false }
 i18n-embed-fl        = { version = "=0.10.1", default-features = false }
 jiff                 = { version = "=0.2.37", default-features = false } # date/time — preferred over chrono/time
+jsonwebtoken         = { version = "=11.1.0", default-features = false } # JWT verification of identity-provider access tokens; aws_lc_rs backend only
 keyring-core         = { version = "=1.0.0", default-features = false }
 linux-keyutils-keyring-store = { version = "=1.0.0", default-features = false }
 mimalloc             = { version = "=0.1.52", default-features = false }

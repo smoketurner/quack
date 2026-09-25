@@ -25,7 +25,11 @@ use oauth2::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use tokio::sync::OnceCell;
+use std::time::{Duration, Instant};
+
+use jsonwebtoken::jwk::{Jwk, JwkSet};
+use jsonwebtoken::{AlgorithmFamily, DecodingKey, Validation};
+use tokio::sync::{OnceCell, RwLock};
 
 use crate::config::OidcConfig;
 use crate::error::{Error, Result};
@@ -33,6 +37,13 @@ use crate::llm::oauth::{CachedToken, Endpoints, OAuthHttp, random_token};
 
 /// How far past `exp` an ID token is still accepted, for clock skew.
 const CLOCK_LEEWAY: SignedDuration = SignedDuration::from_secs(60);
+
+/// How long fetched signing keys are used before they are fetched again.
+const KEYS_TTL: Duration = Duration::from_secs(3600);
+
+/// How soon a token signed with an unknown key may send quack back to the
+/// issuer for its keys (a rotation); sooner, it is refused without asking.
+const KEYS_REFETCH: Duration = Duration::from_secs(60);
 
 /// The `id_token` a token response carries beside the OAuth fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,17 +137,82 @@ pub enum Renewal {
     Revoked(String),
 }
 
+/// Who a token names, in an ID token or an access token alike.
+#[derive(Debug, Deserialize)]
+struct Person {
+    sub: Option<String>,
+    preferred_username: Option<String>,
+    email: Option<String>,
+    /// Every other claim, for a `subject_claim` other than `sub`.
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Person {
+    /// The configured claim that names the person, when it is a non-empty
+    /// string.
+    fn subject(&self, claim: &str) -> Option<OidcSubject> {
+        let value = if claim == OidcConfig::DEFAULT_SUBJECT_CLAIM {
+            self.sub.as_deref()
+        } else {
+            self.rest.get(claim).and_then(serde_json::Value::as_str)
+        };
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(OidcSubject::from)
+    }
+
+    /// A name for a new user: `preferred_username`, else `email`, else the
+    /// subject.
+    fn username(&self, subject: &OidcSubject) -> String {
+        [&self.preferred_username, &self.email]
+            .into_iter()
+            .flatten()
+            .map(|name| name.trim())
+            .find(|name| !name.is_empty())
+            .unwrap_or(subject.as_str())
+            .to_owned()
+    }
+}
+
 /// The ID token claims quack reads.
 #[derive(Debug, Deserialize)]
 struct Claims {
     iss: String,
-    sub: String,
     aud: Audience,
     exp: i64,
     azp: Option<String>,
     nonce: Option<String>,
-    preferred_username: Option<String>,
-    email: Option<String>,
+    #[serde(flatten)]
+    person: Person,
+}
+
+/// The access token claims quack reads beyond the ones `jsonwebtoken`
+/// validates (`iss`, `aud`, `exp`).
+#[derive(Debug, Deserialize)]
+struct AccessClaims {
+    /// Entra and Okta.
+    scp: Option<serde_json::Value>,
+    /// RFC 8693 and 9068, Auth0.
+    scope: Option<serde_json::Value>,
+    #[serde(flatten)]
+    person: Person,
+}
+
+impl AccessClaims {
+    /// Whether the token grants any scope: an access token does, an ID token
+    /// (whose `aud` may be the same client id) does not.
+    fn has_scope(&self) -> bool {
+        [&self.scp, &self.scope]
+            .into_iter()
+            .flatten()
+            .any(|value| match value {
+                serde_json::Value::String(text) => !text.trim().is_empty(),
+                serde_json::Value::Array(items) => !items.is_empty(),
+                _ => false,
+            })
+    }
 }
 
 /// `aud` is one string or a list of them.
@@ -206,20 +282,7 @@ impl Claims {
                 "the ID token does not carry this sign-in's nonce",
             ));
         }
-        if self.sub.is_empty() {
-            return Err(sign_in_error("the ID token has no subject"));
-        }
         Ok(())
-    }
-
-    fn username(&self) -> String {
-        [&self.preferred_username, &self.email]
-            .into_iter()
-            .flatten()
-            .map(|name| name.trim())
-            .find(|name| !name.is_empty())
-            .unwrap_or(&self.sub)
-            .to_owned()
     }
 }
 
@@ -232,6 +295,35 @@ pub struct SignIn {
     config: OidcConfig,
     http: OAuthHttp,
     endpoints: OnceCell<Endpoints>,
+    /// The issuer's signing keys, for access tokens presented as bearers.
+    keys: RwLock<Option<Keys>>,
+}
+
+/// The issuer's published keys and when they were fetched.
+struct Keys {
+    set: JwkSet,
+    fetched: Instant,
+}
+
+impl Keys {
+    /// The key `kid` names, or the only key when the token names none.
+    fn find(&self, kid: Option<&str>) -> Option<&Jwk> {
+        match kid {
+            Some(kid) => self.set.find(kid),
+            None => match self.set.keys.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A verified access token: whom it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bearer {
+    pub subject: OidcSubject,
+    /// A name for a new user, as a sign-in would give one.
+    pub username: String,
 }
 
 impl std::fmt::Debug for SignIn {
@@ -253,7 +345,14 @@ impl SignIn {
             config,
             http: OAuthHttp::new()?,
             endpoints: OnceCell::new(),
+            keys: RwLock::new(None),
         })
+    }
+
+    /// Whether access tokens are accepted as bearers: `audience` is set.
+    #[must_use]
+    pub const fn accepts_bearers(&self) -> bool {
+        self.config.audience.is_some()
     }
 
     /// The issuer's host, for the sign-in button.
@@ -368,6 +467,11 @@ impl SignIn {
             &pending.nonce,
             Timestamp::now(),
         )?;
+        let claim = &self.config.subject_claim;
+        let subject = claims
+            .person
+            .subject(claim)
+            .ok_or_else(|| sign_in_error(format!("the ID token has no {claim} claim")))?;
         if response.refresh_token().is_none() {
             tracing::warn!(
                 issuer = %issuer,
@@ -375,8 +479,8 @@ impl SignIn {
             );
         }
         Ok(SignedIn {
-            subject: OidcSubject(claims.sub.clone()),
-            username: claims.username(),
+            username: claims.person.username(&subject),
+            subject,
             token: CachedToken::from_response(&response),
         })
     }
@@ -410,6 +514,121 @@ impl SignIn {
             Err(e) => Err(sign_in_error(format!("renewing the sign-in failed: {e}"))),
         }
     }
+}
+
+impl SignIn {
+    /// Verify an access token presented to quack as a bearer: signed by the
+    /// issuer's published keys with an asymmetric algorithm, from the issuer,
+    /// for `[server.oidc].audience`, unexpired, and carrying a scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Bearer`] when the token fails any check or no
+    /// audience is configured, and an error when the issuer's documents
+    /// cannot be fetched.
+    pub async fn verify_bearer(&self, token: &str) -> Result<Bearer> {
+        let Some(audience) = self.config.audience.as_deref() else {
+            return Err(bearer_error(
+                "[server.oidc].audience is unset, so no access token is accepted",
+            ));
+        };
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|e| bearer_error(format!("not a JWT: {e}")))?;
+        if AlgorithmFamily::Hmac.algorithms().contains(&header.alg) {
+            return Err(bearer_error(format!(
+                "{:?} is a shared-secret algorithm; only the issuer's public keys are trusted",
+                header.alg
+            )));
+        }
+        let endpoints = self.endpoints().await?;
+        let key = self.key(header.kid.as_deref(), endpoints).await?;
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&[endpoints
+            .issuer
+            .as_deref()
+            .unwrap_or(&self.config.issuer_url)]);
+        validation.set_audience(&[audience]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.leeway = CLOCK_LEEWAY.unsigned_abs().as_secs();
+        let claims = jsonwebtoken::decode::<AccessClaims>(token, &key, &validation)
+            .map_err(|e| bearer_error(e.to_string()))?
+            .claims;
+        if !claims.has_scope() {
+            return Err(bearer_error(
+                "the token carries no scope, so it is not an access token",
+            ));
+        }
+        let claim = &self.config.subject_claim;
+        let subject = claims
+            .person
+            .subject(claim)
+            .ok_or_else(|| bearer_error(format!("the token has no {claim} claim")))?;
+        Ok(Bearer {
+            username: claims.person.username(&subject),
+            subject,
+        })
+    }
+
+    /// How many signing keys the issuer publishes, fetched now, for `quack
+    /// doctor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery or the key set cannot be fetched, or
+    /// the issuer publishes no `jwks_uri`.
+    pub async fn published_keys(&self) -> Result<usize> {
+        let endpoints = self.endpoints().await?;
+        let jwks_uri = endpoints
+            .jwks_uri
+            .as_deref()
+            .ok_or_else(|| bearer_error("the issuer publishes no jwks_uri"))?;
+        let set: JwkSet = self.http.fetch_json(jwks_uri, "the issuer's keys").await?;
+        Ok(set.keys.len())
+    }
+
+    /// The key `kid` names: from the cache while it is fresh, else from the
+    /// issuer's `jwks_uri`, fetched again for an unknown key at most once a
+    /// minute so a flood of bad tokens cannot make quack flood the issuer.
+    async fn key(&self, kid: Option<&str>, endpoints: &Endpoints) -> Result<DecodingKey> {
+        let decode = |jwk: &Jwk| {
+            DecodingKey::from_jwk(jwk)
+                .map_err(|e| bearer_error(format!("the issuer's key is unusable: {e}")))
+        };
+        if let Some(keys) = self.keys.read().await.as_ref()
+            && keys.fetched.elapsed() < KEYS_TTL
+            && let Some(jwk) = keys.find(kid)
+        {
+            return decode(jwk);
+        }
+        let mut keys = self.keys.write().await;
+        if keys
+            .as_ref()
+            .is_none_or(|k| k.fetched.elapsed() >= KEYS_REFETCH)
+        {
+            let jwks_uri = endpoints
+                .jwks_uri
+                .as_deref()
+                .ok_or_else(|| bearer_error("the issuer publishes no jwks_uri"))?;
+            let set: JwkSet = self.http.fetch_json(jwks_uri, "the issuer's keys").await?;
+            *keys = Some(Keys {
+                set,
+                fetched: Instant::now(),
+            });
+        }
+        keys.as_ref().and_then(|k| k.find(kid)).map_or_else(
+            || {
+                Err(bearer_error(format!(
+                    "signed with a key the issuer does not publish ({})",
+                    kid.unwrap_or("no kid")
+                )))
+            },
+            decode,
+        )
+    }
+}
+
+fn bearer_error(message: impl Into<String>) -> Error {
+    Error::Bearer(message.into())
 }
 
 mod tokens;

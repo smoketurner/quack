@@ -575,6 +575,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         authorization: String::from("http://127.0.0.1:9/a"),
         token: String::from("http://127.0.0.1:9/t"),
         device_authorization: None,
+        jwks_uri: None,
     };
     assert!(m.endpoints.set(endpoints).is_ok());
     let err = m.login(LoginFlow::Configured, &|_| {}).await.err();

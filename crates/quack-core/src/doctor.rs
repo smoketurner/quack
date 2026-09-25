@@ -1067,20 +1067,38 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         ));
         return;
     }
-    let begun = match SignIn::new(oidc.clone()) {
-        Ok(sign_in) => sign_in.begin().await.map(drop),
-        Err(e) => Err(e),
+    let sign_in = match SignIn::new(oidc.clone()) {
+        Ok(sign_in) => sign_in,
+        Err(e) => {
+            report.push(Check::new(
+                Area::Server,
+                Status::Fail,
+                format!("sign-in with {issuer}: {e}"),
+            ));
+            return;
+        }
     };
-    report.push(match begun {
-        Ok(()) => Check::new(
+    let keys = match &oidc.audience {
+        Some(_) => sign_in.published_keys().await.map(Some),
+        None => Ok(None),
+    };
+    report.push(match (sign_in.begin().await, keys) {
+        (Ok(_), Ok(keys)) => Check::new(
             Area::Server,
             Status::Ok,
-            format!(
-                "sign-in with {issuer}: the issuer answers discovery; callback {}",
-                oidc.redirect_uri
-            ),
+            match (keys, oidc.audience.as_deref()) {
+                (Some(keys), Some(audience)) => format!(
+                    "sign-in with {issuer}: the issuer answers discovery and publishes {}; access tokens for {audience} are accepted; callback {}",
+                    Count(keys, "signing key"),
+                    oidc.redirect_uri
+                ),
+                (None, _) | (_, None) => format!(
+                    "sign-in with {issuer}: the issuer answers discovery; callback {}",
+                    oidc.redirect_uri
+                ),
+            },
         ),
-        Err(e) => Check::new(
+        (Err(e), _) | (_, Err(e)) => Check::new(
             Area::Server,
             Status::Fail,
             format!("sign-in with {issuer}: {e}"),

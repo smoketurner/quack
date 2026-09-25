@@ -48,4 +48,8 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "std"]
 uuid               = { workspace = true, features = ["std", "v7"] }
 
 [dev-dependencies]
+# Tests sign access tokens the way an issuer would; the binary itself signs
+# nothing and gets its crypto through quack-core.
+aws-lc-rs    = { workspace = true, features = ["aws-lc-sys"] }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }

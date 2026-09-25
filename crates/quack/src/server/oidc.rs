@@ -16,7 +16,7 @@ use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
 use quack_core::llm::oauth::CachedToken;
 use quack_core::oidc::{Pending, Renewal, SignIn, SignedIn, UserTokens};
-use quack_core::storage::control::{AuditEntry, ControlPlane};
+use quack_core::storage::control::{AuditEntry, ControlPlane, UserRow};
 use quack_core::vault::Vault;
 
 use super::error::{ApiError, ApiResult};
@@ -207,6 +207,22 @@ impl Oidc {
                 ))
             }
         }
+    }
+
+    /// Whether access tokens from the issuer are accepted as bearers.
+    pub(crate) fn accepts_bearers(&self) -> bool {
+        self.sign_in.accepts_bearers()
+    }
+
+    /// The user an access token presented as a bearer names, created with no
+    /// access on first sight, as a sign-in would.
+    pub(crate) async fn bearer_user(
+        &self,
+        control: &ControlPlane,
+        token: &str,
+    ) -> CoreResult<UserRow> {
+        let bearer = self.sign_in.verify_bearer(token).await?;
+        control.oidc_user(&bearer.subject, &bearer.username).await
     }
 
     /// Drop a user's stored token, once they have no session left to use it.
