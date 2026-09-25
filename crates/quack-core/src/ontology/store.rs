@@ -293,6 +293,7 @@ fn write_version(
         ],
     )?;
     let prior_since = read_since(conn)?;
+    let prior_since_property = read_since_property(conn)?;
     // An item that already existed keeps the version it first appeared in.
     let since = |existed: bool, kind: &'static str, id: &str| -> i64 {
         let kept = existed
@@ -322,28 +323,10 @@ fn write_version(
                 since(existed, "class", class.id.as_str())
             ],
         )?;
-        for property_id in &class.properties {
-            let Some(property) = stored.property(property_id) else {
-                continue;
-            };
-            let existed = previous.is_some_and(|p| {
-                p.class(class.id.as_str())
-                    .is_some_and(|c| c.properties.contains(property_id))
-            });
-            conn.execute(
-                "INSERT INTO _quack_ontology_properties (id, class_id, label, type, enum_values, since_version) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                duckdb::params![
-                    property.id,
-                    class.id,
-                    property.label.clone().unwrap_or_else(|| property.id.clone()),
-                    property.kind.as_str(),
-                    if property.values.is_empty() { None } else { Some(serde_json::to_string(&property.values)?) },
-                    since(existed, "property", &property.id)
-                ],
-            )?;
-        }
     }
+    // Properties have a composite `(id, class_id)` key and a per-membership
+    // `since_version`, so they carry over per row in their own helper.
+    write_property_rows(conn, version, stored, previous, &prior_since_property)?;
     for relation in &stored.relations {
         let existed = previous.is_some_and(|p| p.relation(relation.id.as_str()).is_some());
         conn.execute(
@@ -378,7 +361,72 @@ fn write_version(
     Ok(())
 }
 
+/// Write the live `_quack_ontology_properties` rows for `stored`, carrying
+/// each `(class, property)` membership's `since_version` forward per row.
+///
+/// `prior_since` is the live table's per-`(class_id, id)` membership
+/// `since_version` map read *before* [`write_version`] deleted the rows, so
+/// each membership keeps the version it first appeared on its class.
+/// Properties are the one ontology kind with a composite key
+/// (`PRIMARY KEY (id, class_id)`): the same property id can first appear on
+/// one class at one version and on another class at a later one, so each
+/// membership row carries its own first-appearance version — never a global
+/// minimum across the classes that share the property id, which would
+/// silently overwrite a later membership's true first-appearance with an
+/// older one.
+fn write_property_rows(
+    conn: &duckdb::Connection,
+    version: OntologyVersion,
+    stored: &Ontology,
+    previous: Option<&Ontology>,
+    prior_since: &BTreeMap<(String, String), u32>,
+) -> Result<()> {
+    for class in &stored.classes {
+        for property_id in &class.properties {
+            let Some(property) = stored.property(property_id) else {
+                continue;
+            };
+            let existed = previous.is_some_and(|p| {
+                p.class(class.id.as_str())
+                    .is_some_and(|c| c.properties.contains(property_id))
+            });
+            let kept = existed
+                .then(|| {
+                    prior_since
+                        .get(&(class.id.to_string(), property.id.clone()))
+                        .copied()
+                })
+                .flatten();
+            conn.execute(
+                "INSERT INTO _quack_ontology_properties (id, class_id, label, type, enum_values, since_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                duckdb::params![
+                    property.id,
+                    class.id,
+                    property.label.clone().unwrap_or_else(|| property.id.clone()),
+                    property.kind.as_str(),
+                    if property.values.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::to_string(&property.values)?)
+                    },
+                    i64::from(kept.unwrap_or(version.get()))
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// `since_version` of every live item, keyed by kind and id.
+///
+/// Properties are intentionally excluded: `_quack_ontology_properties` has a
+/// composite `PRIMARY KEY (id, class_id)`, so the same property id can first
+/// appear on one class at one version and on another class at a later one.
+/// Each membership row carries its own first-appearance version, which a
+/// `min(since_version) ... GROUP BY id` would collapse to a single global
+/// minimum and lose the class dimension. Property memberships are read by
+/// [`read_since_property`] instead.
 fn read_since(conn: &duckdb::Connection) -> Result<BTreeMap<(&'static str, String), u32>> {
     let mut out = BTreeMap::new();
     for (kind, sql) in [
@@ -389,10 +437,6 @@ fn read_since(conn: &duckdb::Connection) -> Result<BTreeMap<(&'static str, Strin
         (
             "relation",
             "SELECT id, since_version FROM _quack_ontology_relations",
-        ),
-        (
-            "property",
-            "SELECT DISTINCT id, min(since_version) FROM _quack_ontology_properties GROUP BY id",
         ),
         (
             "mapping",
@@ -406,6 +450,23 @@ fn read_since(conn: &duckdb::Connection) -> Result<BTreeMap<(&'static str, Strin
             let since: i64 = row.get(1)?;
             out.insert((kind, id), u32::try_from(since).unwrap_or(0));
         }
+    }
+    Ok(out)
+}
+
+/// `since_version` of every property membership, keyed by `(class_id, id)`.
+/// One row per `(class, property)` membership, each carrying the version it
+/// first appeared on that class — never collapsed to a global minimum.
+fn read_since_property(conn: &duckdb::Connection) -> Result<BTreeMap<(String, String), u32>> {
+    let mut out = BTreeMap::new();
+    let mut stmt =
+        conn.prepare("SELECT class_id, id, since_version FROM _quack_ontology_properties")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let class_id: String = row.get(0)?;
+        let id: String = row.get(1)?;
+        let since: i64 = row.get(2)?;
+        out.insert((class_id, id), u32::try_from(since).unwrap_or(0));
     }
     Ok(out)
 }
@@ -613,6 +674,91 @@ mod tests {
             latest_version(&db).ok().flatten(),
             OntologyVersion::new(2),
             "failed saves write nothing"
+        );
+    }
+
+    // A property that lives on more than one class has one row per
+    // `(class, property)` membership in `_quack_ontology_properties`
+    // (`PRIMARY KEY (id, class_id)`), and `since_version` is the version
+    // it first appeared *on that class*. The carry-over must look it up
+    // per membership, not collapse to a global minimum across all classes
+    // that share the property id.
+
+    #[test]
+    fn property_since_version_is_per_class_not_global_min() {
+        let db = db();
+        let mut v1 = Ontology::builtin_default();
+        if let Some(c) = v1.classes.iter_mut().find(|c| c.id == "place") {
+            c.properties.retain(|p| p != "country");
+        }
+        save(&db, &v1, Revision::reviewed(None, None)).unwrap_or_else(|e| fail(&e.to_string()));
+        let v2 = Ontology::builtin_default();
+        save(&db, &v2, Revision::reviewed(None, None)).unwrap_or_else(|e| fail(&e.to_string()));
+        let since_for = |class_id: &str| -> i64 {
+            let mut stmt = db
+                .connection()
+                .prepare(
+                    "SELECT since_version FROM _quack_ontology_properties \
+                     WHERE id = 'country' AND class_id = ?",
+                )
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            stmt.query_row(duckdb::params![class_id], |r| r.get::<_, i64>(0))
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        assert_eq!(since_for("place"), 2, "country on place is new in v2");
+        // `country` on `organization` landed at v1; a global-min read would
+        // make this v2 row drift to 1 on any later save whose `previous`
+        // already contains the membership.
+        assert_eq!(
+            since_for("organization"),
+            1,
+            "country on organization is from v1"
+        );
+        save(&db, &v2, Revision::reviewed(None, None)).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            since_for("place"),
+            2,
+            "an unchanged item must keep the version it first appeared in"
+        );
+        assert_eq!(
+            since_for("organization"),
+            1,
+            "the original membership is untouched by the re-save"
+        );
+    }
+
+    #[test]
+    fn property_since_version_survives_restore() {
+        let db = db();
+        let mut v1 = Ontology::builtin_default();
+        if let Some(c) = v1.classes.iter_mut().find(|c| c.id == "place") {
+            c.properties.retain(|p| p != "country");
+        }
+        save(&db, &v1, Revision::reviewed(None, None)).unwrap_or_else(|e| fail(&e.to_string()));
+        let v2 = Ontology::builtin_default();
+        let saved =
+            save(&db, &v2, Revision::reviewed(None, None)).unwrap_or_else(|e| fail(&e.to_string()));
+        let v2_version = saved
+            .version
+            .unwrap_or_else(|| fail("saved ontology has no version"));
+        // restore v2 right after saving v2: previous current is v2 (which has
+        // place+country), so the membership `existed` and is carried over.
+        // Its true first-appearance on `place` is v2; the global-min read
+        // would instead write 1.
+        restore(&db, v2_version, None).unwrap_or_else(|e| fail(&e.to_string()));
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT since_version FROM _quack_ontology_properties \
+                 WHERE id = 'country' AND class_id = 'place'",
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let since: i64 = stmt
+            .query_row([], |r| r.get(0))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            since, 2,
+            "carried-over membership must keep its true first-appearance (v2), not the global min (v1)"
         );
     }
 }
