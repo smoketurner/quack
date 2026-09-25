@@ -91,18 +91,28 @@ impl Access {
     }
 
     /// Take a user out of this workspace; one who was not a member is an
-    /// error, after the attempt is audited.
+    /// error, after the failed attempt is audited as such. `Allowed` is
+    /// for work that succeeded (`Outcome::of`): a no-op removal that
+    /// answers `404` is `Error`.
     pub(crate) async fn remove_member(&self, app: &App, user_id: &UserId) -> ApiResult<()> {
         let removed = app
             .control
             .remove_member(&self.workspace.id, user_id)
             .await?;
+        let (outcome, detail) = if removed {
+            (Outcome::Allowed, None)
+        } else {
+            (
+                Outcome::Error,
+                Some(serde_json::json!({ "reason": "not a member" })),
+            )
+        };
         self.audit(
             app,
             AuditAction::Member,
             Some(ResourceKind::User.id(user_id.as_str())),
-            Outcome::Allowed,
-            None,
+            outcome,
+            detail,
         )
         .await?;
         if removed {
