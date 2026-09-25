@@ -675,6 +675,34 @@ fn paths_merges_and_listing(
     assert!(resolve::decide(db, proposal.id.as_str(), MergeDecision::Accept, None).is_err());
 }
 
+/// A graph with nodes but no recorded build version is never built, not stale:
+/// `None < Some(_)` used to label mid-extraction and crashed-extraction graphs
+/// stale via `Option` ordering. The never-built state carries its own
+/// remediation (`run quack graph extract`); the `stale` suffix, which names
+/// `revalidate`/`extract` for a *recorded* version that lags, must not fire.
+#[test]
+fn status_is_not_stale_when_built_with_version_is_none() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Provisional).unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert!(status.nodes > 0, "extraction should have inserted nodes");
+    assert_eq!(status.built_with_version, None);
+    assert!(
+        !status.stale,
+        "never-built graph is not stale; Display would print: {status}"
+    );
+    let display = format!("{status}");
+    assert!(
+        display.contains("never built; run `quack graph extract`"),
+        "missing the never-built extract hint: {display}"
+    );
+    assert!(
+        !display.contains("stale"),
+        "a never-built graph must not be labelled stale: {display}"
+    );
+}
+
 #[tokio::test]
 async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     let db = workspace();
@@ -712,6 +740,11 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     .unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(status.stale);
+    assert!(
+        format!("{status}")
+            .contains("stale: run `quack graph revalidate` or `quack graph extract`"),
+        "a genuinely stale graph keeps the stale suffix: {status}"
+    );
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 2, "Kenya and Uganda");
     assert_eq!(outcome.dropped_edges, 0, "their edges went with them");

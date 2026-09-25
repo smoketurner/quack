@@ -551,7 +551,7 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
         provisional_nodes: u64::try_from(provisional_nodes).unwrap_or(0),
         built_with_version,
         ontology_version,
-        stale: nodes > 0 && built_with_version < ontology_version,
+        stale: built_with_version.is_some() && built_with_version < ontology_version,
         pending_merges: u64::try_from(pending_merges).unwrap_or(0),
         drift: drift(db)?,
         missing_tables,
