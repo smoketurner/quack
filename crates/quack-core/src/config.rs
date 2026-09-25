@@ -912,8 +912,8 @@ pub struct OidcConfig {
     /// ending in [`OidcConfig::CALLBACK_PATH`].
     pub redirect_uri: String,
     /// The `aud` of access tokens the issuer makes for quack (Entra: the
-    /// Application ID URI or client id; Okta: the custom authorization
-    /// server's audience; Auth0: the API identifier). When set, the API and
+    /// API's client ID, which a v2.0 token's `aud` always is; Okta: the
+    /// custom authorization server's audience; Auth0: the API identifier). When set, the API and
     /// MCP accept those tokens as bearers and quack publishes its protected
     /// resource metadata (RFC 9728).
     pub audience: Option<String>,

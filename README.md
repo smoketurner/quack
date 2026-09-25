@@ -86,7 +86,9 @@ embedding_dimension = 1024
 
 quack supports Ollama, OpenAI-compatible endpoints, Anthropic, and Amazon Bedrock, with no
 auth, an API key, or OAuth, and for Bedrock whatever the AWS CLI would use (environment,
-`aws_profile` or `AWS_PROFILE`, `aws sso login`, instance roles):
+`aws_profile` or `AWS_PROFILE`, `aws sso login`, instance roles). How people sign in to
+`quack serve` and how quack authenticates to providers is in
+[docs/authentication.md](docs/authentication.md):
 
 ```toml
 [general]
