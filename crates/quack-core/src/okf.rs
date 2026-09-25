@@ -1034,9 +1034,18 @@ pub fn propose(bundle: &Bundle, current: Option<&Ontology>) -> Vec<Candidate> {
         if front.get("generator") == Some(GENERATOR) && !file.path.starts_with("entities/") {
             continue;
         }
-        let Some(kind) = front.get("type").map(type_id) else {
+        let Some(raw) = front.get("type") else {
             continue;
         };
+        // quack's own entity files carry the canonical class id verbatim, so
+        // the foreign-bundle plural-folding `type_id` would mangle ids ending
+        // in a single `s` (e.g. `series` -> `serie`): keep them as written.
+        let kind =
+            if front.get("generator") == Some(GENERATOR) && file.path.starts_with("entities/") {
+                raw.to_owned()
+            } else {
+                type_id(raw)
+            };
         if front.get("resource").is_some() {
             resource_seen = true;
         }
