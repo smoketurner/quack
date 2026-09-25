@@ -1110,7 +1110,7 @@ async fn a_failed_first_turn_leaves_no_empty_session_behind() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_authorized_search_is_audited_as_error() {
     let config = Config::parse(
-        "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 768\n",
+        "[embedding]\nmodel = \"o/e\"\ndimension = 768\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
     )
     .unwrap_or_else(|e| fail(&e.to_string()));
     let h = harness_with(ServeMode::Local, config).await;
@@ -2813,7 +2813,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_authorized_mcp_search_is_audited_as_error() {
     let config = Config::parse(
-        "[general]\nembedding_model = \"o/e\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nembedding_dimension = 768\n",
+        "[embedding]\nmodel = \"o/e\"\ndimension = 768\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
     )
     .unwrap_or_else(|e| fail(&e.to_string()));
     let h = harness_with(ServeMode::Login, config).await;
@@ -2910,8 +2910,7 @@ async fn a_successful_mcp_search_is_audited_as_allowed() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["isError"], false, "{body}");
     assert_eq!(
-        body["result"]["structuredContent"]["chunks"][0]["filename"],
-        "policy.md",
+        body["result"]["structuredContent"]["chunks"][0]["filename"], "policy.md",
         "{body}"
     );
 
