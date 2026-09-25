@@ -1696,7 +1696,15 @@ rerank = "model"
 
     #[test]
     fn provider_names_outside_the_allowed_characters_are_rejected() {
-        for bad in ["../evil", ".hidden", "a/b", "a\\\\b", "", "sp ace", "azure.openai"] {
+        for bad in [
+            "../evil",
+            ".hidden",
+            "a/b",
+            "a\\\\b",
+            "",
+            "sp ace",
+            "azure.openai",
+        ] {
             let toml_text = format!("[providers.\"{bad}\"]\ntype = \"ollama\"\n");
             assert!(err_of(&toml_text).contains("provider name"), "{bad:?}");
         }
