@@ -1316,14 +1316,14 @@ region becomes the signing region unless `region` says otherwise, and a disagree
 is refused; with FIPS required, a non-FIPS AWS host is refused. `base_url` replaces only the
 Bedrock endpoint, never the SSO or STS ones.
 
-On the runtime endpoint, when `base_url` is unset the AWS endpoint-URL overrides the SDK's
-own client honours are honored for the root too — `AWS_ENDPOINT_URL`, the service-specific
+On the runtime endpoint, when `base_url` is unset, the root also honors the AWS endpoint-URL
+overrides the SDK's own client honors — `AWS_ENDPOINT_URL`, the service-specific
 `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, and the matching `[default]` / `[bedrock runtime]`
 profile `endpoint_url` keys — resolved the way the bedrock-runtime `Config` builder resolves
 them, so the OpenAI-compatible transports and the Converse / `InvokeModel` client send to one
-host. The override, like `base_url`, is taken as given (it is not checked for FIPS, because
-the SDK client does not check either and a check here would only split chat and embeddings
-again). The mantle endpoint has no SDK client, so it is unaffected.
+host. With FIPS required, an override that names a non-FIPS AWS host is refused, as
+`base_url` is; the root is resolved before the SDK client is built, so the refusal fails the
+whole provider. The mantle endpoint has no SDK client, so it is unaffected.
 
 The region is `region`, else `base_url`'s, else the SDK's chain (`AWS_REGION`, the profile's
 `region`, instance metadata). The first use of a provider builds its `llm::bedrock::Session`

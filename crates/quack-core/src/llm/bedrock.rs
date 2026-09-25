@@ -22,14 +22,15 @@
 //! SDK's own resolver, which honours `use_fips_endpoint` and
 //! `use_dualstack_endpoint`, the mantle's `bedrock-mantle.{region}.api.aws`.
 //!
-//! On the runtime endpoint, when `base_url` is unset the same AWS endpoint-URL
+//! On the runtime endpoint, when `base_url` is unset, the AWS endpoint-URL
 //! overrides the SDK's own client honours apply here too — `AWS_ENDPOINT_URL`,
 //! the service-specific `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, and the matching
 //! `[default]` / `[bedrock runtime]` profile `endpoint_url` keys — resolved the
 //! way `Builder::from(&sdk)` resolves them, so the OpenAI-compatible transports
 //! (`chat-completions`, `responses`) and the Converse / `InvokeModel` client
-//! never split across two hosts. The mantle endpoint has no SDK client, so it
-//! is unaffected.
+//! never split across two hosts. With FIPS required, an override that names
+//! a non-FIPS AWS host is refused, as `base_url` is. The mantle endpoint has
+//! no SDK client, so it is unaffected.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -313,10 +314,11 @@ async fn build(name: &ProviderName, provider: &ProviderConfig) -> Result<Session
 /// endpoint-URL override the SDK honours (`AWS_ENDPOINT_URL`,
 /// `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, or the profile equivalents), else the
 /// one AWS publishes for `region`, FIPS and dual-stack as the SDK's settings
-/// ask (`AWS_USE_FIPS_ENDPOINT`, `use_fips_endpoint` in the profile). The
-/// override, like `base_url`, is taken as given and is not checked for FIPS:
-/// the Converse client does not check either, and a check here would only
-/// split chat and embeddings again (chat refused, embeddings served).
+/// ask (`AWS_USE_FIPS_ENDPOINT`, `use_fips_endpoint` in the profile). With
+/// FIPS required, `base_url` and the override alike are refused when they
+/// name a non-FIPS AWS host ([`require_fips_host`]); `build()` resolves the
+/// root before it makes the Converse client, so the refusal fails the whole
+/// provider rather than one transport.
 async fn root(
     name: &ProviderName,
     provider: &ProviderConfig,
@@ -326,12 +328,7 @@ async fn root(
 ) -> Result<String> {
     let fips = sdk.use_fips().unwrap_or(false);
     if let Some(base_url) = &provider.base_url {
-        if fips && is_fips_host(base_url) == Some(false) {
-            return Err(Error::Config(format!(
-                "provider '{name}': FIPS endpoints are required (use_fips_endpoint), but \
-                 base_url {base_url} is not one; use a bedrock-runtime-fips endpoint"
-            )));
-        }
+        require_fips_host(name, fips, base_url, "base_url")?;
         return Ok(base_url.trimmed().to_owned());
     }
     match endpoint {
@@ -348,7 +345,13 @@ async fn root(
             // here too, so the OpenAI-compatible transport at this root and the
             // Converse / InvokeModel client cannot resolve to different hosts.
             if let Some(override_url) = runtime_endpoint_override(sdk) {
-                return Ok(override_url.trim_end_matches('/').to_owned());
+                let override_url = BaseUrl::try_from(override_url).map_err(|e| {
+                    Error::Config(format!(
+                        "provider '{name}': the AWS endpoint-URL override: {e}"
+                    ))
+                })?;
+                require_fips_host(name, fips, &override_url, "the AWS endpoint-URL override")?;
+                return Ok(override_url.trimmed().to_owned());
             }
             let params = Params::builder()
                 .region(region)
@@ -367,6 +370,19 @@ async fn root(
             Ok(endpoint.url().trim_end_matches('/').to_owned())
         }
     }
+}
+
+/// Refuses an explicit root (`base_url`, or an AWS endpoint-URL override,
+/// named by `source`) that is a non-FIPS AWS host while FIPS endpoints are
+/// required. A host that is not an AWS one cannot be told and passes.
+fn require_fips_host(name: &ProviderName, fips: bool, url: &BaseUrl, source: &str) -> Result<()> {
+    if fips && is_fips_host(url) == Some(false) {
+        return Err(Error::Config(format!(
+            "provider '{name}': FIPS endpoints are required (use_fips_endpoint), but \
+             {source} {url} is not one; use a bedrock-runtime-fips endpoint"
+        )));
+    }
+    Ok(())
 }
 
 /// The bedrock-runtime endpoint-URL override `root()` honors — resolved the
@@ -1011,6 +1027,58 @@ mod tests {
                 .ok()
                 .as_deref(),
             Some("https://bedrock-runtime-fips.us-west-2.amazonaws.com")
+        );
+    }
+
+    /// The override is refused under FIPS exactly as `base_url` is
+    /// (`each_endpoint_resolves_its_root_fips_included`): a non-FIPS AWS
+    /// host fails the provider, a FIPS one is the root.
+    #[tokio::test]
+    async fn runtime_root_refuses_a_non_fips_override_when_fips_is_required() {
+        let with_override = |url: &str| {
+            SdkConfig::builder()
+                .region(Region::new("us-west-2"))
+                .use_fips(true)
+                .endpoint_url(url)
+                .behavior_version(BehaviorVersion::latest())
+                .build()
+        };
+        let plain = "https://vpce-0abc.bedrock-runtime.us-west-2.vpce.amazonaws.com";
+        let refused = root_of_with_sdk(BedrockEndpoint::Runtime, &with_override(plain)).await;
+        assert!(refused.is_err_and(|e| {
+            let e = e.to_string();
+            e.contains("not one") && e.contains("endpoint-URL override")
+        }));
+        let service_specific = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .use_fips(true)
+            .service_config(BedrockRuntimeServiceConfig(Some(String::from(
+                "https://bedrock-runtime.us-west-2.amazonaws.com",
+            ))))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let refused = root_of_with_sdk(BedrockEndpoint::Runtime, &service_specific).await;
+        assert!(refused.is_err_and(|e| e.to_string().contains("not one")));
+        let fips_vpce = "https://vpce-0abc.bedrock-runtime-fips.us-west-2.vpce.amazonaws.com/";
+        assert_eq!(
+            root_of_with_sdk(BedrockEndpoint::Runtime, &with_override(fips_vpce))
+                .await
+                .ok()
+                .as_deref(),
+            Some("https://vpce-0abc.bedrock-runtime-fips.us-west-2.vpce.amazonaws.com")
+        );
+        // Without FIPS required, the same non-FIPS override is the root.
+        let open = SdkConfig::builder()
+            .region(Region::new("us-west-2"))
+            .endpoint_url(plain)
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        assert_eq!(
+            root_of_with_sdk(BedrockEndpoint::Runtime, &open)
+                .await
+                .ok()
+                .as_deref(),
+            Some(plain)
         );
     }
 
