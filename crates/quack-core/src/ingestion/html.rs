@@ -129,7 +129,15 @@ fn subtree_text(node: ego_tree::NodeRef<'_, Node>) -> String {
     let mut out = String::new();
     for descendant in node.descendants() {
         if let Node::Text(text) = descendant.value() {
-            out.push_str(&text.text);
+            // Mirror `Walker::visit`'s `SKIPPED` policy: drop text sitting
+            // under a skipped element (script/style/noscript/template/svg
+            // nested in a heading), so it never pollutes the section heading.
+            let skipped = descendant
+                .ancestors()
+                .any(|a| matches!(a.value(), Node::Element(e) if SKIPPED.contains(&e.name())));
+            if !skipped {
+                out.push_str(&text.text);
+            }
         }
     }
     out
@@ -184,5 +192,95 @@ mod tests {
                 .first()
                 .is_some_and(|s| s.text == "just text, no tags")
         }));
+    }
+
+    #[test]
+    fn heading_skips_text_from_nested_skipped_elements() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "script",
+                "<html><body><h1>Report <script>track()</script>End</h1><p>body</p></body></html>",
+            ),
+            (
+                "style",
+                "<html><body><h1>Report <style>color:red</style>End</h1><p>body</p></body></html>",
+            ),
+            (
+                "noscript",
+                "<html><body><h1>Report <noscript>fallback()</noscript>End</h1><p>body</p></body></html>",
+            ),
+            (
+                "template",
+                "<html><body><h1>Report <template>t()</template>End</h1><p>body</p></body></html>",
+            ),
+            (
+                "svg",
+                "<html><body><h1>Report <svg><text>icon</text></svg>End</h1><p>body</p></body></html>",
+            ),
+            (
+                "svg-title",
+                "<html><body><h1>Report <svg><title>logo</title></svg>End</h1><p>body</p></body></html>",
+            ),
+        ];
+        for &(label, page) in cases {
+            let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
+            let heading = extracted
+                .sections
+                .iter()
+                .find_map(|s| s.heading.clone())
+                .unwrap_or_default();
+            assert_eq!(
+                heading, "Report End",
+                "[{label}] heading leaked past SKIPPED"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_skips_skipped_element_nested_in_a_block() {
+        let page =
+            "<html><body><h1>A <div><script>x()</script>B</div> C</h1><p>body</p></body></html>";
+        let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
+        let heading = extracted
+            .sections
+            .iter()
+            .find_map(|s| s.heading.clone())
+            .unwrap_or_default();
+        assert_eq!(heading, "A B C");
+    }
+
+    #[test]
+    fn heading_keeps_text_from_non_skipped_phrasing_elements() {
+        let page =
+            "<html><body><h1>Claims <em>process</em> <b>fast</b></h1><p>body</p></body></html>";
+        let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
+        let heading = extracted
+            .sections
+            .iter()
+            .find_map(|s| s.heading.clone())
+            .unwrap_or_default();
+        assert_eq!(heading, "Claims process fast");
+    }
+
+    #[test]
+    fn titleless_page_first_heading_with_skipped_element_yields_clean_title() {
+        let page = "<html><body><h1>Report <svg><text>icon</text></svg>End</h1><p>Body text.</p></body></html>";
+        let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            extracted.title.is_none(),
+            "page should have no <title> element"
+        );
+        assert_eq!(
+            extracted.title(),
+            Some("Report End"),
+            "fallback title leaked text from a skipped element"
+        );
+        assert_eq!(
+            extracted
+                .sections
+                .first()
+                .and_then(|s| s.heading.as_deref()),
+            Some("Report End")
+        );
     }
 }
