@@ -60,9 +60,8 @@ pub(crate) async fn search(
     let result: ApiResult<_> = async {
         let model = Embeddings::from_config(&app.config).await?;
         let embedding = query.embedding(model.as_ref()).await?;
-        Ok(app
-            .read(&id, move |db| query.run(db, embedding.as_ref(), &options))
-            .await?)
+        app.read(&id, move |db| query.run(db, embedding.as_ref(), &options))
+            .await
     }
     .await;
     access
@@ -99,9 +98,8 @@ pub(crate) async fn path(
     let result: ApiResult<_> = async {
         let model = Embeddings::from_config(&app.config).await?;
         let ends = query.embeddings(model.as_ref()).await?;
-        Ok(app
-            .read(&id, move |db| query.run(db, &ends, &options))
-            .await?)
+        app.read(&id, move |db| query.run(db, &ends, &options))
+            .await
     }
     .await;
     access
