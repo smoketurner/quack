@@ -1779,6 +1779,217 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_review_queue_can_flush_all_pending() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "p" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    for sql in [
+        "CREATE TABLE vendors (vendor_id INTEGER, name TEXT)",
+        "INSERT INTO vendors SELECT i, 'V' || i FROM range(30) t(i)",
+        "CREATE TABLE orders (order_id INTEGER, vendor_id INTEGER, mode TEXT)",
+        "INSERT INTO orders SELECT i, i % 30, CASE WHEN i % 2 = 0 THEN 'air' ELSE 'sea' END FROM range(60) t(i)",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let base = format!("/api/v1/workspaces/{ws}/ontology");
+
+    // A plain propose queues candidates (the per-run path, no auto-accept).
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["candidates"].as_u64().unwrap_or(0) > 0,
+        "candidates queued: {body}"
+    );
+
+    // "Reject all pending" clears the whole queue without building a version.
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/candidates"),
+            None,
+            "bulk=reject_all&status=pending",
+        )
+        .await;
+    let loc = location(&headers);
+    assert!(
+        loc.starts_with(&format!("/w/{ws}/ontology?notice=rejected+")),
+        "reject_all flashes a notice: {loc}"
+    );
+    let (status, _) = h.call(Method::GET, &base, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "reject builds no version");
+    let (_, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    assert!(
+        body["candidates"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "pending drained: {body}"
+    );
+
+    // A new propose re-queues (no ontology yet); "accept all pending" then
+    // flushes the whole queue into one version. This deliberate action is
+    // the visible counterpart to the per-run --auto-accept, which is now
+    // scoped to one run and no longer drains the shared queue on its own.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["candidates"].as_u64().unwrap_or(0) > 0, "{body}");
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/candidates"),
+            None,
+            "bulk=accept_all&status=pending",
+        )
+        .await;
+    let loc = location(&headers);
+    assert!(
+        loc.starts_with(&format!("/w/{ws}/ontology?notice=accepted+")),
+        "accept_all flashes a notice: {loc}"
+    );
+    let (status, body) = h.call(Method::GET, &base, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 1, "accept_all built version 1: {body}");
+    assert!(
+        body["classes"].as_array().is_some_and(|c| !c.is_empty()),
+        "version has classes: {body}"
+    );
+    let (_, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    assert!(
+        body["candidates"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "pending drained after accept_all: {body}"
+    );
+
+    // accept_all on an empty queue errors out loud, so it can never quietly
+    // report a count that does not match the version's contents.
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/candidates"),
+            None,
+            "bulk=accept_all&status=pending",
+        )
+        .await;
+    let loc = location(&headers);
+    assert!(
+        loc.starts_with(&format!("/w/{ws}/ontology?error="))
+            && loc.contains("no+pending+candidates"),
+        "accept_all on an empty queue errors: {loc}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn propose_with_auto_accept_builds_a_version_scoped_to_this_run() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "p" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    for sql in [
+        "CREATE TABLE vendors (vendor_id INTEGER, name TEXT)",
+        "INSERT INTO vendors SELECT i, 'V' || i FROM range(30) t(i)",
+        "CREATE TABLE orders (order_id INTEGER, vendor_id INTEGER, mode TEXT)",
+        "INSERT INTO orders SELECT i, i % 30, CASE WHEN i % 2 = 0 THEN 'air' ELSE 'sea' END FROM range(60) t(i)",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let base = format!("/api/v1/workspaces/{ws}/ontology");
+
+    // `auto_accept` queues this run's candidates and accepts them in one
+    // call. Scoping acceptance to this run means the version contains
+    // exactly what was queued, so the reported count matches the version.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "auto_accept": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let queued = body["candidates"].as_u64().unwrap_or(0);
+    assert!(queued > 0, "candidates queued and accepted: {body}");
+    assert_eq!(body["version"], 1, "auto-accept built a version: {body}");
+    assert!(
+        body["run"].as_str().is_some(),
+        "the run id is returned: {body}"
+    );
+
+    let (status, body) = h.call(Method::GET, &base, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 1, "{body}");
+
+    // Every queued candidate was accepted: the pending queue is empty, so
+    // the count the API reported equals the version's additions (no misreport).
+    let (_, body) = h
+        .call(Method::GET, &format!("{base}/candidates"), None, None)
+        .await;
+    assert!(
+        body["candidates"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "pending empty after auto-accept: {body}"
+    );
+
+    // A second auto-accept over the now-covered tables finds nothing new.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/propose"),
+            None,
+            Some(serde_json::json!({ "auto_accept": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["candidates"], 0, "nothing new to propose: {body}");
+    assert!(body["version"].is_null(), "no version built: {body}");
+    assert!(body["run"].is_null(), "no run queued: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_endpoints_manage_users_and_read_the_audit() {
     let h = harness(ServeMode::Login).await;
     h.user("root", UserKind::Admin).await;

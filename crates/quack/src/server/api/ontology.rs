@@ -311,7 +311,9 @@ impl Access {
             }
             let run = candidates::store_run(db, &proposals)?;
             let version = if auto_accept {
-                candidates::accept_all(db, Some(&author))?.version
+                candidates::accept_run(db, &run, Some(&author))?
+                    .ontology
+                    .version
             } else {
                 None
             };
@@ -420,6 +422,55 @@ impl Access {
             rejected,
             version,
         })
+    }
+
+    /// Accept every pending candidate at once: the queue-level flush the
+    /// "accept all pending" review-queue button reaches. Unlike a per-run
+    /// auto-accept (which uses [`propose_from_tables`] and [`candidates::accept_run`]),
+    /// this deliberately accepts every `Pending` row regardless of which
+    /// run produced it, so the version may contain candidates the caller
+    /// did not propose this run. The audit records how many were actually
+    /// accepted, not how many any one run queued.
+    pub(crate) async fn accept_all_pending(
+        &self,
+        app: &App,
+    ) -> ApiResult<candidates::AutoAccepted> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let accepted = with_db(db, move |db| candidates::accept_all(db, Some(&author))).await?;
+        let version = accepted.ontology.version;
+        let count = accepted.accepted;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({
+                "accept_all": true,
+                "accepted": count,
+                "version": version,
+            })),
+        )
+        .await?;
+        Ok(accepted)
+    }
+
+    /// Reject every pending candidate at once: the "reject all pending"
+    /// review-queue button. Nothing changes in the ontology; the audit
+    /// records how many were rejected.
+    pub(crate) async fn reject_all_pending(&self, app: &App) -> ApiResult<usize> {
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let rejected = with_db(db, move |db| candidates::reject_all(db, Some(&author))).await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({ "reject_all": true, "rejected": rejected })),
+        )
+        .await?;
+        Ok(rejected)
     }
 }
 

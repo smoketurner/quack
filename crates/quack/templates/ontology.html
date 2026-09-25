@@ -29,6 +29,7 @@
     <span class="text-slate-500">Ticked candidates:</span>
     <button type="submit" name="bulk" value="accept" class="rounded bg-slate-900 px-2 py-1 text-xs text-white hover:bg-slate-700">Accept selected</button>
     <button type="submit" name="bulk" value="reject" class="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100">Reject selected</button>
+    {% if queue_status == Queue::Pending %}<span class="text-slate-400">·</span><span class="text-slate-500">or the whole pending queue:</span><button type="submit" name="bulk" value="accept_all" class="rounded bg-slate-900 px-2 py-1 text-xs text-white hover:bg-slate-700">Accept all pending</button><button type="submit" name="bulk" value="reject_all" class="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100">Reject all pending</button>{% endif %}
   </form>
   {% endif %}
   <table class="mt-2 w-full text-sm">

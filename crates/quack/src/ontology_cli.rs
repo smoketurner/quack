@@ -442,18 +442,17 @@ async fn propose(
     if proposals.is_empty() {
         writeln!(out, "Nothing to propose: the tables are already covered.")?;
     } else if auto_accept {
-        let run = proposals.clone();
         let stored = db
             .run(move |db| {
-                candidates::store_run(db, &run)?;
-                candidates::accept_all(db, None)
+                let run = candidates::store_run(db, &proposals)?;
+                candidates::accept_run(db, &run, None)
             })
             .await?;
         writeln!(
             out,
             "accepted {} proposals; ontology is now version {}",
-            proposals.len(),
-            stored.saved_version()?
+            stored.accepted,
+            stored.ontology.saved_version()?
         )?;
     } else {
         let run = proposals.clone();

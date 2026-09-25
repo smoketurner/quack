@@ -294,6 +294,13 @@ fn row_from(row: &duckdb::Row<'_>) -> duckdb::Result<CandidateRow> {
 const COLUMNS: &str = "id, kind, CAST(proposal AS VARCHAR), CAST(evidence AS VARCHAR), confidence, status, \
      proposed_by, decided_by, CAST(decided_at AS VARCHAR)";
 
+/// The pending-queue order: classes, properties, relations, then the
+/// rest, so [`apply`] sees a class before the properties and relations
+/// that reference it. Shared by the shared queue and the per-run view so
+/// auto-accepting one run's candidates applies them in the same order.
+const PENDING_ORDER: &str =
+    "CASE kind WHEN 'class' THEN 0 WHEN 'property' THEN 1 WHEN 'relation' THEN 2 ELSE 3 END, id";
+
 /// The candidates in a review queue: the main proposal with classes
 /// first, then properties, relations, mappings; the low-support queue
 /// most confident first.
@@ -303,9 +310,7 @@ const COLUMNS: &str = "id, kind, CAST(proposal AS VARCHAR), CAST(evidence AS VAR
 /// Returns an error if the query fails.
 pub fn queue(db: &WorkspaceDb, queue: Queue) -> Result<Vec<CandidateRow>> {
     let order = match queue {
-        Queue::Pending => {
-            "CASE kind WHEN 'class' THEN 0 WHEN 'property' THEN 1 WHEN 'relation' THEN 2 ELSE 3 END, id"
-        }
+        Queue::Pending => PENDING_ORDER,
         Queue::LowSupport => "confidence DESC, id",
     };
     let sql = format!(
@@ -313,6 +318,22 @@ pub fn queue(db: &WorkspaceDb, queue: Queue) -> Result<Vec<CandidateRow>> {
     );
     let mut stmt = db.connection().prepare(&sql)?;
     let rows = stmt.query_map([queue.status()], row_from)?;
+    Ok(rows.flatten().collect())
+}
+
+/// The pending candidates a single run queued: the rows [`store_run`]
+/// inserted for `run` that are still awaiting a decision. A per-run
+/// auto-accept ([`accept_run`]) reads this instead of the shared [`queue`]
+/// so it does not drain other runs' undecided candidates.
+fn pending_for_run(db: &WorkspaceDb, run: &RunId) -> Result<Vec<CandidateRow>> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM _quack_ontology_candidates WHERE status = ? AND proposed_by = ? ORDER BY {PENDING_ORDER}"
+    );
+    let mut stmt = db.connection().prepare(&sql)?;
+    let rows = stmt.query_map(
+        duckdb::params![Queue::Pending.status(), run.as_str()],
+        row_from,
+    )?;
     Ok(rows.flatten().collect())
 }
 
@@ -331,6 +352,20 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<CandidateRow> {
         .flatten()
         .collect();
     PrefixMatch::of(rows, prefix, |r| r.id.as_str()).one(Record::Candidate, prefix)
+}
+
+/// A new ontology version built by auto-accepting candidates, and how
+/// many candidates it applied to it. [`accept_run`] scopes the count to
+/// one run's pending candidates; [`accept_all`] flushes the whole
+/// pending queue. Callers report `accepted` rather than the number of
+/// proposals they queued, so the published count matches the version's
+/// contents.
+#[derive(Debug, Clone)]
+pub struct AutoAccepted {
+    /// The stored ontology version.
+    pub ontology: Ontology,
+    /// How many candidates were accepted into it.
+    pub accepted: usize,
 }
 
 /// Reject candidates: nothing changes in the ontology.
@@ -419,12 +454,17 @@ fn accept_as(
     Ok(stored)
 }
 
-/// Accept every pending candidate as proposed (`--auto-accept`).
+/// Accept every pending candidate as proposed (`--auto-accept` over the
+/// whole review queue). This is the queue-level flush: it accepts every
+/// `Pending` row regardless of which run produced it, so the version may
+/// contain candidates the caller did not propose this run. A per-run
+/// auto-accept uses [`accept_run`] instead; this function remains the
+/// deliberate "accept all pending" queue action.
 ///
 /// # Errors
 ///
 /// Returns an error when there is nothing pending or the result is invalid.
-pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology> {
+pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<AutoAccepted> {
     let ids: Vec<(String, Decision)> = queue(db, Queue::Pending)?
         .into_iter()
         .map(|c| (c.id.into_string(), Decision::Accept))
@@ -432,7 +472,53 @@ pub fn accept_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<Ontology
     if ids.is_empty() {
         return Err(Error::Ontology(String::from("no pending candidates")));
     }
-    accept_as(db, &ids, decided_by, Acceptance::Auto)
+    let accepted = ids.len();
+    let ontology = accept_as(db, &ids, decided_by, Acceptance::Auto)?;
+    Ok(AutoAccepted { ontology, accepted })
+}
+
+/// Accept the pending candidates one run queued as proposed (`--auto-accept`
+/// over a single run). Unlike [`accept_all`], this leaves other runs'
+/// undecided candidates pending, so an auto-accepted version contains
+/// only the candidates the caller proposed this run and the reported count
+/// matches the version's contents.
+///
+/// # Errors
+///
+/// Returns an error when the run has nothing pending or the result is invalid.
+pub fn accept_run(db: &WorkspaceDb, run: &RunId, decided_by: Option<&str>) -> Result<AutoAccepted> {
+    let ids: Vec<(String, Decision)> = pending_for_run(db, run)?
+        .into_iter()
+        .map(|c| (c.id.into_string(), Decision::Accept))
+        .collect();
+    if ids.is_empty() {
+        return Err(Error::Ontology(String::from(
+            "no pending candidates for run",
+        )));
+    }
+    let accepted = ids.len();
+    let ontology = accept_as(db, &ids, decided_by, Acceptance::Auto)?;
+    Ok(AutoAccepted { ontology, accepted })
+}
+
+/// Reject every pending candidate at once: nothing changes in the ontology.
+/// The queue-level counterpart to [`accept_all`], reached from the
+/// review-queue "reject all pending" action so clearing a backlog is a
+/// deliberate, visible choice rather than a side effect of a per-run
+/// auto-accept.
+///
+/// # Errors
+///
+/// Returns an error if a write fails.
+pub fn reject_all(db: &WorkspaceDb, decided_by: Option<&str>) -> Result<usize> {
+    let ids: Vec<String> = queue(db, Queue::Pending)?
+        .into_iter()
+        .map(|c| c.id.into_string())
+        .collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    reject(db, &ids, decided_by)
 }
 
 #[cfg(test)]
@@ -569,5 +655,226 @@ mod tests {
         assert!(queue(&db, Queue::Pending).is_ok_and(|p| p.is_empty()));
         assert!(accept_all(&db, None).is_err(), "nothing pending");
         assert!(find(&db, "nope").is_err());
+    }
+
+    /// `accept_run` scopes auto-accept to the candidates one run queued, so
+    /// a later run's `--auto-accept` does not sweep an earlier run's
+    /// undecided candidates into the version and the reported count
+    /// matches the version's contents — the bug `accept_all` had over the
+    /// shared queue before a per-run path existed.
+    #[test]
+    fn accept_run_scopes_to_this_run_and_leaves_others_pending() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let doc = Candidate {
+            proposal: Proposal::Class(Class {
+                id: ClassId::from("organization"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "documents", "documents": 4 }),
+            confidence: 0.6,
+            low_support: false,
+        };
+        let run_a =
+            store_run(&db, std::slice::from_ref(&doc)).unwrap_or_else(|e| fail(&e.to_string()));
+        let table = Candidate {
+            proposal: Proposal::Class(Class {
+                id: ClassId::from("customer"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "tables" }),
+            confidence: 0.9,
+            low_support: false,
+        };
+        let run_b =
+            store_run(&db, std::slice::from_ref(&table)).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_ne!(run_a.as_str(), run_b.as_str(), "two distinct runs");
+        let before = queue(&db, Queue::Pending).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(before.len(), 2, "both runs' candidates are pending");
+
+        let accepted = accept_run(&db, &run_b, None).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            accepted.accepted, 1,
+            "only this run's candidate was accepted"
+        );
+        assert!(
+            accepted.ontology.class("customer").is_some(),
+            "this run's table candidate is accepted"
+        );
+        assert!(
+            accepted.ontology.class("organization").is_none(),
+            "the prior run's document candidate is not swept in"
+        );
+
+        let remaining = queue(&db, Queue::Pending).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the prior run's candidate stays pending"
+        );
+        assert_eq!(
+            remaining.first().map_or("", |c| c.proposed_by.as_str()),
+            run_a.as_str(),
+            "the leftover candidate is run A's"
+        );
+
+        // The reported count matches the version's additions exactly: no
+        // misreport of the kind `propose_from_tables` had with `accept_all`.
+        let in_version = ["customer", "organization"]
+            .iter()
+            .filter(|id| accepted.ontology.class(id).is_some())
+            .count();
+        assert_eq!(accepted.accepted, in_version, "count matches the version");
+    }
+
+    /// `accept_all` is the deliberate queue-level flush: it accepts every
+    /// `Pending` row regardless of which run produced it. Auto-accepting a
+    /// single run uses `accept_run`; `accept_all` remains how the "accept
+    /// all pending" review-queue action drains a backlog, and now reports
+    /// how many it actually accepted.
+    #[test]
+    fn accept_all_drains_the_whole_pending_queue() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let doc = Candidate {
+            proposal: Proposal::Class(Class {
+                id: ClassId::from("organization"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "documents", "documents": 4 }),
+            confidence: 0.6,
+            low_support: false,
+        };
+        let run_a =
+            store_run(&db, std::slice::from_ref(&doc)).unwrap_or_else(|e| fail(&e.to_string()));
+        let table = Candidate {
+            proposal: Proposal::Class(Class {
+                id: ClassId::from("customer"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "tables" }),
+            confidence: 0.9,
+            low_support: false,
+        };
+        let run_b =
+            store_run(&db, std::slice::from_ref(&table)).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_ne!(run_a.as_str(), run_b.as_str(), "two distinct runs");
+
+        let accepted = accept_all(&db, None).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(accepted.accepted, 2, "the whole pending queue is drained");
+        assert!(accepted.ontology.class("customer").is_some());
+        assert!(accepted.ontology.class("organization").is_some());
+        assert!(queue(&db, Queue::Pending).is_ok_and(|p| p.is_empty()));
+    }
+
+    /// `reject_all` clears the pending queue without changing the ontology
+    /// and leaves low-support candidates (kept aside) where they are.
+    #[test]
+    fn reject_all_clears_the_pending_queue() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let pending = Candidate {
+            proposal: Proposal::Class(Class {
+                id: ClassId::from("customer"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "tables" }),
+            confidence: 0.9,
+            low_support: false,
+        };
+        let low = Candidate {
+            proposal: Proposal::Class(Class {
+                id: ClassId::from("rumor"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "documents", "documents": 1 }),
+            confidence: 0.2,
+            low_support: true,
+        };
+        store_run(&db, &[pending, low]).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            queue(&db, Queue::Pending)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .len(),
+            1
+        );
+
+        let rejected = reject_all(&db, Some("alice")).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(rejected, 1, "only the pending candidate was rejected");
+        assert!(
+            queue(&db, Queue::Pending).is_ok_and(|p| p.is_empty()),
+            "pending cleared"
+        );
+        assert_eq!(
+            queue(&db, Queue::LowSupport)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .len(),
+            1,
+            "low-support candidates are left aside"
+        );
+        assert_eq!(
+            reject_all(&db, None).unwrap_or_else(|e| fail(&e.to_string())),
+            0,
+            "nothing pending rejects zero"
+        );
+    }
+
+    /// `accept_run` errors when the run has no pending candidates, so an
+    /// empty run never silently produces a version. A run whose only
+    /// candidate was kept aside as low support has nothing pending, and a
+    /// run that stored nothing has nothing pending either.
+    #[test]
+    fn accept_run_errors_when_the_run_has_nothing_pending() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let low = Candidate {
+            proposal: Proposal::Class(Class {
+                id: ClassId::from("rumor"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            }),
+            evidence: serde_json::json!({ "source": "documents", "documents": 1 }),
+            confidence: 0.2,
+            low_support: true,
+        };
+        let run =
+            store_run(&db, std::slice::from_ref(&low)).unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(queue(&db, Queue::Pending).is_ok_and(|p| p.is_empty()));
+        assert!(
+            accept_run(&db, &run, None).is_err(),
+            "a run with only low-support candidates has nothing pending"
+        );
+        let other = RunId::generate();
+        assert!(
+            accept_run(&db, &other, None).is_err(),
+            "a run that stored nothing has nothing pending"
+        );
     }
 }
