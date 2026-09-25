@@ -72,14 +72,25 @@ pub enum Users {
     CreatedAt,
 }
 
+/// The columns every sealed-token table shares.
 #[derive(Iden)]
-pub enum UserTokens {
-    Table,
-    UserId,
+pub enum SealedColumns {
     KeyId,
     Enc,
     Ciphertext,
     UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum UserTokens {
+    Table,
+    UserId,
+}
+
+#[derive(Iden)]
+pub enum ProviderTokens {
+    Table,
+    Provider,
 }
 
 #[derive(Iden)]

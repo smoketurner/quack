@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
-use crate::llm::oauth::{KeySlot, KeySource};
+use crate::llm::oauth::{KeyLocation, KeySlot, KeySource};
 
 /// What a sealed value is for. Each purpose seals under its own HPKE `info`,
 /// so a value sealed for one cannot be opened as another.
@@ -29,10 +29,13 @@ use crate::llm::oauth::{KeySlot, KeySource};
 pub enum Purpose {
     /// A signed-in user's identity-provider token; the subject is the user id.
     UserToken,
+    /// A model provider's OAuth token; the subject is the provider name.
+    ProviderToken,
 }
 
 text_enum!(Purpose, "vault purpose", {
     UserToken => "user-token",
+    ProviderToken => "provider-token",
 });
 
 impl Purpose {
@@ -146,6 +149,12 @@ impl Vault {
             ),
             key: OnceCell::new(),
         }
+    }
+
+    /// Where the key is: the key file when there is one, else the keychain.
+    #[must_use]
+    pub fn key_location(&self) -> KeyLocation {
+        self.slot.location()
     }
 
     /// The key, made and stored the first time something is sealed.

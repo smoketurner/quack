@@ -1,4 +1,4 @@
-//! The OS keychain entry that holds a token cache's encryption key.
+//! The OS keychain entry that holds a key: the vault's (`key_slot.rs`).
 //!
 //! One store per platform: the macOS Keychain, the Linux kernel keyring
 //! (`keyutils`, always present, in-memory only, so a reboot needs a new
@@ -56,7 +56,6 @@ pub(super) struct KeychainEntry(String);
 enum KeychainOp {
     Read,
     Write(String),
-    Delete,
 }
 
 impl KeychainOp {
@@ -64,7 +63,6 @@ impl KeychainOp {
         match self {
             Self::Read => "read",
             Self::Write(_) => "write",
-            Self::Delete => "delete",
         }
     }
 }
@@ -75,8 +73,7 @@ impl KeychainEntry {
     }
 
     /// Do `op` on the blocking pool, since the stores talk to the OS
-    /// synchronously. A read of a missing entry is `None`; deleting one is
-    /// not an error.
+    /// synchronously. A read of a missing entry is `None`.
     async fn run(&self, op: KeychainOp) -> Result<Option<String>> {
         let account = self.0.clone();
         tokio::task::spawn_blocking(move || {
@@ -86,7 +83,6 @@ impl KeychainEntry {
                 .and_then(|entry| match op {
                     KeychainOp::Read => entry.get_password().map(Some),
                     KeychainOp::Write(key) => entry.set_password(&key).map(|()| None),
-                    KeychainOp::Delete => entry.delete_credential().map(|()| None),
                 });
             match outcome {
                 Ok(found) => Ok(found),
@@ -118,15 +114,5 @@ impl KeychainEntry {
     /// write.
     pub(super) async fn set(&self, key: &str) -> Result<()> {
         self.run(KeychainOp::Write(key.to_owned())).await.map(drop)
-    }
-
-    /// Remove the key. A missing entry is not an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the keychain is unavailable or refuses the
-    /// delete.
-    pub(super) async fn delete(&self) -> Result<()> {
-        self.run(KeychainOp::Delete).await.map(drop)
     }
 }

@@ -5,7 +5,7 @@
 use crate::error::Result;
 use crate::ids::UserId;
 use crate::llm::oauth::{CachedToken, Plaintext};
-use crate::storage::control::ControlPlane;
+use crate::storage::control::{ControlPlane, SealedOwner};
 use crate::vault::{Opened, Purpose, Vault};
 
 /// Keeps each signed-in user's token.
@@ -36,7 +36,7 @@ impl UserTokens {
             .vault
             .seal(Purpose::UserToken, user.as_str(), &plaintext)
             .await?;
-        control.put_sealed_token(user, &sealed).await
+        control.put_sealed(SealedOwner::User(user), &sealed).await
     }
 
     /// The user's token, or `None` when there is none or the key that sealed
@@ -47,7 +47,7 @@ impl UserTokens {
     /// Returns an error when the row does not open (altered, or moved from
     /// another user) or a query fails.
     pub async fn load(&self, control: &ControlPlane, user: &UserId) -> Result<Option<CachedToken>> {
-        let Some(sealed) = control.sealed_token(user).await? else {
+        let Some(sealed) = control.sealed(SealedOwner::User(user)).await? else {
             return Ok(None);
         };
         match self
@@ -72,7 +72,7 @@ impl UserTokens {
     ///
     /// Returns an error if the delete fails.
     pub async fn clear(&self, control: &ControlPlane, user: &UserId) -> Result<()> {
-        control.delete_sealed_token(user).await
+        control.delete_sealed(SealedOwner::User(user)).await
     }
 }
 

@@ -36,8 +36,7 @@ build, and no ambiguity about which backend rustls picks at runtime.
   `rustls-aws-lc`, plus `rustls-aws-lc-fips` on Linux, where `llm::bedrock` selects
   `CryptoMode::AwsLcFips`. Bedrock's OpenAI-compatible APIs go through `reqwest` like every
   other provider. SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
-  AES-256-GCM for the provider OAuth token cache from `aws_lc_rs::aead`, HPKE for the vault
-  from `rustls` (below).
+  HPKE for the vault from `rustls` (below).
 - **Exception: SigV4.** Bedrock requests are authenticated with AWS SigV4, an HMAC-SHA256
   over the request. Both the AWS SDK (Converse, embeddings) and quack's own signer
   (`llm::bedrock::Signer`, the OpenAI-compatible APIs) compute it with `aws-sigv4`, which
@@ -54,7 +53,9 @@ build, and no ambiguity about which backend rustls picks at runtime.
   value is sealed for a `vault::Purpose` (the HPKE `info`, `quack vault v1 <purpose>`) and
   a subject (the associated data), and records the key id that sealed it. A `Sealed` value
   is stored by its caller, on the right side of the classification boundary; today that is
-  one purpose, signed-in users' identity-provider tokens in `control.db` (`user_tokens`).
+  two purposes, both in `control.db`: signed-in users' identity-provider tokens
+  (`user_tokens`) and model providers' OAuth tokens from `quack auth login`
+  (`provider_tokens`).
 - `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
   (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`
   to both — Cargo unions the feature sets, so Linux gets FIPS and nothing else changes.
@@ -74,7 +75,8 @@ and Windows build against `aws-lc-sys`. What that means in practice:
 
 - **The whole crate switches, not part of it.** `aws-lc-rs` binds to `aws-lc-fips-sys`
   through `extern crate aws_lc_fips_sys as aws_lc` when the feature is on, so the direct
-  `digest`/`rand`/`aead` calls and rustls's provider all land on the validated module.
+  `digest`/`rand` calls, rustls's provider, and rustls's HPKE (the vault) all land on the
+  validated module.
   rustls's `fips` feature adds the policy half: the cipher suite and key exchange lists
   narrow to the approved ones, and `CryptoProvider::fips()` becomes true. Startup logs the
   linked AWS-LC version and, for a FIPS build, the module version; a Linux binary that

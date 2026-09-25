@@ -322,7 +322,7 @@ fn check_data_dir(report: &mut Report, dir: &Path) -> bool {
                 Status::Warn,
                 format!(
                     "{shown} is open to other users (mode {mode:o}); it holds every workspace's \
-                     content and the OAuth token caches"
+                     content and the vault key that seals stored OAuth tokens"
                 ),
             )
             .fix(format!("chmod 700 {shown}")),
@@ -918,8 +918,7 @@ async fn oauth_token(
     name: &ProviderName,
     oauth: &OAuthConfig,
 ) -> std::result::Result<String, String> {
-    let manager =
-        TokenManager::shared(&config.tokens_dir(), name, oauth).map_err(|e| e.to_string())?;
+    let manager = TokenManager::shared(config, name, oauth).map_err(|e| e.to_string())?;
     let status = manager.status().await.map_err(|e| e.to_string())?;
     let signs_in = match oauth.grant {
         Grant::AuthorizationCode | Grant::DeviceCode => true,
