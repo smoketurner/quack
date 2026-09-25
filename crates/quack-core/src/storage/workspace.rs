@@ -40,10 +40,15 @@ const VECTOR_PROFILES: u32 = 8;
 const DOCUMENT_STATUSES: u32 = 9;
 /// An ontology version records whether it was reviewed.
 const ONTOLOGY_ACCEPTANCE: u32 = 10;
+/// `_quack_graph_merges` is deduplicated by node pair, not by orientation:
+/// a pair whose provenance flipped between passes could land twice, once
+/// as `(keep, drop)` and once as `(drop, keep)`; collapse each pair to one
+/// row, keeping the more-decided one so a reviewer's rejection is not lost.
+const MERGE_DEDUP: u32 = 11;
 
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
-const WORKSPACE_SCHEMA_VERSION: u32 = ONTOLOGY_ACCEPTANCE;
+const WORKSPACE_SCHEMA_VERSION: u32 = MERGE_DEDUP;
 
 /// The tables that hold embedding vectors, with the same `embedding` and
 /// `embedding_profile` columns.
@@ -851,14 +856,65 @@ impl WorkspaceDb {
                 duckdb::params![Acceptance::Auto],
             )?;
         }
+        // Before symmetric dedup, a node pair whose provenance flipped
+        // between resolution passes could land in `_quack_graph_merges`
+        // twice, once in each orientation. Collapse each pair to one row,
+        // keeping the more-decided one (a reviewer's rejection survives),
+        // else the earliest, so the queue no longer lists the same pair
+        // twice and a rejected pair stays rejected.
+        if recorded < MERGE_DEDUP {
+            self.collapse_duplicate_merge_proposals()?;
+        }
         self.set_meta(
             MetaKey::SchemaVersion,
             &WORKSPACE_SCHEMA_VERSION.to_string(),
         )
     }
 
-    /// Record the profile vectors made before profiles existed were made
-    /// under, and tag them with it.
+    /// Collapse opposing-orientation duplicates in `_quack_graph_merges` to
+    /// a single row per unordered node pair. Before symmetric dedup, a pair
+    /// whose provenance flipped between resolution passes could be proposed
+    /// twice — once as `(keep=A, drop=B)` and once as `(keep=B, drop=A)` —
+    /// and an accepted merge of one orientation left the other dangling. Of
+    /// each pair, keep the more-decided row (`accepted` over `rejected` over
+    /// `superseded` over `pending`), breaking ties by earliest decision then
+    /// earliest id, and drop the rest. Idempotent.
+    fn collapse_duplicate_merge_proposals(&self) -> Result<()> {
+        // Pick the surplus rows (the loser of each pair) first; deleting
+        // while reading the same table in one statement is undefined.
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM ( \
+                SELECT id, ROW_NUMBER() OVER ( \
+                    PARTITION BY least(keep_node_id, drop_node_id), \
+                                 greatest(keep_node_id, drop_node_id) \
+                    ORDER BY CASE status \
+                               WHEN 'accepted' THEN 0 \
+                               WHEN 'rejected' THEN 1 \
+                               WHEN 'superseded' THEN 2 \
+                               ELSE 3 \
+                             END, \
+                             decided_at NULLS LAST, id \
+                  ) AS rn \
+                FROM _quack_graph_merges \
+             ) WHERE rn > 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut ids: Vec<String> = Vec::new();
+        while let Some(row) = rows.next()? {
+            ids.push(row.get(0)?);
+        }
+        drop(rows);
+        drop(stmt);
+        // The review queue is small, so a row-at-a-time delete is fine and
+        // sidesteps any self-reference or bind-count limits.
+        for id in ids {
+            self.conn.execute(
+                "DELETE FROM _quack_graph_merges WHERE id = ?",
+                duckdb::params![id],
+            )?;
+        }
+        Ok(())
+    }
     fn tag_legacy_vectors(&self, dim: Dimension) -> Result<()> {
         let mut untagged: i64 = 0;
         for table in VectorTable::ALL {
@@ -1645,15 +1701,18 @@ impl WorkspaceDb {
                 })
             })?
             .collect::<duckdb::Result<Vec<_>>>()?;
-        let stale_nodes: u64 = if self.table_exists("_quack_graph_nodes")? {
+        let (stale_nodes, nodes_needing_embedding): (u64, u64) = if self
+            .table_exists("_quack_graph_nodes")?
+        {
             self.conn.query_row(
-                "SELECT count(*) FROM _quack_graph_nodes \
-                 WHERE embedding IS NOT NULL AND embedding_profile IS DISTINCT FROM ?",
-                duckdb::params![current],
-                |row| row.get(0),
+                "SELECT count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_profile IS DISTINCT FROM ?), \
+                        count(*) FILTER (WHERE embedding IS NULL OR embedding_profile IS DISTINCT FROM ?) \
+                 FROM _quack_graph_nodes",
+                duckdb::params![current, current],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?
         } else {
-            0
+            (0, 0)
         };
         Ok(EmbeddingStatus {
             profile: self.vectors.profile.clone(),
@@ -1662,6 +1721,7 @@ impl WorkspaceDb {
             missing_chunks,
             stale,
             stale_nodes,
+            nodes_needing_embedding,
         })
     }
 
@@ -4834,6 +4894,87 @@ mod tests {
             rows.rows.first().and_then(|r| r.first()),
             Some(&serde_json::Value::Number(1.into())),
             "reopening should have rebuilt the term index with the joined form"
+        );
+    }
+
+    /// A workspace that, before symmetric dedup (`<` `MERGE_DEDUP`), picked up
+    /// opposing-orientation rows for the same merge pair collapses them on
+    /// open to a single row, keeping the more-decided one so a reviewer's
+    /// rejection is not lost; a single-orientation pair is untouched.
+    #[test]
+    fn opening_an_older_workspace_collapses_opposing_merge_duplicates() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            // The same pair, once rejected (keep=A, drop=B) and once a later
+            // pending duplicate in the flipped orientation (keep=B, drop=A).
+            db.execute_statement(
+                "INSERT INTO _quack_graph_merges \
+                 (id, keep_node_id, drop_node_id, distance, status, decided_at) \
+                 VALUES ('m1', 'A', 'B', 0.0, 'rejected', \
+                         TIMESTAMP '2026-01-01 00:00:00')",
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+            db.execute_statement(
+                "INSERT INTO _quack_graph_merges \
+                 (id, keep_node_id, drop_node_id, distance, status) \
+                 VALUES ('m2', 'B', 'A', 0.0, 'pending')",
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+            // An unrelated single-orientation pair stays as it is.
+            db.execute_statement(
+                "INSERT INTO _quack_graph_merges \
+                 (id, keep_node_id, drop_node_id, distance, status, decided_at) \
+                 VALUES ('m3', 'C', 'D', 0.0, 'rejected', \
+                         TIMESTAMP '2026-02-01 00:00:00')",
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+            // Pretend it was last recorded before the symmetric-dedup step.
+            db.set_meta(MetaKey::SchemaVersion, "10")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+
+        let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            reopened
+                .meta(MetaKey::SchemaVersion)
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            Some(WORKSPACE_SCHEMA_VERSION.to_string())
+        );
+        // One row per pair: the rejected row survived, the pending duplicate
+        // was removed, the unrelated pair is still there.
+        let count = reopened
+            .execute_query("SELECT count(*) FROM _quack_graph_merges")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            count.rows.first().and_then(|r| r.first()),
+            Some(&serde_json::json!(2)),
+            "one row per pair"
+        );
+        let kept = reopened
+            .execute_query("SELECT keep_node_id, status FROM _quack_graph_merges WHERE id = 'm1'")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let row = kept
+            .rows
+            .first()
+            .unwrap_or_else(|| fail("the rejected row m1 should have survived"));
+        assert_eq!(row.first(), Some(&serde_json::json!("A")));
+        assert_eq!(row.get(1), Some(&serde_json::json!("rejected")));
+        let gone = reopened
+            .execute_query("SELECT count(*) FROM _quack_graph_merges WHERE id = 'm2'")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            gone.rows.first().and_then(|r| r.first()),
+            Some(&serde_json::json!(0)),
+            "the pending duplicate in the flipped orientation must be gone"
+        );
+        let single = reopened
+            .execute_query("SELECT status FROM _quack_graph_merges WHERE id = 'm3'")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            single.rows.first().and_then(|r| r.first()),
+            Some(&serde_json::json!("rejected"))
         );
     }
 }

@@ -93,17 +93,20 @@ pub fn resolve_entry(
     if normalized.is_empty() {
         return Ok(Vec::new());
     }
+    // Aliases are stored raw (case-preserving, inner whitespace intact),
+    // the way `merge_nodes_in` left them; `normalized_label` is normalized on
+    // both sides, so the alias arm normalizes at read time too — otherwise a
+    // case- or whitespace-differing alias (`"international business machines"`
+    // against stored `"International Business Machines"`) never resolves,
+    // even though the same text against the primary label would.
     let mut stmt = db.connection().prepare(
         "SELECT id, label, class_id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes \
-         WHERE (normalized_label = ? OR list_contains(CAST(json_extract(properties, '$.aliases') AS VARCHAR[]), ?)) \
+         WHERE (normalized_label = ? \
+                OR list_contains(list_transform(CAST(json_extract(properties, '$.aliases') AS VARCHAR[]), \
+                                                 x -> lower(trim(regexp_replace(x, '\\s+', ' ', 'g')))), ?)) \
          AND (? IS NULL OR class_id = ?) ORDER BY label",
     )?;
-    let mut rows = stmt.query(duckdb::params![
-        normalized,
-        entity.trim(),
-        class_id,
-        class_id
-    ])?;
+    let mut rows = stmt.query(duckdb::params![normalized, normalized, class_id, class_id])?;
     let mut exact = Vec::new();
     while let Some(row) = rows.next()? {
         exact.push(Node::try_from(row)?);
