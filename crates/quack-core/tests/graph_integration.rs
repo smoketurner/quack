@@ -394,6 +394,127 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     assert_eq!(ugandas, 1);
 }
 
+/// A rejected merge is not proposed again when a later resolution pass
+/// flips its keep/drop orientation (provenance tilt): the dedup must
+/// recognize the pair in either orientation (`MergeStatus::Rejected`'s
+/// "kept apart; not proposed again" contract).
+#[tokio::test]
+async fn rejected_merge_is_not_reproposed_when_provenance_flips_orientation() {
+    let db = workspace();
+    let writer = writer_of(&db);
+    let node = |label: &str| NewNode {
+        label: label.to_owned(),
+        class_id: ClassId::from("acmeorg"),
+        properties: Properties::default(),
+        standing: Standing::Reviewed,
+    };
+    let chunk =
+        |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
+    let options = GraphOptions {
+        merge_threshold: 0.5,
+        auto_merge_threshold: -1.0,
+        ..GraphOptions::default()
+    };
+    let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
+    let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
+    db.insert_chunk(&NewChunk {
+        id: &ChunkId::from("c3"),
+        document_id: &DocumentId::from("doc-1"),
+        chunk_index: 2,
+        content: "Acme Corp is an acme.",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
+    // First pass: Acme (2 provenance) keeps; Acme Corp (1) drops.
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    let pending = resolve::pending(&db).unwrap();
+    assert_eq!(pending.len(), 1, "one proposal for the Acme/Acme Corp pair");
+    let first = pending.first().unwrap();
+    assert_eq!(first.keep.id, acme, "{first:?}");
+    assert_eq!(first.drop.id, acme_corp, "{first:?}");
+    // A reviewer rejects the pair.
+    resolve::decide(
+        &db,
+        first.id.as_str(),
+        MergeDecision::Reject,
+        Some("tester"),
+    )
+    .unwrap();
+    assert!(resolve::pending(&db).unwrap().is_empty());
+    // Later ingestion tilts provenance the other way: Acme Corp now leads.
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c2")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c3")).unwrap();
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    let repending = resolve::pending(&db).unwrap();
+    assert!(
+        repending.is_empty(),
+        "a rejected pair must not be re-proposed, but got {repending:?}"
+    );
+}
+
+/// A still-pending pair is not duplicated when a later resolution pass flips
+/// its keep/drop orientation: the same node pair appears at most once in
+/// the review queue, regardless of orientation.
+#[tokio::test]
+async fn pending_pair_is_not_duplicated_when_provenance_flips_orientation() {
+    let db = workspace();
+    let writer = writer_of(&db);
+    let node = |label: &str| NewNode {
+        label: label.to_owned(),
+        class_id: ClassId::from("acmeorg"),
+        properties: Properties::default(),
+        standing: Standing::Reviewed,
+    };
+    let chunk =
+        |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
+    let options = GraphOptions {
+        merge_threshold: 0.5,
+        auto_merge_threshold: -1.0,
+        ..GraphOptions::default()
+    };
+    let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
+    let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
+    db.insert_chunk(&NewChunk {
+        id: &ChunkId::from("c3"),
+        document_id: &DocumentId::from("doc-1"),
+        chunk_index: 2,
+        content: "Acme Corp is an acme.",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    assert_eq!(resolve::pending(&db).unwrap().len(), 1);
+    // A second pass after provenance tilts the other way must not add a
+    // second row for the same pair in the swapped orientation.
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c2")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c3")).unwrap();
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    let pending = resolve::pending(&db).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the same pair must not produce duplicate proposals, but got {pending:?}"
+    );
+}
+
 /// Deleting a document takes with it the nodes and edges only it
 /// supported (issue #43): a document's chunk provenance, then a table's
 /// row provenance when the document that loaded the table goes. What
