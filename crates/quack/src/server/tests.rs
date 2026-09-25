@@ -472,6 +472,83 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // The audit must reflect whether anything was actually removed. A
+    // no-op removal that returns 404 used to audit `Allowed`, so a SIEM
+    // reading the OCSF export saw a successful `Member` event for a
+    // request that failed; per `Outcome::of` it is `Error`.
+    let member_rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("member")),
+            ..AuditFilter::default()
+        })
+        .await;
+    // carol: added (Allowed), removed (Allowed), removed again, a no-op (Error).
+    let mut carol_outcomes: Vec<Outcome> = member_rows
+        .iter()
+        .filter(|r| r.resource_id.as_deref() == Some(carol.as_str()))
+        .map(|r| r.outcome)
+        .collect();
+    carol_outcomes.sort_by_key(|o| o.as_str());
+    assert_eq!(
+        carol_outcomes,
+        [Outcome::Allowed, Outcome::Allowed, Outcome::Error],
+        "{member_rows:?}"
+    );
+    // The OCSF export turns that `Error` row into a `Failure` event, never a
+    // `Success` one: the SIEM or archive sees the failed shape, and the
+    // `outcome=allowed` filter no longer returns it.
+    let (status, ocsf) = h
+        .get(
+            &format!("/api/v1/admin/audit?workspace_id={ws}&action=member&format=ocsf"),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ocsf}");
+    let member_events = ocsf["audit"].as_array().cloned().unwrap_or_default();
+    assert!(
+        member_events.iter().all(|e| e["class_uid"] == 6003),
+        "member rows are API activity: {ocsf}"
+    );
+    assert_eq!(
+        member_events
+            .iter()
+            .filter(|e| e["status_id"] == 2 && e["status"] == "Failure")
+            .count(),
+        1,
+        "the no-op removal is the only Failure: {ocsf}"
+    );
+    assert!(
+        member_events
+            .iter()
+            .any(|e| e["status_id"] == 1 && e["status"] == "Success"),
+        "the successful removal is still a Success: {ocsf}"
+    );
+    let (status, allowed) = h
+        .get(
+            &format!("/api/v1/admin/audit?workspace_id={ws}&action=member&outcome=allowed"),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert!(
+        allowed["audit"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().all(|r| r["outcome"] == "allowed")),
+        "outcome=allowed returns only allowed rows: {allowed}"
+    );
+    let (status, error) = h
+        .get(
+            &format!("/api/v1/admin/audit?workspace_id={ws}&action=member&outcome=error"),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{error}");
+    assert_eq!(
+        error["audit"].as_array().map(Vec::len),
+        Some(1),
+        "the no-op removal is found by outcome=error: {error}"
+    );
     let (status, _) = h
         .get(&format!("/api/v1/workspaces/{ws}"), &carol_token)
         .await;
