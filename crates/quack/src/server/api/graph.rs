@@ -53,23 +53,27 @@ pub(crate) async fn search(
         q.hops,
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let model = Embeddings::from_config(&app.config).await?;
-    let embedding = query.embedding(model.as_ref()).await?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
-    let result = app
-        .read(&id, move |db| query.run(db, embedding.as_ref(), &options))
-        .await?;
+    // Run, audit the outcome, then propagate, so a failure after
+    // authorization is recorded as an error rather than dropped.
+    let result: ApiResult<_> = async {
+        let model = Embeddings::from_config(&app.config).await?;
+        let embedding = query.embedding(model.as_ref()).await?;
+        app.read(&id, move |db| query.run(db, embedding.as_ref(), &options))
+            .await
+    }
+    .await;
     access
         .audit(
             &app,
             AuditAction::Graph,
             None,
-            Outcome::Allowed,
+            Outcome::of(&result),
             Some(detail),
         )
         .await?;
-    Ok(Json(serde_json::to_value(result)?))
+    Ok(Json(serde_json::to_value(result?)?))
 }
 
 #[derive(Deserialize)]
@@ -88,23 +92,26 @@ pub(crate) async fn path(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = PathQuery::new(&q.from, &q.to, q.max_hops)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let model = Embeddings::from_config(&app.config).await?;
-    let ends = query.embeddings(model.as_ref()).await?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
-    let result = app
-        .read(&id, move |db| query.run(db, &ends, &options))
-        .await?;
+    // Run, audit the outcome, then propagate (see `search`).
+    let result: ApiResult<_> = async {
+        let model = Embeddings::from_config(&app.config).await?;
+        let ends = query.embeddings(model.as_ref()).await?;
+        app.read(&id, move |db| query.run(db, &ends, &options))
+            .await
+    }
+    .await;
     access
         .audit(
             &app,
             AuditAction::Graph,
             None,
-            Outcome::Allowed,
+            Outcome::of(&result),
             Some(detail),
         )
         .await?;
-    Ok(Json(serde_json::to_value(result)?))
+    Ok(Json(serde_json::to_value(result?)?))
 }
 
 pub(crate) async fn status(

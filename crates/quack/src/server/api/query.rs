@@ -448,36 +448,46 @@ pub(crate) async fn search(
     }
     let top_k = q.top_k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
     let rrf_k = app.config.retrieval.rrf_k;
-    let embedding: Option<Vector> = match Embeddings::from_config(&app.config).await? {
-        Some(model) => Some(
-            model
-                .embed_interactive(&Input::Query(query.clone()))
-                .await?,
-        ),
-        None => None,
-    };
-    let reader_db = app.reader_db(&id).await?;
-    let text = query.clone();
-    let hits = reader_db
-        .with_db(move |db| {
-            let scope = ChunkScope::all();
-            match embedding.as_ref() {
-                Some(vector) => {
-                    db.search_hybrid_chunks(&text, vector, HybridLimits { top_k, rrf_k }, &scope)
+    // Run the search, audit its outcome, then propagate — the way `execute_sql`
+    // does, so a post-authorization failure is recorded instead of dropped.
+    let search_result: ApiResult<Vec<_>> = async {
+        let embedding: Option<Vector> = match Embeddings::from_config(&app.config).await? {
+            Some(model) => Some(
+                model
+                    .embed_interactive(&Input::Query(query.clone()))
+                    .await?,
+            ),
+            None => None,
+        };
+        let reader_db = app.reader_db(&id).await?;
+        let text = query.clone();
+        reader_db
+            .with_db(move |db| {
+                let scope = ChunkScope::all();
+                match embedding.as_ref() {
+                    Some(vector) => db.search_hybrid_chunks(
+                        &text,
+                        vector,
+                        HybridLimits { top_k, rrf_k },
+                        &scope,
+                    ),
+                    None => db.search_keyword_chunks(&text, top_k, &scope),
                 }
-                None => db.search_keyword_chunks(&text, top_k, &scope),
-            }
-        })
-        .await
-        .map_err(ApiError::from)?;
+            })
+            .await
+            .map_err(ApiError::from)
+    }
+    .await;
+    let outcome = Outcome::of(&search_result);
     access
         .audit(
             &app,
             AuditAction::Search,
             None,
-            Outcome::Allowed,
+            outcome,
             Some(serde_json::json!({ "q": query })),
         )
         .await?;
+    let hits = search_result?;
     Ok(Json(serde_json::json!({ "chunks": hits })))
 }
