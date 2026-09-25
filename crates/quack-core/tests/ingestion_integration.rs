@@ -1100,7 +1100,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("10")
+        Some("11")
     );
     assert_eq!(
         db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
@@ -1640,7 +1640,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("10")
+        Some("11")
     );
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())
@@ -2027,6 +2027,221 @@ async fn workbook_loads_one_table_per_sheet_and_delete_drops_them() {
     assert!(db.document(&result.document_id).unwrap().is_none());
     // The workbook and its per-sheet CSVs are gone from files/ too.
     assert_eq!(std::fs::read_dir(&files_dir).unwrap().count(), 0);
+}
+
+/// Like `tiny_xlsx`, but its two sheet names (`Sales Q1` and `Sales-Q1`)
+/// both sanitize to `Sales_Q1`, so a workbook's table names collide.
+fn colliding_xlsx() -> Vec<u8> {
+    use std::io::Write as _;
+    let parts: [(&str, &str); 6] = [
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/workbook.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sales Q1" sheetId="1" r:id="rId1"/><sheet name="Sales-Q1" sheetId="2" r:id="rId2"/></sheets></workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>region</t></is></c><c r="B1" t="inlineStr"><is><t>total</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>north</t></is></c><c r="B2"><v>10</v></c></row></sheetData></worksheet>"#,
+        ),
+        (
+            "xl/worksheets/sheet2.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>note</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>second sheet only</t></is></c></row></sheetData></worksheet>"#,
+        ),
+    ];
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in parts {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+#[tokio::test]
+async fn workbook_colliding_sheet_names_fail_instead_of_overwriting_a_sheet() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-collide").unwrap();
+    let writer = writer_of(&db);
+
+    let outcome = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-collide",
+        &ingestion::NewFile::new("Region Sales.xlsx", &colliding_xlsx()),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await;
+
+    // The ingest is refused: the two sheet names collide on one table after
+    // sanitization, instead of one sheet silently overwriting the other.
+    let err = outcome.err().unwrap();
+    let message = err.to_string();
+    assert!(
+        matches!(&err, Error::Ingestion(_)),
+        "expected Error::Ingestion, got: {err}"
+    );
+    assert!(
+        message.contains("Sales Q1") && message.contains("Sales-Q1"),
+        "the error should name both colliding sheets: {message}"
+    );
+    assert!(
+        message.contains("Region_Sales_Sales_Q1"),
+        "the error should name the colliding table: {message}"
+    );
+
+    // No table was created, so no query can read the wrong sheet's rows.
+    assert!(
+        db.list_tables().unwrap().is_empty(),
+        "no tables should survive a refused collision"
+    );
+    let files_dir = config.workspace_files_dir("ws-collide");
+    assert_eq!(
+        std::fs::read_dir(&files_dir).unwrap().count(),
+        0,
+        "no per-sheet CSVs should be written on a refused collision"
+    );
+
+    // The document row records the failure — not `ready` with a duplicated
+    // `tables` list advertising a table that no longer holds its sheet's data.
+    let docs = db.list_documents().unwrap();
+    assert_eq!(docs.len(), 1, "one document row for the failed ingest");
+    let doc = docs.first().unwrap();
+    assert_eq!(doc.status, DocumentStatus::Error);
+    assert!(
+        doc.tables.is_none(),
+        "no tables recorded for a failed ingest"
+    );
+    assert!(
+        doc.error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("Sales Q1") && m.contains("Sales-Q1")),
+        "the document's error_message should record the collision: {message}"
+    );
+
+    // Re-ingesting the same bytes after the failure (no duplicate lives) can
+    // retry once the sheets are renamed: the failed row is gone, so a fresh
+    // ingest starts clean rather than being treated as a duplicate.
+    assert!(
+        db.delete_document(&doc.id).unwrap(),
+        "the error document can be deleted"
+    );
+    assert!(db.list_documents().unwrap().is_empty());
+    assert!(db.list_tables().unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(&files_dir).unwrap().count(), 0);
+}
+
+/// A two-sheet workbook whose sheet names are `s1` and `s2`, each with one
+/// header row and one data row (`a`/`b` for sheet 1, `c`/`d` for sheet 2).
+/// Used to exercise collisions on characters other than space-vs-hyphen
+/// (e.g. `Sheet 1` vs `Sheet_1`, where the underscore is already in one name).
+fn two_sheet_xlsx(s1: &str, s2: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let workbook_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="{s1}" sheetId="1" r:id="rId1"/><sheet name="{s2}" sheetId="2" r:id="rId2"/></sheets></workbook>"#,
+    );
+    let parts: [(&str, &str); 6] = [
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+        ),
+        ("xl/workbook.xml", workbook_xml.as_str()),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>b</t></is></c></row></sheetData></worksheet>"#,
+        ),
+        (
+            "xl/worksheets/sheet2.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>c</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>d</t></is></c></row></sheetData></worksheet>"#,
+        ),
+    ];
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in parts {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+#[tokio::test]
+async fn workbook_colliding_sheet_names_with_an_underscore_in_one_name_are_refused() {
+    // `Sheet 1` (space) and `Sheet_1` (underscore) both sanitize to
+    // `Sheet_1`, so the table names collide. This confirms the fix is
+    // data-driven (not specific to the space-vs-hyphen pair) and that an
+    // underscore already in one sheet's name is caught too.
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-underscore").unwrap();
+    let writer = writer_of(&db);
+
+    let outcome = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-underscore",
+        &ingestion::NewFile::new("Book.xlsx", &two_sheet_xlsx("Sheet 1", "Sheet_1")),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await;
+
+    let err = outcome.err().unwrap();
+    assert!(
+        matches!(&err, Error::Ingestion(_)),
+        "expected Error::Ingestion, got: {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("Sheet 1") && message.contains("Sheet_1"),
+        "the error should name both colliding sheets: {message}"
+    );
+    assert!(
+        message.contains("Book_Sheet_1"),
+        "the error should name the colliding table: {message}"
+    );
+    assert!(
+        db.list_tables().unwrap().is_empty(),
+        "no tables should survive a refused collision"
+    );
+    let files_dir = config.workspace_files_dir("ws-underscore");
+    assert_eq!(
+        std::fs::read_dir(&files_dir).unwrap().count(),
+        0,
+        "no per-sheet CSVs should be written on a refused collision"
+    );
+    let docs = db.list_documents().unwrap();
+    assert_eq!(docs.len(), 1);
+    let doc = docs.first().unwrap();
+    assert_eq!(doc.status, DocumentStatus::Error);
+    assert!(doc.tables.is_none());
 }
 
 #[tokio::test]

@@ -148,6 +148,31 @@ async fn import_bundle(
         )
     })
     .await?;
+    // `restore_into` writes the workspace ontology (when it had none) and a
+    // candidate run; mirror `api/ontology.rs` and audit each write so the
+    // workspace audit trail records who installed the bundle.
+    if let Some(version) = report.restored {
+        access
+            .audit(
+                app,
+                AuditAction::Ontology,
+                Some(ResourceKind::OntologyVersion.id(&version.to_string())),
+                Outcome::Allowed,
+                Some(serde_json::json!({ "restored": true, "source": "bundle" })),
+            )
+            .await?;
+    }
+    if let Some(run) = report.run.as_ref() {
+        access
+            .audit(
+                app,
+                AuditAction::Propose,
+                Some(ResourceKind::InductionRun.id(run)),
+                Outcome::Allowed,
+                Some(serde_json::json!({ "candidates": report.candidates, "source": "bundle" })),
+            )
+            .await?;
+    }
     let context = bundle.index().map(|index| {
         okf::parse_front_matter(&index.content)
             .body
