@@ -1,8 +1,9 @@
 //! `/mcp/v1/{workspace}`: the MCP server over streamable HTTP, guarded by
 //! the same bearer and role checks as the REST API. Every request is
 //! authorized here; the transport it is handed to belongs to the caller's
-//! workspace, user, and write permission, so its audit rows carry the
-//! right identity.
+//! workspace, user, and write permission, and the request carries its own
+//! `Access` to the tool call, so its audit rows carry the right token,
+//! address, and request id.
 
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
@@ -15,14 +16,14 @@ use tower::ServiceExt;
 
 use super::auth::{Access, Identity, Need};
 use super::error::ApiResult;
-use super::state::{App, McpEntry, McpKey};
-use crate::mcp::{Auditor, McpServer, McpSetup, ServerAuditor};
+use super::state::{App, McpKey};
+use crate::mcp::{Auditor, McpCaller, McpServer, McpSetup};
 
 pub(crate) async fn handle(
     State(app): State<App>,
     mut identity: Identity,
     Path(workspace): Path<WorkspaceId>,
-    request: Request,
+    mut request: Request,
 ) -> ApiResult<Response> {
     identity.channel = Some(Channel::Mcp);
     let access = Access::resolve(&app, identity, &workspace, Need::READ).await?;
@@ -34,7 +35,7 @@ pub(crate) async fn handle(
     };
     let db = app.workspace_db(&access.workspace.id).await?;
     let reader = app.reader_db(&access.workspace.id).await?;
-    let McpEntry { transport, server } = app
+    let transport = app
         .mcp_transport(key, || {
             McpServer::new(McpSetup {
                 config: app.config.clone(),
@@ -43,17 +44,18 @@ pub(crate) async fn handle(
                 workspace: access.workspace.clone(),
                 policy,
                 user_id: Some(access.identity.user_id.clone()),
-                acting: Acting::current(),
-                auditor: Auditor::Server(Box::new(ServerAuditor {
-                    app: std::sync::Arc::clone(&app),
-                    access: std::sync::Mutex::new(access.clone()),
-                })),
+                auditor: Auditor::Server(std::sync::Arc::clone(&app)),
             })
         })
         .await;
-    // Every request is audited as the identity that made it, not the one
-    // that first opened this transport.
-    server.set_access(access);
+    // Every call is audited as the request that made it, not the one that
+    // first opened this transport (issue #245): the transport is shared by
+    // every request of this user, so the caller travels with the request.
+    // rmcp hands the request's parts, extensions included, to the handler.
+    request.extensions_mut().insert(McpCaller {
+        access,
+        acting: Acting::current(),
+    });
     let response = transport
         .oneshot(request)
         .await

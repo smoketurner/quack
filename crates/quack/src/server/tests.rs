@@ -3169,6 +3169,111 @@ async fn a_successful_mcp_search_is_audited_as_allowed() {
     );
 }
 
+/// Concurrent MCP calls by one user with two tokens share one transport
+/// (same workspace, user, and write permission), yet each call's audit row
+/// carries the token and request id of the request that made it: the
+/// `Access` travels with the HTTP request, not on the shared server
+/// (issue #245).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_mcp_calls_by_one_user_audit_their_own_token_and_request_id() {
+    const CALLS: usize = 8;
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("mcpconc", &owner).await;
+    let issue = |name: &'static str| {
+        let h = &h;
+        let ws = &ws;
+        let owner = &owner;
+        async move {
+            h.app
+                .control
+                .create_token(ws, owner, name, &[Scope::Read], None)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        }
+    };
+    let first = issue("first").await;
+    let second = issue("second").await;
+    let tokens = [
+        (
+            first.secret.expose().to_owned(),
+            first.row.token_hash.clone(),
+        ),
+        (
+            second.secret.expose().to_owned(),
+            second.row.token_hash.clone(),
+        ),
+    ];
+    let session = mcp_session(&h, &ws, &tokens[0].0).await;
+
+    let calls = (0..CALLS).flat_map(|n| {
+        tokens
+            .iter()
+            .enumerate()
+            .map(move |(which, (secret, _))| (n, which, secret))
+    });
+    let responses = futures::future::join_all(calls.map(|(n, which, secret)| {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/mcp/v1/{ws}"))
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header("mcp-session-id", &session)
+            .header(super::auth::REQUEST_ID_HEADER, format!("req-{which}-{n}"))
+            .body(Body::from(
+                rpc(
+                    u32::try_from(n * 2 + which + 10).unwrap_or(u32::MAX),
+                    "tools/call",
+                    &serde_json::json!({ "name": "list_tables", "arguments": {} }),
+                )
+                .to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        h.send(request)
+    }))
+    .await;
+    for (status, body, _) in &responses {
+        assert_eq!(*status, StatusCode::OK, "{body}");
+    }
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("list")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(rows.len(), CALLS * 2, "one row per call, {rows:?}");
+    for row in &rows {
+        assert_eq!(row.channel, Channel::Mcp, "{row:?}");
+        let request_id = row.request_id.as_deref().unwrap_or_default();
+        let which = match request_id.split('-').nth(1) {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => fail(&format!("unexpected request id in {row:?}")),
+        };
+        let expected = tokens.get(which).map(|(_, hash)| hash.as_str());
+        assert_eq!(
+            row.token_hash.as_deref(),
+            expected,
+            "request {request_id} was audited with another request's token"
+        );
+    }
+    let mut ids: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.request_id.as_deref())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        CALLS * 2,
+        "every request id appears once, {ids:?}"
+    );
+}
+
 /// Every allowed workspace read writes its access row and its detail row
 /// under one id, and a table name never reaches control.db (issue #54).
 #[tokio::test(flavor = "multi_thread")]
