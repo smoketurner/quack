@@ -98,6 +98,17 @@ async fn token(
                 ),
             }
         }
+        Some("urn:ietf:params:oauth:grant-type:token-exchange") => {
+            let subject = form.get("subject_token").cloned().unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "access_token": format!("obo-{subject}"), "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                })),
+            )
+        }
         _ => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "unsupported_grant_type" })),
@@ -176,12 +187,16 @@ impl Harness {
             audience: audience.map(str::to_owned),
             subject_claim: String::from(OidcConfig::DEFAULT_SUBJECT_CLAIM),
         };
-        let oidc = Oidc::new(&oidc_config, Vault::new(dir.path(), KeySource::File))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        config.server.oidc = Some(oidc_config);
         let control = ControlPlane::open(&config)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
+        let oidc = Oidc::new(
+            &oidc_config,
+            Vault::new(dir.path(), KeySource::File),
+            control.clone(),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        config.server.oidc = Some(oidc_config);
         let app = Arc::new(AppState::new(config, control, ServeMode::Login, Some(oidc)));
         let router = crate::server::router(Arc::clone(&app));
         Self {
@@ -805,4 +820,177 @@ async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
     let member = h.send(initialize(&token)).await;
     assert_eq!(member.status, StatusCode::OK, "{}", member.body);
     assert!(member.body.contains("\"serverInfo\""), "{}", member.body);
+}
+
+// --- on behalf of the caller -------------------------------------------------
+
+/// A token for an on-behalf-of provider at the mock issuer, as the request's
+/// caller: what a turn's model request would send.
+async fn obo_token(app: &App) -> Result<String, crate::server::error::ApiError> {
+    use quack_core::config::{ClientAuth, Exchange, Grant, OAuthConfig};
+    use quack_core::llm::oauth::TokenManager;
+    use secrecy::ExposeSecret;
+    let issuer = app
+        .config
+        .server
+        .oidc
+        .as_ref()
+        .map(|o| o.issuer_url.clone())
+        .unwrap_or_default();
+    let oauth = OAuthConfig {
+        issuer_url: issuer,
+        client_id: String::from("quack"),
+        scopes: Vec::new(),
+        redirect_uri: String::from("http://127.0.0.1:1/callback"),
+        grant: Grant::OnBehalfOf,
+        client_secret_env: Some(String::from("CARGO_PKG_NAME")),
+        client_auth: ClientAuth::ClientSecretPost,
+        exchange: Exchange::TokenExchange,
+        audience: Some(String::from("api://model")),
+        resource: None,
+        actor: false,
+    };
+    let name = "model".parse().map_err(|e: quack_core::error::Error| {
+        crate::server::error::ApiError::internal(e.to_string())
+    })?;
+    let manager = TokenManager::new(&app.config, &name, oauth, KeySource::File)?;
+    Ok(manager.access_token().await?.expose_secret().to_owned())
+}
+
+async fn probe(
+    axum::extract::State(app): axum::extract::State<App>,
+    _caller: crate::server::auth::Identity,
+) -> Result<String, crate::server::error::ApiError> {
+    obo_token(&app).await
+}
+
+/// The same, from inside a background job the caller submits.
+async fn probe_job(
+    axum::extract::State(app): axum::extract::State<App>,
+    _caller: crate::server::auth::Identity,
+) -> Result<String, crate::server::error::ApiError> {
+    use quack_core::jobs::{JobKind, JobSpec};
+    let worker = Arc::clone(&app);
+    let job = app
+        .jobs
+        .submit(JobSpec::new(JobKind::Ingest, "probe"), |_| async move {
+            obo_token(&worker).await.map_err(|e| e.message)
+        });
+    let done = app
+        .jobs
+        .wait(job.id)
+        .await
+        .ok_or_else(|| crate::server::error::ApiError::internal("job forgotten"))?;
+    done.outcome
+        .ok_or_else(|| crate::server::error::ApiError::internal("no outcome"))
+}
+
+impl Harness {
+    /// The probe routes, behind the same acting slot the server uses.
+    async fn probe(&self, uri: &str, credential: (&str, &str)) -> Reply {
+        let router = Router::new()
+            .route("/probe", get(probe))
+            .route("/probe-job", get(probe_job))
+            .layer(axum::middleware::from_fn(crate::server::acting_slot))
+            .with_state(Arc::clone(&self.app));
+        let request = Request::get(uri)
+            .header(credential.0, credential.1)
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let response = router
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        Reply {
+            status,
+            location: String::new(),
+            cookies: Vec::new(),
+            challenge: String::new(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_signed_in_persons_model_requests_are_exchanged_for_them_in_jobs_too() {
+    let h = Harness::new().await;
+    let session = h.sign_in("sub-obo", "obo").await;
+    for uri in ["/probe", "/probe-job"] {
+        let reply = h.probe(uri, ("cookie", &session)).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.body);
+        // The stored sign-in's access token is the subject.
+        assert_eq!(reply.body, "obo-user-access", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn a_bearer_callers_own_token_is_exchanged() {
+    let (h, key, issuer) = Harness::resource().await;
+    let token = key.token(&issuer, "sub-bearer", AUDIENCE);
+    let reply = h
+        .probe("/probe", ("authorization", &format!("Bearer {token}")))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body, format!("obo-{token}"));
+}
+
+#[tokio::test]
+async fn a_password_user_is_refused_rather_than_sent_as_quack() {
+    let h = Harness::new().await;
+    let created = h
+        .app
+        .control
+        .create_user(
+            "pw",
+            "secret",
+            quack_core::storage::control::UserKind::Standard,
+        )
+        .await;
+    assert!(created.is_ok());
+    let login = Request::post("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "username": "pw", "password": "secret" }).to_string(),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let login = h.send(login).await;
+    let reply: Value = serde_json::from_str(&login.body).unwrap_or(Value::Null);
+    let token = reply["token"].as_str().unwrap_or_default().to_owned();
+    assert!(!token.is_empty(), "{}", login.body);
+
+    let refused = h
+        .probe("/probe", ("authorization", &format!("Bearer {token}")))
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    assert!(
+        refused.body.contains("no current sign-in through"),
+        "{}",
+        refused.body
+    );
+}
+
+#[tokio::test]
+async fn a_callback_naming_another_issuer_is_refused() {
+    let h = Harness::new().await;
+    let (state, _, cookie) = h.start().await;
+    let reply = h
+        .get(
+            &format!(
+                "{}?code=c&state={state}&iss=https%3A%2F%2Fevil.example.com",
+                OidcConfig::CALLBACK_PATH
+            ),
+            Some(&format!("{}={cookie}", super::STATE_COOKIE)),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(
+        reply.location.starts_with("/login?error=") && reply.location.contains("9207"),
+        "{}",
+        reply.location
+    );
+    assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
 }

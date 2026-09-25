@@ -21,8 +21,8 @@ use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
 
 use super::{
-    AuthMode, AwsRegion, BaseUrl, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR, ENV_MODEL, Grant,
-    ModelSpec, OAuthConfig, OidcConfig, Overrides, config_file_path,
+    AuthMode, AwsRegion, BaseUrl, ClientAuth, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR,
+    ENV_MODEL, Exchange, Grant, ModelSpec, OAuthConfig, OidcConfig, Overrides, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -425,6 +425,11 @@ const OAUTH_KEYS: &[&str] = &[
     "redirect_uri",
     "grant",
     "client_secret_env",
+    "client_auth",
+    "exchange",
+    "audience",
+    "resource",
+    "actor",
 ];
 
 /// Every recognized setting with the value in force and where it came
@@ -549,6 +554,21 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
             oauth.client_secret_env.as_deref(),
             None,
         );
+        s.text(
+            "client_auth",
+            oauth.client_auth.as_str(),
+            ClientAuth::default().as_str(),
+            None,
+        );
+        s.text(
+            "exchange",
+            oauth.exchange.as_str(),
+            Exchange::default().as_str(),
+            None,
+        );
+        s.optional_text("audience", oauth.audience.as_deref(), None);
+        s.optional_text("resource", oauth.resource.as_deref(), None);
+        s.literal("actor", oauth.actor, true);
     }
 }
 

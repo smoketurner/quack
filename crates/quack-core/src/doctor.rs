@@ -919,10 +919,25 @@ async fn oauth_token(
     oauth: &OAuthConfig,
 ) -> std::result::Result<String, String> {
     let manager = TokenManager::shared(config, name, oauth).map_err(|e| e.to_string())?;
+    if matches!(manager.issuer_supports_grant().await, Ok(Some(false))) {
+        return Err(format!(
+            "provider '{name}': the issuer does not list {} in grant_types_supported; check [providers.{name}.oauth].grant",
+            oauth.grant_type()
+        ));
+    }
     let status = manager.status().await.map_err(|e| e.to_string())?;
     let signs_in = match oauth.grant {
         Grant::AuthorizationCode | Grant::DeviceCode => true,
         Grant::ClientCredentials => false,
+        // Only a signed-in person can be acted for; quack's own token (the
+        // actor) is what can be checked here.
+        Grant::OnBehalfOf => {
+            return manager
+                .service_token()
+                .await
+                .map(|token| token.expose_secret().to_owned())
+                .map_err(|e| format!("provider '{name}': {e}"));
+        }
     };
     if signs_in && status.token.is_none() {
         return Err(format!("provider '{name}' uses OAuth and is not logged in"));

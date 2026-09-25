@@ -25,6 +25,8 @@ pub(super) struct Callback {
     state: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+    /// The issuer the redirect names (RFC 9207).
+    iss: Option<String>,
 }
 
 fn configured(app: &App) -> WebResult<&Oidc> {
@@ -102,6 +104,12 @@ impl Callback {
                 "the identity provider sent no code",
             )));
         };
+        oidc.check_response_issuer(self.iss.as_deref())
+            .await
+            .map_err(|e| match e {
+                CoreError::SignIn(reason) => Refusal::Shown(reason),
+                other => Refusal::Failed(other),
+            })?;
         oidc.finish(code, pending).await.map_err(|e| match e {
             CoreError::SignIn(reason) => Refusal::Shown(reason),
             other => Refusal::Failed(other),
@@ -140,7 +148,7 @@ pub(super) async fn finish(
         .control
         .oidc_user(&signed_in.subject, &signed_in.username)
         .await?;
-    let renew_at = oidc.keep(&app.control, &user.id, &signed_in.token).await?;
+    let renew_at = oidc.keep(&user.id, &signed_in.token).await?;
     entry.outcome = Outcome::Allowed;
     entry.user_id = Some(user.id.clone());
     app.control.record_audit(&entry).await?;

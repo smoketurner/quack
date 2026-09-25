@@ -991,7 +991,7 @@ fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
         .any(|cause| {
             matches!(
                 cause.downcast_ref::<CoreError>(),
-                Some(CoreError::AuthRequired { .. })
+                Some(CoreError::AuthRequired { .. } | CoreError::Delegation { .. })
             )
         })
         .then_some(ExitCode::from(Exit::AuthRequired))
@@ -1014,6 +1014,11 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             let token = manager.login(flow, &show_login_prompt).await?;
             let mut out = stdout.lock();
             match manager.grant() {
+                // `login` refuses this grant, so this only reads well.
+                Grant::OnBehalfOf => writeln!(
+                    out,
+                    "'{provider}' acts on behalf of each person signed in to quack serve."
+                )?,
                 Grant::ClientCredentials => writeln!(
                     out,
                     "The client credentials for '{provider}' were accepted; the token expires at {} and a new one is requested when it runs out.",
@@ -1066,6 +1071,13 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
                     (None, Grant::AuthorizationCode | Grant::DeviceCode) => {
                         format!("not logged in; run `quack auth login {name}`")
                     }
+                    (Some(token), Grant::OnBehalfOf) => format!(
+                        "acts on behalf of each signed-in person; quack's own token (the actor) expires {}",
+                        token.expires_at
+                    ),
+                    (None, Grant::OnBehalfOf) => String::from(
+                        "acts on behalf of each person signed in to quack serve; nothing to log in to",
+                    ),
                 };
                 writeln!(out, "{name}: {state} (key in {})", status.key_location)?;
             }

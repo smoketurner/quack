@@ -461,12 +461,10 @@ async fn an_access_token_signed_by_the_issuer_names_the_person() {
     let bearer = sign_in
         .verify_bearer(&key.sign(&access_claims(&issuer.url, |_| {})))
         .await;
-    assert_eq!(
-        bearer.ok(),
-        Some(Bearer {
-            subject: OidcSubject::from("person-1"),
-            username: String::from("ada"),
-        })
+    assert!(
+        bearer.is_ok_and(|b| b.subject == OidcSubject::from("person-1")
+            && b.username == "ada"
+            && b.expires_at > Timestamp::now())
     );
     // A second token uses the cached keys; Okta's array `scp` counts too.
     let array_scope = access_claims(&issuer.url, |c| c["scp"] = json!(["quack.use"]));

@@ -33,6 +33,12 @@ pub enum Error {
     #[error("access token refused: {0}")]
     Bearer(String),
 
+    /// A provider that acts on behalf of each person could not here: nobody
+    /// is signed in behind the request, the person has no token from the
+    /// identity provider, or the issuer refused the exchange.
+    #[error("provider '{provider}' acts on behalf of the signed-in person and could not: {reason}")]
+    Delegation { provider: String, reason: String },
+
     /// A sign-in through the server's `OpenID` Connect issuer was refused or
     /// could not be verified.
     #[error("sign-in failed: {0}")]

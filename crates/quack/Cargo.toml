@@ -35,6 +35,7 @@ ratatui-textarea   = { workspace = true, features = ["crossterm"] }
 rust-embed         = { workspace = true, features = ["deterministic-timestamps"] }
 serde              = { workspace = true, features = ["derive", "std"] }
 schemars           = { workspace = true, features = ["derive"] }
+secrecy            = { workspace = true }
 serde_json         = { workspace = true, features = ["std"] }
 shlex              = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }

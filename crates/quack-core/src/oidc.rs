@@ -192,6 +192,8 @@ struct Claims {
 /// validates (`iss`, `aud`, `exp`).
 #[derive(Debug, Deserialize)]
 struct AccessClaims {
+    /// Checked by `jsonwebtoken`; kept for the token's expiry.
+    exp: i64,
     /// Entra and Okta.
     scp: Option<serde_json::Value>,
     /// RFC 8693 and 9068, Auth0.
@@ -324,6 +326,8 @@ pub struct Bearer {
     pub subject: OidcSubject,
     /// A name for a new user, as a sign-in would give one.
     pub username: String,
+    /// When the token stops being accepted.
+    pub expires_at: Timestamp,
 }
 
 impl std::fmt::Debug for SignIn {
@@ -368,18 +372,20 @@ impl SignIn {
     /// configured issuer exactly (`OpenID` Connect Discovery 4.3).
     async fn endpoints(&self) -> Result<&Endpoints> {
         self.endpoints
-            .get_or_try_init(|| async {
-                let endpoints = self.http.discover(&self.config.issuer_url).await?;
-                let named = endpoints.issuer.as_deref().map(|i| i.trim_end_matches('/'));
-                if named != Some(self.config.issuer_url.as_str()) {
-                    return Err(sign_in_error(format!(
-                        "the discovery document names issuer {named:?}, not '{}'",
-                        self.config.issuer_url
-                    )));
-                }
-                Ok(endpoints)
-            })
+            .get_or_try_init(|| self.http.discover(&self.config.issuer_url))
             .await
+    }
+
+    /// Check the callback's `iss` against the issuer (RFC 9207).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SignIn`] when the redirect cannot be from the issuer.
+    pub async fn check_response_issuer(&self, iss: Option<&str>) -> Result<()> {
+        self.endpoints()
+            .await?
+            .check_response_issuer(iss)
+            .map_err(sign_in_error)
     }
 
     async fn client(&self) -> Result<(OidcClient, String)> {
@@ -566,6 +572,7 @@ impl SignIn {
         Ok(Bearer {
             username: claims.person.username(&subject),
             subject,
+            expires_at: Timestamp::from_second(claims.exp).unwrap_or(Timestamp::MIN),
         })
     }
 
@@ -631,8 +638,10 @@ fn bearer_error(message: impl Into<String>) -> Error {
     Error::Bearer(message.into())
 }
 
+mod people;
 mod tokens;
 
+pub use people::{PersonTokens, RENEW_MARGIN, Stored};
 pub use tokens::UserTokens;
 
 #[cfg(test)]

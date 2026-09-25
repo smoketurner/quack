@@ -814,7 +814,8 @@ impl FromRow<'_, SqliteRow> for Sealed {
     }
 }
 
-/// Manages the SQLite control plane database.
+/// Manages the SQLite control plane database. Cloning shares the pool.
+#[derive(Clone)]
 pub struct ControlPlane {
     pool: SqlitePool,
 }

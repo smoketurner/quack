@@ -9,6 +9,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::ids::WorkspaceId;
+use quack_core::llm::acting::Acting;
 use quack_core::storage::control::Channel;
 use tower::ServiceExt;
 
@@ -42,6 +43,7 @@ pub(crate) async fn handle(
                 workspace: access.workspace.clone(),
                 policy,
                 user_id: Some(access.identity.user_id.clone()),
+                acting: Acting::current(),
                 auditor: Auditor::Server(Box::new(ServerAuditor {
                     app: std::sync::Arc::clone(&app),
                     access: std::sync::Mutex::new(access.clone()),

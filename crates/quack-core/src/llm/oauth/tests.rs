@@ -19,7 +19,18 @@ struct MockState {
     pending_polls: AtomicUsize,
     code_exchanges: AtomicUsize,
     client_credentials_requests: AtomicUsize,
+    exchanges: AtomicUsize,
+    /// Refuse exchanges with `invalid_grant`.
+    exchange_fails: std::sync::atomic::AtomicBool,
     last_token_body: StdMutex<String>,
+    /// The `Authorization` header of the last token request.
+    last_token_auth: StdMutex<String>,
+    /// Serve only RFC 8414 metadata, not an `OpenID` discovery document.
+    oauth_only: std::sync::atomic::AtomicBool,
+    /// The `issuer` the metadata names; the base URL when unset.
+    named_issuer: StdMutex<Option<String>>,
+    /// `grant_types_supported`, when listed.
+    grants: StdMutex<Option<Vec<String>>>,
 }
 
 struct MockIdp {
@@ -91,6 +102,18 @@ async fn serve(mut stream: tokio::net::TcpStream, base: &str, state: &MockState)
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/")
         .to_owned();
+    if target == "/token"
+        && let Ok(mut auth) = state.last_token_auth.lock()
+    {
+        *auth = head
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.trim().to_owned())
+            })
+            .unwrap_or_default();
+    }
     let (status, json) = route(&target, &body, base, state);
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
@@ -113,14 +136,41 @@ fn token_json(access: &str, refresh: Option<&str>) -> String {
     )
 }
 
+/// The discovery document, or RFC 8414 metadata when `oauth_only`.
+fn metadata(target: &str, base: &str, state: &MockState) -> (&'static str, String) {
+    let oauth_only = state.oauth_only.load(Ordering::SeqCst);
+    if oauth_only == (target == "/.well-known/openid-configuration") {
+        return ("404 Not Found", String::from("{}"));
+    }
+    let issuer = state
+        .named_issuer
+        .lock()
+        .ok()
+        .and_then(|n| n.clone())
+        .unwrap_or_else(|| base.to_owned());
+    let mut metadata = serde_json::json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{base}/authorize"),
+        "token_endpoint": format!("{base}/token"),
+        "device_authorization_endpoint": format!("{base}/device"),
+    });
+    if let (Some(grants), Some(fields)) = (
+        state.grants.lock().ok().and_then(|g| g.clone()),
+        metadata.as_object_mut(),
+    ) {
+        fields.insert(
+            String::from("grant_types_supported"),
+            serde_json::json!(grants),
+        );
+    }
+    ("200 OK", metadata.to_string())
+}
+
 fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static str, String) {
     match target {
-        "/.well-known/openid-configuration" => (
-            "200 OK",
-            format!(
-                "{{\"issuer\":\"{base}\",\"authorization_endpoint\":\"{base}/authorize\",\"token_endpoint\":\"{base}/token\",\"device_authorization_endpoint\":\"{base}/device\"}}"
-            ),
-        ),
+        "/.well-known/openid-configuration" | "/.well-known/oauth-authorization-server" => {
+            metadata(target, base, state)
+        }
         "/device" => (
             "200 OK",
             format!(
@@ -172,6 +222,25 @@ fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static s
                         )
                     }
                 }
+                Some(
+                    "urn:ietf:params:oauth:grant-type:token-exchange"
+                    | "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                ) => {
+                    let n = state.exchanges.fetch_add(1, Ordering::SeqCst);
+                    if state.exchange_fails.load(Ordering::SeqCst) {
+                        (
+                            "400 Bad Request",
+                            String::from(
+                                "{\"error\":\"invalid_grant\",\"error_description\":\"subject token expired\"}",
+                            ),
+                        )
+                    } else {
+                        let subject = form(body, "subject_token")
+                            .or_else(|| form(body, "assertion"))
+                            .unwrap_or_default();
+                        ("200 OK", token_json(&format!("obo-{subject}-{n}"), None))
+                    }
+                }
                 Some("urn:ietf:params:oauth:grant-type:device_code") => {
                     let pending = state.pending_polls.load(Ordering::SeqCst);
                     if pending > 0 {
@@ -217,9 +286,14 @@ fn oauth_config(issuer: &str, grant: Grant) -> OAuthConfig {
         redirect_uri: format!("http://127.0.0.1:{}/callback", free_port()),
         grant,
         client_secret_env: match grant {
-            Grant::ClientCredentials => Some(String::from(SECRET_ENV)),
+            Grant::ClientCredentials | Grant::OnBehalfOf => Some(String::from(SECRET_ENV)),
             Grant::AuthorizationCode | Grant::DeviceCode => None,
         },
+        client_auth: ClientAuth::default(),
+        exchange: Exchange::default(),
+        audience: None,
+        resource: None,
+        actor: true,
     }
 }
 
@@ -588,6 +662,8 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         token: String::from("http://127.0.0.1:9/t"),
         device_authorization: None,
         jwks_uri: None,
+        grant_types_supported: None,
+        authorization_response_iss_parameter_supported: false,
     };
     assert!(m.endpoints.set(endpoints).is_ok());
     let err = m.login(LoginFlow::Configured, &|_| {}).await.err();
@@ -660,4 +736,228 @@ async fn a_login_is_sealed_in_control_db_and_outlives_the_process() {
     assert!(m.status().await.is_ok_and(|s| s.token.is_none()));
     // The vault key stays: other tokens are sealed with it.
     assert!(dir.path().join("vault.key").exists());
+}
+
+// --- on-behalf-of ------------------------------------------------------------
+
+fn acting(user: &str, token: Option<&'static str>) -> Acting {
+    Acting::fixed(
+        UserId::from(user),
+        token.ok_or("no identity-provider sign-in"),
+    )
+}
+
+fn obo(dir: &Path, idp: &MockIdp, change: impl FnOnce(&mut OAuthConfig)) -> TokenManager {
+    let mut config = oauth_config(&idp.issuer, Grant::OnBehalfOf);
+    change(&mut config);
+    TokenManager::new(&config_at(dir), &name("p"), config, KeySource::File)
+        .unwrap_or_else(|e| fail(&e.to_string()))
+}
+
+fn last_body(idp: &MockIdp) -> String {
+    idp.state
+        .last_token_body
+        .lock()
+        .map(|b| b.clone())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn nobody_behind_the_request_is_a_delegation_error_not_a_login_prompt() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |_| {});
+    let err = m.access_token().await.err();
+    assert!(
+        matches!(&err, Some(Error::Delegation { reason, .. }) if reason.contains("no signed-in person")),
+        "{err:?}"
+    );
+    let err = Acting::scope(Some(acting("ada", None)), m.access_token())
+        .await
+        .err();
+    assert!(
+        matches!(&err, Some(Error::Delegation { reason, .. }) if reason.contains("no identity-provider sign-in")),
+        "{err:?}"
+    );
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 0);
+    let login = m.login(LoginFlow::Configured, &|_| {}).await.err();
+    assert!(login.is_some_and(|e| e.to_string().contains("there is no login")));
+}
+
+#[tokio::test]
+async fn a_token_exchange_names_the_person_and_quack_and_is_kept_per_person() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |c| {
+        c.audience = Some(String::from("api://gw"));
+    });
+
+    let ada = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(
+        ada.as_ref()
+            .is_ok_and(|t| t.expose_secret() == "obo-ada-at-0"),
+        "{:?}",
+        ada.err()
+    );
+    let body = last_body(&idp);
+    for part in [
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
+        "subject_token=ada-at",
+        "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+        "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+        "audience=api%3A%2F%2Fgw",
+        "actor_token=service-access",
+        "actor_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+        "client_id=client-1",
+        "client_secret=",
+    ] {
+        assert!(body.contains(part), "{part} missing from {body}");
+    }
+    assert!(idp.state.last_token_auth.lock().is_ok_and(|a| a.is_empty()));
+
+    // The same person again reuses their token; another person gets theirs.
+    let again = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(again.is_ok_and(|t| t.expose_secret() == "obo-ada-at-0"));
+    let bob = Acting::scope(Some(acting("bob", Some("bob-at"))), m.access_token()).await;
+    assert!(bob.is_ok_and(|t| t.expose_secret() == "obo-bob-at-1"));
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 2);
+    // quack's own token (the actor) was obtained once and reused.
+    assert_eq!(
+        idp.state.client_credentials_requests.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn entras_form_sends_the_assertion_and_no_actor_and_basic_auth_uses_the_header() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |c| {
+        c.exchange = Exchange::Entra;
+        c.client_auth = ClientAuth::ClientSecretBasic;
+    });
+    let token = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(token.is_ok_and(|t| t.expose_secret() == "obo-ada-at-0"));
+    let body = last_body(&idp);
+    for part in [
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer",
+        "assertion=ada-at",
+        "requested_token_use=on_behalf_of",
+        "scope=api%3A%2F%2Fx%2F.default+offline_access",
+    ] {
+        assert!(body.contains(part), "{part} missing from {body}");
+    }
+    for absent in ["actor_token", "client_secret", "subject_token"] {
+        assert!(!body.contains(absent), "{absent} in {body}");
+    }
+    assert_eq!(
+        idp.state.client_credentials_requests.load(Ordering::SeqCst),
+        0
+    );
+    let auth = idp
+        .state
+        .last_token_auth
+        .lock()
+        .map(|a| a.clone())
+        .unwrap_or_default();
+    let expected = base64::engine::general_purpose::STANDARD
+        .encode(format!("client-1:{}", env!("CARGO_PKG_NAME")));
+    assert_eq!(auth, format!("Basic {expected}"));
+}
+
+#[tokio::test]
+async fn a_refused_exchange_names_the_issuers_error() {
+    let idp = MockIdp::start().await;
+    idp.state.exchange_fails.store(true, Ordering::SeqCst);
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |c| c.actor = false);
+    let err = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token())
+        .await
+        .err();
+    assert!(
+        matches!(&err, Some(Error::Delegation { reason, .. })
+            if reason.contains("invalid_grant") && reason.contains("subject token expired")),
+        "{err:?}"
+    );
+    assert!(!last_body(&idp).contains("actor_token"));
+}
+
+// --- discovery ---------------------------------------------------------------
+
+#[test]
+fn rfc_8414_metadata_goes_between_the_host_and_the_issuers_path() {
+    let url = |issuer: &str| Endpoints::oauth_metadata_url(issuer).unwrap_or_default();
+    assert_eq!(
+        url("https://login.example.com"),
+        "https://login.example.com/.well-known/oauth-authorization-server"
+    );
+    assert_eq!(
+        url("https://login.example.com/tenant/"),
+        "https://login.example.com/.well-known/oauth-authorization-server/tenant"
+    );
+    assert!(Endpoints::oauth_metadata_url("not a url").is_err());
+}
+
+#[test]
+fn a_redirects_issuer_must_match_and_is_required_when_promised() {
+    let mut endpoints = Endpoints {
+        issuer: Some(String::from("https://i")),
+        authorization: String::new(),
+        token: String::new(),
+        device_authorization: None,
+        jwks_uri: None,
+        grant_types_supported: None,
+        authorization_response_iss_parameter_supported: false,
+    };
+    assert!(endpoints.check_response_issuer(None).is_ok());
+    assert!(endpoints.check_response_issuer(Some("https://i")).is_ok());
+    assert!(
+        endpoints
+            .check_response_issuer(Some("https://evil"))
+            .is_err()
+    );
+    endpoints.authorization_response_iss_parameter_supported = true;
+    assert!(endpoints.check_response_issuer(None).is_err());
+    assert!(endpoints.check_response_issuer(Some("https://i")).is_ok());
+}
+
+#[tokio::test]
+async fn a_plain_oauth_server_is_found_through_rfc_8414() {
+    let idp = MockIdp::start().await;
+    idp.state.oauth_only.store(true, Ordering::SeqCst);
+    let dir = temp();
+    let m = manager(dir.path(), &idp, Grant::ClientCredentials);
+    assert!(
+        m.access_token()
+            .await
+            .is_ok_and(|t| t.expose_secret() == "service-access")
+    );
+}
+
+#[tokio::test]
+async fn metadata_for_another_issuer_is_refused_and_the_grant_is_checked() {
+    let idp = MockIdp::start().await;
+    if let Ok(mut named) = idp.state.named_issuer.lock() {
+        *named = Some(String::from("https://elsewhere.example.com"));
+    }
+    let dir = temp();
+    let m = manager(dir.path(), &idp, Grant::ClientCredentials);
+    let err = m.access_token().await.err();
+    assert!(err.is_some_and(|e| e.to_string().contains("elsewhere.example.com")));
+    assert_eq!(
+        idp.state.client_credentials_requests.load(Ordering::SeqCst),
+        0
+    );
+
+    let idp = MockIdp::start().await;
+    let m = manager(dir.path(), &idp, Grant::ClientCredentials);
+    assert!(matches!(m.issuer_supports_grant().await, Ok(None)));
+    let idp = MockIdp::start().await;
+    if let Ok(mut grants) = idp.state.grants.lock() {
+        *grants = Some(vec![String::from("authorization_code")]);
+    }
+    let m = manager(dir.path(), &idp, Grant::ClientCredentials);
+    assert!(matches!(m.issuer_supports_grant().await, Ok(Some(false))));
+    let m = manager(dir.path(), &idp, Grant::AuthorizationCode);
+    assert!(matches!(m.issuer_supports_grant().await, Ok(Some(true))));
 }
