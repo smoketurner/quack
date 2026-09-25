@@ -50,6 +50,7 @@ pub(crate) async fn list(
             .member_role(&token.workspace_id, &identity.user_id)
             .await?;
         ws.into_iter()
+            .filter(|_| role.is_some() || identity.is_admin)
             .map(|w| WorkspaceView::new(w, role))
             .collect()
     } else if identity.is_admin {

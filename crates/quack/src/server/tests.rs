@@ -4496,3 +4496,180 @@ async fn local_mode_refuses_new_users_from_the_api() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+/// `list`'s token branch filters out a removed non-admin member's workspace,
+/// so `list` agrees with `show` for the same still-valid token, while
+/// preserving the admin-without-membership path (role `null`) and the
+/// current-member path — including a write-only token's workspace discovery,
+/// whose scope dimension is deliberately left untouched. See the report on
+/// the `remove_member`/`show` asymmetry that `list`'s token branch missed.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_token_branch_filters_removed_non_admin_member() {
+    let h = harness(ServeMode::Login).await;
+    let root_id = h.user("root", UserKind::Admin).await;
+    h.user("dir", UserKind::Admin).await;
+    let former = h.user("former", UserKind::Standard).await;
+    let root = h.login("root").await;
+    let dir = h.login("dir").await;
+
+    // `root` owns "leak"; `former` is added as a viewer.
+    let (status, body) = h
+        .post(
+            "/api/v1/workspaces",
+            &root,
+            serde_json::json!({ "name": "leak" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &root,
+            serde_json::json!({ "username": "former", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Operator-mints a Read token for `former` (mirrors admin CLI create_token).
+    let IssuedToken { secret, .. } = h
+        .app
+        .control
+        .create_token(&ws, &former, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let former_ro = secret.expose().to_owned();
+
+    // PRE-REMOVAL: the token lists its bound workspace with role "viewer".
+    let (status, body) = h.get("/api/v1/workspaces", &former_ro).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspaces"][0]["id"], ws.as_str(), "{body}");
+    assert_eq!(body["workspaces"][0]["role"], "viewer", "{body}");
+
+    // `remove_member` is the access-revocation operation; it does not revoke tokens.
+    let removed = h
+        .app
+        .control
+        .remove_member(&ws, &former)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(removed);
+
+    // FIX: the removed non-admin's still-valid token no longer lists the workspace.
+    let (status, body) = h.get("/api/v1/workspaces", &former_ro).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let leaked = body["workspaces"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|w| w["id"] == ws.as_str());
+    assert!(
+        leaked.is_none(),
+        "removed non-admin's token must not list the workspace; got {body}"
+    );
+    assert_eq!(
+        body["workspaces"].as_array().map(Vec::len),
+        Some(0),
+        "the removed member's bound workspace is filtered out; got {body}"
+    );
+
+    // `list` stays unaudited (no denied `open` row), like every other branch.
+    let denied_open_after_list = h
+        .audit(AuditFilter {
+            user_id: Some(former.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await
+        .into_iter()
+        .filter(|r| r.action == "open" && r.workspace_id.as_ref() == Some(&ws))
+        .count();
+    assert_eq!(
+        denied_open_after_list, 0,
+        "list writes no denied `open` row; got {denied_open_after_list}"
+    );
+
+    // `show` still refuses the same caller — `list` now agrees with `show`.
+    let (status, body) = h.get(&format!("/api/v1/workspaces/{ws}"), &former_ro).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "show denies the removed member's token; got {body}"
+    );
+    let denied_open_after_show = h
+        .audit(AuditFilter {
+            user_id: Some(former.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await
+        .into_iter()
+        .filter(|r| r.action == "open" && r.workspace_id.as_ref() == Some(&ws))
+        .count();
+    assert_eq!(
+        denied_open_after_show, 1,
+        "show writes exactly one denied `open` row; got {denied_open_after_show}"
+    );
+
+    // NO REGRESSION — an admin without membership still lists (role `null`),
+    // mirroring `show`'s admin path: the `|| identity.is_admin` arm of the filter.
+    let (status, body) = h
+        .post(
+            "/api/v1/workspaces",
+            &dir,
+            serde_json::json!({ "name": "other" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws2 = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    // `root` is an admin but never a member of `ws2`; operator-mints a token for root.
+    let IssuedToken { secret, .. } = h
+        .app
+        .control
+        .create_token(&ws2, &root_id, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let admin_ro = secret.expose().to_owned();
+    let (status, body) = h.get("/api/v1/workspaces", &admin_ro).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspaces"][0]["id"], ws2.as_str(), "{body}");
+    assert_eq!(
+        body["workspaces"][0]["role"],
+        serde_json::Value::Null,
+        "admin-without-membership lists with role null; got {body}"
+    );
+    let (status, body) = h.get(&format!("/api/v1/workspaces/{ws2}"), &admin_ro).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "show admits a non-member admin's token; got {body}"
+    );
+    assert_eq!(body["role"], serde_json::Value::Null, "{body}");
+
+    // NO REGRESSION — a current member's write-only token still discovers its
+    // workspace (the scope dimension is deliberately untouched by this fix).
+    let keeper = h.user("keeper", UserKind::Standard).await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &root,
+            serde_json::json!({ "username": "keeper", "role": "member" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let IssuedToken { secret, .. } = h
+        .app
+        .control
+        .create_token(&ws, &keeper, "wo", &[Scope::Write], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let keeper_wo = secret.expose().to_owned();
+    let (status, body) = h.get("/api/v1/workspaces", &keeper_wo).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspaces"][0]["id"], ws.as_str(), "{body}");
+    assert_eq!(
+        body["workspaces"][0]["role"], "member",
+        "a current member's write-only token still lists its role; got {body}"
+    );
+}
