@@ -3051,6 +3051,17 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {
     }
 }
 
+/// A decimal's digit text without the trailing zeros of its declared scale:
+/// `12.50` is `12.5`, `100.00` is `100`, and `-0.00` is `0`.
+fn decimal_digits(text: &str) -> &str {
+    let trimmed = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        text
+    };
+    if trimmed == "-0" { "0" } else { trimmed }
+}
+
 /// A `DuckDB` value as JSON: numbers stay numbers (integers beyond i64, and
 /// decimals whose normalized digits would not survive an `f64`, keep their
 /// digits as strings),
@@ -3089,10 +3100,11 @@ fn json_of(value: duckdb::types::Value) -> serde_json::Value {
             // scale, so `12.50` is `12.5` and `100.00` is `100`): a value whose
             // digits survive the `f64` stays a number, so one money column is
             // all numbers; one that would lose digits keeps its exact text.
-            let normalized = d.normalize().to_string();
+            let text = d.to_string();
+            let normalized = decimal_digits(&text);
             match normalized.parse::<serde_json::Number>() {
                 Ok(n) if n.to_string() == normalized => Json::Number(n),
-                _ => Json::String(d.to_string()),
+                _ => Json::String(text),
             }
         }
         Value::Timestamp(unit, n) => Json::String(timestamp_text(unit, n)),
