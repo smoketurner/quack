@@ -472,6 +472,83 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // The audit must reflect whether anything was actually removed. A
+    // no-op removal that returns 404 used to audit `Allowed`, so a SIEM
+    // reading the OCSF export saw a successful `Member` event for a
+    // request that failed; per `Outcome::of` it is `Error`.
+    let member_rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("member")),
+            ..AuditFilter::default()
+        })
+        .await;
+    // carol: added (Allowed), removed (Allowed), removed again, a no-op (Error).
+    let mut carol_outcomes: Vec<Outcome> = member_rows
+        .iter()
+        .filter(|r| r.resource_id.as_deref() == Some(carol.as_str()))
+        .map(|r| r.outcome)
+        .collect();
+    carol_outcomes.sort_by_key(|o| o.as_str());
+    assert_eq!(
+        carol_outcomes,
+        [Outcome::Allowed, Outcome::Allowed, Outcome::Error],
+        "{member_rows:?}"
+    );
+    // The OCSF export turns that `Error` row into a `Failure` event, never a
+    // `Success` one: the SIEM or archive sees the failed shape, and the
+    // `outcome=allowed` filter no longer returns it.
+    let (status, ocsf) = h
+        .get(
+            &format!("/api/v1/admin/audit?workspace_id={ws}&action=member&format=ocsf"),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ocsf}");
+    let member_events = ocsf["audit"].as_array().cloned().unwrap_or_default();
+    assert!(
+        member_events.iter().all(|e| e["class_uid"] == 6003),
+        "member rows are API activity: {ocsf}"
+    );
+    assert_eq!(
+        member_events
+            .iter()
+            .filter(|e| e["status_id"] == 2 && e["status"] == "Failure")
+            .count(),
+        1,
+        "the no-op removal is the only Failure: {ocsf}"
+    );
+    assert!(
+        member_events
+            .iter()
+            .any(|e| e["status_id"] == 1 && e["status"] == "Success"),
+        "the successful removal is still a Success: {ocsf}"
+    );
+    let (status, allowed) = h
+        .get(
+            &format!("/api/v1/admin/audit?workspace_id={ws}&action=member&outcome=allowed"),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert!(
+        allowed["audit"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().all(|r| r["outcome"] == "allowed")),
+        "outcome=allowed returns only allowed rows: {allowed}"
+    );
+    let (status, error) = h
+        .get(
+            &format!("/api/v1/admin/audit?workspace_id={ws}&action=member&outcome=error"),
+            &root,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{error}");
+    assert_eq!(
+        error["audit"].as_array().map(Vec::len),
+        Some(1),
+        "the no-op removal is found by outcome=error: {error}"
+    );
     let (status, _) = h
         .get(&format!("/api/v1/workspaces/{ws}"), &carol_token)
         .await;
@@ -3311,6 +3388,35 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             .is_some_and(|c| c.iter().any(|x| x["id"] == "organization")),
         "{restored}"
     );
+    // The ontology `restore_into` seeded is audited as `ontology` (issue #71):
+    // the bundle seeded an ontology into an empty workspace, and the audit
+    // log records who did, with the version as the resource.
+    let ont = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws3.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        ont.len(),
+        1,
+        "one ontology audit row for the restore: {ont:?}"
+    );
+    assert_eq!(ont[0].resource_type.as_deref(), Some("ontology_version"));
+    assert_eq!(ont[0].resource_id.as_deref(), Some("1"));
+    assert_eq!(ont[0].outcome, Outcome::Allowed);
+    let proposed = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws3.clone()),
+            action: Some(String::from("propose")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        proposed.is_empty(),
+        "no propose row when nothing was proposed: {proposed:?}"
+    );
 
     // Import into a fresh workspace: concept files become documents, types
     // and links become candidates, index.md comes back as context.
@@ -3384,6 +3490,57 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         ids.contains(&"vendor") && ids.contains(&"vendor_links_country"),
         "{ids:?}"
     );
+    // The candidate run `restore_into` stored is audited as `propose` (issue
+    // #71), keyed by the run id the pending candidates carry, so the audit
+    // trail records who queued them and correlates with the review queue.
+    let proposed = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws2.clone()),
+            action: Some(String::from("propose")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        proposed.len(),
+        1,
+        "one propose audit row for the run: {proposed:?}"
+    );
+    assert_eq!(proposed[0].resource_type.as_deref(), Some("induction_run"));
+    assert_eq!(proposed[0].outcome, Outcome::Allowed);
+    let run_id = proposed[0].resource_id.clone().unwrap_or_default();
+    assert!(
+        !run_id.is_empty(),
+        "the run id is the audit resource: {proposed:?}"
+    );
+    assert!(
+        body["candidates"].as_array().is_some_and(|cs| cs
+            .iter()
+            .all(|c| c["proposed_by"].as_str() == Some(run_id.as_str()))),
+        "the candidates' proposed_by is the audited run id: {body}"
+    );
+    let ont = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws2.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        ont.is_empty(),
+        "no ontology audit row when the bundle carried no snapshot: {ont:?}"
+    );
+    let ingests = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws2.clone()),
+            action: Some(String::from("ingest")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        ingests.len(),
+        2,
+        "the two ingested documents are audited: {ingests:?}"
+    );
 
     // A body that is not a tar is a 400.
     let request = Request::builder()
@@ -3394,6 +3551,111 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         .unwrap_or_else(|e| fail(&e.to_string()));
     let (status, _, _) = h.send(request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_bundle_audits_both_the_ontology_restore_and_the_candidate_run() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "mix" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    // A bundle that carries an ontology snapshot (so it restores) and one
+    // foreign concept file (so it also proposes a class): one import does
+    // both writes, so it must record both audit rows.
+    let mut incoming = TarSink::new(Vec::new());
+    let snapshot = "---\ntype: ontology\ngenerator: quack\n---\n# Ontology\n\n```json\n{}\n```\n";
+    for (path, content) in [
+        ("ontology/ontology.md", snapshot),
+        (
+            "widgets/acme.md",
+            "---\ntype: Widget\ntitle: Acme\n---\nMade of steel.\n",
+        ),
+    ] {
+        incoming
+            .file(path, content)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws}/documents"))
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .body(Body::from(
+            incoming.finish().unwrap_or_else(|e| fail(&e.to_string())),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["ontology_version"], 1, "{body}");
+    assert_eq!(body["candidates"], 1, "{body}");
+    assert_eq!(
+        body["documents"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+
+    // The ontology restore is audited as `ontology`, keyed by the version.
+    let ont = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(ont.len(), 1, "one ontology audit row: {ont:?}");
+    assert_eq!(ont[0].resource_type.as_deref(), Some("ontology_version"));
+    assert_eq!(ont[0].resource_id.as_deref(), Some("1"));
+    assert_eq!(ont[0].outcome, Outcome::Allowed);
+
+    // The candidate run is audited as `propose`, keyed by the run id the
+    // pending candidate carries as `proposed_by`.
+    let proposed = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("propose")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(proposed.len(), 1, "one propose audit row: {proposed:?}");
+    assert_eq!(proposed[0].resource_type.as_deref(), Some("induction_run"));
+    assert_eq!(proposed[0].outcome, Outcome::Allowed);
+    let run_id = proposed[0].resource_id.clone().unwrap_or_default();
+    assert!(
+        !run_id.is_empty(),
+        "the run id is the audit resource: {proposed:?}"
+    );
+    let (_, body) = h
+        .get(&format!("/api/v1/workspaces/{ws}/ontology/candidates"), "")
+        .await;
+    assert_eq!(
+        body["candidates"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        body["candidates"][0]["proposed_by"].as_str(),
+        Some(run_id.as_str()),
+        "the candidate's proposed_by is the audited run id: {body}"
+    );
+
+    // The concept file was ingested as a document and that is audited too.
+    let ingests = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("ingest")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        ingests.len(),
+        1,
+        "the one ingested document is audited: {ingests:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4350,4 +4612,181 @@ async fn local_mode_refuses_new_users_from_the_api() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// `list`'s token branch filters out a removed non-admin member's workspace,
+/// so `list` agrees with `show` for the same still-valid token, while
+/// preserving the admin-without-membership path (role `null`) and the
+/// current-member path — including a write-only token's workspace discovery,
+/// whose scope dimension is deliberately left untouched. See the report on
+/// the `remove_member`/`show` asymmetry that `list`'s token branch missed.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_token_branch_filters_removed_non_admin_member() {
+    let h = harness(ServeMode::Login).await;
+    let root_id = h.user("root", UserKind::Admin).await;
+    h.user("dir", UserKind::Admin).await;
+    let former = h.user("former", UserKind::Standard).await;
+    let root = h.login("root").await;
+    let dir = h.login("dir").await;
+
+    // `root` owns "leak"; `former` is added as a viewer.
+    let (status, body) = h
+        .post(
+            "/api/v1/workspaces",
+            &root,
+            serde_json::json!({ "name": "leak" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &root,
+            serde_json::json!({ "username": "former", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Operator-mints a Read token for `former` (mirrors admin CLI create_token).
+    let IssuedToken { secret, .. } = h
+        .app
+        .control
+        .create_token(&ws, &former, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let former_ro = secret.expose().to_owned();
+
+    // PRE-REMOVAL: the token lists its bound workspace with role "viewer".
+    let (status, body) = h.get("/api/v1/workspaces", &former_ro).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspaces"][0]["id"], ws.as_str(), "{body}");
+    assert_eq!(body["workspaces"][0]["role"], "viewer", "{body}");
+
+    // `remove_member` is the access-revocation operation; it does not revoke tokens.
+    let removed = h
+        .app
+        .control
+        .remove_member(&ws, &former)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(removed);
+
+    // FIX: the removed non-admin's still-valid token no longer lists the workspace.
+    let (status, body) = h.get("/api/v1/workspaces", &former_ro).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let leaked = body["workspaces"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|w| w["id"] == ws.as_str());
+    assert!(
+        leaked.is_none(),
+        "removed non-admin's token must not list the workspace; got {body}"
+    );
+    assert_eq!(
+        body["workspaces"].as_array().map(Vec::len),
+        Some(0),
+        "the removed member's bound workspace is filtered out; got {body}"
+    );
+
+    // `list` stays unaudited (no denied `open` row), like every other branch.
+    let denied_open_after_list = h
+        .audit(AuditFilter {
+            user_id: Some(former.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await
+        .into_iter()
+        .filter(|r| r.action == "open" && r.workspace_id.as_ref() == Some(&ws))
+        .count();
+    assert_eq!(
+        denied_open_after_list, 0,
+        "list writes no denied `open` row; got {denied_open_after_list}"
+    );
+
+    // `show` still refuses the same caller — `list` now agrees with `show`.
+    let (status, body) = h.get(&format!("/api/v1/workspaces/{ws}"), &former_ro).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "show denies the removed member's token; got {body}"
+    );
+    let denied_open_after_show = h
+        .audit(AuditFilter {
+            user_id: Some(former.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await
+        .into_iter()
+        .filter(|r| r.action == "open" && r.workspace_id.as_ref() == Some(&ws))
+        .count();
+    assert_eq!(
+        denied_open_after_show, 1,
+        "show writes exactly one denied `open` row; got {denied_open_after_show}"
+    );
+
+    // NO REGRESSION — an admin without membership still lists (role `null`),
+    // mirroring `show`'s admin path: the `|| identity.is_admin` arm of the filter.
+    let (status, body) = h
+        .post(
+            "/api/v1/workspaces",
+            &dir,
+            serde_json::json!({ "name": "other" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws2 = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    // `root` is an admin but never a member of `ws2`; operator-mints a token for root.
+    let IssuedToken { secret, .. } = h
+        .app
+        .control
+        .create_token(&ws2, &root_id, "ro", &[Scope::Read], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let admin_ro = secret.expose().to_owned();
+    let (status, body) = h.get("/api/v1/workspaces", &admin_ro).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspaces"][0]["id"], ws2.as_str(), "{body}");
+    assert_eq!(
+        body["workspaces"][0]["role"],
+        serde_json::Value::Null,
+        "admin-without-membership lists with role null; got {body}"
+    );
+    let (status, body) = h.get(&format!("/api/v1/workspaces/{ws2}"), &admin_ro).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "show admits a non-member admin's token; got {body}"
+    );
+    assert_eq!(body["role"], serde_json::Value::Null, "{body}");
+
+    // NO REGRESSION — a current member's write-only token still discovers its
+    // workspace (the scope dimension is deliberately untouched by this fix).
+    let keeper = h.user("keeper", UserKind::Standard).await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &root,
+            serde_json::json!({ "username": "keeper", "role": "member" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let IssuedToken { secret, .. } = h
+        .app
+        .control
+        .create_token(&ws, &keeper, "wo", &[Scope::Write], None)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let keeper_wo = secret.expose().to_owned();
+    let (status, body) = h.get("/api/v1/workspaces", &keeper_wo).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspaces"][0]["id"], ws.as_str(), "{body}");
+    assert_eq!(
+        body["workspaces"][0]["role"], "member",
+        "a current member's write-only token still lists its role; got {body}"
+    );
 }
