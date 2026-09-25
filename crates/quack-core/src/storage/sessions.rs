@@ -525,6 +525,11 @@ pub fn record_turn(
 /// trimmed from the oldest end to fit `token_budget`. Tool messages are not
 /// replayed; the assistant text already describes what the tools found.
 ///
+/// The result is always anchored on a `User` message: when trimming drops
+/// the `User` that preceded a kept `Assistant`, that orphaned assistant is
+/// dropped too, so the replayed thread opens with a `User` rather than an
+/// answer whose question was discarded for budget.
+///
 /// # Errors
 ///
 /// Returns an error if the messages cannot be read.
@@ -552,6 +557,9 @@ pub fn history_for_model(
         kept.push(message);
     }
     kept.reverse();
+    while matches!(kept.first(), Some(rig::message::Message::Assistant { .. })) {
+        kept.remove(0);
+    }
     Ok(kept)
 }
 
@@ -1050,6 +1058,118 @@ mod tests {
 
         let none = history_for_model(&db, &session.id, Tokens::new(1)).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn history_does_not_start_with_an_orphaned_assistant() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Query, None).unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "first question",
+            &response(
+                "first answer",
+                vec![step(ToolName::RunSql, "SELECT 1", "1 rows")],
+            ),
+        )
+        .unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "second question",
+            &response("second answer", vec![]),
+        )
+        .unwrap();
+
+        // "second answer" is 13 bytes = 4 tokens, so a budget of 4 admits only
+        // the newest assistant and not its preceding user. The kept suffix
+        // would be an orphaned Assistant; it must be dropped, leaving an empty
+        // history rather than one that opens with an answer whose question
+        // was cut for budget.
+        let trimmed = history_for_model(&db, &session.id, Tokens::new(4)).unwrap();
+        assert!(
+            trimmed.is_empty(),
+            "expected empty history, got {trimmed:?}"
+        );
+        assert!(
+            !matches!(
+                trimmed.first(),
+                Some(rig::message::Message::Assistant { .. })
+            ),
+            "orphaned Assistant first: {trimmed:?}"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn history_is_always_user_anchored_and_strictly_alternating() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Query, None).unwrap();
+        // Five turns with deliberately varied per-message sizes so a budget
+        // sweep crosses trim boundaries of both kept-count parities.
+        let turns = [
+            ("aaaa", "bbbbbbbb"),
+            ("ccc", "dddddddddd"),
+            ("eeeeeeee", "ff"),
+            ("gggggg", "hhhhhhhhhhhh"),
+            ("iiiiiiiiii", "jjjj"),
+        ];
+        for (question, answer) in turns {
+            record_turn(
+                &db,
+                &session.id,
+                question,
+                &response(answer, vec![step(ToolName::RunSql, "SELECT 1", "1 rows")]),
+            )
+            .unwrap();
+        }
+
+        for budget in 0..=128u32 {
+            let trimmed = history_for_model(&db, &session.id, Tokens::new(budget)).unwrap();
+            assert!(
+                matches!(
+                    trimmed.first(),
+                    None | Some(rig::message::Message::User { .. })
+                ),
+                "budget {budget}: history opens with an orphaned Assistant: {trimmed:?}"
+            );
+            if !trimmed.is_empty() {
+                assert!(
+                    matches!(
+                        trimmed.last(),
+                        Some(rig::message::Message::Assistant { .. })
+                    ),
+                    "budget {budget}: history does not end on an Assistant: {trimmed:?}"
+                );
+                let mut want_user = true;
+                for message in &trimmed {
+                    let is_user = matches!(message, rig::message::Message::User { .. });
+                    assert_eq!(
+                        is_user, want_user,
+                        "budget {budget}: non-alternating role {message:?}"
+                    );
+                    want_user = !want_user;
+                }
+            }
+        }
+
+        assert!(
+            history_for_model(&db, &session.id, Tokens::new(0))
+                .unwrap()
+                .is_empty()
+        );
+        let full = history_for_model(&db, &session.id, Tokens::new(1_000)).unwrap();
+        assert_eq!(full.len(), 10);
+        assert!(matches!(
+            full.first(),
+            Some(rig::message::Message::User { .. })
+        ));
+        assert!(matches!(
+            full.last(),
+            Some(rig::message::Message::Assistant { .. })
+        ));
     }
 
     #[test]

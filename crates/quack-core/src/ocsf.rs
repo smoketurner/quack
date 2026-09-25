@@ -326,6 +326,18 @@ mod tests {
             render(&row("delete", Outcome::Error))["status_detail"],
             "error"
         );
+        // A membership change is API activity/Update; a failed no-op removal
+        // audited as `Error` is a `Failure` event, never a `Success` one.
+        let allowed = render(&row("member", Outcome::Allowed));
+        assert_eq!(allowed["type_uid"], 600_303);
+        assert_eq!(allowed["activity_name"], "Update");
+        assert_eq!(allowed["status_id"], 1);
+        assert_eq!(allowed["status"], "Success");
+        let failed = render(&row("member", Outcome::Error));
+        assert_eq!(failed["type_uid"], 600_303);
+        assert_eq!(failed["status_id"], 2);
+        assert_eq!(failed["status"], "Failure");
+        assert_eq!(failed["status_detail"], "error");
     }
 
     #[test]

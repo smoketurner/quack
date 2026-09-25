@@ -394,6 +394,127 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     assert_eq!(ugandas, 1);
 }
 
+/// A rejected merge is not proposed again when a later resolution pass
+/// flips its keep/drop orientation (provenance tilt): the dedup must
+/// recognize the pair in either orientation (`MergeStatus::Rejected`'s
+/// "kept apart; not proposed again" contract).
+#[tokio::test]
+async fn rejected_merge_is_not_reproposed_when_provenance_flips_orientation() {
+    let db = workspace();
+    let writer = writer_of(&db);
+    let node = |label: &str| NewNode {
+        label: label.to_owned(),
+        class_id: ClassId::from("acmeorg"),
+        properties: Properties::default(),
+        standing: Standing::Reviewed,
+    };
+    let chunk =
+        |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
+    let options = GraphOptions {
+        merge_threshold: 0.5,
+        auto_merge_threshold: -1.0,
+        ..GraphOptions::default()
+    };
+    let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
+    let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
+    db.insert_chunk(&NewChunk {
+        id: &ChunkId::from("c3"),
+        document_id: &DocumentId::from("doc-1"),
+        chunk_index: 2,
+        content: "Acme Corp is an acme.",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
+    // First pass: Acme (2 provenance) keeps; Acme Corp (1) drops.
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    let pending = resolve::pending(&db).unwrap();
+    assert_eq!(pending.len(), 1, "one proposal for the Acme/Acme Corp pair");
+    let first = pending.first().unwrap();
+    assert_eq!(first.keep.id, acme, "{first:?}");
+    assert_eq!(first.drop.id, acme_corp, "{first:?}");
+    // A reviewer rejects the pair.
+    resolve::decide(
+        &db,
+        first.id.as_str(),
+        MergeDecision::Reject,
+        Some("tester"),
+    )
+    .unwrap();
+    assert!(resolve::pending(&db).unwrap().is_empty());
+    // Later ingestion tilts provenance the other way: Acme Corp now leads.
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c2")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c3")).unwrap();
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    let repending = resolve::pending(&db).unwrap();
+    assert!(
+        repending.is_empty(),
+        "a rejected pair must not be re-proposed, but got {repending:?}"
+    );
+}
+
+/// A still-pending pair is not duplicated when a later resolution pass flips
+/// its keep/drop orientation: the same node pair appears at most once in
+/// the review queue, regardless of orientation.
+#[tokio::test]
+async fn pending_pair_is_not_duplicated_when_provenance_flips_orientation() {
+    let db = workspace();
+    let writer = writer_of(&db);
+    let node = |label: &str| NewNode {
+        label: label.to_owned(),
+        class_id: ClassId::from("acmeorg"),
+        properties: Properties::default(),
+        standing: Standing::Reviewed,
+    };
+    let chunk =
+        |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
+    let options = GraphOptions {
+        merge_threshold: 0.5,
+        auto_merge_threshold: -1.0,
+        ..GraphOptions::default()
+    };
+    let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
+    graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
+    let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
+    db.insert_chunk(&NewChunk {
+        id: &ChunkId::from("c3"),
+        document_id: &DocumentId::from("doc-1"),
+        chunk_index: 2,
+        content: "Acme Corp is an acme.",
+        heading: None,
+        page: None,
+        embedding: None,
+    })
+    .unwrap();
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    assert_eq!(resolve::pending(&db).unwrap().len(), 1);
+    // A second pass after provenance tilts the other way must not add a
+    // second row for the same pair in the swapped orientation.
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c2")).unwrap();
+    graph_store::add_provenance(&db, &acme_corp, &chunk("c3")).unwrap();
+    resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    let pending = resolve::pending(&db).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the same pair must not produce duplicate proposals, but got {pending:?}"
+    );
+}
+
 /// Deleting a document takes with it the nodes and edges only it
 /// supported (issue #43): a document's chunk provenance, then a table's
 /// row provenance when the document that loaded the table goes. What
@@ -662,6 +783,32 @@ fn paths_merges_and_listing(
             .get("aliases")
             .and_then(|a| a.as_array())
             .is_some_and(|a| a.len() == 1)
+    );
+    // The absorbed label is now an alias; entry-point lookup matches it the
+    // same way as the primary label — case- and whitespace-insensitively.
+    // The terminal never passes an embedder, so this is the path it takes.
+    assert!(
+        kept.properties
+            .aliases()
+            .contains(&String::from("Orgenics Ltd")),
+        "{:?}",
+        kept.properties.aliases()
+    );
+    assert_eq!(
+        traverse::resolve_entry(db, "orgenics ltd", None, None)
+            .unwrap()
+            .first()
+            .map(|n| n.label.as_str()),
+        Some(kept.label.as_str()),
+        "a case-differing alias resolves to the kept node"
+    );
+    assert_eq!(
+        traverse::resolve_entry(db, "ORGENICS  ltd", None, None)
+            .unwrap()
+            .first()
+            .map(|n| n.label.as_str()),
+        Some(kept.label.as_str()),
+        "a whitespace-differing alias resolves to the kept node"
     );
     assert!(graph_store::node(db, &proposal.drop.id).unwrap().is_none());
     assert_eq!(graph_store::status(db).unwrap().nodes, 7);
@@ -1068,5 +1215,137 @@ async fn a_missed_lookup_suggests_the_labels_that_exist() {
     assert!(
         suggestions.contains(&String::from("Kenya (country)")),
         "{suggestions:?}"
+    );
+}
+
+/// Entry-point lookup matches an alias the same way it matches a primary
+/// label: case- and whitespace-insensitively. Aliases are stored raw (the
+/// absorbed node's label, case and inner whitespace preserved), so a typed
+/// alias that differs only in casing or whitespace must still resolve — the
+/// terminal reproduces this unconditionally, since it never passes an
+/// embedder and so never reaches the embedding fallback.
+#[test]
+fn aliases_resolve_case_and_whitespace_insensitively_like_primary_labels() {
+    let db = workspace();
+    let node = |label: &str, class: &str, aliases: &[&str]| {
+        let mut properties = Properties::default();
+        if !aliases.is_empty() {
+            properties.set_aliases(
+                &aliases
+                    .iter()
+                    .copied()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from(label),
+                class_id: ClassId::from(String::from(class)),
+                properties,
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap()
+    };
+    // An abbreviation: the alias is textually divergent from the label, so
+    // `suggest_entities` (which scores against the *label*) cannot rescue it.
+    node("IBM", "vendor", &["International Business Machines"]);
+    // Token-sharing trading names (the auto-merge path would consider these),
+    // also divergent from the kept label.
+    node("Northwind Trading Co", "vendor", &["Pacific Trading Group"]);
+    // A node with no aliases, and a node of another class.
+    node("Acme", "vendor", &[]);
+    node("Kenya", "country", &["Republic of Kenya"]);
+
+    let label_of = |entity: &str, class: Option<&str>| -> String {
+        traverse::resolve_entry(&db, entity, class, None)
+            .unwrap()
+            .first()
+            .map(|n| n.label.clone())
+            .unwrap_or_default()
+    };
+
+    // Case-differing alias resolves, no embedder (the terminal's worst case).
+    assert_eq!(label_of("international business machines", None), "IBM");
+    // All-caps.
+    assert_eq!(label_of("INTERNATIONAL BUSINESS MACHINES", None), "IBM");
+    // Inner-whitespace collapse.
+    assert_eq!(label_of("International  Business   Machines", None), "IBM");
+    // Surrounding whitespace.
+    assert_eq!(label_of(" International Business Machines ", None), "IBM");
+    // Mixed-case alias of the token-sharing pair.
+    assert_eq!(
+        label_of("PaCiFiC TrAdInG GrOuP", None),
+        "Northwind Trading Co"
+    );
+    // A multi-word alias with case and whitespace differences.
+    assert_eq!(label_of("republic   of  KENYA", None), "Kenya");
+
+    // Exact-case alias still resolves (no regression on the alias arm).
+    assert_eq!(label_of("International Business Machines", None), "IBM");
+
+    // The class filter applies to the alias arm too: asking the country class
+    // for a vendor's alias finds nothing; asking the vendor class finds it.
+    assert!(
+        traverse::resolve_entry(
+            &db,
+            "International Business Machines",
+            Some("country"),
+            None
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(
+        label_of("international business machines", Some("vendor")),
+        "IBM"
+    );
+
+    // Primary labels still resolve case-insensitively (no regression on the
+    // label arm), and an alias of one class does not resolve another class's
+    // node.
+    assert_eq!(label_of("ibm", None), "IBM");
+    assert_eq!(
+        label_of("NORTHWIND TRADING CO", None),
+        "Northwind Trading Co"
+    );
+    assert_eq!(label_of("republic of kenya", Some("country")), "Kenya");
+    // The vendor's alias is not a country and vice versa.
+    assert!(
+        traverse::resolve_entry(&db, "Republic of Kenya", Some("vendor"), None)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A name that is neither a label nor an alias of any node resolves to
+    // nothing (no false positive), and one alias-bearing node does not pull in
+    // another: each alias resolves to exactly one node.
+    assert!(
+        traverse::resolve_entry(&db, "Nonexistent Corp", None, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        traverse::resolve_entry(&db, "pacific trading group", None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // With the case-differing alias now resolving directly, the suggestion
+    // fallback is not consulted for it; a *nonexistent* name still offers
+    // labels close to its spelling, and a divergent alias that resolves is
+    // not duplicated as a suggestion.
+    assert!(
+        traverse::suggest_entities(&db, "international business machines", None, None)
+            .unwrap()
+            .is_empty(),
+        "the alias resolves directly, so no suggestion is needed"
+    );
+    assert_eq!(
+        traverse::suggest_entities(&db, "Ibm", None, None).unwrap(),
+        ["IBM (vendor)"]
     );
 }

@@ -320,9 +320,16 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<MergeCount
             auto = auto.saturating_add(1);
             continue;
         }
+        // The pair, not the orientation: `keep`/`drop` is derived from the
+        // current provenance counts (`keep_and_drop`), which ingestion and
+        // prior merges can flip between passes, so the same node pair may
+        // re-enter the queue as `(drop, keep)`. Recognize it either way so a
+        // rejected or still-pending pair is not proposed a second time.
         let already: i64 = db.connection().query_row(
-            "SELECT count(*) FROM _quack_graph_merges WHERE keep_node_id = ? AND drop_node_id = ?",
-            duckdb::params![keep, drop],
+            "SELECT count(*) FROM _quack_graph_merges \
+             WHERE (keep_node_id = ? AND drop_node_id = ?) \
+                OR (keep_node_id = ? AND drop_node_id = ?)",
+            duckdb::params![keep, drop, drop, keep],
             |r| r.get(0),
         )?;
         if already > 0 {
