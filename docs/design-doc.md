@@ -1271,6 +1271,9 @@ stale rather than wrong: they are not searched, their chunks are found by keywor
 
 ### 10.2 Authentication
 
+`docs/authentication.md` is the operator's guide to both directions (signing in to quack,
+and quack authenticating to providers); this section and section 12 hold the design.
+
 Each provider has an `auth` mode: `none`, `api-key` (from the env var named by
 `api_key_env`), or `oauth` (an access token from an enterprise IdP used as the bearer for
 the provider endpoint; how Azure OpenAI and internal gateways are reached where static keys
@@ -1740,6 +1743,8 @@ roadmap and may never be built.
 
 ## 12. Server Auth, Roles, and Audit
 
+How to configure each way in is in `docs/authentication.md`.
+
 - `quack serve --local`: no auth, loopback only, single implicit user. For a laptop that
   wants the browser.
 - Otherwise, users in `control.db` with argon2id password hashes and a login form that sets
@@ -1782,8 +1787,10 @@ roadmap and may never be built.
   `iss` the issuer, `aud` the configured audience, and `exp` checked with a minute's leeway.
   A token without `scp` or `scope` is refused, since an ID token can carry the same `aud`.
   The token names its user through `subject_claim` (default `sub`; Entra deployments set
-  `oid`, since Entra's `sub` differs per application, and set the API's
-  `accessTokenAcceptedVersion` to 2 so its tokens carry the v2 issuer), found or created
+  `oid`, since Entra's `sub` differs per application, set the API's
+  `requestedAccessTokenVersion` (formerly `accessTokenAcceptedVersion`) to 2 so its tokens
+  carry the v2 issuer, and set `audience` to the API's client ID, which is what a v2.0
+  token's `aud` always is), found or created
   with no access as a sign-in would, and carries that user's own access (`Credential::
   IdentityProvider`, channel `api`). A refused token is audited as a denied `token`.
   `/.well-known/oauth-protected-resource` describes the server (`resource` is the origin
@@ -1972,7 +1979,7 @@ client_id = "..."
 redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's URL
 # client_secret_env = "QUACK_OIDC_SECRET"      # confidential client
 # scopes = ["openid", "profile", "email", "offline_access"]
-# audience = "api://quack"                     # accept the issuer's access tokens (RFC 9728)
+# audience = "api://quack"                     # accept the issuer's access tokens (RFC 9728); Entra: the API's client ID
 # subject_claim = "sub"                        # "oid" for Entra
 ```
 

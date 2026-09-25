@@ -364,4 +364,5 @@ everything and publishes nothing.
 
 `docs/architecture.md` maps the design to the modules; `docs/migrations.md`,
 `docs/crypto.md`, `docs/web-ui.md`, and `docs/ci-cd.md` cover the schema, TLS, web UI, and
-release layers (the table in `README.md`). Read the relevant one before changing that layer.
+release layers, and `docs/authentication.md` covers signing in to quack and quack
+authenticating to providers. Read the relevant one before changing that layer.
