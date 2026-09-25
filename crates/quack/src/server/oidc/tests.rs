@@ -243,7 +243,7 @@ impl Harness {
     /// Start a sign-in: the `state` and `nonce` the issuer was sent, and the
     /// state cookie the browser got.
     async fn start(&self) -> (String, String, String) {
-        let reply = self.get("/login/oidc", None).await;
+        let reply = self.get(OidcConfig::START_PATH, None).await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
         let query: HashMap<String, String> = reply
             .location
@@ -339,6 +339,13 @@ async fn a_first_sign_in_creates_a_user_with_no_access_and_a_session() {
     let login = h.get("/login", None).await;
     assert!(
         login.body.contains("Sign in with 127.0.0.1"),
+        "{}",
+        login.body
+    );
+    assert!(
+        login
+            .body
+            .contains(&format!("href=\"{}\"", OidcConfig::START_PATH)),
         "{}",
         login.body
     );
@@ -524,7 +531,7 @@ async fn without_oidc_there_is_no_button_and_no_route() {
     let router = crate::server::router(app);
     for (uri, status) in [
         ("/login", StatusCode::OK),
-        ("/login/oidc", StatusCode::NOT_FOUND),
+        (OidcConfig::START_PATH, StatusCode::NOT_FOUND),
     ] {
         let response = router
             .clone()

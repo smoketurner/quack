@@ -1719,11 +1719,11 @@ roadmap and may never be built.
   a session cookie; API tokens (`quack token create` or the admin UI) as bearer tokens
   scoped to a workspace with `read` / `write` / `admin` scopes.
 - **Sign-in through the organization's identity provider** (`[server.oidc]`, beside the
-  password form). The login page's "Sign in with <issuer>" goes to `GET /login/oidc`, which
+  password form). The login page's "Sign in with <issuer>" goes to `GET /auth/oidc`, which
   starts Authorization Code with PKCE, a `state`, and a `nonce`; the pending sign-in waits
   in memory for ten minutes (at most 10,000 at once), and an `HttpOnly` state cookie scoped
   to the callback ties the return to the browser that left, so a callback link someone else
-  started cannot sign this browser in. `GET /login/oidc/callback` exchanges the code, reads
+  started cannot sign this browser in. `GET /auth/oidc/callback` exchanges the code, reads
   the ID token straight from the token endpoint over TLS (OpenID Connect Core 3.1.3.7: no
   signature check, so no JWT library, but `iss`, `aud`, `azp`, `exp`, and the nonce are
   checked), and finds the user by `sub` (`oidc_subject`). A first sign-in creates the user
@@ -1937,7 +1937,7 @@ session_idle_minutes = 120              # ... or this long after its last reques
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
-redirect_uri = "https://quack.example.com/login/oidc/callback"   # this server's URL
+redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's URL
 # client_secret_env = "QUACK_OIDC_SECRET"      # confidential client
 # scopes = ["openid", "profile", "email", "offline_access"]
 # audience = "api://quack"                     # accept the issuer's access tokens (RFC 9728)

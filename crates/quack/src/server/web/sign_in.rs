@@ -1,5 +1,5 @@
-//! `GET /login/oidc` sends the browser to the issuer; the issuer sends it
-//! back to `GET /login/oidc/callback`, which opens a session.
+//! `GET /auth/oidc` sends the browser to the issuer; the issuer sends it
+//! back to `GET /auth/oidc/callback`, which opens a session.
 
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};

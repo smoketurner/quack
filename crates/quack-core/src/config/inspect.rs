@@ -1297,7 +1297,7 @@ top_k = 3
     fn every_oidc_key_has_a_setting_and_strays_are_named() {
         let inspection = inspect(
             "[server.oidc]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n\
-             client_secret_env = \"S\"\nredirect_uri = \"https://q/login/oidc/callback\"\n",
+             client_secret_env = \"S\"\nredirect_uri = \"https://q/auth/oidc/callback\"\n",
         );
         let listed: BTreeSet<String> = inspection.settings.iter().map(Setting::path).collect();
         for key in OIDC_KEYS {

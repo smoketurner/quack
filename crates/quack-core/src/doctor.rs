@@ -1309,7 +1309,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn sign_in_is_checked_for_its_secret_and_local_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let oidc = "[server.oidc]\nissuer_url = \"https://login.example.com\"\nclient_id = \"quack\"\nredirect_uri = \"https://q.example.com/login/oidc/callback\"\n";
+        let oidc = "[server.oidc]\nissuer_url = \"https://login.example.com\"\nclient_id = \"quack\"\nredirect_uri = \"https://q.example.com/auth/oidc/callback\"\n";
         let mut found = Vec::new();
         for extra in [
             "",

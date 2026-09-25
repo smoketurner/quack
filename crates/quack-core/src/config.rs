@@ -924,8 +924,11 @@ pub struct OidcConfig {
 }
 
 impl OidcConfig {
+    /// The route that starts a sign-in: the login page's button.
+    pub const START_PATH: &str = "/auth/oidc";
+
     /// The route that receives the issuer's redirect.
-    pub const CALLBACK_PATH: &str = "/login/oidc/callback";
+    pub const CALLBACK_PATH: &str = "/auth/oidc/callback";
 
     /// The claim that names a person when `subject_claim` is unset.
     pub const DEFAULT_SUBJECT_CLAIM: &str = "sub";
@@ -1930,7 +1933,7 @@ rerank = "model"
                 "[server.oidc]\nissuer_url = \"https://login.example.com/\"\nclient_id = \"quack\"\n{extra}"
             )
         };
-        let good = section("redirect_uri = \"https://quack.example.com/login/oidc/callback\"\n");
+        let good = section("redirect_uri = \"https://quack.example.com/auth/oidc/callback\"\n");
         let config = Config::parse(&good);
         let Ok(config) = config else {
             return assert!(config.is_ok(), "{config:?}");
@@ -1946,7 +1949,7 @@ rerank = "model"
         );
         assert!(Config::default().server.oidc.is_none());
         let entra = Config::parse(&section(
-            "redirect_uri = \"http://q:8080/login/oidc/callback\"\naudience = \" api://quack \"\nsubject_claim = \"oid\"\n",
+            "redirect_uri = \"http://q:8080/auth/oidc/callback\"\naudience = \" api://quack \"\nsubject_claim = \"oid\"\n",
         ));
         assert!(entra.is_ok_and(|c| {
             c.server.oidc.is_some_and(|o| {
@@ -1955,7 +1958,7 @@ rerank = "model"
                     && o.public_url() == "http://q:8080"
             })
         }));
-        let callback = "redirect_uri = \"https://q/login/oidc/callback\"\n";
+        let callback = "redirect_uri = \"https://q/auth/oidc/callback\"\n";
         assert!(
             err_of(&section(&format!("{callback}audience = \" \"\n")))
                 .contains("audience is empty")
@@ -1967,23 +1970,23 @@ rerank = "model"
 
         assert!(
             err_of(&section("redirect_uri = \"https://q/callback\"\n"))
-                .contains("ending in /login/oidc/callback")
+                .contains("ending in /auth/oidc/callback")
         );
         assert!(
-            err_of(&section("redirect_uri = \"ftp://q/login/oidc/callback\"\n"))
+            err_of(&section("redirect_uri = \"ftp://q/auth/oidc/callback\"\n"))
                 .contains("ending in")
         );
         assert!(err_of(&section("redirect_uri = \"not a url\"\n")).contains("is not a URL"));
         assert!(
             err_of(&section(
-                "redirect_uri = \"https://q/login/oidc/callback\"\nscopes = [\"email\"]\n"
+                "redirect_uri = \"https://q/auth/oidc/callback\"\nscopes = [\"email\"]\n"
             ))
             .contains("must include \"openid\"")
         );
-        assert!(err_of("[server.oidc]\nissuer_url = \" \"\nclient_id = \"c\"\nredirect_uri = \"https://q/login/oidc/callback\"\n").contains("needs issuer_url"));
+        assert!(err_of("[server.oidc]\nissuer_url = \" \"\nclient_id = \"c\"\nredirect_uri = \"https://q/auth/oidc/callback\"\n").contains("needs issuer_url"));
         assert!(
             err_of(&section(
-                "redirect_uri = \"https://q/login/oidc/callback\"\ntenant = \"t\"\n"
+                "redirect_uri = \"https://q/auth/oidc/callback\"\ntenant = \"t\"\n"
             ))
             .contains("tenant")
         );
