@@ -183,22 +183,46 @@ impl SourceUrl {
         }
     }
 
-    /// The URL with the password of its user info removed.
+    /// The URL with the password of its user info replaced by `***`.
+    ///
+    /// A real URL parser splits the user info from the host at the *last*
+    /// `@` before the path (RFC 3986), so a raw `@` inside the password no
+    /// longer leaks its suffix, and an `@` in the path or query of a URL
+    /// with no user info no longer inserts a spurious `:***`. URLs with no
+    /// user info (sqlite paths, plain `https://host/file`) are returned
+    /// verbatim, and anything `Url::parse` rejects is returned verbatim
+    /// too, so the redacted value is never a worse disclosure than the
+    /// input.
     #[must_use]
     pub fn redacted(&self) -> String {
         let url = self.0.as_str();
-        let Some((scheme, rest)) = url.split_once("://") else {
+        let Ok(mut parsed) = reqwest::Url::parse(url) else {
             return url.to_owned();
         };
-        let Some((userinfo, host)) = rest.split_once('@') else {
+        if parsed.username().is_empty() && parsed.password().is_none() {
+            // No credentials to redact: keep the URL verbatim so sqlite
+            // paths and `@`-in-path/query URLs are unchanged (the old
+            // first-`@` split corrupted the latter with a spurious `:***`).
             return url.to_owned();
-        };
-        let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
-        if user.is_empty() {
-            format!("{scheme}://{host}")
-        } else {
-            format!("{scheme}://{user}:***@{host}")
         }
+        // A real parser splits the user info from the host at the *last*
+        // `@` before the path (RFC 3986), and percent-encodes any raw `@`
+        // in the password, so the redaction below never confuses one with
+        // the other the way the old `split_once('@')` on the raw string did.
+        if parsed.username().is_empty() {
+            // `:password@` with no username: the old redaction dropped the
+            // whole user info. The rendered URL has exactly one authority
+            // `@`, so split there and keep the rest verbatim.
+            return drop_userinfo(parsed.as_str());
+        }
+        // Username present: replace the whole password with `***`. The
+        // parser already percent-encoded any `@` in it, so the marker
+        // supplants the entire value; `set_password` needs an authority and
+        // a username to succeed, both of which hold here.
+        if parsed.set_password(Some("***")).is_ok() {
+            return parsed.to_string();
+        }
+        url.to_owned()
     }
 
     /// The file a `sqlite:` URL names: the scheme and any `//` stripped,
@@ -222,6 +246,21 @@ impl SourceUrl {
             _ => false,
         }
     }
+}
+
+/// Drop the user info from a parsed URL's rendered form. `Url::parse`
+/// percent-encodes any `@` in the password, so the first `@` after the
+/// scheme is the one authority separator; everything up to it is the
+/// user info and is discarded, keeping the host, port, path, query, and
+/// fragment intact. Anything without that shape round-trips unchanged.
+fn drop_userinfo(rendered: &str) -> String {
+    let Some((scheme, rest)) = rendered.split_once("://") else {
+        return rendered.to_owned();
+    };
+    let Some((_userinfo, tail)) = rest.split_once('@') else {
+        return rendered.to_owned();
+    };
+    format!("{scheme}://{tail}")
 }
 
 /// What a source yielded, ready to load: the staging file's name and
@@ -660,6 +699,88 @@ mod tests {
         );
     }
 
+    /// A raw `@` in the password must not leak its suffix, an `@` in the
+    /// path or query of a URL with no user info must not gain a spurious
+    /// `:***`, and the empty-username `:password@` shape still drops the
+    /// whole user info.
+    #[test]
+    fn redaction_drops_the_whole_password_and_keeps_non_userinfo_urls() {
+        // Passwords carrying a raw `@`: the whole password is gone.
+        assert_eq!(
+            SourceUrl::from("postgres://user:p@ss@host/db").redacted(),
+            "postgres://user:***@host/db"
+        );
+        assert_eq!(
+            SourceUrl::from("postgres://user:p@ss@10.255.255.1:1/db").redacted(),
+            "postgres://user:***@10.255.255.1:1/db"
+        );
+        // A percent-encoded `@` already redacted correctly; it still does.
+        assert_eq!(
+            SourceUrl::from("postgres://user:p%40ss@host/db").redacted(),
+            "postgres://user:***@host/db"
+        );
+        // Username only: the marker password is inserted, as before.
+        assert_eq!(
+            SourceUrl::from("postgres://alice@db.local/sales").redacted(),
+            "postgres://alice:***@db.local/sales"
+        );
+        // Empty username with a password: the user info is dropped.
+        assert_eq!(
+            SourceUrl::from("postgres://:secret@host/db").redacted(),
+            "postgres://host/db"
+        );
+        assert_eq!(
+            SourceUrl::from("postgres://:p@ss@host/db").redacted(),
+            "postgres://host/db"
+        );
+        assert_eq!(
+            SourceUrl::from("postgres://:secret@[::1]:5432/db?x=1#f").redacted(),
+            "postgres://[::1]:5432/db?x=1#f"
+        );
+        // An `@` in the path or query with no user info is left untouched.
+        assert_eq!(
+            SourceUrl::from("https://example.com/data@2024/sales.csv").redacted(),
+            "https://example.com/data@2024/sales.csv"
+        );
+        assert_eq!(
+            SourceUrl::from("https://example.com/search?q=foo@bar").redacted(),
+            "https://example.com/search?q=foo@bar"
+        );
+        // No credentials and a non-special scheme round-trip verbatim,
+        // including a mixed-case scheme (no parser normalization here).
+        assert_eq!(
+            SourceUrl::from("SQLite:/tmp/x.db?mode=ro").redacted(),
+            "SQLite:/tmp/x.db?mode=ro"
+        );
+        assert_eq!(
+            SourceUrl::from("sqlite://a/b.db?x=1").redacted(),
+            "sqlite://a/b.db?x=1"
+        );
+    }
+
+    /// The redacted value holds none of the password and reparses to the
+    /// same host and path as the URL the import actually connects through.
+    #[expect(clippy::unwrap_used, reason = "test fixtures are known-good URLs")]
+    #[test]
+    fn redacted_url_reparses_to_the_same_host_with_no_password() {
+        for url in [
+            "postgres://user:p@ss@host/db",
+            "postgres://user:p@ss@10.255.255.1:1/db",
+            "postgres://alice:secret@db.local:5432/sales",
+            "postgres://:secret@host/db",
+            "postgres://:p@ss@host/db",
+        ] {
+            let red = SourceUrl::from(url).redacted();
+            assert!(!red.contains("secret"), "{url}: secret leaked into {red}");
+            assert!(!red.contains("p@ss"), "{url}: password leaked into {red}");
+            assert!(!red.contains("ss@"), "{url}: '@' suffix leaked into {red}");
+            let real = reqwest::Url::parse(url).unwrap();
+            let redacted = reqwest::Url::parse(&red).unwrap();
+            assert_eq!(real.host_str(), redacted.host_str(), "{url}: host changed");
+            assert_eq!(real.path(), redacted.path(), "{url}: path changed");
+        }
+    }
+
     #[test]
     fn queries_come_from_the_request_and_tables_are_checked() {
         let base = ImportRequest {
@@ -916,6 +1037,52 @@ mod tests {
             .map(|r| r.rows.len())
             .unwrap_or_default();
         assert_eq!(kept, 2);
+    }
+
+    /// A raw `@` in an HTTP import's password is masked out of the summary
+    /// source — the same value that becomes the document title and the
+    /// tracing-log field — while the download still reaches the host the
+    /// parser identifies (the owner may reach loopback), so the `ss@`
+    /// suffix the old first-`@` split leaked no longer lands anywhere.
+    #[tokio::test]
+    async fn an_http_import_with_a_raw_at_in_the_password_masks_the_source() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().to_path_buf();
+        let db = open_writer(&config);
+        let served = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nn,s\n1,a\n2,b\n3,c\n",
+        )
+        .await;
+        // `serve_once` returns `http://127.0.0.1:<port>/data.csv`; inject
+        // `user:p@ss@` userinfo so the password carries a raw `@`.
+        let tail = match served.strip_prefix("http://") {
+            Some(rest) => rest,
+            None => served.as_str(),
+        };
+        let url = format!("http://user:p@ss@{tail}");
+        let request = ImportRequest {
+            url: url.into(),
+            table: String::from("rows"),
+            query: None,
+            source_table: None,
+            limit: None,
+        };
+        let summary = Importing {
+            config: &config,
+            db: &db,
+            workspace_id: "ws",
+            request: &request,
+            policy: ImportPolicy::owner(),
+            embedder: None::<&Embeddings>,
+            control: RunControl::unobserved(),
+        }
+        .run()
+        .await
+        .unwrap_or_else(|e| no_import(&e.to_string()));
+        assert_eq!(summary.source, format!("http://user:***@{tail}"));
+        assert!(!summary.source.contains("ss@"), "{}", summary.source);
+        assert!(!summary.source.contains("p@ss"), "{}", summary.source);
     }
 
     #[expect(clippy::panic, reason = "test helper: a temp dir must exist")]
