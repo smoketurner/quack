@@ -169,8 +169,9 @@ silent refresh, and `Error::AuthRequired` (exit 4 from every command that reache
 A client with `client_auth = "private_key_jwt"` (a provider or `[server.oidc]`) signs a new ES256
 client assertion for every token-endpoint and PAR request with a vault-sealed P-256 key in
 `control.db` (`client_keys`, `llm::oauth::client_key`, one per issuer and client id; `quack auth
-jwks` prints it; `--rotate` stages a replacement under `next <issuer> <client_id>` and prints both,
-`--rotate --activate` swaps it in within one transaction), and a browser sign-in is pushed first (RFC 9126) whenever discovery lists a PAR endpoint.
+jwks` prints it; `--rotate` stages a replacement under `next <issuer> <client_id>` and gives the
+issuer both, `--rotate --activate` swaps it in within one transaction and gives the issuer the new
+key alone), and a browser sign-in is pushed first (RFC 9126) whenever discovery lists a PAR endpoint.
 `quack auth register` (`llm::oauth::registration`) registers one such client per issuer through
 RFC 7591 for every section there that leaves `client_id` out, keeps its `client_id`, sealed
 `registration_access_token`, and `registration_client_uri` in `control.db` (`client_registrations`,
@@ -178,8 +179,12 @@ named by the issuer), and those sections resolve their `client_id` from it at us
 the issuer's name until the id exists. At Vouch (or with `--sign-in`/`--device-code`) it
 first signs the person in through a temporary public client it registers and deletes again
 (`Registrar::register_signed_in`), so the registration's bearer is the person's own and Vouch
-records them as the owner; widening the client to the organization stays a manual console step. RFC 7592 then rotates the key (`jwks --rotate`, a full-metadata
-`PUT`, the stored key replaced only after the issuer accepts) and deletes the client (`unregister`).
+records them as the owner; widening the client to the organization stays a manual console step. Each
+temporary client stays recorded (sealed) until deleted, so an interrupted run leaves it deletable
+(the next run deletes it; `quack doctor` names it). An issuer that is not Vouch needs `--sign-in`,
+`--token-env`, or `--open`. RFC 7592 carries
+each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
+client (`unregister`).
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
 labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200 plus a `write_refused` SSE event, MCP structured

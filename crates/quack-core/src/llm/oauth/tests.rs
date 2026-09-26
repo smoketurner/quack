@@ -37,7 +37,7 @@ struct MockState {
     /// finishing its own refresh of the same token meanwhile.
     before_refusal: tokio::sync::Mutex<Option<BeforeRefusal>>,
     /// The public key registered for `client-1`'s `private_key_jwt`.
-    client_jwk: StdMutex<Option<PublicJwk>>,
+    client_jwk: StdMutex<Vec<PublicJwk>>,
     /// Every assertion `jti` accepted so far: the issuer spends them.
     spent: StdMutex<HashSet<String>>,
     /// Why each refused client assertion was refused.
@@ -60,6 +60,12 @@ struct MockState {
     management_requests: StdMutex<Vec<(String, String, String, String)>>,
     /// Refuse updates.
     update_fails: std::sync::atomic::AtomicBool,
+    /// Refuse deletes (RFC 7592 2.3) with a server error.
+    delete_fails: std::sync::atomic::AtomicBool,
+    /// Answer a device-code poll with `access_denied`: the person declined.
+    device_denied: std::sync::atomic::AtomicBool,
+    /// Refuse a registration (RFC 7591) that carries a bearer.
+    refuse_bearer_registrations: std::sync::atomic::AtomicBool,
     /// Issue a new registration access token with each update.
     rotate_registration_token: std::sync::atomic::AtomicBool,
 }
@@ -247,20 +253,31 @@ fn metadata(target: &str, base: &str, state: &MockState) -> (&'static str, Strin
 /// passes; the refusal otherwise.
 fn refuse_assertion(body: &str, base: &str, state: &MockState) -> Option<(&'static str, String)> {
     let assertion = form(body, "client_assertion")?;
-    let checked =
-        if form(body, "client_assertion_type").as_deref() != Some(client_key::ASSERTION_TYPE) {
-            Err(String::from("wrong client_assertion_type"))
-        } else if form(body, "client_id") != Some(expected_client(state)) {
-            Err(String::from("client_id missing or wrong"))
-        } else {
-            match (state.client_jwk.lock(), state.spent.lock()) {
-                (Ok(jwk), Ok(mut spent)) => jwk.as_ref().map_or_else(
-                    || Err(String::from("no key registered")),
-                    |jwk| verify(jwk, &assertion, &expected_client(state), base, &mut spent),
-                ),
-                _ => Err(String::from("mock state poisoned")),
+    let checked = if form(body, "client_assertion_type").as_deref()
+        != Some(client_key::ASSERTION_TYPE)
+    {
+        Err(String::from("wrong client_assertion_type"))
+    } else if form(body, "client_id") != Some(expected_client(state)) {
+        Err(String::from("client_id missing or wrong"))
+    } else {
+        match (state.client_jwk.lock(), state.spent.lock()) {
+            // Any key of the registered set, matched by `kid` as an
+            // issuer matches it: `verify` checks the `kid` before it
+            // spends the `jti`, so a key that does not match spends
+            // nothing.
+            (Ok(jwks), Ok(mut spent)) => {
+                let mut checked = Err(String::from("no key registered"));
+                for jwk in jwks.iter() {
+                    checked = verify(jwk, &assertion, &expected_client(state), base, &mut spent);
+                    if checked.is_ok() {
+                        break;
+                    }
+                }
+                checked
             }
-        };
+            _ => Err(String::from("mock state poisoned")),
+        }
+    };
     let why = checked.err()?;
     if let Ok(mut refused) = state.refused_assertions.lock() {
         refused.push(why);
@@ -284,13 +301,18 @@ fn expected_client(state: &MockState) -> String {
 /// The key a registration's `jwks` carries, which the mock then checks
 /// assertions against.
 fn registered_key(metadata: &serde_json::Value, state: &MockState) {
-    let jwk = metadata
+    let jwks: Vec<PublicJwk> = metadata
         .get("jwks")
         .and_then(|jwks| jwks.get("keys"))
-        .and_then(|keys| keys.get(0))
-        .and_then(|key| serde_json::from_value::<PublicJwk>(key.clone()).ok());
+        .and_then(serde_json::Value::as_array)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|key| serde_json::from_value::<PublicJwk>(key.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
     if let Ok(mut registered) = state.client_jwk.lock() {
-        *registered = jwk;
+        *registered = jwks;
     }
 }
 
@@ -308,6 +330,12 @@ fn register_client(
     }
     if let Ok(mut seen) = state.registration_requests.lock() {
         seen.push((authorization.to_owned(), parsed.clone()));
+    }
+    if !authorization.is_empty() && state.refuse_bearer_registrations.load(Ordering::SeqCst) {
+        return (
+            "400 Bad Request",
+            String::from("{\"error\":\"invalid_client_metadata\"}"),
+        );
     }
     let n = state
         .registrations
@@ -416,6 +444,10 @@ fn registration(
             clients.insert(id, (token, parsed));
             ("200 OK", answer)
         }
+        "DELETE" if state.delete_fails.load(Ordering::SeqCst) => (
+            "500 Internal Server Error",
+            String::from("{\"error\":\"server_error\"}"),
+        ),
         "DELETE" => {
             clients.remove(&id);
             ("204 No Content", String::new())
@@ -514,20 +546,7 @@ fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static s
                         ("200 OK", token_json(&format!("obo-{subject}-{n}"), None))
                     }
                 }
-                Some("urn:ietf:params:oauth:grant-type:device_code") => {
-                    let pending = state.pending_polls.load(Ordering::SeqCst);
-                    if pending > 0 {
-                        state
-                            .pending_polls
-                            .store(pending.saturating_sub(1), Ordering::SeqCst);
-                        (
-                            "400 Bad Request",
-                            String::from("{\"error\":\"authorization_pending\"}"),
-                        )
-                    } else {
-                        ("200 OK", token_json("device-access", None))
-                    }
-                }
+                Some("urn:ietf:params:oauth:grant-type:device_code") => device_token(state),
                 _ => (
                     "400 Bad Request",
                     String::from("{\"error\":\"unsupported_grant_type\"}"),
@@ -535,6 +554,27 @@ fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static s
             }
         }
         _ => ("404 Not Found", String::from("{}")),
+    }
+}
+
+/// The token endpoint's answer to a device-code poll.
+fn device_token(state: &MockState) -> (&'static str, String) {
+    let pending = state.pending_polls.load(Ordering::SeqCst);
+    if state.device_denied.load(Ordering::SeqCst) {
+        (
+            "400 Bad Request",
+            String::from("{\"error\":\"access_denied\"}"),
+        )
+    } else if pending > 0 {
+        state
+            .pending_polls
+            .store(pending.saturating_sub(1), Ordering::SeqCst);
+        (
+            "400 Bad Request",
+            String::from("{\"error\":\"authorization_pending\"}"),
+        )
+    } else {
+        ("200 OK", token_json("device-access", None))
     }
 }
 
@@ -1329,7 +1369,7 @@ async fn register_client_key(dir: &Path, idp: &MockIdp) -> PublicJwk {
         fail("no client key");
     };
     if let Ok(mut jwk) = idp.state.client_jwk.lock() {
-        *jwk = Some(key.jwk().clone());
+        *jwk = vec![key.jwk().clone()];
     }
     key.jwk().clone()
 }

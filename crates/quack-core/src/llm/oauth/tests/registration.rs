@@ -336,8 +336,11 @@ async fn a_client_without_a_registration_names_quack_auth_register() {
     }));
 }
 
+/// `--replace` registers the new client and keeps it before it deletes
+/// the old one, so a delete that fails leaves quack with the new client,
+/// never with none.
 #[tokio::test]
-async fn replace_deletes_the_old_client_first_and_keeps_only_the_new_key() {
+async fn replace_registers_the_new_client_first_then_deletes_the_old() {
     let idp = MockIdp::start().await;
     let dir = temp();
     let config = registered_config(dir.path(), &idp.issuer, "");
@@ -381,6 +384,24 @@ async fn replace_deletes_the_old_client_first_and_keeps_only_the_new_key() {
             .is_ok_and(|id| id == "client-2")
     );
 
+    // A delete the issuer refuses after the new client is kept: quack uses
+    // the new client and says the old one is left.
+    idp.state.delete_fails.store(true, Ordering::SeqCst);
+    let kept = register(&config, &registrar, &issuer, None, true).await;
+    assert!(
+        kept.as_ref().is_ok_and(|r| r.client_id == "client-3"
+            && matches!(&r.replaced, Some(Removal::Left { client_id, .. }) if client_id == "client-2")),
+        "{kept:?}"
+    );
+    assert!(
+        registrar
+            .keys()
+            .registration(&issuer)
+            .await
+            .is_ok_and(|r| r.is_some_and(|r| r.client_id == "client-3"))
+    );
+    idp.state.delete_fails.store(false, Ordering::SeqCst);
+
     // A client the issuer already forgot is no reason to stop.
     if let Ok(mut clients) = idp.state.clients.lock() {
         clients.clear();
@@ -389,15 +410,23 @@ async fn replace_deletes_the_old_client_first_and_keeps_only_the_new_key() {
     assert!(
         again.as_ref().is_ok_and(|r| r.replaced
             == Some(Removal::AlreadyGone {
-                client_id: String::from("client-2"),
+                client_id: String::from("client-3"),
                 status: 401
             })),
         "{again:?}"
     );
 }
 
+/// A registered client's key rotates as a client registered by hand does,
+/// with quack updating the issuer (RFC 7592) itself: `--rotate` puts the
+/// new key beside the one in use, and `--activate` signs with it and leaves
+/// the issuer holding it alone. Every assertion along the way is accepted.
 #[tokio::test]
-async fn rotation_sends_the_whole_registration_and_switches_keys_only_once_accepted() {
+#[expect(
+    clippy::too_many_lines,
+    reason = "three rotation steps checked against the issuer in one flow"
+)]
+async fn rotation_puts_both_keys_at_the_issuer_then_the_new_one_alone() {
     let idp = MockIdp::start().await;
     let dir = temp();
     let config = registered_config(dir.path(), &idp.issuer, &service_provider(&idp.issuer));
@@ -408,6 +437,7 @@ async fn rotation_sends_the_whole_registration_and_switches_keys_only_once_accep
             .await
             .is_ok()
     );
+    let client = ClientKeyName::new(&idp.issuer, "client-1");
     let original = stored_thumbprint(&config, "client-1", &idp.issuer).await;
     let login = |config: Config| async move {
         provider_manager(&config, "svc")
@@ -416,37 +446,44 @@ async fn rotation_sends_the_whole_registration_and_switches_keys_only_once_accep
     };
     assert!(login(config.clone()).await.is_ok(), "{:?}", refused(&idp));
 
-    // A refused update leaves the key in use.
+    // --rotate: the new key waits beside the one in use.
+    let keys = registrar.keys();
+    let (in_use, next) = keys
+        .stage_replacement(&client)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let mut both = next.jwks();
+    if let Some(in_use) = &in_use {
+        both.keys.insert(0, in_use.jwk().clone());
+    }
+    // A refused update leaves the issuer as it was.
     idp.state.update_fails.store(true, Ordering::SeqCst);
-    let refused_update = registrar.rotate(&issuer).await;
+    let refused_update = registrar.publish_keys(&issuer, &both).await;
     assert!(
         refused_update
             .as_ref()
             .is_err_and(|e| e.to_string().contains("invalid_client_metadata")),
         "{refused_update:?}"
     );
-    assert_eq!(
-        stored_thumbprint(&config, "client-1", &idp.issuer).await,
-        original
-    );
-    assert!(login(config.clone()).await.is_ok(), "{:?}", refused(&idp));
-
     idp.state.update_fails.store(false, Ordering::SeqCst);
     idp.state
         .rotate_registration_token
         .store(true, Ordering::SeqCst);
-    let rotated = registrar.rotate(&issuer).await;
-    let Ok(rotated) = rotated else {
-        fail(&format!("{rotated:?}"));
-    };
-    assert_eq!(rotated.old_thumbprint, original);
-    assert!(rotated.new_registration_token);
-    assert_ne!(Some(rotated.new_thumbprint.clone()), original);
+    let published = registrar.publish_keys(&issuer, &both).await;
+    assert!(
+        published.as_ref().is_ok_and(|p| p.new_registration_token),
+        "{published:?}"
+    );
+    assert_eq!(
+        stored_thumbprint(&config, "client-1", &idp.issuer).await,
+        original,
+        "the key in use stays in use"
+    );
+    assert!(login(config.clone()).await.is_ok(), "{:?}", refused(&idp));
 
     // The update read the registration back and sent all of it, with the
-    // client id and the new key, and none of the issuer's bookkeeping.
+    // client id and both keys, and none of the issuer's bookkeeping.
     let management = management_requests(&idp);
-    // The last update, the one accepted.
     let Some((_, _, auth, body)) = management.iter().rev().find(|(m, ..)| m == "PUT") else {
         fail(&format!("no update: {management:?}"));
     };
@@ -482,22 +519,22 @@ async fn rotation_sends_the_whole_registration_and_switches_keys_only_once_accep
     ] {
         assert!(sent.get(field).is_none(), "{field} is the issuer's");
     }
-    let new_kid = sent
-        .get("jwks")
-        .and_then(|j| j.get("keys"))
-        .and_then(|k| k.get(0))
-        .and_then(|k| k.get("kid"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    assert_eq!(new_kid.as_deref(), Some(rotated.new_thumbprint.as_str()));
-    assert_eq!(
-        stored_thumbprint(&config, "client-1", &idp.issuer).await,
-        Some(rotated.new_thumbprint.clone())
-    );
+    assert_eq!(sent.get("jwks"), serde_json::to_value(&both).ok().as_ref());
 
-    // The next assertion is signed with the new key, which is the only one
-    // the issuer now holds; the new registration token reads it back.
-    assert!(login(config.clone()).await.is_ok(), "{:?}", refused(&idp));
+    // --activate: quack signs with the new key, which the issuer accepts,
+    let active = keys
+        .activate_replacement(&client)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(active.thumbprint(), next.thumbprint());
+    let fresh = registered_config(dir.path(), &idp.issuer, &service_provider(&idp.issuer));
+    assert!(login(fresh.clone()).await.is_ok(), "{:?}", refused(&idp));
+
+    // and the issuer then holds it alone, still accepted; the rotated
+    // registration token reads the registration back.
+    let retired = registrar.publish_keys(&issuer, &active.jwks()).await;
+    assert!(retired.is_ok(), "{retired:?}");
+    assert!(login(fresh).await.is_ok(), "{:?}", refused(&idp));
     assert!(refused(&idp).is_empty(), "{:?}", refused(&idp));
     assert_eq!(
         registrar.read(&issuer).await.ok().flatten(),
@@ -549,29 +586,30 @@ async fn unregister_deletes_the_client_then_its_record_and_key() {
     assert!(registrar.unregister(&issuer).await.is_err());
 }
 
+/// A client named in the configuration (registered by hand) gets a key of
+/// its own: it never takes over the key waiting for a registration, which
+/// another client at the same issuer could otherwise claim.
 #[tokio::test]
-async fn a_client_registered_by_hand_takes_over_the_key_its_registration_carried() {
+async fn a_client_named_in_the_configuration_never_takes_the_pending_key() {
     let idp = MockIdp::start().await;
     let dir = temp();
     let config = registered_config(dir.path(), &idp.issuer, "");
     let issuer = RegistrationName::new(&idp.issuer);
     let registrar = registrar(&config);
-    // `quack auth register --print` made the key and printed the request.
-    let printed = registrar
+    let pending = registrar
         .pending_key(&issuer)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    // The operator registered it by hand and wrote the client id down.
     let keys = ClientKeys::new(&config, KeySource::File);
-    let adopted = keys
+    let by_hand = keys
         .key(&ClientKeyName::new(&idp.issuer, "by-hand"))
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(adopted.thumbprint(), printed.thumbprint());
+    assert_ne!(by_hand.thumbprint(), pending.thumbprint());
     assert!(
         keys.existing(&ClientKeyName::pending(&idp.issuer))
             .await
-            .is_ok_and(|k| k.is_none())
+            .is_ok_and(|k| k.is_some_and(|k| k.thumbprint() == pending.thumbprint()))
     );
 }
 
@@ -695,6 +733,10 @@ async fn quack_config_shows_the_registered_client_id_and_where_it_came_from() {
 /// temporary client is deleted last, since deleting a client can end the
 /// sign-ins made through it.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the whole signed-in registration, end to end"
+)]
 async fn a_signed_in_registration_uses_the_persons_token_then_deletes_the_sign_in_client() {
     let idp = MockIdp::start().await;
     let dir = temp();
@@ -724,6 +766,14 @@ async fn a_signed_in_registration_uses_the_persons_token_then_deletes_the_sign_i
         .unwrap_or_else(|e| fail(&e.to_string()));
 
     assert_eq!(done.registered.client_id, "client-2");
+    assert!(done.earlier.is_empty());
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l.is_empty()),
+        "the temporary client's record is gone with it"
+    );
     assert_eq!(
         done.temporary,
         TemporaryClient::Deleted {
@@ -752,6 +802,20 @@ async fn a_signed_in_registration_uses_the_persons_token_then_deletes_the_sign_i
         ])
     );
     assert!(sign_in_client.get("jwks").is_none());
+    assert_eq!(sign_in_client["application_type"], "native");
+    let redirect = sign_in_client
+        .get("redirect_uris")
+        .and_then(|uris| uris.get(0))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        redirect.starts_with("http://127.0.0.1:") && redirect.ends_with("/callback"),
+        "{redirect}"
+    );
+    assert!(
+        !redirect.contains(":19876/"),
+        "a free port, not the one `quack auth login` uses"
+    );
     // quack's client: the person's token as the bearer, quack's key.
     assert_eq!(second_auth, "Bearer device-access");
     assert_eq!(
@@ -828,4 +892,209 @@ async fn a_signed_in_registration_over_an_existing_client_is_refused_before_sign
         "an existing registration needs --replace"
     );
     assert_eq!(registration_requests(&idp).len(), 1, "no temporary client");
+}
+
+/// Sign in for a registration at `issuer` with the device-code flow, the
+/// prompts dropped.
+async fn sign_in_and_register(
+    registrar: &Registrar,
+    issuer: &RegistrationName,
+    metadata: &ClientMetadata,
+) -> Result<crate::llm::oauth::registration::SignedInRegistration> {
+    registrar
+        .register_signed_in(
+            issuer,
+            metadata,
+            false,
+            SignInWith {
+                flow: LoginFlow::DeviceCode,
+                key_source: KeySource::File,
+                notify: &|_| {},
+            },
+        )
+        .await
+}
+
+fn deleted(idp: &MockIdp, client_id: &str) -> bool {
+    management_requests(idp)
+        .iter()
+        .any(|(m, path, ..)| m == "DELETE" && *path == format!("/register/{client_id}"))
+}
+
+/// A sign-in the person declines still deletes the temporary client, and
+/// registers nothing else.
+#[tokio::test]
+async fn a_declined_sign_in_still_deletes_the_temporary_client() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let config = registered_config(dir.path(), &idp.issuer, "");
+    let issuer = RegistrationName::new(&idp.issuer);
+    let registrar = registrar(&config);
+    let metadata = metadata(&config, &registrar, &issuer).await;
+    idp.state.device_denied.store(true, Ordering::SeqCst);
+
+    let declined = sign_in_and_register(&registrar, &issuer, &metadata).await;
+    assert!(declined.is_err(), "{declined:?}");
+    assert_eq!(
+        registration_requests(&idp).len(),
+        1,
+        "only the temporary client"
+    );
+    assert!(deleted(&idp, "client-1"));
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l.is_empty())
+    );
+    assert!(
+        registrar
+            .keys()
+            .registration(&issuer)
+            .await
+            .is_ok_and(|r| r.is_none())
+    );
+}
+
+/// A registration the issuer refuses after the sign-in still deletes the
+/// temporary client.
+#[tokio::test]
+async fn a_refused_registration_still_deletes_the_temporary_client() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let config = registered_config(dir.path(), &idp.issuer, "");
+    let issuer = RegistrationName::new(&idp.issuer);
+    let registrar = registrar(&config);
+    let metadata = metadata(&config, &registrar, &issuer).await;
+    idp.state
+        .refuse_bearer_registrations
+        .store(true, Ordering::SeqCst);
+
+    let refused_registration = sign_in_and_register(&registrar, &issuer, &metadata).await;
+    assert!(
+        refused_registration
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("invalid_client_metadata")),
+        "{refused_registration:?}"
+    );
+    assert_eq!(registration_requests(&idp).len(), 2);
+    assert!(deleted(&idp, "client-1"));
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l.is_empty())
+    );
+}
+
+/// A temporary client the issuer would not delete stays recorded, so
+/// `quack doctor` names it and the next `quack auth register` deletes it
+/// and reports it.
+#[tokio::test]
+async fn a_temporary_client_left_behind_is_recorded_and_deleted_later() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let config = registered_config(dir.path(), &idp.issuer, "");
+    let issuer = RegistrationName::new(&idp.issuer);
+    let registrar = registrar(&config);
+    let metadata = metadata(&config, &registrar, &issuer).await;
+    idp.state.device_denied.store(true, Ordering::SeqCst);
+    idp.state.delete_fails.store(true, Ordering::SeqCst);
+
+    assert!(
+        sign_in_and_register(&registrar, &issuer, &metadata)
+            .await
+            .is_err()
+    );
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l == ["client-1"]),
+        "the record survives a refused delete"
+    );
+    // `quack doctor` names it, with the command that deletes it.
+    let control = ControlPlane::open(&config)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let mut report = Report::default();
+    crate::doctor::check_registrations(
+        &mut report,
+        &config,
+        Some(&control),
+        Probing::Offline,
+        KeySource::File,
+    )
+    .await;
+    assert!(
+        auth_checks(&report)
+            .iter()
+            .any(|(status, summary, fix)| *status == Status::Warn
+                && summary.contains("temporary sign-in client client-1")
+                && fix
+                    .as_deref()
+                    .is_some_and(|f| f.contains("quack auth register --issuer"))),
+        "{:?}",
+        auth_checks(&report)
+    );
+    // Another left behind: each keeps a record of its own.
+    assert!(
+        sign_in_and_register(&registrar, &issuer, &metadata)
+            .await
+            .is_err()
+    );
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l == ["client-1", "client-2"])
+    );
+
+    // The next `quack auth register` deletes them once the issuer deletes
+    // again.
+    idp.state.delete_fails.store(false, Ordering::SeqCst);
+    let cleaned = registrar.clean_up_sign_in(&issuer).await;
+    assert_eq!(
+        cleaned.ok(),
+        Some(vec![
+            TemporaryClient::Deleted {
+                client_id: String::from("client-1")
+            },
+            TemporaryClient::Deleted {
+                client_id: String::from("client-2")
+            },
+        ])
+    );
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l.is_empty())
+    );
+
+    // The next signed-in registration deletes one left before it, and says so.
+    idp.state.delete_fails.store(true, Ordering::SeqCst);
+    assert!(
+        sign_in_and_register(&registrar, &issuer, &metadata)
+            .await
+            .is_err()
+    );
+    idp.state.delete_fails.store(false, Ordering::SeqCst);
+    idp.state.device_denied.store(false, Ordering::SeqCst);
+    let done = sign_in_and_register(&registrar, &issuer, &metadata).await;
+    let Ok(done) = done else {
+        fail(&format!("{done:?}"));
+    };
+    assert_eq!(
+        done.earlier,
+        vec![TemporaryClient::Deleted {
+            client_id: String::from("client-3")
+        }]
+    );
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l.is_empty())
+    );
 }

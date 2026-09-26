@@ -398,16 +398,15 @@ enum AuthAction {
         /// [server.oidc] sign-in client
         provider: Option<String>,
 
-        /// Replace the key: a client quack registered is updated at the
-        /// issuer (RFC 7592) and switches at once; for any other client,
-        /// print the current and new keys to register, then run again with
-        /// --activate
+        /// Replace the key, in two runs: --rotate makes a new key and puts
+        /// it beside the key in use at the issuer (itself, for a client
+        /// quack registered; printed to register by hand otherwise)
         #[arg(long)]
         rotate: bool,
 
-        /// With --rotate, for a client registered by hand: sign with the
-        /// new key from now on, once the issuer holds it, and delete the old
-        /// one (restart `quack serve`)
+        /// With --rotate, once the issuer holds both keys: sign with the new
+        /// key and leave the issuer holding it alone (then restart `quack
+        /// serve`)
         #[arg(long, requires = "rotate")]
         activate: bool,
     },
@@ -1052,6 +1051,13 @@ async fn run_register(config: &Config, args: auth_cli::RegisterArgs) -> Result<(
         auth_cli::SignInWith {
             browser: browser_can_open(),
             notify: &show_login_prompt,
+            interrupt: Box::pin(async {
+                // A signal handler that cannot be installed must not read as
+                // an interruption.
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }),
         },
     )
     .await
@@ -1143,7 +1149,10 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             provider,
             rotate,
             activate,
-        } => auth_cli::run_jwks(config, provider.as_deref(), rotate, activate).await?,
+        } => {
+            let step = auth_cli::Step::of(rotate, activate);
+            auth_cli::run_jwks(config, provider.as_deref(), step).await?;
+        }
         AuthAction::Register(args) => run_register(config, args).await?,
         AuthAction::Unregister { issuer, yes } => {
             auth_cli::run_unregister(config, issuer.as_deref(), Confirm::Ask.or_yes(yes)).await?;
