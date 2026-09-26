@@ -167,8 +167,9 @@ enum Commands {
     /// and definitions for the agent)
     Context(ContextArgs),
 
-    /// Log in to an OAuth provider, show token state, forget a token, or
-    /// print a client's public key set
+    /// Log in to an OAuth provider, show token state, forget a token, print
+    /// or rotate a client's public key set, or register a client with the
+    /// issuer
     #[command(subcommand)]
     Auth(AuthAction),
 
@@ -395,6 +396,34 @@ enum AuthAction {
         /// Provider name from [providers.NAME]; without one, the
         /// [server.oidc] sign-in client
         provider: Option<String>,
+
+        /// Replace the key: a client quack registered is updated at the
+        /// issuer (RFC 7592) and switches at once; for any other client,
+        /// print the current and new keys to register, then run again with
+        /// --activate
+        #[arg(long)]
+        rotate: bool,
+
+        /// With --rotate, for a client registered by hand: sign with the
+        /// new key from now on, once the issuer holds it
+        #[arg(long, requires = "rotate")]
+        activate: bool,
+    },
+    /// Register one private-key-JWT client with the issuer (RFC 7591) for
+    /// every [server.oidc] and [providers.NAME.oauth] section there that
+    /// names no client id
+    Register(auth_cli::RegisterArgs),
+    /// Delete the client quack registered at the issuer (RFC 7592), then
+    /// its registration and key
+    Unregister {
+        /// The issuer; by default the one the sections without a client id
+        /// share
+        #[arg(long)]
+        issuer: Option<String>,
+
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1092,12 +1121,17 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             writeln!(out, "Logged out of '{provider}'.")?;
             out.flush()?;
         }
-        AuthAction::Jwks { provider } => {
-            let jwks =
-                auth_cli::client_jwks(config, provider.as_deref(), KeySource::Keychain).await?;
-            let mut out = stdout.lock();
-            writeln!(out, "{}", serde_json::to_string_pretty(&jwks)?)?;
-            out.flush()?;
+        AuthAction::Jwks {
+            provider,
+            rotate,
+            activate,
+        } => auth_cli::run_jwks(config, provider.as_deref(), rotate, activate).await?,
+        AuthAction::Register(args) => {
+            let confirm = Confirm::Ask.or_yes(args.yes);
+            auth_cli::run_register(config, args, confirm).await?;
+        }
+        AuthAction::Unregister { issuer, yes } => {
+            auth_cli::run_unregister(config, issuer.as_deref(), Confirm::Ask.or_yes(yes)).await?;
         }
     }
     Ok(())
