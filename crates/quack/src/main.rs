@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
+mod auth_cli;
 mod config_cli;
 mod confirm;
 mod doctor_cli;
@@ -21,7 +22,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::inspect::SettingFilter;
-use quack_core::config::{ClientAuth, Config, Grant};
+use quack_core::config::{Config, Grant};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
@@ -29,7 +30,6 @@ use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
-use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwks};
 use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager};
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
@@ -647,7 +647,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             command.run(&config, cli.workspace.as_deref()).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Config(args) => run_config(&args),
+        Commands::Config(args) => run_config(&args).await,
         Commands::Doctor(args) => run_doctor(cli, &args).await,
         Commands::Docs(args) => {
             let ws_db = open_workspace(cli).await?;
@@ -660,9 +660,13 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
 /// `quack config`: what this binary makes of `config.toml`. It reads the
 /// file outside `Config::load`, so it reports a file every other command
 /// refuses rather than failing the same way, and says so in its status.
-fn run_config(args: &ConfigArgs) -> Result<ExitCode> {
+async fn run_config(args: &ConfigArgs) -> Result<ExitCode> {
     init_logging();
-    let inspection = config::inspect::Inspection::load();
+    let mut inspection = config::inspect::Inspection::load();
+    // A client_id the file leaves out comes from its registration.
+    if let Err(e) = inspection.resolve_registered().await {
+        tracing::warn!(error = %e, "cannot read the registered OAuth clients from control.db");
+    }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let filter = if args.changed {
@@ -1067,13 +1071,14 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
                 let manager = TokenManager::for_provider(config, name)?;
                 let status = manager.status().await?;
                 let state = token_state(name, status.token, manager.grant(), manager.sends_actor());
-                let key = client_key_state(config, Some(name), KeySource::Keychain)
+                let key = auth_cli::client_key_state(config, Some(name), KeySource::Keychain)
                     .await?
                     .map_or(String::new(), |key| format!("; {key}"));
                 writeln!(out, "{name}: {state} (key in {}){key}", status.key_location)?;
             }
             if provider.is_none()
-                && let Some(key) = client_key_state(config, None, KeySource::Keychain).await?
+                && let Some(key) =
+                    auth_cli::client_key_state(config, None, KeySource::Keychain).await?
             {
                 writeln!(out, "[server.oidc] sign-in: {key}")?;
             }
@@ -1088,7 +1093,8 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             out.flush()?;
         }
         AuthAction::Jwks { provider } => {
-            let jwks = client_jwks(config, provider.as_deref(), KeySource::Keychain).await?;
+            let jwks =
+                auth_cli::client_jwks(config, provider.as_deref(), KeySource::Keychain).await?;
             let mut out = stdout.lock();
             writeln!(out, "{}", serde_json::to_string_pretty(&jwks)?)?;
             out.flush()?;
@@ -1131,76 +1137,6 @@ fn token_state(
             "acts on behalf of each person signed in to quack serve; nothing to log in to",
         ),
     }
-}
-
-/// The client `quack auth jwks [PROVIDER]` names: the provider's OAuth
-/// client, or without one the `[server.oidc]` sign-in client. Its key name
-/// and how it authenticates.
-fn named_client(config: &Config, provider: Option<&str>) -> Result<(ClientKeyName, ClientAuth)> {
-    if let Some(name) = provider {
-        let oauth = config
-            .providers
-            .get(name)
-            .and_then(|p| p.auth.oauth())
-            .ok_or_else(|| anyhow::anyhow!("'{name}' is not a provider with auth = \"oauth\""))?;
-        return Ok((
-            ClientKeyName::new(&oauth.issuer_url, &oauth.client_id),
-            oauth.client_auth,
-        ));
-    }
-    let oidc = config.server.oidc.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "[server.oidc] is not configured; name a provider: `quack auth jwks PROVIDER`"
-        )
-    })?;
-    Ok((
-        ClientKeyName::new(&oidc.issuer_url, &oidc.client_id),
-        oidc.client_auth,
-    ))
-}
-
-/// The public key set of the client's `private_key_jwt` key, made and
-/// stored when there is none yet.
-async fn client_jwks(
-    config: &Config,
-    provider: Option<&str>,
-    key_source: KeySource,
-) -> Result<PublicJwks> {
-    let (name, auth) = named_client(config, provider)?;
-    if auth != ClientAuth::PrivateKeyJwt {
-        let section = provider.map_or_else(
-            || String::from("[server.oidc]"),
-            |p| format!("[providers.{p}.oauth]"),
-        );
-        anyhow::bail!(
-            "{section} authenticates with client_auth = \"{auth}\"; set client_auth = \"private_key_jwt\" to sign with a key"
-        );
-    }
-    let key = ClientKeys::new(config, key_source).key(&name).await?;
-    Ok(key.jwks())
-}
-
-/// What `quack auth status` says about a client's `private_key_jwt` key:
-/// its thumbprint, or that none is made yet. Nothing for other clients.
-async fn client_key_state(
-    config: &Config,
-    provider: Option<&str>,
-    key_source: KeySource,
-) -> Result<Option<String>> {
-    let (name, auth) = named_client(config, provider)?;
-    if auth != ClientAuth::PrivateKeyJwt {
-        return Ok(None);
-    }
-    let command = provider.map_or_else(
-        || String::from("quack auth jwks"),
-        |p| format!("quack auth jwks {p}"),
-    );
-    Ok(Some(
-        match ClientKeys::new(config, key_source).existing(&name).await? {
-            Some(key) => format!("client key {}", key.thumbprint()),
-            None => format!("no client key yet; `{command}` makes one"),
-        },
-    ))
 }
 
 /// Print what the user must do for a login step. The browser prompt also
@@ -1847,7 +1783,6 @@ mod tests {
     use super::*;
     use quack_core::embedding::Dimension;
     use quack_core::error::AuthReason;
-    use quack_core::llm::oauth::client_key::PublicJwk;
     use quack_core::storage::workspace::NewDocument;
 
     /// A closed reader surfaces as an `io::Error`, a `serde_json` or `csv`
@@ -1914,84 +1849,6 @@ mod tests {
         assert!(auth_exit_code(&anyhow::Error::from(auth()).context("import failed")).is_some());
         assert!(auth_exit_code(&anyhow::anyhow!(auth().to_string())).is_none());
         assert!(auth_exit_code(&anyhow::anyhow!("something else")).is_none());
-    }
-
-    /// `quack auth jwks` for a provider and for `[server.oidc]` registered as
-    /// the same Vouch client: one key, printed as a set an issuer reads.
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    #[expect(clippy::indexing_slicing, reason = "test: JSON indexing yields Null")]
-    async fn auth_jwks_prints_the_shared_client_key_as_a_jwk_set() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = "[server.oidc]\nissuer_url = \"https://us.vouch.sh\"\nclient_id = \"quack\"\n\
-                    client_auth = \"private_key_jwt\"\nredirect_uri = \"https://q.example.com/auth/oidc/callback\"\n\
-                    [providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example.com/v1\"\nauth = \"oauth\"\n\
-                    [providers.gw.oauth]\nissuer_url = \"https://us.vouch.sh/\"\nclient_id = \"quack\"\n\
-                    client_auth = \"private_key_jwt\"\ngrant = \"on-behalf-of\"\nactor = false\n\
-                    [providers.plain]\ntype = \"openai\"\nbase_url = \"https://p.example.com/v1\"\nauth = \"oauth\"\n\
-                    [providers.plain.oauth]\nissuer_url = \"https://us.vouch.sh\"\nclient_id = \"other\"\n";
-        let mut config = Config::parse(toml).unwrap();
-        config.general.data_dir = dir.path().to_path_buf();
-
-        assert!(
-            client_key_state(&config, Some("gw"), KeySource::File)
-                .await
-                .unwrap()
-                .is_some_and(|s| s.contains("quack auth jwks gw"))
-        );
-        let printed = serde_json::to_string_pretty(
-            &client_jwks(&config, None, KeySource::File).await.unwrap(),
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&printed).unwrap();
-        let keys = parsed["keys"].as_array().unwrap();
-        assert_eq!(keys.len(), 1);
-        let jwk: PublicJwk = serde_json::from_value(keys[0].clone()).unwrap();
-        assert_eq!(
-            (
-                jwk.kty.as_str(),
-                jwk.crv.as_str(),
-                jwk.use_.as_str(),
-                jwk.alg.as_str()
-            ),
-            ("EC", "P-256", "sig", "ES256")
-        );
-        assert_eq!(keys[0]["use"], "sig");
-        // The stored key is the printed one, and the provider shares it.
-        let stored = ClientKeys::new(&config, KeySource::File)
-            .existing(&ClientKeyName::new("https://us.vouch.sh", "quack"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.thumbprint(), jwk.kid);
-        assert_eq!(stored.jwk(), &jwk);
-        let provider = client_jwks(&config, Some("gw"), KeySource::File)
-            .await
-            .unwrap();
-        assert_eq!(provider.keys, vec![jwk.clone()]);
-        assert_eq!(
-            client_key_state(&config, Some("gw"), KeySource::File)
-                .await
-                .unwrap(),
-            Some(format!("client key {}", jwk.kid))
-        );
-        // A client without private_key_jwt has no key to print.
-        let err = client_jwks(&config, Some("plain"), KeySource::File)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("client_secret_post"), "{err}");
-        assert!(
-            client_key_state(&config, Some("plain"), KeySource::File)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            client_jwks(&config, Some("nope"), KeySource::File)
-                .await
-                .is_err()
-        );
     }
 
     #[test]

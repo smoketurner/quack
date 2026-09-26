@@ -298,6 +298,8 @@ pub struct SignIn {
     config: OidcConfig,
     /// The key `client_auth = "private_key_jwt"` signs with.
     client_keys: ClientKeys,
+    /// The configured `client_id`, or the registered client's, read once.
+    client_id: OnceCell<String>,
     http: OAuthHttp,
     endpoints: OnceCell<Endpoints>,
     /// The issuer's signing keys, for access tokens presented as bearers.
@@ -352,6 +354,7 @@ impl SignIn {
         Ok(Self {
             config,
             client_keys,
+            client_id: OnceCell::new(),
             http: OAuthHttp::new()?,
             endpoints: OnceCell::new(),
             keys: RwLock::new(None),
@@ -403,6 +406,32 @@ impl SignIn {
             .map_err(sign_in_error)
     }
 
+    /// The sign-in client's id: the configured `client_id`, else the one
+    /// `quack auth register` registered for the issuer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming `quack auth register` when neither
+    /// exists, or an error reading the registration.
+    pub async fn client_id(&self) -> Result<&str> {
+        self.client_id
+            .get_or_try_init(|| async {
+                match &self.config.client_id {
+                    Some(id) => Ok(id.clone()),
+                    // Boxed: this sits inside every renewal's future.
+                    None => {
+                        Box::pin(
+                            self.client_keys
+                                .registered_client_id(&self.config.issuer_url, "[server.oidc]"),
+                        )
+                        .await
+                    }
+                }
+            })
+            .await
+            .map(String::as_str)
+    }
+
     /// How quack authenticates as the sign-in client: its key's assertions,
     /// its secret, or nothing but its `client_id`.
     async fn credential(&self) -> Result<Credential> {
@@ -421,7 +450,7 @@ impl SignIn {
         Credential::of(
             credential::Registration {
                 auth: self.config.client_auth,
-                client_id: &self.config.client_id,
+                client_id: self.client_id().await?,
                 issuer_url: &self.config.issuer_url,
                 audience: audience.as_deref(),
                 secret,
@@ -439,7 +468,7 @@ impl SignIn {
         let parse = |what: &str, url: &str| {
             Url::parse(url).map_err(|e| sign_in_error(format!("{what} '{url}' is not a URL: {e}")))
         };
-        let mut client = UnconfiguredClient::new(ClientId::new(self.config.client_id.clone()))
+        let mut client = UnconfiguredClient::new(ClientId::new(self.client_id().await?.to_owned()))
             .set_auth_type(credential.auth_type())
             .set_auth_uri(AuthUrl::from_url(parse(
                 "authorization_endpoint",
@@ -491,7 +520,7 @@ impl SignIn {
                     .push_authorization(
                         pushed,
                         &endpoints.authorization,
-                        &self.config.client_id,
+                        self.client_id().await?,
                         &credential,
                         &params,
                     )
@@ -539,7 +568,7 @@ impl SignIn {
         let claims = Claims::of(id_token)?;
         claims.check(
             &issuer,
-            &self.config.client_id,
+            self.client_id().await?,
             &pending.nonce,
             Timestamp::now(),
         )?;

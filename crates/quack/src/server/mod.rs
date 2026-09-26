@@ -39,6 +39,7 @@ use oidc::Oidc;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::KeySource;
 use quack_core::llm::oauth::client_key::ClientKeys;
+use quack_core::llm::oauth::registration::{ClientSection, registered_sections};
 use quack_core::storage::control::ControlPlane;
 use quack_core::vault::Vault;
 use state::{App, AppState, ServeMode};
@@ -338,6 +339,18 @@ pub(crate) async fn serve(
         tracing::warn!(
             "no users exist; nobody can log in until `quack user add NAME --admin` runs"
         );
+    }
+    // A client without a client_id takes its registered one; without a
+    // registration it would fail on first use, so fail here instead.
+    let client_keys = ClientKeys::with_control(&config, KeySource::Keychain, control.clone());
+    for registered in registered_sections(&config) {
+        if mode == ServeMode::Local && registered.section == ClientSection::SignIn {
+            continue;
+        }
+        let client_id = client_keys
+            .registered_client_id(registered.issuer.as_str(), &registered.section.to_string())
+            .await?;
+        tracing::info!(section = %registered.section, issuer = %registered.issuer, client_id, "using the registered OAuth client");
     }
     let oidc = match (&config.server.oidc, mode) {
         (Some(oidc), ServeMode::Login) => Some(

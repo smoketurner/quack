@@ -16,6 +16,7 @@ pub mod client_key;
 pub(crate) mod credential;
 mod key_slot;
 mod keychain;
+pub mod registration;
 mod store;
 mod token;
 
@@ -98,6 +99,10 @@ pub(crate) struct Endpoints {
     pub(crate) jwks_uri: Option<String>,
     /// The grants the issuer supports, when it says.
     pub(crate) grant_types_supported: Option<Vec<String>>,
+    /// Where a client registers itself (RFC 7591), when the issuer takes
+    /// registrations.
+    #[serde(rename = "registration_endpoint")]
+    pub(crate) registration: Option<String>,
     /// Whether every authorization redirect carries `iss` (RFC 9207).
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
@@ -484,6 +489,8 @@ pub struct TokenManager {
     store: ProviderTokens,
     /// The key `client_auth = "private_key_jwt"` signs with.
     client_keys: ClientKeys,
+    /// The configured `client_id`, or the registered client's, read once.
+    client_id: OnceCell<String>,
     http: OAuthHttp,
     endpoints: OnceCell<Endpoints>,
     current: RwLock<Option<CachedToken>>,
@@ -567,6 +574,7 @@ impl TokenManager {
             config: oauth,
             store: ProviderTokens::new(config, provider, key_source),
             client_keys: ClientKeys::new(config, key_source),
+            client_id: OnceCell::new(),
             http: OAuthHttp::new()?,
             endpoints: OnceCell::new(),
             current: RwLock::new(None),
@@ -818,7 +826,7 @@ impl TokenManager {
                     .push_authorization(
                         pushed,
                         &endpoints.authorization,
-                        &self.config.client_id,
+                        self.client_id().await?,
                         &credential,
                         &params,
                     )
@@ -1053,7 +1061,12 @@ impl TokenManager {
         }
         let (status, body) = self
             .http
-            .post_form(&endpoints.token, &self.config.client_id, &credential, &form)
+            .post_form(
+                &endpoints.token,
+                self.client_id().await?,
+                &credential,
+                &form,
+            )
             .await?;
         if status.is_success() {
             let response: BasicTokenResponse = serde_json::from_slice(&body).map_err(|e| {
@@ -1071,6 +1084,32 @@ impl TokenManager {
         )))
     }
 
+    /// The client quack is at the issuer: the configured `client_id`, else
+    /// the one `quack auth register` registered for the issuer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming `quack auth register` when neither
+    /// exists, or an error reading the registration.
+    pub async fn client_id(&self) -> Result<&str> {
+        self.client_id
+            .get_or_try_init(|| async {
+                match &self.config.client_id {
+                    Some(id) => Ok(id.clone()),
+                    // Boxed: this sits inside every model request's future.
+                    None => {
+                        Box::pin(self.client_keys.registered_client_id(
+                            &self.config.issuer_url,
+                            &format!("[providers.{}.oauth]", self.provider),
+                        ))
+                        .await
+                    }
+                }
+            })
+            .await
+            .map(String::as_str)
+    }
+
     /// How quack authenticates as this provider's client: its key's
     /// assertions, its secret, or nothing but its `client_id`.
     pub(crate) async fn credential(&self) -> Result<Credential> {
@@ -1081,7 +1120,7 @@ impl TokenManager {
         Credential::of(
             credential::Registration {
                 auth: self.config.client_auth,
-                client_id: &self.config.client_id,
+                client_id: self.client_id().await?,
                 issuer_url: &self.config.issuer_url,
                 audience: audience.as_deref(),
                 secret: self.client_secret()?,
@@ -1109,7 +1148,7 @@ impl TokenManager {
             .map(|u| parse("device_authorization_endpoint", u))
             .transpose()?
             .map(DeviceAuthorizationUrl::from_url);
-        let mut client = BasicClient::new(ClientId::new(self.config.client_id.clone()))
+        let mut client = BasicClient::new(ClientId::new(self.client_id().await?.to_owned()))
             .set_auth_type(credential.auth_type())
             .set_auth_uri(AuthUrl::from_url(parse(
                 "authorization_endpoint",

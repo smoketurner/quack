@@ -13,6 +13,17 @@
 //! process. A key whose vault key is gone cannot be opened again, so it is
 //! replaced, and the new public key must be registered with the issuer
 //! (`quack auth jwks`).
+//!
+//! A key can exist before the client does. A client registered with the
+//! issuer through RFC 7591 learns its id only from the registration, which
+//! must already carry the public key, so that key is made under the issuer's
+//! name alone ([`ClientKeyName::pending`]) and moves to `<issuer>
+//! <client_id>` once the issuer has assigned the id: `quack auth register`
+//! moves it itself, and a client whose id the operator wrote into the file
+//! after registering by hand takes it over on first use. A replacement key
+//! waiting for the operator to register it is kept under
+//! [`ClientKeyName::replacement`] until `quack auth jwks --rotate
+//! --activate`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,8 +41,8 @@ use tokio::sync::OnceCell;
 use super::key_slot::KeySource;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::storage::control::{ControlPlane, SealedOwner};
-use crate::vault::{Opened, Purpose, Vault};
+use crate::storage::control::{ControlPlane, KeyChange, SealedOwner};
+use crate::vault::{Opened, Purpose, Sealed, Vault};
 
 /// The one algorithm quack signs assertions with, as issuers list it in
 /// `token_endpoint_auth_signing_alg_values_supported`.
@@ -50,25 +61,74 @@ fn key_error(message: impl std::fmt::Display) -> Error {
 
 /// The client a key authenticates: the issuer (without a trailing slash)
 /// and the client id, space-separated. A URL holds no space, so the two
-/// halves cannot run into each other.
+/// halves cannot run into each other. Before the client has an id its key
+/// is named by the issuer alone ([`ClientKeyName::pending`]), and a
+/// replacement waiting to be registered by `next ` and the client's name
+/// ([`ClientKeyName::replacement`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClientKeyName(String);
+pub struct ClientKeyName {
+    name: String,
+    /// The issuer, without a trailing slash.
+    issuer: String,
+    role: KeyRole,
+}
+
+/// What a named key is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum KeyRole {
+    /// A client's key in use.
+    Client,
+    /// A key made for a client the issuer has not yet assigned an id.
+    Pending,
+    /// A client's replacement key, not yet registered.
+    Next,
+}
 
 impl ClientKeyName {
     #[must_use]
     pub fn new(issuer_url: &str, client_id: &str) -> Self {
-        Self(format!("{} {client_id}", issuer_url.trim_end_matches('/')))
+        let issuer = issuer_url.trim_end_matches('/');
+        Self {
+            name: format!("{issuer} {client_id}"),
+            issuer: issuer.to_owned(),
+            role: KeyRole::Client,
+        }
+    }
+
+    /// The key for a client not yet registered at the issuer: named by the
+    /// issuer alone, since there is no client id yet. Registering moves it
+    /// to [`ClientKeyName::new`].
+    #[must_use]
+    pub fn pending(issuer_url: &str) -> Self {
+        let issuer = issuer_url.trim_end_matches('/');
+        Self {
+            name: issuer.to_owned(),
+            issuer: issuer.to_owned(),
+            role: KeyRole::Pending,
+        }
+    }
+
+    /// The replacement for this client's key while the operator registers
+    /// it: `next ` before the client's own name, which starts with the
+    /// issuer's scheme and so can never start that way.
+    #[must_use]
+    pub fn replacement(&self) -> Self {
+        Self {
+            name: format!("next {}", self.name),
+            issuer: self.issuer.clone(),
+            role: KeyRole::Next,
+        }
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.name
     }
 }
 
 impl std::fmt::Display for ClientKeyName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.name)
     }
 }
 
@@ -292,10 +352,75 @@ impl ClientKeys {
         }
     }
 
-    async fn control(&self) -> Result<&ControlPlane> {
+    pub(crate) async fn control(&self) -> Result<&ControlPlane> {
         self.control
             .get_or_try_init(|| ControlPlane::open(&self.config))
             .await
+    }
+
+    pub(crate) const fn vault(&self) -> &Vault {
+        &self.vault
+    }
+
+    /// Drop the process's copy of the key `name`, so its next use reads the
+    /// stored one: after a rotation or a registration moved or replaced it.
+    pub(crate) fn forget(&self, name: &ClientKeyName) {
+        let mut cache = cache().lock().unwrap_or_else(PoisonError::into_inner);
+        cache.remove(&(self.config.data_dir().to_path_buf(), name.clone()));
+    }
+
+    /// Seal a key's PKCS#8 document for `name`.
+    pub(crate) async fn seal(&self, name: &ClientKeyName, der: &[u8]) -> Result<Sealed> {
+        self.vault
+            .seal(Purpose::ClientKey, name.as_str(), der)
+            .await
+    }
+
+    /// The stored key's PKCS#8 document, or `None` when there is none or
+    /// the vault key that sealed it is gone.
+    pub(crate) async fn stored_der(&self, name: &ClientKeyName) -> Result<Option<Vec<u8>>> {
+        let owner = SealedOwner::ClientKey(name.as_str());
+        let Some(sealed) = self.control().await?.sealed(owner).await? else {
+            return Ok(None);
+        };
+        match self
+            .vault
+            .open(Purpose::ClientKey, name.as_str(), &sealed)
+            .await?
+        {
+            Opened::Plaintext(der) => Ok(Some(der)),
+            Opened::KeyGone => Ok(None),
+        }
+    }
+
+    /// A client without a key of its own takes over the pending key made
+    /// for its issuer: the one registered by hand from `quack auth register
+    /// --print` before the operator wrote the client id into the file. The
+    /// move is one transaction, so the key is never in both places.
+    async fn adopt_pending(&self, name: &ClientKeyName) -> Result<Option<ClientKey>> {
+        if name.role != KeyRole::Client {
+            return Ok(None);
+        }
+        let pending = ClientKeyName::pending(&name.issuer);
+        let Some(der) = self.stored_der(&pending).await? else {
+            return Ok(None);
+        };
+        let key = ClientKey::from_pkcs8(&der)?;
+        let sealed = self.seal(name, &der).await?;
+        self.control()
+            .await?
+            .change_client_keys(KeyChange {
+                put: Some((name.as_str(), &sealed)),
+                delete: &[pending.as_str()],
+            })
+            .await?;
+        self.forget(&pending);
+        tracing::info!(
+            client = %name,
+            thumbprint = key.thumbprint(),
+            "took over the key made for this issuer by `quack auth register --print`"
+        );
+        Ok(Some(key))
     }
 
     fn slot(&self, name: &ClientKeyName) -> Slot {
@@ -342,21 +467,60 @@ impl ClientKeys {
         )))
     }
 
+    /// Start replacing the key of a client quack did not register itself:
+    /// its replacement, made (or, when a replacement already waits, loaded)
+    /// under [`ClientKeyName::replacement`], and its key in use, which
+    /// stays in use until [`ClientKeys::activate_replacement`]. The issuer
+    /// should hold both while the operator switches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key cannot be loaded or made.
+    pub async fn stage_replacement(
+        &self,
+        client: &ClientKeyName,
+    ) -> Result<(Option<Arc<ClientKey>>, Arc<ClientKey>)> {
+        let current = self.existing(client).await?;
+        let next = self.key(&client.replacement()).await?;
+        Ok((current, next))
+    }
+
+    /// Put the waiting replacement in place of the client's key, in one
+    /// transaction; the old key is gone afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no replacement waits, or the keys cannot be
+    /// written.
+    pub async fn activate_replacement(&self, client: &ClientKeyName) -> Result<Arc<ClientKey>> {
+        let next = client.replacement();
+        let der = self.stored_der(&next).await?.ok_or_else(|| {
+            key_error(format!(
+                "no replacement key waits for {client}; `quack auth jwks --rotate` makes one"
+            ))
+        })?;
+        let key = ClientKey::from_pkcs8(&der)?;
+        let sealed = self.seal(client, &der).await?;
+        self.control()
+            .await?
+            .change_client_keys(KeyChange {
+                put: Some((client.as_str(), &sealed)),
+                delete: &[next.as_str()],
+            })
+            .await?;
+        self.forget(client);
+        self.forget(&next);
+        tracing::info!(client = %client, thumbprint = key.thumbprint(), "the replacement client key is now in use");
+        Ok(Arc::new(key))
+    }
+
     /// The stored key, or `None` when there is none or the vault key that
     /// sealed it is gone.
     async fn load(&self, name: &ClientKeyName) -> Result<Option<ClientKey>> {
-        let owner = SealedOwner::ClientKey(name.as_str());
-        let Some(sealed) = self.control().await?.sealed(owner).await? else {
-            return Ok(None);
-        };
-        match self
-            .vault
-            .open(Purpose::ClientKey, name.as_str(), &sealed)
+        self.stored_der(name)
             .await?
-        {
-            Opened::Plaintext(der) => ClientKey::from_pkcs8(&der).map(Some),
-            Opened::KeyGone => Ok(None),
-        }
+            .map(|der| ClientKey::from_pkcs8(&der))
+            .transpose()
     }
 
     /// The stored key, bypassing the process cache; made and stored when
@@ -375,6 +539,8 @@ impl ClientKeys {
                 Opened::Plaintext(der) => return ClientKey::from_pkcs8(&der),
                 Opened::KeyGone => {}
             }
+        } else if let Some(key) = self.adopt_pending(name).await? {
+            return Ok(key);
         }
         let (key, der) = ClientKey::generate()?;
         let sealed = self

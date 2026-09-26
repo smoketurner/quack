@@ -9,6 +9,7 @@
 //! with [`Probing::Offline`]. No credential is ever printed: a check says
 //! which environment variable a key comes from and whether it is set.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -24,6 +25,7 @@ use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::OllamaRunningModels;
 use crate::llm::oauth::client_key::ClientKeys;
+use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
@@ -66,6 +68,8 @@ pub enum Area {
     ChatModel,
     Embeddings,
     Server,
+    /// The OAuth clients quack registered itself (`quack auth register`).
+    Auth,
 }
 
 text_enum!(Area, "doctor area", {
@@ -77,6 +81,7 @@ text_enum!(Area, "doctor area", {
     ChatModel => "chat model",
     Embeddings => "embeddings",
     Server => "server",
+    Auth => "auth",
 });
 
 /// One finding: what was checked, how it came out, and what to do.
@@ -202,6 +207,14 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
     check_embedding_model(&mut report, config, http.as_ref()).await;
     check_server(&mut report, config, control.as_ref()).await;
     check_sign_in(&mut report, config, options.probing).await;
+    check_registrations(
+        &mut report,
+        config,
+        control.as_ref(),
+        options.probing,
+        KeySource::Keychain,
+    )
+    .await;
     report
 }
 
@@ -1153,6 +1166,115 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         )
         .fix("check [server.oidc].issuer_url, and that this host can reach the issuer"),
     });
+}
+
+/// The clients `quack auth register` registered, one per issuer that a
+/// section without a `client_id` names: the registration is kept, and
+/// online, the issuer still describes that client at its
+/// `registration_client_uri` (RFC 7592 read).
+pub(crate) async fn check_registrations(
+    report: &mut Report,
+    config: &Config,
+    control: Option<&ControlPlane>,
+    probing: Probing,
+    key_source: KeySource,
+) {
+    let mut by_issuer: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for section in registered_sections(config) {
+        by_issuer
+            .entry(section.issuer.as_str().to_owned())
+            .or_default()
+            .push(section.section.to_string());
+    }
+    for (issuer, served) in by_issuer {
+        let served = served.join(" and ");
+        let name = RegistrationName::new(&issuer);
+        let missing = || {
+            Check::new(
+                Area::Auth,
+                Status::Fail,
+                format!("no client is registered at {issuer} for {served}, which the file names no client_id for"),
+            )
+            .fix(format!(
+                "quack auth register --issuer {issuer}, or set client_id"
+            ))
+        };
+        let Some(control) = control else {
+            report.push(missing());
+            continue;
+        };
+        let keys = ClientKeys::with_control(config, key_source, control.clone());
+        let row = match keys.registration(&name).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                report.push(missing());
+                continue;
+            }
+            Err(e) => {
+                report.push(Check::new(
+                    Area::Auth,
+                    Status::Fail,
+                    format!("the registration at {issuer} cannot be read: {e}"),
+                ));
+                continue;
+            }
+        };
+        let id = row.client_id;
+        if probing == Probing::Offline {
+            report.push(Check::new(
+                Area::Auth,
+                Status::Ok,
+                format!(
+                    "client {id}, registered at {issuer}, serves {served} (not read back: --offline)"
+                ),
+            ));
+            continue;
+        }
+        let read = match Registrar::new(keys) {
+            Ok(registrar) => registrar.read(&name).await,
+            Err(e) => Err(e),
+        };
+        report.push(match read {
+            Ok(Some(ReadBack::Readable { .. })) => Check::new(
+                Area::Auth,
+                Status::Ok,
+                format!(
+                    "client {id}, registered at {issuer}, serves {served}; the issuer still describes it"
+                ),
+            ),
+            Ok(Some(ReadBack::Unmanaged { .. })) => Check::new(
+                Area::Auth,
+                Status::Warn,
+                format!(
+                    "client {id}, registered at {issuer}, serves {served}; the issuer returned no registration token, so quack cannot read it back, rotate its key, or delete it"
+                ),
+            )
+            .fix("manage the client in the issuer's console"),
+            Ok(Some(ReadBack::Refused { status, .. })) => Check::new(
+                Area::Auth,
+                Status::Fail,
+                format!(
+                    "{issuer} refused to read back client {id} (HTTP {status}): it was deleted at the issuer, or its registration token was revoked"
+                ),
+            )
+            .fix("quack auth register --replace"),
+            Ok(Some(ReadBack::Mismatch { stored, read })) => Check::new(
+                Area::Auth,
+                Status::Fail,
+                format!(
+                    "{issuer} describes client {read} at the registration kept for client {stored}"
+                ),
+            )
+            .fix("quack auth register --replace"),
+            Ok(None) => missing(),
+            Err(e) => Check::new(
+                Area::Auth,
+                Status::Fail,
+                format!("client {id} at {issuer} cannot be read back: {e}"),
+            )
+            .fix(format!("check that this host can reach {issuer}")),
+        });
+    }
 }
 
 enum Listing {

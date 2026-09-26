@@ -103,7 +103,7 @@ impl MockIssuer {
     fn sign_in(&self) -> SignIn {
         let config = OidcConfig {
             issuer_url: self.url.clone(),
-            client_id: String::from("quack"),
+            client_id: Some(String::from("quack")),
             client_secret_env: None,
             client_auth: ClientAuth::default(),
             scopes: OidcConfig::default_scopes(),
@@ -795,7 +795,7 @@ async fn the_sign_in_and_a_provider_registered_as_the_same_client_share_one_key(
     let oauth = OAuthConfig {
         // The same client, written with a trailing slash.
         issuer_url: format!("{}/", issuer.url),
-        client_id: String::from("quack"),
+        client_id: Some(String::from("quack")),
         scopes: Vec::new(),
         redirect_uri: String::from(OAuthConfig::DEFAULT_REDIRECT_URI),
         grant: Grant::OnBehalfOf,
