@@ -492,33 +492,52 @@ This is the setup to copy for reaching a model provider as each person, with
 
 ### Create the client in the Vouch console
 
-In the Vouch console, create an application with these settings:
+The client authenticates with a key that quack holds (`private_key_jwt`), so there is no
+shared secret. quack names its key after the client, and the console issues the client ID
+only after the application exists, so registering the key takes two passes: create the
+application with a key made under a placeholder ID, then replace it with the key for the
+real ID.
 
-| Setting | Value |
-|---|---|
-| Application type | Web |
-| Redirect URI | `https://quack.example.com/auth/oidc/callback` (your server's public URL) |
-| Access scope | Organization |
-| FAPI 2.0 | off |
+1. Configure quack as below with `client_id = "pending"` in both sections, and print a key
+   set:
 
-Copy the client ID and the client secret it shows. The secret is shown once.
+   ```bash
+   quack auth jwks
+   ```
 
-Leave FAPI 2.0 off. A FAPI client must send a DPoP proof or a TLS client certificate with
-every token request, so Vouch binds its tokens to a key, and the model API behind an
-on-behalf-of provider, which takes bearer tokens, refuses them.
+2. In the Vouch console, create an application with these settings:
+
+   | Setting | Value |
+   |---|---|
+   | Application type | Web |
+   | Redirect URI | `https://quack.example.com/auth/oidc/callback` (your server's public URL) |
+   | Access scope | Organization |
+   | Security profile | Standard OAuth |
+   | Client authentication | Private key (`private_key_jwt`) |
+   | JWKS | the output of `quack auth jwks` |
+
+   Vouch issues no client secret for it.
+
+3. Put the client ID from the console in place of `"pending"` in both sections, and print
+   the key set again. It is a new key, named after the real client:
+
+   ```bash
+   quack auth jwks
+   ```
+
+4. On the application's page in the console, edit the application, replace the JWKS with
+   this output, and save.
+
+The key made for `"pending"` stays in `control.db` unused. Leave the security profile on
+Standard OAuth: see [Why each setting](#why-each-setting).
 
 ### Configure quack
-
-```bash
-export VOUCH_CLIENT_SECRET='…'          # the secret from the console
-```
 
 ```toml
 [server.oidc]
 issuer_url = "https://us.vouch.sh"
 client_id = "…"                          # the client ID from the console
-client_secret_env = "VOUCH_CLIENT_SECRET"
-client_auth = "client_secret_basic"
+client_auth = "private_key_jwt"
 redirect_uri = "https://quack.example.com/auth/oidc/callback"
 scopes = ["openid", "email"]
 
@@ -530,13 +549,15 @@ auth = "oauth"
 [providers.gateway.oauth]
 issuer_url = "https://us.vouch.sh"
 client_id = "…"                          # the same client
-client_secret_env = "VOUCH_CLIENT_SECRET"
-client_auth = "client_secret_basic"
+client_auth = "private_key_jwt"
 grant = "on-behalf-of"
 exchange = "token-exchange"
 actor = false
 # audience = "https://models.example.com"   # when the model API expects one
 ```
+
+Both sections name the same client at the same issuer, so they share one key and one
+registration. Neither sets `client_secret_env`.
 
 ### Start it
 
@@ -554,38 +575,39 @@ workspaces with `quack member add` or on the workspace's Settings page.
 - **PKCE** makes a stolen authorization code useless, since only quack knows the verifier.
 - **PAR** keeps the sign-in request off the browser: Vouch's discovery lists
   `https://us.vouch.sh/oauth/par`, so quack pushes the request there automatically.
-- **An authenticated token exchange**: only a holder of the client's credentials can turn a
-  person's Vouch token into a token for the model API.
+- **`private_key_jwt`**: only a holder of the client's key can turn a person's Vouch token
+  into a token for the model API, and the key never leaves quack. Vouch holds only its
+  public half, so there is no shared secret to copy, store, or leak.
+- **Standard profile, not FAPI 2.0**: a FAPI client must send a DPoP proof or a TLS client
+  certificate with every token request, so Vouch binds its tokens to a key, and the model
+  API behind an on-behalf-of provider, which takes bearer tokens, cannot use them.
 - **`actor = false`** is required: Vouch accepts an actor token only when it belongs to a
   Vouch user, and quack's own token names a client, so Vouch would refuse the exchange with
   "Actor token user not found". The issued token still names the person as its subject and
   records quack's `client_id`.
-- **No DPoP**: DPoP would bind the exchanged token to quack's key, and model APIs accept
-  only bearer tokens.
 
 Vouch offers only the `openid` and `email` scopes and issues no refresh tokens, so a
 sign-in lasts for Vouch's session. Its exchange accepts only tokens Vouch issued as the
 subject, so each person must have signed in to quack through Vouch.
 
-### A key instead of the secret
+### Rotate the key
 
-`client_auth = "private_key_jwt"` would replace the shared secret with a key that never
-leaves quack. Vouch cannot give quack such a client today:
-
-- The console makes a `private_key_jwt` client only for FAPI 2.0 applications, whose tokens
-  are bound (see above).
-- Dynamic registration (`https://us.vouch.sh/oauth/register`) can make a non-FAPI
-  `private_key_jwt` client, but an unauthenticated registration makes a public client any
-  Vouch user can sign in to, and the Vouch CLI's own access token (`vouch credential
-  token`) is DPoP-bound, so Vouch refuses it as the bearer of a registration.
-
-Once the console can make a Web application that authenticates with `private_key_jwt` and
-a pasted key set without FAPI 2.0, the steps become: run `quack auth jwks`, paste its output
-into the application, and set `client_auth = "private_key_jwt"` in place of the secret, in
-both sections, removing `client_secret_env`. Rotate the key later with `quack auth jwks
---rotate` and `--rotate --activate`, as
+Rotate it with `quack auth jwks --rotate`, which prints the key in use and a new one: paste
+that pair into the application's JWKS in the console. Then run `quack auth jwks --rotate
+--activate`, paste the new key alone, and restart `quack serve`, as
 [Client authentication with a key](#client-authentication-with-a-key-private_key_jwt)
 describes.
+
+### With a client secret instead
+
+A Vouch deployment whose console has no Client authentication choice makes a non-FAPI Web
+application with a client secret only. Copy the secret it shows once, export it, and in
+both sections replace `client_auth = "private_key_jwt"` with:
+
+```toml
+client_secret_env = "VOUCH_CLIENT_SECRET"
+client_auth = "client_secret_basic"
+```
 
 ## One person on the command line
 
