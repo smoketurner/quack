@@ -585,6 +585,16 @@ impl TokenManager {
         self.config.grant
     }
 
+    /// Whether an on-behalf-of exchange sends quack's own token as the
+    /// actor: `actor` is on and the exchange is RFC 8693's, since Entra's
+    /// has no actor.
+    #[must_use]
+    pub fn sends_actor(&self) -> bool {
+        self.config.grant == Grant::OnBehalfOf
+            && self.config.actor
+            && self.config.exchange == Exchange::TokenExchange
+    }
+
     /// A bearer token with more than a minute of life left.
     ///
     /// # Errors

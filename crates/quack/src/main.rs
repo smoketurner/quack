@@ -1066,7 +1066,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             for name in names {
                 let manager = TokenManager::for_provider(config, name)?;
                 let status = manager.status().await?;
-                let state = token_state(name, status.token, manager.grant());
+                let state = token_state(name, status.token, manager.grant(), manager.sends_actor());
                 let key = client_key_state(config, Some(name), KeySource::Keychain)
                     .await?
                     .map_or(String::new(), |key| format!("; {key}"));
@@ -1102,8 +1102,14 @@ fn token_state(
     name: &str,
     token: Option<quack_core::llm::oauth::TokenStatus>,
     grant: Grant,
+    sends_actor: bool,
 ) -> String {
     match (token, grant) {
+        // Without an actor token quack has no token of its own here; one
+        // stored before `actor = false` is unused.
+        (_, Grant::OnBehalfOf) if !sends_actor => String::from(
+            "acts on behalf of each person signed in to quack serve, without an actor token; nothing to log in to",
+        ),
         (Some(token), Grant::ClientCredentials) => {
             format!("token expires {}, {}", token.expires_at, token.renewal)
         }
@@ -1985,6 +1991,24 @@ mod tests {
             client_jwks(&config, Some("nope"), KeySource::File)
                 .await
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn auth_status_names_the_actor_only_when_one_is_sent() {
+        let token = quack_core::llm::oauth::TokenStatus {
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+            renewal: quack_core::llm::oauth::Renewal::Regrant,
+        };
+        let with_actor = token_state("gw", Some(token), Grant::OnBehalfOf, true);
+        assert!(with_actor.contains("(the actor)"), "{with_actor}");
+        for stored in [Some(token), None] {
+            let vouch = token_state("gw", stored, Grant::OnBehalfOf, false);
+            assert!(!vouch.contains("the actor"), "{vouch}");
+            assert!(vouch.contains("without an actor token"), "{vouch}");
+        }
+        assert!(
+            token_state("p", None, Grant::AuthorizationCode, false).contains("quack auth login p")
         );
     }
 }
