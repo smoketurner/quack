@@ -563,11 +563,25 @@ CREATE TABLE provider_tokens (
 -- an OAuth client's private_key_jwt signing key (P-256, PKCS#8), HPKE-sealed by the
 -- vault; section 10.2
 CREATE TABLE client_keys (
-    name       TEXT PRIMARY KEY,           -- '<issuer> <client_id>'
+    -- '<issuer> <client_id>'; '<issuer>' alone until the client is registered
+    name       TEXT PRIMARY KEY,
     key_id     TEXT NOT NULL,
     enc        BLOB NOT NULL,
     ciphertext BLOB NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- a client quack registered itself (RFC 7591), one per issuer; its registration access
+-- token HPKE-sealed by the vault (NULL when the issuer returned none); section 10.2
+CREATE TABLE client_registrations (
+    name                    TEXT PRIMARY KEY,  -- the issuer, without a trailing slash
+    client_id               TEXT NOT NULL,
+    key_id                  TEXT,
+    enc                     BLOB,
+    ciphertext              BLOB,
+    registration_client_uri TEXT,
+    created_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- a signed-in user's identity-provider token, HPKE-sealed under the server's key
@@ -1427,8 +1441,35 @@ sealed by the vault for the `client-key` purpose, loaded once per process, and n
 `<issuer> <client_id>`, so `[server.oidc]` and a provider registered as the same client
 share one key and one registered JWKS. `quack auth jwks [PROVIDER]` prints the public
 key set to register; `quack auth status` shows the thumbprint. A key whose vault key is
-gone is replaced with a warning to register the new one; rotating is deleting the row and
-registering what `quack auth jwks` prints next. `client_secret_env` must be unset, and the
+gone is replaced with a warning to register the new one. For a client registered by hand,
+`quack auth jwks --rotate` keeps the key in use and prints it beside a new one (kept under
+`next <issuer> <client_id>`) for the operator to register, and `--rotate --activate` puts
+the new one in use, so quack is never without a key the issuer accepts.
+
+**Registering the client** (`quack auth register`, `llm::oauth::registration`, RFC 7591
+and 7592). A `[server.oidc]` or `[providers.NAME.oauth]` section with `client_auth =
+"private_key_jwt"` may leave `client_id` out; one registration per issuer then serves every
+such section there, which is Vouch's model of one client for sign-in and token exchange.
+The command posts the metadata the sections need (the union of their grants, with
+`client_credentials` only for that grant or an actor token and `refresh_token` only with
+`offline_access`; the sign-in callback as a `web` client, or a loopback redirect alone as a
+`native` one, never both; `private_key_jwt` with ES256 and the `jwks`; the union of scopes;
+never `dpop_bound_access_tokens` or `tls_client_certificate_bound_access_tokens`, which make
+bound tokens model APIs refuse) to the discovered `registration_endpoint`, with
+`--token-env`'s token as the bearer or, after a warning and a confirmation, openly. The key
+is made first under the issuer's name alone and moves to `<issuer> <client_id>` in the
+transaction that stores the registration in `control.db` (`client_registrations`, migration
+8: the `client_id`, the `registration_client_uri`, and the `registration_access_token`
+sealed for the `registration-token` purpose), named by the issuer, which is how the
+sections find their `client_id` before they know it; `quack config` shows it with the origin
+`registration`, and `quack serve` refuses to start without it. `--replace` deletes the old
+client (RFC 7592 `DELETE`) before registering anew; `jwks --rotate` reads the registration
+back, sends all of it with a new `jwks` (`PUT`, which replaces every field), and replaces
+the stored key, and a rotated registration token, only after the issuer accepts; `quack
+auth unregister` deletes the client, then the record and the key. `--print` prints the
+request for registering by hand; a client whose `client_id` is then written into the file
+takes over the printed key on first use. `quack doctor` checks each registration is kept
+and, online, still readable at the issuer. `client_secret_env` must be unset, and the
 key satisfies the confidential-client requirement of `client-credentials` and
 `on-behalf-of`. DPoP (RFC 9449) is not used: it would bind tokens to the key, and model
 APIs take bearer tokens only.
@@ -1713,7 +1754,11 @@ quack context show | edit | history | export FILE | import FILE
 quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
-quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER | jwks [PROVIDER]
+quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
+quack auth jwks [PROVIDER] [--rotate [--activate]]
+quack auth register [--issuer URL] [--token-env VAR] [--name NAME] [--replace] [--print]
+                    [--yes]
+quack auth unregister [--issuer URL] [--yes]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]

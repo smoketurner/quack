@@ -93,7 +93,8 @@ cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | pat
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
-cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER]  # OAuth tokens; a client's public key
+cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
+cargo run --bin quack -- auth register [--issuer URL] [--token-env VAR] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
 cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind; exit 1 on a failure
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
@@ -169,6 +170,12 @@ A client with `client_auth = "private_key_jwt"` (a provider or `[server.oidc]`) 
 client assertion for every token-endpoint and PAR request with a vault-sealed P-256 key in
 `control.db` (`client_keys`, `llm::oauth::client_key`, one per issuer and client id; `quack auth
 jwks` prints it), and a browser sign-in is pushed first (RFC 9126) whenever discovery lists a PAR endpoint.
+`quack auth register` (`llm::oauth::registration`) registers one such client per issuer through
+RFC 7591 for every section there that leaves `client_id` out, keeps its `client_id`, sealed
+`registration_access_token`, and `registration_client_uri` in `control.db` (`client_registrations`,
+named by the issuer), and those sections resolve their `client_id` from it at use; the key waits under
+the issuer's name until the id exists. RFC 7592 then rotates the key (`jwks --rotate`, a full-metadata
+`PUT`, the stored key replaced only after the issuer accepts) and deletes the client (`unregister`).
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
 labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200 plus a `write_refused` SSE event, MCP structured
