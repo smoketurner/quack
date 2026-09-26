@@ -1449,7 +1449,9 @@ the new one in use, so quack is never without a key the issuer accepts.
 **Registering the client** (`quack auth register`, `llm::oauth::registration`, RFC 7591
 and 7592). A `[server.oidc]` or `[providers.NAME.oauth]` section with `client_auth =
 "private_key_jwt"` may leave `client_id` out; one registration per issuer then serves every
-such section there, which is Vouch's model of one client for sign-in and token exchange.
+such section there, one client for sign-in and token exchange. (Vouch cannot use this
+yet: its console makes `private_key_jwt` clients only as FAPI 2.0 ones, and its CLI token
+is DPoP-bound, so it cannot be the registration bearer; `docs/authentication.md`.)
 The command posts the metadata the sections need (the union of their grants, with
 `client_credentials` only for that grant or an actor token and `refresh_token` only with
 `offline_access`; the sign-in callback as a `web` client, or a loopback redirect alone as a
