@@ -167,8 +167,9 @@ enum Commands {
     /// and definitions for the agent)
     Context(ContextArgs),
 
-    /// Log in to an OAuth provider, show token state, forget a token, or
-    /// print or rotate a client's public key set
+    /// Log in to an OAuth provider, show token state, forget a token, print
+    /// or rotate a client's public key set, or register a client with the
+    /// issuer
     #[command(subcommand)]
     Auth(AuthAction),
 
@@ -397,16 +398,34 @@ enum AuthAction {
         /// [server.oidc] sign-in client
         provider: Option<String>,
 
-        /// Make a replacement key and print it beside the key in use, to
-        /// register both with the issuer; quack keeps signing with the old
-        /// key until --activate. Run again, it prints the same pair
+        /// Replace the key: a client quack registered is updated at the
+        /// issuer (RFC 7592) and switches at once; for any other client,
+        /// print the current and new keys to register, then run again with
+        /// --activate
         #[arg(long)]
         rotate: bool,
 
-        /// With --rotate, once the issuer holds the new key: sign with it
-        /// from now on and delete the old one (restart `quack serve`)
+        /// With --rotate, for a client registered by hand: sign with the
+        /// new key from now on, once the issuer holds it, and delete the old
+        /// one (restart `quack serve`)
         #[arg(long, requires = "rotate")]
         activate: bool,
+    },
+    /// Register one private-key-JWT client with the issuer (RFC 7591) for
+    /// every [server.oidc] and [providers.NAME.oauth] section there that
+    /// names no client id
+    Register(auth_cli::RegisterArgs),
+    /// Delete the client quack registered at the issuer (RFC 7592), then
+    /// its registration and key
+    Unregister {
+        /// The issuer; by default the one the sections without a client id
+        /// share
+        #[arg(long)]
+        issuer: Option<String>,
+
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -659,7 +678,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             command.run(&config, cli.workspace.as_deref()).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Config(args) => run_config(&args),
+        Commands::Config(args) => run_config(&args).await,
         Commands::Doctor(args) => run_doctor(cli, &args).await,
         Commands::Docs(args) => {
             let ws_db = open_workspace(cli).await?;
@@ -672,9 +691,13 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
 /// `quack config`: what this binary makes of `config.toml`. It reads the
 /// file outside `Config::load`, so it reports a file every other command
 /// refuses rather than failing the same way, and says so in its status.
-fn run_config(args: &ConfigArgs) -> Result<ExitCode> {
+async fn run_config(args: &ConfigArgs) -> Result<ExitCode> {
     init_logging();
-    let inspection = config::inspect::Inspection::load();
+    let mut inspection = config::inspect::Inspection::load();
+    // A client_id the file leaves out comes from its registration.
+    if let Err(e) = inspection.resolve_registered().await {
+        tracing::warn!(error = %e, "cannot read the registered OAuth clients from control.db");
+    }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let filter = if args.changed {
@@ -1018,6 +1041,22 @@ fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
         .then_some(ExitCode::from(Exit::AuthRequired))
 }
 
+/// `quack auth register`, signing the person in on this terminal when it
+/// comes to that.
+async fn run_register(config: &Config, args: auth_cli::RegisterArgs) -> Result<()> {
+    let confirm = Confirm::Ask.or_yes(args.yes);
+    auth_cli::run_register(
+        config,
+        args,
+        confirm,
+        auth_cli::SignInWith {
+            browser: browser_can_open(),
+            notify: &show_login_prompt,
+        },
+    )
+    .await
+}
+
 /// `quack auth login|status|logout`.
 async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
     let stdout = std::io::stdout();
@@ -1105,6 +1144,10 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             rotate,
             activate,
         } => auth_cli::run_jwks(config, provider.as_deref(), rotate, activate).await?,
+        AuthAction::Register(args) => run_register(config, args).await?,
+        AuthAction::Unregister { issuer, yes } => {
+            auth_cli::run_unregister(config, issuer.as_deref(), Confirm::Ask.or_yes(yes)).await?;
+        }
     }
     Ok(())
 }

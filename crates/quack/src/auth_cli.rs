@@ -1,20 +1,29 @@
-//! `quack auth jwks [--rotate [--activate]]` and the key state `quack auth
-//! status` shows: the key a `private_key_jwt` client signs with, and its
-//! replacement while the operator registers it with the issuer.
+//! `quack auth jwks`, `register`, and `unregister`: the key a
+//! `private_key_jwt` client signs with, and the clients quack registers
+//! with an issuer itself (RFC 7591) and manages afterwards (RFC 7592).
 
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use quack_core::config::{ClientAuth, Config};
-use quack_core::llm::oauth::KeySource;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwks};
+use quack_core::llm::oauth::registration::{
+    ClientMetadata, Registered, Registrar, RegistrationName, Removal, SignIn, TemporaryClient,
+    issuer_to_register, metadata_for, registered_sections,
+};
+use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt};
+use quack_core::storage::control::RegistrationRow;
+use secrecy::SecretString;
+
+use crate::confirm::Confirm;
 
 /// One configured OAuth client, as the file names it.
 struct Client {
     /// `[server.oidc]` or `[providers.NAME.oauth]`.
     section: String,
     issuer: String,
-    id: String,
+    /// The `client_id` the file names; `None` for a registered client.
+    configured: Option<String>,
     auth: ClientAuth,
     /// How the `quack auth` commands name it: ` NAME` for a provider,
     /// nothing for the sign-in client.
@@ -36,7 +45,7 @@ impl Client {
             return Ok(Self {
                 section: format!("[providers.{name}.oauth]"),
                 issuer: oauth.issuer_url.clone(),
-                id: oauth.client_id.clone(),
+                configured: oauth.client_id.clone(),
                 auth: oauth.client_auth,
                 argument: format!(" {name}"),
             });
@@ -49,7 +58,7 @@ impl Client {
         Ok(Self {
             section: String::from("[server.oidc]"),
             issuer: oidc.issuer_url.clone(),
-            id: oidc.client_id.clone(),
+            configured: oidc.client_id.clone(),
             auth: oidc.client_auth,
             argument: String::new(),
         })
@@ -66,14 +75,41 @@ impl Client {
         Ok(())
     }
 
-    /// The key it signs with.
-    fn key_name(&self) -> ClientKeyName {
-        ClientKeyName::new(&self.issuer, &self.id)
+    fn registration_name(&self) -> RegistrationName {
+        RegistrationName::new(&self.issuer)
+    }
+
+    /// The client id in use: the file's, else the registration's.
+    fn client_id<'a>(&'a self, registration: Option<&'a RegistrationRow>) -> Option<&'a str> {
+        self.configured
+            .as_deref()
+            .or_else(|| registration.map(|row| row.client_id.as_str()))
+    }
+
+    /// Whether quack registered this client: the file leaves its id out, or
+    /// names the one registered at its issuer.
+    fn is_registered(&self, registration: Option<&RegistrationRow>) -> bool {
+        registration.is_some_and(|row| {
+            self.configured
+                .as_deref()
+                .is_none_or(|id| id == row.client_id)
+        })
+    }
+
+    /// The key it signs with: its client's, or, for a client not registered
+    /// yet, the key its registration will carry.
+    fn key_name(&self, registration: Option<&RegistrationRow>) -> ClientKeyName {
+        match self.client_id(registration) {
+            Some(id) => ClientKeyName::new(&self.issuer, id),
+            None => ClientKeyName::pending(&self.issuer),
+        }
     }
 }
 
 /// The public key set of the client's `private_key_jwt` key, made and
-/// stored when there is none yet.
+/// stored when there is none yet. For a client the file names no id for
+/// and nothing is registered yet, that is the key `quack auth register`
+/// (or a registration by hand) sends.
 pub(crate) async fn client_jwks(
     config: &Config,
     provider: Option<&str>,
@@ -81,9 +117,9 @@ pub(crate) async fn client_jwks(
 ) -> Result<PublicJwks> {
     let client = Client::of(config, provider)?;
     client.require_key()?;
-    let key = ClientKeys::new(config, key_source)
-        .key(&client.key_name())
-        .await?;
+    let keys = ClientKeys::new(config, key_source);
+    let registration = keys.registration(&client.registration_name()).await?;
+    let key = keys.key(&client.key_name(registration.as_ref())).await?;
     Ok(key.jwks())
 }
 
@@ -100,15 +136,29 @@ pub(crate) async fn client_key_state(
         return Ok(None);
     }
     let keys = ClientKeys::new(config, key_source);
-    let name = client.key_name();
-    let mut state = match keys.existing(&name).await? {
-        Some(key) => format!("client key {}", key.thumbprint()),
-        None => format!(
-            "no client key yet; `quack auth jwks{}` makes one",
-            client.argument
-        ),
+    let registration = keys.registration(&client.registration_name()).await?;
+    let key = keys
+        .existing(&client.key_name(registration.as_ref()))
+        .await?;
+    let command = format!("quack auth jwks{}", client.argument);
+    let mut state = match (client.client_id(registration.as_ref()), key) {
+        (None, _) => {
+            return Ok(Some(format!(
+                "no client is registered at {}; `quack auth register` registers one",
+                client.registration_name()
+            )));
+        }
+        (Some(id), Some(key)) if client.is_registered(registration.as_ref()) => {
+            format!("registered client {id}, client key {}", key.thumbprint())
+        }
+        (Some(_), Some(key)) => format!("client key {}", key.thumbprint()),
+        (Some(_), None) => format!("no client key yet; `{command}` makes one"),
     };
-    if let Some(next) = keys.waiting_replacement(&name).await? {
+    if !client.is_registered(registration.as_ref())
+        && let Some(next) = keys
+            .waiting_replacement(&client.key_name(registration.as_ref()))
+            .await?
+    {
         state = format!(
             "{state}; replacement key {} waits for `quack auth jwks --rotate --activate{}`",
             next.thumbprint(),
@@ -118,48 +168,398 @@ pub(crate) async fn client_key_state(
     Ok(Some(state))
 }
 
+/// What `quack auth register` was asked.
+#[derive(Debug, clap::Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a command-line switch; clap refuses the combinations that conflict"
+)]
+pub(crate) struct RegisterArgs {
+    /// The issuer; by default the one those sections share
+    #[arg(long)]
+    pub(crate) issuer: Option<String>,
+
+    /// Environment variable holding an access token to register with (the
+    /// issuer's initial access token, or your own access token, which makes
+    /// the client yours)
+    #[arg(long, value_name = "VAR", conflicts_with_all = ["sign_in", "open"])]
+    pub(crate) token_env: Option<String>,
+
+    /// Sign in to the issuer first and register with your own token, which
+    /// makes the client yours: the default at Vouch
+    #[arg(long, conflicts_with = "open")]
+    pub(crate) sign_in: bool,
+
+    /// Sign in with the device-code flow instead of the browser (implies
+    /// --sign-in)
+    #[arg(long, conflicts_with = "open")]
+    pub(crate) device_code: bool,
+
+    /// Register an open client, one that anyone with an account at the
+    /// issuer can sign in to, with no token and no sign-in
+    #[arg(long)]
+    pub(crate) open: bool,
+
+    /// The client name the issuer shows
+    #[arg(long = "name", default_value = "quack")]
+    pub(crate) client_name: String,
+
+    /// Delete the client registered at the issuer (RFC 7592) and register a
+    /// new one
+    #[arg(long)]
+    pub(crate) replace: bool,
+
+    /// Print the registration request as JSON and send nothing
+    #[arg(long)]
+    pub(crate) print: bool,
+
+    /// Register an open client without asking
+    #[arg(long)]
+    pub(crate) yes: bool,
+}
+
+/// `quack auth register`: register one client for every section at the
+/// issuer without a `client_id`, or with `print`, show the request only.
+pub(crate) async fn register(
+    out: &mut impl Write,
+    config: &Config,
+    request: RegisterArgs,
+    key_source: KeySource,
+    confirm: Confirm,
+    sign_in: SignInWith<'_>,
+) -> Result<()> {
+    let issuer = issuer_to_register(config, request.issuer.as_deref())?;
+    let registrar = Registrar::new(ClientKeys::new(config, key_source))?;
+    let key = registrar.pending_key(&issuer).await?;
+    let metadata = metadata_for(config, &issuer, &request.client_name, key.jwks())?;
+    if request.print {
+        writeln!(out, "{}", serde_json::to_string_pretty(&metadata)?)?;
+        return Ok(());
+    }
+    let how = How::of(&request, &issuer);
+    if how == How::Open {
+        writeln!(
+            out,
+            "This is an open registration: {issuer} makes a client that anyone with an account there can sign in to. Sign in first (--sign-in) or register with an access token (--token-env VAR) to make the client yours, and restrict who may use it at the issuer."
+        )?;
+        if !confirm.ask(
+            out,
+            &format!("Register an open client at {issuer}?"),
+            Some("--yes"),
+        )? {
+            anyhow::bail!("nothing registered");
+        }
+    }
+    let existing = registrar.keys().registration(&issuer).await?;
+    if let (Some(row), true) = (&existing, request.replace) {
+        writeln!(
+            out,
+            "Replacing client {}: quack deletes it at {issuer} first, and anything else configured with its client_id stops working.",
+            row.client_id
+        )?;
+    }
+    let registered = match how {
+        How::Token(var) => {
+            let token = SecretString::from(
+                std::env::var(var)
+                    .with_context(|| format!("--token-env names {var}, which is not set"))?,
+            );
+            registrar
+                .register(&issuer, &metadata, Some(&token), request.replace)
+                .await?
+        }
+        How::Open => {
+            registrar
+                .register(&issuer, &metadata, None, request.replace)
+                .await?
+        }
+        How::SignIn => {
+            let flow = if request.device_code || !sign_in.browser {
+                LoginFlow::DeviceCode
+            } else {
+                LoginFlow::Configured
+            };
+            writeln!(
+                out,
+                "Sign in to {issuer} to register the client as yours. quack registers a temporary sign-in client for this and deletes it afterwards."
+            )?;
+            out.flush()?;
+            let done = registrar
+                .register_signed_in(
+                    &issuer,
+                    &metadata,
+                    request.replace,
+                    SignIn {
+                        flow,
+                        key_source,
+                        notify: sign_in.notify,
+                    },
+                )
+                .await?;
+            if let TemporaryClient::Left { client_id, reason } = &done.temporary {
+                writeln!(
+                    out,
+                    "quack could not delete the temporary sign-in client {client_id} ({reason}); delete it in {issuer}'s console."
+                )?;
+            }
+            done.registered
+        }
+    };
+    match &registered.replaced {
+        Some(Removal::Deleted { client_id }) => {
+            writeln!(out, "Deleted client {client_id} at {issuer}.")?;
+        }
+        Some(Removal::AlreadyGone { client_id, status }) => writeln!(
+            out,
+            "{issuer} no longer knew client {client_id} (HTTP {status}); nothing was left to delete."
+        )?,
+        Some(Removal::Unmanaged { client_id }) => writeln!(
+            out,
+            "quack could not delete client {client_id}: {issuer} returned no registration token for it. Delete it in the issuer's console."
+        )?,
+        None => {}
+    }
+    write_registered(out, config, &issuer, &metadata, &registered, how)?;
+    Ok(())
+}
+
+/// How `quack auth register` authorizes the registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum How<'a> {
+    /// With the access token in this environment variable.
+    Token(&'a str),
+    /// After the person signs in, with their token: the client is theirs.
+    SignIn,
+    /// With nothing: anyone at the issuer can sign in to the client.
+    Open,
+}
+
+impl<'a> How<'a> {
+    /// `--token-env`, `--open`, and `--sign-in` (or `--device-code`) say;
+    /// with none of them, Vouch signs the person in, since it takes the
+    /// registration's bearer as the client's owner and an open client there
+    /// is every Vouch user's, and any other issuer is asked for an open
+    /// registration, as before.
+    fn of(request: &'a RegisterArgs, issuer: &RegistrationName) -> Self {
+        if let Some(var) = &request.token_env {
+            Self::Token(var)
+        } else if request.open {
+            Self::Open
+        } else if request.sign_in || request.device_code || is_vouch(issuer) {
+            Self::SignIn
+        } else {
+            Self::Open
+        }
+    }
+}
+
+/// How `quack auth register` shows a sign-in to the person.
+pub(crate) struct SignInWith<'a> {
+    /// Whether a browser here can reach the loopback redirect; without one
+    /// the sign-in uses the device-code flow.
+    pub(crate) browser: bool,
+    /// Shows what the person must do.
+    pub(crate) notify: &'a (dyn Fn(LoginPrompt) + Sync),
+}
+
+fn write_registered(
+    out: &mut impl Write,
+    config: &Config,
+    issuer: &RegistrationName,
+    metadata: &ClientMetadata,
+    registered: &Registered,
+    how: How<'_>,
+) -> Result<()> {
+    let id = &registered.client_id;
+    writeln!(
+        out,
+        "Registered client {id} at {issuer} (grants: {}; key {}).",
+        metadata.grant_types.join(", "),
+        registered.thumbprint
+    )?;
+    if let Some(method) = &registered.other_auth_method {
+        writeln!(
+            out,
+            "Warning: {issuer} registered the client with token_endpoint_auth_method \"{method}\", not \"private_key_jwt\"; quack's assertions may be refused."
+        )?;
+    }
+    if !registered.manageable {
+        writeln!(
+            out,
+            "{issuer} returned no registration access token, so quack cannot rotate the key or delete the client later (RFC 7592); do that in its console."
+        )?;
+    }
+    let served: Vec<String> = registered_sections(config)
+        .into_iter()
+        .filter(|s| s.issuer == *issuer)
+        .map(|s| s.section.to_string())
+        .collect();
+    writeln!(
+        out,
+        "\n{} leave client_id out and read it from this registration. To name it in the file instead, add to each:\n\n  client_id = \"{id}\"",
+        served.join(" and ")
+    )?;
+    writeln!(out, "\nNext:")?;
+    if is_vouch(issuer) {
+        match how {
+            How::Open => writeln!(
+                out,
+                "  - Every Vouch user can sign in to this client: an open registration has no owner, so its access scope cannot be changed. To limit it to your organization, `quack auth register --replace` without --open."
+            )?,
+            How::SignIn | How::Token(_) => writeln!(
+                out,
+                "  - Only you can sign in to this client: Vouch registered it as yours (access scope Personal). To let your organization sign in, open it on your Applications page in the Vouch console ({issuer}/applications), set Access scope to Organization, and save."
+            )?,
+        }
+    } else {
+        writeln!(
+            out,
+            "  - At the issuer, check who may use the new client and grant it what it needs."
+        )?;
+    }
+    writeln!(
+        out,
+        "  - `quack doctor` reads the registration back; then start quack (restart a running `quack serve`)."
+    )?;
+    Ok(())
+}
+
+/// Whether the issuer is Vouch, whose console must widen a registered app
+/// to the organization.
+fn is_vouch(issuer: &RegistrationName) -> bool {
+    let host = issuer
+        .as_str()
+        .split_once("://")
+        .map_or(issuer.as_str(), |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "vouch.sh" || host.ends_with(".vouch.sh")
+}
+
+/// `quack auth register` on the terminal. Its questions must reach the
+/// screen before the answer is read, so it writes to stdout directly, which
+/// locks for each write and never across a request to the issuer.
+pub(crate) async fn run_register(
+    config: &Config,
+    request: RegisterArgs,
+    confirm: Confirm,
+    sign_in: SignInWith<'_>,
+) -> Result<()> {
+    let mut out = std::io::stdout();
+    register(
+        &mut out,
+        config,
+        request,
+        KeySource::Keychain,
+        confirm,
+        sign_in,
+    )
+    .await?;
+    out.flush()?;
+    Ok(())
+}
+
+/// `quack auth unregister` on the terminal, written as `run_register` is.
+pub(crate) async fn run_unregister(
+    config: &Config,
+    issuer: Option<&str>,
+    confirm: Confirm,
+) -> Result<()> {
+    let mut out = std::io::stdout();
+    unregister(&mut out, config, issuer, KeySource::Keychain, confirm).await?;
+    out.flush()?;
+    Ok(())
+}
+
 /// `quack auth jwks [--rotate [--activate]]` on the terminal: the key set
-/// to stdout, what to do to stderr. Each is written whole once the keys are
-/// ready, so no standard stream is locked across an await.
+/// to stdout, what to do to stderr.
 pub(crate) async fn run_jwks(
     config: &Config,
     provider: Option<&str>,
     rotate_key: bool,
     activate: bool,
 ) -> Result<()> {
-    let (mut out, mut note) = (Vec::new(), Vec::new());
-    if rotate_key {
-        rotate(
-            &mut out,
-            &mut note,
-            config,
-            provider,
-            activate,
-            KeySource::Keychain,
-        )
-        .await?;
-    } else {
+    if !rotate_key {
         let jwks = client_jwks(config, provider, KeySource::Keychain).await?;
-        writeln!(out, "{}", serde_json::to_string_pretty(&jwks)?)?;
+        return write_stdout(format!("{}\n", serde_json::to_string_pretty(&jwks)?).as_bytes());
     }
-    if !note.is_empty() {
-        let mut err = std::io::stderr().lock();
-        err.write_all(&note)?;
-        err.flush()?;
-    }
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&out)?;
-    stdout.flush()?;
+    let (mut out, mut note) = (Vec::new(), Vec::new());
+    rotate(
+        &mut out,
+        &mut note,
+        config,
+        provider,
+        activate,
+        KeySource::Keychain,
+    )
+    .await?;
+    std::io::stderr().lock().write_all(&note)?;
+    write_stdout(&out)
+}
+
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(bytes)?;
+    out.flush()?;
     Ok(())
 }
 
-/// `quack auth jwks --rotate [--activate]`: a new key for the client, in
-/// two steps that never leave quack without a key the issuer accepts.
-/// `--rotate` makes the replacement (or finds the one already waiting) and
-/// prints the key in use beside it, for the operator to register; the key
-/// in use keeps signing. `--activate`, run once the issuer holds the new
-/// key, puts it in place of the old one and prints it alone. The JWKS goes
-/// to `out`; what to do next goes to `note`.
+/// `quack auth unregister`: delete the registered client at the issuer,
+/// then its registration and key.
+pub(crate) async fn unregister(
+    out: &mut impl Write,
+    config: &Config,
+    issuer: Option<&str>,
+    key_source: KeySource,
+    confirm: Confirm,
+) -> Result<()> {
+    let issuer = match issuer {
+        Some(issuer) => RegistrationName::new(issuer),
+        None => issuer_to_register(config, None)?,
+    };
+    let registrar = Registrar::new(ClientKeys::new(config, key_source))?;
+    let Some(row) = registrar.keys().registration(&issuer).await? else {
+        anyhow::bail!("no client is registered at {issuer}");
+    };
+    if !confirm.ask(
+        out,
+        &format!(
+            "Delete client {} at {issuer}? Every section that uses it stops working until a client is registered again.",
+            row.client_id
+        ),
+        Some("--yes"),
+    )? {
+        anyhow::bail!("nothing deleted");
+    }
+    match registrar.unregister(&issuer).await? {
+        Removal::Deleted { client_id } => writeln!(
+            out,
+            "Deleted client {client_id} at {issuer}, and quack's record of it and its key."
+        )?,
+        Removal::AlreadyGone { client_id, status } => writeln!(
+            out,
+            "{issuer} no longer knew client {client_id} (HTTP {status}); quack's record of it and its key are deleted."
+        )?,
+        Removal::Unmanaged { client_id } => writeln!(
+            out,
+            "quack's record of client {client_id} and its key are deleted, but {issuer} returned no registration token to delete the client with; delete it in the issuer's console."
+        )?,
+    }
+    Ok(())
+}
+
+/// `quack auth jwks --rotate [--activate]`: a new key for the client.
+///
+/// A client quack registered is updated at the issuer (RFC 7592) and
+/// switches to the new key at once. Any other client's issuer cannot be
+/// told by quack, so the switch takes two steps that never leave quack
+/// without a key the issuer accepts: `--rotate` makes the replacement and
+/// prints both keys for the operator to register, and `--activate`, run
+/// once the issuer holds the new key, puts it in use. The JWKS goes to
+/// stdout; what to do goes to `note`.
 pub(crate) async fn rotate(
     out: &mut impl Write,
     note: &mut impl Write,
@@ -171,31 +571,62 @@ pub(crate) async fn rotate(
     let client = Client::of(config, provider)?;
     client.require_key()?;
     let keys = ClientKeys::new(config, key_source);
-    let name = client.key_name();
-    let (id, issuer) = (&client.id, &client.issuer);
+    let name = client.registration_name();
+    let registration = keys.registration(&name).await?;
+    if client.is_registered(registration.as_ref()) {
+        if activate {
+            anyhow::bail!(
+                "--activate is for a client registered by hand: quack registered this one, and `quack auth jwks --rotate{}` replaces its key at {name} in one step",
+                client.argument
+            );
+        }
+        let rotated = Registrar::new(keys)?.rotate(&name).await?;
+        writeln!(
+            note,
+            "{name} accepted the new key {} for client {}{}; quack signs with it from now on. Restart a running `quack serve`, which holds the old key in memory.{}",
+            rotated.new_thumbprint,
+            rotated.client_id,
+            rotated
+                .old_thumbprint
+                .map_or(String::new(), |old| format!(" in place of {old}")),
+            if rotated.new_registration_token {
+                " The issuer also issued a new registration access token, which quack keeps."
+            } else {
+                ""
+            }
+        )?;
+        return Ok(());
+    }
+    let Some(id) = client.configured.as_deref() else {
+        anyhow::bail!(
+            "{} names no client_id and no client is registered at {name}; `quack auth register` registers one",
+            client.section
+        );
+    };
+    let current = ClientKeyName::new(&client.issuer, id);
     if activate {
-        let key = keys.activate_replacement(&name).await?;
+        let key = keys.activate_replacement(&current).await?;
         writeln!(out, "{}", serde_json::to_string_pretty(&key.jwks())?)?;
         writeln!(
             note,
-            "quack now signs with key {} for client {id}, and the old key is deleted. Replace the key set registered for the client at {issuer} with the one above, which holds the new key alone. Restart a running `quack serve`: it holds the old key in memory until then.",
+            "quack now signs with key {} for client {id}, and the old key is deleted. Replace the key set registered for the client at {name} with the one above, which holds the new key alone. Restart a running `quack serve`: it holds the old key in memory until then.",
             key.thumbprint()
         )?;
         return Ok(());
     }
-    let (current, next) = keys.stage_replacement(&name).await?;
+    let (in_use, next) = keys.stage_replacement(&current).await?;
     let mut both = next.jwks();
-    if let Some(current) = &current {
-        both.keys.insert(0, current.jwk().clone());
+    if let Some(in_use) = &in_use {
+        both.keys.insert(0, in_use.jwk().clone());
     }
     writeln!(out, "{}", serde_json::to_string_pretty(&both)?)?;
-    let in_use = current.as_ref().map_or_else(
+    let in_use = in_use.as_ref().map_or_else(
         || String::from("no key in use yet"),
         |key| format!("the key in use ({})", key.thumbprint()),
     );
     writeln!(
         note,
-        "Register this key set for client {id} at {issuer} in place of the one there: it holds {in_use} and the new key ({}), so the issuer accepts either while you switch. quack keeps signing with the key in use, and running `--rotate` again prints this same pair. Once the issuer holds the set, run `quack auth jwks --rotate --activate{}` to sign with the new key, then restart a running `quack serve`.",
+        "Register this key set for client {id} at {name} in place of the one there: it holds {in_use} and the new key ({}), so the issuer accepts either while you switch. quack keeps signing with the key in use, and running `--rotate` again prints this same pair. Once the issuer holds the set, run `quack auth jwks --rotate --activate{}` to sign with the new key, then restart a running `quack serve`.",
         next.thumbprint(),
         client.argument
     )?;

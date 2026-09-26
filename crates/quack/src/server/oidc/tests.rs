@@ -231,7 +231,7 @@ impl Harness {
         config.general.data_dir = dir.path().to_path_buf();
         let oidc_config = OidcConfig {
             issuer_url: base,
-            client_id: String::from("quack"),
+            client_id: Some(String::from("quack")),
             client_secret_env: None,
             client_auth: ClientAuth::default(),
             scopes: OidcConfig::default_scopes(),
@@ -1031,7 +1031,7 @@ async fn obo_token_as(
         .unwrap_or_default();
     let oauth = OAuthConfig {
         issuer_url: issuer,
-        client_id: String::from("quack"),
+        client_id: Some(String::from("quack")),
         scopes: Vec::new(),
         redirect_uri: String::from("http://127.0.0.1:1/callback"),
         grant: Grant::OnBehalfOf,
