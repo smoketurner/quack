@@ -34,12 +34,17 @@ pub enum Purpose {
     /// An OAuth client's `private_key_jwt` signing key (PKCS#8); the subject
     /// is the key name, `<issuer> <client_id>`.
     ClientKey,
+    /// The `registration_access_token` of a client quack registered itself
+    /// (RFC 7591 and 7592); the subject is the registration's name, the
+    /// issuer.
+    RegistrationToken,
 }
 
 text_enum!(Purpose, "vault purpose", {
     UserToken => "user-token",
     ProviderToken => "provider-token",
     ClientKey => "client-key",
+    RegistrationToken => "registration-token",
 });
 
 impl Purpose {

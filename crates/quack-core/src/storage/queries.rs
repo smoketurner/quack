@@ -103,6 +103,19 @@ pub enum ClientKeys {
     CreatedAt,
 }
 
+/// A client quack registered with an issuer itself (RFC 7591), by issuer:
+/// its `client_id`, its sealed `registration_access_token` (the
+/// [`SealedColumns`], all NULL when the issuer returned none), and where
+/// RFC 7592 manages it.
+#[derive(Iden)]
+pub enum ClientRegistrations {
+    Table,
+    Name,
+    ClientId,
+    RegistrationClientUri,
+    CreatedAt,
+}
+
 #[derive(Iden)]
 pub enum Workspaces {
     Table,

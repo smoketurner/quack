@@ -19,8 +19,8 @@ use std::str::FromStr;
 use jiff::{SignedDuration, Timestamp};
 
 use super::queries::{
-    ApiTokens, AuditLog, Bound, ClientKeys, Members, ProviderTokens, SealedColumns, UserTokens,
-    Users, Workspaces,
+    ApiTokens, AuditLog, Bound, ClientKeys, ClientRegistrations, Members, ProviderTokens,
+    SealedColumns, UserTokens, Users, Workspaces,
 };
 use crate::config::{Config, ProviderName};
 use crate::error::{Error, Result};
@@ -784,7 +784,9 @@ pub enum SealedOwner<'a> {
     /// `vault::Purpose::ProviderToken`).
     Provider(&'a ProviderName),
     /// An OAuth client's `private_key_jwt` signing key, by key name
-    /// (`<issuer> <client_id>`; `client_keys`; `vault::Purpose::ClientKey`).
+    /// (`<issuer> <client_id>`, or a key not yet in use: see
+    /// `llm::oauth::client_key::ClientKeyName`; `client_keys`;
+    /// `vault::Purpose::ClientKey`).
     ClientKey(&'a str),
 }
 
@@ -813,6 +815,51 @@ impl SealedOwner<'_> {
             ),
         }
     }
+}
+
+/// A client quack registered with an issuer itself (`client_registrations`,
+/// RFC 7591): found by `name`, the issuer, before its `client_id` is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationRow {
+    /// The issuer, without a trailing slash.
+    pub name: String,
+    pub client_id: String,
+    /// Where RFC 7592 reads, updates, and deletes the registration, when
+    /// the issuer said.
+    pub registration_client_uri: Option<String>,
+    /// The `registration_access_token`, sealed for
+    /// `vault::Purpose::RegistrationToken`, when the issuer returned one.
+    pub token: Option<Sealed>,
+}
+
+impl FromRow<'_, SqliteRow> for RegistrationRow {
+    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+        let key_id: Option<String> = r.try_get("key_id")?;
+        let enc: Option<Vec<u8>> = r.try_get("enc")?;
+        let ciphertext: Option<Vec<u8>> = r.try_get("ciphertext")?;
+        Ok(Self {
+            name: r.try_get("name")?,
+            client_id: r.try_get("client_id")?,
+            registration_client_uri: r.try_get("registration_client_uri")?,
+            token: match (key_id, enc, ciphertext) {
+                (Some(key_id), Some(enc), Some(ciphertext)) => Some(Sealed {
+                    key_id,
+                    enc,
+                    ciphertext,
+                }),
+                _ => None,
+            },
+        })
+    }
+}
+
+/// A change to the client keys that must land together with a
+/// registration's (or on its own, all or nothing): the key to write under
+/// its name, replacing any there, and the names whose keys to delete.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyChange<'a> {
+    pub put: Option<(&'a str, &'a Sealed)>,
+    pub delete: &'a [&'a str],
 }
 
 /// A sealed-token row: the sealed value, as `vault::Sealed` is.
@@ -1310,6 +1357,16 @@ impl ControlPlane {
         sealed: &Sealed,
         replace: bool,
     ) -> Result<bool> {
+        let done = Self::sealed_insert(owner, sealed, replace)?
+            .query()
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The insert that keeps `owner`'s sealed value: replacing the one
+    /// before it, or only when there is none.
+    fn sealed_insert(owner: SealedOwner<'_>, sealed: &Sealed, replace: bool) -> Result<Bound> {
         let (table, key, id, stamp) = owner.row();
         let conflict = if replace {
             OnConflict::column(key.clone())
@@ -1342,8 +1399,17 @@ impl ControlPlane {
                 ])?
                 .on_conflict(conflict),
         )?;
-        let done = bound.query().execute(&self.pool).await?;
-        Ok(done.rows_affected() > 0)
+        Ok(bound)
+    }
+
+    /// The delete that forgets `owner`'s sealed value.
+    fn sealed_delete(owner: SealedOwner<'_>) -> Result<Bound> {
+        let (table, key, id, _) = owner.row();
+        Ok(Bound::new(
+            Query::delete()
+                .from_table(table)
+                .and_where(Expr::col(key).eq(id)),
+        )?)
     }
 
     /// Forget `owner`'s sealed token; one without is already done.
@@ -1352,13 +1418,144 @@ impl ControlPlane {
     ///
     /// Returns an error if the delete fails.
     pub async fn delete_sealed(&self, owner: SealedOwner<'_>) -> Result<()> {
-        let (table, key, id, _) = owner.row();
+        Self::sealed_delete(owner)?
+            .query()
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // --- client registrations (RFC 7591) ------------------------------------
+
+    /// The client registered at the issuer `name`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn registration(&self, name: &str) -> Result<Option<RegistrationRow>> {
         let bound = Bound::new(
-            Query::delete()
-                .from_table(table)
-                .and_where(Expr::col(key).eq(id)),
+            Query::select()
+                .columns([
+                    ClientRegistrations::Name.into_iden(),
+                    ClientRegistrations::ClientId.into_iden(),
+                    ClientRegistrations::RegistrationClientUri.into_iden(),
+                    SealedColumns::KeyId.into_iden(),
+                    SealedColumns::Enc.into_iden(),
+                    SealedColumns::Ciphertext.into_iden(),
+                ])
+                .from(ClientRegistrations::Table)
+                .and_where(Expr::col(ClientRegistrations::Name).eq(name)),
         )?;
-        bound.query().execute(&self.pool).await?;
+        Ok(bound.query_as().fetch_optional(&self.pool).await?)
+    }
+
+    /// Keep `row`, replacing the registration at its issuer, and apply
+    /// `keys` in the same transaction: a registration and the key it was
+    /// registered with are written together or not at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write fails; nothing is then changed.
+    pub async fn save_registration(
+        &self,
+        row: &RegistrationRow,
+        keys: KeyChange<'_>,
+    ) -> Result<()> {
+        let (key_id, enc, ciphertext) = match &row.token {
+            Some(sealed) => (
+                Some(sealed.key_id.clone()),
+                Some(sealed.enc.clone()),
+                Some(sealed.ciphertext.clone()),
+            ),
+            None => (None, None, None),
+        };
+        let upsert = Bound::new(
+            Query::insert()
+                .into_table(ClientRegistrations::Table)
+                .columns([
+                    ClientRegistrations::Name.into_iden(),
+                    ClientRegistrations::ClientId.into_iden(),
+                    ClientRegistrations::RegistrationClientUri.into_iden(),
+                    SealedColumns::KeyId.into_iden(),
+                    SealedColumns::Enc.into_iden(),
+                    SealedColumns::Ciphertext.into_iden(),
+                    SealedColumns::UpdatedAt.into_iden(),
+                ])
+                .values([
+                    row.name.as_str().into(),
+                    row.client_id.as_str().into(),
+                    row.registration_client_uri.clone().into(),
+                    key_id.into(),
+                    enc.into(),
+                    ciphertext.into(),
+                    Expr::current_timestamp(),
+                ])?
+                .on_conflict(
+                    OnConflict::column(ClientRegistrations::Name)
+                        .update_columns([
+                            ClientRegistrations::ClientId.into_iden(),
+                            ClientRegistrations::RegistrationClientUri.into_iden(),
+                            SealedColumns::KeyId.into_iden(),
+                            SealedColumns::Enc.into_iden(),
+                            SealedColumns::Ciphertext.into_iden(),
+                            SealedColumns::UpdatedAt.into_iden(),
+                        ])
+                        .to_owned(),
+                ),
+        )?;
+        let mut statements = vec![upsert];
+        statements.extend(Self::key_statements(keys)?);
+        self.in_transaction(statements).await
+    }
+
+    /// Forget the registration at the issuer `name` and apply `keys`, in one
+    /// transaction; a registration that is not there is already forgotten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a delete fails; nothing is then changed.
+    pub async fn delete_registration(&self, name: &str, keys: KeyChange<'_>) -> Result<()> {
+        let delete = Bound::new(
+            Query::delete()
+                .from_table(ClientRegistrations::Table)
+                .and_where(Expr::col(ClientRegistrations::Name).eq(name)),
+        )?;
+        let mut statements = vec![delete];
+        statements.extend(Self::key_statements(keys)?);
+        self.in_transaction(statements).await
+    }
+
+    /// Apply `keys` alone, all or nothing: a key moved from one name to
+    /// another is never in both places, nor in neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write fails; nothing is then changed.
+    pub async fn change_client_keys(&self, keys: KeyChange<'_>) -> Result<()> {
+        self.in_transaction(Self::key_statements(keys)?).await
+    }
+
+    fn key_statements(keys: KeyChange<'_>) -> Result<Vec<Bound>> {
+        let mut statements = Vec::new();
+        for name in keys.delete {
+            statements.push(Self::sealed_delete(SealedOwner::ClientKey(name))?);
+        }
+        if let Some((name, sealed)) = keys.put {
+            statements.push(Self::sealed_insert(
+                SealedOwner::ClientKey(name),
+                sealed,
+                true,
+            )?);
+        }
+        Ok(statements)
+    }
+
+    async fn in_transaction(&self, statements: Vec<Bound>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for statement in statements {
+            statement.query().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2155,6 +2352,94 @@ mod tests {
                 .is_ok_and(|t| t.is_none())
         );
         assert!(cp.delete_sealed(SealedOwner::User(&user.id)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_registration_is_kept_with_its_key_and_forgotten_with_it() {
+        let (_dir, cp) = open().await;
+        let sealed = |id: &str| Sealed {
+            key_id: id.to_owned(),
+            enc: vec![1],
+            ciphertext: vec![2, 3],
+        };
+        let key = sealed("key");
+        let mut row = RegistrationRow {
+            name: String::from("https://i"),
+            client_id: String::from("c1"),
+            registration_client_uri: Some(String::from("https://i/register/c1")),
+            token: Some(sealed("t1")),
+        };
+        assert!(
+            cp.registration("https://i")
+                .await
+                .is_ok_and(|r| r.is_none())
+        );
+        assert!(
+            cp.add_sealed(SealedOwner::ClientKey("https://i"), &sealed("pending"))
+                .await
+                .is_ok()
+        );
+        // The pending key moves to the client's name with the registration.
+        assert!(
+            cp.save_registration(
+                &row,
+                KeyChange {
+                    put: Some(("https://i c1", &key)),
+                    delete: &["https://i"],
+                },
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            cp.registration("https://i")
+                .await
+                .is_ok_and(|r| r.as_ref() == Some(&row))
+        );
+        assert!(
+            cp.sealed(SealedOwner::ClientKey("https://i c1"))
+                .await
+                .is_ok_and(|k| k == Some(key.clone()))
+        );
+        assert!(
+            cp.sealed(SealedOwner::ClientKey("https://i"))
+                .await
+                .is_ok_and(|k| k.is_none())
+        );
+        // An issuer without RFC 7592 leaves nothing to manage it with.
+        row.token = None;
+        row.registration_client_uri = None;
+        assert!(
+            cp.save_registration(&row, KeyChange::default())
+                .await
+                .is_ok()
+        );
+        assert!(
+            cp.registration("https://i")
+                .await
+                .is_ok_and(|r| r.as_ref() == Some(&row))
+        );
+        assert!(
+            cp.delete_registration(
+                "https://i",
+                KeyChange {
+                    put: None,
+                    delete: &["https://i c1"],
+                },
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            cp.registration("https://i")
+                .await
+                .is_ok_and(|r| r.is_none())
+        );
+        assert!(
+            cp.sealed(SealedOwner::ClientKey("https://i c1"))
+                .await
+                .is_ok_and(|k| k.is_none())
+        );
     }
 
     #[tokio::test]
