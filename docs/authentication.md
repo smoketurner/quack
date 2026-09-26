@@ -24,6 +24,9 @@ covers the cryptography.
 | JWT (JSON Web Token) | A signed token format with readable claims such as `iss` (issuer), `sub` (subject), `aud` (audience), and `exp` (expiry). |
 | JWKS (JSON Web Key Set) | The public keys an issuer publishes at its `jwks_uri` so others can check its JWT signatures. |
 | PKCE (Proof Key for Code Exchange) | A secret the client proves at the token endpoint, so a stolen sign-in code is useless. |
+| PAR (Pushed Authorization Request) | The client sends its sign-in request straight to the issuer and the browser carries only a reference to it (RFC 9126). |
+| Client assertion, `private_key_jwt` | A short-lived JWT the client signs with its own private key to authenticate at the token endpoint, in place of a shared secret (RFC 7523). |
+| OBO (on behalf of) | quack exchanges a signed-in person's token for a token to a model provider, so the provider sees the person rather than quack. |
 | MCP (Model Context Protocol) | The protocol that AI clients such as Claude Code use to call tools; quack serves it at `/mcp/v1/{workspace}`. |
 | RFC (Request for Comments) | A standard from the Internet Engineering Task Force, cited here by number. |
 | HPKE (Hybrid Public Key Encryption) | The encryption scheme the vault uses for stored tokens (RFC 9180). |
@@ -129,6 +132,7 @@ password form. Password login continues to work beside it.
 issuer_url = "https://login.example.com"                      # quack reads its /.well-known/openid-configuration
 client_id = "quack"
 client_secret_env = "QUACK_OIDC_SECRET"                       # when the issuer registers quack as a confidential client
+# client_auth = "private_key_jwt"                             # sign with quack's own key; no secret
 redirect_uri = "https://quack.example.com/auth/oidc/callback" # this server's own URL; register it with the issuer
 # scopes = ["openid", "profile", "email", "offline_access"]   # the default; "openid" is required
 # subject_claim = "sub"                                       # set "oid" for Entra ID
@@ -140,7 +144,11 @@ sequenceDiagram
     participant Q as quack serve
     participant I as Identity provider
     B->>Q: GET /auth/oidc
-    Q-->>B: 303 to the issuer (PKCE challenge, state, nonce) and a state cookie
+    opt the issuer lists a pushed_authorization_request_endpoint
+        Q->>I: POST the request (PKCE challenge, state, nonce), authenticated
+        I-->>Q: request_uri
+    end
+    Q-->>B: 303 to the issuer (the request, or only its request_uri) and a state cookie
     B->>I: the person signs in
     I-->>B: 302 to /auth/oidc/callback?code&state&iss
     B->>Q: GET /auth/oidc/callback, with the state cookie
@@ -148,6 +156,14 @@ sequenceDiagram
     I-->>Q: ID token, access token, refresh token
     Q-->>B: a session cookie, and 303 to /workspaces
 ```
+
+When the issuer's discovery document lists a `pushed_authorization_request_endpoint`, quack
+pushes the sign-in request there first, as RFC 9126 describes, and authenticates the push
+the same way it authenticates at the token endpoint. The browser then carries only
+`client_id` and the `request_uri` the issuer returned, so no one can read or alter the PKCE
+challenge, the `state`, the `nonce`, or the redirect on the way. Without that endpoint the
+browser carries the request itself, as before. quack does the same for a provider's
+`authorization-code` login.
 
 The callback must come from the browser that started the sign-in. quack compares the
 callback's `state` with a cookie it set on that browser when the sign-in began. A callback
@@ -259,7 +275,7 @@ bearer. The `grant` setting decides how quack obtains it:
 |---|---|---|
 | `authorization-code` (the default) | A person, in a browser. quack runs PKCE and catches the redirect on a loopback listener at `redirect_uri`. | With the refresh token, without a new sign-in. |
 | `device-code` | A person, who enters a code on another device (for SSH sessions, or hosts without a browser). | With the refresh token, without a new sign-in. |
-| `client-credentials` | Nobody. quack authenticates as itself with `client_id` and the secret in `client_secret_env`. | quack runs the grant again. |
+| `client-credentials` | Nobody. quack authenticates as itself with `client_id` and the secret in `client_secret_env`, or its key (`private_key_jwt`). | quack runs the grant again. |
 
 ```toml
 [providers.azure]
@@ -272,8 +288,8 @@ issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
 scopes = ["https://cognitiveservices.azure.com/.default", "offline_access"]
 # grant = "authorization-code"                  # or "device-code", "client-credentials", "on-behalf-of"
-# client_secret_env = "AZURE_CLIENT_SECRET"      # required by client-credentials and on-behalf-of
-# client_auth = "client_secret_post"             # or "client_secret_basic"
+# client_secret_env = "AZURE_CLIENT_SECRET"      # client-credentials and on-behalf-of need it or a key
+# client_auth = "client_secret_post"             # or "client_secret_basic", or "private_key_jwt"
 # redirect_uri = "http://127.0.0.1:19876/callback"
 ```
 
@@ -305,10 +321,83 @@ stored, and every process needs `quack auth login` again. With such an issuer, l
 process do the refreshing: run the model calls through one long-lived process, such as
 `quack serve`, rather than several processes on one data directory.
 
-`client_auth` sets how quack presents its secret at the token endpoint. The default,
-`client_secret_post`, sends it in the request body, which Entra ID and Auth0 accept.
+`client_auth` sets how quack authenticates at the token endpoint. The default,
+`client_secret_post`, sends the secret in the request body, which Entra ID and Auth0 accept.
 `client_secret_basic` sends it in an HTTP Basic header, which Okta applications use by
-default. The setting applies to every grant.
+default. `private_key_jwt` sends no secret at all; the next section describes it. Without
+a secret and without `private_key_jwt`, quack is a public client and sends only its
+`client_id`. The setting applies to every grant and to `[server.oidc]` as well.
+
+### Client authentication with a key (`private_key_jwt`)
+
+A shared secret works only while it stays secret, and it has to be copied into quack's
+environment to be used. With `client_auth = "private_key_jwt"`, quack holds a private key
+that never leaves it, and the issuer holds only the public half. On every request to the
+token endpoint, and on every pushed authorization request, quack signs a new client
+assertion (RFC 7523 section 2.2) and sends it as `client_assertion`, with
+`client_assertion_type` set to `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
+and its `client_id`. It sends no `client_secret` and no HTTP Basic header.
+
+The assertion is a JWT signed with ES256 (the elliptic-curve signature on P-256 with
+SHA-256). Its header names the key by `kid`, the key's RFC 7638 thumbprint. Its claims are:
+
+| Claim | Value |
+|---|---|
+| `iss`, `sub` | the `client_id` |
+| `aud` | the issuer identifier from discovery, else the configured `issuer_url` |
+| `jti` | a new UUID v7 |
+| `iat`, `exp` | now, and one minute later |
+
+The issuer records each `jti` and refuses it the second time, so quack signs every request
+anew, including a device-code poll and a retry. `client_secret_env` must be unset: quack
+refuses a configuration that names both. The key counts as a client credential, so the
+`client-credentials` and `on-behalf-of` grants accept it in place of a secret.
+
+```bash
+quack auth jwks gateway     # the public key set of [providers.gateway.oauth]'s client
+quack auth jwks             # the public key set of the [server.oidc] sign-in client
+```
+
+`quack auth jwks` prints the public key as a JWK set, ready for the issuer's client
+registration (its `jwks` field):
+
+```json
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "…",
+      "y": "…",
+      "kid": "…the RFC 7638 thumbprint…",
+      "use": "sig",
+      "alg": "ES256"
+    }
+  ]
+}
+```
+
+quack makes the key with aws-lc-rs the first time it is needed, whether by `quack auth
+jwks` or by a request, and keeps it in `control.db` (table `client_keys`), sealed by the
+vault like the tokens. It names the key after the client it authenticates: the issuer
+without a trailing slash, then the `client_id`. `[server.oidc]` and a provider that use the
+same client at the same issuer therefore share one key and one registration. Each process
+loads the key once. `quack auth status` shows the key's thumbprint for every client that
+uses `private_key_jwt`.
+
+To rotate the key, stop `quack serve`, which holds the key in memory, and delete the key's
+row, then run `quack auth jwks` to make and print a new one and register that with the
+issuer in place of the old one:
+
+```bash
+sqlite3 "$DATA_DIR/control.db" \
+  "DELETE FROM client_keys WHERE name = 'https://us.vouch.sh quack'"
+quack auth jwks
+```
+
+If the vault key is lost, the stored key cannot be opened. quack then makes a new key on
+its next request and logs a warning that the new public key must be registered (`quack auth
+jwks`); until it is, the issuer refuses quack's assertions with `invalid_client`.
 
 quack reads the issuer's endpoints from `{issuer_url}/.well-known/openid-configuration`. If
 that document does not exist, quack reads the OAuth 2.0 Authorization Server Metadata that
@@ -326,7 +415,7 @@ user. This grant works only in `quack serve`.
 [providers.gateway.oauth]
 issuer_url = "https://login.example.com"
 client_id = "quack"
-client_secret_env = "GATEWAY_SECRET"   # required
+client_secret_env = "GATEWAY_SECRET"   # or client_auth = "private_key_jwt"; one is required
 grant = "on-behalf-of"
 exchange = "token-exchange"            # or "entra"
 audience = "api://model-gateway"       # RFC 8693 audience (Okta, Auth0)
@@ -366,9 +455,10 @@ issuer. The refusal names the provider and the reason, and it returns `403` from
 or exit code 4 from the CLI. quack never sends such a request as itself.
 
 `quack auth login` has nothing to do for this grant and says so. `quack auth status` reports
-the grant. `quack doctor` checks that quack can obtain its own client-credentials token (the
-actor), and, when the issuer lists `grant_types_supported`, that the list includes the
-configured exchange.
+the grant. When the issuer lists `grant_types_supported`, `quack doctor` checks that the
+list includes the configured exchange. With `actor = true` it also checks that quack can
+obtain its own client-credentials token (the actor). With `actor = false`, quack never runs
+the client-credentials grant for the provider, and `quack doctor` requests no token at all.
 
 ### AWS (Bedrock)
 
@@ -382,6 +472,115 @@ instance roles of ECS (Elastic Container Service) and EC2 (Elastic Compute Cloud
 stores nothing; the SDK caches and refreshes the credentials. Design doc 10.2 has the
 details.
 
+## Recommended: on behalf of each person, with Vouch
+
+This is the most secure way quack can reach a model provider as each person, and the
+setup to copy. It uses [Vouch](https://vouch.sh) as the issuer, with one confidential
+client that serves both the sign-in to `quack serve` and the token exchange.
+
+Register one client with Vouch:
+
+```json
+{
+  "client_name": "quack",
+  "token_endpoint_auth_method": "private_key_jwt",
+  "token_endpoint_auth_signing_alg": "ES256",
+  "jwks": { "keys": ["…the key that `quack auth jwks` prints…"] },
+  "grant_types": [
+    "authorization_code",
+    "urn:ietf:params:oauth:grant-type:token-exchange"
+  ],
+  "response_types": ["code"],
+  "redirect_uris": ["https://quack.example.com/auth/oidc/callback"],
+  "scope": "openid email",
+  "dpop_bound_access_tokens": false,
+  "tls_client_certificate_bound_access_tokens": false
+}
+```
+
+Configure quack with the same `client_id` in both places:
+
+```toml
+[server.oidc]
+issuer_url = "https://us.vouch.sh"
+client_id = "quack"
+client_auth = "private_key_jwt"
+redirect_uri = "https://quack.example.com/auth/oidc/callback"
+scopes = ["openid", "email"]
+
+[providers.gateway]
+type = "openai"
+base_url = "https://models.example.com/v1"
+auth = "oauth"
+
+[providers.gateway.oauth]
+issuer_url = "https://us.vouch.sh"
+client_id = "quack"
+client_auth = "private_key_jwt"
+grant = "on-behalf-of"
+exchange = "token-exchange"
+actor = false
+# audience = "https://models.example.com"   # when the model API expects one
+```
+
+Then print the key set and paste it into the registration's `jwks`:
+
+```bash
+quack auth jwks             # the sign-in client's key, which the provider shares
+quack doctor                # checks discovery and that Vouch lists token exchange
+```
+
+Both sections name the same issuer and client, so they share one key. Each choice closes
+a specific gap:
+
+- **PKCE** makes a stolen authorization code useless, since only quack knows the verifier.
+- **PAR** keeps the sign-in request off the browser: Vouch's discovery lists
+  `https://us.vouch.sh/oauth/par`, so quack pushes the request there automatically.
+- **`private_key_jwt`** replaces a shared secret with a key that never leaves quack; each
+  assertion lasts a minute and works once.
+- **No `client_credentials`** grant is registered, because quack never needs a token of its
+  own here; a grant the client cannot use cannot be misused.
+- **`actor = false`** is required: Vouch accepts an actor token only when it belongs to a
+  Vouch user, and quack's own token names a client, so Vouch would refuse the exchange with
+  "Actor token user not found". The issued token still names the person as its subject and
+  records quack's `client_id`.
+
+Register the client as an ordinary client, not a FAPI (Financial-grade API) client: Vouch
+requires a DPoP proof from FAPI clients. Vouch offers only the `openid` and `email` scopes.
+Vouch checks the assertion as quack builds it: `iss` and `sub` are the `client_id`, `aud` is
+the issuer, `https://us.vouch.sh`, as a single string (the only form a FAPI client may
+use), the algorithm is ES256, the lifetime is within Vouch's limit, and the `jti` has not
+been seen before. Vouch issues no refresh tokens, so a sign-in lasts for Vouch's session.
+Its exchange accepts only tokens Vouch issued as the subject, so each person must have
+signed in to quack through Vouch.
+
+quack does not use DPoP (Demonstrating Proof of Possession). DPoP would bind the exchanged
+token to quack's key, and model APIs accept only bearer tokens, so the provider would
+refuse it. Hence `dpop_bound_access_tokens` and `tls_client_certificate_bound_access_tokens`
+are false.
+
+## One person on the command line
+
+For one person using quack on their own machine, register a public client, with no secret
+and no key, and use `grant = "authorization-code"`:
+
+```toml
+[providers.gateway.oauth]
+issuer_url = "https://login.example.com"
+client_id = "quack-cli"
+grant = "authorization-code"                    # the default
+# redirect_uri = "http://127.0.0.1:19876/callback"
+```
+
+`quack auth login gateway` opens the browser and catches the redirect on a loopback
+listener, and PKCE protects the code. Register the loopback `redirect_uri` with the issuer.
+A secret or key would add nothing on a machine where the person can read it anyway.
+
+Use `device-code` only on a headless machine, such as one reached over SSH with no local
+browser. A device code can be phished: an attacker starts a login, sends the victim the
+code, and receives the victim's token when the victim approves. With the browser flow, the
+token goes only to the listener that started the login.
+
 ## Where quack keeps secrets
 
 | Secret | Location | Protection |
@@ -389,6 +588,7 @@ details.
 | The vault key (an HPKE P-256 key pair) | OS keychain entry `quack` / `vault`; `<data_dir>/vault.key` where no keychain works | the keychain, or file mode `0600` |
 | Signed-in users' identity-provider tokens | `control.db`, table `user_tokens`, deleted with the user | sealed by the vault |
 | Providers' OAuth tokens | `control.db`, table `provider_tokens` | sealed by the vault |
+| Client keys for `private_key_jwt` (P-256, PKCS#8) | `control.db`, table `client_keys` | sealed by the vault |
 | Exchanged on-behalf-of tokens | memory only | lost on restart, and exchanged again on demand |
 | Passwords | `control.db`, `users.password_hash` | argon2id |
 | API tokens | `control.db`, `api_tokens.token_hash` | the SHA-256 of a 32-byte random token |
@@ -458,30 +658,22 @@ MCP client, can use it with quack. For on-behalf-of, turn on On-Behalf-Of Token 
 quack's own client (the one that performs the exchange) and set `audience` to the
 downstream API's identifier.
 
-**Vouch** ([vouch.sh](https://vouch.sh)). Register quack as an ordinary client, not a FAPI
-(Financial-grade API) client. Vouch requires a DPoP (RFC 9449) proof only from FAPI clients;
-it gives every other client plain bearer tokens, which is what quack sends and what model
-APIs accept. Vouch offers only the `openid` and `email` scopes, so set
-`scopes = ["openid", "email"]`. It issues no refresh tokens, so a sign-in lasts for Vouch's
-session. For on-behalf-of, use `exchange = "token-exchange"` and set `actor = false`. Vouch
-accepts an actor token only when it belongs to a Vouch user, and quack's own
-client-credentials token names quack's client, not a user, so Vouch refuses the exchange
-with "Actor token user not found". Without the actor token, the issued token names the
-person as its subject, and Vouch still records quack's `client_id` on it. Vouch's exchange
-accepts only tokens Vouch issued as the subject, so the person must have signed in to quack
-through Vouch.
+**Vouch** ([vouch.sh](https://vouch.sh)). See
+[Recommended: on behalf of each person, with Vouch](#recommended-on-behalf-of-each-person-with-vouch)
+above.
 
 ## Troubleshooting
 
 `quack doctor` checks each configured piece. For every model provider it confirms that the
 endpoint answers, that the credential is accepted, and that the model is listed. For an
-on-behalf-of provider it checks quack's own actor token instead of a user's. For
+on-behalf-of provider it checks quack's own actor token instead of a user's, and with
+`actor = false` it checks only that the issuer lists the exchange. For
 `[server.oidc]` it checks that the secret variable is set, that the issuer answers discovery
 under its configured name, and, with `audience`, how many signing keys the issuer publishes.
 `--offline` skips every network check. `quack config` lists every setting in force and where
 each value came from.
 
-Six errors and their fixes:
+Seven errors and their fixes:
 
 - "provider 'X' needs a login" (exit 4, or `503` from the server). Run
   `quack auth login X` as the operating-system user the server runs as. Use the same data
@@ -497,6 +689,9 @@ Six errors and their fixes:
 - "the sign-in could not be matched to this browser": the state cookie was missing. The
   sign-in started in another browser or tab, or the browser used a different host name than
   `redirect_uri`, so it did not send the cookie.
+- `invalid_client` with `client_auth = "private_key_jwt"`: the issuer does not have quack's
+  current public key. Run `quack auth jwks` (with the provider name for a provider) and
+  register its output. Check the log for a warning that the key was replaced.
 - "the redirect names issuer …, not this one (RFC 9207)": the redirect came from a
   different server than the configured issuer. Check `issuer_url`, and check for a proxy or
   a mix of tenants.
@@ -522,4 +717,5 @@ a stolen token is useless on its own. quack sends and accepts bearer tokens only
 bound with DPoP must be presented with a fresh proof on every request, and model APIs accept
 bearer tokens, so a bound on-behalf-of token would be refused by the provider it is for.
 Issuers that support DPoP, Vouch among them, still issue bearer tokens to a client that sends
-no proof, so quack works with them unchanged.
+no proof, so quack works with them unchanged. The key quack does hold, for
+`private_key_jwt`, authenticates quack to the issuer; it binds no token.
