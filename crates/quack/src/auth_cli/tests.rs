@@ -108,8 +108,6 @@ fn request(print: bool) -> RegisterArgs {
         sign_in: false,
         device_code: false,
         open: false,
-        adopt: None,
-        clean_up: false,
     }
 }
 
@@ -249,13 +247,13 @@ fn vouch_is_recognized_by_its_host() {
     )));
 }
 
-/// A client registered by hand rotates in three steps: `--rotate` prints
-/// the key in use beside its replacement (again the same pair if repeated),
-/// `--activate` signs with the replacement, and `--retire` prints it alone,
-/// the set to leave at the issuer once every `quack serve` has restarted.
+/// A client registered by hand rotates in two steps: `--rotate` prints the
+/// key in use beside its replacement (again the same pair if repeated), and
+/// `--activate` signs with the replacement and prints it alone, the set to
+/// leave at the issuer (again, if repeated).
 #[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test")]
-async fn a_hand_registered_client_rotates_in_three_steps_without_losing_its_key() {
+async fn a_hand_registered_client_rotates_in_two_steps_without_losing_its_key() {
     let dir = tempfile::tempdir().unwrap();
     let toml = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example.com/v1\"\nauth = \"oauth\"\n\
                 [providers.gw.oauth]\nissuer_url = \"https://idp.example.com\"\nclient_id = \"quack\"\n\
@@ -286,9 +284,8 @@ async fn a_hand_registered_client_rotates_in_three_steps_without_losing_its_key(
             )
         }
     };
-    // Nothing to retire before a rotation finishes: no replacement waits,
-    // and the key in use is the only one.
-    let (done, alone, _) = step(Step::Retire).await;
+    // With no rotation under way, `--activate` prints the key in use alone.
+    let (done, alone, _) = step(Step::Activate).await;
     assert!(done.is_ok(), "{done:?}");
     assert_eq!(alone.as_ref(), Some(&current));
 
@@ -318,14 +315,11 @@ async fn a_hand_registered_client_rotates_in_three_steps_without_losing_its_key(
         "{state}"
     );
     assert!(state.contains("--rotate --activate gw"), "{state}");
-    // Retiring now would drop the key quack still signs with.
-    let (done, _, _) = step(Step::Retire).await;
-    assert!(done.is_err_and(|e| e.to_string().contains("--rotate --activate gw")));
 
-    let (done, _, note) = step(Step::Activate).await;
+    let (done, alone, note) = step(Step::Activate).await;
     assert!(done.is_ok(), "{done:?}");
-    assert!(note.contains("still accepts both"), "{note}");
-    assert!(note.contains("--rotate --retire gw"), "{note}");
+    assert!(note.contains("Replace the key set registered"), "{note}");
+    assert!(note.contains("quack serve"), "{note}");
     let active = client_jwks(&config, Some("gw"), KeySource::File)
         .await
         .unwrap();
@@ -336,14 +330,11 @@ async fn a_hand_registered_client_rotates_in_three_steps_without_losing_its_key(
             .unwrap(),
         Some(format!("client key {next}"))
     );
-    // Nothing waits any more.
-    let (done, _, _) = step(Step::Activate).await;
-    assert!(done.is_err_and(|e| e.to_string().contains("no replacement key")));
-
-    let (done, alone, note) = step(Step::Retire).await;
+    assert_eq!(alone.as_ref(), Some(&active));
+    // Nothing waits any more: a repeat prints the same key alone.
+    let (done, again, _) = step(Step::Activate).await;
     assert!(done.is_ok(), "{done:?}");
-    assert_eq!(alone, Some(active));
-    assert!(note.contains("Replace the key set registered"), "{note}");
+    assert_eq!(again, Some(active));
 }
 
 /// Without a provider, `--rotate` targets the `[server.oidc]` client, and a

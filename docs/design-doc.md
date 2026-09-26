@@ -1441,14 +1441,12 @@ sealed by the vault for the `client-key` purpose, loaded once per process, and n
 `<issuer> <client_id>`, so `[server.oidc]` and a provider registered as the same client
 share one key and one registered JWKS. `quack auth jwks [PROVIDER]` prints the public
 key set to register; `quack auth status` shows the thumbprint. A key whose vault key is
-gone is replaced with a warning to register the new one. Rotation takes three steps, so the
-issuer always accepts the key every quack process signs with: `quack auth jwks --rotate`
+gone is replaced with a warning to register the new one. Rotation takes two steps: `quack auth jwks --rotate`
 makes a replacement under `next <issuer> <client_id>` in `client_keys` and gives the issuer
 both keys (again the same pair if repeated) while the old key keeps signing;
 `--rotate --activate` moves the replacement onto the client's name and deletes the old key
-in one transaction (`ControlPlane::change_client_keys`), the issuer still accepting either
-while every `quack serve` restarts onto it; and `--rotate --retire` gives the issuer the new
-key alone. For a client quack registered and holds a registration token for, quack sends
+in one transaction (`ControlPlane::change_client_keys`) and gives the issuer the new key
+alone (again, if repeated), after which every running `quack serve` must restart. For a client quack registered and holds a registration token for, quack sends
 each set itself (RFC 7592, `Registrar::publish_keys`); for any other it prints the set to
 register by hand. `quack auth status` shows a replacement waiting.
 
@@ -1471,7 +1469,7 @@ With none of these an issuer that is not Vouch is refused, never registered open
 temporary client's record (`sign-in <issuer> <client_id>` in `client_registrations`, its
 registration token sealed) is kept until it is deleted, so an interrupted run (Ctrl-C
 deletes it on the way out) or a refused delete leaves something to delete it with: the next
-`quack auth register` does, `--clean-up` does alone, and `quack doctor` names it. The key
+`quack auth register` does, and `quack doctor` names it. The key
 is made first under the issuer's name alone and moves to `<issuer> <client_id>` in the
 transaction that stores the registration in `control.db` (`client_registrations`, migration
 8: the `client_id`, the `registration_client_uri`, and the `registration_access_token`
@@ -1484,9 +1482,8 @@ registers and keeps the new client first and deletes the old one (RFC 7592 `DELE
 so a failure never leaves quack without a client; each rotation update reads the
 registration back and sends all of it with the new `jwks` (`PUT`, which replaces every
 field), keeping a rotated registration token; `quack auth unregister` deletes the client,
-then the record and the key. For registering by hand, `quack auth jwks` or `--print` shows
-the pending key, and `--adopt CLIENT_ID` records the client and gives it that key; nothing
-takes the pending key over implicitly. `quack doctor` checks each registration is kept and,
+then the record and the key. A client registered by hand is not recorded: its `client_id` goes
+in the sections, and its key is made under that name; nothing takes the pending key over. `quack doctor` checks each registration is kept and,
 online, still readable at the issuer. `client_secret_env` must be unset, and the
 key satisfies the confidential-client requirement of `client-credentials` and
 `on-behalf-of`. DPoP (RFC 9449) is not used: it would bind tokens to the key, and model
@@ -1773,10 +1770,9 @@ quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
-quack auth jwks [PROVIDER] [--rotate [--activate | --retire]]
+quack auth jwks [PROVIDER] [--rotate [--activate]]
 quack auth register [--issuer URL] [--sign-in | --device-code | --token-env VAR |
-                    --open] [--name NAME] [--replace] [--print]
-                    [--yes] | --adopt CLIENT_ID | --clean-up
+                    --open] [--name NAME] [--replace] [--print] [--yes]
 quack auth unregister [--issuer URL] [--yes]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]

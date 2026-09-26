@@ -14,23 +14,20 @@
 //! replaced, and the new public key must be registered with the issuer
 //! (`quack auth jwks`).
 //!
-//! Rotating takes three steps, so the issuer always accepts the key every
-//! quack process signs with. [`ClientKeys::stage_replacement`] makes a new
+//! Rotating takes two steps. [`ClientKeys::stage_replacement`] makes a new
 //! key under [`ClientKeyName::replacement`] (`next <issuer> <client_id>`)
 //! while the key in use keeps signing, and the issuer is given both
 //! (`quack auth jwks --rotate`); [`ClientKeys::activate_replacement`] puts
-//! it in place of the old one in one transaction (`--activate`); and once
-//! every `quack serve` has restarted onto it, the issuer is given it alone
-//! (`--retire`).
+//! it in place of the old one in one transaction, and the issuer is given
+//! it alone (`--activate`).
 //!
 //! A key can exist before the client does. A client registered with the
 //! issuer through RFC 7591 learns its id only from the registration, which
 //! must already carry the public key, so that key is made under the issuer's
 //! name alone ([`ClientKeyName::pending`]) and moves to `<issuer>
-//! <client_id>` once the issuer has assigned the id: `quack auth register`
-//! moves it itself, and `quack auth register --adopt ID` moves it for a
-//! client registered by hand. Nothing takes it over implicitly, since
-//! another client at the same issuer could get there first.
+//! <client_id>` once `quack auth register` has the id from the issuer. A
+//! client registered by hand has its `client_id` in the configuration
+//! before quack makes its key, so its key is made under that name.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -82,9 +79,8 @@ impl ClientKeyName {
     }
 
     /// The key for a client not yet registered at the issuer: named by the
-    /// issuer alone, since there is no client id yet. Registering, or
-    /// `quack auth register --adopt` for a client registered by hand, moves
-    /// it to [`ClientKeyName::new`].
+    /// issuer alone, since there is no client id yet. Registering moves it
+    /// to [`ClientKeyName::new`].
     #[must_use]
     pub fn pending(issuer_url: &str) -> Self {
         Self(issuer_url.trim_end_matches('/').to_owned())

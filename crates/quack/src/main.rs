@@ -398,21 +398,17 @@ enum AuthAction {
         /// [server.oidc] sign-in client
         provider: Option<String>,
 
-        /// Replace the key, in three runs: --rotate makes a new key and puts
+        /// Replace the key, in two runs: --rotate makes a new key and puts
         /// it beside the key in use at the issuer (itself, for a client
         /// quack registered; printed to register by hand otherwise)
         #[arg(long)]
         rotate: bool,
 
         /// With --rotate, once the issuer holds both keys: sign with the new
-        /// key from now on (then restart `quack serve`)
-        #[arg(long, requires = "rotate", conflicts_with = "retire")]
-        activate: bool,
-
-        /// With --rotate, once every `quack serve` signs with the new key:
-        /// leave the issuer holding it alone
+        /// key and leave the issuer holding it alone (then restart `quack
+        /// serve`)
         #[arg(long, requires = "rotate")]
-        retire: bool,
+        activate: bool,
     },
     /// Register one private-key-JWT client with the issuer (RFC 7591) for
     /// every [server.oidc] and [providers.NAME.oauth] section there that
@@ -1153,9 +1149,8 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             provider,
             rotate,
             activate,
-            retire,
         } => {
-            let step = auth_cli::Step::of(rotate, activate, retire);
+            let step = auth_cli::Step::of(rotate, activate);
             auth_cli::run_jwks(config, provider.as_deref(), step).await?;
         }
         AuthAction::Register(args) => run_register(config, args).await?,

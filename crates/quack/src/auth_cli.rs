@@ -216,30 +216,12 @@ pub(crate) struct RegisterArgs {
     /// Register an open client without asking
     #[arg(long)]
     pub(crate) yes: bool,
-
-    /// Record a client you registered by hand (in the issuer's console)
-    /// with the key `quack auth jwks` printed, and give it that key; the
-    /// sections without a `client_id` then use it
-    #[arg(
-        long,
-        value_name = "CLIENT_ID",
-        conflicts_with_all = ["token_env", "sign_in", "device_code", "open", "replace", "print"]
-    )]
-    pub(crate) adopt: Option<String>,
-
-    /// Only delete the temporary sign-in clients interrupted runs left at
-    /// the issuer, and register nothing
-    #[arg(
-        long,
-        conflicts_with_all = ["token_env", "sign_in", "device_code", "open", "replace", "print", "adopt"]
-    )]
-    pub(crate) clean_up: bool,
 }
 
 /// `quack auth register`: register one client for every section at the
-/// issuer without a `client_id`, or with `print`, show the request only;
-/// with `adopt`, record a client registered by hand; with `clean_up`, only
-/// delete the temporary sign-in clients interrupted runs left.
+/// issuer without a `client_id`, or with `print`, show the request only.
+/// Every run first deletes the temporary sign-in clients interrupted runs
+/// left at the issuer.
 pub(crate) async fn register(
     out: &mut impl Write,
     config: &Config,
@@ -250,29 +232,14 @@ pub(crate) async fn register(
 ) -> Result<()> {
     let issuer = issuer_to_register(config, request.issuer.as_deref())?;
     let registrar = Registrar::new(ClientKeys::new(config, key_source))?;
-    if request.clean_up {
-        let outcomes = registrar.clean_up_sign_in(&issuer).await?;
-        if outcomes.is_empty() {
-            writeln!(out, "No temporary sign-in client is left at {issuer}.")?;
-        }
-        write_temporary(out, &issuer, &outcomes)?;
-        return Ok(());
-    }
-    if let Some(client_id) = &request.adopt {
-        let key = registrar.adopt(&issuer, client_id).await?;
-        writeln!(
-            out,
-            "Client {client_id} at {issuer} now signs with key {}, and serves the sections without a client_id there. quack holds no registration token for it, so rotate its key with `quack auth jwks --rotate`, pasting each key set into the issuer's console.",
-            key.thumbprint()
-        )?;
-        return Ok(());
-    }
     let key = registrar.pending_key(&issuer).await?;
     let metadata = metadata_for(config, &issuer, &request.client_name, key.jwks())?;
     if request.print {
         writeln!(out, "{}", serde_json::to_string_pretty(&metadata)?)?;
         return Ok(());
     }
+    let earlier = registrar.clean_up_sign_in(&issuer).await?;
+    write_temporary(out, &issuer, &earlier)?;
     let how = How::of(&request, &issuer)?;
     if how == How::Open {
         writeln!(
@@ -368,7 +335,7 @@ async fn register_signed_in(
     if let TemporaryClient::Left { client_id, reason } = &done.temporary {
         writeln!(
             out,
-            "quack could not delete the temporary sign-in client {client_id} ({reason}); it keeps a record of it, and `quack auth register --clean-up` tries again."
+            "quack could not delete the temporary sign-in client {client_id} ({reason}); it keeps a record of it, and the next `quack auth register` tries again."
         )?;
     }
     Ok(done.registered)
@@ -415,7 +382,7 @@ fn write_temporary(
             )?,
             TemporaryClient::Left { client_id, reason } => writeln!(
                 out,
-                "The temporary sign-in client {client_id} at {issuer} is still registered ({reason}); `quack auth register --clean-up` tries again."
+                "The temporary sign-in client {client_id} at {issuer} is still registered ({reason}); the next `quack auth register` tries again."
             )?,
         }
     }
@@ -669,35 +636,28 @@ pub(crate) async fn unregister(
 pub(crate) enum Step {
     /// `--rotate`: a new key beside the one in use, both at the issuer.
     Stage,
-    /// `--activate`: sign with the new key; the issuer still holds both.
+    /// `--activate`: sign with the new key, and the issuer holds it alone.
     Activate,
-    /// `--retire`: the issuer holds the key in use alone.
-    Retire,
 }
 
 impl Step {
     /// The step `quack auth jwks` flags name, or none without `--rotate`.
-    pub(crate) fn of(rotate: bool, activate: bool, retire: bool) -> Option<Self> {
+    pub(crate) fn of(rotate: bool, activate: bool) -> Option<Self> {
         rotate.then_some(if activate {
             Self::Activate
-        } else if retire {
-            Self::Retire
         } else {
             Self::Stage
         })
     }
 }
 
-/// `quack auth jwks --rotate [--activate | --retire]`: a new key for the
-/// client, in three steps that never leave a quack process signing with a
-/// key the issuer refuses. `--rotate` makes the replacement beside the key
-/// in use and puts both at the issuer; `--activate` signs with the new key,
-/// the issuer still accepting either while every `quack serve` restarts
-/// onto it; `--retire` then leaves the issuer holding the new key alone.
-/// For a client quack registered and holds a registration token for, quack
-/// updates the issuer itself (RFC 7592); for any other client it prints
-/// the key set to register by hand. The JWKS goes to `out`; what to do
-/// next goes to `note`.
+/// `quack auth jwks --rotate [--activate]`: a new key for the client, in
+/// two steps. `--rotate` makes the replacement beside the key in use and
+/// puts both at the issuer, so either authenticates; `--activate` signs
+/// with the new key and leaves the issuer holding it alone. For a client
+/// quack registered and holds a registration token for, quack updates the
+/// issuer itself (RFC 7592); for any other client it prints the key set to
+/// register by hand. The JWKS goes to `out`; what to do next goes to `note`.
 pub(crate) async fn rotate(
     out: &mut impl Write,
     note: &mut impl Write,
@@ -753,28 +713,22 @@ pub(crate) async fn rotate(
             }
         }
         Step::Activate => {
-            let key = keys.activate_replacement(&current).await?;
-            writeln!(
-                note,
-                "quack now signs with key {} for client {id}, and the old key is deleted here; {name} still accepts both. Restart every running `quack serve`, which holds the old key in memory until then, and then run `quack auth jwks --rotate --retire{argument}` to leave {name} holding the new key alone.",
-                key.thumbprint()
-            )?;
-        }
-        Step::Retire => {
-            if let Some(next) = keys.waiting_replacement(&current).await? {
-                anyhow::bail!(
-                    "replacement key {} is not in use yet; run `quack auth jwks --rotate --activate{argument}` first",
-                    next.thumbprint()
-                );
-            }
-            let key = keys.existing(&current).await?.ok_or_else(|| {
-                anyhow::anyhow!("client {id} at {name} has no key yet; nothing to retire")
-            })?;
+            // Idempotent: with no replacement waiting, the key in use is
+            // sent (or printed) alone again, so a failed update can be retried.
+            let key = if keys.waiting_replacement(&current).await?.is_some() {
+                keys.activate_replacement(&current).await?
+            } else {
+                keys.existing(&current).await?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "client {id} at {name} has no key yet; `quack auth jwks --rotate{argument}` makes one"
+                    )
+                })?
+            };
             if managed {
                 let published = registrar.publish_keys(&name, &key.jwks()).await?;
                 writeln!(
                     note,
-                    "{name} now holds key {} alone for client {id}; the old key no longer authenticates.{}",
+                    "quack now signs with key {} for client {id}, and {name} holds it alone; the old key no longer authenticates. Restart every running `quack serve`, which signs with the old key until then.{}",
                     key.thumbprint(),
                     token_note(published.new_registration_token)
                 )?;
@@ -782,7 +736,7 @@ pub(crate) async fn rotate(
                 writeln!(out, "{}", serde_json::to_string_pretty(&key.jwks())?)?;
                 writeln!(
                     note,
-                    "Replace the key set registered for client {id} at {name} with this one, which holds the key in use ({}) alone, once every `quack serve` has restarted onto it.",
+                    "quack now signs with key {} for client {id}. Replace the key set registered at {name} with this one, which holds that key alone, after restarting every running `quack serve`, which signs with the old key until then.",
                     key.thumbprint()
                 )?;
             }

@@ -419,9 +419,8 @@ async fn replace_registers_the_new_client_first_then_deletes_the_old() {
 
 /// A registered client's key rotates as a client registered by hand does,
 /// with quack updating the issuer (RFC 7592) itself: `--rotate` puts the
-/// new key beside the one in use, `--activate` signs with it while the
-/// issuer still accepts either, and `--retire` leaves it alone. Every
-/// assertion along the way is accepted.
+/// new key beside the one in use, and `--activate` signs with it and leaves
+/// the issuer holding it alone. Every assertion along the way is accepted.
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -522,7 +521,7 @@ async fn rotation_puts_both_keys_at_the_issuer_then_the_new_one_alone() {
     }
     assert_eq!(sent.get("jwks"), serde_json::to_value(&both).ok().as_ref());
 
-    // --activate: quack signs with the new key, which the issuer accepts.
+    // --activate: quack signs with the new key, which the issuer accepts,
     let active = keys
         .activate_replacement(&client)
         .await
@@ -531,8 +530,8 @@ async fn rotation_puts_both_keys_at_the_issuer_then_the_new_one_alone() {
     let fresh = registered_config(dir.path(), &idp.issuer, &service_provider(&idp.issuer));
     assert!(login(fresh.clone()).await.is_ok(), "{:?}", refused(&idp));
 
-    // --retire: the issuer holds the new key alone, still accepted, and the
-    // rotated registration token reads the registration back.
+    // and the issuer then holds it alone, still accepted; the rotated
+    // registration token reads the registration back.
     let retired = registrar.publish_keys(&issuer, &active.jwks()).await;
     assert!(retired.is_ok(), "{retired:?}");
     assert!(login(fresh).await.is_ok(), "{:?}", refused(&idp));
@@ -587,63 +586,31 @@ async fn unregister_deletes_the_client_then_its_record_and_key() {
     assert!(registrar.unregister(&issuer).await.is_err());
 }
 
-/// A client registered by hand with the pending key takes it over only
-/// when `quack auth register --adopt` says so: another client at the same
-/// issuer never takes it on its own.
+/// A client named in the configuration (registered by hand) gets a key of
+/// its own: it never takes over the key waiting for a registration, which
+/// another client at the same issuer could otherwise claim.
 #[tokio::test]
-async fn a_client_registered_by_hand_takes_the_pending_key_only_when_adopted() {
+async fn a_client_named_in_the_configuration_never_takes_the_pending_key() {
     let idp = MockIdp::start().await;
     let dir = temp();
     let config = registered_config(dir.path(), &idp.issuer, "");
     let issuer = RegistrationName::new(&idp.issuer);
     let registrar = registrar(&config);
-    // `quack auth jwks` (or `--print`) made the key the operator registered.
-    let printed = registrar
+    let pending = registrar
         .pending_key(&issuer)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    // Another client at the issuer, named in the file, gets its own key.
     let keys = ClientKeys::new(&config, KeySource::File);
-    let other = keys
-        .key(&ClientKeyName::new(&idp.issuer, "someone-else"))
+    let by_hand = keys
+        .key(&ClientKeyName::new(&idp.issuer, "by-hand"))
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    assert_ne!(other.thumbprint(), printed.thumbprint());
-
-    let adopted = registrar.adopt(&issuer, "by-hand").await;
-    assert!(
-        adopted
-            .as_ref()
-            .is_ok_and(|k| k.thumbprint() == printed.thumbprint()),
-        "{adopted:?}"
-    );
-    assert_eq!(
-        stored_thumbprint(&config, "by-hand", &idp.issuer)
-            .await
-            .as_deref(),
-        Some(printed.thumbprint())
-    );
+    assert_ne!(by_hand.thumbprint(), pending.thumbprint());
     assert!(
         keys.existing(&ClientKeyName::pending(&idp.issuer))
             .await
-            .is_ok_and(|k| k.is_none())
+            .is_ok_and(|k| k.is_some_and(|k| k.thumbprint() == pending.thumbprint()))
     );
-    // The sections without a client_id now use it, with nothing to manage
-    // it by.
-    assert!(
-        provider_manager(&config, "gw")
-            .client_id()
-            .await
-            .is_ok_and(|id| id == "by-hand")
-    );
-    assert_eq!(
-        registrar.read(&issuer).await.ok().flatten(),
-        Some(ReadBack::Unmanaged {
-            client_id: String::from("by-hand")
-        })
-    );
-    // A second adoption is refused: a client is recorded, and no key waits.
-    assert!(registrar.adopt(&issuer, "another").await.is_err());
 }
 
 fn auth_checks(report: &Report) -> Vec<(Status, String, Option<String>)> {
@@ -1021,8 +988,8 @@ async fn a_refused_registration_still_deletes_the_temporary_client() {
 }
 
 /// A temporary client the issuer would not delete stays recorded, so
-/// `quack doctor` names it and a later run deletes it: `--clean-up`, or the
-/// next signed-in registration, which reports it.
+/// `quack doctor` names it and the next `quack auth register` deletes it
+/// and reports it.
 #[tokio::test]
 async fn a_temporary_client_left_behind_is_recorded_and_deleted_later() {
     let idp = MockIdp::start().await;
@@ -1064,7 +1031,9 @@ async fn a_temporary_client_left_behind_is_recorded_and_deleted_later() {
             .iter()
             .any(|(status, summary, fix)| *status == Status::Warn
                 && summary.contains("temporary sign-in client client-1")
-                && fix.as_deref().is_some_and(|f| f.contains("--clean-up"))),
+                && fix
+                    .as_deref()
+                    .is_some_and(|f| f.contains("quack auth register --issuer"))),
         "{:?}",
         auth_checks(&report)
     );
@@ -1081,7 +1050,8 @@ async fn a_temporary_client_left_behind_is_recorded_and_deleted_later() {
             .is_ok_and(|l| l == ["client-1", "client-2"])
     );
 
-    // `--clean-up` once the issuer deletes again.
+    // The next `quack auth register` deletes them once the issuer deletes
+    // again.
     idp.state.delete_fails.store(false, Ordering::SeqCst);
     let cleaned = registrar.clean_up_sign_in(&issuer).await;
     assert_eq!(

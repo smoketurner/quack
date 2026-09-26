@@ -1198,7 +1198,7 @@ async fn report_sign_in_leftovers(
                     leftovers.join(", ")
                 ),
             )
-            .fix(format!("quack auth register --clean-up --issuer {issuer}")),
+            .fix(format!("quack auth register --issuer {issuer} (it deletes them first)")),
         );
     }
 }

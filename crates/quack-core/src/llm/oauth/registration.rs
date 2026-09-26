@@ -476,8 +476,7 @@ pub enum TemporaryClient {
     /// RFC 7592 deleted it, or the issuer no longer knew it.
     Deleted { client_id: String },
     /// Still registered at the issuer. quack keeps its record while it can
-    /// still delete it, and tries again on the next `quack auth register`
-    /// or `--clean-up`.
+    /// still delete it, and tries again on the next `quack auth register`.
     Left { client_id: String, reason: String },
 }
 
@@ -748,72 +747,6 @@ impl Registrar {
                 .filter(|m| m != ClientAuth::PrivateKeyJwt.as_str()),
             replaced,
         })
-    }
-
-    /// Record a client someone registered by hand with the pending key (the
-    /// one `quack auth jwks` or `--print` showed before any `client_id`
-    /// existed), and give it that key. The sections without a `client_id`
-    /// at the issuer then use it. quack holds nothing to manage it with
-    /// (RFC 7592), so its key rotates by hand.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a client is already registered at the issuer,
-    /// no pending key waits, the client already has a key, or the record
-    /// cannot be written.
-    pub async fn adopt(
-        &self,
-        issuer: &RegistrationName,
-        client_id: &str,
-    ) -> Result<Arc<ClientKey>> {
-        if let Some(row) = self.keys.registration(issuer).await? {
-            return Err(Error::Config(format!(
-                "client {} is already registered at {issuer}; `quack auth unregister` forgets it first",
-                row.client_id
-            )));
-        }
-        let pending = ClientKeyName::pending(issuer.as_str());
-        let der = self.keys.stored_der(&pending).await?.ok_or_else(|| {
-            Error::Config(format!(
-                "no key waits for a client at {issuer}; `quack auth jwks` makes one to register with"
-            ))
-        })?;
-        let client = ClientKeyName::new(issuer.as_str(), client_id);
-        if self.keys.existing(&client).await?.is_some() {
-            return Err(Error::Config(format!(
-                "client {client_id} at {issuer} already has a key of its own; nothing to adopt"
-            )));
-        }
-        let key = ClientKey::from_pkcs8(&der)?;
-        let sealed = self.keys.seal(&client, &der).await?;
-        let row = RegistrationRow {
-            name: issuer.as_str().to_owned(),
-            client_id: client_id.to_owned(),
-            registration_client_uri: None,
-            token: None,
-        };
-        let saved = self
-            .keys
-            .control()
-            .await?
-            .save_registration(
-                &row,
-                Previous::Nothing,
-                KeyChange {
-                    put: Some((client.as_str(), &sealed)),
-                    delete: &[pending.as_str()],
-                },
-            )
-            .await?;
-        if !saved {
-            return Err(registration_error(format!(
-                "another registration at {issuer} finished first; nothing was adopted"
-            )));
-        }
-        self.keys.forget(&pending);
-        self.keys.forget(&client);
-        tracing::info!(issuer = %issuer, client_id, thumbprint = key.thumbprint(), "adopted a client registered by hand");
-        Ok(Arc::new(key))
     }
 
     /// Register `metadata` as the client of the person who signs in now,
@@ -1196,8 +1129,7 @@ impl Registrar {
     /// it (RFC 7592 2.1), sent back with the new `jwks`, since an update
     /// replaces every field (2.2). A new registration token, when the
     /// issuer rotates it, is kept. `quack auth jwks --rotate` sends the key
-    /// in use and its replacement, and `--retire` the key in use alone, so
-    /// the issuer always accepts the key every quack process signs with.
+    /// in use and its replacement, and `--activate` the new key alone.
     ///
     /// # Errors
     ///
