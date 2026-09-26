@@ -486,37 +486,39 @@ details.
 
 ## Recommended: on behalf of each person, with Vouch
 
-This is the most secure way quack can reach a model provider as each person, and the
-setup to copy. It uses [Vouch](https://vouch.sh) as the issuer, with one confidential
-client that serves both the sign-in to `quack serve` and the token exchange.
+This is the setup to copy for reaching a model provider as each person, with
+[Vouch](https://vouch.sh) as the issuer. One confidential client serves both the sign-in to
+`quack serve` and the token exchange.
 
-Register one client with Vouch:
+### Create the client in the Vouch console
 
-```json
-{
-  "client_name": "quack",
-  "token_endpoint_auth_method": "private_key_jwt",
-  "token_endpoint_auth_signing_alg": "ES256",
-  "jwks": { "keys": ["…the key that `quack auth jwks` prints…"] },
-  "grant_types": [
-    "authorization_code",
-    "urn:ietf:params:oauth:grant-type:token-exchange"
-  ],
-  "response_types": ["code"],
-  "redirect_uris": ["https://quack.example.com/auth/oidc/callback"],
-  "scope": "openid email",
-  "dpop_bound_access_tokens": false,
-  "tls_client_certificate_bound_access_tokens": false
-}
+In the Vouch console, create an application with these settings:
+
+| Setting | Value |
+|---|---|
+| Application type | Web |
+| Redirect URI | `https://quack.example.com/auth/oidc/callback` (your server's public URL) |
+| Access scope | Organization |
+| FAPI 2.0 | off |
+
+Copy the client ID and the client secret it shows. The secret is shown once.
+
+Leave FAPI 2.0 off. A FAPI client must send a DPoP proof or a TLS client certificate with
+every token request, so Vouch binds its tokens to a key, and the model API behind an
+on-behalf-of provider, which takes bearer tokens, refuses them.
+
+### Configure quack
+
+```bash
+export VOUCH_CLIENT_SECRET='…'          # the secret from the console
 ```
-
-Configure quack with the same `client_id` in both places:
 
 ```toml
 [server.oidc]
 issuer_url = "https://us.vouch.sh"
-client_id = "quack"
-client_auth = "private_key_jwt"
+client_id = "…"                          # the client ID from the console
+client_secret_env = "VOUCH_CLIENT_SECRET"
+client_auth = "client_secret_basic"
 redirect_uri = "https://quack.example.com/auth/oidc/callback"
 scopes = ["openid", "email"]
 
@@ -527,49 +529,63 @@ auth = "oauth"
 
 [providers.gateway.oauth]
 issuer_url = "https://us.vouch.sh"
-client_id = "quack"
-client_auth = "private_key_jwt"
+client_id = "…"                          # the same client
+client_secret_env = "VOUCH_CLIENT_SECRET"
+client_auth = "client_secret_basic"
 grant = "on-behalf-of"
 exchange = "token-exchange"
 actor = false
 # audience = "https://models.example.com"   # when the model API expects one
 ```
 
-Then print the key set and paste it into the registration's `jwks`:
+### Start it
 
 ```bash
-quack auth jwks             # the sign-in client's key, which the provider shares
-quack doctor                # checks discovery and that Vouch lists token exchange
+quack user add admin --admin    # Vouch sign-ins start with no access
+quack doctor                    # checks the client and the token exchange
+quack serve
 ```
 
-Both sections name the same issuer and client, so they share one key. Each choice closes
-a specific gap:
+Each person clicks "Sign in with us.vouch.sh" on the login page. An owner then gives them
+workspaces with `quack member add` or on the workspace's Settings page.
+
+### Why each setting
 
 - **PKCE** makes a stolen authorization code useless, since only quack knows the verifier.
 - **PAR** keeps the sign-in request off the browser: Vouch's discovery lists
   `https://us.vouch.sh/oauth/par`, so quack pushes the request there automatically.
-- **`private_key_jwt`** replaces a shared secret with a key that never leaves quack; each
-  assertion lasts a minute and works once.
-- **No `client_credentials`** grant is registered, because quack never needs a token of its
-  own here; a grant the client cannot use cannot be misused.
+- **An authenticated token exchange**: only a holder of the client's credentials can turn a
+  person's Vouch token into a token for the model API.
 - **`actor = false`** is required: Vouch accepts an actor token only when it belongs to a
   Vouch user, and quack's own token names a client, so Vouch would refuse the exchange with
   "Actor token user not found". The issued token still names the person as its subject and
   records quack's `client_id`.
+- **No DPoP**: DPoP would bind the exchanged token to quack's key, and model APIs accept
+  only bearer tokens.
 
-Register the client as an ordinary client, not a FAPI (Financial-grade API) client: Vouch
-requires a DPoP proof from FAPI clients. Vouch offers only the `openid` and `email` scopes.
-Vouch checks the assertion as quack builds it: `iss` and `sub` are the `client_id`, `aud` is
-the issuer, `https://us.vouch.sh`, as a single string (the only form a FAPI client may
-use), the algorithm is ES256, the lifetime is within Vouch's limit, and the `jti` has not
-been seen before. Vouch issues no refresh tokens, so a sign-in lasts for Vouch's session.
-Its exchange accepts only tokens Vouch issued as the subject, so each person must have
-signed in to quack through Vouch.
+Vouch offers only the `openid` and `email` scopes and issues no refresh tokens, so a
+sign-in lasts for Vouch's session. Its exchange accepts only tokens Vouch issued as the
+subject, so each person must have signed in to quack through Vouch.
 
-quack does not use DPoP (Demonstrating Proof of Possession). DPoP would bind the exchanged
-token to quack's key, and model APIs accept only bearer tokens, so the provider would
-refuse it. Hence `dpop_bound_access_tokens` and `tls_client_certificate_bound_access_tokens`
-are false.
+### A key instead of the secret
+
+`client_auth = "private_key_jwt"` would replace the shared secret with a key that never
+leaves quack. Vouch cannot give quack such a client today:
+
+- The console makes a `private_key_jwt` client only for FAPI 2.0 applications, whose tokens
+  are bound (see above).
+- Dynamic registration (`https://us.vouch.sh/oauth/register`) can make a non-FAPI
+  `private_key_jwt` client, but an unauthenticated registration makes a public client any
+  Vouch user can sign in to, and the Vouch CLI's own access token (`vouch credential
+  token`) is DPoP-bound, so Vouch refuses it as the bearer of a registration.
+
+Once the console can make a Web application that authenticates with `private_key_jwt` and
+a pasted key set without FAPI 2.0, the steps become: run `quack auth jwks`, paste its output
+into the application, and set `client_auth = "private_key_jwt"` in place of the secret, in
+both sections, removing `client_secret_env`. Rotate the key later with `quack auth jwks
+--rotate` and `--rotate --activate`, as
+[Client authentication with a key](#client-authentication-with-a-key-private_key_jwt)
+describes.
 
 ## One person on the command line
 
