@@ -1427,8 +1427,13 @@ sealed by the vault for the `client-key` purpose, loaded once per process, and n
 `<issuer> <client_id>`, so `[server.oidc]` and a provider registered as the same client
 share one key and one registered JWKS. `quack auth jwks [PROVIDER]` prints the public
 key set to register; `quack auth status` shows the thumbprint. A key whose vault key is
-gone is replaced with a warning to register the new one; rotating is deleting the row and
-registering what `quack auth jwks` prints next. `client_secret_env` must be unset, and the
+gone is replaced with a warning to register the new one. Rotation takes two steps: `quack
+auth jwks --rotate` makes a replacement under `next <issuer> <client_id>` in `client_keys`
+and prints both keys for the operator to register (again the same pair if repeated), while
+the old key keeps signing; `--rotate --activate` moves the replacement onto the client's
+name and deletes the old key in one transaction (`ControlPlane::move_client_key`) and prints
+the new key alone. `quack auth status` shows a replacement waiting, and a running `quack
+serve` keeps the old key until it restarts. `client_secret_env` must be unset, and the
 key satisfies the confidential-client requirement of `client-credentials` and
 `on-behalf-of`. DPoP (RFC 9449) is not used: it would bind tokens to the key, and model
 APIs take bearer tokens only.
@@ -1713,7 +1718,7 @@ quack context show | edit | history | export FILE | import FILE
 quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
-quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER | jwks [PROVIDER]
+quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER | jwks [PROVIDER] [--rotate [--activate]]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]

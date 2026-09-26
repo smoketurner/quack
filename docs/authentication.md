@@ -385,15 +385,27 @@ same client at the same issuer therefore share one key and one registration. Eac
 loads the key once. `quack auth status` shows the key's thumbprint for every client that
 uses `private_key_jwt`.
 
-To rotate the key, stop `quack serve`, which holds the key in memory, and delete the key's
-row, then run `quack auth jwks` to make and print a new one and register that with the
-issuer in place of the old one:
+Rotating the key takes two steps, so quack never signs with a key the issuer does not hold
+yet:
 
 ```bash
-sqlite3 "$DATA_DIR/control.db" \
-  "DELETE FROM client_keys WHERE name = 'https://us.vouch.sh quack'"
-quack auth jwks
+quack auth jwks --rotate gateway              # the key in use and a new one, to register
+quack auth jwks --rotate --activate gateway   # sign with the new key; prints it alone
 ```
+
+Leave out the provider name for the `[server.oidc]` client, as with `quack auth jwks`.
+
+1. `quack auth jwks --rotate` makes a new key and keeps it in `client_keys` under a pending
+   name, `next <issuer> <client_id>`. It prints a key set that holds both the key in use
+   and the new one. Register that set with the issuer in place of the old one, so the
+   issuer accepts either key while you switch. quack keeps signing with the old key, and
+   running `--rotate` again prints the same pair without making another key. `quack auth
+   status` shows the replacement waiting.
+2. Once the issuer holds the set, `quack auth jwks --rotate --activate` puts the new key in
+   place of the old one and deletes the old one, in one transaction. It prints the new key
+   alone, which is the set to keep at the issuer; replace the pair with it there.
+3. Restart `quack serve`. It loads the key once and keeps signing with the old one until it
+   restarts, which the issuer refuses once the old key is gone from the registration.
 
 If the vault key is lost, the stored key cannot be opened. quack then makes a new key on
 its next request and logs a warning that the new public key must be registered (`quack auth
@@ -691,7 +703,8 @@ Seven errors and their fixes:
   `redirect_uri`, so it did not send the cookie.
 - `invalid_client` with `client_auth = "private_key_jwt"`: the issuer does not have quack's
   current public key. Run `quack auth jwks` (with the provider name for a provider) and
-  register its output. Check the log for a warning that the key was replaced.
+  register its output. Check the log for a warning that the key was replaced. After `quack
+  auth jwks --rotate --activate`, restart `quack serve`, which still signs with the old key.
 - "the redirect names issuer …, not this one (RFC 9207)": the redirect came from a
   different server than the configured issuer. Check `issuer_url`, and check for a proxy or
   a mix of tenants.

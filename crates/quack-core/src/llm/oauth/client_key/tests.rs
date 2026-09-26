@@ -212,3 +212,79 @@ async fn a_key_whose_vault_key_is_gone_is_replaced() {
             .is_ok_and(|k| k.thumbprint() == new.thumbprint())
     );
 }
+
+#[test]
+fn a_replacement_is_named_apart_from_every_client() {
+    assert_eq!(
+        name().replacement().as_str(),
+        "next https://us.vouch.sh quack"
+    );
+    assert_ne!(name().replacement(), name());
+}
+
+#[tokio::test]
+async fn a_replacement_waits_beside_the_key_in_use_until_it_is_activated() {
+    let dir = temp();
+    let keys = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    // Nothing waits, so there is nothing to activate.
+    assert!(keys.activate_replacement(&name()).await.is_err());
+    let Ok(old) = keys.key(&name()).await else {
+        fail("no key");
+    };
+    let Ok((Some(current), next)) = keys.stage_replacement(&name()).await else {
+        fail("no replacement");
+    };
+    assert_eq!(current.thumbprint(), old.thumbprint());
+    assert_ne!(next.thumbprint(), old.thumbprint());
+    // Staging again, even from another process, finds the same pair.
+    let other = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    let Ok((Some(again_current), again_next)) = other.stage_replacement(&name()).await else {
+        fail("no replacement");
+    };
+    assert_eq!(again_current.thumbprint(), old.thumbprint());
+    assert_eq!(again_next.thumbprint(), next.thumbprint());
+    assert!(
+        keys.waiting_replacement(&name())
+            .await
+            .is_ok_and(|k| k.is_some_and(|k| k.thumbprint() == next.thumbprint()))
+    );
+    // The key in use is unchanged until activation.
+    assert!(
+        other
+            .load_or_create(&name())
+            .await
+            .is_ok_and(|k| k.thumbprint() == old.thumbprint())
+    );
+
+    let Ok(active) = keys.activate_replacement(&name()).await else {
+        fail("activation failed");
+    };
+    assert_eq!(active.thumbprint(), next.thumbprint());
+    // This process signs with the new key at once, and the stored row, which
+    // another process reads, holds it, resealed under the client's name.
+    assert!(
+        keys.key(&name())
+            .await
+            .is_ok_and(|k| k.thumbprint() == next.thumbprint())
+    );
+    let reread = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    assert!(
+        reread
+            .load_or_create(&name())
+            .await
+            .is_ok_and(|k| k.thumbprint() == next.thumbprint())
+    );
+    // Nothing waits any more.
+    assert!(
+        reread
+            .load(&name().replacement())
+            .await
+            .is_ok_and(|k| k.is_none())
+    );
+    assert!(
+        keys.waiting_replacement(&name())
+            .await
+            .is_ok_and(|k| k.is_none())
+    );
+    assert!(keys.activate_replacement(&name()).await.is_err());
+}

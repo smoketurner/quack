@@ -1310,6 +1310,16 @@ impl ControlPlane {
         sealed: &Sealed,
         replace: bool,
     ) -> Result<bool> {
+        let done = Self::sealed_insert(owner, sealed, replace)?
+            .query()
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The insert that keeps `owner`'s sealed value: replacing the one
+    /// before it, or only when there is none.
+    fn sealed_insert(owner: SealedOwner<'_>, sealed: &Sealed, replace: bool) -> Result<Bound> {
         let (table, key, id, stamp) = owner.row();
         let conflict = if replace {
             OnConflict::column(key.clone())
@@ -1342,8 +1352,17 @@ impl ControlPlane {
                 ])?
                 .on_conflict(conflict),
         )?;
-        let done = bound.query().execute(&self.pool).await?;
-        Ok(done.rows_affected() > 0)
+        Ok(bound)
+    }
+
+    /// The delete that forgets `owner`'s sealed value.
+    fn sealed_delete(owner: SealedOwner<'_>) -> Result<Bound> {
+        let (table, key, id, _) = owner.row();
+        Ok(Bound::new(
+            Query::delete()
+                .from_table(table)
+                .and_where(Expr::col(key).eq(id)),
+        )?)
     }
 
     /// Forget `owner`'s sealed token; one without is already done.
@@ -1352,13 +1371,27 @@ impl ControlPlane {
     ///
     /// Returns an error if the delete fails.
     pub async fn delete_sealed(&self, owner: SealedOwner<'_>) -> Result<()> {
-        let (table, key, id, _) = owner.row();
-        let bound = Bound::new(
-            Query::delete()
-                .from_table(table)
-                .and_where(Expr::col(key).eq(id)),
-        )?;
-        bound.query().execute(&self.pool).await?;
+        Self::sealed_delete(owner)?
+            .query()
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Put `sealed` in place of the client key `name` and delete the key
+    /// `from`, in one transaction: a key moved from one name to another is
+    /// never in both places, nor in neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write fails; nothing is then changed.
+    pub async fn move_client_key(&self, from: &str, name: &str, sealed: &Sealed) -> Result<()> {
+        let delete = Self::sealed_delete(SealedOwner::ClientKey(from))?;
+        let put = Self::sealed_insert(SealedOwner::ClientKey(name), sealed, true)?;
+        let mut tx = self.pool.begin().await?;
+        delete.query().execute(&mut *tx).await?;
+        put.query().execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2196,6 +2229,43 @@ mod tests {
         );
         assert!(cp.delete_sealed(owner).await.is_ok());
         assert!(cp.sealed(owner).await.is_ok_and(|t| t.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_client_key_moves_to_another_name_in_one_step() {
+        let (_dir, cp) = open().await;
+        let sealed = |id: &str| Sealed {
+            key_id: id.to_owned(),
+            enc: vec![1],
+            ciphertext: vec![2, 3],
+        };
+        let (current, next) = ("https://i c", "next https://i c");
+        assert!(
+            cp.add_sealed(SealedOwner::ClientKey(current), &sealed("old"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            cp.add_sealed(SealedOwner::ClientKey(next), &sealed("new"))
+                .await
+                .is_ok()
+        );
+        // The replacement, resealed for the client's name, takes its place.
+        assert!(
+            cp.move_client_key(next, current, &sealed("new for c"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            cp.sealed(SealedOwner::ClientKey(current))
+                .await
+                .is_ok_and(|t| t == Some(sealed("new for c")))
+        );
+        assert!(
+            cp.sealed(SealedOwner::ClientKey(next))
+                .await
+                .is_ok_and(|t| t.is_none())
+        );
     }
 
     #[tokio::test]
