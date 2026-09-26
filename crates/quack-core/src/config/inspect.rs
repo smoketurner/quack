@@ -37,6 +37,9 @@ pub enum Origin {
     File,
     /// The named environment variable sets it, whatever the file says.
     Env(&'static str),
+    /// A client `quack auth register` registered: the `client_id` the file
+    /// leaves out, read from the registration kept in `control.db`.
+    Registration,
 }
 
 /// Written as it prints: `default`, `file`, or `env NAME`.
@@ -52,6 +55,7 @@ impl fmt::Display for Origin {
             Self::Default => f.write_str("default"),
             Self::File => f.write_str("file"),
             Self::Env(var) => write!(f, "env {var}"),
+            Self::Registration => f.write_str("registration"),
         }
     }
 }
@@ -216,6 +220,43 @@ impl Inspection {
             unknown,
             environment,
         }
+    }
+
+    /// Fill in the `client_id` each OAuth section leaves out from the
+    /// client `quack auth register` registered at its issuer, marked as
+    /// coming from the registration. A section whose issuer has none stays
+    /// unset. `control.db` is only read, and not created when it does not
+    /// exist yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `control.db` exists but cannot be opened or
+    /// read.
+    pub async fn resolve_registered(&mut self) -> crate::error::Result<()> {
+        use crate::llm::oauth::registration::{ClientSection, registered_sections};
+        let sections = registered_sections(&self.config);
+        if sections.is_empty() || !self.config.control_db_path().exists() {
+            return Ok(());
+        }
+        let control = crate::storage::control::ControlPlane::open(&self.config).await?;
+        for registered in sections {
+            let Some(row) = control.registration(registered.issuer.as_str()).await? else {
+                continue;
+            };
+            let section = match &registered.section {
+                ClientSection::SignIn => String::from("server.oidc"),
+                ClientSection::Provider(name) => format!("providers.{name}.oauth"),
+            };
+            if let Some(setting) = self
+                .settings
+                .iter_mut()
+                .find(|s| s.section == section && s.key == "client_id" && s.value.is_none())
+            {
+                setting.value = Some(quoted(&row.client_id));
+                setting.origin = Origin::Registration;
+            }
+        }
+        Ok(())
     }
 
     /// Whether the binary would start on this configuration.
@@ -524,7 +565,7 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
         };
         let mut s = inventory.section(format!("{section}.oauth"));
         s.required_text("issuer_url", &oauth.issuer_url);
-        s.required_text("client_id", &oauth.client_id);
+        s.optional_text("client_id", oauth.client_id.as_deref(), None);
         s.optional(
             "scopes",
             Some(render_list(&oauth.scopes)),
@@ -753,7 +794,7 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     };
     let mut s = inventory.section(String::from("server.oidc"));
     s.required_text("issuer_url", &oidc.issuer_url);
-    s.required_text("client_id", &oidc.client_id);
+    s.optional_text("client_id", oidc.client_id.as_deref(), None);
     s.optional_text("client_secret_env", oidc.client_secret_env.as_deref(), None);
     s.text(
         "client_auth",

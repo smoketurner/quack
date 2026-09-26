@@ -25,6 +25,7 @@ covers the cryptography.
 | JWKS (JSON Web Key Set) | The public keys an issuer publishes at its `jwks_uri` so others can check its JWT signatures. |
 | PKCE (Proof Key for Code Exchange) | A secret the client proves at the token endpoint, so a stolen sign-in code is useless. |
 | PAR (Pushed Authorization Request) | The client sends its sign-in request straight to the issuer and the browser carries only a reference to it (RFC 9126). |
+| DCR (Dynamic Client Registration) | A client registers itself with the issuer over HTTP (RFC 7591), and later reads, updates, or deletes that registration (RFC 7592). |
 | Client assertion, `private_key_jwt` | A short-lived JWT the client signs with its own private key to authenticate at the token endpoint, in place of a shared secret (RFC 7523). |
 | OBO (on behalf of) | quack exchanges a signed-in person's token for a token to a model provider, so the provider sees the person rather than quack. |
 | MCP (Model Context Protocol) | The protocol that AI clients such as Claude Code use to call tools; quack serves it at `/mcp/v1/{workspace}`. |
@@ -381,12 +382,15 @@ quack makes the key with aws-lc-rs the first time it is needed, whether by `quac
 jwks` or by a request, and keeps it in `control.db` (table `client_keys`), sealed by the
 vault like the tokens. It names the key after the client it authenticates: the issuer
 without a trailing slash, then the `client_id`. `[server.oidc]` and a provider that use the
-same client at the same issuer therefore share one key and one registration. Each process
-loads the key once. `quack auth status` shows the key's thumbprint for every client that
-uses `private_key_jwt`.
+same client at the same issuer therefore share one key and one registration. A client that
+is not registered yet has no `client_id`, so its key waits under the issuer's name alone,
+and registering moves it (see [Registering the client from
+quack](#registering-the-client-from-quack)). Each process loads the key once. `quack auth
+status` shows the key's thumbprint for every client that uses `private_key_jwt`.
 
-Rotating the key takes two steps, so quack never signs with a key the issuer does not hold
-yet:
+A client that quack registered itself rotates its key in one step (see the same section).
+For a client registered by hand, in the issuer's console, rotating takes two steps, so
+quack never signs with a key the issuer does not hold yet:
 
 ```bash
 quack auth jwks --rotate gateway              # the key in use and a new one, to register
@@ -416,6 +420,117 @@ that document does not exist, quack reads the OAuth 2.0 Authorization Server Met
 RFC 8414 defines, at `/.well-known/oauth-authorization-server` placed before the issuer's
 path. Either document must name the configured issuer, and the browser flow's redirect must
 satisfy the RFC 9207 check described for sign-in.
+
+### Registering the client from quack
+
+Many issuers let a client register itself: the issuer lists a `registration_endpoint` in
+its discovery document, and the client posts its metadata there (Dynamic Client
+Registration, RFC 7591). The answer carries the new `client_id`, and usually a
+`registration_access_token` and a `registration_client_uri` with which the client can later
+read, update, or delete its registration (RFC 7592). `quack auth register` uses this to
+create a `private_key_jwt` client, so nobody copies a key into a console or a `client_id`
+back into the file.
+
+Leave `client_id` out of every section the registered client should serve, and set
+`client_auth = "private_key_jwt"` in each; quack refuses a section with neither a
+`client_id` nor a key. One registration serves every such section at one issuer, so
+`[server.oidc]` and an on-behalf-of provider share the client.
+
+```bash
+quack auth register                         # at Vouch: sign in, then register as yours
+quack auth register --sign-in               # the same at any issuer
+quack auth register --device-code           # sign in with a device code (no browser)
+quack auth register --token-env IDP_TOKEN   # register with an access token as the bearer
+quack auth register --open                  # register with no token: anyone may sign in
+quack auth register --print                 # the request as JSON, sent nowhere
+quack auth register --replace               # delete the registered client, register anew
+quack auth jwks --rotate                    # a new key, sent to the issuer (RFC 7592)
+quack auth unregister                       # delete the client at the issuer, then locally
+```
+
+`quack auth register` works out the issuer on its own when all the sections without a
+`client_id` share one; with several, name one with `--issuer`. It then makes the client's
+key and builds the request from the configuration:
+
+| Field | Value |
+|---|---|
+| `grant_types` | `authorization_code` for sign-in and for a provider's browser login; the device-code grant; the token-exchange grant for `on-behalf-of`; `client_credentials` for a provider with that grant, or for an on-behalf-of provider with `actor = true`; `refresh_token` when a section's scopes include `offline_access` |
+| `response_types` | `["code"]` when `authorization_code` is among the grants |
+| `redirect_uris` | `[server.oidc].redirect_uri`, or a provider's loopback `redirect_uri` |
+| `application_type` | `web` with the sign-in callback, `native` with a loopback redirect alone |
+| `token_endpoint_auth_method` | `private_key_jwt`, signing with ES256, and `jwks` holding the key |
+| `scope` | every scope the sections ask for |
+| `client_name` | `--name`, `quack` by default |
+
+The request never asks for `dpop_bound_access_tokens` or
+`tls_client_certificate_bound_access_tokens`. Tokens bound that way must be presented with
+a proof on every request, which model APIs cannot take. A provider that logs in through the
+loopback listener cannot share a registration with the `[server.oidc]` callback: OpenID
+Connect Dynamic Client Registration 1.0 section 2 lets a native client register only
+custom-scheme or loopback redirects, so it cannot take the https callback, and lets an
+issuer reject an `http` redirect on any other client. quack refuses that combination and
+names the provider, which then needs a `client_id` of its own.
+
+Who the client belongs to depends on what authorizes the registration:
+
+- **Signing in** (`--sign-in`, `--device-code`, and the default at Vouch). An issuer that
+  takes the registration's bearer as the client's owner needs a token of the person's own,
+  and a person rarely has one to hand. quack registers a temporary public client (no
+  secret, PKCE, the loopback redirect `http://127.0.0.1:19876/callback`) and signs the
+  person in through it, in the browser or with a device code over SSH. It registers the
+  real client with that token, which it keeps nowhere, and then deletes the temporary client
+  (RFC 7592), which also ends that sign-in. The temporary client is deleted whether or not
+  the registration succeeds; if the issuer refuses the delete, quack names the client to
+  delete in the issuer's console.
+- **An access token** (`--token-env VAR`): the environment variable holds the bearer, such
+  as the initial access token some issuers require.
+- **Nothing** (`--open`, and the default at other issuers). quack warns that an open
+  registration may create a client anyone with an account at the issuer can use, and asks
+  before it goes ahead; `--yes` answers for it.
+
+quack keeps the result in `control.db`, table `client_registrations`, under the issuer's
+name: the `client_id`, the `registration_client_uri`, and the `registration_access_token`,
+sealed by the vault like the other tokens. The key moves from the issuer's name, where it
+waited for the registration, to `<issuer> <client_id>` in the same transaction. Every
+section without a `client_id` reads it from there, and `quack config` shows the value with
+the origin `registration`. `quack serve` refuses to start when such a section's issuer has
+no registration, and any other command fails on first use with an error that names `quack
+auth register`. You can also write the registered `client_id` into the file; quack still
+manages the client, because its id matches the registration.
+
+`--replace` deletes the registered client at the issuer first (an RFC 7592 `DELETE` with the
+registration access token), then registers a new one with a new key. A client the issuer no
+longer knows is no obstacle, but any other refusal stops the command, so a replacement never
+leaves two clients behind. Anything else configured with the old `client_id` stops working.
+
+`quack auth jwks --rotate` rotates a registered client's key in one step. quack reads the
+registration back (RFC 7592 `GET`), makes a new key, and sends the whole registration back
+with the new `jwks` and the `client_id` (RFC 7592 `PUT`), since an update replaces every
+field the issuer holds. quack replaces its stored key only after the issuer accepts the
+update, so a refusal leaves the old key in use. When the issuer answers with a new
+registration access token, quack keeps that one. Restart `quack serve` afterwards, because
+it holds the old key in memory and the issuer no longer accepts it.
+
+`quack auth unregister` deletes the client at the issuer, then the registration and the key.
+`quack doctor` checks that every section without a `client_id` has a registration, and,
+unless `--offline`, that the issuer still describes the client at its
+`registration_client_uri`.
+
+For registering by hand, `quack auth register --print` prints the request as JSON with the
+key the registration needs, and sends nothing. Post it to the issuer's
+`registration_endpoint`, or paste its `jwks` into the issuer's console, then write the
+`client_id` into the file: the client takes over the printed key on its first use. quack
+cannot manage such a client afterwards, since it never saw the registration access token,
+so rotate its key with `--rotate` and `--activate` as described above.
+
+Vouch accepts dynamic registration, open or with a signed-in person's token (see
+[Recommended: on behalf of each person, with
+Vouch](#recommended-on-behalf-of-each-person-with-vouch)). Auth0 accepts it once Dynamic
+Client Registration is turned on for the tenant, and Okta with an initial access token or
+an API token as the bearer (`--token-env`). Microsoft Entra ID does not offer RFC 7591;
+register the client in the Azure portal and set `client_id`. An issuer that returns no
+registration access token leaves quack unable to rotate or delete the client; quack says so
+when it registers one.
 
 ### OAuth on behalf of the person
 
@@ -490,53 +605,14 @@ This is the setup to copy for reaching a model provider as each person, with
 [Vouch](https://vouch.sh) as the issuer. One confidential client serves both the sign-in to
 `quack serve` and the token exchange.
 
-### Create the client in the Vouch console
+### Configure quack
 
 The client authenticates with a key that quack holds (`private_key_jwt`), so there is no
-shared secret. quack names its key after the client, and the console issues the client ID
-only after the application exists, so registering the key takes two passes: create the
-application with a key made under a placeholder ID, then replace it with the key for the
-real ID.
-
-1. Configure quack as below with `client_id = "pending"` in both sections, and print a key
-   set:
-
-   ```bash
-   quack auth jwks
-   ```
-
-2. In the Vouch console, create an application with these settings:
-
-   | Setting | Value |
-   |---|---|
-   | Application type | Web |
-   | Redirect URI | `https://quack.example.com/auth/oidc/callback` (your server's public URL) |
-   | Access scope | Organization |
-   | Security profile | Standard OAuth |
-   | Client authentication | Private key (`private_key_jwt`) |
-   | JWKS | the output of `quack auth jwks` |
-
-   Vouch issues no client secret for it.
-
-3. Put the client ID from the console in place of `"pending"` in both sections, and print
-   the key set again. It is a new key, named after the real client:
-
-   ```bash
-   quack auth jwks
-   ```
-
-4. On the application's page in the console, edit the application, replace the JWKS with
-   this output, and save.
-
-The key made for `"pending"` stays in `control.db` unused. Leave the security profile on
-Standard OAuth: see [Why each setting](#why-each-setting).
-
-### Configure quack
+shared secret. Leave `client_id` out: `quack auth register` fills it in.
 
 ```toml
 [server.oidc]
 issuer_url = "https://us.vouch.sh"
-client_id = "…"                          # the client ID from the console
 client_auth = "private_key_jwt"
 redirect_uri = "https://quack.example.com/auth/oidc/callback"
 scopes = ["openid", "email"]
@@ -548,7 +624,6 @@ auth = "oauth"
 
 [providers.gateway.oauth]
 issuer_url = "https://us.vouch.sh"
-client_id = "…"                          # the same client
 client_auth = "private_key_jwt"
 grant = "on-behalf-of"
 exchange = "token-exchange"
@@ -556,8 +631,27 @@ actor = false
 # audience = "https://models.example.com"   # when the model API expects one
 ```
 
-Both sections name the same client at the same issuer, so they share one key and one
-registration. Neither sets `client_secret_env`.
+Both sections name the same issuer and no `client_id`, so one registration serves both, with
+one key. Neither sets `client_secret_env`.
+
+### Register the client
+
+```bash
+quack auth register
+```
+
+quack opens the browser to sign you in to Vouch (with a device code instead over SSH, or
+with `--device-code`), registers the client as yours, and prints its client ID. It
+registers exactly what the two sections need: the sign-in callback, the
+`authorization_code` and token-exchange grants, `private_key_jwt` with quack's key, and
+neither DPoP nor mTLS binding. To sign you in, it registers a temporary public client and
+deletes it once the registration is done.
+
+Vouch records you as the client's owner, with access scope Personal, so only you can sign
+in to it until you widen it. Open it on your Applications page in the Vouch console
+(`https://us.vouch.sh/applications`), set **Access scope** to **Organization**, and save.
+This step is deliberately manual: RFC 7591 has no field for it, and it decides who in your
+organization can use quack.
 
 ### Start it
 
@@ -592,17 +686,45 @@ subject, so each person must have signed in to quack through Vouch.
 
 ### Rotate the key
 
-Rotate it with `quack auth jwks --rotate`, which prints the key in use and a new one: paste
-that pair into the application's JWKS in the console. Then run `quack auth jwks --rotate
---activate`, paste the new key alone, and restart `quack serve`, as
-[Client authentication with a key](#client-authentication-with-a-key-private_key_jwt)
-describes.
+`quack auth jwks --rotate` makes a new key, sends it to Vouch in place of the old one (RFC
+7592), and signs with it once Vouch accepts. Restart a running `quack serve` afterwards.
+
+### Without registration: create the client in the console
+
+1. Configure quack as above, still without a `client_id`, and print the key made for the
+   client:
+
+   ```bash
+   quack auth jwks
+   ```
+
+2. In the Vouch console, create an application with these settings:
+
+   | Setting | Value |
+   |---|---|
+   | Application type | Web |
+   | Redirect URI | `https://quack.example.com/auth/oidc/callback` (your server's public URL) |
+   | Access scope | Organization |
+   | Security profile | Standard OAuth |
+   | Client authentication | Private key (`private_key_jwt`) |
+   | JWKS | the output of `quack auth jwks` |
+
+   Vouch issues no client secret for it.
+
+3. Add `client_id = "…"`, the client ID from the console, to both sections. The client
+   takes over the key it was registered with on its first use.
+
+quack did not register this client, so it cannot update it at Vouch: rotate its key in two
+steps with `quack auth jwks --rotate` and `--rotate --activate`, pasting each key set into
+the application's JWKS, as [Client authentication with a
+key](#client-authentication-with-a-key-private_key_jwt) describes.
 
 ### With a client secret instead
 
 A Vouch deployment whose console has no Client authentication choice makes a non-FAPI Web
-application with a client secret only. Copy the secret it shows once, export it, and in
-both sections replace `client_auth = "private_key_jwt"` with:
+application with a client secret only. Copy the client ID and the secret it shows once,
+export the secret, and in both sections add `client_id` and replace `client_auth =
+"private_key_jwt"` with:
 
 ```toml
 client_secret_env = "VOUCH_CLIENT_SECRET"

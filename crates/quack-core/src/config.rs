@@ -354,6 +354,21 @@ impl ClientAuth {
         Ok(())
     }
 
+    /// The rule for leaving `client_id` out: only a client quack registers
+    /// itself (`quack auth register`) has none in the file, and quack
+    /// registers every client it makes with `private_key_jwt`.
+    fn check_client_id(self, section: &str, client_id: Option<&str>) -> Result<()> {
+        match client_id {
+            Some(id) if id.trim().is_empty() => Err(Error::Config(format!(
+                "{section}: client_id is empty; name the client, or remove client_id for one `quack auth register` registers"
+            ))),
+            None if self != Self::PrivateKeyJwt => Err(Error::Config(format!(
+                "{section} needs client_id, unless quack registers the client itself (`quack auth register`), which takes client_auth = \"private_key_jwt\""
+            ))),
+            Some(_) | None => Ok(()),
+        }
+    }
+
     /// Whether the client proves who it is: a secret is named, or it signs
     /// assertions.
     const fn is_confidential(self, has_secret: bool) -> bool {
@@ -376,7 +391,10 @@ pub struct OAuthConfig {
     /// Issuer whose `/.well-known/openid-configuration` names the endpoints,
     /// e.g. `https://login.microsoftonline.com/{tenant}/v2.0`.
     pub issuer_url: String,
-    pub client_id: String,
+    /// The client quack is at the issuer. Unset for a client quack
+    /// registered itself (`quack auth register`, RFC 7591), whose id is
+    /// read from the registration kept for the issuer.
+    pub client_id: Option<String>,
     /// Scopes requested at login, e.g.
     /// `["https://cognitiveservices.azure.com/.default", "offline_access"]`.
     /// Include `offline_access` where the issuer needs it to return a refresh
@@ -438,13 +456,15 @@ impl OAuthConfig {
 
     /// The rules between the section's keys that the parser cannot check.
     fn check(&self) -> Result<()> {
-        if self.issuer_url.is_empty() || self.client_id.is_empty() {
+        if self.issuer_url.is_empty() {
             return Err(Error::Config(String::from(
-                "the oauth section needs issuer_url and client_id",
+                "the oauth section needs issuer_url",
             )));
         }
         self.client_auth
             .check("the oauth section", self.client_secret_env.as_ref())?;
+        self.client_auth
+            .check_client_id("the oauth section", self.client_id.as_deref())?;
         if matches!(self.grant, Grant::ClientCredentials | Grant::OnBehalfOf)
             && !self
                 .client_auth
@@ -1004,7 +1024,10 @@ pub struct OidcConfig {
     /// Issuer whose `/.well-known/openid-configuration` names the endpoints;
     /// ID tokens must name exactly this issuer.
     pub issuer_url: String,
-    pub client_id: String,
+    /// The client quack is at the issuer. Unset for a client quack
+    /// registered itself (`quack auth register`, RFC 7591), whose id is
+    /// read from the registration kept for the issuer.
+    pub client_id: Option<String>,
     /// Environment variable holding the client secret, for an issuer that
     /// registers quack as a confidential client.
     pub client_secret_env: Option<String>,
@@ -1074,7 +1097,7 @@ impl OidcConfig {
 #[serde(deny_unknown_fields)]
 struct RawOidcConfig {
     issuer_url: String,
-    client_id: String,
+    client_id: Option<String>,
     client_secret_env: Option<String>,
     #[serde(default)]
     client_auth: ClientAuth,
@@ -1090,13 +1113,15 @@ impl TryFrom<RawOidcConfig> for OidcConfig {
     type Error = Error;
 
     fn try_from(raw: RawOidcConfig) -> Result<Self> {
-        if raw.issuer_url.trim().is_empty() || raw.client_id.trim().is_empty() {
+        if raw.issuer_url.trim().is_empty() {
             return Err(Error::Config(String::from(
-                "[server.oidc] needs issuer_url and client_id",
+                "[server.oidc] needs issuer_url",
             )));
         }
         raw.client_auth
             .check("[server.oidc]", raw.client_secret_env.as_ref())?;
+        raw.client_auth
+            .check_client_id("[server.oidc]", raw.client_id.as_deref())?;
         if !raw.scopes.iter().any(|scope| scope == "openid") {
             return Err(Error::Config(String::from(
                 "[server.oidc].scopes must include \"openid\"",
@@ -1134,7 +1159,7 @@ impl TryFrom<RawOidcConfig> for OidcConfig {
         }
         Ok(Self {
             issuer_url: raw.issuer_url.trim().trim_end_matches('/').to_owned(),
-            client_id: raw.client_id.trim().to_owned(),
+            client_id: raw.client_id.map(|id| id.trim().to_owned()),
             client_secret_env: raw.client_secret_env,
             client_auth: raw.client_auth,
             scopes: raw.scopes,
@@ -1858,7 +1883,7 @@ rerank = "model"
         }
         assert!(
             err_of("[providers.p]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.p.oauth]\nissuer_url = \"\"\nclient_id = \"c\"\n")
-                .contains("issuer_url and client_id")
+                .contains("needs issuer_url")
         );
     }
 
@@ -2127,7 +2152,7 @@ rerank = "model"
         let with_key = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\napi_key_env = \"K\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n";
         assert!(err_of(with_key).contains("sets api_key_env"));
         let empty = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"\"\nclient_id = \"c\"\n";
-        assert!(err_of(empty).contains("needs issuer_url and client_id"));
+        assert!(err_of(empty).contains("needs issuer_url"));
         assert!(err_of("[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\ntenant = \"x\"\n").contains("tenant"));
     }
 
@@ -2311,6 +2336,35 @@ rerank = "model"
             err_of(&format!("{oidc}client_auth = \"tls_client_auth\"\n"))
                 .contains("tls_client_auth")
         );
+    }
+
+    #[test]
+    fn client_id_may_be_left_out_only_for_a_registered_key_client() {
+        let provider = |extra: &str| {
+            format!(
+                "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"https://us.vouch.sh\"\n{extra}"
+            )
+        };
+        let registered = Config::parse(&provider(
+            "client_auth = \"private_key_jwt\"\ngrant = \"on-behalf-of\"\nactor = false\n",
+        ));
+        assert!(registered.is_ok_and(|c| {
+            c.providers
+                .get("o")
+                .and_then(|p| p.auth.oauth())
+                .is_some_and(|o| o.client_id.is_none())
+        }));
+        assert!(err_of(&provider("")).contains("quack auth register"));
+        assert!(err_of(&provider("client_id = \" \"\n")).contains("client_id is empty"));
+
+        let oidc = |extra: &str| {
+            format!(
+                "[server.oidc]\nissuer_url = \"https://us.vouch.sh\"\nredirect_uri = \"https://q/auth/oidc/callback\"\n{extra}"
+            )
+        };
+        let sign_in = Config::parse(&oidc("client_auth = \"private_key_jwt\"\n"));
+        assert!(sign_in.is_ok_and(|c| c.server.oidc.is_some_and(|o| o.client_id.is_none())));
+        assert!(err_of(&oidc("")).contains("[server.oidc] needs client_id"));
     }
 
     #[test]

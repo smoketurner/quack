@@ -1,6 +1,6 @@
 //! Token manager and login flows against a mock identity provider.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -46,6 +46,22 @@ struct MockState {
     par: std::sync::atomic::AtomicBool,
     /// Each pushed authorization request's body.
     par_bodies: StdMutex<Vec<String>>,
+    /// The client assertions are checked for: the last one registered
+    /// (RFC 7591), else `client-1`.
+    registered_id: StdMutex<Option<String>>,
+    /// Registrations made so far, which also numbers the next client.
+    registrations: AtomicUsize,
+    /// Each registration request: its `Authorization` header and body.
+    registration_requests: StdMutex<Vec<(String, serde_json::Value)>>,
+    /// The registered clients: their registration access token and
+    /// metadata.
+    clients: StdMutex<HashMap<String, (String, serde_json::Value)>>,
+    /// Each RFC 7592 request: method, path, `Authorization`, and body.
+    management_requests: StdMutex<Vec<(String, String, String, String)>>,
+    /// Refuse updates.
+    update_fails: std::sync::atomic::AtomicBool,
+    /// Issue a new registration access token with each update.
+    rotate_registration_token: std::sync::atomic::AtomicBool,
 }
 
 type BeforeRefusal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
@@ -119,6 +135,20 @@ async fn serve(mut stream: tokio::net::TcpStream, base: &str, state: &MockState)
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/")
         .to_owned();
+    let method = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or("GET")
+        .to_owned();
+    let authorization = head
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.trim().to_owned())
+        })
+        .unwrap_or_default();
     if target == "/token"
         && let Ok(mut auth) = state.last_token_auth.lock()
     {
@@ -146,6 +176,9 @@ async fn serve(mut stream: tokio::net::TcpStream, base: &str, state: &MockState)
     let (status, json) = match refused {
         Some(refusal) => refusal,
         None if target == "/par" => pushed(&body, state),
+        None if target.starts_with("/register") => {
+            registration(&method, &target, &authorization, &body, base, state)
+        }
         None => route(&target, &body, base, state),
     };
     let response = format!(
@@ -185,6 +218,7 @@ fn metadata(target: &str, base: &str, state: &MockState) -> (&'static str, Strin
         "issuer": issuer,
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/token"),
+        "registration_endpoint": format!("{base}/register"),
         "device_authorization_endpoint": format!("{base}/device"),
     });
     if state.par.load(Ordering::SeqCst)
@@ -216,13 +250,13 @@ fn refuse_assertion(body: &str, base: &str, state: &MockState) -> Option<(&'stat
     let checked =
         if form(body, "client_assertion_type").as_deref() != Some(client_key::ASSERTION_TYPE) {
             Err(String::from("wrong client_assertion_type"))
-        } else if form(body, "client_id").as_deref() != Some("client-1") {
+        } else if form(body, "client_id") != Some(expected_client(state)) {
             Err(String::from("client_id missing or wrong"))
         } else {
             match (state.client_jwk.lock(), state.spent.lock()) {
                 (Ok(jwk), Ok(mut spent)) => jwk.as_ref().map_or_else(
                     || Err(String::from("no key registered")),
-                    |jwk| verify(jwk, &assertion, "client-1", base, &mut spent),
+                    |jwk| verify(jwk, &assertion, &expected_client(state), base, &mut spent),
                 ),
                 _ => Err(String::from("mock state poisoned")),
             }
@@ -235,6 +269,159 @@ fn refuse_assertion(body: &str, base: &str, state: &MockState) -> Option<(&'stat
         "401 Unauthorized",
         String::from("{\"error\":\"invalid_client\"}"),
     ))
+}
+
+/// The client id assertions must name.
+fn expected_client(state: &MockState) -> String {
+    state
+        .registered_id
+        .lock()
+        .ok()
+        .and_then(|id| id.clone())
+        .unwrap_or_else(|| String::from("client-1"))
+}
+
+/// The key a registration's `jwks` carries, which the mock then checks
+/// assertions against.
+fn registered_key(metadata: &serde_json::Value, state: &MockState) {
+    let jwk = metadata
+        .get("jwks")
+        .and_then(|jwks| jwks.get("keys"))
+        .and_then(|keys| keys.get(0))
+        .and_then(|key| serde_json::from_value::<PublicJwk>(key.clone()).ok());
+    if let Ok(mut registered) = state.client_jwk.lock() {
+        *registered = jwk;
+    }
+}
+
+/// A registration (RFC 7591): a new client, whose key the mock then
+/// checks assertions against.
+fn register_client(
+    method: &str,
+    authorization: &str,
+    parsed: serde_json::Value,
+    base: &str,
+    state: &MockState,
+) -> (&'static str, String) {
+    if method != "POST" {
+        return ("405 Method Not Allowed", String::from("{}"));
+    }
+    if let Ok(mut seen) = state.registration_requests.lock() {
+        seen.push((authorization.to_owned(), parsed.clone()));
+    }
+    let n = state
+        .registrations
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let id = format!("client-{n}");
+    let token = format!("rat-{n}");
+    let mut answer = parsed.clone();
+    if let Some(fields) = answer.as_object_mut() {
+        fields.insert(String::from("client_id"), serde_json::json!(id));
+        fields.insert(String::from("client_id_issued_at"), serde_json::json!(1));
+        fields.insert(
+            String::from("registration_access_token"),
+            serde_json::json!(token),
+        );
+        fields.insert(
+            String::from("registration_client_uri"),
+            serde_json::json!(format!("{base}/register/{id}")),
+        );
+    }
+    registered_key(&parsed, state);
+    if let Ok(mut registered) = state.registered_id.lock() {
+        *registered = Some(id.clone());
+    }
+    if let Ok(mut clients) = state.clients.lock() {
+        clients.insert(id, (token, parsed));
+    }
+    ("201 Created", answer.to_string())
+}
+
+/// Dynamic client registration (RFC 7591) at `/register`, and the client
+/// configuration endpoint (RFC 7592) at `/register/{client_id}`.
+fn registration(
+    method: &str,
+    target: &str,
+    authorization: &str,
+    body: &str,
+    base: &str,
+    state: &MockState,
+) -> (&'static str, String) {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    if target == "/register" {
+        return register_client(method, authorization, parsed, base, state);
+    }
+    if let Ok(mut seen) = state.management_requests.lock() {
+        seen.push((
+            method.to_owned(),
+            target.to_owned(),
+            authorization.to_owned(),
+            body.to_owned(),
+        ));
+    }
+    let id = target.trim_start_matches("/register/").to_owned();
+    let Ok(mut clients) = state.clients.lock() else {
+        return ("500 Internal Server Error", String::from("{}"));
+    };
+    let Some((token, metadata)) = clients.get(&id).cloned() else {
+        return (
+            "401 Unauthorized",
+            String::from("{\"error\":\"invalid_token\"}"),
+        );
+    };
+    if authorization != format!("Bearer {token}") {
+        return (
+            "401 Unauthorized",
+            String::from("{\"error\":\"invalid_token\"}"),
+        );
+    }
+    let described = |metadata: &serde_json::Value, token: Option<&str>| {
+        let mut answer = metadata.clone();
+        if let Some(fields) = answer.as_object_mut() {
+            fields.insert(String::from("client_id"), serde_json::json!(id));
+            fields.insert(
+                String::from("registration_client_uri"),
+                serde_json::json!(format!("{base}/register/{id}")),
+            );
+            if let Some(token) = token {
+                fields.insert(
+                    String::from("registration_access_token"),
+                    serde_json::json!(token),
+                );
+            }
+        }
+        answer.to_string()
+    };
+    match method {
+        "GET" => ("200 OK", described(&metadata, None)),
+        "PUT" if state.update_fails.load(Ordering::SeqCst) => (
+            "400 Bad Request",
+            String::from("{\"error\":\"invalid_client_metadata\"}"),
+        ),
+        "PUT" => {
+            if parsed.get("client_id").and_then(serde_json::Value::as_str) != Some(id.as_str()) {
+                return (
+                    "400 Bad Request",
+                    String::from("{\"error\":\"invalid_request\"}"),
+                );
+            }
+            let token = if state.rotate_registration_token.load(Ordering::SeqCst) {
+                format!("{token}-rotated")
+            } else {
+                token
+            };
+            registered_key(&parsed, state);
+            let answer = described(&parsed, Some(&token));
+            clients.insert(id, (token, parsed));
+            ("200 OK", answer)
+        }
+        "DELETE" => {
+            clients.remove(&id);
+            ("204 No Content", String::new())
+        }
+        _ => ("405 Method Not Allowed", String::from("{}")),
+    }
 }
 
 /// A pushed authorization request (RFC 9126), kept for the test to read.
@@ -364,7 +551,7 @@ const SECRET_ENV: &str = "CARGO_PKG_NAME";
 fn oauth_config(issuer: &str, grant: Grant) -> OAuthConfig {
     OAuthConfig {
         issuer_url: issuer.to_owned(),
-        client_id: String::from("client-1"),
+        client_id: Some(String::from("client-1")),
         scopes: vec![
             String::from("api://x/.default"),
             String::from("offline_access"),
@@ -830,6 +1017,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         pushed_authorization: None,
         jwks_uri: None,
         grant_types_supported: None,
+        registration: None,
         authorization_response_iss_parameter_supported: false,
     };
     assert!(m.endpoints.set(endpoints).is_ok());
@@ -1075,6 +1263,7 @@ fn a_redirects_issuer_must_match_and_is_required_when_promised() {
         pushed_authorization: None,
         jwks_uri: None,
         grant_types_supported: None,
+        registration: None,
         authorization_response_iss_parameter_supported: false,
     };
     assert!(endpoints.check_response_issuer(None).is_ok());
@@ -1339,3 +1528,5 @@ async fn a_browser_login_pushes_its_request_and_signs_the_code_exchange() {
     assert_eq!(spent(&idp), 2);
     assert!(refused(&idp).is_empty(), "{:?}", refused(&idp));
 }
+
+mod registration;
