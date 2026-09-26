@@ -862,6 +862,18 @@ pub struct KeyChange<'a> {
     pub delete: &'a [&'a str],
 }
 
+/// What a registration's name must still hold for
+/// [`ControlPlane::save_registration`] to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Previous<'a> {
+    /// No registration: a new one.
+    Nothing,
+    /// The registration of this client: an update or a replacement.
+    Client(&'a str),
+    /// Whatever is there.
+    Any,
+}
+
 /// A sealed-token row: the sealed value, as `vault::Sealed` is.
 impl FromRow<'_, SqliteRow> for Sealed {
     fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
@@ -1449,9 +1461,35 @@ impl ControlPlane {
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
-    /// Keep `row`, replacing the registration at its issuer, and apply
-    /// `keys` in the same transaction: a registration and the key it was
-    /// registered with are written together or not at all.
+    /// Every kept registration: quack's clients, one per issuer, and the
+    /// records of temporary sign-in clients not yet deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn registrations(&self) -> Result<Vec<RegistrationRow>> {
+        let bound = Bound::new(
+            Query::select()
+                .columns([
+                    ClientRegistrations::Name.into_iden(),
+                    ClientRegistrations::ClientId.into_iden(),
+                    ClientRegistrations::RegistrationClientUri.into_iden(),
+                    SealedColumns::KeyId.into_iden(),
+                    SealedColumns::Enc.into_iden(),
+                    SealedColumns::Ciphertext.into_iden(),
+                ])
+                .from(ClientRegistrations::Table)
+                .order_by(ClientRegistrations::Name, Order::Asc),
+        )?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
+    }
+
+    /// Keep `row` at its name and apply `keys` in the same transaction, but
+    /// only while the name still holds what the caller read: nothing
+    /// ([`Previous::Nothing`]), the client it names ([`Previous::Client`]),
+    /// or anything ([`Previous::Any`]). Returns `false`, having changed
+    /// nothing, when another writer got there first, so two registrations
+    /// racing each other never overwrite one another's record.
     ///
     /// # Errors
     ///
@@ -1459,8 +1497,9 @@ impl ControlPlane {
     pub async fn save_registration(
         &self,
         row: &RegistrationRow,
+        previous: Previous<'_>,
         keys: KeyChange<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (key_id, enc, ciphertext) = match &row.token {
             Some(sealed) => (
                 Some(sealed.key_id.clone()),
@@ -1469,43 +1508,88 @@ impl ControlPlane {
             ),
             None => (None, None, None),
         };
-        let upsert = Bound::new(
-            Query::insert()
-                .into_table(ClientRegistrations::Table)
-                .columns([
-                    ClientRegistrations::Name.into_iden(),
-                    ClientRegistrations::ClientId.into_iden(),
-                    ClientRegistrations::RegistrationClientUri.into_iden(),
-                    SealedColumns::KeyId.into_iden(),
-                    SealedColumns::Enc.into_iden(),
-                    SealedColumns::Ciphertext.into_iden(),
-                    SealedColumns::UpdatedAt.into_iden(),
-                ])
-                .values([
-                    row.name.as_str().into(),
-                    row.client_id.as_str().into(),
-                    row.registration_client_uri.clone().into(),
-                    key_id.into(),
-                    enc.into(),
-                    ciphertext.into(),
-                    Expr::current_timestamp(),
-                ])?
-                .on_conflict(
-                    OnConflict::column(ClientRegistrations::Name)
-                        .update_columns([
+        let values = [
+            row.name.as_str().into(),
+            row.client_id.as_str().into(),
+            row.registration_client_uri.clone().into(),
+            key_id.clone().into(),
+            enc.clone().into(),
+            ciphertext.clone().into(),
+            Expr::current_timestamp(),
+        ];
+        let columns = [
+            ClientRegistrations::Name.into_iden(),
+            ClientRegistrations::ClientId.into_iden(),
+            ClientRegistrations::RegistrationClientUri.into_iden(),
+            SealedColumns::KeyId.into_iden(),
+            SealedColumns::Enc.into_iden(),
+            SealedColumns::Ciphertext.into_iden(),
+            SealedColumns::UpdatedAt.into_iden(),
+        ];
+        let updated = [
+            ClientRegistrations::ClientId.into_iden(),
+            ClientRegistrations::RegistrationClientUri.into_iden(),
+            SealedColumns::KeyId.into_iden(),
+            SealedColumns::Enc.into_iden(),
+            SealedColumns::Ciphertext.into_iden(),
+            SealedColumns::UpdatedAt.into_iden(),
+        ];
+        let write = match previous {
+            Previous::Nothing => Bound::new(
+                Query::insert()
+                    .into_table(ClientRegistrations::Table)
+                    .columns(columns)
+                    .values(values)?
+                    .on_conflict(
+                        OnConflict::column(ClientRegistrations::Name)
+                            .do_nothing()
+                            .to_owned(),
+                    ),
+            )?,
+            Previous::Any => Bound::new(
+                Query::insert()
+                    .into_table(ClientRegistrations::Table)
+                    .columns(columns)
+                    .values(values)?
+                    .on_conflict(
+                        OnConflict::column(ClientRegistrations::Name)
+                            .update_columns(updated)
+                            .to_owned(),
+                    ),
+            )?,
+            Previous::Client(client_id) => Bound::new(
+                Query::update()
+                    .table(ClientRegistrations::Table)
+                    .values([
+                        (
                             ClientRegistrations::ClientId.into_iden(),
+                            row.client_id.as_str().into(),
+                        ),
+                        (
                             ClientRegistrations::RegistrationClientUri.into_iden(),
-                            SealedColumns::KeyId.into_iden(),
-                            SealedColumns::Enc.into_iden(),
-                            SealedColumns::Ciphertext.into_iden(),
+                            row.registration_client_uri.clone().into(),
+                        ),
+                        (SealedColumns::KeyId.into_iden(), key_id.into()),
+                        (SealedColumns::Enc.into_iden(), enc.into()),
+                        (SealedColumns::Ciphertext.into_iden(), ciphertext.into()),
+                        (
                             SealedColumns::UpdatedAt.into_iden(),
-                        ])
-                        .to_owned(),
-                ),
-        )?;
-        let mut statements = vec![upsert];
-        statements.extend(Self::key_statements(keys)?);
-        self.in_transaction(statements).await
+                            Expr::current_timestamp(),
+                        ),
+                    ])
+                    .and_where(Expr::col(ClientRegistrations::Name).eq(row.name.as_str()))
+                    .and_where(Expr::col(ClientRegistrations::ClientId).eq(client_id)),
+            )?,
+        };
+        let mut tx = self.pool.begin().await?;
+        if write.query().execute(&mut *tx).await?.rows_affected() == 0 {
+            return Ok(false);
+        }
+        for statement in Self::key_statements(keys)? {
+            statement.query().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Forget the registration at the issuer `name` and apply `keys`, in one
@@ -1533,21 +1617,6 @@ impl ControlPlane {
     /// Returns an error if a write fails; nothing is then changed.
     pub async fn change_client_keys(&self, keys: KeyChange<'_>) -> Result<()> {
         self.in_transaction(Self::key_statements(keys)?).await
-    }
-
-    /// Put `sealed` in place of the client key `name` and delete the key
-    /// `from`, in one transaction: a key moved from one name to another is
-    /// never in both places, nor in neither.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a write fails; nothing is then changed.
-    pub async fn move_client_key(&self, from: &str, name: &str, sealed: &Sealed) -> Result<()> {
-        self.change_client_keys(KeyChange {
-            put: Some((name, sealed)),
-            delete: &[from],
-        })
-        .await
     }
 
     fn key_statements(keys: KeyChange<'_>) -> Result<Vec<Bound>> {
@@ -2370,6 +2439,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "one registration's life, end to end")]
     async fn a_registration_is_kept_with_its_key_and_forgotten_with_it() {
         let (_dir, cp) = open().await;
         let sealed = |id: &str| Sealed {
@@ -2398,13 +2468,44 @@ mod tests {
         assert!(
             cp.save_registration(
                 &row,
+                Previous::Nothing,
                 KeyChange {
                     put: Some(("https://i c1", &key)),
                     delete: &["https://i"],
                 },
             )
             .await
-            .is_ok()
+            .is_ok_and(|saved| saved)
+        );
+        // A second new registration at the same name loses the race and
+        // changes nothing, keys included.
+        let rival = RegistrationRow {
+            client_id: String::from("c9"),
+            ..row.clone()
+        };
+        assert!(
+            cp.save_registration(
+                &rival,
+                Previous::Nothing,
+                KeyChange {
+                    put: Some(("https://i c9", &sealed("rival key"))),
+                    delete: &[],
+                },
+            )
+            .await
+            .is_ok_and(|saved| !saved)
+        );
+        assert!(
+            cp.sealed(SealedOwner::ClientKey("https://i c9"))
+                .await
+                .is_ok_and(|k| k.is_none())
+        );
+        // An update names the client it expects, and misses when another
+        // one is registered there.
+        assert!(
+            cp.save_registration(&rival, Previous::Client("c9"), KeyChange::default())
+                .await
+                .is_ok_and(|saved| !saved)
         );
         assert!(
             cp.registration("https://i")
@@ -2425,9 +2526,9 @@ mod tests {
         row.token = None;
         row.registration_client_uri = None;
         assert!(
-            cp.save_registration(&row, KeyChange::default())
+            cp.save_registration(&row, Previous::Client("c1"), KeyChange::default())
                 .await
-                .is_ok()
+                .is_ok_and(|saved| saved)
         );
         assert!(
             cp.registration("https://i")
@@ -2519,9 +2620,12 @@ mod tests {
         );
         // The replacement, resealed for the client's name, takes its place.
         assert!(
-            cp.move_client_key(next, current, &sealed("new for c"))
-                .await
-                .is_ok()
+            cp.change_client_keys(KeyChange {
+                put: Some((current, &sealed("new for c"))),
+                delete: &[next],
+            })
+            .await
+            .is_ok()
         );
         assert!(
             cp.sealed(SealedOwner::ClientKey(current))

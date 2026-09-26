@@ -108,6 +108,8 @@ fn request(print: bool) -> RegisterArgs {
         sign_in: false,
         device_code: false,
         open: false,
+        adopt: None,
+        clean_up: false,
     }
 }
 
@@ -118,6 +120,7 @@ fn no_sign_in() -> SignInWith<'static> {
     SignInWith {
         browser: false,
         notify: &|prompt| panic!("no sign-in expected: {prompt:?}"),
+        interrupt: Box::pin(std::future::pending()),
     }
 }
 
@@ -204,74 +207,6 @@ async fn an_open_registration_is_refused_without_a_yes() {
     assert!(err.contains("QUACK_TEST_UNSET_TOKEN_VARIABLE"), "{err}");
 }
 
-/// A client registered by hand rotates in two steps: `--rotate` prints the
-/// key in use beside its replacement, again the same pair if repeated, and
-/// only `--activate` puts the replacement in use.
-#[tokio::test]
-#[expect(clippy::unwrap_used, reason = "test")]
-async fn a_hand_registered_client_rotates_in_two_steps_without_losing_its_key() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example.com/v1\"\nauth = \"oauth\"\n\
-                [providers.gw.oauth]\nissuer_url = \"https://idp.example.com\"\nclient_id = \"quack\"\n\
-                client_auth = \"private_key_jwt\"\ngrant = \"client-credentials\"\n";
-    let mut config = Config::parse(toml).unwrap();
-    config.general.data_dir = dir.path().to_path_buf();
-    let current = client_jwks(&config, Some("gw"), KeySource::File)
-        .await
-        .unwrap();
-
-    let staged = |activate: bool| {
-        let config = config.clone();
-        async move {
-            let (mut out, mut note) = (Vec::new(), Vec::new());
-            let done = rotate(
-                &mut out,
-                &mut note,
-                &config,
-                Some("gw"),
-                activate,
-                KeySource::File,
-            )
-            .await;
-            (
-                done,
-                serde_json::from_slice::<PublicJwks>(&out).ok(),
-                String::from_utf8(note).unwrap_or_default(),
-            )
-        }
-    };
-    let (done, both, note) = staged(false).await;
-    assert!(done.is_ok(), "{done:?}");
-    let both = both.unwrap();
-    assert_eq!(both.keys.len(), 2);
-    assert_eq!(both.keys.first(), current.keys.first());
-    assert!(note.contains("--rotate --activate gw"), "{note}");
-    // Still signing with the old key; a repeat shows the same pair.
-    assert_eq!(
-        client_jwks(&config, Some("gw"), KeySource::File)
-            .await
-            .unwrap(),
-        current
-    );
-    let (_, again, _) = staged(false).await;
-    assert_eq!(again, Some(both.clone()));
-
-    let (done, active, note) = staged(true).await;
-    assert!(done.is_ok(), "{done:?}");
-    let active = active.unwrap();
-    assert_eq!(Some(active.keys.as_slice()), both.keys.get(1..));
-    assert!(note.contains("Replace the key set registered"), "{note}");
-    assert_eq!(
-        client_jwks(&config, Some("gw"), KeySource::File)
-            .await
-            .unwrap(),
-        active
-    );
-    // Nothing waits any more.
-    let (done, _, _) = staged(true).await;
-    assert!(done.is_err_and(|e| e.to_string().contains("no replacement key")));
-}
-
 /// A client without a `client_id` and without a registration has nothing to
 /// rotate or unregister.
 #[tokio::test]
@@ -284,7 +219,7 @@ async fn an_unregistered_client_has_nothing_to_rotate_or_delete() {
         &mut Vec::new(),
         &config,
         Some("gw"),
-        false,
+        Step::Stage,
         KeySource::File,
     )
     .await
@@ -314,12 +249,13 @@ fn vouch_is_recognized_by_its_host() {
     )));
 }
 
-/// A client registered by hand rotates in two steps: `--rotate` prints the
-/// key in use beside its replacement, again the same pair if repeated, and
-/// only `--activate` puts the replacement in use.
+/// A client registered by hand rotates in three steps: `--rotate` prints
+/// the key in use beside its replacement (again the same pair if repeated),
+/// `--activate` signs with the replacement, and `--retire` prints it alone,
+/// the set to leave at the issuer once every `quack serve` has restarted.
 #[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test")]
-async fn a_client_rotates_in_two_steps_without_losing_its_key() {
+async fn a_hand_registered_client_rotates_in_three_steps_without_losing_its_key() {
     let dir = tempfile::tempdir().unwrap();
     let toml = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example.com/v1\"\nauth = \"oauth\"\n\
                 [providers.gw.oauth]\nissuer_url = \"https://idp.example.com\"\nclient_id = \"quack\"\n\
@@ -330,7 +266,7 @@ async fn a_client_rotates_in_two_steps_without_losing_its_key() {
         .await
         .unwrap();
 
-    let staged = |activate: bool| {
+    let step = |step: Step| {
         let config = config.clone();
         async move {
             let (mut out, mut note) = (Vec::new(), Vec::new());
@@ -339,7 +275,7 @@ async fn a_client_rotates_in_two_steps_without_losing_its_key() {
                 &mut note,
                 &config,
                 Some("gw"),
-                activate,
+                step,
                 KeySource::File,
             )
             .await;
@@ -350,7 +286,13 @@ async fn a_client_rotates_in_two_steps_without_losing_its_key() {
             )
         }
     };
-    let (done, both, note) = staged(false).await;
+    // Nothing to retire before a rotation finishes: no replacement waits,
+    // and the key in use is the only one.
+    let (done, alone, _) = step(Step::Retire).await;
+    assert!(done.is_ok(), "{done:?}");
+    assert_eq!(alone.as_ref(), Some(&current));
+
+    let (done, both, note) = step(Step::Stage).await;
     assert!(done.is_ok(), "{done:?}");
     let both = both.unwrap();
     assert_eq!(both.keys.len(), 2);
@@ -364,7 +306,7 @@ async fn a_client_rotates_in_two_steps_without_losing_its_key() {
             .unwrap(),
         current
     );
-    let (_, again, _) = staged(false).await;
+    let (_, again, _) = step(Step::Stage).await;
     assert_eq!(again, Some(both.clone()));
     let state = client_key_state(&config, Some("gw"), KeySource::File)
         .await
@@ -376,18 +318,18 @@ async fn a_client_rotates_in_two_steps_without_losing_its_key() {
         "{state}"
     );
     assert!(state.contains("--rotate --activate gw"), "{state}");
+    // Retiring now would drop the key quack still signs with.
+    let (done, _, _) = step(Step::Retire).await;
+    assert!(done.is_err_and(|e| e.to_string().contains("--rotate --activate gw")));
 
-    let (done, active, note) = staged(true).await;
+    let (done, _, note) = step(Step::Activate).await;
     assert!(done.is_ok(), "{done:?}");
-    let active = active.unwrap();
+    assert!(note.contains("still accepts both"), "{note}");
+    assert!(note.contains("--rotate --retire gw"), "{note}");
+    let active = client_jwks(&config, Some("gw"), KeySource::File)
+        .await
+        .unwrap();
     assert_eq!(Some(active.keys.as_slice()), both.keys.get(1..));
-    assert!(note.contains("Restart a running `quack serve`"), "{note}");
-    assert_eq!(
-        client_jwks(&config, Some("gw"), KeySource::File)
-            .await
-            .unwrap(),
-        active
-    );
     assert_eq!(
         client_key_state(&config, Some("gw"), KeySource::File)
             .await
@@ -395,8 +337,13 @@ async fn a_client_rotates_in_two_steps_without_losing_its_key() {
         Some(format!("client key {next}"))
     );
     // Nothing waits any more.
-    let (done, _, _) = staged(true).await;
+    let (done, _, _) = step(Step::Activate).await;
     assert!(done.is_err_and(|e| e.to_string().contains("no replacement key")));
+
+    let (done, alone, note) = step(Step::Retire).await;
+    assert!(done.is_ok(), "{done:?}");
+    assert_eq!(alone, Some(active));
+    assert!(note.contains("Replace the key set registered"), "{note}");
 }
 
 /// Without a provider, `--rotate` targets the `[server.oidc]` client, and a
@@ -412,9 +359,16 @@ async fn rotate_without_a_provider_is_the_sign_in_client() {
     let mut config = Config::parse(toml).unwrap();
     config.general.data_dir = dir.path().to_path_buf();
     let (mut out, mut note) = (Vec::new(), Vec::new());
-    rotate(&mut out, &mut note, &config, None, false, KeySource::File)
-        .await
-        .unwrap();
+    rotate(
+        &mut out,
+        &mut note,
+        &config,
+        None,
+        Step::Stage,
+        KeySource::File,
+    )
+    .await
+    .unwrap();
     let note = String::from_utf8(note).unwrap();
     assert!(note.contains("no key in use yet"), "{note}");
     assert!(
@@ -429,11 +383,40 @@ async fn rotate_without_a_provider_is_the_sign_in_client() {
         &mut Vec::new(),
         &config,
         Some("plain"),
-        false,
+        Step::Stage,
         KeySource::File,
     )
     .await
     .unwrap_err()
     .to_string();
     assert!(err.contains("client_secret_post"), "{err}");
+}
+
+/// At an issuer that is not recognized as Vouch, `quack auth register`
+/// says how it would register rather than registering an open client, even
+/// with `--yes`: an open client there may be anyone's to sign in to.
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn an_unrecognized_issuer_needs_to_be_told_how_to_register() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = "[server.oidc]\nissuer_url = \"https://login.example.com\"\nclient_auth = \"private_key_jwt\"\n\
+                redirect_uri = \"https://q.example.com/auth/oidc/callback\"\n";
+    let mut config = Config::parse(toml).unwrap();
+    config.general.data_dir = dir.path().to_path_buf();
+    let mut yes = request(false);
+    yes.yes = true;
+    let err = register(
+        &mut Vec::new(),
+        &config,
+        yes,
+        KeySource::File,
+        Confirm::Assume,
+        no_sign_in(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    for choice in ["--sign-in", "--token-env", "--open"] {
+        assert!(err.contains(choice), "{err}");
+    }
 }

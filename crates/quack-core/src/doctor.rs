@@ -1168,6 +1168,41 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
     });
 }
 
+/// Warn about the temporary sign-in clients an interrupted `quack auth
+/// register` left recorded at `issuer`: anyone with an account there can
+/// sign in to one until it is deleted.
+async fn report_sign_in_leftovers(
+    report: &mut Report,
+    config: &Config,
+    control: &ControlPlane,
+    key_source: KeySource,
+    issuer: &RegistrationName,
+) {
+    let leftovers = match Registrar::new(ClientKeys::with_control(
+        config,
+        key_source,
+        control.clone(),
+    )) {
+        Ok(registrar) => registrar.sign_in_leftovers(issuer).await,
+        Err(e) => Err(e),
+    };
+    if let Ok(leftovers) = leftovers
+        && !leftovers.is_empty()
+    {
+        report.push(
+            Check::new(
+                Area::Auth,
+                Status::Warn,
+                format!(
+                    "an interrupted `quack auth register` left temporary sign-in client {} registered at {issuer}; until it is deleted, anyone with an account there can sign in to it",
+                    leftovers.join(", ")
+                ),
+            )
+            .fix(format!("quack auth register --clean-up --issuer {issuer}")),
+        );
+    }
+}
+
 /// The clients `quack auth register` registered, one per issuer that a
 /// section without a `client_id` names: the registration is kept, and
 /// online, the issuer still describes that client at its
@@ -1203,6 +1238,7 @@ pub(crate) async fn check_registrations(
             report.push(missing());
             continue;
         };
+        report_sign_in_leftovers(report, config, control, key_source, &name).await;
         let keys = ClientKeys::with_control(config, key_source, control.clone());
         let row = match keys.registration(&name).await {
             Ok(Some(row)) => row,
@@ -1246,10 +1282,10 @@ pub(crate) async fn check_registrations(
                 Area::Auth,
                 Status::Warn,
                 format!(
-                    "client {id}, registered at {issuer}, serves {served}; the issuer returned no registration token, so quack cannot read it back, rotate its key, or delete it"
+                    "client {id}, registered at {issuer}, serves {served}; quack holds no registration token for it (it was registered by hand, or the issuer returned none), so it cannot read it back or delete it, and its key rotates by hand"
                 ),
             )
-            .fix("manage the client in the issuer's console"),
+            .fix("manage the client in the issuer's console; rotate its key with `quack auth jwks --rotate`"),
             Ok(Some(ReadBack::Refused { status, .. })) => Check::new(
                 Area::Auth,
                 Status::Fail,

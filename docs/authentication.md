@@ -388,28 +388,33 @@ and registering moves it (see [Registering the client from
 quack](#registering-the-client-from-quack)). Each process loads the key once. `quack auth
 status` shows the key's thumbprint for every client that uses `private_key_jwt`.
 
-A client that quack registered itself rotates its key in one step (see the same section).
-For a client registered by hand, in the issuer's console, rotating takes two steps, so
-quack never signs with a key the issuer does not hold yet:
+Rotating the key takes three steps, so the issuer always accepts the key every quack
+process signs with. For a client that quack registered itself (see the next section), quack
+updates the issuer at each step (RFC 7592); for a client registered by hand, in the issuer's
+console, it prints the key set to register there:
 
 ```bash
-quack auth jwks --rotate gateway              # the key in use and a new one, to register
-quack auth jwks --rotate --activate gateway   # sign with the new key; prints it alone
+quack auth jwks --rotate gateway              # a new key beside the one in use
+quack auth jwks --rotate --activate gateway   # sign with the new key
+quack auth jwks --rotate --retire gateway     # leave the issuer holding it alone
 ```
 
 Leave out the provider name for the `[server.oidc]` client, as with `quack auth jwks`.
 
-1. `quack auth jwks --rotate` makes a new key and keeps it in `client_keys` under a pending
-   name, `next <issuer> <client_id>`. It prints a key set that holds both the key in use
-   and the new one. Register that set with the issuer in place of the old one, so the
-   issuer accepts either key while you switch. quack keeps signing with the old key, and
-   running `--rotate` again prints the same pair without making another key. `quack auth
-   status` shows the replacement waiting.
-2. Once the issuer holds the set, `quack auth jwks --rotate --activate` puts the new key in
-   place of the old one and deletes the old one, in one transaction. It prints the new key
-   alone, which is the set to keep at the issuer; replace the pair with it there.
-3. Restart `quack serve`. It loads the key once and keeps signing with the old one until it
-   restarts, which the issuer refuses once the old key is gone from the registration.
+1. `quack auth jwks --rotate` makes a new key and keeps it in `client_keys` under its
+   replacement name, `next <issuer> <client_id>`. The issuer is given a key set holding both
+   the key in use and the new one: quack sends it for a client it registered, and prints it
+   for any other, to register in place of the one there. quack keeps signing with the key in
+   use, and running `--rotate` again sends or prints the same pair without making another
+   key. `quack auth status` shows the replacement waiting.
+2. Once the issuer holds both, `quack auth jwks --rotate --activate` puts the new key in
+   place of the old one and deletes the old one, in one transaction. The issuer still
+   accepts either, so restart every running `quack serve` now: it loads the key once and
+   keeps signing with the old one until it restarts.
+3. Once every `quack serve` has restarted, `quack auth jwks --rotate --retire` leaves the
+   issuer holding the new key alone: quack sends it for a client it registered, and prints
+   it for any other, to register in place of the pair. It refuses while a replacement is
+   still waiting to be activated.
 
 If the vault key is lost, the stored key cannot be opened. quack then makes a new key on
 its next request and logs a warning that the new public key must be registered (`quack auth
@@ -443,8 +448,10 @@ quack auth register --device-code           # sign in with a device code (no bro
 quack auth register --token-env IDP_TOKEN   # register with an access token as the bearer
 quack auth register --open                  # register with no token: anyone may sign in
 quack auth register --print                 # the request as JSON, sent nowhere
-quack auth register --replace               # delete the registered client, register anew
-quack auth jwks --rotate                    # a new key, sent to the issuer (RFC 7592)
+quack auth register --replace               # register a new client, then delete the old one
+quack auth register --adopt CLIENT_ID       # record a client registered by hand
+quack auth register --clean-up              # delete temporary sign-in clients left behind
+quack auth jwks --rotate                    # a new key beside the old, sent to the issuer
 quack auth unregister                       # delete the client at the issuer, then locally
 ```
 
@@ -475,18 +482,25 @@ Who the client belongs to depends on what authorizes the registration:
 
 - **Signing in** (`--sign-in`, `--device-code`, and the default at Vouch). An issuer that
   takes the registration's bearer as the client's owner needs a token of the person's own,
-  and a person rarely has one to hand. quack registers a temporary public client (no
-  secret, PKCE, the loopback redirect `http://127.0.0.1:19876/callback`) and signs the
-  person in through it, in the browser or with a device code over SSH. It registers the
-  real client with that token, which it keeps nowhere, and then deletes the temporary client
-  (RFC 7592), which also ends that sign-in. The temporary client is deleted whether or not
-  the registration succeeds; if the issuer refuses the delete, quack names the client to
-  delete in the issuer's console.
+  and a person rarely has one to hand. quack registers a temporary public client (a native
+  app with no secret, PKCE, and a loopback redirect on a free port) and signs the person in
+  through it, in the browser or with a device code over SSH. It registers the real client
+  with that token, which it keeps nowhere, and then deletes the temporary client (RFC 7592),
+  which also ends that sign-in. quack keeps the temporary client's record, sealed, in
+  `control.db` from its registration until it is deleted, so a run that is interrupted
+  (Ctrl-C deletes it on the way out) or whose delete the issuer refuses leaves something to
+  delete it with: the next `quack auth register` deletes it first, `quack auth register
+  --clean-up` deletes it alone, and `quack doctor` names it until then. Until it is deleted,
+  anyone with an account at the issuer can sign in to it.
 - **An access token** (`--token-env VAR`): the environment variable holds the bearer, such
   as the initial access token some issuers require.
-- **Nothing** (`--open`, and the default at other issuers). quack warns that an open
-  registration may create a client anyone with an account at the issuer can use, and asks
-  before it goes ahead; `--yes` answers for it.
+- **Nothing** (`--open`). quack warns that an open registration may create a client anyone
+  with an account at the issuer can use, and asks before it goes ahead; `--yes` answers for
+  it.
+
+With none of these, quack signs the person in at Vouch (an issuer on `vouch.sh`) and refuses
+at any other issuer, naming the three choices: it never registers an open client unless
+told to, since at a Vouch on its own domain that client would be every user's.
 
 quack keeps the result in `control.db`, table `client_registrations`, under the issuer's
 name: the `client_id`, the `registration_client_uri`, and the `registration_access_token`,
@@ -498,30 +512,36 @@ no registration, and any other command fails on first use with an error that nam
 auth register`. You can also write the registered `client_id` into the file; quack still
 manages the client, because its id matches the registration.
 
-`--replace` deletes the registered client at the issuer first (an RFC 7592 `DELETE` with the
-registration access token), then registers a new one with a new key. A client the issuer no
-longer knows is no obstacle, but any other refusal stops the command, so a replacement never
-leaves two clients behind. Anything else configured with the old `client_id` stops working.
+`--replace` registers a new client with a new key and keeps it, then deletes the old client
+at the issuer (an RFC 7592 `DELETE` with its registration access token), so a failure never
+leaves quack without a client. A delete the issuer refuses leaves the old client there, and
+quack says so; one the issuer no longer knows is already gone. Anything else configured with
+the old `client_id` stops working.
 
-`quack auth jwks --rotate` rotates a registered client's key in one step. quack reads the
-registration back (RFC 7592 `GET`), makes a new key, and sends the whole registration back
-with the new `jwks` and the `client_id` (RFC 7592 `PUT`), since an update replaces every
-field the issuer holds. quack replaces its stored key only after the issuer accepts the
-update, so a refusal leaves the old key in use. When the issuer answers with a new
-registration access token, quack keeps that one. Restart `quack serve` afterwards, because
-it holds the old key in memory and the issuer no longer accepts it.
+Two registrations at one issuer never overwrite each other's record: whichever keeps its
+client second deletes that client at the issuer again and stops.
+
+A registered client's key rotates in the three steps [Client authentication with a
+key](#client-authentication-with-a-key-private_key_jwt) describes, with quack updating the
+issuer at `--rotate` and `--retire`. Each update reads the registration back (RFC 7592
+`GET`) and sends all of it back with the new `jwks` and the `client_id` (RFC 7592 `PUT`),
+since an update replaces every field the issuer holds. When the issuer answers with a new
+registration access token, quack keeps that one.
 
 `quack auth unregister` deletes the client at the issuer, then the registration and the key.
 `quack doctor` checks that every section without a `client_id` has a registration, and,
 unless `--offline`, that the issuer still describes the client at its
 `registration_client_uri`.
 
-For registering by hand, `quack auth register --print` prints the request as JSON with the
-key the registration needs, and sends nothing. Post it to the issuer's
-`registration_endpoint`, or paste its `jwks` into the issuer's console, then write the
-`client_id` into the file: the client takes over the printed key on its first use. quack
-cannot manage such a client afterwards, since it never saw the registration access token,
-so rotate its key with `--rotate` and `--activate` as described above.
+For registering by hand, `quack auth jwks` prints the key a section without a `client_id`
+will use, and `quack auth register --print` the whole request as JSON with that key; neither
+sends anything. Post the request to the issuer's `registration_endpoint`, or paste the key
+set into the issuer's console, then run `quack auth register --adopt CLIENT_ID` with the
+`client_id` the issuer gave. That records the client, gives it the key, and every section
+without a `client_id` at the issuer uses it. Nothing takes the key over implicitly, since
+another client at the same issuer could get to it first. quack cannot manage an adopted
+client, since it never saw a registration access token, so its key rotates by hand, as
+described above.
 
 Vouch accepts dynamic registration, open or with a signed-in person's token (see
 [Recommended: on behalf of each person, with
@@ -686,8 +706,16 @@ subject, so each person must have signed in to quack through Vouch.
 
 ### Rotate the key
 
-`quack auth jwks --rotate` makes a new key, sends it to Vouch in place of the old one (RFC
-7592), and signs with it once Vouch accepts. Restart a running `quack serve` afterwards.
+Rotate in three steps; quack updates Vouch itself (RFC 7592):
+
+```bash
+quack auth jwks --rotate              # Vouch holds the key in use and a new one
+quack auth jwks --rotate --activate   # quack signs with the new one; restart quack serve
+quack auth jwks --rotate --retire     # Vouch holds the new one alone
+```
+
+Vouch accepts either key between the first and the last step, so restarting `quack serve`
+after `--activate` never meets a refused assertion.
 
 ### Without registration: create the client in the console
 
@@ -711,12 +739,18 @@ subject, so each person must have signed in to quack through Vouch.
 
    Vouch issues no client secret for it.
 
-3. Add `client_id = "…"`, the client ID from the console, to both sections. The client
-   takes over the key it was registered with on its first use.
+3. Record it, with the client ID from the console:
 
-quack did not register this client, so it cannot update it at Vouch: rotate its key in two
-steps with `quack auth jwks --rotate` and `--rotate --activate`, pasting each key set into
-the application's JWKS, as [Client authentication with a
+   ```bash
+   quack auth register --adopt CLIENT_ID
+   ```
+
+   The client takes the key printed in step 1, and both sections use it without a
+   `client_id` in the file.
+
+quack did not register this client, so it cannot update it at Vouch: rotate its key with
+`quack auth jwks --rotate`, `--rotate --activate`, and `--rotate --retire`, pasting each key
+set it prints into the application's JWKS, as [Client authentication with a
 key](#client-authentication-with-a-key-private_key_jwt) describes.
 
 ### With a client secret instead
@@ -864,7 +898,8 @@ Seven errors and their fixes:
 - `invalid_client` with `client_auth = "private_key_jwt"`: the issuer does not have quack's
   current public key. Run `quack auth jwks` (with the provider name for a provider) and
   register its output. Check the log for a warning that the key was replaced. After `quack
-  auth jwks --rotate --activate`, restart `quack serve`, which still signs with the old key.
+  auth jwks --rotate --activate`, restart `quack serve`, which still signs with the old key,
+  before `--retire` leaves the issuer holding the new key alone.
 - "the redirect names issuer …, not this one (RFC 9207)": the redirect came from a
   different server than the configured issuer. Check `issuer_url`, and check for a proxy or
   a mix of tenants.

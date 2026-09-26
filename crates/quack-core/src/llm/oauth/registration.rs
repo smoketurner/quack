@@ -33,7 +33,7 @@ use super::key_slot::KeySource;
 use super::{LoginFlow, LoginPrompt, OAuthHttp, TokenManager};
 use crate::config::{ClientAuth, Config, Exchange, Grant, OAuthConfig, ProviderName};
 use crate::error::{Error, Result};
-use crate::storage::control::{KeyChange, RegistrationRow};
+use crate::storage::control::{KeyChange, Previous, RegistrationRow};
 use crate::vault::{Opened, Purpose};
 
 /// The metadata RFC 7592 says a client must leave out of an update: the
@@ -323,12 +323,33 @@ pub fn metadata_for(
 
 /// An issuer's answer to a registration or an update (RFC 7591 3.2.1, RFC
 /// 7592 3), as far as quack keeps it.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct Answer {
     client_id: String,
     registration_access_token: Option<String>,
     registration_client_uri: Option<String>,
     token_endpoint_auth_method: Option<String>,
+}
+
+/// Leaves the registration access token out: it manages the client.
+impl std::fmt::Debug for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Answer")
+            .field("client_id", &self.client_id)
+            .field(
+                "registration_access_token",
+                &self
+                    .registration_access_token
+                    .as_ref()
+                    .map(|_| "[redacted]"),
+            )
+            .field("registration_client_uri", &self.registration_client_uri)
+            .field(
+                "token_endpoint_auth_method",
+                &self.token_endpoint_auth_method,
+            )
+            .finish()
+    }
 }
 
 /// An issuer's refusal (RFC 7591 3.2.2).
@@ -376,14 +397,15 @@ pub enum Removal {
     /// The issuer returned nothing to manage it with: delete it in the
     /// issuer's console.
     Unmanaged { client_id: String },
+    /// The issuer refused, or could not be reached: it may still hold the
+    /// client, to delete in its console.
+    Left { client_id: String, reason: String },
 }
 
-/// What a rotation came to.
+/// What sending a registered client's key set to the issuer came to.
 #[derive(Debug)]
-pub struct Rotated {
+pub struct Published {
     pub client_id: String,
-    pub old_thumbprint: Option<String>,
-    pub new_thumbprint: String,
     /// Whether the issuer issued a new `registration_access_token`.
     pub new_registration_token: bool,
 }
@@ -391,6 +413,35 @@ pub struct Rotated {
 /// The name the temporary sign-in client's manager goes by; its token is
 /// never stored, so it names nothing in `control.db`.
 const SIGN_IN_PROVIDER: &str = "register-sign-in";
+
+/// The prefix of every temporary sign-in client's record at `issuer` in
+/// `client_registrations`. A record is kept from the client's registration
+/// until it is deleted, so an interrupted `quack auth register` leaves
+/// something to delete it with. A URL holds no space, so the name never
+/// meets an issuer's.
+fn sign_in_prefix(issuer: &RegistrationName) -> String {
+    format!("sign-in {issuer} ")
+}
+
+/// One temporary sign-in client's record: each has its own, so one the
+/// issuer refused to delete is never overwritten by the next.
+fn sign_in_record(issuer: &RegistrationName, client_id: &str) -> String {
+    format!("{}{client_id}", sign_in_prefix(issuer))
+}
+
+/// A loopback redirect on a port nothing listens on now, for the temporary
+/// sign-in client: RFC 8252 7.3 lets a native app pick the port, and a
+/// fixed one would clash with a concurrent `quack auth login`.
+async fn free_loopback_redirect() -> Result<String> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| registration_error(format!("no free loopback port: {e}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| registration_error(format!("no free loopback port: {e}")))?
+        .port();
+    Ok(format!("http://127.0.0.1:{port}/callback"))
+}
 
 /// The name the issuer shows for the temporary sign-in client.
 const SIGN_IN_CLIENT_NAME: &str = "quack sign-in (temporary, deleted after use)";
@@ -412,21 +463,34 @@ pub struct SignIn<'a> {
 #[derive(Debug)]
 pub struct SignedInRegistration {
     pub registered: Registered,
-    /// Whether the temporary sign-in client is gone.
+    /// Whether this run's temporary sign-in client is gone.
     pub temporary: TemporaryClient,
+    /// Temporary clients earlier, interrupted runs left, which this run
+    /// deleted or tried to.
+    pub earlier: Vec<TemporaryClient>,
 }
 
-/// What became of the temporary sign-in client.
+/// What became of a temporary sign-in client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemporaryClient {
-    Deleted {
-        client_id: String,
-    },
-    /// Still registered at the issuer; delete it in the issuer's console.
-    Left {
-        client_id: String,
-        reason: String,
-    },
+    /// RFC 7592 deleted it, or the issuer no longer knew it.
+    Deleted { client_id: String },
+    /// Still registered at the issuer. quack keeps its record while it can
+    /// still delete it, and tries again on the next `quack auth register`
+    /// or `--clean-up`.
+    Left { client_id: String, reason: String },
+}
+
+/// What a registration starts from, checked before anything is sent.
+struct Prepared {
+    /// The registration it replaces, and what deletes that client at the
+    /// issuer, read before the new record takes its place.
+    existing: Option<(RegistrationRow, Option<(SecretString, String)>)>,
+    /// The pending key's PKCS#8 document, and the key.
+    der: Vec<u8>,
+    key: ClientKey,
+    /// The issuer's `registration_endpoint`.
+    endpoint: String,
 }
 
 /// What reading a registration back (RFC 7592 2.1) found, for `quack
@@ -543,14 +607,16 @@ impl Registrar {
     /// `initial_token` as the bearer when given (the issuer's initial access
     /// token, or at Vouch a person's access token, which makes the client
     /// theirs), and keep the registration with its key. An existing
-    /// registration is refused unless `replace`, which deletes the old
-    /// client first (RFC 7592).
+    /// registration is refused unless `replace`: the new client is then
+    /// registered and kept first, and the old one deleted (RFC 7592) after,
+    /// so a failure never leaves quack with no client.
     ///
     /// # Errors
     ///
     /// Returns an error when a client is registered and `replace` is off,
     /// `metadata` does not carry the pending key, the issuer lists no
-    /// registration endpoint or refuses, or the result cannot be stored.
+    /// registration endpoint or refuses, another registration at the issuer
+    /// finished first, or the result cannot be stored.
     pub async fn register(
         &self,
         issuer: &RegistrationName,
@@ -558,12 +624,55 @@ impl Registrar {
         initial_token: Option<&SecretString>,
         replace: bool,
     ) -> Result<Registered> {
-        let (existing, der, key, endpoint) = self.prepare(issuer, metadata, replace).await?;
-        let pending = ClientKeyName::pending(issuer.as_str());
-        let replaced = match &existing {
-            Some(row) => Some(self.remove_at_issuer(row).await?),
-            None => None,
+        let prepared = self.prepare(issuer, metadata, replace).await?;
+        self.register_prepared(issuer, metadata, initial_token, prepared)
+            .await
+    }
+
+    /// Another `quack auth register` kept its client first: take this one
+    /// back rather than leave it registered and unrecorded.
+    async fn take_back(&self, issuer: &RegistrationName, answer: &Answer) -> Error {
+        let removed = self
+            .delete_at(
+                &answer.client_id,
+                answer
+                    .registration_access_token
+                    .as_deref()
+                    .map(|t| SecretString::from(t.to_owned()))
+                    .zip(answer.registration_client_uri.clone()),
+            )
+            .await;
+        let outcome = match removed {
+            Removal::Left { reason, .. } => {
+                format!(" and could not be deleted ({reason}); delete it in the issuer's console")
+            }
+            Removal::Unmanaged { .. } => String::from(
+                ", and the issuer returned no token to delete it with; delete it in the issuer's console",
+            ),
+            Removal::Deleted { .. } | Removal::AlreadyGone { .. } => {
+                String::from(" and is deleted")
+            }
         };
+        registration_error(format!(
+            "another registration at {issuer} finished first, so client {} was not kept{outcome}; run `quack auth register` again to see what is registered",
+            answer.client_id
+        ))
+    }
+
+    async fn register_prepared(
+        &self,
+        issuer: &RegistrationName,
+        metadata: &ClientMetadata,
+        initial_token: Option<&SecretString>,
+        prepared: Prepared,
+    ) -> Result<Registered> {
+        let Prepared {
+            existing,
+            der,
+            key,
+            endpoint,
+        } = prepared;
+        let pending = ClientKeyName::pending(issuer.as_str());
         let body = serde_json::to_value(metadata)?;
         let (status, answer) = self
             .http
@@ -578,7 +687,7 @@ impl Registrar {
         let client = ClientKeyName::new(issuer.as_str(), &answer.client_id);
         let sealed_key = self.keys.seal(&client, &der).await?;
         let token = self
-            .seal_token(issuer, answer.registration_access_token.as_deref())
+            .seal_token(issuer.as_str(), answer.registration_access_token.as_deref())
             .await?;
         let row = RegistrationRow {
             name: issuer.as_str().to_owned(),
@@ -588,17 +697,22 @@ impl Registrar {
         };
         let old = existing
             .as_ref()
-            .map(|old| ClientKeyName::new(issuer.as_str(), &old.client_id))
+            .map(|(old, _)| ClientKeyName::new(issuer.as_str(), &old.client_id))
             .filter(|old| *old != client);
         let mut delete = vec![pending.as_str()];
         if let Some(old) = &old {
             delete.push(old.as_str());
         }
-        self.keys
+        let previous = existing.as_ref().map_or(Previous::Nothing, |(old, _)| {
+            Previous::Client(&old.client_id)
+        });
+        let saved = self
+            .keys
             .control()
             .await?
             .save_registration(
                 &row,
+                previous,
                 KeyChange {
                     put: Some((client.as_str(), &sealed_key)),
                     delete: &delete,
@@ -611,6 +725,9 @@ impl Registrar {
                     answer.client_id
                 ))
             })?;
+        if !saved {
+            return Err(self.take_back(issuer, &answer).await);
+        }
         for name in [Some(&pending), Some(&client), old.as_ref()]
             .into_iter()
             .flatten()
@@ -618,6 +735,10 @@ impl Registrar {
             self.keys.forget(name);
         }
         tracing::info!(issuer = %issuer, client_id = %answer.client_id, thumbprint = key.thumbprint(), "registered a client");
+        let replaced = match existing {
+            Some((old, management)) => Some(self.delete_at(&old.client_id, management).await),
+            None => None,
+        };
         Ok(Registered {
             manageable: row.token.is_some() && row.registration_client_uri.is_some(),
             client_id: answer.client_id,
@@ -629,18 +750,86 @@ impl Registrar {
         })
     }
 
+    /// Record a client someone registered by hand with the pending key (the
+    /// one `quack auth jwks` or `--print` showed before any `client_id`
+    /// existed), and give it that key. The sections without a `client_id`
+    /// at the issuer then use it. quack holds nothing to manage it with
+    /// (RFC 7592), so its key rotates by hand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a client is already registered at the issuer,
+    /// no pending key waits, the client already has a key, or the record
+    /// cannot be written.
+    pub async fn adopt(
+        &self,
+        issuer: &RegistrationName,
+        client_id: &str,
+    ) -> Result<Arc<ClientKey>> {
+        if let Some(row) = self.keys.registration(issuer).await? {
+            return Err(Error::Config(format!(
+                "client {} is already registered at {issuer}; `quack auth unregister` forgets it first",
+                row.client_id
+            )));
+        }
+        let pending = ClientKeyName::pending(issuer.as_str());
+        let der = self.keys.stored_der(&pending).await?.ok_or_else(|| {
+            Error::Config(format!(
+                "no key waits for a client at {issuer}; `quack auth jwks` makes one to register with"
+            ))
+        })?;
+        let client = ClientKeyName::new(issuer.as_str(), client_id);
+        if self.keys.existing(&client).await?.is_some() {
+            return Err(Error::Config(format!(
+                "client {client_id} at {issuer} already has a key of its own; nothing to adopt"
+            )));
+        }
+        let key = ClientKey::from_pkcs8(&der)?;
+        let sealed = self.keys.seal(&client, &der).await?;
+        let row = RegistrationRow {
+            name: issuer.as_str().to_owned(),
+            client_id: client_id.to_owned(),
+            registration_client_uri: None,
+            token: None,
+        };
+        let saved = self
+            .keys
+            .control()
+            .await?
+            .save_registration(
+                &row,
+                Previous::Nothing,
+                KeyChange {
+                    put: Some((client.as_str(), &sealed)),
+                    delete: &[pending.as_str()],
+                },
+            )
+            .await?;
+        if !saved {
+            return Err(registration_error(format!(
+                "another registration at {issuer} finished first; nothing was adopted"
+            )));
+        }
+        self.keys.forget(&pending);
+        self.keys.forget(&client);
+        tracing::info!(issuer = %issuer, client_id, thumbprint = key.thumbprint(), "adopted a client registered by hand");
+        Ok(Arc::new(key))
+    }
+
     /// Register `metadata` as the client of the person who signs in now,
     /// so the issuer records them as its owner: an issuer such as Vouch
     /// takes the registration's bearer as the owner, and a person has no
     /// token of their own that it accepts as one.
     ///
-    /// quack first registers a temporary public client (RFC 7591: no
-    /// secret, PKCE, the loopback redirect) and signs the person in through
-    /// it with `flow`, keeping the token nowhere. It registers `metadata`
-    /// with that token, then deletes the temporary client (RFC 7592), which
-    /// also ends the sign-in. The delete runs whether or not the sign-in or
-    /// the registration succeeded; [`SignedInRegistration::temporary`] says
-    /// how it went.
+    /// quack first registers a temporary public client (RFC 7591: a native
+    /// app, no secret, PKCE, a loopback redirect on a free port) and keeps
+    /// its record, sealed, so an interrupted run leaves something to delete
+    /// it with. It signs the person in through it with `flow`, keeping the
+    /// token nowhere, registers `metadata` with that token, then deletes
+    /// the temporary client (RFC 7592), which also ends the sign-in. The
+    /// delete runs whether or not the sign-in or the registration
+    /// succeeded, and a temporary client an earlier run left behind is
+    /// deleted first; [`SignedInRegistration`] says how both went.
     ///
     /// # Errors
     ///
@@ -655,18 +844,23 @@ impl Registrar {
     ) -> Result<SignedInRegistration> {
         // The same checks a registration makes, before anyone is asked to
         // sign in for one that cannot happen.
-        let (_, _, _, endpoint) = self.prepare(issuer, metadata, replace).await?;
+        let prepared = self.prepare(issuer, metadata, replace).await?;
+        let earlier = self.clean_up_sign_in(issuer).await?;
+        let redirect = free_loopback_redirect().await?;
         let temporary = self
-            .register_sign_in_client(&endpoint, sign_in.flow)
+            .register_sign_in_client(issuer, &prepared.endpoint, sign_in.flow, &redirect)
             .await?;
         let outcome = self
-            .sign_in_and_register(issuer, metadata, replace, &temporary, &sign_in)
+            .sign_in_and_register(issuer, metadata, prepared, &temporary, &redirect, &sign_in)
             .await;
-        let removed = self.delete_sign_in_client(&temporary).await;
+        let removed = self
+            .clean_up_record(&sign_in_record(issuer, &temporary))
+            .await;
         let registered = outcome?;
         Ok(SignedInRegistration {
             registered,
             temporary: removed,
+            earlier,
         })
     }
 
@@ -674,8 +868,9 @@ impl Registrar {
         &self,
         issuer: &RegistrationName,
         metadata: &ClientMetadata,
-        replace: bool,
-        temporary: &Answer,
+        prepared: Prepared,
+        temporary: &str,
+        redirect: &str,
         sign_in: &SignIn<'_>,
     ) -> Result<Registered> {
         let grant = match sign_in.flow {
@@ -684,9 +879,10 @@ impl Registrar {
         };
         let oauth: OAuthConfig = serde_json::from_value(serde_json::json!({
             "issuer_url": issuer.as_str(),
-            "client_id": temporary.client_id,
+            "client_id": temporary,
             "scopes": ["openid"],
             "grant": grant,
+            "redirect_uri": redirect,
         }))
         .map_err(|e| registration_error(format!("the sign-in client's settings: {e}")))?;
         let name: ProviderName = SIGN_IN_PROVIDER
@@ -694,21 +890,33 @@ impl Registrar {
             .map_err(|e| registration_error(format!("{e}")))?;
         let manager = TokenManager::new(self.keys.config(), &name, oauth, sign_in.key_source)?;
         let token = manager.sign_in_once(sign_in.flow, sign_in.notify).await?;
-        self.register(issuer, metadata, Some(&token.access_token), replace)
+        self.register_prepared(issuer, metadata, Some(&token.access_token), prepared)
             .await
     }
 
-    /// Register the temporary public client a person signs in through: a
-    /// native app with the loopback redirect, for the browser, and the
-    /// device-code grant for a machine without one.
-    async fn register_sign_in_client(&self, endpoint: &str, flow: LoginFlow) -> Result<Answer> {
+    /// Register the temporary public client a person signs in through (a
+    /// native app with a loopback redirect, and the device-code grant for a
+    /// machine without a browser) and keep its record, sealed, until it is
+    /// deleted. Returns its `client_id`.
+    async fn register_sign_in_client(
+        &self,
+        issuer: &RegistrationName,
+        endpoint: &str,
+        flow: LoginFlow,
+        redirect: &str,
+    ) -> Result<String> {
         let mut grant_types = vec![GRANT_AUTHORIZATION_CODE];
         if flow == LoginFlow::DeviceCode {
             grant_types.push(GRANT_DEVICE_CODE);
         }
+        // OpenID Connect Dynamic Client Registration 1.0 section 2: a web
+        // client is the default, and "Native Clients MUST only register
+        // `redirect_uris` using custom URI schemes or loopback URLs"; an
+        // issuer may refuse a loopback redirect on any other client.
         let body = serde_json::json!({
             "client_name": SIGN_IN_CLIENT_NAME,
-            "redirect_uris": [OAuthConfig::DEFAULT_REDIRECT_URI],
+            "application_type": "native",
+            "redirect_uris": [redirect],
             "grant_types": grant_types,
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
@@ -724,59 +932,171 @@ impl Registrar {
                 &answer,
             ));
         }
-        serde_json::from_slice(&answer)
-            .map_err(|e| registration_error(format!("the issuer's answer has no client_id: {e}")))
+        let answer: Answer = serde_json::from_slice(&answer).map_err(|e| {
+            registration_error(format!("the issuer's answer has no client_id: {e}"))
+        })?;
+        let record = sign_in_record(issuer, &answer.client_id);
+        let row = RegistrationRow {
+            token: self
+                .seal_token(&record, answer.registration_access_token.as_deref())
+                .await?,
+            name: record,
+            client_id: answer.client_id.clone(),
+            registration_client_uri: answer.registration_client_uri.clone(),
+        };
+        let saved = match self.keys.control().await {
+            Ok(control) => {
+                control
+                    .save_registration(&row, Previous::Nothing, KeyChange::default())
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if !matches!(saved, Ok(true)) {
+            // Without its record an interruption could not delete it later:
+            // delete it now and stop.
+            let management = answer
+                .registration_access_token
+                .map(SecretString::from)
+                .zip(answer.registration_client_uri);
+            self.delete_at(&answer.client_id, management).await;
+            return Err(registration_error(
+                "quack could not keep a record of the temporary sign-in client, so it deleted it again",
+            ));
+        }
+        Ok(answer.client_id)
     }
 
-    /// Delete the temporary sign-in client (RFC 7592). A failure is
-    /// reported, not raised: the registration it served stands either way.
-    async fn delete_sign_in_client(&self, temporary: &Answer) -> TemporaryClient {
-        let client_id = temporary.client_id.clone();
-        let (Some(token), Some(uri)) = (
-            &temporary.registration_access_token,
-            &temporary.registration_client_uri,
-        ) else {
-            return TemporaryClient::Left {
+    /// Delete every temporary sign-in client recorded at `issuer`, the ones
+    /// interrupted runs left, and forget each once it is gone. One the
+    /// issuer refused to delete stays recorded for the next try.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `control.db` cannot be read.
+    pub async fn clean_up_sign_in(
+        &self,
+        issuer: &RegistrationName,
+    ) -> Result<Vec<TemporaryClient>> {
+        let mut outcomes = Vec::new();
+        for record in self.sign_in_records(issuer).await? {
+            outcomes.push(self.clean_up_record(&record.name).await);
+        }
+        Ok(outcomes)
+    }
+
+    /// The `client_id`s of the temporary sign-in clients interrupted runs
+    /// left recorded at `issuer`: what `quack doctor` reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `control.db` cannot be read.
+    pub async fn sign_in_leftovers(&self, issuer: &RegistrationName) -> Result<Vec<String>> {
+        Ok(self
+            .sign_in_records(issuer)
+            .await?
+            .into_iter()
+            .map(|row| row.client_id)
+            .collect())
+    }
+
+    async fn sign_in_records(&self, issuer: &RegistrationName) -> Result<Vec<RegistrationRow>> {
+        let prefix = sign_in_prefix(issuer);
+        Ok(self
+            .keys
+            .control()
+            .await?
+            .registrations()
+            .await?
+            .into_iter()
+            .filter(|row| row.name.starts_with(&prefix))
+            .collect())
+    }
+
+    /// Delete the temporary sign-in client recorded as `record`, and forget
+    /// the record once the client is gone; a failure is reported, not
+    /// raised, and the record then stays for the next try.
+    async fn clean_up_record(&self, record: &str) -> TemporaryClient {
+        let row = match self.keys.control().await {
+            Ok(control) => control.registration(record).await,
+            Err(e) => Err(e),
+        };
+        let row = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return TemporaryClient::Left {
+                    client_id: record.rsplit(' ').next().unwrap_or(record).to_owned(),
+                    reason: String::from("its record is gone"),
+                };
+            }
+            Err(e) => {
+                return TemporaryClient::Left {
+                    client_id: record.rsplit(' ').next().unwrap_or(record).to_owned(),
+                    reason: e.to_string(),
+                };
+            }
+        };
+        let management = match self.keys.management(&row).await {
+            Ok(management) => management,
+            Err(e) => {
+                return TemporaryClient::Left {
+                    client_id: row.client_id,
+                    reason: e.to_string(),
+                };
+            }
+        };
+        let outcome = match self.delete_at(&row.client_id, management).await {
+            Removal::Deleted { client_id } | Removal::AlreadyGone { client_id, .. } => {
+                TemporaryClient::Deleted { client_id }
+            }
+            Removal::Unmanaged { client_id } => TemporaryClient::Left {
                 client_id,
                 reason: String::from("the issuer returned no registration access token for it"),
-            };
+            },
+            Removal::Left { client_id, reason } => {
+                return TemporaryClient::Left { client_id, reason };
+            }
         };
-        let token = SecretString::from(token.clone());
-        match self
-            .http
-            .send_json(reqwest::Method::DELETE, uri, Some(&token), None)
-            .await
-        {
-            Ok((status, _)) if status.is_success() => TemporaryClient::Deleted { client_id },
-            Ok((status, _)) => TemporaryClient::Left {
-                client_id,
-                reason: format!("the issuer answered HTTP {status}"),
-            },
-            Err(e) => TemporaryClient::Left {
-                client_id,
-                reason: e.to_string(),
-            },
+        let forgotten = match self.keys.control().await {
+            Ok(control) => {
+                control
+                    .delete_registration(record, KeyChange::default())
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = forgotten {
+            tracing::warn!(record, error = %e, "deleted a temporary sign-in client but could not forget its record");
         }
+        outcome
     }
 
-    /// What a registration starts from: the registration it replaces, the
-    /// pending key (its PKCS#8 document too), which `metadata` must carry,
-    /// and the issuer's registration endpoint.
+    /// What a registration starts from: the registration it replaces and
+    /// what deletes that client, the pending key (its PKCS#8 document
+    /// too), which `metadata` must carry, and the issuer's registration
+    /// endpoint. Discovery runs once here, for the whole registration.
     async fn prepare(
         &self,
         issuer: &RegistrationName,
         metadata: &ClientMetadata,
         replace: bool,
-    ) -> Result<(Option<RegistrationRow>, Vec<u8>, ClientKey, String)> {
+    ) -> Result<Prepared> {
         let existing = self.keys.registration(issuer).await?;
         if let Some(row) = &existing
             && !replace
         {
             return Err(Error::Config(format!(
-                "client {} is already registered at {issuer}; `quack auth register --replace` deletes it and registers a new one",
+                "client {} is already registered at {issuer}; `quack auth register --replace` registers a new one and deletes it",
                 row.client_id
             )));
         }
+        let existing = match existing {
+            Some(row) => {
+                let management = self.keys.management(&row).await?;
+                Some((row, management))
+            }
+            None => None,
+        };
         let pending = ClientKeyName::pending(issuer.as_str());
         let der = self.keys.stored_der(&pending).await?.ok_or_else(|| {
             registration_error(format!("no pending key for {issuer}; it was just made"))
@@ -797,24 +1117,26 @@ impl Registrar {
                     "{issuer} lists no registration_endpoint, so it takes no RFC 7591 registrations; register the client in its console and set client_id"
                 ))
             })?;
-        Ok((existing, der, key, endpoint))
+        Ok(Prepared {
+            existing,
+            der,
+            key,
+            endpoint,
+        })
     }
 
-    /// A registration access token sealed for keeping, when there is one.
+    /// A registration access token sealed for keeping under the record
+    /// `name`, when there is one.
     async fn seal_token(
         &self,
-        issuer: &RegistrationName,
+        name: &str,
         token: Option<&str>,
     ) -> Result<Option<crate::vault::Sealed>> {
         match token {
             Some(token) => Ok(Some(
                 self.keys
                     .vault()
-                    .seal(
-                        Purpose::RegistrationToken,
-                        issuer.as_str(),
-                        token.as_bytes(),
-                    )
+                    .seal(Purpose::RegistrationToken, name, token.as_bytes())
                     .await?,
             )),
             None => Ok(None),
@@ -823,39 +1145,70 @@ impl Registrar {
 
     /// Delete the client `row` records at the issuer (RFC 7592 2.3). A
     /// client the issuer no longer knows is already gone; any other
-    /// refusal stops here, so a replacement never leaves two clients.
+    /// refusal stops here, so `unregister` forgets nothing the issuer still
+    /// holds.
     async fn remove_at_issuer(&self, row: &RegistrationRow) -> Result<Removal> {
-        let client_id = row.client_id.clone();
-        let Some((token, uri)) = self.keys.management(row).await? else {
-            return Ok(Removal::Unmanaged { client_id });
-        };
-        let (status, body) = self
-            .http
-            .send_json(reqwest::Method::DELETE, &uri, Some(&token), None)
-            .await?;
-        match status.as_u16() {
-            200..=299 => Ok(Removal::Deleted { client_id }),
-            code @ (401 | 403 | 404) => Ok(Removal::AlreadyGone {
-                client_id,
-                status: code,
-            }),
-            _ => Err(refusal("deleting the client", status, &body)),
+        let management = self.keys.management(row).await?;
+        match self.delete_at(&row.client_id, management).await {
+            Removal::Left { reason, .. } => Err(registration_error(format!(
+                "deleting client {} failed: {reason}",
+                row.client_id
+            ))),
+            removal => Ok(removal),
         }
     }
 
-    /// Replace the key of the client registered at `issuer`: a new key, and
-    /// the whole registration as the issuer describes it (RFC 7592 2.1)
-    /// sent back with the new `jwks`, since an update replaces every field
-    /// (2.2). The stored key is replaced only after the issuer accepts, so
-    /// a refusal leaves the old key in use; a new registration token, when
-    /// the issuer rotates it, is kept with it.
+    /// Delete `client_id` at the issuer with its registration access token
+    /// and `registration_client_uri` (RFC 7592 2.3), reporting rather than
+    /// raising what happened.
+    async fn delete_at(
+        &self,
+        client_id: &str,
+        management: Option<(SecretString, String)>,
+    ) -> Removal {
+        let client_id = client_id.to_owned();
+        let Some((token, uri)) = management else {
+            return Removal::Unmanaged { client_id };
+        };
+        match self
+            .http
+            .send_json(reqwest::Method::DELETE, &uri, Some(&token), None)
+            .await
+        {
+            Ok((status, _)) if status.is_success() => Removal::Deleted { client_id },
+            Ok((status, _)) if matches!(status.as_u16(), 401 | 403 | 404) => Removal::AlreadyGone {
+                client_id,
+                status: status.as_u16(),
+            },
+            Ok((status, body)) => Removal::Left {
+                client_id,
+                reason: refusal("deleting the client", status, &body).to_string(),
+            },
+            Err(e) => Removal::Left {
+                client_id,
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    /// Replace the key set the issuer holds for the client registered at
+    /// `issuer` with `jwks`: the whole registration as the issuer describes
+    /// it (RFC 7592 2.1), sent back with the new `jwks`, since an update
+    /// replaces every field (2.2). A new registration token, when the
+    /// issuer rotates it, is kept. `quack auth jwks --rotate` sends the key
+    /// in use and its replacement, and `--retire` the key in use alone, so
+    /// the issuer always accepts the key every quack process signs with.
     ///
     /// # Errors
     ///
     /// Returns an error when nothing is registered, the issuer returned
     /// nothing to manage the client with, it refuses the read or the
-    /// update, or the result cannot be stored.
-    pub async fn rotate(&self, issuer: &RegistrationName) -> Result<Rotated> {
+    /// update, or the new registration token cannot be stored.
+    pub async fn publish_keys(
+        &self,
+        issuer: &RegistrationName,
+        jwks: &PublicJwks,
+    ) -> Result<Published> {
         let row = self.keys.registration(issuer).await?.ok_or_else(|| {
             Error::Config(format!(
                 "no client is registered at {issuer}; `quack auth register` registers one"
@@ -863,28 +1216,18 @@ impl Registrar {
         })?;
         let (token, uri) = self.keys.management(&row).await?.ok_or_else(|| {
             registration_error(format!(
-                "{issuer} returned no registration_access_token for client {}, so quack cannot update it (RFC 7592); register the new key in the issuer's console",
+                "{issuer} returned no registration_access_token for client {}, so quack cannot update it (RFC 7592); register the key set in the issuer's console",
                 row.client_id
             ))
         })?;
         let current = self.read_metadata(&uri, &token).await?;
-        let client = ClientKeyName::new(issuer.as_str(), &row.client_id);
-        let old_thumbprint = self
-            .keys
-            .existing(&client)
-            .await?
-            .map(|key| key.thumbprint().to_owned());
-        // Made and sealed before the update, so after the issuer accepts it
-        // only the local write remains.
-        let (key, der) = ClientKey::generate()?;
-        let sealed_key = self.keys.seal(&client, &der).await?;
-        let update = updated_metadata(current, &row.client_id, &key.jwks())?;
+        let update = updated_metadata(current, &row.client_id, jwks)?;
         let (status, answer) = self
             .http
             .send_json(reqwest::Method::PUT, &uri, Some(&token), Some(&update))
             .await?;
         if !status.is_success() {
-            return Err(refusal("the new key", status, &answer));
+            return Err(refusal("the key set", status, &answer));
         }
         let answer: Answer = serde_json::from_slice(&answer).map_err(|e| {
             registration_error(format!(
@@ -901,36 +1244,37 @@ impl Registrar {
             .registration_access_token
             .as_deref()
             .filter(|new| *new != token.expose_secret());
-        let mut updated = row.clone();
-        if let Some(sealed) = self.seal_token(issuer, new_token).await? {
-            updated.token = Some(sealed);
-        }
-        if let Some(uri) = answer.registration_client_uri {
-            updated.registration_client_uri = Some(uri);
-        }
-        self.keys
-            .control()
-            .await?
-            .save_registration(
-                &updated,
-                KeyChange {
-                    put: Some((client.as_str(), &sealed_key)),
-                    delete: &[],
-                },
-            )
-            .await
-            .map_err(|e| {
-                registration_error(format!(
-                    "the issuer accepted the new key for client {}, but quack could not keep it ({e}); run `quack auth jwks --rotate` again",
+        let new_uri = answer
+            .registration_client_uri
+            .filter(|new| row.registration_client_uri.as_deref() != Some(new.as_str()));
+        if new_token.is_some() || new_uri.is_some() {
+            let mut updated = row.clone();
+            if let Some(sealed) = self.seal_token(issuer.as_str(), new_token).await? {
+                updated.token = Some(sealed);
+            }
+            if let Some(uri) = new_uri {
+                updated.registration_client_uri = Some(uri);
+            }
+            let saved = self
+                .keys
+                .control()
+                .await?
+                .save_registration(
+                    &updated,
+                    Previous::Client(&row.client_id),
+                    KeyChange::default(),
+                )
+                .await?;
+            if !saved {
+                return Err(registration_error(format!(
+                    "the issuer took the key set for client {}, but its registration at {issuer} changed meanwhile, so quack did not keep the issuer's new registration token",
                     row.client_id
-                ))
-            })?;
-        self.keys.forget(&client);
-        tracing::info!(issuer = %issuer, client_id = %row.client_id, thumbprint = key.thumbprint(), "rotated a registered client's key");
-        Ok(Rotated {
+                )));
+            }
+        }
+        tracing::info!(issuer = %issuer, client_id = %row.client_id, keys = jwks.keys.len(), "sent a registered client's key set to the issuer");
+        Ok(Published {
             client_id: row.client_id,
-            old_thumbprint,
-            new_thumbprint: key.thumbprint().to_owned(),
             new_registration_token: new_token.is_some(),
         })
     }
@@ -1046,28 +1390,6 @@ fn updated_metadata(
     );
     current.insert(String::from("jwks"), serde_json::to_value(jwks)?);
     Ok(serde_json::Value::Object(current))
-}
-
-/// Every section without a `client_id`, with the id its registration
-/// gives it, or the error naming `quack auth register` for the first one
-/// without: what `quack serve` checks before it starts.
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] for a section whose issuer has no
-/// registration, or an error reading `control.db`.
-pub async fn resolve_registered(
-    config: &Config,
-    keys: &ClientKeys,
-) -> Result<Vec<(RegisteredSection, String)>> {
-    let mut resolved = Vec::new();
-    for section in registered_sections(config) {
-        let client_id = keys
-            .registered_client_id(section.issuer.as_str(), &section.section.to_string())
-            .await?;
-        resolved.push((section, client_id));
-    }
-    Ok(resolved)
 }
 
 impl OAuthHttp {

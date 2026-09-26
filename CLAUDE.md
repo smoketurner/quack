@@ -93,8 +93,8 @@ cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | pat
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
-cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
-cargo run --bin quack -- auth register [--issuer URL] [--sign-in|--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
+cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate|--retire]]  # OAuth tokens; a client's public key
+cargo run --bin quack -- auth register [--issuer URL] [--sign-in|--device-code|--token-env VAR|--open] [--replace] [--print] [--adopt ID] [--clean-up] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
 cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind; exit 1 on a failure
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
@@ -169,8 +169,9 @@ silent refresh, and `Error::AuthRequired` (exit 4 from every command that reache
 A client with `client_auth = "private_key_jwt"` (a provider or `[server.oidc]`) signs a new ES256
 client assertion for every token-endpoint and PAR request with a vault-sealed P-256 key in
 `control.db` (`client_keys`, `llm::oauth::client_key`, one per issuer and client id; `quack auth
-jwks` prints it; `--rotate` stages a replacement under `next <issuer> <client_id>` and prints both,
-`--rotate --activate` swaps it in within one transaction), and a browser sign-in is pushed first (RFC 9126) whenever discovery lists a PAR endpoint.
+jwks` prints it; `--rotate` stages a replacement under `next <issuer> <client_id>` and gives the
+issuer both, `--rotate --activate` swaps it in within one transaction, `--rotate --retire` gives the
+issuer the new key alone), and a browser sign-in is pushed first (RFC 9126) whenever discovery lists a PAR endpoint.
 `quack auth register` (`llm::oauth::registration`) registers one such client per issuer through
 RFC 7591 for every section there that leaves `client_id` out, keeps its `client_id`, sealed
 `registration_access_token`, and `registration_client_uri` in `control.db` (`client_registrations`,
@@ -178,8 +179,12 @@ named by the issuer), and those sections resolve their `client_id` from it at us
 the issuer's name until the id exists. At Vouch (or with `--sign-in`/`--device-code`) it
 first signs the person in through a temporary public client it registers and deletes again
 (`Registrar::register_signed_in`), so the registration's bearer is the person's own and Vouch
-records them as the owner; widening the client to the organization stays a manual console step. RFC 7592 then rotates the key (`jwks --rotate`, a full-metadata
-`PUT`, the stored key replaced only after the issuer accepts) and deletes the client (`unregister`).
+records them as the owner; widening the client to the organization stays a manual console step. Each
+temporary client stays recorded (sealed) until deleted, so an interrupted run leaves it deletable
+(`--clean-up`, the next run, `quack doctor`). An issuer that is not Vouch needs `--sign-in`,
+`--token-env`, or `--open`; a client registered by hand is recorded with `--adopt`. RFC 7592 carries
+each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
+client (`unregister`).
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
 labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200 plus a `write_refused` SSE event, MCP structured
