@@ -90,6 +90,10 @@ pub(crate) struct Endpoints {
     pub(crate) token: String,
     #[serde(rename = "device_authorization_endpoint")]
     device_authorization: Option<String>,
+    /// Where an authorization request is pushed before the browser is sent
+    /// off (RFC 9126), when the issuer takes pushed requests.
+    #[serde(rename = "pushed_authorization_request_endpoint")]
+    pub(crate) pushed_authorization: Option<String>,
     /// Where the issuer publishes the keys its tokens are signed with.
     pub(crate) jwks_uri: Option<String>,
     /// The grants the issuer supports, when it says.
@@ -306,6 +310,59 @@ impl OAuthHttp {
             .await
             .map_err(|e| Error::Llm(format!("the token response from {url} was cut short: {e}")))?;
         Ok((status, bytes.to_vec()))
+    }
+
+    /// Push an authorization request to the issuer's `endpoint` (RFC 9126),
+    /// authenticated as `client_id` with `credential`, and return where to
+    /// send the browser: `authorization` with only `client_id` and the
+    /// `request_uri` the issuer answered with. The request's parameters,
+    /// the PKCE challenge among them, never pass through the browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be sent, the issuer refuses
+    /// it, or its answer has no `request_uri`.
+    pub(crate) async fn push_authorization(
+        &self,
+        endpoint: &str,
+        authorization: &str,
+        client_id: &str,
+        credential: &Credential,
+        params: &[(&str, String)],
+    ) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Pushed {
+            request_uri: String,
+        }
+        let mut form = vec![("client_id", client_id.to_owned())];
+        form.extend(params.iter().cloned());
+        let (status, body) = self
+            .post_form(endpoint, client_id, credential, &form)
+            .await?;
+        if !status.is_success() {
+            let refusal: TokenRefusal = serde_json::from_slice(&body).unwrap_or_default();
+            return Err(Error::Llm(format!(
+                "the issuer refused the pushed authorization request ({status}): {}{}",
+                refusal.error.as_deref().unwrap_or("no error code"),
+                refusal
+                    .error_description
+                    .map_or(String::new(), |d| format!(" ({d})"))
+            )));
+        }
+        let pushed: Pushed = serde_json::from_slice(&body).map_err(|e| {
+            Error::Llm(format!(
+                "the pushed authorization request's answer has no request_uri: {e}"
+            ))
+        })?;
+        let mut url = Url::parse(authorization).map_err(|e| {
+            Error::Llm(format!(
+                "authorization_endpoint '{authorization}' is not a URL: {e}"
+            ))
+        })?;
+        url.query_pairs_mut()
+            .append_pair("client_id", client_id)
+            .append_pair("request_uri", &pushed.request_uri);
+        Ok(url.into())
     }
 
     /// GET a JSON document; `what` names it in errors.
@@ -736,18 +793,41 @@ impl TokenManager {
         let verifier = PkceCodeVerifier::new(random_token()?);
         let challenge = PkceCodeChallenge::from_code_verifier_sha256(&verifier);
         let state = random_token()?;
-        let (url, csrf) = client
-            .authorize_url(|| CsrfToken::new(state))
-            .add_scopes(self.scopes())
-            .set_pkce_challenge(challenge)
-            .url();
-        notify(LoginPrompt::Browser {
-            url: url.to_string(),
-        });
+        let endpoints = self.endpoints().await?;
+        let url = match &endpoints.pushed_authorization {
+            Some(pushed) => {
+                let params = [
+                    ("response_type", String::from("code")),
+                    ("redirect_uri", self.config.redirect_uri.clone()),
+                    ("scope", self.config.scopes.join(" ")),
+                    ("state", state.clone()),
+                    ("code_challenge", challenge.as_str().to_owned()),
+                    ("code_challenge_method", String::from("S256")),
+                ];
+                self.http
+                    .push_authorization(
+                        pushed,
+                        &endpoints.authorization,
+                        &self.config.client_id,
+                        &credential,
+                        &params,
+                    )
+                    .await
+                    .map_err(|e| Error::Llm(format!("provider '{}': {e}", self.provider)))?
+            }
+            None => client
+                .authorize_url(|| CsrfToken::new(state.clone()))
+                .add_scopes(self.scopes())
+                .set_pkce_challenge(challenge)
+                .url()
+                .0
+                .to_string(),
+        };
+        notify(LoginPrompt::Browser { url });
 
         let redirected = tokio::time::timeout(
             BROWSER_TIMEOUT,
-            wait_for_callback(&listener, redirect.path(), csrf.secret()),
+            wait_for_callback(&listener, redirect.path(), &state),
         )
         .await
         .map_err(|_| {

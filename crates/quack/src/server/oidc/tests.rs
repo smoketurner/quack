@@ -19,7 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
 use quack_core::config::{ClientAuth, Config, OidcConfig};
 use quack_core::ids::UserId;
-use quack_core::llm::oauth::client_key::ClientKeys;
+use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
 use quack_core::llm::oauth::{CachedToken, KeySource};
 use quack_core::oidc::OidcSubject;
 use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome, SealedOwner};
@@ -47,18 +47,44 @@ struct IssuerState {
     jwks: Vec<Value>,
     refresh_error: Option<&'static str>,
     refreshes: usize,
+    /// Whether discovery lists a pushed authorization request endpoint.
+    par: bool,
+    /// Each pushed authorization request, as sent.
+    pushed: Vec<HashMap<String, String>>,
+    /// Each token request, and its `Authorization` header.
+    token_requests: Vec<(HashMap<String, String>, Option<String>)>,
 }
 
 type Issuer = Arc<Mutex<IssuerState>>;
 
 async fn discovery(State(issuer): State<Issuer>) -> Json<Value> {
-    let base = issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
-    Json(json!({
+    let (base, par) = issuer
+        .lock()
+        .map(|s| (s.base.clone(), s.par))
+        .unwrap_or_default();
+    let mut metadata = json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/token"),
         "jwks_uri": format!("{base}/jwks"),
-    }))
+    });
+    if par {
+        metadata["pushed_authorization_request_endpoint"] = json!(format!("{base}/par"));
+    }
+    Json(metadata)
+}
+
+async fn par(
+    State(issuer): State<Issuer>,
+    Form(form): Form<HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    if let Ok(mut state) = issuer.lock() {
+        state.pushed.push(form);
+    }
+    (
+        StatusCode::CREATED,
+        Json(json!({ "request_uri": "urn:ietf:params:oauth:request_uri:r1", "expires_in": 60 })),
+    )
 }
 
 async fn jwks(State(issuer): State<Issuer>) -> Json<Value> {
@@ -68,11 +94,17 @@ async fn jwks(State(issuer): State<Issuer>) -> Json<Value> {
 
 async fn token(
     State(issuer): State<Issuer>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> (StatusCode, Json<Value>) {
     let Ok(mut state) = issuer.lock() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})));
     };
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    state.token_requests.push((form.clone(), authorization));
     let lifetime = state.lifetime;
     match form.get("grant_type").map(String::as_str) {
         Some("authorization_code") => {
@@ -134,6 +166,7 @@ async fn start_issuer() -> Issuer {
     let routes = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/token", post(token))
+        .route("/par", post(par))
         .route("/jwks", get(jwks))
         .with_state(Arc::clone(&issuer));
     tokio::spawn(async move { axum::serve(listener, routes).await });
@@ -182,6 +215,15 @@ impl Harness {
     /// A harness whose public URL (the origin of `redirect_uri`) is
     /// `origin`.
     async fn build(audience: Option<&str>, origin: &str) -> Self {
+        Self::build_with(audience, origin, |_| {}).await
+    }
+
+    /// A harness whose `[server.oidc]` `change` adjusts.
+    async fn build_with(
+        audience: Option<&str>,
+        origin: &str,
+        change: impl FnOnce(&mut OidcConfig),
+    ) -> Self {
         let issuer = start_issuer().await;
         let base = issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -197,6 +239,8 @@ impl Harness {
             audience: audience.map(str::to_owned),
             subject_claim: String::from(OidcConfig::DEFAULT_SUBJECT_CLAIM),
         };
+        let mut oidc_config = oidc_config;
+        change(&mut oidc_config);
         let control = ControlPlane::open(&config)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -967,6 +1011,14 @@ async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
 /// A token for an on-behalf-of provider at the mock issuer, as the request's
 /// caller: what a turn's model request would send.
 async fn obo_token(app: &App) -> Result<String, crate::server::error::ApiError> {
+    obo_token_as(app, quack_core::config::ClientAuth::ClientSecretPost).await
+}
+
+/// As [`obo_token`], with the provider's client authenticating by `auth`.
+async fn obo_token_as(
+    app: &App,
+    auth: quack_core::config::ClientAuth,
+) -> Result<String, crate::server::error::ApiError> {
     use quack_core::config::{Exchange, Grant, OAuthConfig};
     use quack_core::llm::oauth::TokenManager;
     use secrecy::ExposeSecret;
@@ -983,8 +1035,9 @@ async fn obo_token(app: &App) -> Result<String, crate::server::error::ApiError> 
         scopes: Vec::new(),
         redirect_uri: String::from("http://127.0.0.1:1/callback"),
         grant: Grant::OnBehalfOf,
-        client_secret_env: Some(String::from("CARGO_PKG_NAME")),
-        client_auth: ClientAuth::ClientSecretPost,
+        client_secret_env: (auth != ClientAuth::PrivateKeyJwt)
+            .then(|| String::from("CARGO_PKG_NAME")),
+        client_auth: auth,
         exchange: Exchange::TokenExchange,
         audience: Some(String::from("api://model")),
         resource: None,
@@ -1002,6 +1055,14 @@ async fn probe(
     _caller: crate::server::auth::Identity,
 ) -> Result<String, crate::server::error::ApiError> {
     obo_token(&app).await
+}
+
+/// The same, for a provider that signs client assertions.
+async fn probe_key(
+    axum::extract::State(app): axum::extract::State<App>,
+    _caller: crate::server::auth::Identity,
+) -> Result<String, crate::server::error::ApiError> {
+    obo_token_as(&app, ClientAuth::PrivateKeyJwt).await
 }
 
 /// The same, from inside a background job the caller submits.
@@ -1031,6 +1092,7 @@ impl Harness {
         let router = Router::new()
             .route("/probe", get(probe))
             .route("/probe-job", get(probe_job))
+            .route("/probe-key", get(probe_key))
             .layer(axum::middleware::from_fn(crate::server::acting_slot))
             .with_state(Arc::clone(&self.app));
         let request = Request::get(uri)
@@ -1214,4 +1276,149 @@ async fn an_http_public_url_leaves_loopback_cookies_plain() {
         "{:?}",
         remote.cookies
     );
+}
+
+// --- the most secure on-behalf-of setup (Vouch) ------------------------------
+
+/// Check a client assertion with the registered key: ES256 by that key,
+/// `iss` and `sub` quack's client, `aud` the issuer, a lifetime of at most a
+/// minute, and a `jti` not seen before.
+fn check_assertion(
+    form: &HashMap<String, String>,
+    key: &PublicJwk,
+    base: &str,
+    seen: &mut Vec<String>,
+) {
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+    assert_eq!(
+        form.get("client_assertion_type").map(String::as_str),
+        Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+    );
+    assert_eq!(form.get("client_id").map(String::as_str), Some("quack"));
+    assert!(!form.contains_key("client_secret"), "{form:?}");
+    let assertion = form.get("client_assertion").cloned().unwrap_or_default();
+    let jwk: jsonwebtoken::jwk::Jwk =
+        serde_json::from_value(serde_json::to_value(key).unwrap_or(Value::Null))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    let decoding = DecodingKey::from_jwk(&jwk).unwrap_or_else(|e| fail(&e.to_string()));
+    let mut validation = Validation::new(Algorithm::ES256);
+    validation.set_issuer(&["quack"]);
+    validation.set_audience(&[base]);
+    validation.sub = Some(String::from("quack"));
+    let claims = jsonwebtoken::decode::<Value>(&assertion, &decoding, &validation)
+        .unwrap_or_else(|e| fail(&format!("assertion refused: {e}")))
+        .claims;
+    let lifetime = claims["exp"]
+        .as_i64()
+        .unwrap_or_default()
+        .saturating_sub(claims["iat"].as_i64().unwrap_or_default());
+    assert!((1..=60).contains(&lifetime), "{claims}");
+    let jti = claims["jti"].as_str().unwrap_or_default().to_owned();
+    assert!(!jti.is_empty() && !seen.contains(&jti), "jti {jti} reused");
+    seen.push(jti);
+}
+
+#[tokio::test]
+async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges_for_the_person() {
+    let h = Harness::build_with(None, "https://quack.example.com", |c| {
+        c.client_auth = ClientAuth::PrivateKeyJwt;
+    })
+    .await;
+    h.issuer(|s| s.par = true);
+    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+
+    // Out: the browser carries only a reference to the pushed request.
+    let reply = h.get(OidcConfig::START_PATH, None).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let location: axum::http::Uri = reply.location.parse().unwrap_or_else(|_| fail("location"));
+    let query: HashMap<String, String> = axum::extract::Query::try_from_uri(&location)
+        .map(|axum::extract::Query(q)| q)
+        .unwrap_or_default();
+    assert_eq!(query.len(), 2, "{}", reply.location);
+    assert_eq!(query.get("client_id").map(String::as_str), Some("quack"));
+    assert!(query.contains_key("request_uri"));
+    let pushed = h
+        .issuer
+        .lock()
+        .map(|s| s.pushed.clone())
+        .unwrap_or_default();
+    let [pushed] = pushed.as_slice() else {
+        fail(&format!("{pushed:?}"));
+    };
+    assert_eq!(
+        pushed.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
+    assert!(pushed.contains_key("code_challenge"));
+
+    // The key the assertions are signed with, as `quack auth jwks` prints it.
+    let key = ClientKeys::new(&h.app.config, KeySource::File)
+        .existing(&ClientKeyName::new(&base, "quack"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no client key was made"));
+    let mut seen = Vec::new();
+    check_assertion(pushed, key.jwk(), &base, &mut seen);
+
+    // Back: the code exchange is signed too.
+    let state = pushed.get("state").cloned().unwrap_or_default();
+    let nonce = pushed.get("nonce").cloned().unwrap_or_default();
+    let cookie = reply
+        .cookie(super::STATE_COOKIE)
+        .unwrap_or_else(|| fail("no state cookie"));
+    assert_eq!(state, cookie);
+    h.issuer(|s| {
+        s.id_claims = json!({
+            "iss": base, "sub": "sub-vouch", "aud": "quack",
+            "exp": Timestamp::now().as_second().saturating_add(3600),
+            "nonce": nonce, "email": "ada@example.com",
+        });
+    });
+    let callback = h
+        .get(
+            &format!("{}?code=c&state={state}", OidcConfig::CALLBACK_PATH),
+            Some(&format!("{}={cookie}", super::STATE_COOKIE)),
+        )
+        .await;
+    assert_eq!(callback.status, StatusCode::SEE_OTHER, "{}", callback.body);
+    let session = callback
+        .cookie(crate::server::auth::SESSION_COOKIE)
+        .unwrap_or_else(|| fail("no session cookie"));
+
+    // On behalf of the person: the provider shares the sign-in's key and
+    // sends no actor token, no secret, and no Basic header.
+    let obo = h
+        .probe(
+            "/probe-key",
+            (
+                "cookie",
+                &format!("{}={session}", crate::server::auth::SESSION_COOKIE),
+            ),
+        )
+        .await;
+    assert_eq!(obo.status, StatusCode::OK, "{}", obo.body);
+    assert_eq!(obo.body, "obo-user-access");
+
+    let requests = h
+        .issuer
+        .lock()
+        .map(|s| s.token_requests.clone())
+        .unwrap_or_default();
+    let grants: Vec<&str> = requests
+        .iter()
+        .filter_map(|(form, _)| form.get("grant_type").map(String::as_str))
+        .collect();
+    assert_eq!(
+        grants,
+        [
+            "authorization_code",
+            "urn:ietf:params:oauth:grant-type:token-exchange"
+        ]
+    );
+    for (form, authorization) in &requests {
+        assert!(authorization.is_none(), "{authorization:?}");
+        assert!(!form.contains_key("actor_token"), "{form:?}");
+        check_assertion(form, key.jwk(), &base, &mut seen);
+    }
 }

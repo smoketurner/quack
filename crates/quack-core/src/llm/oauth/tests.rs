@@ -42,6 +42,10 @@ struct MockState {
     spent: StdMutex<HashSet<String>>,
     /// Why each refused client assertion was refused.
     refused_assertions: StdMutex<Vec<String>>,
+    /// Whether discovery lists a pushed authorization request endpoint.
+    par: std::sync::atomic::AtomicBool,
+    /// Each pushed authorization request's body.
+    par_bodies: StdMutex<Vec<String>>,
 }
 
 type BeforeRefusal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
@@ -134,12 +138,16 @@ async fn serve(mut stream: tokio::net::TcpStream, base: &str, state: &MockState)
     {
         meanwhile.await;
     }
-    let refused = if matches!(target.as_str(), "/token" | "/device") {
+    let refused = if matches!(target.as_str(), "/token" | "/device" | "/par") {
         refuse_assertion(&body, base, state)
     } else {
         None
     };
-    let (status, json) = refused.unwrap_or_else(|| route(&target, &body, base, state));
+    let (status, json) = match refused {
+        Some(refusal) => refusal,
+        None if target == "/par" => pushed(&body, state),
+        None => route(&target, &body, base, state),
+    };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
         json.len()
@@ -179,6 +187,14 @@ fn metadata(target: &str, base: &str, state: &MockState) -> (&'static str, Strin
         "token_endpoint": format!("{base}/token"),
         "device_authorization_endpoint": format!("{base}/device"),
     });
+    if state.par.load(Ordering::SeqCst)
+        && let Some(fields) = metadata.as_object_mut()
+    {
+        fields.insert(
+            String::from("pushed_authorization_request_endpoint"),
+            serde_json::json!(format!("{base}/par")),
+        );
+    }
     if let (Some(grants), Some(fields)) = (
         state.grants.lock().ok().and_then(|g| g.clone()),
         metadata.as_object_mut(),
@@ -219,6 +235,19 @@ fn refuse_assertion(body: &str, base: &str, state: &MockState) -> Option<(&'stat
         "401 Unauthorized",
         String::from("{\"error\":\"invalid_client\"}"),
     ))
+}
+
+/// A pushed authorization request (RFC 9126), kept for the test to read.
+fn pushed(body: &str, state: &MockState) -> (&'static str, String) {
+    if let Ok(mut bodies) = state.par_bodies.lock() {
+        bodies.push(body.to_owned());
+    }
+    (
+        "201 Created",
+        String::from(
+            "{\"request_uri\":\"urn:ietf:params:oauth:request_uri:p1\",\"expires_in\":60}",
+        ),
+    )
 }
 
 fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static str, String) {
@@ -798,6 +827,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         authorization: String::from("http://127.0.0.1:9/a"),
         token: String::from("http://127.0.0.1:9/t"),
         device_authorization: None,
+        pushed_authorization: None,
         jwks_uri: None,
         grant_types_supported: None,
         authorization_response_iss_parameter_supported: false,
@@ -1042,6 +1072,7 @@ fn a_redirects_issuer_must_match_and_is_required_when_promised() {
         authorization: String::new(),
         token: String::new(),
         device_authorization: None,
+        pushed_authorization: None,
         jwks_uri: None,
         grant_types_supported: None,
         authorization_response_iss_parameter_supported: false,
@@ -1246,4 +1277,65 @@ async fn an_unregistered_client_key_is_refused_by_the_issuer() {
     assert_eq!(refused(&idp).len(), 1);
     assert_eq!(spent(&idp), 0);
     assert!(!registered.kid.is_empty());
+}
+
+#[tokio::test]
+async fn a_browser_login_pushes_its_request_and_signs_the_code_exchange() {
+    let idp = MockIdp::start().await;
+    idp.state.par.store(true, Ordering::SeqCst);
+    let dir = temp();
+    register_client_key(dir.path(), &idp).await;
+    let config = with_key(oauth_config(&idp.issuer, Grant::AuthorizationCode));
+    let m = Arc::new(
+        TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+            .unwrap_or_else(|e| fail(&e.to_string())),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let login = {
+        let m = Arc::clone(&m);
+        tokio::spawn(async move {
+            let notify = move |p: LoginPrompt| drop(tx.send(p));
+            m.login(LoginFlow::Configured, &notify).await
+        })
+    };
+    let Some(LoginPrompt::Browser { url }) = rx.recv().await else {
+        fail("expected a browser prompt");
+    };
+    let Ok(auth_url) = Url::parse(&url) else {
+        fail(&format!("auth url unparsable: {url}"));
+    };
+    let q: HashMap<_, _> = auth_url.query_pairs().into_owned().collect();
+    assert_eq!(q.len(), 2, "{url}");
+    assert_eq!(q.get("client_id").map(String::as_str), Some("client-1"));
+    assert!(q.contains_key("request_uri"));
+    let pushed = idp
+        .state
+        .par_bodies
+        .lock()
+        .map(|b| b.clone())
+        .unwrap_or_default();
+    let [pushed] = pushed.as_slice() else {
+        fail(&format!("{pushed:?}"));
+    };
+    assert_eq!(
+        form(pushed, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    assert!(form(pushed, "code_challenge").is_some());
+    assert!(form(pushed, "client_assertion").is_some());
+    let state = form(pushed, "state").unwrap_or_default();
+    let redirect = form(pushed, "redirect_uri").unwrap_or_default();
+    let back = reqwest::Client::new()
+        .get(format!("{redirect}?code=the-code&state={state}"))
+        .send()
+        .await;
+    assert!(back.is_ok_and(|r| r.status() == 200));
+    let token = login.await;
+    assert!(token.is_ok_and(|t| t.is_ok_and(|t| t.access_token.expose_secret() == "code-access")));
+    let body = last_body(&idp);
+    assert!(body.contains("client_assertion="), "{body}");
+    assert!(!body.contains("client_secret"), "{body}");
+    assert!(last_auth(&idp).is_empty());
+    assert_eq!(spent(&idp), 2);
+    assert!(refused(&idp).is_empty(), "{:?}", refused(&idp));
 }

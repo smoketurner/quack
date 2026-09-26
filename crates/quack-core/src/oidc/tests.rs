@@ -4,7 +4,7 @@
     reason = "fixtures index JSON objects they built, where a missing key is inserted, not a panic"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPai
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
 use super::*;
+use crate::llm::oauth::client_key::{ClientKeyName, PublicJwk, tests::verify};
 
 /// The `aud` the test sign-in accepts on access tokens.
 const AUDIENCE: &str = "api://quack";
@@ -38,6 +39,16 @@ struct IssuerState {
     /// The JWK set `/jwks` serves.
     jwks: Vec<Value>,
     jwks_fetches: usize,
+    /// Whether discovery lists `pushed_authorization_request_endpoint`.
+    par: bool,
+    /// Each pushed authorization request's body.
+    par_bodies: Vec<String>,
+    /// The public key registered for quack's `private_key_jwt`.
+    client_jwk: Option<PublicJwk>,
+    /// Every assertion `jti` accepted: the issuer spends them.
+    spent: HashSet<String>,
+    /// Why each refused client assertion was refused.
+    refused: Vec<String>,
 }
 
 struct MockIssuer {
@@ -160,16 +171,31 @@ fn answer(
     let Ok(mut state) = state.lock() else {
         return ("500 Internal Server Error", json!({}));
     };
+    if matches!(target, "/token" | "/par")
+        && let Some(refusal) = refuse_assertion(body, base, &mut state)
+    {
+        return refusal;
+    }
     match target {
-        "/.well-known/openid-configuration" => (
-            "200 OK",
-            json!({
+        "/.well-known/openid-configuration" => {
+            let mut metadata = json!({
                 "issuer": state.named_issuer.clone().unwrap_or_else(|| base.to_owned()),
                 "authorization_endpoint": format!("{base}/authorize"),
                 "token_endpoint": format!("{base}/token"),
                 "jwks_uri": format!("{base}/jwks"),
-            }),
-        ),
+            });
+            if state.par {
+                metadata["pushed_authorization_request_endpoint"] = json!(format!("{base}/par"));
+            }
+            ("200 OK", metadata)
+        }
+        "/par" => {
+            state.par_bodies.push(body.to_owned());
+            (
+                "201 Created",
+                json!({ "request_uri": "urn:ietf:params:oauth:request_uri:pushed-1", "expires_in": 60 }),
+            )
+        }
         "/jwks" => {
             state.jwks_fetches = state.jwks_fetches.saturating_add(1);
             ("200 OK", json!({ "keys": state.jwks }))
@@ -208,6 +234,28 @@ fn answer(
         }
         _ => ("404 Not Found", json!({})),
     }
+}
+
+/// A client assertion checked as Vouch checks one; the refusal when it
+/// fails, `None` when there is none or it passes.
+fn refuse_assertion(
+    body: &str,
+    base: &str,
+    state: &mut IssuerState,
+) -> Option<(&'static str, Value)> {
+    let form: HashMap<String, String> = oauth2::url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    let assertion = form.get("client_assertion")?;
+    let state = &mut *state;
+    let checked = match (&state.client_jwk, form.get("client_id").map(String::as_str)) {
+        (Some(jwk), Some("quack")) => verify(jwk, assertion, "quack", base, &mut state.spent),
+        (None, _) => Err(String::from("no key registered")),
+        (_, other) => Err(format!("client_id {other:?}")),
+    };
+    let why = checked.err()?;
+    state.refused.push(why);
+    Some(("401 Unauthorized", json!({ "error": "invalid_client" })))
 }
 
 /// An unsigned compact JWT carrying `claims`.
@@ -599,4 +647,180 @@ async fn without_an_audience_no_bearer_is_accepted_and_oid_can_name_the_person()
             .await
             .is_ok_and(|b| b.subject == OidcSubject::from("object-1"))
     );
+}
+
+// --- private_key_jwt and pushed authorization requests -------------------------
+
+impl MockIssuer {
+    /// A sign-in that authenticates with `private_key_jwt`, its key
+    /// registered at this issuer.
+    async fn sign_in_with_key(&self) -> SignIn {
+        let Ok(key) = self
+            .keys()
+            .key(&ClientKeyName::new(&self.url, "quack"))
+            .await
+        else {
+            fail("no client key");
+        };
+        self.with(|s| s.client_jwk = Some(key.jwk().clone()));
+        let mut config = self.sign_in().config;
+        config.client_auth = ClientAuth::PrivateKeyJwt;
+        SignIn::new(config, self.keys()).unwrap_or_else(|e| fail(&e.to_string()))
+    }
+
+    fn par_bodies(&self) -> Vec<HashMap<String, String>> {
+        self.state
+            .lock()
+            .map(|s| {
+                s.par_bodies
+                    .iter()
+                    .map(|b| {
+                        oauth2::url::form_urlencoded::parse(b.as_bytes())
+                            .into_owned()
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn spent_and_refused(&self) -> (usize, Vec<String>) {
+        self.state
+            .lock()
+            .map(|s| (s.spent.len(), s.refused.clone()))
+            .unwrap_or_default()
+    }
+}
+
+#[tokio::test]
+async fn an_advertised_par_endpoint_takes_the_request_and_the_browser_only_a_reference() {
+    let issuer = MockIssuer::start().await;
+    issuer.with(|s| s.par = true);
+    let sign_in = issuer.sign_in_with_key().await;
+    let begun = sign_in.begin().await;
+    let Ok((url, pending)) = begun else {
+        fail(&format!("{:?}", begun.err()));
+    };
+    assert!(
+        url.starts_with(&format!("{}/authorize?", issuer.url)),
+        "{url}"
+    );
+    let q = query(&url);
+    assert_eq!(q.len(), 2, "{url}");
+    assert_eq!(q.get("client_id").map(String::as_str), Some("quack"));
+    assert_eq!(
+        q.get("request_uri").map(String::as_str),
+        Some("urn:ietf:params:oauth:request_uri:pushed-1")
+    );
+
+    let pushed = issuer.par_bodies();
+    let [pushed] = pushed.as_slice() else {
+        fail(&format!("{pushed:?}"));
+    };
+    let field = |k: &str| pushed.get(k).cloned().unwrap_or_default();
+    assert_eq!(field("response_type"), "code");
+    assert_eq!(field("client_id"), "quack");
+    assert_eq!(field("state"), pending.state);
+    assert_eq!(field("nonce"), pending.nonce);
+    assert_eq!(field("code_challenge_method"), "S256");
+    assert_eq!(field("code_challenge").len(), 43);
+    assert!(field("redirect_uri").ends_with(OidcConfig::CALLBACK_PATH));
+    assert!(field("scope").split(' ').any(|s| s == "openid"));
+    assert_eq!(
+        field("client_assertion_type"),
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    );
+    assert!(!pushed.contains_key("client_secret"));
+
+    let nonce = pending.nonce.clone();
+    issuer.with(|s| {
+        s.id_claims = Some(json!({
+            "iss": issuer.url, "sub": "subject-1", "aud": "quack", "exp": in_an_hour(),
+            "nonce": nonce,
+        }));
+    });
+    let signed_in = sign_in.finish("the-code", pending).await;
+    assert!(signed_in.is_ok(), "{:?}", signed_in.err());
+    let body = issuer.last_token_body();
+    assert!(body.contains("client_assertion="), "{body}");
+    assert!(body.contains("client_id=quack"), "{body}");
+    assert!(!body.contains("client_secret"), "{body}");
+    let renewed = sign_in
+        .renew(&SecretString::from(String::from("user-refresh")))
+        .await;
+    assert!(matches!(renewed, Ok(Renewal::Renewed(_))), "{renewed:?}");
+    // Three requests, three assertions, none refused and none reused.
+    let (spent, refused) = issuer.spent_and_refused();
+    assert_eq!(spent, 3);
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_confidential_client_pushes_with_its_secret_and_without_par_nothing_is_pushed() {
+    let issuer = MockIssuer::start().await;
+    issuer.with(|s| s.par = true);
+    let mut config = issuer.sign_in().config;
+    config.client_secret_env = Some(String::from("CARGO_PKG_NAME"));
+    let sign_in = SignIn::new(config, issuer.keys()).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(sign_in.begin().await.is_ok());
+    let pushed = issuer.par_bodies();
+    assert!(
+        matches!(pushed.as_slice(), [p] if p.get("client_secret").map(String::as_str) == Some(env!("CARGO_PKG_NAME"))
+            && !p.contains_key("client_assertion")),
+        "{pushed:?}"
+    );
+
+    // Not advertised: the browser carries the request, as before.
+    let plain = MockIssuer::start().await;
+    let Ok((url, _)) = plain.sign_in_with_key().await.begin().await else {
+        fail("begin failed");
+    };
+    let q = query(&url);
+    assert!(
+        q.contains_key("code_challenge") && q.contains_key("nonce"),
+        "{url}"
+    );
+    assert!(!q.contains_key("request_uri"));
+    assert!(plain.par_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn the_sign_in_and_a_provider_registered_as_the_same_client_share_one_key() {
+    use crate::config::{Exchange, Grant, OAuthConfig};
+    use crate::llm::oauth::{KeySource, TokenManager};
+    let issuer = MockIssuer::start().await;
+    let sign_in = issuer.sign_in_with_key().await;
+    let mut config = crate::config::Config::default();
+    config.general.data_dir = issuer.dir.path().to_path_buf();
+    let oauth = OAuthConfig {
+        // The same client, written with a trailing slash.
+        issuer_url: format!("{}/", issuer.url),
+        client_id: String::from("quack"),
+        scopes: Vec::new(),
+        redirect_uri: String::from(OAuthConfig::DEFAULT_REDIRECT_URI),
+        grant: Grant::OnBehalfOf,
+        client_secret_env: None,
+        client_auth: ClientAuth::PrivateKeyJwt,
+        exchange: Exchange::TokenExchange,
+        audience: None,
+        resource: None,
+        actor: false,
+    };
+    let name = "gw".parse().unwrap_or_else(|e: Error| fail(&e.to_string()));
+    let manager = TokenManager::new(&config, &name, oauth, KeySource::File)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (ours, theirs) = (sign_in.credential().await, manager.credential().await);
+    let (Ok(ours), Ok(theirs)) = (ours, theirs) else {
+        fail("no credential");
+    };
+    let (Some(ours), Some(theirs)) = (ours.assertion(), theirs.assertion()) else {
+        fail("not assertions");
+    };
+    assert_eq!(ours.thumbprint(), theirs.thumbprint());
+    // Another process finds the one stored row.
+    let stored = issuer
+        .keys()
+        .load_or_create(&ClientKeyName::new(&issuer.url, "quack"))
+        .await;
+    assert!(stored.is_ok_and(|k| k.thumbprint() == ours.thumbprint()));
 }

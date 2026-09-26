@@ -467,19 +467,48 @@ impl SignIn {
     ///
     /// Returns an error when discovery fails or randomness is unavailable.
     pub async fn begin(&self) -> Result<(String, Pending)> {
-        let (client, _, _) = self.client().await?;
+        let (client, _, credential) = self.client().await?;
         let verifier = PkceCodeVerifier::new(random_token()?);
         let challenge = PkceCodeChallenge::from_code_verifier_sha256(&verifier);
         let state = random_token()?;
         let nonce = random_token()?;
-        let (url, _) = client
-            .authorize_url(|| CsrfToken::new(state.clone()))
-            .add_scopes(self.config.scopes.iter().cloned().map(Scope::new))
-            .set_pkce_challenge(challenge)
-            .add_extra_param("nonce", nonce.clone())
-            .url();
+        let endpoints = self.endpoints().await?;
+        let url = match &endpoints.pushed_authorization {
+            // The issuer takes pushed requests (RFC 9126): the parameters go
+            // to it directly, with the client's credential, and the browser
+            // carries only a reference to them.
+            Some(pushed) => {
+                let params = [
+                    ("response_type", String::from("code")),
+                    ("redirect_uri", self.config.redirect_uri.clone()),
+                    ("scope", self.config.scopes.join(" ")),
+                    ("state", state.clone()),
+                    ("nonce", nonce.clone()),
+                    ("code_challenge", challenge.as_str().to_owned()),
+                    ("code_challenge_method", String::from("S256")),
+                ];
+                self.http
+                    .push_authorization(
+                        pushed,
+                        &endpoints.authorization,
+                        &self.config.client_id,
+                        &credential,
+                        &params,
+                    )
+                    .await
+                    .map_err(|e| sign_in_error(e.to_string()))?
+            }
+            None => client
+                .authorize_url(|| CsrfToken::new(state.clone()))
+                .add_scopes(self.config.scopes.iter().cloned().map(Scope::new))
+                .set_pkce_challenge(challenge)
+                .add_extra_param("nonce", nonce.clone())
+                .url()
+                .0
+                .to_string(),
+        };
         Ok((
-            url.to_string(),
+            url,
             Pending {
                 state,
                 nonce,

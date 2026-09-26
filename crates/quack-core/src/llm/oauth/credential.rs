@@ -117,6 +117,12 @@ impl Credential {
 }
 
 impl Assertion {
+    /// The signing key's RFC 7638 thumbprint.
+    #[cfg(test)]
+    pub(crate) fn thumbprint(&self) -> &str {
+        self.key.thumbprint()
+    }
+
     /// `client_assertion_type` and a newly signed `client_assertion`.
     ///
     /// # Errors
