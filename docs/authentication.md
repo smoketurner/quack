@@ -440,8 +440,7 @@ Leave `client_id` out of every section the registered client should serve, and s
 `[server.oidc]` and an on-behalf-of provider share the client.
 
 ```bash
-quack auth register                         # at Vouch: sign in, then register as yours
-quack auth register --sign-in               # the same at any issuer
+quack auth register                         # sign in, then register as yours
 quack auth register --device-code           # sign in with a device code (no browser)
 quack auth register --token-env IDP_TOKEN   # register with an access token as the bearer
 quack auth register --open                  # register with no token: anyone may sign in
@@ -476,7 +475,7 @@ names the provider, which then needs a `client_id` of its own.
 
 Who the client belongs to depends on what authorizes the registration:
 
-- **Signing in** (`--sign-in`, `--device-code`, and the default at Vouch). An issuer that
+- **Signing in** (the default; `--device-code` forces the device-code flow). An issuer that
   takes the registration's bearer as the client's owner needs a token of the person's own,
   and a person rarely has one to hand. quack registers a temporary public client (a native
   app with no secret, PKCE, and a loopback redirect on a free port) and signs the person in
@@ -494,9 +493,15 @@ Who the client belongs to depends on what authorizes the registration:
   with an account at the issuer can use, and asks before it goes ahead; `--yes` answers for
   it.
 
-With none of these, quack signs the person in at Vouch (an issuer on `vouch.sh`) and refuses
-at any other issuer, naming the three choices: it never registers an open client unless
-told to, since at a Vouch on its own domain that client would be every user's.
+Without `--token-env` or `--open`, quack signs the person in wherever the issuer's discovery
+document advertises what that needs: a `registration_endpoint`, `none` in
+`token_endpoint_auth_methods_supported` (the temporary client is public), and `S256` in
+`code_challenge_methods_supported`. RFC 8414 section 2 makes `client_secret_basic` the
+default when the first list is omitted, and says of the second: "If omitted, the
+authorization server does not support PKCE." An issuer lacking any of them is refused,
+with what it lacks and the other two choices named: quack never registers an open client
+unless told to, since that client could be every user's. Vouch advertises all three, on
+`vouch.sh` or its own domain.
 
 quack keeps the result in `control.db`, table `client_registrations`, under the issuer's
 name: the `client_id`, the `registration_client_uri`, and the `registration_access_token`,

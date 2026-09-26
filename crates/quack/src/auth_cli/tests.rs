@@ -105,7 +105,6 @@ fn request(print: bool) -> RegisterArgs {
         replace: false,
         print,
         yes: false,
-        sign_in: false,
         device_code: false,
         open: false,
     }
@@ -235,16 +234,6 @@ async fn an_unregistered_client_has_nothing_to_rotate_or_delete() {
     .unwrap_err()
     .to_string();
     assert!(err.contains("no client is registered"), "{err}");
-}
-
-#[test]
-fn vouch_is_recognized_by_its_host() {
-    assert!(is_vouch(&RegistrationName::new("https://us.vouch.sh")));
-    assert!(is_vouch(&RegistrationName::new("https://vouch.sh/")));
-    assert!(!is_vouch(&RegistrationName::new("https://notvouch.sh")));
-    assert!(!is_vouch(&RegistrationName::new(
-        "https://login.example.com/vouch.sh"
-    )));
 }
 
 /// A client registered by hand rotates in two steps: `--rotate` prints the
@@ -383,16 +372,36 @@ async fn rotate_without_a_provider_is_the_sign_in_client() {
     assert!(err.contains("client_secret_post"), "{err}");
 }
 
-/// At an issuer that is not recognized as Vouch, `quack auth register`
-/// says how it would register rather than registering an open client, even
-/// with `--yes`: an open client there may be anyone's to sign in to.
+/// An issuer whose discovery document advertises no public clients cannot
+/// sign a person in, so `quack auth register` says how else it could
+/// register rather than registering an open client, even with `--yes`: an
+/// open client there may be anyone's to sign in to. It is the document that
+/// decides, not the issuer's name.
 #[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test")]
-async fn an_unrecognized_issuer_needs_to_be_told_how_to_register() {
+async fn an_issuer_without_public_clients_needs_to_be_told_how_to_register() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let document = serde_json::json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "registration_endpoint": format!("{issuer}/register"),
+        "token_endpoint_auth_methods_supported": ["private_key_jwt"],
+        "code_challenge_methods_supported": ["S256"],
+    });
+    let app = axum::Router::new().route(
+        "/.well-known/openid-configuration",
+        axum::routing::get(move || async move { axum::Json(document) }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
     let dir = tempfile::tempdir().unwrap();
-    let toml = "[server.oidc]\nissuer_url = \"https://login.example.com\"\nclient_auth = \"private_key_jwt\"\n\
-                redirect_uri = \"https://q.example.com/auth/oidc/callback\"\n";
-    let mut config = Config::parse(toml).unwrap();
+    let toml = format!(
+        "[server.oidc]\nissuer_url = \"{issuer}\"\nclient_auth = \"private_key_jwt\"\n\
+         redirect_uri = \"https://q.example.com/auth/oidc/callback\"\n"
+    );
+    let mut config = Config::parse(&toml).unwrap();
     config.general.data_dir = dir.path().to_path_buf();
     let mut yes = request(false);
     yes.yes = true;
@@ -407,7 +416,11 @@ async fn an_unrecognized_issuer_needs_to_be_told_how_to_register() {
     .await
     .unwrap_err()
     .to_string();
-    for choice in ["--sign-in", "--token-env", "--open"] {
+    assert!(
+        err.contains("token_endpoint_auth_methods_supported"),
+        "{err}"
+    );
+    for choice in ["--token-env", "--open"] {
         assert!(err.contains(choice), "{err}");
     }
 }

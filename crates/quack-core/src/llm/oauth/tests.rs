@@ -66,6 +66,9 @@ struct MockState {
     device_denied: std::sync::atomic::AtomicBool,
     /// Refuse a registration (RFC 7591) that carries a bearer.
     refuse_bearer_registrations: std::sync::atomic::AtomicBool,
+    /// Leave `none` out of `token_endpoint_auth_methods_supported`: the
+    /// issuer takes no public clients.
+    no_public_clients: std::sync::atomic::AtomicBool,
     /// Issue a new registration access token with each update.
     rotate_registration_token: std::sync::atomic::AtomicBool,
 }
@@ -226,7 +229,19 @@ fn metadata(target: &str, base: &str, state: &MockState) -> (&'static str, Strin
         "token_endpoint": format!("{base}/token"),
         "registration_endpoint": format!("{base}/register"),
         "device_authorization_endpoint": format!("{base}/device"),
+        "code_challenge_methods_supported": ["S256"],
     });
+    if let Some(fields) = metadata.as_object_mut() {
+        let methods = if state.no_public_clients.load(Ordering::SeqCst) {
+            serde_json::json!(["private_key_jwt"])
+        } else {
+            serde_json::json!(["none", "private_key_jwt"])
+        };
+        fields.insert(
+            String::from("token_endpoint_auth_methods_supported"),
+            methods,
+        );
+    }
     if state.par.load(Ordering::SeqCst)
         && let Some(fields) = metadata.as_object_mut()
     {
@@ -1058,6 +1073,8 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         jwks_uri: None,
         grant_types_supported: None,
         registration: None,
+        token_endpoint_auth_methods_supported: None,
+        code_challenge_methods_supported: None,
         authorization_response_iss_parameter_supported: false,
     };
     assert!(m.endpoints.set(endpoints).is_ok());
@@ -1304,6 +1321,8 @@ fn a_redirects_issuer_must_match_and_is_required_when_promised() {
         jwks_uri: None,
         grant_types_supported: None,
         registration: None,
+        token_endpoint_auth_methods_supported: None,
+        code_challenge_methods_supported: None,
         authorization_response_iss_parameter_supported: false,
     };
     assert!(endpoints.check_response_issuer(None).is_ok());

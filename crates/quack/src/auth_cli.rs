@@ -182,16 +182,10 @@ pub(crate) struct RegisterArgs {
     /// Environment variable holding an access token to register with (the
     /// issuer's initial access token, or your own access token, which makes
     /// the client yours)
-    #[arg(long, value_name = "VAR", conflicts_with_all = ["sign_in", "open"])]
+    #[arg(long, value_name = "VAR", conflicts_with_all = ["device_code", "open"])]
     pub(crate) token_env: Option<String>,
 
-    /// Sign in to the issuer first and register with your own token, which
-    /// makes the client yours: the default at Vouch
-    #[arg(long, conflicts_with = "open")]
-    pub(crate) sign_in: bool,
-
-    /// Sign in with the device-code flow instead of the browser (implies
-    /// --sign-in)
+    /// Sign in with the device-code flow instead of the browser
     #[arg(long, conflicts_with = "open")]
     pub(crate) device_code: bool,
 
@@ -240,11 +234,11 @@ pub(crate) async fn register(
     }
     let earlier = registrar.clean_up_sign_in(&issuer).await?;
     write_temporary(out, &issuer, &earlier)?;
-    let how = How::of(&request, &issuer)?;
+    let how = How::of(&request, &registrar, &issuer).await?;
     if how == How::Open {
         writeln!(
             out,
-            "This is an open registration: {issuer} makes a client that anyone with an account there can sign in to. Sign in first (--sign-in) or register with an access token (--token-env VAR) to make the client yours, and restrict who may use it at the issuer."
+            "This is an open registration: {issuer} makes a client that anyone with an account there can sign in to. Register with an access token (--token-env VAR) to make the client yours, and restrict who may use it at the issuer."
         )?;
         if !confirm.ask(
             out,
@@ -401,23 +395,32 @@ enum How<'a> {
 }
 
 impl<'a> How<'a> {
-    /// `--token-env`, `--open`, and `--sign-in` (or `--device-code`) say.
-    /// With none of them, Vouch signs the person in, since it takes the
-    /// registration's bearer as the client's owner; any other issuer is
+    /// `--token-env` and `--open` say; without either, the person signs in
+    /// wherever the issuer's discovery document advertises what that needs
+    /// (a `registration_endpoint`, public clients, and PKCE with `S256`),
+    /// so an issuer that takes the registration's bearer as the client's
+    /// owner, as Vouch does, makes the client theirs. Any other issuer is
     /// refused rather than registered openly, since an open client there
-    /// may be anyone's to sign in to (a Vouch on its own domain included).
-    fn of(request: &'a RegisterArgs, issuer: &RegistrationName) -> Result<Self> {
+    /// may be anyone's to sign in to.
+    async fn of(
+        request: &'a RegisterArgs,
+        registrar: &Registrar,
+        issuer: &RegistrationName,
+    ) -> Result<Self> {
         if let Some(var) = &request.token_env {
-            Ok(Self::Token(var))
-        } else if request.open {
-            Ok(Self::Open)
-        } else if request.sign_in || request.device_code || is_vouch(issuer) {
-            Ok(Self::SignIn)
-        } else {
-            anyhow::bail!(
-                "say how to register at {issuer}: --sign-in to sign in and register the client as yours (Vouch on its own domain, for one), --token-env VAR to register with an access token, or --open to register a client anyone with an account there can sign in to"
-            )
+            return Ok(Self::Token(var));
         }
+        if request.open {
+            return Ok(Self::Open);
+        }
+        let missing = registrar.missing_for_sign_in(issuer).await?;
+        if missing.is_empty() {
+            return Ok(Self::SignIn);
+        }
+        anyhow::bail!(
+            "{issuer} cannot sign you in to register: its discovery document lacks {}. Register with an access token (--token-env VAR), or with --open a client anyone with an account there can sign in to",
+            missing.join(", ")
+        )
     }
 }
 
@@ -471,46 +474,26 @@ fn write_registered(
         served.join(" and ")
     )?;
     writeln!(out, "\nNext:")?;
-    if is_vouch(issuer) {
-        match how {
-            How::Open => writeln!(
-                out,
-                "  - Every Vouch user can sign in to this client: an open registration has no owner, so its access scope cannot be changed. To limit it to your organization, `quack auth register --replace --sign-in`."
-            )?,
-            How::SignIn => writeln!(
-                out,
-                "  - Only you can sign in to this client: Vouch registered it as yours (access scope Personal). To let your organization sign in, open it on your Applications page in the Vouch console ({issuer}/applications), set Access scope to Organization, and save."
-            )?,
-            How::Token(_) => writeln!(
-                out,
-                "  - Vouch registered the client to the account the token belongs to (access scope Personal), so only that account can sign in to it. To let your organization sign in, that account opens it on its Applications page in the Vouch console ({issuer}/applications), sets Access scope to Organization, and saves."
-            )?,
-        }
-    } else {
-        writeln!(
+    match how {
+        How::Open => writeln!(
             out,
-            "  - At the issuer, check who may use the new client and grant it what it needs."
-        )?;
+            "  - An open registration has no owner, so anyone with an account at {issuer} may be able to sign in to this client. To make it yours, `quack auth register --replace`."
+        )?,
+        How::SignIn | How::Token(_) => writeln!(
+            out,
+            "  - The client was registered with {} token. An issuer that makes that account its owner lets only it sign in until the client is widened in the issuer's console (at Vouch: the Applications page, Access scope Organization).",
+            if matches!(how, How::SignIn) {
+                "your own"
+            } else {
+                "that account's"
+            }
+        )?,
     }
     writeln!(
         out,
         "  - `quack doctor` reads the registration back; then start quack (restart a running `quack serve`)."
     )?;
     Ok(())
-}
-
-/// Whether the issuer is Vouch, whose console must widen a registered app
-/// to the organization.
-fn is_vouch(issuer: &RegistrationName) -> bool {
-    let host = issuer
-        .as_str()
-        .split_once("://")
-        .map_or(issuer.as_str(), |(_, rest)| rest)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    host == "vouch.sh" || host.ends_with(".vouch.sh")
 }
 
 /// `quack auth register` on the terminal. Its questions must reach the

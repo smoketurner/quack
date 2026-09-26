@@ -94,7 +94,7 @@ cargo run --bin quack -- okf export DIR|-                                       
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
-cargo run --bin quack -- auth register [--issuer URL] [--sign-in|--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
+cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
 cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind; exit 1 on a failure
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
@@ -176,13 +176,13 @@ key alone), and a browser sign-in is pushed first (RFC 9126) whenever discovery 
 RFC 7591 for every section there that leaves `client_id` out, keeps its `client_id`, sealed
 `registration_access_token`, and `registration_client_uri` in `control.db` (`client_registrations`,
 named by the issuer), and those sections resolve their `client_id` from it at use; the key waits under
-the issuer's name until the id exists. At Vouch (or with `--sign-in`/`--device-code`) it
-first signs the person in through a temporary public client it registers and deletes again
+the issuer's name until the id exists. By default, wherever discovery advertises a
+`registration_endpoint`, public clients, and PKCE `S256` (as Vouch does), it first signs the person in through a temporary public client it registers and deletes again
 (`Registrar::register_signed_in`), so the registration's bearer is the person's own and Vouch
 records them as the owner; widening the client to the organization stays a manual console step. Each
 temporary client stays recorded (sealed) until deleted, so an interrupted run leaves it deletable
-(the next run deletes it; `quack doctor` names it). An issuer that is not Vouch needs `--sign-in`,
-`--token-env`, or `--open`. RFC 7592 carries
+(the next run deletes it; `quack doctor` names it). An issuer that advertises less needs
+`--token-env` or `--open`. RFC 7592 carries
 each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
 client (`unregister`).
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
