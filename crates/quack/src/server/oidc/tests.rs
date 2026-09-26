@@ -1278,7 +1278,7 @@ async fn an_http_public_url_leaves_loopback_cookies_plain() {
     );
 }
 
-// --- the most secure on-behalf-of setup (Vouch) ------------------------------
+// --- private_key_jwt sign-in and on-behalf-of, checked as Vouch checks -------
 
 /// Check a client assertion with the registered key: ES256 by that key,
 /// `iss` and `sub` quack's client, `aud` the issuer, a lifetime of at most a
