@@ -103,12 +103,39 @@ pub(crate) struct Endpoints {
     /// registrations.
     #[serde(rename = "registration_endpoint")]
     pub(crate) registration: Option<String>,
+    /// How clients may authenticate at the token endpoint; RFC 8414 2 makes
+    /// `client_secret_basic` the default when it is omitted.
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    /// The PKCE methods the issuer takes; RFC 8414 2: "If omitted, the
+    /// authorization server does not support PKCE."
+    code_challenge_methods_supported: Option<Vec<String>>,
     /// Whether every authorization redirect carries `iss` (RFC 9207).
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
 }
 
 impl Endpoints {
+    /// What this issuer lacks for `quack auth register` to sign a person in
+    /// through a temporary client: registering it (RFC 7591), taking it as
+    /// a public client (`token_endpoint_auth_method` `none`), and PKCE with
+    /// `S256`. Empty when it advertises all three.
+    pub(crate) fn missing_for_sign_in(&self) -> Vec<&'static str> {
+        let has = |list: &Option<Vec<String>>, value: &str| {
+            list.as_ref().is_some_and(|l| l.iter().any(|v| v == value))
+        };
+        let mut missing = Vec::new();
+        if self.registration.is_none() {
+            missing.push("a registration_endpoint");
+        }
+        if !has(&self.token_endpoint_auth_methods_supported, "none") {
+            missing.push("\"none\" in token_endpoint_auth_methods_supported");
+        }
+        if !has(&self.code_challenge_methods_supported, "S256") {
+            missing.push("\"S256\" in code_challenge_methods_supported");
+        }
+        missing
+    }
+
     /// Where RFC 8414 puts an OAuth server's metadata: the well-known
     /// segment inserted between the host and the issuer's path.
     fn oauth_metadata_url(issuer: &str) -> Result<String> {

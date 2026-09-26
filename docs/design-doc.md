@@ -1460,12 +1460,14 @@ The command posts the metadata the sections need (the union of their grants, wit
 `native` one, never both; `private_key_jwt` with ES256 and the `jwks`; the union of scopes;
 never `dpop_bound_access_tokens` or `tls_client_certificate_bound_access_tokens`, which make
 bound tokens model APIs refuse) to the discovered `registration_endpoint`, with
-`--token-env`'s token as the bearer; or, at Vouch and with `--sign-in`, a signed-in person's
-token, obtained through a temporary public client (a native app, no secret, PKCE, a
+`--token-env`'s token as the bearer; or, by default wherever discovery advertises a
+`registration_endpoint`, public clients (`none` in `token_endpoint_auth_methods_supported`),
+and PKCE with `S256`, as Vouch does, a signed-in person's token, obtained through a temporary public client (a native app, no secret, PKCE, a
 loopback redirect on a free port) that quack registers, signs the person in through without
 keeping the token, and deletes (RFC 7592) only after the real registration, since deleting a
 client can end its sign-ins; or, with `--open`, after a warning and a confirmation, openly.
-With none of these an issuer that is not Vouch is refused, never registered openly. Each
+An issuer that advertises less is refused unless told `--token-env` or `--open`, never
+registered openly; quack never picks the flow by the issuer's name. Each
 temporary client's record (`sign-in <issuer> <client_id>` in `client_registrations`, its
 registration token sealed) is kept until it is deleted, so an interrupted run (Ctrl-C
 deletes it on the way out) or a refused delete leaves something to delete it with: the next
@@ -1771,8 +1773,8 @@ quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
 quack auth jwks [PROVIDER] [--rotate [--activate]]
-quack auth register [--issuer URL] [--sign-in | --device-code | --token-env VAR |
-                    --open] [--name NAME] [--replace] [--print] [--yes]
+quack auth register [--issuer URL] [--device-code | --token-env VAR | --open]
+                    [--name NAME] [--replace] [--print] [--yes]
 quack auth unregister [--issuer URL] [--yes]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]

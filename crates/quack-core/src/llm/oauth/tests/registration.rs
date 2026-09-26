@@ -1098,3 +1098,27 @@ async fn a_temporary_client_left_behind_is_recorded_and_deleted_later() {
             .is_ok_and(|l| l.is_empty())
     );
 }
+
+/// Signing in before registering is chosen from the issuer's discovery
+/// document, not its name: it needs a `registration_endpoint`, public
+/// clients, and PKCE with `S256`. RFC 8414 2 makes `client_secret_basic`
+/// the default when `token_endpoint_auth_methods_supported` is omitted, and
+/// says of `code_challenge_methods_supported`: "If omitted, the
+/// authorization server does not support PKCE."
+#[tokio::test]
+async fn signing_in_is_offered_where_discovery_advertises_public_clients() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let config = registered_config(dir.path(), &idp.issuer, "");
+    let issuer = RegistrationName::new(&idp.issuer);
+    let registrar = registrar(&config);
+    assert_eq!(
+        registrar.missing_for_sign_in(&issuer).await.ok(),
+        Some(Vec::new())
+    );
+    idp.state.no_public_clients.store(true, Ordering::SeqCst);
+    assert_eq!(
+        registrar.missing_for_sign_in(&issuer).await.ok(),
+        Some(vec!["\"none\" in token_endpoint_auth_methods_supported"])
+    );
+}

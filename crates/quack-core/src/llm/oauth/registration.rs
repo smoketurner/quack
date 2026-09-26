@@ -900,6 +900,25 @@ impl Registrar {
         Ok(answer.client_id)
     }
 
+    /// What `issuer`'s discovery document lacks for signing a person in
+    /// before registering ([`Registrar::register_signed_in`]): an empty list
+    /// when it advertises a `registration_endpoint`, public clients, and
+    /// PKCE with `S256`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the issuer's discovery document cannot be read.
+    pub async fn missing_for_sign_in(
+        &self,
+        issuer: &RegistrationName,
+    ) -> Result<Vec<&'static str>> {
+        Ok(self
+            .http
+            .discover(issuer.as_str())
+            .await?
+            .missing_for_sign_in())
+    }
+
     /// Delete every temporary sign-in client recorded at `issuer`, the ones
     /// interrupted runs left, and forget each once it is gone. One the
     /// issuer refused to delete stays recorded for the next try.
