@@ -6,8 +6,8 @@ use crate::config::inspect::{Inspection, Origin};
 use crate::doctor::{Area, Probing, Report, Status};
 use crate::llm::oauth::client_key::ClientKey;
 use crate::llm::oauth::registration::{
-    ClientMetadata, ReadBack, Registered, Registrar, RegistrationName, Removal, SignIn as SignInWith,
-    TemporaryClient, metadata_for,
+    ClientMetadata, ReadBack, Registered, Registrar, RegistrationName, Removal,
+    SignIn as SignInWith, TemporaryClient, metadata_for,
 };
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
@@ -754,7 +754,10 @@ async fn a_signed_in_registration_uses_the_persons_token_then_deletes_the_sign_i
     assert!(sign_in_client.get("jwks").is_none());
     // quack's client: the person's token as the bearer, quack's key.
     assert_eq!(second_auth, "Bearer device-access");
-    assert_eq!(quacks_client["token_endpoint_auth_method"], "private_key_jwt");
+    assert_eq!(
+        quacks_client["token_endpoint_auth_method"],
+        "private_key_jwt"
+    );
     assert_eq!(
         quacks_client["jwks"],
         serde_json::to_value(&metadata.jwks).unwrap_or_default()
@@ -783,7 +786,12 @@ async fn a_signed_in_registration_uses_the_persons_token_then_deletes_the_sign_i
             .await
             .is_ok_and(|r| r.is_some_and(|r| r.client_id == "client-2"))
     );
-    assert!(provider_manager(&config, "gw").client_id().await.is_ok_and(|id| id == "client-2"));
+    assert!(
+        provider_manager(&config, "gw")
+            .client_id()
+            .await
+            .is_ok_and(|id| id == "client-2")
+    );
 }
 
 /// A registration that would be refused is refused before anyone is asked
@@ -821,4 +829,3 @@ async fn a_signed_in_registration_over_an_existing_client_is_refused_before_sign
     );
     assert_eq!(registration_requests(&idp).len(), 1, "no temporary client");
 }
-

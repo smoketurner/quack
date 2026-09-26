@@ -235,9 +235,9 @@ impl Needs {
 /// `private_key_jwt`, or when the sign-in callback and a provider's
 /// loopback login would share the registration. `OpenID` Connect Dynamic
 /// Client Registration 1.0 section 2: "Native Clients MUST only register
-/// "redirect_uris" using custom URI schemes or loopback URLs", so a native
+/// `redirect_uris` using custom URI schemes or loopback URLs", so a native
 /// client cannot take the https callback, and "Authorization Servers MAY
-/// reject Redirection URI values using the "http" scheme, other than the
+/// reject Redirection URI values using the `http` scheme, other than the
 /// loopback case for Native Clients", so a web client may not take the
 /// loopback one.
 pub fn metadata_for(
@@ -419,9 +419,14 @@ pub struct SignedInRegistration {
 /// What became of the temporary sign-in client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemporaryClient {
-    Deleted { client_id: String },
+    Deleted {
+        client_id: String,
+    },
     /// Still registered at the issuer; delete it in the issuer's console.
-    Left { client_id: String, reason: String },
+    Left {
+        client_id: String,
+        reason: String,
+    },
 }
 
 /// What reading a registration back (RFC 7592 2.1) found, for `quack
@@ -651,8 +656,12 @@ impl Registrar {
         // The same checks a registration makes, before anyone is asked to
         // sign in for one that cannot happen.
         let (_, _, _, endpoint) = self.prepare(issuer, metadata, replace).await?;
-        let temporary = self.register_sign_in_client(&endpoint, sign_in.flow).await?;
-        let outcome = self.sign_in_and_register(issuer, metadata, replace, &temporary, &sign_in).await;
+        let temporary = self
+            .register_sign_in_client(&endpoint, sign_in.flow)
+            .await?;
+        let outcome = self
+            .sign_in_and_register(issuer, metadata, replace, &temporary, &sign_in)
+            .await;
         let removed = self.delete_sign_in_client(&temporary).await;
         let registered = outcome?;
         Ok(SignedInRegistration {
@@ -709,11 +718,14 @@ impl Registrar {
             .send_json(reqwest::Method::POST, endpoint, None, Some(&body))
             .await?;
         if !status.is_success() {
-            return Err(refusal("registering the temporary sign-in client", status, &answer));
+            return Err(refusal(
+                "registering the temporary sign-in client",
+                status,
+                &answer,
+            ));
         }
-        serde_json::from_slice(&answer).map_err(|e| {
-            registration_error(format!("the issuer's answer has no client_id: {e}"))
-        })
+        serde_json::from_slice(&answer)
+            .map_err(|e| registration_error(format!("the issuer's answer has no client_id: {e}")))
     }
 
     /// Delete the temporary sign-in client (RFC 7592). A failure is

@@ -1041,6 +1041,22 @@ fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
         .then_some(ExitCode::from(Exit::AuthRequired))
 }
 
+/// `quack auth register`, signing the person in on this terminal when it
+/// comes to that.
+async fn run_register(config: &Config, args: auth_cli::RegisterArgs) -> Result<()> {
+    let confirm = Confirm::Ask.or_yes(args.yes);
+    auth_cli::run_register(
+        config,
+        args,
+        confirm,
+        auth_cli::SignInWith {
+            browser: browser_can_open(),
+            notify: &show_login_prompt,
+        },
+    )
+    .await
+}
+
 /// `quack auth login|status|logout`.
 async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
     let stdout = std::io::stdout();
@@ -1128,19 +1144,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             rotate,
             activate,
         } => auth_cli::run_jwks(config, provider.as_deref(), rotate, activate).await?,
-        AuthAction::Register(args) => {
-            let confirm = Confirm::Ask.or_yes(args.yes);
-            auth_cli::run_register(
-                config,
-                args,
-                confirm,
-                auth_cli::SignInWith {
-                    browser: browser_can_open(),
-                    notify: &show_login_prompt,
-                },
-            )
-            .await?;
-        }
+        AuthAction::Register(args) => run_register(config, args).await?,
         AuthAction::Unregister { issuer, yes } => {
             auth_cli::run_unregister(config, issuer.as_deref(), Confirm::Ask.or_yes(yes)).await?;
         }

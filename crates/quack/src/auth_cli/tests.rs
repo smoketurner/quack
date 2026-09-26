@@ -113,6 +113,7 @@ fn request(print: bool) -> RegisterArgs {
 
 /// A sign-in no test reaches: registrations here are printed, open, or
 /// refused before one would start.
+#[expect(clippy::panic, reason = "test failure path")]
 fn no_sign_in() -> SignInWith<'static> {
     SignInWith {
         browser: false,
@@ -259,7 +260,7 @@ async fn a_hand_registered_client_rotates_in_two_steps_without_losing_its_key() 
     assert!(done.is_ok(), "{done:?}");
     let active = active.unwrap();
     assert_eq!(Some(active.keys.as_slice()), both.keys.get(1..));
-    assert!(note.contains("Remove the old key"), "{note}");
+    assert!(note.contains("Replace the key set registered"), "{note}");
     assert_eq!(
         client_jwks(&config, Some("gw"), KeySource::File)
             .await

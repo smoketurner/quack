@@ -6,12 +6,12 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use quack_core::config::{ClientAuth, Config};
-use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt};
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwks};
 use quack_core::llm::oauth::registration::{
     ClientMetadata, Registered, Registrar, RegistrationName, Removal, SignIn, TemporaryClient,
     issuer_to_register, metadata_for, registered_sections,
 };
+use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt};
 use quack_core::storage::control::RegistrationRow;
 use secrecy::SecretString;
 
@@ -170,6 +170,10 @@ pub(crate) async fn client_key_state(
 
 /// What `quack auth register` was asked.
 #[derive(Debug, clap::Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a command-line switch; clap refuses the combinations that conflict"
+)]
 pub(crate) struct RegisterArgs {
     /// The issuer; by default the one those sections share
     #[arg(long)]
