@@ -560,6 +560,16 @@ CREATE TABLE provider_tokens (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- an OAuth client's private_key_jwt signing key (P-256, PKCS#8), HPKE-sealed by the
+-- vault; section 10.2
+CREATE TABLE client_keys (
+    name       TEXT PRIMARY KEY,           -- '<issuer> <client_id>'
+    key_id     TEXT NOT NULL,
+    enc        BLOB NOT NULL,
+    ciphertext BLOB NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- a signed-in user's identity-provider token, HPKE-sealed under the server's key
 -- (the vault key: the OS keychain or <data_dir>/vault.key, never here); section 12
 CREATE TABLE user_tokens (
@@ -1373,8 +1383,11 @@ Lifecycle: acquire via `quack auth login PROVIDER` (browser PKCE, or device code
 the document must name the configured issuer; the redirect's `iss` must match it when
 present, and must be present when the issuer advertises
 `authorization_response_iss_parameter_supported` (RFC 9207); verifier from aws-lc-rs
-randomness; the client secret goes in the body or, with `client_auth =
-"client_secret_basic"`, in HTTP Basic);
+randomness; the client authenticates as `client_auth` says: the secret in the body, or
+with `client_secret_basic` in HTTP Basic, or with `private_key_jwt` a client assertion
+(RFC 7523 2.2), described below; when discovery lists a
+`pushed_authorization_request_endpoint`, the authorization request is pushed there first
+(RFC 9126) and the browser carries only its `request_uri`);
 reuse while more than 60 s remain; refresh silently under `refresh_lock`; restart on
 refresh failure; in print, ingest, and server modes, where no flow can run, fail with exit
 4 / HTTP 503 naming the command to run. A `client-credentials` provider needs no login:
@@ -1399,26 +1412,49 @@ The server holds one `TokenManager` per OAuth provider, shared across requests. 
 that reaches Azure OpenAI this way is a confidential client and should be registered as
 such with a client secret or certificate; `client_secret_env` is honored when set.
 
+**Client authentication with a key** (`client_auth = "private_key_jwt"`, on
+`[providers.NAME.oauth]` and `[server.oidc]`). In place of a shared secret, quack signs a
+client assertion on every request to the token endpoint and the pushed authorization
+request endpoint: an ES256 JWT with `kid` the key's RFC 7638 thumbprint, `iss` and `sub`
+the `client_id`, `aud` the issuer identifier from discovery (FAPI clients at Vouch accept
+only that), a UUID v7 `jti`, and a minute's lifetime. The issuer spends each `jti`, so a
+retry or a device-code poll signs anew: `OAuthHttp::sender` appends a fresh assertion to
+each request the `oauth2` crate sends, which is given the client as a public one (so
+`client_id` goes in the body and never an HTTP Basic header), and hand-built requests
+(token exchange, PAR) add their own. The key is P-256, made with aws-lc-rs on first use
+(`llm::oauth::client_key`), kept PKCS#8 in `control.db` (`client_keys`, migration 7),
+sealed by the vault for the `client-key` purpose, loaded once per process, and named
+`<issuer> <client_id>`, so `[server.oidc]` and a provider registered as the same client
+share one key and one registered JWKS. `quack auth jwks [PROVIDER]` prints the public
+key set to register; `quack auth status` shows the thumbprint. A key whose vault key is
+gone is replaced with a warning to register the new one; rotating is deleting the row and
+registering what `quack auth jwks` prints next. `client_secret_env` must be unset, and the
+key satisfies the confidential-client requirement of `client-credentials` and
+`on-behalf-of`. DPoP (RFC 9449) is not used: it would bind tokens to the key, and model
+APIs take bearer tokens only.
+
 **On behalf of each person** (`grant = "on-behalf-of"`, `quack serve` only). Each request,
 and each background job, reaches the provider as the person who made it: quack exchanges
 that person's own access token for quack (their stored sign-in, section 12, renewed when
 due, else the identity-provider token they presented as a bearer) for a token to this
-provider, kept per person in memory. `exchange` picks the wire form:
-`token-exchange` (RFC 8693, the default: `subject_token` of type `access_token`,
-`requested_token_type` `access_token`, `scope`, `audience`, and `resource` when set; Okta,
-Auth0, Vouch) or `entra` (the `jwt-bearer` grant with `assertion` and
-`requested_token_use=on_behalf_of`). With `token-exchange`, quack also sends its own
-client-credentials token as `actor_token` (`actor = true`, the default) so the issued
-token names quack as the actor beside the person; Entra's form has no actor. The grant
-needs `client_secret_env`. A request with no signed-in person behind it (the CLI, the
-terminal, local mode) or whose person has no current identity-provider token is refused
-with `Error::Delegation` (HTTP 403, exit 4): nothing reaches such a provider as quack
-itself. The acting person travels in a task-local (`llm::acting::Acting`): the server
-scopes an empty slot around each request, the identity extractor fills it, the job queue
-carries the submitter's into every job, and MCP's `query` and `search` carry the
-transport's user, since they run in the MCP session's task. `quack auth login` refuses the
-grant; `quack doctor` checks quack's own token (the actor) and, when the issuer lists
-`grant_types_supported`, that it lists the configured grant.
+provider, kept per person in memory. `exchange` picks the wire form: `token-exchange` (RFC
+8693, the default: `subject_token` of type `access_token`, `requested_token_type`
+`access_token`, `scope`, `audience`, and `resource` when set; Okta, Auth0, Vouch) or `entra`
+(the `jwt-bearer` grant with `assertion` and `requested_token_use=on_behalf_of`). With
+`token-exchange`, quack also sends its own client-credentials token as `actor_token` (`actor
+= true`, the default) so the issued token names quack as the actor beside the person;
+Entra's form has no actor. With `actor = false` quack never runs the client-credentials
+grant for the provider (Vouch accepts only a user's token as the actor). The grant needs a
+confidential client: `client_secret_env`, or `client_auth = "private_key_jwt"`. A request
+with no signed-in person behind it (the CLI, the terminal, local mode) or whose person has
+no current identity-provider token is refused with `Error::Delegation` (HTTP 403, exit 4):
+nothing reaches such a provider as quack itself. The acting person travels in a task-local
+(`llm::acting::Acting`): the server scopes an empty slot around each request, the identity
+extractor fills it, the job queue carries the submitter's into every job, and MCP's `query`
+and `search` carry the transport's user, since they run in the MCP session's task. `quack
+auth login` refuses the grant; `quack doctor` checks quack's own token (the actor) when one
+is sent and, when the issuer lists `grant_types_supported`, that it lists the configured
+grant; with `actor = false` it requests no token at all.
 
 ### 10.3 Crypto
 
@@ -1677,7 +1713,7 @@ quack context show | edit | history | export FILE | import FILE
 quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
-quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
+quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER | jwks [PROVIDER]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]
@@ -1761,7 +1797,11 @@ How to configure each way in is in `docs/authentication.md`.
   scoped to a workspace with `read` / `write` / `admin` scopes.
 - **Sign-in through the organization's identity provider** (`[server.oidc]`, beside the
   password form). The login page's "Sign in with <issuer>" goes to `GET /auth/oidc`, which
-  starts Authorization Code with PKCE, a `state`, and a `nonce`; the pending sign-in waits
+  starts Authorization Code with PKCE, a `state`, and a `nonce` (pushed to the issuer first,
+  RFC 9126, with the client's credential, when discovery lists a
+  `pushed_authorization_request_endpoint`, so the browser carries only a `request_uri`;
+  the code exchange and every renewal authenticate as `client_auth` says, section 10.2);
+  the pending sign-in waits
   in memory for ten minutes (at most 10,000 at once), and an `HttpOnly` state cookie scoped
   to the callback ties the return to the browser that left, so a callback link someone else
   started cannot sign this browser in. `GET /auth/oidc/callback` exchanges the code, reads
@@ -1916,7 +1956,7 @@ scopes = ["https://cognitiveservices.azure.com/.default", "offline_access"]
 redirect_uri = "http://127.0.0.1:19876/callback"
 # grant = "authorization-code"                # or "device-code", "client-credentials", "on-behalf-of"
 # client_secret_env = "AZURE_CLIENT_SECRET"   # confidential client; client-credentials and on-behalf-of need it
-# client_auth = "client_secret_post"          # or "client_secret_basic" (Okta's default)
+# client_auth = "client_secret_post"          # or "client_secret_basic" (Okta's default), or "private_key_jwt"
 # exchange = "entra"                          # on-behalf-of: "token-exchange" (default) or "entra"
 # audience = "api://model"                    # on-behalf-of: RFC 8693 audience (Okta, Auth0)
 # resource = "https://model.example.com"      # on-behalf-of: RFC 8707 resource
@@ -1997,6 +2037,7 @@ issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
 redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's URL
 # client_secret_env = "QUACK_OIDC_SECRET"      # confidential client
+# client_auth = "client_secret_post"           # or "client_secret_basic", or "private_key_jwt"
 # scopes = ["openid", "profile", "email", "offline_access"]
 # audience = "api://quack"                     # accept the issuer's access tokens (RFC 9728); Entra: the API's client ID
 # subject_claim = "sub"                        # "oid" for Entra

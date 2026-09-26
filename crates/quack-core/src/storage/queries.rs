@@ -93,6 +93,16 @@ pub enum ProviderTokens {
     Provider,
 }
 
+/// Each OAuth client's private key for `private_key_jwt`, sealed like the
+/// tokens; its timestamp column is `created_at`, as the key is replaced
+/// whole, never updated.
+#[derive(Iden)]
+pub enum ClientKeys {
+    Table,
+    Name,
+    CreatedAt,
+}
+
 #[derive(Iden)]
 pub enum Workspaces {
     Table,

@@ -314,23 +314,52 @@ text_enum!(Exchange, "exchange", {
     Entra => "entra",
 });
 
-/// How quack authenticates itself at a token endpoint with its client
-/// secret (RFC 6749 2.3.1; the names are RFC 8414's).
+/// How quack authenticates itself at a token endpoint: with its client
+/// secret (RFC 6749 2.3.1), or with a JWT signed by its own key (RFC 7523
+/// 2.2). The names are RFC 8414's. With a secret method and no
+/// `client_secret_env`, quack is a public client and sends only its
+/// `client_id`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub enum ClientAuth {
-    /// In the request body (Entra, Auth0's default).
+    /// The secret in the request body (Entra, Auth0's default).
     #[default]
     #[serde(rename = "client_secret_post")]
     ClientSecretPost,
-    /// In an HTTP Basic `Authorization` header (Okta's default).
+    /// The secret in an HTTP Basic `Authorization` header (Okta's default).
     #[serde(rename = "client_secret_basic")]
     ClientSecretBasic,
+    /// A client assertion: a short-lived ES256 JWT signed with a P-256 key
+    /// quack keeps sealed in `control.db`, whose public half is registered
+    /// with the issuer (`quack auth jwks`). No secret is shared.
+    #[serde(rename = "private_key_jwt")]
+    PrivateKeyJwt,
 }
 
 text_enum!(ClientAuth, "client authentication", {
     ClientSecretPost => "client_secret_post",
     ClientSecretBasic => "client_secret_basic",
+    PrivateKeyJwt => "private_key_jwt",
 });
+
+impl ClientAuth {
+    /// The rule between `client_auth` and `client_secret_env` for the
+    /// section `section`: a signed assertion replaces the secret, so naming
+    /// both is refused.
+    fn check(self, section: &str, client_secret_env: Option<&String>) -> Result<()> {
+        if self == Self::PrivateKeyJwt && client_secret_env.is_some() {
+            return Err(Error::Config(format!(
+                "{section}: client_auth = \"private_key_jwt\" signs with quack's own key and sends no secret; remove client_secret_env"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the client proves who it is: a secret is named, or it signs
+    /// assertions.
+    const fn is_confidential(self, has_secret: bool) -> bool {
+        has_secret || matches!(self, Self::PrivateKeyJwt)
+    }
+}
 
 text_enum!(Grant, "grant", {
     AuthorizationCode => "authorization-code",
@@ -361,9 +390,9 @@ pub struct OAuthConfig {
     pub grant: Grant,
     /// Environment variable holding the client secret: quack as a
     /// confidential client. `client-credentials` and `on-behalf-of` require
-    /// it.
+    /// it, unless `client_auth` is `private_key_jwt`, which excludes it.
     pub client_secret_env: Option<String>,
-    /// How the secret is presented at the token endpoint.
+    /// How quack authenticates at the token endpoint.
     #[serde(default)]
     pub client_auth: ClientAuth,
     /// `on-behalf-of`: the exchange's wire form.
@@ -414,11 +443,15 @@ impl OAuthConfig {
                 "the oauth section needs issuer_url and client_id",
             )));
         }
+        self.client_auth
+            .check("the oauth section", self.client_secret_env.as_ref())?;
         if matches!(self.grant, Grant::ClientCredentials | Grant::OnBehalfOf)
-            && self.client_secret_env.is_none()
+            && !self
+                .client_auth
+                .is_confidential(self.client_secret_env.is_some())
         {
             return Err(Error::Config(format!(
-                "grant = \"{}\" needs client_secret_env",
+                "grant = \"{}\" needs client_secret_env, or client_auth = \"private_key_jwt\"",
                 self.grant
             )));
         }
@@ -975,6 +1008,10 @@ pub struct OidcConfig {
     /// Environment variable holding the client secret, for an issuer that
     /// registers quack as a confidential client.
     pub client_secret_env: Option<String>,
+    /// How quack authenticates at the token endpoint (and at the pushed
+    /// authorization request endpoint): the secret in the body by default,
+    /// or a signed assertion with `private_key_jwt`.
+    pub client_auth: ClientAuth,
     /// Requested at sign-in; `openid` is required, and `offline_access` is
     /// what makes most issuers return the refresh token quack keeps.
     pub scopes: Vec<String>,
@@ -1039,6 +1076,8 @@ struct RawOidcConfig {
     issuer_url: String,
     client_id: String,
     client_secret_env: Option<String>,
+    #[serde(default)]
+    client_auth: ClientAuth,
     #[serde(default = "OidcConfig::default_scopes")]
     scopes: Vec<String>,
     redirect_uri: String,
@@ -1056,6 +1095,8 @@ impl TryFrom<RawOidcConfig> for OidcConfig {
                 "[server.oidc] needs issuer_url and client_id",
             )));
         }
+        raw.client_auth
+            .check("[server.oidc]", raw.client_secret_env.as_ref())?;
         if !raw.scopes.iter().any(|scope| scope == "openid") {
             return Err(Error::Config(String::from(
                 "[server.oidc].scopes must include \"openid\"",
@@ -1095,6 +1136,7 @@ impl TryFrom<RawOidcConfig> for OidcConfig {
             issuer_url: raw.issuer_url.trim().trim_end_matches('/').to_owned(),
             client_id: raw.client_id.trim().to_owned(),
             client_secret_env: raw.client_secret_env,
+            client_auth: raw.client_auth,
             scopes: raw.scopes,
             redirect_uri: raw.redirect_uri,
             audience,
@@ -2215,6 +2257,59 @@ rerank = "model"
         assert_eq!(
             named("exchange = \"entra\"\n"),
             Some("urn:ietf:params:oauth:grant-type:jwt-bearer")
+        );
+    }
+
+    #[test]
+    fn private_key_jwt_replaces_the_secret_and_refuses_one_beside_it() {
+        let provider = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"https://us.vouch.sh\"\nclient_id = \"c\"\nclient_auth = \"private_key_jwt\"\n";
+        let oauth_of = |extra: &str| {
+            Config::parse(&format!("{provider}{extra}"))
+                .ok()
+                .and_then(|c| c.providers.get("o").and_then(|p| p.auth.oauth().cloned()))
+        };
+        // No secret, and still a confidential client for these grants.
+        let vouch = oauth_of("grant = \"on-behalf-of\"\nactor = false\n");
+        assert!(
+            vouch.is_some_and(|o| o.client_auth == ClientAuth::PrivateKeyJwt
+                && o.client_secret_env.is_none()
+                && !o.actor)
+        );
+        assert!(oauth_of("grant = \"client-credentials\"\n").is_some());
+        assert!(oauth_of("").is_some_and(|o| o.grant == Grant::AuthorizationCode));
+        assert!(
+            err_of(&format!("{provider}client_secret_env = \"S\"\n"))
+                .contains("remove client_secret_env")
+        );
+        // A secret method without a secret is still refused for these grants.
+        let public = "[providers.o]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.o.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\nclient_auth = \"client_secret_basic\"\ngrant = \"on-behalf-of\"\n";
+        assert!(err_of(public).contains("or client_auth = \"private_key_jwt\""));
+
+        let oidc = "[server.oidc]\nissuer_url = \"https://us.vouch.sh\"\nclient_id = \"c\"\nredirect_uri = \"https://q/auth/oidc/callback\"\n";
+        let sign_in = |extra: &str| {
+            Config::parse(&format!("{oidc}{extra}"))
+                .ok()
+                .and_then(|c| c.server.oidc)
+                .map(|o| o.client_auth)
+        };
+        assert_eq!(sign_in(""), Some(ClientAuth::ClientSecretPost));
+        assert_eq!(
+            sign_in("client_auth = \"private_key_jwt\"\n"),
+            Some(ClientAuth::PrivateKeyJwt)
+        );
+        assert_eq!(
+            sign_in("client_auth = \"client_secret_basic\"\nclient_secret_env = \"S\"\n"),
+            Some(ClientAuth::ClientSecretBasic)
+        );
+        assert!(
+            err_of(&format!(
+                "{oidc}client_auth = \"private_key_jwt\"\nclient_secret_env = \"S\"\n"
+            ))
+            .contains("[server.oidc]: client_auth = \"private_key_jwt\"")
+        );
+        assert!(
+            err_of(&format!("{oidc}client_auth = \"tls_client_auth\"\n"))
+                .contains("tls_client_auth")
         );
     }
 

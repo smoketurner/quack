@@ -12,6 +12,8 @@
 //! client-credentials grant, run again whenever the token runs out. The
 //! token is kept in `control.db`, sealed by the vault (`store.rs`).
 
+pub mod client_key;
+pub(crate) mod credential;
 mod key_slot;
 mod keychain;
 mod store;
@@ -30,10 +32,9 @@ use jiff::{SignedDuration, Timestamp};
 use oauth2::basic::{BasicClient, BasicTokenResponse};
 use oauth2::url::Url;
 use oauth2::{
-    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    DeviceAuthorizationUrl, EndpointMaybeSet, EndpointNotSet, EndpointSet, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, StandardDeviceAuthorizationResponse,
-    TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, DeviceAuthorizationUrl, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
+    Scope, StandardDeviceAuthorizationResponse, TokenResponse, TokenUrl,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -41,6 +42,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
+use client_key::ClientKeys;
+pub(crate) use credential::Credential;
 pub(crate) use key_slot::KeySlot;
 pub use key_slot::{KeyLocation, KeySource};
 use store::ProviderTokens;
@@ -65,14 +68,6 @@ struct TokenRefusal {
     error_description: Option<String>,
 }
 
-/// quack's client credentials for a token request it builds itself.
-#[derive(Clone, Copy)]
-pub(crate) struct TokenClient<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) secret: &'a str,
-    pub(crate) auth: ClientAuth,
-}
-
 /// Tokens with less than this left are refreshed before use.
 const REUSE_MARGIN: SignedDuration = SignedDuration::from_secs(60);
 /// How long the browser flow waits for the redirect.
@@ -95,6 +90,10 @@ pub(crate) struct Endpoints {
     pub(crate) token: String,
     #[serde(rename = "device_authorization_endpoint")]
     device_authorization: Option<String>,
+    /// Where an authorization request is pushed before the browser is sent
+    /// off (RFC 9126), when the issuer takes pushed requests.
+    #[serde(rename = "pushed_authorization_request_endpoint")]
+    pub(crate) pushed_authorization: Option<String>,
     /// Where the issuer publishes the keys its tokens are signed with.
     pub(crate) jwks_uri: Option<String>,
     /// The grants the issuer supports, when it says.
@@ -161,12 +160,24 @@ impl OAuthHttp {
     }
 
     /// Bridge from the `oauth2` crate's request type to this client; the
-    /// crate's own client would pull in `ring`.
-    pub(crate) fn sender(&self) -> impl Fn(oauth2::HttpRequest) -> HttpFuture + use<> {
+    /// crate's own client would pull in `ring`. For a client that
+    /// authenticates with assertions, each request gets a newly signed one
+    /// here, so a device-code poll or a retry never reuses a spent `jti`.
+    pub(crate) fn sender(
+        &self,
+        credential: &Credential,
+    ) -> impl Fn(oauth2::HttpRequest) -> HttpFuture + use<> {
         let client = self.0.clone();
-        move |request| {
+        let assertion = credential.assertion().cloned();
+        move |mut request| {
             let client = client.clone();
+            let assertion = assertion.clone();
             Box::pin(async move {
+                if let Some(assertion) = &assertion {
+                    assertion
+                        .append_to(request.body_mut())
+                        .map_err(|e| HttpError::Assertion(e.to_string()))?;
+                }
                 let request = reqwest::Request::try_from(request)?;
                 let response = client.execute(request).await?;
                 let status = response.status();
@@ -208,18 +219,23 @@ impl OAuthHttp {
         Ok(endpoints)
     }
 
-    /// POST a token request built by hand (the `oauth2` crate has no token
-    /// exchange), authenticating the client as `client.auth` says: HTTP
-    /// Basic with both halves form-encoded (RFC 6749 2.3.1), or in the body.
+    /// POST a request built by hand (the `oauth2` crate has neither token
+    /// exchange nor pushed authorization requests), authenticating the
+    /// client `client_id` with `credential`: a secret in HTTP Basic with both
+    /// halves form-encoded (RFC 6749 2.3.1) or in the body, or a newly
+    /// signed assertion. `client_id` goes in the body unless the secret
+    /// travels in the header or `form` already carries it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the request cannot be sent or read; a refusal
-    /// is a status, returned with its body.
+    /// Returns an error when an assertion cannot be signed or the request
+    /// cannot be sent or read; a refusal is a status, returned with its
+    /// body.
     pub(crate) async fn post_form(
         &self,
         url: &str,
-        client: TokenClient<'_>,
+        client_id: &str,
+        credential: &Credential,
         form: &[(&str, String)],
     ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let mut basic = None;
@@ -228,21 +244,43 @@ impl OAuthHttp {
             for (key, value) in form {
                 body.append_pair(key, value);
             }
-            match client.auth {
-                ClientAuth::ClientSecretPost => {
-                    body.append_pair("client_id", client.id);
-                    body.append_pair("client_secret", client.secret);
-                }
-                ClientAuth::ClientSecretBasic => {
+            let names_client = form.iter().any(|(key, _)| *key == "client_id");
+            match credential {
+                Credential::Secret {
+                    secret,
+                    basic: true,
+                } => {
                     let encode = |part: &str| {
                         oauth2::url::form_urlencoded::byte_serialize(part.as_bytes())
                             .collect::<String>()
                     };
                     basic = Some(base64::engine::general_purpose::STANDARD.encode(format!(
                         "{}:{}",
-                        encode(client.id),
-                        encode(client.secret)
+                        encode(client_id),
+                        encode(secret.expose_secret())
                     )));
+                }
+                Credential::Secret {
+                    secret,
+                    basic: false,
+                } => {
+                    if !names_client {
+                        body.append_pair("client_id", client_id);
+                    }
+                    body.append_pair("client_secret", secret.expose_secret());
+                }
+                Credential::Public => {
+                    if !names_client {
+                        body.append_pair("client_id", client_id);
+                    }
+                }
+                Credential::Assertion(assertion) => {
+                    if !names_client {
+                        body.append_pair("client_id", client_id);
+                    }
+                    for (key, value) in assertion.params()? {
+                        body.append_pair(key, &value);
+                    }
                 }
             }
             body.finish()
@@ -272,6 +310,59 @@ impl OAuthHttp {
             .await
             .map_err(|e| Error::Llm(format!("the token response from {url} was cut short: {e}")))?;
         Ok((status, bytes.to_vec()))
+    }
+
+    /// Push an authorization request to the issuer's `endpoint` (RFC 9126),
+    /// authenticated as `client_id` with `credential`, and return where to
+    /// send the browser: `authorization` with only `client_id` and the
+    /// `request_uri` the issuer answered with. The request's parameters,
+    /// the PKCE challenge among them, never pass through the browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be sent, the issuer refuses
+    /// it, or its answer has no `request_uri`.
+    pub(crate) async fn push_authorization(
+        &self,
+        endpoint: &str,
+        authorization: &str,
+        client_id: &str,
+        credential: &Credential,
+        params: &[(&str, String)],
+    ) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Pushed {
+            request_uri: String,
+        }
+        let mut form = vec![("client_id", client_id.to_owned())];
+        form.extend(params.iter().cloned());
+        let (status, body) = self
+            .post_form(endpoint, client_id, credential, &form)
+            .await?;
+        if !status.is_success() {
+            let refusal: TokenRefusal = serde_json::from_slice(&body).unwrap_or_default();
+            return Err(Error::Llm(format!(
+                "the issuer refused the pushed authorization request ({status}): {}{}",
+                refusal.error.as_deref().unwrap_or("no error code"),
+                refusal
+                    .error_description
+                    .map_or(String::new(), |d| format!(" ({d})"))
+            )));
+        }
+        let pushed: Pushed = serde_json::from_slice(&body).map_err(|e| {
+            Error::Llm(format!(
+                "the pushed authorization request's answer has no request_uri: {e}"
+            ))
+        })?;
+        let mut url = Url::parse(authorization).map_err(|e| {
+            Error::Llm(format!(
+                "authorization_endpoint '{authorization}' is not a URL: {e}"
+            ))
+        })?;
+        url.query_pairs_mut()
+            .append_pair("client_id", client_id)
+            .append_pair("request_uri", &pushed.request_uri);
+        Ok(url.into())
     }
 
     /// GET a JSON document; `what` names it in errors.
@@ -304,6 +395,8 @@ pub(crate) enum HttpError {
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
     Http(#[from] http::Error),
+    #[error("{0}")]
+    Assertion(String),
 }
 
 pub(crate) type HttpFuture =
@@ -389,6 +482,8 @@ pub struct TokenManager {
     provider: ProviderName,
     config: OAuthConfig,
     store: ProviderTokens,
+    /// The key `client_auth = "private_key_jwt"` signs with.
+    client_keys: ClientKeys,
     http: OAuthHttp,
     endpoints: OnceCell<Endpoints>,
     current: RwLock<Option<CachedToken>>,
@@ -471,6 +566,7 @@ impl TokenManager {
             provider: provider.clone(),
             config: oauth,
             store: ProviderTokens::new(config, provider, key_source),
+            client_keys: ClientKeys::new(config, key_source),
             http: OAuthHttp::new()?,
             endpoints: OnceCell::new(),
             current: RwLock::new(None),
@@ -487,6 +583,16 @@ impl TokenManager {
     #[must_use]
     pub const fn grant(&self) -> Grant {
         self.config.grant
+    }
+
+    /// Whether an on-behalf-of exchange sends quack's own token as the
+    /// actor: `actor` is on and the exchange is RFC 8693's, since Entra's
+    /// has no actor.
+    #[must_use]
+    pub fn sends_actor(&self) -> bool {
+        self.config.grant == Grant::OnBehalfOf
+            && self.config.actor
+            && self.config.exchange == Exchange::TokenExchange
     }
 
     /// A bearer token with more than a minute of life left.
@@ -626,8 +732,8 @@ impl TokenManager {
 
     async fn refresh(&self, refresh: &SecretString) -> Result<CachedToken> {
         tracing::info!(provider = %self.provider, "refreshing the OAuth access token");
-        let client = self.client().await?;
-        let http = self.http.sender();
+        let (client, credential) = self.client().await?;
+        let http = self.http.sender(&credential);
         let response = client
             .exchange_refresh_token(&RefreshToken::new(refresh.expose_secret().to_owned()))
             .request_async(&http)
@@ -693,22 +799,45 @@ impl TokenManager {
             ))
         })?;
 
-        let client = self.client().await?;
+        let (client, credential) = self.client().await?;
         let verifier = PkceCodeVerifier::new(random_token()?);
         let challenge = PkceCodeChallenge::from_code_verifier_sha256(&verifier);
         let state = random_token()?;
-        let (url, csrf) = client
-            .authorize_url(|| CsrfToken::new(state))
-            .add_scopes(self.scopes())
-            .set_pkce_challenge(challenge)
-            .url();
-        notify(LoginPrompt::Browser {
-            url: url.to_string(),
-        });
+        let endpoints = self.endpoints().await?;
+        let url = match &endpoints.pushed_authorization {
+            Some(pushed) => {
+                let params = [
+                    ("response_type", String::from("code")),
+                    ("redirect_uri", self.config.redirect_uri.clone()),
+                    ("scope", self.config.scopes.join(" ")),
+                    ("state", state.clone()),
+                    ("code_challenge", challenge.as_str().to_owned()),
+                    ("code_challenge_method", String::from("S256")),
+                ];
+                self.http
+                    .push_authorization(
+                        pushed,
+                        &endpoints.authorization,
+                        &self.config.client_id,
+                        &credential,
+                        &params,
+                    )
+                    .await
+                    .map_err(|e| Error::Llm(format!("provider '{}': {e}", self.provider)))?
+            }
+            None => client
+                .authorize_url(|| CsrfToken::new(state.clone()))
+                .add_scopes(self.scopes())
+                .set_pkce_challenge(challenge)
+                .url()
+                .0
+                .to_string(),
+        };
+        notify(LoginPrompt::Browser { url });
 
         let redirected = tokio::time::timeout(
             BROWSER_TIMEOUT,
-            wait_for_callback(&listener, redirect.path(), csrf.secret()),
+            wait_for_callback(&listener, redirect.path(), &state),
         )
         .await
         .map_err(|_| {
@@ -722,7 +851,7 @@ impl TokenManager {
             .await?
             .check_response_issuer(redirected.iss.as_deref())
             .map_err(|e| Error::Llm(format!("provider '{}': {e}", self.provider)))?;
-        let http = self.http.sender();
+        let http = self.http.sender(&credential);
         let response = client
             .exchange_code(AuthorizationCode::new(redirected.code))
             .set_pkce_verifier(verifier)
@@ -734,8 +863,8 @@ impl TokenManager {
 
     async fn client_credentials(&self) -> Result<CachedToken> {
         tracing::info!(provider = %self.provider, "requesting a token with the client-credentials grant");
-        let client = self.client().await?;
-        let http = self.http.sender();
+        let (client, credential) = self.client().await?;
+        let http = self.http.sender(&credential);
         let response = client
             .exchange_client_credentials()
             .add_scopes(self.scopes())
@@ -754,8 +883,8 @@ impl TokenManager {
         &self,
         notify: &(dyn Fn(LoginPrompt) + Sync),
     ) -> Result<CachedToken> {
-        let client = self.client().await?;
-        let http = self.http.sender();
+        let (client, credential) = self.client().await?;
+        let http = self.http.sender(&credential);
         let details: StandardDeviceAuthorizationResponse = client
             .exchange_device_code()
             .map_err(|_| {
@@ -886,9 +1015,12 @@ impl TokenManager {
     /// to this provider, in the configured wire form.
     async fn exchange(&self, subject: &SecretString) -> Result<CachedToken> {
         let endpoints = self.endpoints().await?;
-        let secret = self
-            .client_secret()?
-            .ok_or_else(|| self.delegation("no client_secret_env is configured"))?;
+        let credential = self.credential().await?;
+        if credential.is_public() {
+            return Err(self.delegation(
+                "quack has no client credential: set client_secret_env or client_auth = \"private_key_jwt\"",
+            ));
+        }
         let scope = self.config.scopes.join(" ");
         let mut form: Vec<(&str, String)> = Vec::new();
         match self.config.exchange {
@@ -919,12 +1051,10 @@ impl TokenManager {
                 }
             }
         }
-        let client = TokenClient {
-            id: &self.config.client_id,
-            secret: &secret,
-            auth: self.config.client_auth,
-        };
-        let (status, body) = self.http.post_form(&endpoints.token, client, &form).await?;
+        let (status, body) = self
+            .http
+            .post_form(&endpoints.token, &self.config.client_id, &credential, &form)
+            .await?;
         if status.is_success() {
             let response: BasicTokenResponse = serde_json::from_slice(&body).map_err(|e| {
                 self.delegation(format!("the issuer's answer is not a token response: {e}"))
@@ -941,7 +1071,30 @@ impl TokenManager {
         )))
     }
 
-    async fn client(&self) -> Result<OAuthClient> {
+    /// How quack authenticates as this provider's client: its key's
+    /// assertions, its secret, or nothing but its `client_id`.
+    pub(crate) async fn credential(&self) -> Result<Credential> {
+        let audience = match self.config.client_auth {
+            ClientAuth::PrivateKeyJwt => self.endpoints().await?.issuer.clone(),
+            ClientAuth::ClientSecretPost | ClientAuth::ClientSecretBasic => None,
+        };
+        Credential::of(
+            credential::Registration {
+                auth: self.config.client_auth,
+                client_id: &self.config.client_id,
+                issuer_url: &self.config.issuer_url,
+                audience: audience.as_deref(),
+                secret: self.client_secret()?,
+            },
+            &self.client_keys,
+        )
+        .await
+    }
+
+    /// The `oauth2` crate's client for this provider, and the credential
+    /// its requests must be sent with (`OAuthHttp::sender`).
+    async fn client(&self) -> Result<(OAuthClient, Credential)> {
+        let credential = self.credential().await?;
         let endpoints = self.endpoints().await?.clone();
         let parse = |what: &str, url: String| {
             Url::parse(&url).map_err(|e| {
@@ -956,12 +1109,8 @@ impl TokenManager {
             .map(|u| parse("device_authorization_endpoint", u))
             .transpose()?
             .map(DeviceAuthorizationUrl::from_url);
-        let auth_type = match self.config.client_auth {
-            ClientAuth::ClientSecretPost => AuthType::RequestBody,
-            ClientAuth::ClientSecretBasic => AuthType::BasicAuth,
-        };
         let mut client = BasicClient::new(ClientId::new(self.config.client_id.clone()))
-            .set_auth_type(auth_type)
+            .set_auth_type(credential.auth_type())
             .set_auth_uri(AuthUrl::from_url(parse(
                 "authorization_endpoint",
                 endpoints.authorization,
@@ -975,10 +1124,10 @@ impl TokenManager {
                 "redirect_uri",
                 self.config.redirect_uri.clone(),
             )?));
-        if let Some(secret) = self.client_secret()? {
-            client = client.set_client_secret(ClientSecret::new(secret));
+        if let Some(secret) = credential.client_secret() {
+            client = client.set_client_secret(secret);
         }
-        Ok(client)
+        Ok((client, credential))
     }
 }
 

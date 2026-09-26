@@ -409,6 +409,7 @@ const OIDC_KEYS: &[&str] = &[
     "issuer_url",
     "client_id",
     "client_secret_env",
+    "client_auth",
     "scopes",
     "redirect_uri",
     "audience",
@@ -754,6 +755,12 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     s.required_text("issuer_url", &oidc.issuer_url);
     s.required_text("client_id", &oidc.client_id);
     s.optional_text("client_secret_env", oidc.client_secret_env.as_deref(), None);
+    s.text(
+        "client_auth",
+        oidc.client_auth.as_str(),
+        ClientAuth::default().as_str(),
+        None,
+    );
     s.optional(
         "scopes",
         Some(render_list(&oidc.scopes)),

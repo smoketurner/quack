@@ -1,5 +1,6 @@
 //! Token manager and login flows against a mock identity provider.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8,6 +9,7 @@ use tokio::net::TcpListener;
 
 use std::path::Path;
 
+use super::client_key::{ClientKeyName, PublicJwk, tests::verify};
 use super::*;
 
 /// What the mock issuer does and what it saw.
@@ -34,6 +36,16 @@ struct MockState {
     /// Run once before a refused refresh is answered: another process
     /// finishing its own refresh of the same token meanwhile.
     before_refusal: tokio::sync::Mutex<Option<BeforeRefusal>>,
+    /// The public key registered for `client-1`'s `private_key_jwt`.
+    client_jwk: StdMutex<Option<PublicJwk>>,
+    /// Every assertion `jti` accepted so far: the issuer spends them.
+    spent: StdMutex<HashSet<String>>,
+    /// Why each refused client assertion was refused.
+    refused_assertions: StdMutex<Vec<String>>,
+    /// Whether discovery lists a pushed authorization request endpoint.
+    par: std::sync::atomic::AtomicBool,
+    /// Each pushed authorization request's body.
+    par_bodies: StdMutex<Vec<String>>,
 }
 
 type BeforeRefusal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
@@ -126,7 +138,16 @@ async fn serve(mut stream: tokio::net::TcpStream, base: &str, state: &MockState)
     {
         meanwhile.await;
     }
-    let (status, json) = route(&target, &body, base, state);
+    let refused = if matches!(target.as_str(), "/token" | "/device" | "/par") {
+        refuse_assertion(&body, base, state)
+    } else {
+        None
+    };
+    let (status, json) = match refused {
+        Some(refusal) => refusal,
+        None if target == "/par" => pushed(&body, state),
+        None => route(&target, &body, base, state),
+    };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
         json.len()
@@ -166,6 +187,14 @@ fn metadata(target: &str, base: &str, state: &MockState) -> (&'static str, Strin
         "token_endpoint": format!("{base}/token"),
         "device_authorization_endpoint": format!("{base}/device"),
     });
+    if state.par.load(Ordering::SeqCst)
+        && let Some(fields) = metadata.as_object_mut()
+    {
+        fields.insert(
+            String::from("pushed_authorization_request_endpoint"),
+            serde_json::json!(format!("{base}/par")),
+        );
+    }
     if let (Some(grants), Some(fields)) = (
         state.grants.lock().ok().and_then(|g| g.clone()),
         metadata.as_object_mut(),
@@ -176,6 +205,49 @@ fn metadata(target: &str, base: &str, state: &MockState) -> (&'static str, Strin
         );
     }
     ("200 OK", metadata.to_string())
+}
+
+/// A client assertion checked as Vouch checks one: signed by the registered
+/// key, `iss` and `sub` the client, `aud` the issuer, unexpired, and a `jti`
+/// never seen before. `None` when the request carries no assertion or it
+/// passes; the refusal otherwise.
+fn refuse_assertion(body: &str, base: &str, state: &MockState) -> Option<(&'static str, String)> {
+    let assertion = form(body, "client_assertion")?;
+    let checked =
+        if form(body, "client_assertion_type").as_deref() != Some(client_key::ASSERTION_TYPE) {
+            Err(String::from("wrong client_assertion_type"))
+        } else if form(body, "client_id").as_deref() != Some("client-1") {
+            Err(String::from("client_id missing or wrong"))
+        } else {
+            match (state.client_jwk.lock(), state.spent.lock()) {
+                (Ok(jwk), Ok(mut spent)) => jwk.as_ref().map_or_else(
+                    || Err(String::from("no key registered")),
+                    |jwk| verify(jwk, &assertion, "client-1", base, &mut spent),
+                ),
+                _ => Err(String::from("mock state poisoned")),
+            }
+        };
+    let why = checked.err()?;
+    if let Ok(mut refused) = state.refused_assertions.lock() {
+        refused.push(why);
+    }
+    Some((
+        "401 Unauthorized",
+        String::from("{\"error\":\"invalid_client\"}"),
+    ))
+}
+
+/// A pushed authorization request (RFC 9126), kept for the test to read.
+fn pushed(body: &str, state: &MockState) -> (&'static str, String) {
+    if let Ok(mut bodies) = state.par_bodies.lock() {
+        bodies.push(body.to_owned());
+    }
+    (
+        "201 Created",
+        String::from(
+            "{\"request_uri\":\"urn:ietf:params:oauth:request_uri:p1\",\"expires_in\":60}",
+        ),
+    )
 }
 
 fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static str, String) {
@@ -225,7 +297,9 @@ fn route(target: &str, body: &str, base: &str, state: &MockState) -> (&'static s
                     state
                         .client_credentials_requests
                         .fetch_add(1, Ordering::SeqCst);
-                    if form(body, "client_secret").as_deref() == Some(env!("CARGO_PKG_NAME")) {
+                    if form(body, "client_secret").as_deref() == Some(env!("CARGO_PKG_NAME"))
+                        || form(body, "client_assertion").is_some()
+                    {
                         ("200 OK", token_json("service-access", None))
                     } else {
                         (
@@ -753,6 +827,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         authorization: String::from("http://127.0.0.1:9/a"),
         token: String::from("http://127.0.0.1:9/t"),
         device_authorization: None,
+        pushed_authorization: None,
         jwks_uri: None,
         grant_types_supported: None,
         authorization_response_iss_parameter_supported: false,
@@ -997,6 +1072,7 @@ fn a_redirects_issuer_must_match_and_is_required_when_promised() {
         authorization: String::new(),
         token: String::new(),
         device_authorization: None,
+        pushed_authorization: None,
         jwks_uri: None,
         grant_types_supported: None,
         authorization_response_iss_parameter_supported: false,
@@ -1052,4 +1128,214 @@ async fn metadata_for_another_issuer_is_refused_and_the_grant_is_checked() {
     assert!(matches!(m.issuer_supports_grant().await, Ok(Some(false))));
     let m = manager(dir.path(), &idp, Grant::AuthorizationCode);
     assert!(matches!(m.issuer_supports_grant().await, Ok(Some(true))));
+}
+
+// --- private_key_jwt ---------------------------------------------------------
+
+/// Register the key `dir`'s data directory signs `client-1`'s assertions
+/// with at the mock issuer, as `quack auth jwks` output is registered.
+async fn register_client_key(dir: &Path, idp: &MockIdp) -> PublicJwk {
+    let keys = ClientKeys::new(&config_at(dir), KeySource::File);
+    let Ok(key) = keys.key(&ClientKeyName::new(&idp.issuer, "client-1")).await else {
+        fail("no client key");
+    };
+    if let Ok(mut jwk) = idp.state.client_jwk.lock() {
+        *jwk = Some(key.jwk().clone());
+    }
+    key.jwk().clone()
+}
+
+fn with_key(mut config: OAuthConfig) -> OAuthConfig {
+    config.client_auth = ClientAuth::PrivateKeyJwt;
+    config.client_secret_env = None;
+    config
+}
+
+fn spent(idp: &MockIdp) -> usize {
+    idp.state.spent.lock().map(|s| s.len()).unwrap_or_default()
+}
+
+fn refused(idp: &MockIdp) -> Vec<String> {
+    idp.state
+        .refused_assertions
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_default()
+}
+
+fn last_auth(idp: &MockIdp) -> String {
+    idp.state
+        .last_token_auth
+        .lock()
+        .map(|a| a.clone())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn private_key_jwt_signs_each_device_poll_and_refresh_anew_and_sends_no_secret() {
+    let idp = MockIdp::start().await;
+    idp.state.pending_polls.store(2, Ordering::SeqCst);
+    let dir = temp();
+    register_client_key(dir.path(), &idp).await;
+    let config = with_key(oauth_config(&idp.issuer, Grant::DeviceCode));
+    let m = TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let token = m.login(LoginFlow::Configured, &|_| {}).await;
+    assert!(
+        token.is_ok_and(|t| t.access_token.expose_secret() == "device-access"),
+        "{:?}",
+        refused(&idp)
+    );
+    // The device authorization request and three polls, each with its own
+    // assertion: the issuer would refuse a spent jti.
+    assert_eq!(spent(&idp), 4);
+    assert!(refused(&idp).is_empty(), "{:?}", refused(&idp));
+    let body = last_body(&idp);
+    assert!(body.contains("client_id=client-1"), "{body}");
+    assert!(!body.contains("client_secret"), "{body}");
+    assert!(last_auth(&idp).is_empty());
+
+    assert!(
+        m.store
+            .store(&seed(SignedDuration::from_secs(-5), Some("r")))
+            .await
+            .is_ok()
+    );
+    *m.current.write().await = None;
+    assert!(
+        m.access_token()
+            .await
+            .is_ok_and(|t| t.expose_secret() == "refreshed-access")
+    );
+    assert_eq!(spent(&idp), 5);
+    assert!(!last_body(&idp).contains("client_secret"));
+}
+
+#[tokio::test]
+async fn private_key_jwt_obtains_client_credentials_and_exchanges_without_a_secret() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    register_client_key(dir.path(), &idp).await;
+    let config = with_key(oauth_config(&idp.issuer, Grant::ClientCredentials));
+    let m = TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        m.access_token()
+            .await
+            .is_ok_and(|t| t.expose_secret() == "service-access")
+    );
+    assert_eq!(spent(&idp), 1);
+
+    // On behalf of a person, as with Vouch: no actor, no secret.
+    let m = obo(dir.path(), &idp, |c| {
+        *c = with_key(c.clone());
+        c.actor = false;
+    });
+    for (person, subject) in [("ada", "ada-at"), ("bob", "bob-at")] {
+        let got = Acting::scope(Some(acting(person, Some(subject))), m.access_token()).await;
+        assert!(
+            got.as_ref()
+                .is_ok_and(|t| t.expose_secret().starts_with(&format!("obo-{subject}"))),
+            "{:?} {:?}",
+            got.err(),
+            refused(&idp)
+        );
+        let body = last_body(&idp);
+        for part in [
+            "client_id=client-1",
+            "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+            "client_assertion=",
+            "subject_token=",
+        ] {
+            assert!(body.contains(part), "{part} missing from {body}");
+        }
+        for absent in ["client_secret", "actor_token"] {
+            assert!(!body.contains(absent), "{absent} in {body}");
+        }
+        assert!(last_auth(&idp).is_empty());
+    }
+    assert_eq!(spent(&idp), 3);
+    assert_eq!(
+        idp.state.client_credentials_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert!(refused(&idp).is_empty(), "{:?}", refused(&idp));
+}
+
+#[tokio::test]
+async fn an_unregistered_client_key_is_refused_by_the_issuer() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    // The issuer holds some other key.
+    let other = temp();
+    let registered = register_client_key(other.path(), &idp).await;
+    let config = with_key(oauth_config(&idp.issuer, Grant::ClientCredentials));
+    let m = TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let err = m.access_token().await.err();
+    assert!(err.is_some_and(|e| e.to_string().contains("invalid_client")));
+    assert_eq!(refused(&idp).len(), 1);
+    assert_eq!(spent(&idp), 0);
+    assert!(!registered.kid.is_empty());
+}
+
+#[tokio::test]
+async fn a_browser_login_pushes_its_request_and_signs_the_code_exchange() {
+    let idp = MockIdp::start().await;
+    idp.state.par.store(true, Ordering::SeqCst);
+    let dir = temp();
+    register_client_key(dir.path(), &idp).await;
+    let config = with_key(oauth_config(&idp.issuer, Grant::AuthorizationCode));
+    let m = Arc::new(
+        TokenManager::new(&config_at(dir.path()), &name("p"), config, KeySource::File)
+            .unwrap_or_else(|e| fail(&e.to_string())),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let login = {
+        let m = Arc::clone(&m);
+        tokio::spawn(async move {
+            let notify = move |p: LoginPrompt| drop(tx.send(p));
+            m.login(LoginFlow::Configured, &notify).await
+        })
+    };
+    let Some(LoginPrompt::Browser { url }) = rx.recv().await else {
+        fail("expected a browser prompt");
+    };
+    let Ok(auth_url) = Url::parse(&url) else {
+        fail(&format!("auth url unparsable: {url}"));
+    };
+    let q: HashMap<_, _> = auth_url.query_pairs().into_owned().collect();
+    assert_eq!(q.len(), 2, "{url}");
+    assert_eq!(q.get("client_id").map(String::as_str), Some("client-1"));
+    assert!(q.contains_key("request_uri"));
+    let pushed = idp
+        .state
+        .par_bodies
+        .lock()
+        .map(|b| b.clone())
+        .unwrap_or_default();
+    let [pushed] = pushed.as_slice() else {
+        fail(&format!("{pushed:?}"));
+    };
+    assert_eq!(
+        form(pushed, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    assert!(form(pushed, "code_challenge").is_some());
+    assert!(form(pushed, "client_assertion").is_some());
+    let state = form(pushed, "state").unwrap_or_default();
+    let redirect = form(pushed, "redirect_uri").unwrap_or_default();
+    let back = reqwest::Client::new()
+        .get(format!("{redirect}?code=the-code&state={state}"))
+        .send()
+        .await;
+    assert!(back.is_ok_and(|r| r.status() == 200));
+    let token = login.await;
+    assert!(token.is_ok_and(|t| t.is_ok_and(|t| t.access_token.expose_secret() == "code-access")));
+    let body = last_body(&idp);
+    assert!(body.contains("client_assertion="), "{body}");
+    assert!(!body.contains("client_secret"), "{body}");
+    assert!(last_auth(&idp).is_empty());
+    assert_eq!(spent(&idp), 2);
+    assert!(refused(&idp).is_empty(), "{:?}", refused(&idp));
 }

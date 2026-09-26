@@ -24,8 +24,10 @@ Plain SQL files under `crates/quack-core/migrations/`, embedded at compile time 
   emits dynamic SQL strings. Handlers call typed store methods and never see SQL. Only DDL
   moved to files.
 - Nothing that reveals workspace content: users, workspaces (name and label), membership,
-  tokens, and the access `audit_log`. The audit log is append-only; no code path may
-  `UPDATE` or `DELETE` it.
+  tokens (API token hashes, and signed-in users' and model providers' OAuth tokens in
+  `user_tokens` and `provider_tokens`), each OAuth client's `private_key_jwt` signing key in
+  `client_keys` (version 7), the tokens and keys all sealed by the vault, and the access
+  `audit_log`. The audit log is append-only; no code path may `UPDATE` or `DELETE` it.
 
 ### Databases created before the switch
 

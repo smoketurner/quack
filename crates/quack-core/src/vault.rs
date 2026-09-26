@@ -31,11 +31,15 @@ pub enum Purpose {
     UserToken,
     /// A model provider's OAuth token; the subject is the provider name.
     ProviderToken,
+    /// An OAuth client's `private_key_jwt` signing key (PKCS#8); the subject
+    /// is the key name, `<issuer> <client_id>`.
+    ClientKey,
 }
 
 text_enum!(Purpose, "vault purpose", {
     UserToken => "user-token",
     ProviderToken => "provider-token",
+    ClientKey => "client-key",
 });
 
 impl Purpose {

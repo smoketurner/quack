@@ -23,7 +23,8 @@ use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::Error;
 use crate::llm::OllamaRunningModels;
-use crate::llm::oauth::TokenManager;
+use crate::llm::oauth::client_key::ClientKeys;
+use crate::llm::oauth::{KeySource, TokenManager};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -821,7 +822,21 @@ async fn model_credential(
         },
         // Status first: asking for a token without a login would start one.
         ProviderAuth::Oauth(oauth) => match oauth_token(config, name, oauth).await {
-            Ok(token) => Some(token),
+            Ok(OAuthProbe::Token(token)) => Some(token),
+            Ok(OAuthProbe::Delegated { listed }) => {
+                return Err(Box::new(Check::new(
+                    area,
+                    Status::Ok,
+                    format!(
+                        "{model}: acts on behalf of each person signed in to quack serve, without an actor token; {}; the model is reached with the first signed-in person's request",
+                        if listed {
+                            format!("the issuer lists {}", oauth.grant_type())
+                        } else {
+                            String::from("the issuer does not list its grants")
+                        }
+                    ),
+                )));
+            }
             Err(message) => {
                 return Err(Box::new(
                     Check::new(area, Status::Fail, format!("{model}: {message}"))
@@ -910,39 +925,61 @@ fn listing_check(
     }
 }
 
+/// What `quack doctor` can learn of an OAuth provider's credential.
+enum OAuthProbe {
+    /// A token to probe the model list with.
+    Token(String),
+    /// An on-behalf-of provider without an actor token: only a signed-in
+    /// person's request obtains a token, so nothing is requested here.
+    /// `listed` is whether the issuer lists its grants (and so, having
+    /// passed, lists the exchange).
+    Delegated { listed: bool },
+}
+
 async fn oauth_token(
     config: &Config,
     name: &ProviderName,
     oauth: &OAuthConfig,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<OAuthProbe, String> {
     let manager = TokenManager::shared(config, name, oauth).map_err(|e| e.to_string())?;
-    if matches!(manager.issuer_supports_grant().await, Ok(Some(false))) {
+    let supported = manager.issuer_supports_grant().await;
+    if matches!(supported, Ok(Some(false))) {
         return Err(format!(
             "provider '{name}': the issuer does not list {} in grant_types_supported; check [providers.{name}.oauth].grant",
             oauth.grant_type()
         ));
     }
-    let status = manager.status().await.map_err(|e| e.to_string())?;
     let signs_in = match oauth.grant {
         Grant::AuthorizationCode | Grant::DeviceCode => true,
         Grant::ClientCredentials => false,
+        // Without an actor, quack never has a token of its own for this
+        // provider (Vouch refuses one that names no user), so asking for
+        // one would test a grant it never uses.
+        Grant::OnBehalfOf if !oauth.actor => {
+            return supported
+                .map(|listed| OAuthProbe::Delegated {
+                    listed: listed.is_some(),
+                })
+                .map_err(|e| format!("provider '{name}': {e}"));
+        }
         // Only a signed-in person can be acted for; quack's own token (the
         // actor) is what can be checked here.
         Grant::OnBehalfOf => {
             return manager
                 .service_token()
                 .await
-                .map(|token| token.expose_secret().to_owned())
+                .map(|token| OAuthProbe::Token(token.expose_secret().to_owned()))
                 .map_err(|e| format!("provider '{name}': {e}"));
         }
     };
+    let status = manager.status().await.map_err(|e| e.to_string())?;
     if signs_in && status.token.is_none() {
         return Err(format!("provider '{name}' uses OAuth and is not logged in"));
     }
     manager
         .access_token()
         .await
-        .map(|token| token.expose_secret().to_owned())
+        .map(|token| OAuthProbe::Token(token.expose_secret().to_owned()))
         .map_err(|e| format!("provider '{name}': {e}"))
 }
 
@@ -1078,7 +1115,7 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         ));
         return;
     }
-    let sign_in = match SignIn::new(oidc.clone()) {
+    let sign_in = match SignIn::new(oidc.clone(), ClientKeys::new(config, KeySource::Keychain)) {
         Ok(sign_in) => sign_in,
         Err(e) => {
             report.push(Check::new(
@@ -1093,8 +1130,8 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         Some(_) => sign_in.published_keys().await.map(Some),
         None => Ok(None),
     };
-    report.push(match (sign_in.begin().await, keys) {
-        (Ok(_), Ok(keys)) => Check::new(
+    report.push(match (sign_in.discover().await, keys) {
+        (Ok(()), Ok(keys)) => Check::new(
             Area::Server,
             Status::Ok,
             match (keys, oidc.audience.as_deref()) {
@@ -1480,5 +1517,99 @@ mod tests {
             find(&local, Area::Server).first().unwrap().status,
             Status::Fail
         );
+    }
+
+    /// A mock issuer for the doctor: its discovery document lists `grants`,
+    /// and it counts token requests.
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn grant_listing_issuer(
+        grants: &'static [&'static str],
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = listener
+            .local_addr()
+            .map(|a| format!("http://{a}"))
+            .unwrap_or_default();
+        let tokens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (served, counted) = (base.clone(), std::sync::Arc::clone(&tokens));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_string();
+                let target = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (status, body) = if target == "/.well-known/openid-configuration" {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "issuer": served,
+                            "authorization_endpoint": format!("{served}/authorize"),
+                            "token_endpoint": format!("{served}/token"),
+                            "grant_types_supported": grants,
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        "400 Bad Request",
+                        String::from("{\"error\":\"invalid_client\"}"),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                drop(stream.write_all(response.as_bytes()).await);
+            }
+        });
+        (base, tokens)
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn on_behalf_of_without_an_actor_checks_the_grant_list_and_requests_no_token() {
+        let options = Options {
+            probing: Probing::Online {
+                timeout: Duration::from_secs(5),
+            },
+            ..Options::default()
+        };
+        let provider = |issuer: &str| {
+            format!(
+                "[general]\nchat_model = \"gw/m\"\n[providers.gw]\ntype = \"openai\"\n\
+                 base_url = \"https://gw.example.com/v1\"\nauth = \"oauth\"\n[providers.gw.oauth]\n\
+                 issuer_url = \"{issuer}\"\nclient_id = \"quack\"\nclient_auth = \"private_key_jwt\"\n\
+                 grant = \"on-behalf-of\"\nactor = false\n"
+            )
+        };
+
+        let (issuer, tokens) = grant_listing_issuer(&[
+            "authorization_code",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let report = run(&inspection(dir.path(), Some(&provider(&issuer))), &options).await;
+        let chat = find(&report, Area::ChatModel);
+        let check = *chat.first().unwrap();
+        assert_eq!(check.status, Status::Ok, "{check:#?}");
+        assert!(check.summary.contains("on behalf of"), "{check:#?}");
+        assert!(check.summary.contains("token-exchange"), "{check:#?}");
+        assert!(!check.summary.contains("actor)"), "{check:#?}");
+        // No client-credentials token, nor any other, was asked for.
+        assert_eq!(tokens.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (issuer, tokens) = grant_listing_issuer(&["authorization_code"]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let report = run(&inspection(dir.path(), Some(&provider(&issuer))), &options).await;
+        let check = *find(&report, Area::ChatModel).first().unwrap();
+        assert_eq!(check.status, Status::Fail, "{check:#?}");
+        assert!(
+            check.summary.contains("grant_types_supported"),
+            "{check:#?}"
+        );
+        assert_eq!(tokens.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
