@@ -606,7 +606,7 @@ impl McpServer {
 
     #[tool(
         name = "list_tables",
-        description = "List the tables in the workspace."
+        description = "List the names of the user tables in the workspace, as `{\"tables\": [...]}`. quack's internal tables are not listed. Call `describe_table` on a name for its columns, types, row count, and sample rows, and `sql` to query it. Takes no arguments."
     )]
     async fn list_tables(&self, extensions: Extensions) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;

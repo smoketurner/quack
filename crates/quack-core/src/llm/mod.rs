@@ -7,6 +7,7 @@
 pub mod acting;
 pub mod bedrock;
 pub mod oauth;
+pub mod sampling;
 
 use rig::client::EmbeddingsClient;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
@@ -22,6 +23,7 @@ use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
+use crate::config::Effort;
 use crate::config::{
     BaseUrl, BedrockApi, Config, ModelRef, ProviderAuth, ProviderConfig, ProviderName,
     ProviderType, config_file_path,
@@ -35,6 +37,7 @@ use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::Priority;
 use crate::storage::{context, sessions};
+use sampling::{Sampled, Wire};
 pub use tokio_util::sync::CancellationToken;
 
 pub mod limit;
@@ -333,7 +336,8 @@ enum ChatClient {
     /// Bedrock's Converse API through the AWS SDK. Bedrock's Chat
     /// Completions is [`Self::OpenAi`] over a signing client.
     Bedrock(bedrock::BedrockClient),
-    /// Bedrock's OpenAI-compatible Responses API, signed.
+    /// An OpenAI-compatible Responses API: Bedrock's, signed, or a
+    /// `type = "openai"` provider's with `api = "responses"`.
     Responses(ResponsesClient),
 }
 
@@ -343,6 +347,9 @@ impl ChatClient {
         Ok(match provider.provider_type {
             ProviderType::Ollama => {
                 Self::Ollama(build_ollama_client(config, name, provider).await?)
+            }
+            ProviderType::Openai if provider.openai_chat_api() == BedrockApi::Responses => {
+                Self::Responses(build_openai_responses_client(config, name, provider).await?)
             }
             ProviderType::Openai => {
                 Self::OpenAi(build_openai_client(config, name, provider).await?)
@@ -385,33 +392,63 @@ impl ChatClient {
         })
     }
 
+    /// The API this client calls the chat model through.
+    const fn wire(&self) -> Wire {
+        match self {
+            Self::Ollama(_) => Wire::Ollama,
+            Self::OpenAi(_) => Wire::ChatCompletions,
+            Self::Anthropic(_) => Wire::Anthropic,
+            Self::Bedrock(_) => Wire::Converse,
+            Self::Responses(_) => Wire::Responses,
+        }
+    }
+
     fn one_shot(
         &self,
         model: &str,
         preamble: &str,
         timeout: Duration,
         label: &'static str,
-    ) -> OneShotAgent {
-        match self {
-            Self::Ollama(client) => {
-                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
-            }
-            Self::OpenAi(client) => {
-                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
-            }
-            Self::Anthropic(client) => {
-                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
-            }
-            Self::Bedrock(client) => {
-                OneShotAgent::new(client.completion_model(model), preamble, timeout, label)
-            }
-            Self::Responses(client) => OneShotAgent::new(
-                Unstored(client.completion_model(model)),
+        effort: Option<Effort>,
+    ) -> Result<OneShotAgent> {
+        let wire = self.wire();
+        Ok(match self {
+            Self::Ollama(client) => OneShotAgent::new(
+                Sampled::new(client.completion_model(model), model, wire, effort)?,
                 preamble,
                 timeout,
                 label,
             ),
-        }
+            Self::OpenAi(client) => OneShotAgent::new(
+                Sampled::new(client.completion_model(model), model, wire, effort)?,
+                preamble,
+                timeout,
+                label,
+            ),
+            Self::Anthropic(client) => OneShotAgent::new(
+                Sampled::new(client.completion_model(model), model, wire, effort)?,
+                preamble,
+                timeout,
+                label,
+            ),
+            Self::Bedrock(client) => OneShotAgent::new(
+                Sampled::new(client.completion_model(model), model, wire, effort)?,
+                preamble,
+                timeout,
+                label,
+            ),
+            Self::Responses(client) => OneShotAgent::new(
+                Sampled::new(
+                    Unstored(client.completion_model(model)),
+                    model,
+                    wire,
+                    effort,
+                )?,
+                preamble,
+                timeout,
+                label,
+            ),
+        })
     }
 }
 
@@ -420,8 +457,8 @@ impl ChatClient {
 const SIGNED_PLACEHOLDER_KEY: &str = "sigv4";
 
 /// A Responses API model asked to keep nothing: every request carries
-/// `store: false`, so Bedrock retains no copy of the conversation (it keeps
-/// one for 30 days by default) and no workspace content leaves the
+/// `store: false`, so neither Bedrock nor `OpenAI` retains a copy of the
+/// conversation (Bedrock keeps one for 30 days by default) and no workspace content leaves the
 /// workspace file's boundary to be stored (design doc section 5). quack
 /// replays history itself and never uses `previous_response_id`.
 #[derive(Clone)]
@@ -471,7 +508,8 @@ impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for U
     }
 }
 
-/// A tool-less agent at temperature 0 that answers one prompt at a time,
+/// A tool-less agent at temperature 0 (where the model takes one; see
+/// [`sampling`]) that answers one prompt at a time,
 /// streamed and collected. Streaming is the path the chat agent uses and
 /// the one Ollama answers reliably, and it keeps long generations from
 /// tripping the HTTP client's read timeout. Extraction and reranking are
@@ -576,7 +614,8 @@ pub async fn graph_extractor(
         &ontology.extraction_prompt(),
         config.analysis.extraction_timeout(),
         "graph extraction",
-    )))
+        config.analysis.background_effort,
+    )?))
 }
 
 /// The configured chat model as an open extractor for ontology induction.
@@ -592,7 +631,8 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
         documents::EXTRACTION_PROMPT,
         config.analysis.extraction_timeout(),
         "extraction",
-    )))
+        config.analysis.background_effort,
+    )?))
 }
 
 impl ProviderAuth {
@@ -711,6 +751,36 @@ async fn build_openai_client(
         &key,
         LimitedHttp::for_provider(name, provider),
     )
+}
+
+/// The Responses client of a `type = "openai"` provider set to
+/// `api = "responses"`, with the same key, base URL, and request limits as
+/// its Chat Completions client.
+async fn build_openai_responses_client(
+    config: &Config,
+    name: &ProviderName,
+    provider: &ProviderConfig,
+) -> Result<ResponsesClient> {
+    let key = provider
+        .auth
+        .credential(config, name)
+        .await?
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "provider '{name}' (openai) requires auth = \"api-key\" or \"oauth\""
+            ))
+        })?;
+    let mut builder = rig::providers::openai::Client::builder()
+        .api_key(&key)
+        .http_client(LimitedHttp::for_provider(name, provider));
+    if let Some(base_url) = provider.base_url.as_ref() {
+        builder = builder.base_url(base_url.as_str());
+    }
+    builder.build().map_err(|e| {
+        Error::Llm(format!(
+            "failed to build Responses client for '{name}': {e}"
+        ))
+    })
 }
 
 fn openai_client_with_key(
@@ -950,7 +1020,10 @@ async fn dispatch(
     analysis: Analysis<'_, EmbedModel>,
     sink: EventSink,
 ) -> Result<AgentResponse> {
-    match ChatClient::build(config, &chat).await? {
+    let client = ChatClient::build(config, &chat).await?;
+    let (wire, effort) = (client.wire(), config.analysis.effort);
+    sampling::check_tool_calls(chat.model, wire, effort)?;
+    match client {
         ChatClient::Ollama(client) => {
             // A first request after idle loads the model, which took 5
             // seconds for a 12 GB model measured live and shows the user
@@ -972,24 +1045,66 @@ async fn dispatch(
                 ))));
             }
             analysis
-                .run(client.completion_model(chat.model), sink)
+                .run(
+                    Sampled::new(
+                        client.completion_model(chat.model),
+                        chat.model,
+                        wire,
+                        effort,
+                    )?,
+                    sink,
+                )
                 .await
         }
         ChatClient::OpenAi(client) => {
             analysis
-                .run(client.completion_model(chat.model), sink)
+                .run(
+                    Sampled::new(
+                        client.completion_model(chat.model),
+                        chat.model,
+                        wire,
+                        effort,
+                    )?,
+                    sink,
+                )
                 .await
         }
         ChatClient::Anthropic(client) => {
             analysis
-                .run(client.completion_model(chat.model), sink)
+                .run(
+                    Sampled::new(
+                        client.completion_model(chat.model),
+                        chat.model,
+                        wire,
+                        effort,
+                    )?,
+                    sink,
+                )
                 .await
         }
         ChatClient::Bedrock(client) => {
-            Box::pin(analysis.run(client.completion_model(chat.model), sink)).await
+            Box::pin(analysis.run(
+                Sampled::new(
+                    client.completion_model(chat.model),
+                    chat.model,
+                    wire,
+                    effort,
+                )?,
+                sink,
+            ))
+            .await
         }
         ChatClient::Responses(client) => {
-            Box::pin(analysis.run(Unstored(client.completion_model(chat.model)), sink)).await
+            Box::pin(analysis.run(
+                Sampled::new(
+                    Unstored(client.completion_model(chat.model)),
+                    chat.model,
+                    wire,
+                    effort,
+                )?,
+                sink,
+            ))
+            .await
         }
     }
 }
@@ -1114,7 +1229,9 @@ mod tests {
                     "Answer.",
                     Duration::from_secs(10),
                     "wire test",
+                    None,
                 )
+                .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")
                 .await;
             assert!(answer.is_err(), "the server answers 400");

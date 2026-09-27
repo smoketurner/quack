@@ -154,9 +154,10 @@ impl SystemPrompt {
                 "Mode: query. Every factual claim must come from a retrieved chunk or from a \
                  query you ran this turn. Do not answer from memory. If search and queries find \
                  nothing relevant, say that the workspace does not cover the question and stop. \
-                 Every sentence that states something from a document MUST end with that chunk's \
-                 [n] marker, e.g. \"Flood damage is excluded [2].\" An answer about the documents \
-                 with no [n] markers is wrong.\n\n",
+                 Every sentence that states something from a document ends with that chunk's [n] \
+                 marker, e.g. \"Flood damage is excluded [2].\", because the sources listed under \
+                 the answer are built from those markers and a sentence without one has no \
+                 source.\n\n",
             ),
         }
 
@@ -228,9 +229,9 @@ impl SystemPrompt {
     fn tool_guidance(&mut self, modeled: Modeled) {
         self.text.push_str(
             "When answering analytical questions about structured data:\n\
-             1. First use list_tables or describe_table to understand the available data; run \
-             SUMMARIZE <table> when you need min, max, null share, or distinct counts per column \
-             before choosing a filter\n\
+             1. The tables block below describes the data; call describe_table for a table it \
+             lists without columns or sample rows, and run SUMMARIZE <table> when you need min, \
+             max, null share, or distinct counts per column before choosing a filter\n\
              2. Write and execute SQL queries using run_sql\n\
              3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
              misspelled one and describe_table shows the real names. Fix the statement and run \
@@ -666,7 +667,7 @@ mod tests {
         let query = SystemPrompt::build(&db, &options(ChatMode::Query, 1000)).unwrap();
         assert!(query.contains("Mode: query."));
         assert!(query.contains("Do not answer from memory"));
-        assert!(query.contains("MUST end with that chunk's [n]"));
+        assert!(query.contains("ends with that chunk's [n] marker"));
     }
 
     #[test]

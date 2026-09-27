@@ -159,7 +159,11 @@ The agent turn is an event stream (`quack_core::analysis::events`): text deltas,
 started/finished with timing, permission requests, turn complete. Every interface consumes
 it. `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
 prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
-clients themselves. OAuth providers (`quack_core::llm::oauth`) hand out a bearer through
+clients themselves. Every chat model is wrapped in `llm::sampling::Sampled`: Claude and `OpenAI`
+reasoning models get no `temperature`, Claude gets `max_tokens` 64,000, and
+`[analysis].effort` / `background_effort` go out as each API's field. `type = "openai"` takes
+`api = "responses"` or `"chat-completions"`; unset, `OpenAI` itself gets Responses and a `base_url`
+server gets Chat Completions. OAuth providers (`quack_core::llm::oauth`) hand out a bearer through
 one shared `TokenManager` per provider: PKCE or device-code login via `quack auth` (or the
 client-credentials grant, which needs no login; or `on-behalf-of`, which exchanges the
 requesting person's own token per request, the person carried in the `llm::acting::Acting`

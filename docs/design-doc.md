@@ -1035,8 +1035,13 @@ drift, propose again.
 0. Before 2, when the model has to be loaded first (Ollama, cold): emit Status { line }
 ```
 
-`max_turns` 15, temperature 0.1. The turn races a `CancellationToken`; a cancelled turn
-keeps the text streamed so far, appends a note, reports `cancelled: true`, and is recorded.
+`max_turns` 15, temperature 0.1. `llm::sampling` adjusts that per model: Claude and `OpenAI`'s
+reasoning models (GPT-5.x, GPT-6, o-series) reject a non-default temperature, so none is sent,
+and Claude gets `max_tokens` 64,000, since thinking counts against it. `[analysis].effort` goes out
+as each API's field (`output_config.effort` for Claude, `reasoning_effort` or `reasoning.effort`
+for `OpenAI`, `think` on Ollama); a level the model lacks is refused before the call, and a
+GPT-5.6 model on Chat Completions is refused because it cannot call tools there. The turn races a
+`CancellationToken`; a cancelled turn keeps the text streamed so far, appends a note, reports `cancelled: true`, and is recorded.
 
 `llm::TurnRequest::run` yields these events on a channel. The web UI turns them into HTML
 fragments over SSE; REST forwards them as typed SSE events or collects one JSON response;
@@ -1265,7 +1270,7 @@ assistant message that produced it and appears there in every rendering.
 | `type` | Chat | Embeddings | Notes |
 |--------|------|------------|-------|
 | `ollama` | yes | yes | Offline default. `base_url` defaults to `http://localhost:11434` |
-| `openai` | yes | yes | Also OpenAI-compatible endpoints via `base_url` (vLLM, LiteLLM, Azure OpenAI) |
+| `openai` | yes | yes | Also OpenAI-compatible endpoints via `base_url` (vLLM, LiteLLM, Azure OpenAI). `api = "responses"` (sent with `store: false`; the default without a `base_url`, since GPT-5.6 calls tools only there) or `"chat-completions"` (the default with one, since compatible servers may offer nothing else) |
 | `anthropic` | yes | no | Native Messages API with tool use |
 | `bedrock` | yes | yes | Amazon Bedrock's `bedrock-runtime` endpoint: `api = "converse"` (default, rig-bedrock over the AWS SDK), `"chat-completions"`, or `"responses"` (OpenAI-compatible, `/openai/v1`). Embeddings are InvokeModel in Titan Text Embeddings V2's request shape. `region`, `aws_profile`, `base_url` (VPC endpoint) optional |
 | `bedrock-mantle` | yes | no | Amazon Bedrock's `bedrock-mantle` endpoint: `api = "responses"` (default) or `"chat-completions"` (`/v1`). Same `region`, `aws_profile`, `base_url` |
@@ -1305,7 +1310,7 @@ inference profiles, a FIPS endpoint, embeddings. `bedrock-mantle`
 and Responses features only it has, such as Responses for GPT OSS. Each is its own provider
 type, `bedrock` and `bedrock-mantle` (like LiteLLM's `bedrock` and `bedrock_mantle`), and an
 entry names one `api` on it. A model on the other endpoint needs a second entry sharing the
-profile, picked by the model reference (`bedrock/us.anthropic.claude-sonnet-5`,
+profile, picked by the model reference (`bedrock/us.anthropic.claude-opus-5-5`,
 `mantle/openai.gpt-oss-120b`). Config reading refuses an API the endpoint lacks (`converse`
 on `bedrock-mantle`) and embeddings on `bedrock-mantle`.
 
@@ -2071,6 +2076,8 @@ max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for
 extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
 extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
 reader_pool_size = 4                    # reader connections per workspace handle, round-robined
+# effort = "high"                       # chat turns: none, minimal, low, medium, high, xhigh, max; unset = model default
+# background_effort = "low"             # graph extraction and the ontology document pass
 
 [import]
 max_rows = 1000000

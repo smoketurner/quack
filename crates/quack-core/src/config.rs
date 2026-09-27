@@ -648,6 +648,10 @@ pub struct ProviderConfig {
     /// The endpoint, API, and region of a `type = "bedrock"` provider; set
     /// for that type and no other.
     pub bedrock: Option<BedrockConfig>,
+    /// The `api` a `type = "openai"` provider sets: `chat-completions` or
+    /// `responses`. `None` when unset or for other types; see
+    /// [`Self::openai_chat_api`] for the one in force.
+    pub openai_api: Option<BedrockApi>,
     /// Model requests in flight to this provider at once, across the whole
     /// process; the rest wait their turn (design doc 4.1). Unset: 1 for
     /// Ollama, which serves one request per model unless
@@ -697,12 +701,27 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
                 raw.region,
                 raw.base_url.as_ref(),
             )?),
-            None if raw.api.is_some() || raw.region.is_some() => {
+            None if raw.region.is_some() => {
                 return Err(Error::Config(String::from(
-                    "api and region are only for type = \"bedrock\" and \"bedrock-mantle\"",
+                    "region is only for type = \"bedrock\" and \"bedrock-mantle\"",
                 )));
             }
             None => None,
+        };
+        let openai_api = match (raw.provider_type, endpoint, raw.api) {
+            (_, Some(_), _) | (_, None, None) => None,
+            (ProviderType::Openai, None, Some(BedrockApi::Converse)) => {
+                return Err(Error::Config(String::from(
+                    "type = \"openai\" takes api = \"chat-completions\" or \"responses\"; \
+                     converse is Bedrock's own API",
+                )));
+            }
+            (ProviderType::Openai, None, Some(api)) => Some(api),
+            (_, None, Some(_)) => {
+                return Err(Error::Config(String::from(
+                    "api is only for type = \"openai\", \"bedrock\", and \"bedrock-mantle\"",
+                )));
+            }
         };
         if raw.aws_profile.is_some() && mode != AuthMode::Aws {
             return Err(Error::Config(String::from(
@@ -755,6 +774,7 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
             auth,
             base_url: raw.base_url,
             bedrock: bedrock_config,
+            openai_api,
 
             max_concurrent_requests: raw.max_concurrent_requests,
         })
@@ -778,7 +798,30 @@ impl ProviderConfig {
                     api: endpoint.default_api(),
                     region: None,
                 }),
+            openai_api: None,
             max_concurrent_requests: None,
+        }
+    }
+
+    /// The API a `type = "openai"` provider's chat model is called through:
+    /// the `api` it sets, else [`Self::openai_default_api`].
+    #[must_use]
+    pub const fn openai_chat_api(&self) -> BedrockApi {
+        match self.openai_api {
+            Some(api) => api,
+            None => self.openai_default_api(),
+        }
+    }
+
+    /// A `type = "openai"` provider's API when `api` is unset: Responses for
+    /// `OpenAI` itself (no `base_url`), Chat Completions for a compatible
+    /// server at a `base_url`, since many of those implement nothing else.
+    #[must_use]
+    pub const fn openai_default_api(&self) -> BedrockApi {
+        if self.base_url.is_some() {
+            BedrockApi::ChatCompletions
+        } else {
+            BedrockApi::Responses
         }
     }
 
@@ -1319,6 +1362,31 @@ text_enum!(RerankMode, "rerank mode", {
     Model => "model",
 });
 
+/// How long a reasoning model thinks before it answers (`[analysis].effort`
+/// and `background_effort`). `llm::sampling` sends it in the form each
+/// provider and model family takes, and refuses a level the model lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+text_enum!(Effort, "effort", {
+    None => "none",
+    Minimal => "minimal",
+    Low => "low",
+    Medium => "medium",
+    High => "high",
+    Xhigh => "xhigh",
+    Max => "max",
+});
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
@@ -1345,6 +1413,11 @@ pub struct AnalysisConfig {
     /// concurrent reads run in parallel instead of queuing behind each
     /// other on one shared connection.
     pub reader_pool_size: u32,
+    /// Reasoning effort for chat turns. Unset: the model's own default.
+    pub effort: Option<Effort>,
+    /// Reasoning effort for background calls: graph extraction, the
+    /// ontology's document pass, and reranking. Unset: the model's default.
+    pub background_effort: Option<Effort>,
 }
 
 impl AnalysisConfig {
@@ -1374,6 +1447,8 @@ impl Default for AnalysisConfig {
             extraction_timeout_seconds: 120,
             extraction_concurrency: 1,
             reader_pool_size: 4,
+            effort: None,
+            background_effort: None,
         }
     }
 }
@@ -1981,9 +2056,49 @@ rerank = "model"
     }
 
     #[test]
+    fn openai_takes_chat_completions_or_responses() {
+        let api_of = |text: &str| {
+            Config::parse(text)
+                .ok()
+                .and_then(|c| c.providers.get("o").map(ProviderConfig::openai_chat_api))
+        };
+        let base = "[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"K\"\n";
+        // OpenAI itself defaults to Responses; a compatible server to Chat Completions.
+        assert_eq!(api_of(base), Some(BedrockApi::Responses));
+        let gateway = format!("{base}base_url = \"https://models.example.com/v1\"\n");
+        assert_eq!(api_of(&gateway), Some(BedrockApi::ChatCompletions));
+        assert_eq!(
+            api_of(&format!("{gateway}api = \"responses\"\n")),
+            Some(BedrockApi::Responses)
+        );
+        assert_eq!(
+            api_of(&format!("{base}api = \"chat-completions\"\n")),
+            Some(BedrockApi::ChatCompletions)
+        );
+        assert!(err_of(&format!("{base}api = \"converse\"\n")).contains("converse"));
+        assert!(
+            err_of("[providers.a]\ntype = \"anthropic\"\napi = \"responses\"\n")
+                .contains("api is only for")
+        );
+        assert!(
+            err_of("[providers.o]\ntype = \"ollama\"\nregion = \"us-east-1\"\n").contains("region")
+        );
+    }
+
+    #[test]
+    fn effort_is_unset_or_a_known_level() {
+        let unset = Config::parse("").map(|c| (c.analysis.effort, c.analysis.background_effort));
+        assert!(unset.is_ok_and(|e| e == (None, None)));
+        let set = Config::parse("[analysis]\neffort = \"xhigh\"\nbackground_effort = \"low\"\n")
+            .map(|c| (c.analysis.effort, c.analysis.background_effort));
+        assert!(set.is_ok_and(|e| e == (Some(Effort::Xhigh), Some(Effort::Low))));
+        assert_ne!(err_of("[analysis]\neffort = \"extreme\"\n"), "<ok>");
+    }
+
+    #[test]
     fn bedrock_signs_with_the_aws_chain_by_default() {
         let config = Config::parse(
-            "[general]\nchat_model = \"aws/us.anthropic.claude-sonnet-5\"\n\
+            "[general]\nchat_model = \"aws/us.anthropic.claude-opus-5-5\"\n\
              [providers.aws]\ntype = \"bedrock\"\naws_profile = \"dev-sso\"\nregion = \"us-west-2\"\n",
         );
         assert!(

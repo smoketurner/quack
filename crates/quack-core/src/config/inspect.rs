@@ -22,7 +22,8 @@ use crate::embedding::presets::Family;
 
 use super::{
     AuthMode, AwsRegion, BaseUrl, ClientAuth, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR,
-    ENV_MODEL, Exchange, Grant, ModelSpec, OAuthConfig, OidcConfig, Overrides, config_file_path,
+    ENV_MODEL, Effort, Exchange, Grant, ModelSpec, OAuthConfig, OidcConfig, Overrides,
+    ProviderType, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -385,6 +386,8 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "extraction_timeout_seconds",
             "extraction_concurrency",
             "reader_pool_size",
+            "effort",
+            "background_effort",
         ],
     ),
     (
@@ -550,6 +553,14 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 s.optional_text(
                     "region",
                     bedrock.region.as_ref().map(AwsRegion::as_str),
+                    None,
+                );
+            }
+            if provider.provider_type == ProviderType::Openai {
+                s.text(
+                    "api",
+                    provider.openai_chat_api().as_str(),
+                    provider.openai_default_api().as_str(),
                     None,
                 );
             }
@@ -760,6 +771,12 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "reader_pool_size",
         analysis.reader_pool_size,
         default.reader_pool_size,
+    );
+    s.optional_text("effort", analysis.effort.map(Effort::as_str), None);
+    s.optional_text(
+        "background_effort",
+        analysis.background_effort.map(Effort::as_str),
+        None,
     );
 }
 
@@ -1402,7 +1419,7 @@ top_k = 3
              [providers.p.oauth]\nissuer_url = \"https://i\"\nclient_id = \"c\"\n",
         );
         let listed: BTreeSet<String> = inspection.settings.iter().map(Setting::path).collect();
-        let bedrock_only = ["api", "region"];
+        let bedrock_only = ["region"];
         for key in PROVIDER_KEYS
             .iter()
             .filter(|k| **k != "oauth" && !bedrock_only.contains(*k))
