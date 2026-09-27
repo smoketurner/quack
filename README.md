@@ -95,11 +95,29 @@ quack supports Ollama, OpenAI-compatible endpoints, Anthropic, and Amazon Bedroc
 provider takes no auth, an API key, or OAuth. Bedrock uses whatever the AWS CLI would use:
 the environment, `aws_profile` or `AWS_PROFILE`, `aws sso login`, or instance roles.
 [docs/authentication.md](docs/authentication.md) covers how people sign in to
-`quack serve` and how quack authenticates to providers. A Bedrock setup:
+`quack serve` and how quack authenticates to providers. The Anthropic and OpenAI APIs
+directly:
 
 ```toml
 [general]
-chat_model = "bedrock/us.anthropic.claude-sonnet-5"   # or "mantle/openai.gpt-oss-120b"
+chat_model = "anthropic/claude-opus-5-5"   # or "openai/gpt-5.6-sol"
+
+[providers.anthropic]
+type = "anthropic"
+auth = "api-key"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.openai]
+type = "openai"
+auth = "api-key"
+api_key_env = "OPENAI_API_KEY"
+```
+
+The same models through Amazon Bedrock:
+
+```toml
+[general]
+chat_model = "bedrock/us.anthropic.claude-opus-5-5"   # or "mantle/openai.gpt-5.6-sol", "mantle/openai.gpt-oss-120b"
 
 [providers.bedrock]              # bedrock-runtime: Converse (default), chat-completions, or responses
 type = "bedrock"
@@ -110,6 +128,15 @@ region = "us-east-1"             # optional
 type = "bedrock-mantle"
 aws_profile = "my-sso-profile"
 # base_url = "https://vpce-0123456789abcdef0.bedrock-mantle.us-east-1.vpce.amazonaws.com"   # a VPC endpoint without private DNS
+```
+
+Reasoning effort is set per kind of call. Unset sends nothing, so each model uses its own
+default. quack sends the field each provider expects and refuses a level the model lacks:
+
+```toml
+[analysis]
+effort = "high"              # chat turns
+background_effort = "low"    # graph extraction and the ontology's document pass
 ```
 
 - `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data directories.

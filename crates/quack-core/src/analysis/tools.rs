@@ -990,7 +990,14 @@ impl Tool for DescribeTableTool {
     type Output = String;
 
     fn description(&self) -> String {
-        String::from("Returns column names, types, and 3 sample rows for a table in the workspace.")
+        String::from(
+            "Describe one table in the workspace: its row count, every column with its DuckDB \
+             type, and up to 3 sample rows. Use it for a table the system prompt lists without \
+             columns or sample rows, or to confirm exact column names before writing SQL. A name \
+             that matches no table returns an error followed by the names of the tables that \
+             exist. It does not profile values; for min, max, null share, or distinct counts, \
+             run SUMMARIZE <table> with run_sql.",
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1071,7 +1078,12 @@ impl Tool for ListTablesTool {
     type Output = String;
 
     fn description(&self) -> String {
-        String::from("Returns all user-created tables in the workspace.")
+        String::from(
+            "List every user table in the workspace with its row count, one per line. The \
+             system prompt already lists the tables, so call this to re-check after a statement \
+             created, replaced, or dropped one. quack's internal tables are not listed and cannot \
+             be queried. Takes no arguments.",
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1130,7 +1142,13 @@ impl Tool for ListDocumentsTool {
     type Output = String;
 
     fn description(&self) -> String {
-        String::from("Returns all ingested documents with their status.")
+        String::from(
+            "List every ingested document with its id, file name, status (queued, processing, \
+             ready, or error), MIME type, source, and title when it has one. A document's text is \
+             searchable once its status is ready; a tabular file is loaded as a table instead. To \
+             search within particular documents, pass their ids (a prefix is enough) or exact \
+             file names as search_documents' document_ids. Takes no arguments.",
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {

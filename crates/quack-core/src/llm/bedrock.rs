@@ -1237,10 +1237,10 @@ mod tests {
     fn model_calls_are_found_by_path_and_nothing_else_is() {
         assert_eq!(
             model_of(
-                "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-5/converse-stream"
+                "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-opus-5-5/converse-stream"
             )
             .as_deref(),
-            Some("us.anthropic.claude-sonnet-5")
+            Some("us.anthropic.claude-opus-5-5")
         );
         assert_eq!(
             model_of(
