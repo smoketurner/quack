@@ -1,16 +1,17 @@
 # quack
 
 quack answers questions about your own data on a machine with no internet connection.
-You give it files. It stores tables in DuckDB, documents as searchable chunks, and the
-entities in both as a knowledge graph. One agent answers across all three and shows every
-step it took. It runs as one static binary with a terminal session, a print mode, a web
-UI, a REST API, and an MCP server, and needs only a local model server such as Ollama.
+It stores tables in DuckDB, documents as searchable chunks, and the entities in both as a
+knowledge graph. One agent answers across all three and shows every step it took.
+
+It is one static binary: a terminal session, a print mode, a web UI, a REST API, and an MCP
+server. It needs only a local model server such as Ollama.
 
 ## What you can ask it
 
-Most tools make you pick a lane: SQL over a database, or chat over a pile of PDFs. quack
-puts both in one workspace, adds a graph of the entities in them, and lets one agent
-choose. These run against the demo workspace below.
+Most tools do one of two things: SQL over a database, or chat over a pile of PDFs. quack
+puts both in one workspace, adds a graph of their entities, and lets one agent choose. The
+examples below run against the [demo workspace](#try-it).
 
 **Questions your tables answer.** The agent writes DuckDB SQL, shows you the statement,
 runs it, and explains the rows.
@@ -20,59 +21,63 @@ quack -w storms -p "which states had the most direct deaths, and from what kind 
 quack -w storms -p "chart property damage by month"     # returns a chart plus the numbers
 ```
 
-**Questions your documents answer.** Retrieval is hybrid — vector similarity and a
-keyword index — and every `[n]` in the answer is checked against a chunk actually
-retrieved on that turn. `--mode query` forbids answering from anything else.
+**Questions your documents answer.** Retrieval combines vector similarity with a keyword
+index. Every `[n]` in the answer must match a chunk retrieved on that turn. `--mode query`
+forbids answering from anything else.
 
 ```bash
 quack -w storms -p "what wind speeds define an EF3?" --mode query
 quack -w storms -p "what is the difference between a direct and an indirect fatality?" --mode query
 ```
 
-**Questions that need both at once.** This is the part a SQL tool and a document chatbot
-each get half of: the tables hold the numbers, the documents say what the numbers mean.
+**Questions that need both at once.** The tables hold the numbers; the documents say
+what the numbers mean. A SQL tool or a document chatbot gets only half.
 
 ```bash
 quack -w storms -p "deaths per million residents by state, top ten"   # joins the storm table to Census figures imported over HTTPS
 quack -w storms -p "how many people died in mobile homes, and do those count as direct deaths?"
 ```
 
-**Questions about how things connect.** Once the graph is built the agent walks it —
-neighborhoods, shortest paths, everything of a class — instead of guessing a join.
+**Questions about how things connect.** Once the graph is built, the agent walks it
+(neighborhoods, shortest paths, every entity of a class) instead of guessing a join.
 
 ```bash
 quack -w storms -p "which forecast offices recorded events that killed people in mobile homes?"
 quack -w storms graph path 58277 GSP    # a fatality -> its flash flood -> the office that recorded it
 ```
 
-**Follow-up questions.** Sessions live in the workspace file, resumable and exportable as
-a Markdown transcript or as the SQL that ran.
+**Follow-up questions.** Sessions live in the workspace file. You can resume one, or
+export it as a Markdown transcript or as the SQL that ran.
 
 ```bash
 quack -w storms -p "and how many of those were indirect?" -c
 ```
 
-What it will not do: write to your data without asking, cite a source it did not
-retrieve, reach the network while answering a question, or store anything that reveals a
-workspace's contents outside that workspace's own file.
+What it will not do:
+
+- write to your data without asking;
+- cite a source it did not retrieve;
+- reach the network while answering a question;
+- store anything that reveals a workspace's contents outside that workspace's own file.
 
 ## Install
 
-Download a static binary for Linux (x86_64, aarch64), macOS (Apple silicon), or Windows
-(x86_64, arm64) from the releases page; each release carries `SHA256SUMS` and a build
-provenance attestation you can check with `gh attestation verify`. On macOS, install
-it with Homebrew: `brew install smoketurner/tap/quack`. On Debian, Ubuntu,
-Fedora, or RHEL, install the `quack` package from
-[packages.smoketurner.com](https://packages.smoketurner.com), which has the APT and DNF
-setup; the `.deb` and `.rpm` files are on the releases page too. Or run the container,
-`ghcr.io/smoketurner/quack`, which starts `quack serve` and has a `docker-compose.yml`
-that puts Ollama beside it. Or build it: `cargo build --release`, with `cmake` and a C++
-compiler, plus `clang` and `go` on Linux.
+- **Binary:** download one for Linux (x86_64, aarch64), macOS (Apple silicon), or Windows
+  (x86_64, arm64) from the releases page. Each release carries `SHA256SUMS` and a build
+  provenance attestation you can check with `gh attestation verify`.
+- **macOS:** `brew install smoketurner/tap/quack`.
+- **Debian, Ubuntu, Fedora, RHEL:** install the `quack` package from
+  [packages.smoketurner.com](https://packages.smoketurner.com), which has the APT and DNF
+  setup. The `.deb` and `.rpm` files are also on the releases page.
+- **Container:** `ghcr.io/smoketurner/quack` starts `quack serve`. Its
+  `docker-compose.yml` runs Ollama beside it.
+- **Source:** `cargo build --release`. Needs `cmake` and a C++ compiler, plus `clang` and
+  `go` on Linux.
 
 ## Configure
 
-Name your models in `~/.config/quack/config.toml`. This is the smallest working setup
-with Ollama:
+Name your models in `~/.config/quack/config.toml`. The smallest working setup, with
+Ollama:
 
 ```toml
 [general]
@@ -86,11 +91,11 @@ dimension = 1024
 type = "ollama"
 ```
 
-quack supports Ollama, OpenAI-compatible endpoints, Anthropic, and Amazon Bedrock, with no
-auth, an API key, or OAuth, and for Bedrock whatever the AWS CLI would use (environment,
-`aws_profile` or `AWS_PROFILE`, `aws sso login`, instance roles). How people sign in to
-`quack serve` and how quack authenticates to providers is in
-[docs/authentication.md](docs/authentication.md):
+quack supports Ollama, OpenAI-compatible endpoints, Anthropic, and Amazon Bedrock. A
+provider takes no auth, an API key, or OAuth. Bedrock uses whatever the AWS CLI would use:
+the environment, `aws_profile` or `AWS_PROFILE`, `aws sso login`, or instance roles.
+[docs/authentication.md](docs/authentication.md) covers how people sign in to
+`quack serve` and how quack authenticates to providers. A Bedrock setup:
 
 ```toml
 [general]
@@ -107,12 +112,14 @@ aws_profile = "my-sso-profile"
 # base_url = "https://vpce-0123456789abcdef0.bedrock-mantle.us-east-1.vpce.amazonaws.com"   # a VPC endpoint without private DNS
 ```
 
- `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data directories.
-`[embedding].dimension` must be the width your embedding model produces; `quack doctor`
-checks it. quack adds the query and document prefixes each known embedding model was
-trained with (`[embedding]` overrides them). After you change the embedding model, its
-width, or those prefixes, `quack embeddings refresh -w NAME` updates each workspace's vectors. Until
-you do, documents are still found by keyword search.
+- `QUACK_CONFIG_DIR` and `QUACK_DATA_DIR` move the config and data directories.
+- `[embedding].dimension` must be the width your embedding model produces. `quack doctor`
+  checks it.
+- quack adds the query and document prefixes each known embedding model was trained with.
+  `[embedding]` overrides them.
+- After you change the embedding model, its width, or those prefixes, run
+  `quack embeddings refresh -w NAME` for each workspace. Until you do, keyword search still
+  finds its documents.
 
 ## Try it
 
@@ -120,10 +127,11 @@ you do, documents are still found by keyword search.
 make demo-data      # about two minutes
 ```
 
-That is NOAA's 2024 Storm Events Database: three linked tables, Census population figures
-imported over HTTPS, the government documents defining every code in the tables, an
-ontology, and a knowledge graph. Every question above works against it. [examples/](examples/)
-has the walkthrough and a second workspace built from USAID supply chain shipments.
+This builds a workspace from NOAA's 2024 Storm Events Database: three linked tables,
+Census population figures imported over HTTPS, the government documents that define every
+code in the tables, an ontology, and a knowledge graph. Every question above works against
+it. [examples/](examples/) has the walkthrough and a second workspace built from USAID
+supply chain shipments.
 
 ## Use it
 
@@ -157,8 +165,9 @@ quack config --changed                   # only what config.toml and the environ
 quack doctor                             # check config, data dir, workspace, model providers, and bind address; say how to fix each
 ```
 
-No configuration is needed to start: with no chat model, `quack` and `quack -q` still run
-SQL, load files, and take every slash command, and a question says how to set a model up.
+You need no configuration to start. Without a chat model, `quack` and `quack -q` still run
+SQL, load files, and take every slash command; asking a question tells you how to set up a
+model.
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
 
@@ -166,10 +175,10 @@ Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
 
 - Retrieval combines vector search with quack's own BM25 index. No DuckDB extension is
   loaded at runtime, so the binary stays one file.
-- The agent asks before it writes; print mode refuses writes without `--allow-write` and
+- The agent asks before it writes. Print mode refuses writes without `--allow-write`, and
   the API requires the write scope.
-- The ontology is proposed from your tables and documents and accepted by a person;
-  extraction is constrained by it, and every node and edge records where it came from.
+- quack proposes the ontology from your tables and documents, and a person accepts it.
+  Extraction follows it, and every node and edge records where it came from.
 - Everything that could reveal workspace content stays in that workspace's file. The
   server keeps users, tokens, and an append-only access log separately.
 
