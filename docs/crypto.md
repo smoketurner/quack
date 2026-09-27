@@ -1,113 +1,110 @@
 # Crypto and TLS: aws-lc-rs only
 
-quack uses aws-lc-rs as the single crypto provider for every TLS connection and for
-hashing. OpenSSL and `ring` are kept out: `deny.toml` bans `openssl`, `openssl-sys`,
-`native-tls`, and `ring`, and every TLS-capable dependency is enabled with its aws-lc-rs
-feature. One audited, FIPS-capable provider, nothing to cross-compile for the static musl
-build, and no ambiguity about which backend rustls picks at runtime.
+aws-lc-rs is quack's single crypto provider for TLS and hashing. `deny.toml` bans
+`openssl`, `openssl-sys`, `native-tls`, and `ring`, and every TLS-capable dependency
+enables its aws-lc-rs feature. That gives one audited, FIPS-capable provider, nothing extra
+to cross-compile for the static musl build, and one certain rustls backend at runtime.
 
 ## Where it is wired
 
-- `quack_core::crypto::install_default_provider()` installs the rustls default provider
-  and is the first call in `main`, before any TLS use. A second call in one process is an
-  error, which the strict lints surface instead of an `unwrap`. On Linux it names
+- `quack_core::crypto::install_default_provider()` installs the rustls default provider.
+  It is the first call in `main`, before any TLS use. A second call is an error, which the
+  strict lints surface instead of an `unwrap`. On Linux it names
   `rustls::crypto::default_fips_provider()`, which exists only under rustls's `fips`
-  feature and returns the same provider: dropping that feature becomes a build failure
-  instead of a silent return to non-FIPS key exchange.
-- `crypto::CryptoModule::log` records the module behind the installed provider — the AWS-LC
-  version and, for a FIPS build, the module version. It runs from `init_logging_at`, not
-  next to the install: the install happens before any tracing subscriber exists, so a log
-  there would go nowhere. It logs at `info`, which `quack serve` shows by default while the
-  other subcommands (default `warn`) need `RUST_LOG=info`.
-- `quack --version` prints the same module on its second line
-  (`CryptoModule`'s `Display`), so a FIPS binary is identifiable without turning on
-  logging; `-V` stays the bare version. The AWS-LC library version is the one that matters
-  for a CVE or a certificate — aws-lc-rs exposes no runtime API for its own crate version,
-  which stays in `Cargo.lock`.
-- Both numbers come from `aws_lc_rs::awslc_version()` and `aws_lc_rs::fips_version()`,
-  added in [aws/aws-lc-rs#1167](https://github.com/aws/aws-lc-rs/pull/1167) and present in
-  the pinned 1.18.1, so the pin cannot move backwards past that release.
-  `fips_version()` is `None` for every `aws-lc-sys` build, which is what the `AWS-LC FIPS`
-  label keys on; it is resolved from the headers at build time, so the log line asks
-  `CryptoProvider::fips()` instead for what rustls actually installed.
-- Features: `reqwest` and `rig` with `rustls`, `sqlx` with `tls-rustls-aws-lc-rs` (the
-  Postgres import), and the AWS SDK behind the Bedrock provider (`aws-config` and
-  `aws-sdk-bedrockruntime` with `default-https-client`) on `aws-smithy-http-client`'s
-  `rustls-aws-lc`, plus `rustls-aws-lc-fips` on Linux, where `llm::bedrock` selects
-  `CryptoMode::AwsLcFips`. Bedrock's OpenAI-compatible APIs go through `reqwest` like every
-  other provider. SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`,
-  HPKE for the vault from `rustls` (below).
-- **Exception: SigV4.** Bedrock requests are authenticated with AWS SigV4, an HMAC-SHA256
-  over the request. Both the AWS SDK (Converse, embeddings) and quack's own signer
-  (`llm::bedrock::Signer`, the OpenAI-compatible APIs) compute it with `aws-sigv4`, which
-  uses the RustCrypto `hmac` and `sha2` crates rather than aws-lc-rs, so that MAC is not
-  computed inside the FIPS-validated module even on Linux. The TLS connection it travels
-  over is. Neither crate is `ring` or OpenSSL, so the gates pass; a deployment that must keep
-  every primitive inside the validated module should not configure a Bedrock provider.
+  feature, so dropping the feature fails the build instead of silently reverting to
+  non-FIPS key exchange.
+- `crypto::CryptoModule::log` records the module behind the installed provider: the AWS-LC
+  version and, for a FIPS build, the module version. It runs from `init_logging_at`,
+  since no tracing subscriber exists at install time. It logs at `info`: `quack serve`
+  shows it by default; other subcommands (default `warn`) need `RUST_LOG=info`.
+- `quack --version` prints the same module on its second line (`CryptoModule`'s
+  `Display`), so a FIPS binary is identifiable without logging; `-V` stays the bare
+  version. The AWS-LC library version is what matters for a CVE or a certificate. The
+  aws-lc-rs crate version has no runtime API; it stays in `Cargo.lock`.
+- Both numbers come from `aws_lc_rs::awslc_version()` and `aws_lc_rs::fips_version()`.
+  [aws/aws-lc-rs#1167](https://github.com/aws/aws-lc-rs/pull/1167) added them in time for
+  the pinned 1.18.1, so the pin cannot move back past that release. The `AWS-LC FIPS`
+  label keys on `fips_version()`, which is `None` for every `aws-lc-sys` build. It is
+  resolved from headers at build time, so the log line asks `CryptoProvider::fips()` what
+  rustls actually installed.
+- Features:
+  - `reqwest` and `rig` with `rustls`.
+  - `sqlx` with `tls-rustls-aws-lc-rs` (the Postgres import).
+  - The AWS SDK behind the Bedrock provider (`aws-config` and `aws-sdk-bedrockruntime`
+    with `default-https-client`) on `aws-smithy-http-client`'s `rustls-aws-lc`. Linux adds
+    `rustls-aws-lc-fips`, and there `llm::bedrock` selects `CryptoMode::AwsLcFips`.
+    Bedrock's OpenAI-compatible APIs go through `reqwest` like every other provider.
+  - SHA-256 for tokens and document dedup comes from `aws_lc_rs::digest`; HPKE for the
+    vault comes from `rustls` (below).
+- **Exception: SigV4.** AWS SigV4 authenticates Bedrock requests with an HMAC-SHA256 over
+  the request. The AWS SDK (Converse, embeddings) and quack's own signer
+  (`llm::bedrock::Signer`, the OpenAI-compatible APIs) both compute it with `aws-sigv4`.
+  That crate uses RustCrypto's `hmac` and `sha2`, so the MAC runs outside the
+  FIPS-validated module even on Linux; the TLS connection carrying it runs inside. Neither
+  crate is `ring` or OpenSSL, so the gates pass. A deployment that needs every primitive
+  inside the validated module should not configure a Bedrock provider.
 - `quack_core::vault` seals data at rest with HPKE (RFC 9180, base mode):
-  DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM, from rustls's
+  DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM. The suite comes from rustls's
   `crypto::aws_lc_rs::hpke` (`DH_KEM_P256_HKDF_SHA256_AES_256`), which is aws-lc-rs
-  underneath and one of the suites rustls keeps under its `fips` feature; X25519 and
-  ChaCha20-Poly1305 suites are not, so the suite must not change to them. One key pair per
-  data directory, in the OS keychain (entry `vault`) or `<data_dir>/vault.key` (0600). Each
-  value is sealed for a `vault::Purpose` (the HPKE `info`, `quack vault v1 <purpose>`) and
-  a subject (the associated data), and records the key id that sealed it. A `Sealed` value
-  is stored by its caller, on the right side of the classification boundary; today that is
-  two purposes, both in `control.db`: signed-in users' identity-provider tokens
-  (`user_tokens`) and model providers' OAuth tokens from `quack auth login`
-  (`provider_tokens`).
+  underneath and one of the suites rustls keeps under its `fips` feature. The X25519 and
+  ChaCha20-Poly1305 suites are not, so the suite must not change to them.
+  - One key pair per data directory, in the OS keychain (entry `vault`) or
+    `<data_dir>/vault.key` (0600).
+  - Each value is sealed for a `vault::Purpose` (the HPKE `info`,
+    `quack vault v1 <purpose>`) and a subject (the associated data). It records the key id
+    that sealed it.
+  - The caller stores the `Sealed` value on the right side of the classification boundary.
+    Today there are two purposes, both in `control.db`: signed-in users'
+    identity-provider tokens (`user_tokens`) and model providers' OAuth tokens from
+    `quack auth login` (`provider_tokens`).
 - `jsonwebtoken` verifies identity-provider access tokens presented to `quack serve` (RFC
   9728, design doc 12). It is pinned with `default-features = false` and only its
-  `aws_lc_rs` feature, so its signature checks run on the same aws-lc-rs as everything else
-  (and on the FIPS module on Linux); its `rust_crypto` backend is never enabled, and with
-  exactly one backend it selects its provider itself, with nothing to install. Its
-  `signature` dependency is RustCrypto's trait crate, with no algorithms in it.
-- `aws-lc-rs` and `rustls` sit in `[dependencies]` with the features every target shares
-  (`crates/quack-core/Cargo.toml`), and the `cfg(target_os = "linux")` section adds `fips`
-  to both — Cargo unions the feature sets, so Linux gets FIPS and nothing else changes.
-  `crates/quack` declares neither at runtime: it installs the provider through
-  `quack_core::crypto` and uses no rustls API of its own. Its tests sign access tokens the
-  way an issuer would, with `aws-lc-rs` and `jsonwebtoken` as dev-dependencies only.
-- `rustls` carries `prefer-post-quantum`, so `X25519MLKEM768` leads the key exchange list
-  instead of trailing it. It survives the FIPS build too: that hybrid sends the ML-KEM
-  share first (`post_quantum_first: true`), and rustls's `fips()` for a hybrid defers to
-  whichever half comes first, which is approved when the library is in FIPS mode.
+  `aws_lc_rs` feature (never `rust_crypto`), so its signature checks run on the same
+  aws-lc-rs, the FIPS module on Linux. With one backend it selects its provider itself.
+  Its `signature` dependency is RustCrypto's trait crate and holds no algorithms.
+- `crates/quack` declares neither `aws-lc-rs` nor `rustls` at runtime: it installs the
+  provider through `quack_core::crypto` and uses no rustls API of its own. Its tests sign
+  access tokens the way an issuer would, with `aws-lc-rs` and `jsonwebtoken` as
+  dev-dependencies only.
+- `rustls` carries `prefer-post-quantum`, so `X25519MLKEM768` leads the key exchange list.
+  It survives the FIPS build: the hybrid sends the ML-KEM share first
+  (`post_quantum_first: true`), and rustls's `fips()` for a hybrid defers to that half,
+  which FIPS mode approves.
 
 ## FIPS on Linux
 
-The Linux binaries quack distributes — the static musl ones for x86_64 and aarch64, and the
-container image built from them — run on the FIPS-validated AWS-LC module. `quack-core`
-enables `aws-lc-rs`'s and `rustls`'s `fips` features for `cfg(target_os = "linux")`; macOS
-and Windows build against `aws-lc-sys`. What that means in practice:
+quack's distributed Linux binaries run on the FIPS-validated AWS-LC module: the static
+musl binaries for x86_64 and aarch64 and the container image built from them. In
+`crates/quack-core/Cargo.toml`, `aws-lc-rs` and `rustls` sit in `[dependencies]` with the
+features every target shares, and the `cfg(target_os = "linux")` section adds `fips` to
+both. Cargo unions the feature sets, so Linux gets FIPS and nothing else changes. macOS and
+Windows build against `aws-lc-sys`.
 
-- **The whole crate switches, not part of it.** `aws-lc-rs` binds to `aws-lc-fips-sys`
-  through `extern crate aws_lc_fips_sys as aws_lc` when the feature is on, so the direct
+- **The whole crate switches.** With the feature on, `aws-lc-rs` binds to
+  `aws-lc-fips-sys` through `extern crate aws_lc_fips_sys as aws_lc`. The direct
   `digest`/`rand` calls, rustls's provider, and rustls's HPKE (the vault) all land on the
-  validated module.
-  rustls's `fips` feature adds the policy half: the cipher suite and key exchange lists
-  narrow to the approved ones, and `CryptoProvider::fips()` becomes true. Startup logs the
-  linked AWS-LC version and, for a FIPS build, the module version; a Linux binary that
-  reports a non-FIPS provider logs a warning rather than refusing to start, and
+  validated module. rustls's `fips` feature adds the policy half: the cipher suite and key
+  exchange lists narrow to approved ones, and `CryptoProvider::fips()` becomes true. A
+  Linux binary that reports a non-FIPS provider logs a warning at startup and still runs.
   `crypto::tests::the_provider_is_fips_on_linux_and_not_elsewhere` fails the build if the
   target gating drifts.
-- **macOS is excluded because of linkage, not tooling.** `aws-lc-fips-sys` emits a static
-  library for a FIPS build only on Linux and BSD, and only on x86_64 and aarch64
-  (`builder/main.rs`, `impl Default for OutputLibType`); everywhere else a FIPS build
-  produces a shared library. A macOS FIPS binary would therefore depend on a
-  `libcrypto.dylib` that the single-file release archive cannot carry. Windows is excluded
-  for a second reason as well: `aws-lc-fips-sys` has no pre-generated bindings for either
-  Windows target, so it would need bindgen with libclang, and the x86_64 one an assembler.
-- **The Linux build needs `cmake` and `go`, and clang specifically.** Every
-  `aws-lc-fips-sys` build runs AWS-LC's `delocate` pass over generated assembly, which is a
-  Go program that cannot parse what gcc emits — it fails with `parse error near WS`.
-  `AWS_LC_FIPS_SYS_CC=clang` and `AWS_LC_FIPS_SYS_CXX=clang++` are set in `Dockerfile`,
-  `Dockerfile.build`, and both workflows' `env:` blocks, and `go` is installed alongside
-  `cmake` in each Linux builder. Ninja is not needed; the cmake crate drives make. Building
-  quack from source on Linux therefore requires Go in addition to CMake and a C++ compiler.
+- **Linkage, not tooling, excludes macOS.** `aws-lc-fips-sys` emits a static library for a
+  FIPS build only on Linux and BSD, on x86_64 and aarch64 (`builder/main.rs`,
+  `impl Default for OutputLibType`). Everywhere else a FIPS build produces a shared
+  library, and the single-file release archive cannot carry a macOS `libcrypto.dylib`.
+  Windows has a second blocker: `aws-lc-fips-sys` has no pre-generated bindings for either
+  Windows target, so it would need bindgen with libclang, and x86_64 an assembler.
+- **The Linux build needs `cmake`, `go`, and clang.** Every `aws-lc-fips-sys` build runs
+  AWS-LC's `delocate` pass over generated assembly. `delocate` is a Go program that cannot
+  parse gcc output; it fails with `parse error near WS`. `AWS_LC_FIPS_SYS_CC=clang` and
+  `AWS_LC_FIPS_SYS_CXX=clang++` are set in `Dockerfile`, `Dockerfile.build`, and both
+  workflows' `env:` blocks, and each Linux builder installs `go` beside `cmake`. The cmake
+  crate drives make; Ninja is not needed. A Linux source build needs Go, CMake, and a C++
+  compiler.
 - **The FIPS sources carry the OpenSSL license**, because AWS-LC descends from OpenSSL via
   BoringSSL, so `deny.toml` holds an `exceptions` entry for `aws-lc-fips-sys`. That is a
-  license, not the banned `openssl` crate: nothing links OpenSSL, which the gate below
-  re-checks.
+  license, not the banned `openssl` crate; the gate below re-checks that nothing links
+  OpenSSL.
 
 ## The gate
 
@@ -115,9 +112,9 @@ and Windows build against `aws-lc-sys`. What that means in practice:
 make release-gates   # crypto-gates, then cargo deny check
 ```
 
-runs `cargo tree -i ring -e normal` and `cargo tree -i openssl-sys -e normal`, which must
-print nothing, then `cargo deny check`. The `-e normal` matters: `libduckdb-sys` pulls
-`ureq`, and with it `ring`, as a build-time dependency only; nothing links it into the
-binary. The release workflow runs the tree half as `make crypto-gates` before building
-anything, and the deny half through the pinned cargo-deny action — the runner has no
-cargo-deny binary of its own.
+It runs `cargo tree -i ring -e normal` and `cargo tree -i openssl-sys -e normal`, which
+must print nothing, then `cargo deny check`. The `-e normal` matters: `libduckdb-sys`
+pulls `ureq`, and with it `ring`, as a build-time dependency only; nothing links it into
+the binary. The release workflow runs the tree half as `make crypto-gates` before building
+anything. It runs the deny half through the pinned cargo-deny action, because the runner
+has no cargo-deny binary.

@@ -1,22 +1,25 @@
 # Architecture
 
-How the code is laid out. The product design is [design-doc.md](design-doc.md); this file
-maps its sections to the crates and modules that exist.
+This file maps the sections of [design-doc.md](design-doc.md), the product design, to the
+crates and modules that exist.
 
 ## Workspace
 
-A virtual Cargo workspace (`Cargo.toml` has no `[package]`) with two members under
-`crates/`: `quack-core`, the library, and `quack`, the one binary. Shared settings come
-from the root: `[workspace.package]` (edition 2024, the MSRV), `[workspace.dependencies]`
-(every dependency pinned to an exact version with default features off; members opt in),
-and `[workspace.lints]` (panic, cast, and arithmetic denies plus clippy `pedantic`). Every
-member declares `[lints] workspace = true`. There are no Cargo features: every build
-contains every surface.
+quack is a virtual Cargo workspace (`Cargo.toml` has no `[package]`) with two members
+under `crates/`: `quack-core`, the library, and `quack`, the one binary. The root sets:
+
+- `[workspace.package]`: edition 2024, the MSRV.
+- `[workspace.dependencies]`: every dependency pinned to an exact version, default features
+  off; members opt in.
+- `[workspace.lints]`: panic, cast, and arithmetic denies plus clippy `pedantic`. Every
+  member declares `[lints] workspace = true`.
+
+There are no Cargo features: every build contains every surface.
 
 ## Layering
 
-Every interface is a thin adapter over the core. Nothing above the core line owns
-behavior; nothing below it knows about HTTP, terminals, or windows.
+Every interface is a thin adapter over the core. Nothing above the core owns behavior;
+nothing in it knows about HTTP, terminals, or windows.
 
 ```
       +------------+  +------------+  +------------+  +------------+  +---------------+
@@ -38,19 +41,19 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 | Module | Owns | Design doc |
 |---|---|---|
 | `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[embedding]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[import]`, `[jobs]`), unknown keys rejected, `QUACK_*` overrides | 13 |
-| `config::inspect` | the same file read outside `Config::load`: every recognized setting with the value in force and its origin, the file's unrecognized keys, the environment variables read (`quack config`) | 13 |
+| `config::inspect` | the file read outside `Config::load` (`quack config`): each recognized setting's value in force and origin, unrecognized keys, the environment variables read | 13 |
 | `crypto` | installs the aws-lc-rs provider once | 14 |
 | `vault` | data at rest sealed with HPKE under one key in the OS keychain, per purpose and subject; callers store the `Sealed` value | 10.3, 12 |
-| `oidc` | server sign-in through an OpenID Connect issuer (`SignIn`), verification of the issuer's access tokens presented as bearers (`SignIn::verify_bearer`), signed-in users' tokens sealed in `control.db` (`UserTokens`), and each person's own token for session renewal and on-behalf-of exchanges (`SubjectTokens`) | 10.2, 12 |
+| `oidc` | server sign-in through an OpenID Connect issuer (`SignIn`), bearer verification of the issuer's access tokens (`SignIn::verify_bearer`), signed-in users' tokens sealed in `control.db` (`UserTokens`), each person's own token for session renewal and on-behalf-of exchanges (`SubjectTokens`) | 10.2, 12 |
 | `doctor` | `quack doctor`'s checks over a `config::inspect` result: config file, crypto module, data directory mode, `control.db`, the workspace, each model's credential and a model-list probe of its provider, the server bind; creates nothing | 11.5 |
 | `error` | the `thiserror` enum every layer returns | |
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |
 | `migrations/*.sql` | `control.db` schema versions | [migrations.md](migrations.md) |
 | `storage::workspace` | the workspace DuckDB file: open with confinement and limits, the `_quack_` tables, statement classification, hybrid retrieval (cosine scan plus BM25 over `_quack_terms`), the document registry, query execution with faithful JSON values | 5.4, 6.1, 7.4 |
-| `storage::writer` | the workspace's one writer connection as an actor: a thread of its own runs the closures sent to it, interactive before background; callers await `run` / `run_at` | 4.1, 7.4 |
+| `storage::writer` | the workspace's one writer connection as an actor: its own thread runs the closures sent to it, interactive before background; callers await `run` / `run_at` | 4.1, 7.4 |
 | `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
 | `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the server's insert-only audit connection) | 5.3, 8 |
-| `embedding` | the role every text is embedded in (query, document, similarity), the prefixes each model family was trained with (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, and `refresh` | 6.1, 5.4 |
+| `embedding` | each text's embedding role (query, document, similarity), each model family's trained prefixes (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, `refresh` | 6.1, 5.4 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
 | `import` | rows from Postgres, SQLite, or an HTTP data file as a workspace table | 6.2 |
 | `analysis` | the agent loop as an event stream (`agent`, `events`), the tools (`tools`), the system prompt (`text_to_sql`), write policy, citations, the chart spec, the reranking hook (`rerank`) | 7, 9 |
@@ -76,12 +79,12 @@ behavior; nothing below it knows about HTTP, terminals, or windows.
 
 ## The storage boundary
 
-A workspace is one directory: `data.duckdb` plus `files/`. Everything classified about the
-workspace is inside it: the sessions, the ontology, the graph, the context, and the detail
-of what was done. `control.db` holds only who may open which workspace and the access audit
-(who, what resource by opaque id, outcome, channel, when). When adding a table, ask which
-side of the boundary it belongs on; if it can reveal workspace content, it goes in the
-DuckDB file with a `_quack_` prefix (design doc sections 5 and 12).
+A table that can reveal workspace content goes in the workspace DuckDB file with a
+`_quack_` prefix (design doc sections 5 and 12). A workspace is one directory:
+`data.duckdb` plus `files/`. It holds everything classified about the workspace: the
+sessions, the ontology, the graph, the context, and the detail of what was done.
+`control.db` holds only who may open which workspace and the access audit (who, what
+resource by opaque id, outcome, channel, when). Decide the side for every new table.
 
 ## Build and test
 
@@ -92,5 +95,5 @@ make test    # cargo test --workspace --all-features
 make deny    # cargo deny check (advisories, licenses, bans)
 ```
 
-New dependencies go in the root `[workspace.dependencies]` menu, pinned to the current
+Add new dependencies to the root `[workspace.dependencies]` menu, pinned to the current
 version, never inline in a member crate.

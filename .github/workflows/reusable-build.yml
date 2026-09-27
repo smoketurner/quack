@@ -654,6 +654,10 @@ jobs:
     needs: image
     if: inputs.push-image
     runs-on: ubuntu-latest
+    # Two tags in flight would race on the `latest` tag below; the second waits.
+    concurrency:
+      group: release-image-index
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write

@@ -5,79 +5,84 @@ Two databases carry schema, each versioned on its own side of the classification
 
 ## `control.db` (SQLite, server mode)
 
-Plain SQL files under `crates/quack-core/migrations/`, embedded at compile time by
-`sqlx::migrate!` and applied by `ControlPlane::open()`. Applied versions are recorded in
-`_sqlx_migrations` with a SHA-384 checksum of the file.
+`sqlx::migrate!` embeds the SQL files under `crates/quack-core/migrations/` at compile
+time, and `ControlPlane::open()` applies them. `_sqlx_migrations` records each applied
+version with a SHA-384 checksum of its file.
 
-- One file per version, named `NNNN_description.sql`. Add a version by adding a file; never
-  edit one that has shipped — sqlx compares checksums on open and refuses a database whose
-  recorded checksum no longer matches, which is the point of the format.
-- A migration file is frozen history. It must not be regenerated from the `Iden` enums in
-  `storage::queries`, because those track the *current* schema: renaming a column there
-  would silently change what an old version emits, so a freshly created database and one
-  migrated by an older binary would disagree while both reported the same version.
+- One file per version, named `NNNN_description.sql`. Add a version by adding a file;
+  never edit a shipped one. sqlx compares checksums on open and, by design, refuses a
+  database whose recorded checksum no longer matches.
+- A migration file is frozen history, never regenerated from the `Iden` enums in
+  `storage::queries`. Those track the *current* schema: renaming a column there would
+  silently change an old version's output, and a fresh database and one migrated by an
+  older binary would disagree while reporting the same version.
 - Each file runs in one transaction (SQLite has transactional DDL), so a failed migration
   leaves nothing half-applied.
 - UUID v7 primary keys, client-generated with `uuid::Uuid::now_v7()`; no `SERIAL`.
-- Runtime queries are still built with sea-query (`Iden` enums per table,
-  `SqliteQueryBuilder`) and run through sqlx wrapped in `AssertSqlSafe`, because sea-query
-  emits dynamic SQL strings. Handlers call typed store methods and never see SQL. Only DDL
-  moved to files.
-- Nothing that reveals workspace content: users, workspaces (name and label), membership,
-  tokens (API token hashes, and signed-in users' and model providers' OAuth tokens in
-  `user_tokens` and `provider_tokens`), each OAuth client's `private_key_jwt` signing key in
-  `client_keys` (version 7), the clients quack registered itself (RFC 7591) with their
-  registration access tokens in `client_registrations` (version 8), the tokens and keys all
-  sealed by the vault, and the access `audit_log`. The audit log is append-only; no code path may `UPDATE` or `DELETE` it.
+- Only DDL lives in files. Runtime queries use sea-query (`Iden` enums per table,
+  `SqliteQueryBuilder`) run through sqlx wrapped in `AssertSqlSafe`, since sea-query emits
+  dynamic SQL strings. Handlers call typed store methods and never see SQL.
+- Nothing that reveals workspace content. The database holds users, workspaces (name and
+  label), membership, tokens (API token hashes; signed-in users' and model providers' OAuth
+  tokens in `user_tokens` and `provider_tokens`), each OAuth client's `private_key_jwt`
+  signing key in `client_keys` (version 7), the clients quack registered itself (RFC 7591)
+  with their registration access tokens in `client_registrations` (version 8), and the
+  access `audit_log`. The vault seals every token and key. The audit log is append-only; no
+  code path may `UPDATE` or `DELETE` it.
 
 ### Databases created before the switch
 
 Versions 1 to 3 were applied by sea-query DDL builders that recorded progress in a
 `schema_version` table. `ControlPlane::open()` adopts such a database: it reads
 `MAX(version)` from `schema_version` and calls `Migrator::skip` for those versions, which
-records them in `_sqlx_migrations` without executing them. Replaying them would not be
-idempotent — version 2 drops and recreates `audit_log`, which would destroy the access
-record. The `schema_version` table is left in place; it is inert, and it keeps an older
-binary from re-running the same migrations against the same file.
+records them in `_sqlx_migrations` without running them. A replay would not be idempotent:
+version 2 drops and recreates `audit_log`, destroying the access record. The inert
+`schema_version` table stays, which keeps an older binary from re-running those migrations
+on the same file.
 
 ## Workspace DuckDB files
 
-Each workspace's `data.duckdb` carries the `_quack_` tables (documents, chunks, terms,
-ontology, graph, provenance, merges, sessions, messages, context, audit detail; design doc
-section 5.4) beside the user's tables and views. `WorkspaceDb::open()` creates what is
-missing and records `_quack_meta.schema_version`; a bump can trigger a rebuild, as version
-6 rebuilt the term index when stemming arrived, version 7 rebuilt it again to add the
-joined identifier term (`pol8841` alongside `pol` and `8841` for `POL-8841`; issue #77),
-version 8 tagged every stored vector with the embedding profile it was made under (the
-model the workspace had recorded, no prefixes), and version 9 marks documents still carrying
-the old `pending` default (or no status) as `error`, since a status is now read as one of
-`queued`, `processing`, `ready`, or `error` and those rows were never processed. Version 10
-adds `_quack_ontology_versions.acceptance` (`reviewed` or `auto`) and marks versions whose
-note starts `auto-accepted` as `auto`, which was the only record of an auto-accept before.
-Version 11 collapses opposing-orientation rows in `_quack_graph_merges`: before the dedup
-recognized a node pair in either orientation, a pair whose provenance flipped between
-resolution passes could land twice (`(keep, drop)` and `(drop, keep)`); on open each pair is
-reduced to one row, keeping the more-decided one so a reviewer's rejection survives.
-Phrase search (`"..."` in a keyword query) needed no version bump: it post-filters
-candidates by substring rather than adding term positions to `_quack_terms`.
+Each workspace's `data.duckdb` holds the `_quack_` tables beside the user's tables and
+views: documents, chunks, terms, ontology, graph, provenance, merges, sessions, messages,
+context, and audit detail (design doc section 5.4). `WorkspaceDb::open()` creates what is
+missing and records `_quack_meta.schema_version`. A version bump can trigger a rebuild on
+open:
 
-This side is deliberately *not* a numbered migration list, and stays in Rust: the DDL is
-parameterized by the workspace's embedding width (`FLOAT[{dim}]`, `graph::ddl(dim)`), and
-the version-keyed steps are data rebuilds (the term reindex), not SQL. It converges instead
-of migrating — `CREATE TABLE IF NOT EXISTS` plus `ADD COLUMN IF NOT EXISTS`, replayed on
-every open.
+- **6**: Rebuilt the term index when stemming arrived.
+- **7**: Rebuilt it again to add the joined identifier term (`pol8841` alongside `pol` and
+  `8841` for `POL-8841`; issue #77).
+- **8**: Tagged every stored vector with the embedding profile it was made under (the model
+  the workspace had recorded, no prefixes).
+- **9**: Marks documents still carrying the old `pending` default (or no status) as `error`:
+  a status is now one of `queued`, `processing`, `ready`, or `error`, and those rows were
+  never processed.
+- **10**: Adds `_quack_ontology_versions.acceptance` (`reviewed` or `auto`) and marks
+  versions whose note starts `auto-accepted` as `auto`, the only earlier record of an
+  auto-accept.
+- **11**: Collapses opposing-orientation rows in `_quack_graph_merges`. Before the dedup
+  matched a node pair in either orientation, a pair whose provenance flipped between
+  resolution passes could land twice (`(keep, drop)` and `(drop, keep)`). Each pair keeps
+  one row, the more-decided one, so a reviewer's rejection survives.
+
+Phrase search (`"..."` in a keyword query) needed no bump: it post-filters candidates by
+substring instead of adding term positions to `_quack_terms`.
+
+This side is *not* a numbered migration list. It stays in Rust because the DDL is
+parameterized by the embedding width (`FLOAT[{dim}]`, `graph::ddl(dim)`) and the
+version-keyed steps are data rebuilds (the term reindex), not SQL. It converges instead:
+every open replays `CREATE TABLE IF NOT EXISTS` plus `ADD COLUMN IF NOT EXISTS`.
 
 - Internal statements are constant strings with `duckdb::params!` bindings. The only
   interpolated values are identifiers through `quote_ident` and the validated `FLOAT[N]`
   embedding width. sea-query is not used here: its SQLite backend cannot express DuckDB's
   arrays or recursive CTEs.
-- Every internal table is prefixed `_quack_` so it is hidden from the agent's table listing
-  and refused in user and agent SQL.
-- The embedding dimension is fixed per workspace and recorded in `_quack_meta`; a schema
-  version never changes it. Changing the embedding model, its width, or its input
-  prefixes leaves vectors stale, never dropped on open; `quack embeddings refresh` brings them up to
-  date, retyping the vector columns first when the width changed.
+- The `_quack_` prefix hides every internal table from the agent's table listing, and user
+  and agent SQL referencing one is refused.
+- The embedding dimension is fixed per workspace and recorded in `_quack_meta`; no schema
+  version changes it. A new embedding model, width, or input prefix leaves vectors stale,
+  never dropped on open; `quack embeddings refresh` updates them, retyping the vector
+  columns first when the width changed.
 - The ontology and the workspace context are versioned as data
   (`_quack_ontology_versions`, `_quack_context`), not by schema versions.
-- A workspace directory is portable: every version must open a file created by an older
-  binary on another machine. User tables and views are never touched.
+- A workspace directory is portable: every version must open a file an older binary created
+  on another machine. User tables and views are never touched.
