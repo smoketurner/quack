@@ -42,7 +42,8 @@ Workspace members are auto-detected from `Cargo.toml`. Track these logical subsy
 - Sessions: `cargo run --bin quack -- sessions [--format json]`, `export ID [--sql|--markdown]`,
   `-p ... -c` / `-r ID`
 - TUI: `cargo run --bin quack -- -w <workspace>` (no arguments, needs a TTY)
-- Target (design doc section 11): `quack serve`, `quack mcp`, `quack desktop`
+- Server: `cargo run --bin quack -- serve [--bind ADDR] [--local]`; MCP: `cargo run --bin quack -- mcp [-w ws]`
+- Planned (design doc section 11.6): `quack desktop`
 
 ## Critical Paths
 
@@ -63,7 +64,7 @@ Features prone to silent breakage — live-test before any PR that touches them:
 - Citation validation: `[n]` markers (also `【n】` and `[^n]`) not registered this turn are
   stripped; the rest are renumbered from 1 and listed as sources
 - Print mode must never hold the stdout or stderr lock across an await: the tracing
-  subscriber writes to stderr from the agent's threads (deadlock seen live in #20)
+  subscriber writes to stderr from the agent's threads, so holding the lock deadlocks
 - Pinned documents injected in full within `[retrieval].pinned_token_budget`
 - Chart spec (`analysis::chart::ChartSpec`, design doc section 9) is the only chart
   format: bar, line, scatter, pie; at most 200 points; rendered by ratatui and stored on
@@ -79,8 +80,8 @@ Features prone to silent breakage — live-test before any PR that touches them:
 - aws-lc-rs default crypto provider installed exactly once at startup
 
 The implementation rules behind these paths are the review gates in
-[`code-standards.md`](code-standards.md); the full stack patterns are the `docs/` table in
-[`README.md`](../../README.md). Read them before changing the code behind any path above.
+[`code-standards.md`](code-standards.md); the full stack patterns are the `docs/` guides
+listed under "Where to read more" in `CLAUDE.md`. Read them before changing the code behind any path above.
 
 ## Environment Setup
 

@@ -23,8 +23,9 @@ and code — this file is the gate, the doc is the detail.
       beside the binary. The Linux build needs `cmake`, `go`, and
       `AWS_LC_FIPS_SYS_CC=clang`/`CXX=clang++`; `crypto::install_default_provider` logs the
       module it installed and a test asserts the gating (`docs/crypto.md`).
-- [ ] Binaries install the default provider **once** at the top of `main`
-      (`aws_lc_rs::default_provider().install_default()`), before any TLS use.
+- [ ] Binaries install the default provider **once** at the top of `main` by calling
+      `quack_core::crypto::install_default_provider()` (it installs
+      `rustls::crypto::aws_lc_rs::default_provider()`), before any TLS use.
 - [ ] After touching TLS deps: `cargo tree -i ring` and `cargo tree -i openssl-sys` return no
       match; `cargo deny check` passes.
 

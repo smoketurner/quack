@@ -39,8 +39,8 @@ deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.98.1 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
 crates/               # quack-core (engine), quack (the binary) — see crates/README.md
-docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd
-.claude/rules/        # branching, commits, continuous-improvement conventions
+docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication
+.claude/rules/        # code-standards and development-discipline gates; branching, commits, continuous-improvement conventions
 ```
 
 ## Conventions
@@ -151,7 +151,7 @@ background job kind). Callers await `Writer::run` (or the server's `with_db`); n
 locks the writer. Ingestion, import, extraction, `graph_cli`, and `ontology_cli` take
 `&Writer` (the CLI spawns one per command, like the server and the terminal) and send
 one step at a time, rendering command output into a buffer on the writer's thread
-(`graph_cli::rendered`); file parsing runs on the blocking pool, so every job, the
+(`graph_cli::RenderOnWriter`); file parsing runs on the blocking pool, so every job, the
 terminal's included, is a plain task on the runtime. Tests that also read through a
 `WorkspaceDb` give the pipeline a writer over its `try_clone_reader` connection.
 
@@ -335,8 +335,8 @@ and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `t
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits) and
 htmx and ECharts are vendored (`docs/web-ui.md`). Tests drive the router with
-`tower::ServiceExt::oneshot` and no model. Target CLI (`quack -p`, `quack serve`, `quack mcp`,
-`quack ontology propose`, ...) is in design doc section 11.
+`tower::ServiceExt::oneshot` and no model. The full CLI (`quack -p`, `quack serve`, `quack mcp`,
+`quack ontology propose`, ...) is specified in design doc section 11.
 
 ## Common commands
 
@@ -354,7 +354,7 @@ make image     # the quack serve container image from source (docker buildx)
 make help      # list targets
 ```
 
-Run a specific test (once at least one crate exists):
+Run a specific test:
 
 ```bash
 cargo test -p <crate> <test_name>    # one test (name filter) in one crate
