@@ -1,14 +1,10 @@
 # Authentication
 
-This document explains how quack proves identity in two directions. Inbound, people and
-programs prove to `quack serve` who they are. Outbound, quack proves to each model provider
-who is calling: quack itself, or the person who made the request. An operator configures
-the two directions separately. `[server]` and `[server.oidc]` control inbound
-authentication, and `[providers.NAME]` controls outbound. The two directions can share one
-identity provider, but neither requires the other.
-
-Design doc sections 10.2 and 12 record why quack works this way. [`crypto.md`](crypto.md)
-covers the cryptography.
+quack proves identity in two directions. Inbound, people and programs prove who they are to
+`quack serve` (`[server]`, `[server.oidc]`). Outbound, quack proves to each model provider
+(`[providers.NAME]`) who is calling: quack itself, or the person who made the request. The
+two can share one identity provider; neither requires the other. Design doc sections 10.2 and
+12 record the reasoning; [`crypto.md`](crypto.md) covers the cryptography.
 
 ## Terms
 
@@ -52,37 +48,34 @@ covers the cryptography.
 ### Which interfaces authenticate
 
 Only `quack serve` authenticates callers. The terminal session, print mode (`-p` and `-q`),
-`quack ingest`, and `quack mcp` on stdio run as the operating-system user who starts them.
-Anyone who can run the binary against a data directory can read everything in it. quack
-therefore creates that directory with mode `0700`, and `quack doctor` warns when other users
-can read it. `control.db` does not audit these interfaces.
+`quack ingest`, and `quack mcp` on stdio run as the operating-system user who starts them,
+unaudited in `control.db`. Anyone who can run the binary against a data directory can read
+all of it, so quack creates that directory with mode `0700` and `quack doctor` warns when
+other users can read it.
 
-`quack serve --local` turns authentication off. One implicit owner holds every workspace,
-and the server refuses to bind any address other than loopback. This mode serves one person
-who wants the browser on their own machine.
+`quack serve --local` turns authentication off, for one person's own browser. One implicit
+owner holds every workspace, and the server refuses to bind any address but loopback.
 
 ### How `quack serve` decides who is calling
 
 One extractor, `server::auth`, handles every request to the REST API, the MCP endpoint, and
-the web user interface (UI). It reads the bearer from the `Authorization: Bearer` header, or
-else the `quack_session` cookie, and tries three kinds of credential in this order:
+the web user interface (UI). It takes the bearer from the `Authorization: Bearer` header, else
+the `quack_session` cookie, and tries three kinds of credential in order:
 
 1. A session (`qs_…`), which a password login or an OpenID Connect sign-in opened.
 2. An identity-provider access token, when `[server.oidc].audience` is set and the bearer
    has the three dot-separated parts of a JWT.
 3. An API token (`qk_…`).
 
-A request that matches none of them receives `401`. When quack acts as a protected resource
-(described below), that `401` also tells the client where to obtain a token. Web pages
-redirect to `/login` instead of returning `401`.
+A request that matches none gets `401`, which also names where to obtain a token when quack
+acts as a protected resource (below). Web pages redirect to `/login` instead.
 
-Workspace membership, not the kind of credential, decides what an authenticated caller may
-do. Each member holds one role per workspace: `viewer`, `member`, or `owner`. The
-server-wide admin flag lets a user manage users, workspaces, and membership, but it never
-grants access to workspace content. An API token also carries scopes (`read`, `write`,
-`admin`) and works in one workspace only. Every request that touches a workspace, including
-a denied one, writes an access row to `control.db`'s `audit_log` and a detail row inside
-that workspace's own file (design doc 12).
+Workspace membership, not the kind of credential, decides what a caller may do. Each member
+holds one role per workspace: `viewer`, `member`, or `owner`. The server-wide admin flag
+manages users, workspaces, and membership, never workspace content. An API token also carries
+scopes (`read`, `write`, `admin`) and works in one workspace only. Every request that touches
+a workspace, denied ones included, writes an access row to `control.db`'s `audit_log` and a
+detail row in that workspace's own file (design doc 12).
 
 ### Passwords and sessions
 
@@ -91,24 +84,23 @@ quack user add alice            # prompts for the password; reads stdin when it 
 quack user add admin --admin
 ```
 
-quack hashes passwords with argon2id, a password-hashing function built to resist guessing.
-The web form (`POST /login`) and the API (`POST /api/v1/auth/login`) both check the password
-and open a session. A session token is `qs_` followed by 32 random bytes. quack holds
-sessions in memory only, so a restart signs every user out.
-
-The session cookie carries `HttpOnly`, `SameSite=Lax`, and `Path=/`. It also carries
-`Secure` unless the request arrived from loopback. A TLS-terminating proxy on the same host
-also connects over loopback, so on loopback the cookie still carries `Secure` when
-`[server.oidc].redirect_uri` is an https URL, or when `[server].secure_cookies = "always"`
-(the default is `"auto"`). Set `"always"` behind a same-host proxy that serves https
-without `[server.oidc]`. quack never reads `X-Forwarded-Proto` for this, since any client
-can send it. The sign-in state cookie of `[server.oidc]` follows the same rule. A session ends 12 hours after login
+quack hashes passwords with argon2id. The web form (`POST /login`) and the API
+(`POST /api/v1/auth/login`) both check the password and open a session: `qs_` followed by 32
+random bytes, held in memory only, so a restart signs every user out. `POST /logout` (web) and
+`POST /api/v1/auth/logout` (API) end a session. So does 12 hours after login
 (`[server].session_max_age_hours`) or 120 minutes after its last request
-(`[server].session_idle_minutes`), whichever comes first. The two login routes accept 2
-requests per second from one peer address, with bursts of up to 10, in addition to the
-server-wide rate limit, which is also per address. Neither limit looks at the
-`Authorization` header, so a client cannot buy a fresh budget by changing it. `POST /logout` (web) and `POST /api/v1/auth/logout` (API) end a
-session.
+(`[server].session_idle_minutes`), whichever comes first.
+
+The session cookie carries `HttpOnly`, `SameSite=Lax`, `Path=/`, and, unless the request came
+from loopback, `Secure`. A same-host TLS-terminating proxy also connects over loopback, so
+there the cookie keeps `Secure` when `[server.oidc].redirect_uri` is https or
+`[server].secure_cookies = "always"` (default `"auto"`). Set `"always"` behind a same-host
+https proxy without `[server.oidc]`. quack ignores `X-Forwarded-Proto` here, since any client
+can send it. The `[server.oidc]` sign-in state cookie follows the same rule.
+
+The two login routes allow 2 requests per second per peer address, bursting to 10, on top of
+the per-address server-wide limit. Neither limit reads the `Authorization` header, so changing
+it buys no fresh budget.
 
 ### API tokens
 
@@ -119,14 +111,14 @@ quack token revoke -w sales HASH          # a prefix of the hash is enough
 ```
 
 An API token is `qk_` followed by 32 random bytes. quack shows it once and stores only its
-SHA-256 hash. The token acts as its user in one workspace, limited to its scopes. quack
-refuses and audits an expired or revoked token. Workspace owners can also create and revoke
-tokens on the workspace's Settings page.
+SHA-256 hash. It acts as its user in one workspace, limited to its scopes. quack refuses and
+audits an expired or revoked token. Workspace owners can also create and revoke tokens on the
+workspace's Settings page.
 
 ### Sign-in through the organization's identity provider
 
 With `[server.oidc]` set, the login page offers "Sign in with *issuer host*" above the
-password form. Password login continues to work beside it.
+password form, which keeps working.
 
 ```toml
 [server.oidc]
@@ -158,51 +150,44 @@ sequenceDiagram
     Q-->>B: a session cookie, and 303 to /workspaces
 ```
 
-When the issuer's discovery document lists a `pushed_authorization_request_endpoint`, quack
-pushes the sign-in request there first, as RFC 9126 describes, and authenticates the push
-the same way it authenticates at the token endpoint. The browser then carries only
-`client_id` and the `request_uri` the issuer returned, so no one can read or alter the PKCE
-challenge, the `state`, the `nonce`, or the redirect on the way. Without that endpoint the
-browser carries the request itself, as before. quack does the same for a provider's
-`authorization-code` login.
+If discovery lists a `pushed_authorization_request_endpoint`, quack pushes the sign-in
+request there first (RFC 9126), authenticated as at the token endpoint. The browser then
+carries only `client_id` and the returned `request_uri`, so nobody can read or alter the PKCE
+challenge, `state`, `nonce`, or redirect in transit. Otherwise the browser carries the
+request itself. A provider's `authorization-code` login works the same way.
 
-The callback must come from the browser that started the sign-in. quack compares the
-callback's `state` with a cookie it set on that browser when the sign-in began. A callback
-link that someone else started therefore cannot sign this browser in. A pending sign-in
-expires after 10 minutes, quack accepts each `state` once, and quack holds at most 10,000
-pending sign-ins at a time. When the redirect names an issuer in its `iss` parameter, that
-issuer must be the configured one; an issuer that advertises
-`authorization_response_iss_parameter_supported` must always send it (RFC 9207). This check
-stops a response from one server from passing as another's.
+quack binds the callback to the browser that started the sign-in: it compares the callback's
+`state` with a cookie set on that browser at the start. A callback link someone else started
+therefore cannot sign this browser in. A pending sign-in expires after 10 minutes, each
+`state` works once, and at most 10,000 are pending at a time. An `iss` parameter on the
+redirect must name the configured issuer, and an issuer that advertises
+`authorization_response_iss_parameter_supported` must always send it (RFC 9207). This stops
+one server's response from passing as another's.
 
-The ID token arrives from the token endpoint over TLS (Transport Layer Security). OpenID
-Connect Core 3.1.3.7 accepts that channel in place of a signature check. quack checks four
-claims instead. `iss` must match the discovery document. `aud` and `azp` must name quack's
-client. `exp` must not have passed, with 60 seconds of leeway. `nonce` must equal the value
-quack sent.
+The ID token arrives from the token endpoint over TLS (Transport Layer Security), which
+OpenID Connect Core 3.1.3.7 accepts in place of a signature check. quack checks four claims
+instead: `iss` matches the discovery document; `aud` and `azp` name quack's client; `exp` has
+not passed, with 60 seconds of leeway; and `nonce` equals the value quack sent.
 
-The claim named by `subject_claim` identifies the person. The default is `sub`. Entra ID
-gives one person a different `sub` in every application, so Entra deployments set `oid`.
-The first sign-in creates a user with no password, no admin flag, and no workspace
-memberships; the new user sees nothing until an owner adds them. quack takes the username
-from `preferred_username`, then `email`, then the subject. If another user already holds
-that name, the new user receives it with a suffix, so a sign-in never takes over an existing
-account by name.
+`subject_claim` (default `sub`) names the claim that identifies the person; Entra deployments
+set `oid` ([Provider notes](#provider-notes)). A first sign-in creates a user with no
+password, no admin flag, and no memberships, who sees nothing until an owner adds them. The
+username comes from `preferred_username`, then `email`, then the subject, with a suffix if
+taken, so a sign-in never takes over an existing account by name.
 
-quack keeps the person's tokens, including the refresh token, sealed in `control.db`. When
-the access token nears expiry, the person's next request renews it. If the issuer refuses
-the renewal, because it revoked the grant or disabled the account, every session the person
-holds ends. If the issuer cannot be reached, quack retries 60 seconds later and the session
-continues meanwhile. An issuer that returns no refresh token (no `offline_access`) leaves
-the session to quack's own 12-hour and 120-minute limits. Logging out of a person's last
-session deletes their stored tokens. `control.db`'s audit log records every sign-in as
-`login`, and every sign-in the issuer ended as a denied `session`.
+quack keeps the person's tokens, refresh token included, sealed in `control.db`, and renews
+the access token on the first request near its expiry. If the issuer refuses (revoked grant,
+disabled account), all the person's sessions end. If it is unreachable, quack retries after 60
+seconds and the session continues. Without a refresh token (no `offline_access`), only
+quack's 12-hour and 120-minute limits apply. Logging out of the last session deletes the
+stored tokens. `control.db`'s audit log records each sign-in as `login`, and each one the
+issuer ended as a denied `session`.
 
 ### Access tokens from the identity provider (quack as a protected resource)
 
-When `audience` is set, the API and MCP also accept access tokens that the identity provider
-issues for quack. A script or an MCP client such as Claude Code can then use a token it
-already holds, and no one creates or hands out a quack API token.
+With `audience` set, the API and MCP also accept access tokens the identity provider issues
+for quack. A script or an MCP client such as Claude Code then uses a token it already holds
+instead of a quack API token.
 
 ```toml
 [server.oidc]
@@ -210,21 +195,21 @@ already holds, and no one creates or hands out a quack API token.
 audience = "api://quack"   # the aud of access tokens for quack; see the provider notes
 ```
 
-quack verifies each token with `jsonwebtoken` on aws-lc-rs, against the keys published at
-the issuer's `jwks_uri`. It caches those keys for one hour. A token signed with an unknown
-key causes one fetch, at most once a minute, which covers key rotation without letting
-invalid tokens flood the issuer. quack accepts asymmetric signature algorithms only. It
-requires `iss` to be the issuer and `aud` to be the configured audience. `exp` must be in
-the future, with 60 seconds of leeway. The token must also carry a `scp` or `scope` claim.
-An ID token can carry the same `aud` as an access token but carries no scope, so this rule
-refuses ID tokens.
+quack verifies each token with `jsonwebtoken` on aws-lc-rs against the issuer's `jwks_uri`
+keys, cached for one hour. An unknown key triggers at most one refetch a minute: enough for
+key rotation, too few for invalid tokens to flood the issuer. quack accepts asymmetric
+signature algorithms only, and requires:
 
-The token identifies its user through `subject_claim`, as a sign-in does. One person
-therefore maps to one quack user however they arrive. quack creates a person it has not seen
-before with no access, and the token then carries that user's own memberships. quack answers
-a refused token with `401` and audits it as a denied `token`.
+- `iss` to be the issuer and `aud` the configured audience;
+- `exp` in the future, with 60 seconds of leeway;
+- a `scp` or `scope` claim. An ID token can carry the same `aud` as an access token but
+  carries no scope, so this rule refuses ID tokens.
 
-quack publishes where to obtain such a token, as OAuth 2.0 Protected Resource Metadata
+Like a sign-in, the token maps to its user through `subject_claim`, so one person is one
+quack user however they arrive. A new person gets a user with no access; the token then
+carries that user's memberships. A refused token gets `401` and a denied `token` audit row.
+
+quack publishes where to obtain such a token as OAuth 2.0 Protected Resource Metadata
 (RFC 9728):
 
 | Path | Describes |
@@ -241,9 +226,9 @@ HTTP/1.1 401 Unauthorized
 WWW-Authenticate: Bearer resource_metadata="https://quack.example.com/.well-known/oauth-protected-resource/mcp/v1/sales"
 ```
 
-When a caller presented a credential and quack refused it, the challenge adds
-`error="invalid_token"`. This is the discovery the MCP authorization specification expects.
-An MCP client pointed at `https://quack.example.com/mcp/v1/sales` without a token reads the
+When quack refused a presented credential, the challenge adds
+`error="invalid_token"`. This is the discovery the MCP authorization specification expects:
+an MCP client pointed at `https://quack.example.com/mcp/v1/sales` without a token reads the
 metadata, signs the user in with the issuer, and retries with the access token. Without
 `audience`, quack publishes nothing and treats a JWT bearer as an unknown API token.
 
@@ -263,14 +248,14 @@ auth = "api-key"
 api_key_env = "ANTHROPIC_API_KEY"
 ```
 
-quack reads an API key from the named environment variable and sends it as the bearer. It
+quack reads an API key from the named environment variable, sends it as the bearer, and
 stores nothing.
 
 ### OAuth as quack
 
-An endpoint behind an identity provider, such as Azure OpenAI with Entra ID or an internal
-gateway, needs an access token. With `auth = "oauth"`, quack obtains one and sends it as the
-bearer. The `grant` setting decides how quack obtains it:
+With `auth = "oauth"`, quack obtains an access token and sends it as the bearer, for an
+endpoint behind an identity provider such as Azure OpenAI with Entra ID or an internal
+gateway. `grant` decides how:
 
 | `grant` | Who signs in | How the token renews |
 |---|---|---|
@@ -300,44 +285,44 @@ quack auth status           # each OAuth provider: when its token expires, how i
 quack auth logout azure
 ```
 
-quack reuses a token while more than 60 seconds remain. It then renews the token under one
-lock, so concurrent requests share one renewal. Sometimes a person must sign in and cannot,
-because the caller is a server or print mode. quack then fails with "needs a login; run
-`quack auth login NAME`". The command-line interface (CLI) exits with code 4, and the
-server answers `503`. A `client-credentials` provider
-needs no login; its first request obtains a token, and `quack auth login` only checks the
-credentials. quack stores the token sealed in `control.db` (`provider_tokens`), so one login
-serves every later process that uses the same data directory, including `quack serve`.
+quack reuses a token while more than 60 seconds remain, then renews it under one lock that
+concurrent requests share. When a person must sign in but cannot (a server, or print mode),
+quack fails with "needs a login; run `quack auth login NAME`": the command-line interface
+(CLI) exits with code 4 and the server answers `503`. A `client-credentials` provider needs no
+login: its first request obtains a token, and `quack auth login` only checks the credentials.
+The token is sealed in `control.db` (`provider_tokens`), so one login serves every later
+process on that data directory, `quack serve` included.
 
-The renewal lock covers one process. Two processes that share a data directory, such as
-`quack serve` and a `quack -p` beside it, can both find the token expiring and both refresh
-it. Many issuers rotate refresh tokens: each refresh returns a new one and refuses the old.
-The process that refreshes second then presents a refresh token the first already used, and
-the issuer refuses it. On a refused refresh, quack reads the stored token again, and when
-another process has stored a different, unexpired token meanwhile, uses that one instead of
-asking for a login. This does not help with an issuer that treats the reuse of a refresh
-token as theft and revokes the whole token family, as Okta's and Auth0's refresh token
-rotation with reuse detection do: the reuse also revokes the token the first process just
-stored, and every process needs `quack auth login` again. With such an issuer, let one
-process do the refreshing: run the model calls through one long-lived process, such as
-`quack serve`, rather than several processes on one data directory.
+The renewal lock covers one process. Two processes on one data directory, such as `quack
+serve` and a `quack -p` beside it, can both refresh an expiring token. An issuer that rotates
+refresh tokens returns a new one on each refresh and refuses the old, so the second refresh
+fails. quack then rereads the stored token and uses it if another process stored a
+different, unexpired one meanwhile. That fails with reuse detection, as in Okta's and Auth0's
+refresh token rotation: the issuer treats the reuse as theft and revokes the whole token
+family, including the token the first process just stored, and every process needs `quack
+auth login` again. With such an issuer, make the model calls through one long-lived process,
+such as `quack serve`.
 
-`client_auth` sets how quack authenticates at the token endpoint. The default,
-`client_secret_post`, sends the secret in the request body, which Entra ID and Auth0 accept.
-`client_secret_basic` sends it in an HTTP Basic header, which Okta applications use by
-default. `private_key_jwt` sends no secret at all; the next section describes it. Without
-a secret and without `private_key_jwt`, quack is a public client and sends only its
-`client_id`. The setting applies to every grant and to `[server.oidc]` as well.
+`client_auth` sets how quack authenticates at the token endpoint, for every grant and for
+`[server.oidc]`:
+
+| `client_auth` | What quack sends |
+|---|---|
+| `client_secret_post` (the default) | the secret in the request body; Entra ID and Auth0 accept it |
+| `client_secret_basic` | the secret in an HTTP Basic header; Okta applications use it by default |
+| `private_key_jwt` | a signed assertion and no secret (next section) |
+
+With neither a secret nor `private_key_jwt`, quack is a public client and sends only its
+`client_id`.
 
 ### Client authentication with a key (`private_key_jwt`)
 
-A shared secret works only while it stays secret, and it has to be copied into quack's
-environment to be used. With `client_auth = "private_key_jwt"`, quack holds a private key
-that never leaves it, and the issuer holds only the public half. On every request to the
-token endpoint, and on every pushed authorization request, quack signs a new client
-assertion (RFC 7523 section 2.2) and sends it as `client_assertion`, with
-`client_assertion_type` set to `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
-and its `client_id`. It sends no `client_secret` and no HTTP Basic header.
+With `client_auth = "private_key_jwt"`, quack authenticates with a private key that never
+leaves it. The issuer holds only the public half, and no shared secret is copied into quack's
+environment. On every token-endpoint request and pushed authorization request, quack signs a
+new client assertion (RFC 7523 section 2.2) and sends it as `client_assertion`, with
+`client_assertion_type` set to `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and
+its `client_id`. It sends no `client_secret` and no HTTP Basic header.
 
 The assertion is a JWT signed with ES256 (the elliptic-curve signature on P-256 with
 SHA-256). Its header names the key by `kid`, the key's RFC 7638 thumbprint. Its claims are:
@@ -349,10 +334,10 @@ SHA-256). Its header names the key by `kid`, the key's RFC 7638 thumbprint. Its 
 | `jti` | a new UUID v7 |
 | `iat`, `exp` | now, and one minute later |
 
-The issuer records each `jti` and refuses it the second time, so quack signs every request
-anew, including a device-code poll and a retry. `client_secret_env` must be unset: quack
-refuses a configuration that names both. The key counts as a client credential, so the
-`client-credentials` and `on-behalf-of` grants accept it in place of a secret.
+The issuer refuses a reused `jti`, so quack signs every request anew, device-code polls and
+retries included. quack refuses a configuration that also sets `client_secret_env`. The key
+is a client credential, so the `client-credentials` and `on-behalf-of` grants accept it in
+place of a secret.
 
 ```bash
 quack auth jwks gateway     # the public key set of [providers.gateway.oauth]'s client
@@ -378,19 +363,18 @@ registration (its `jwks` field):
 }
 ```
 
-quack makes the key with aws-lc-rs the first time it is needed, whether by `quack auth
-jwks` or by a request, and keeps it in `control.db` (table `client_keys`), sealed by the
-vault like the tokens. It names the key after the client it authenticates: the issuer
-without a trailing slash, then the `client_id`. `[server.oidc]` and a provider that use the
-same client at the same issuer therefore share one key and one registration. A client that
-is not registered yet has no `client_id`, so its key waits under the issuer's name alone,
-and registering moves it (see [Registering the client from
-quack](#registering-the-client-from-quack)). Each process loads the key once. `quack auth
-status` shows the key's thumbprint for every client that uses `private_key_jwt`.
+quack makes the key with aws-lc-rs on first use (`quack auth jwks` or a request) and keeps it
+vault-sealed in `control.db` (table `client_keys`). The key's name is its client's: the
+issuer without a trailing slash, then the `client_id`. So `[server.oidc]` and a provider
+using the same client at the same issuer share one key and one registration. An unregistered
+client has no `client_id`; its key waits under the issuer's name alone until registration
+moves it ([Registering the client from quack](#registering-the-client-from-quack)). Each
+process loads the key once. `quack auth status` shows its thumbprint for every
+`private_key_jwt` client.
 
-Rotating the key takes two steps. For a client that quack registered itself (see the next
-section), quack updates the issuer at each step (RFC 7592); for a client registered by hand,
-in the issuer's console, it prints the key set to register there:
+Rotation takes two steps. At each, quack sends the key set to the issuer for a client it
+registered (RFC 7592), or prints it for a client registered by hand, to replace the set in
+the issuer's console.
 
 ```bash
 quack auth jwks --rotate gateway              # a new key beside the one in use
@@ -399,40 +383,33 @@ quack auth jwks --rotate --activate gateway   # sign with the new key; the issue
 
 Leave out the provider name for the `[server.oidc]` client, as with `quack auth jwks`.
 
-1. `quack auth jwks --rotate` makes a new key and keeps it in `client_keys` under its
-   replacement name, `next <issuer> <client_id>`. The issuer is given a key set holding both
-   the key in use and the new one: quack sends it for a client it registered, and prints it
-   for any other, to register in place of the one there. quack keeps signing with the key in
-   use, and running `--rotate` again sends or prints the same pair without making another
-   key. `quack auth status` shows the replacement waiting.
-2. Once the issuer holds both, `quack auth jwks --rotate --activate` puts the new key in
-   place of the old one and deletes the old one, in one transaction, and the issuer is given
-   the new key alone: quack sends it for a client it registered, and prints it for any
-   other, to register in place of the pair. Restart every running `quack serve` right
-   after: it loads the key once and signs with the old one, which the issuer no longer
-   accepts, until it restarts (for a client registered by hand, restart it before pasting).
-   Running `--activate` again sends or prints the key in use alone, so a failed update can
-   be retried.
+1. `--rotate` stores a new key in `client_keys` under its replacement name,
+   `next <issuer> <client_id>`, and gives the issuer the key in use plus the new one. quack
+   keeps signing with the key in use. Repeating `--rotate` sends or prints the same pair
+   without making another key. `quack auth status` shows the replacement waiting.
+2. Once the issuer holds both, `--rotate --activate` swaps in the new key and deletes the old
+   one in one transaction, and gives the issuer the new key alone. Restart every running
+   `quack serve` right after (for a client registered by hand, before pasting): each loaded
+   the old key once, and the issuer no longer accepts it. Repeating `--activate` sends or
+   prints the key in use alone, so a failed update can be retried.
 
-If the vault key is lost, the stored key cannot be opened. quack then makes a new key on
-its next request and logs a warning that the new public key must be registered (`quack auth
-jwks`); until it is, the issuer refuses quack's assertions with `invalid_client`.
+If the vault key is lost, quack cannot open the stored key. It makes a new key on its next
+request and logs a warning to register the new public key (`quack auth jwks`). Until then the
+issuer refuses quack's assertions with `invalid_client`.
 
-quack reads the issuer's endpoints from `{issuer_url}/.well-known/openid-configuration`. If
-that document does not exist, quack reads the OAuth 2.0 Authorization Server Metadata that
-RFC 8414 defines, at `/.well-known/oauth-authorization-server` placed before the issuer's
-path. Either document must name the configured issuer, and the browser flow's redirect must
-satisfy the RFC 9207 check described for sign-in.
+quack reads the issuer's endpoints from `{issuer_url}/.well-known/openid-configuration`, or,
+if that does not exist, from the OAuth 2.0 Authorization Server Metadata of RFC 8414, at
+`/.well-known/oauth-authorization-server` placed before the issuer's path. Either document
+must name the configured issuer, and the browser flow's redirect must pass the RFC 9207 check
+described for sign-in.
 
 ### Registering the client from quack
 
-Many issuers let a client register itself: the issuer lists a `registration_endpoint` in
-its discovery document, and the client posts its metadata there (Dynamic Client
-Registration, RFC 7591). The answer carries the new `client_id`, and usually a
-`registration_access_token` and a `registration_client_uri` with which the client can later
-read, update, or delete its registration (RFC 7592). `quack auth register` uses this to
-create a `private_key_jwt` client, so nobody copies a key into a console or a `client_id`
-back into the file.
+`quack auth register` creates a `private_key_jwt` client by posting its metadata to the
+`registration_endpoint` in the issuer's discovery document (Dynamic Client Registration, RFC
+7591), so nobody copies a key into a console or a `client_id` back into the file. The answer
+carries the new `client_id`, and usually a `registration_access_token` and a
+`registration_client_uri` to read, update, or delete the registration later (RFC 7592).
 
 Leave `client_id` out of every section the registered client should serve, and set
 `client_auth = "private_key_jwt"` in each; quack refuses a section with neither a
@@ -450,9 +427,9 @@ quack auth jwks --rotate                    # a new key beside the old, sent to 
 quack auth unregister                       # delete the client at the issuer, then locally
 ```
 
-`quack auth register` works out the issuer on its own when all the sections without a
-`client_id` share one; with several, name one with `--issuer`. It then makes the client's
-key and builds the request from the configuration:
+`quack auth register` finds the issuer itself when all the sections without a `client_id`
+share one; with several, name one with `--issuer`. It then makes the client's key and builds
+the request from the configuration:
 
 | Field | Value |
 |---|---|
@@ -465,96 +442,89 @@ key and builds the request from the configuration:
 | `client_name` | `--name`, `quack` by default |
 
 The request never asks for `dpop_bound_access_tokens` or
-`tls_client_certificate_bound_access_tokens`. Tokens bound that way must be presented with
-a proof on every request, which model APIs cannot take. A provider that logs in through the
-loopback listener cannot share a registration with the `[server.oidc]` callback: OpenID
-Connect Dynamic Client Registration 1.0 section 2 lets a native client register only
-custom-scheme or loopback redirects, so it cannot take the https callback, and lets an
-issuer reject an `http` redirect on any other client. quack refuses that combination and
-names the provider, which then needs a `client_id` of its own.
+`tls_client_certificate_bound_access_tokens`: a bound token needs a proof on every request,
+which model APIs cannot take. A provider that logs in through the loopback listener cannot
+share a registration with the `[server.oidc]` callback: OpenID Connect Dynamic Client
+Registration 1.0 section 2 lets a native client register only custom-scheme or loopback
+redirects, and lets an issuer reject an `http` redirect on any other client. quack refuses
+that combination and names the provider, which then needs its own `client_id`.
 
-Who the client belongs to depends on what authorizes the registration:
+What authorizes the registration decides who owns the client:
 
 - **Signing in** (the default; `--device-code` forces the device-code flow). An issuer that
-  takes the registration's bearer as the client's owner needs a token of the person's own,
-  and a person rarely has one to hand. quack registers a temporary public client (a native
-  app with no secret, PKCE, and a loopback redirect on a free port) and signs the person in
-  through it, in the browser or with a device code over SSH. It registers the real client
-  with that token, which it keeps nowhere, and then deletes the temporary client (RFC 7592),
-  which also ends that sign-in. quack keeps the temporary client's record, sealed, in
-  `control.db` from its registration until it is deleted, so a run that is interrupted
-  (Ctrl-C deletes it on the way out) or whose delete the issuer refuses leaves something to
-  delete it with: the next `quack auth register` deletes it first, and `quack doctor` names
-  it until then. Until it is deleted,
-  anyone with an account at the issuer can sign in to it.
+  makes the registration's bearer the client's owner needs the person's own token, which
+  people rarely have to hand. quack registers a temporary public client (a native app with no
+  secret, PKCE, and a loopback redirect on a free port) and signs the person in through it,
+  in the browser or with a device code over SSH. It registers the real client with that
+  token, stores the token nowhere, then deletes the temporary client (RFC 7592), ending that
+  sign-in. Until then, anyone with an account at the issuer can sign in to it, so quack keeps
+  its record sealed in `control.db`. After an interrupted run (Ctrl-C deletes it on the way
+  out) or a refused delete, the next `quack auth register` deletes it first, and `quack
+  doctor` names it meanwhile.
 - **An access token** (`--token-env VAR`): the environment variable holds the bearer, such
   as the initial access token some issuers require.
 - **Nothing** (`--open`). quack warns that an open registration may create a client anyone
-  with an account at the issuer can use, and asks before it goes ahead; `--yes` answers for
-  it.
+  with an account at the issuer can use, and asks first; `--yes` answers for it.
 
-Without `--token-env` or `--open`, quack signs the person in wherever the issuer's discovery
-document advertises what that needs: a `registration_endpoint`, `none` in
-`token_endpoint_auth_methods_supported` (the temporary client is public), and `S256` in
-`code_challenge_methods_supported`. RFC 8414 section 2 makes `client_secret_basic` the
-default when the first list is omitted, and says of the second: "If omitted, the
-authorization server does not support PKCE." An issuer lacking any of them is refused,
-with what it lacks and the other two choices named: quack never registers an open client
-unless told to, since that client could be every user's. Vouch advertises all three, on
+Without `--token-env` or `--open`, quack signs the person in only if discovery advertises a
+`registration_endpoint`, `none` in `token_endpoint_auth_methods_supported` (the temporary
+client is public), and `S256` in `code_challenge_methods_supported`. RFC 8414 section 2 makes
+`client_secret_basic` the default when the first list is omitted, and says of the second:
+"If omitted, the authorization server does not support PKCE." quack refuses an issuer lacking
+any of them, naming what is missing and the other two choices. It never registers an open
+client unasked, since that client could be every user's. Vouch advertises all three, on
 `vouch.sh` or its own domain.
 
-quack keeps the result in `control.db`, table `client_registrations`, under the issuer's
-name: the `client_id`, the `registration_client_uri`, and the `registration_access_token`,
-sealed by the vault like the other tokens. The key moves from the issuer's name, where it
-waited for the registration, to `<issuer> <client_id>` in the same transaction. Every
-section without a `client_id` reads it from there, and `quack config` shows the value with
-the origin `registration`. `quack serve` refuses to start when such a section's issuer has
-no registration, and any other command fails on first use with an error that names `quack
-auth register`. You can also write the registered `client_id` into the file; quack still
-manages the client, because its id matches the registration.
+quack stores the result in `control.db`, table `client_registrations`, under the issuer's
+name: the `client_id`, the `registration_client_uri`, and the vault-sealed
+`registration_access_token`. The same transaction renames the key from the issuer's name to
+`<issuer> <client_id>`. Every section without a `client_id` reads it from there, and `quack
+config` shows its origin as `registration`. If such a section's issuer has no registration,
+`quack serve` refuses to start and other commands fail on first use, naming `quack auth
+register`. Writing the registered `client_id` into the file also works; quack still manages
+the client, since the id matches the registration.
 
-`--replace` registers a new client with a new key and keeps it, then deletes the old client
-at the issuer (an RFC 7592 `DELETE` with its registration access token), so a failure never
-leaves quack without a client. A delete the issuer refuses leaves the old client there, and
-quack says so; one the issuer no longer knows is already gone. Anything else configured with
-the old `client_id` stops working.
+`--replace` registers and keeps a new client with a new key before deleting the old one at
+the issuer (an RFC 7592 `DELETE` with its registration access token), so a failure never
+leaves quack without a client. quack reports a refused delete, which leaves the old client in
+place; one the issuer no longer knows is already gone. Anything else configured with the old
+`client_id` stops working.
 
-Two registrations at one issuer never overwrite each other's record: whichever keeps its
-client second deletes that client at the issuer again and stops.
+Two registrations at one issuer never overwrite each other's record: the one that keeps its
+client second deletes that client at the issuer and stops.
 
-A registered client's key rotates in the two steps [Client authentication with a
-key](#client-authentication-with-a-key-private_key_jwt) describes, with quack updating the
-issuer at each. Each update reads the registration back (RFC 7592
-`GET`) and sends all of it back with the new `jwks` and the `client_id` (RFC 7592 `PUT`),
-since an update replaces every field the issuer holds. When the issuer answers with a new
-registration access token, quack keeps that one.
+A registered client's key rotates as in [Client authentication with a
+key](#client-authentication-with-a-key-private_key_jwt). Each update reads the registration
+(RFC 7592 `GET`) and sends all of it back with the new `jwks` and the `client_id` (RFC 7592
+`PUT`), since an update replaces every field the issuer holds. quack keeps any new
+registration access token the issuer returns.
 
 `quack auth unregister` deletes the client at the issuer, then the registration and the key.
-`quack doctor` checks that every section without a `client_id` has a registration, and,
-unless `--offline`, that the issuer still describes the client at its
-`registration_client_uri`.
+`quack doctor` checks that every section without a `client_id` has a registration and, unless
+`--offline`, that the issuer still describes the client at its `registration_client_uri`.
 
-`quack auth register --print` shows the whole request as JSON and sends nothing. A client
-registered by hand is not recorded: put the `client_id` the issuer gave in each section, run
-`quack auth jwks` for it, and register the key set it prints (see [Without registration:
-create the client in the console](#without-registration-create-the-client-in-the-console)).
-quack cannot manage such a client, since it never saw a registration access token, so its
-key rotates by hand, as described above.
+For a client registered by hand, put the issuer's `client_id` in each section, run `quack
+auth jwks`, and register the printed key set ([Without registration: create the client in the
+console](#without-registration-create-the-client-in-the-console)). quack records no such
+client and holds no registration access token for it, so its key rotates by hand.
 
-Vouch accepts dynamic registration, open or with a signed-in person's token (see
-[Recommended: on behalf of each person, with
-Vouch](#recommended-on-behalf-of-each-person-with-vouch)). Auth0 accepts it once Dynamic
-Client Registration is turned on for the tenant, and Okta with an initial access token or
-an API token as the bearer (`--token-env`). Microsoft Entra ID does not offer RFC 7591;
-register the client in the Azure portal and set `client_id`. An issuer that returns no
-registration access token leaves quack unable to rotate or delete the client; quack says so
-when it registers one.
+Issuer support for registration:
+
+- Vouch accepts it, open or with a signed-in person's token (see [Recommended: on behalf of
+  each person, with Vouch](#recommended-on-behalf-of-each-person-with-vouch)).
+- Auth0 accepts it once Dynamic Client Registration is turned on for the tenant.
+- Okta accepts it with an initial access token or an API token as the bearer (`--token-env`).
+- Microsoft Entra ID does not offer RFC 7591: register the client in the Azure portal and set
+  `client_id`.
+
+An issuer that returns no registration access token leaves quack unable to rotate or delete
+the client; quack says so when it registers one.
 
 ### OAuth on behalf of the person
 
 With `grant = "on-behalf-of"`, each request reaches the provider as the person who made it,
-not as quack. The model API's own logs, quotas, and access policies then see the individual
-user. This grant works only in `quack serve`.
+so the model API's own logs, quotas, and access policies see individual users. This grant
+works only in `quack serve`.
 
 ```toml
 [providers.gateway.oauth]
@@ -569,64 +539,67 @@ audience = "api://model-gateway"       # RFC 8693 audience (Okta, Auth0)
 # scopes = ["model.use"]
 ```
 
-For each request, quack takes the person's own access token for quack and exchanges it at
-the issuer for a token to the provider. The person's token is their stored sign-in, renewed
-when it is due, or else the identity-provider access token they presented as a bearer.
-quack keeps each person's exchanged token in memory and reuses it until 60 seconds before
-it expires.
+For each request, quack exchanges the person's access token for quack at the issuer for a
+token to the provider. The person's token is their stored sign-in, renewed when due, or else
+the identity-provider access token they presented as a bearer. quack caches each exchanged
+token in memory until 60 seconds before it expires.
 
 `exchange` chooses the request format:
 
 - `token-exchange`, the default, is OAuth 2.0 Token Exchange (RFC 8693), which Okta, Auth0,
   and Vouch implement. quack sends the person's token as `subject_token` of type
   `access_token`, asks for an access token back (`requested_token_type`), and adds `scope`,
-  `audience`, and `resource` when they are set. quack also sends its own client-credentials
-  token as `actor_token`, so the issued token names the person as its subject (`sub`) and
-  quack as the party acting for them (`act`). Setting `actor = false` omits the actor token
-  for an issuer that does not accept one, such as Vouch (see below).
+  `audience`, and `resource` when set. quack also sends its own client-credentials token as
+  `actor_token`, so the issued token names the person as its subject (`sub`) and quack as the
+  party acting for them (`act`). `actor = false` omits the actor token for an issuer that
+  does not accept one, such as Vouch (see [Why each setting](#why-each-setting)).
 - `entra` is Microsoft Entra ID's On-Behalf-Of flow: the `jwt-bearer` grant with the
   person's token as `assertion` and `requested_token_use=on_behalf_of`. Entra's flow has no
   actor token, so quack ignores `actor`.
 
-quack decides whom a request acts for as follows. A request to `quack serve` acts for its
-authenticated caller. A background job, such as the embeddings an upload triggers, acts for
-the user who submitted it, even when it runs hours later. An MCP `query` or `search` acts
-for the user of that MCP connection.
+Whom a request acts for:
 
-quack refuses a request that has no signed-in person behind it, such as one from the CLI,
-the terminal, or local mode. It also refuses a request whose person has no current
-identity-provider token, such as a password user who has never signed in through the
-issuer. The refusal names the provider and the reason, and it returns `403` from the server
-or exit code 4 from the CLI. quack never sends such a request as itself.
+- A request to `quack serve` acts for its authenticated caller.
+- A background job, such as the embeddings an upload triggers, acts for the user who
+  submitted it, even when it runs hours later.
+- An MCP `query` or `search` acts for the user of that MCP connection.
 
-`quack auth login` has nothing to do for this grant and says so. `quack auth status` reports
-the grant. When the issuer lists `grant_types_supported`, `quack doctor` checks that the
-list includes the configured exchange. With `actor = true` it also checks that quack can
-obtain its own client-credentials token (the actor). With `actor = false`, quack never runs
-the client-credentials grant for the provider, and `quack doctor` requests no token at all.
+quack refuses a request with no signed-in person behind it (the CLI, the terminal, local
+mode), or whose person has no current identity-provider token (such as a password user who
+never signed in through the issuer). The refusal names the provider and the reason: `403`
+from the server, exit code 4 from the CLI. quack never sends such a request as itself.
+
+`quack auth login` has nothing to do for this grant and says so; `quack auth status` reports
+the grant. `quack doctor` checks that the issuer's `grant_types_supported`, when listed,
+includes the configured exchange, and with `actor = true` that quack can obtain its own
+client-credentials token (the actor). With `actor = false`, quack never runs the
+client-credentials grant for the provider, and `quack doctor` requests no token at all.
 
 ### AWS (Bedrock)
 
 `bedrock` and `bedrock-mantle` providers sign requests with the default credential chain of
-the AWS SDK (software development kit), the same chain the AWS CLI uses. The chain checks
-four places in order. First come environment variables. Next comes the profile named by
-`aws_profile` (else `AWS_PROFILE`, else `default`), with its `role_arn`, `source_profile`,
-`credential_process`, and IAM (Identity and Access Management) Identity Center (`aws sso
-login`) settings. Then comes web identity on EKS (Elastic Kubernetes Service). Last come the
-instance roles of ECS (Elastic Container Service) and EC2 (Elastic Compute Cloud). quack
-stores nothing; the SDK caches and refreshes the credentials. Design doc 10.2 has the
+the AWS SDK (software development kit), the chain the AWS CLI uses. It checks, in order:
+
+1. environment variables;
+2. the profile named by `aws_profile` (else `AWS_PROFILE`, else `default`), with its
+   `role_arn`, `source_profile`, `credential_process`, and IAM (Identity and Access
+   Management) Identity Center (`aws sso login`) settings;
+3. web identity on EKS (Elastic Kubernetes Service);
+4. the instance roles of ECS (Elastic Container Service) and EC2 (Elastic Compute Cloud).
+
+quack stores nothing; the SDK caches and refreshes the credentials. Design doc 10.2 has the
 details.
 
 ## Recommended: on behalf of each person, with Vouch
 
-This is the setup to copy for reaching a model provider as each person, with
-[Vouch](https://vouch.sh) as the issuer. One confidential client serves both the sign-in to
-`quack serve` and the token exchange.
+Copy this setup to reach a model provider as each person, with [Vouch](https://vouch.sh) as
+the issuer. One confidential client serves both the sign-in to `quack serve` and the token
+exchange.
 
 ### Configure quack
 
-The client authenticates with a key that quack holds (`private_key_jwt`), so there is no
-shared secret. Leave `client_id` out: `quack auth register` fills it in.
+The client authenticates with a key quack holds (`private_key_jwt`), so there is no shared
+secret. Leave `client_id` out: `quack auth register` fills it in.
 
 ```toml
 [server.oidc]
@@ -649,8 +622,8 @@ actor = false
 # audience = "https://models.example.com"   # when the model API expects one
 ```
 
-Both sections name the same issuer and no `client_id`, so one registration serves both, with
-one key. Neither sets `client_secret_env`.
+Both sections name the same issuer and set neither `client_id` nor `client_secret_env`, so
+one registration and one key serve both.
 
 ### Register the client
 
@@ -658,17 +631,15 @@ one key. Neither sets `client_secret_env`.
 quack auth register
 ```
 
-quack opens the browser to sign you in to Vouch (with a device code instead over SSH, or
-with `--device-code`), registers the client as yours, and prints its client ID. It
-registers exactly what the two sections need: the sign-in callback, the
-`authorization_code` and token-exchange grants, `private_key_jwt` with quack's key, and
-neither DPoP nor mTLS binding. To sign you in, it registers a temporary public client and
-deletes it once the registration is done.
+quack signs you in to Vouch through a temporary public client it deletes afterwards (in the
+browser; with a device code over SSH or with `--device-code`), registers the client as yours,
+and prints its client ID. It registers exactly what the two sections need: the sign-in
+callback, the `authorization_code` and token-exchange grants, `private_key_jwt` with quack's
+key, and neither DPoP nor mTLS binding.
 
-Vouch records you as the client's owner, with access scope Personal, so only you can sign
-in to it until you widen it. Open it on your Applications page in the Vouch console
-(`https://us.vouch.sh/applications`), set **Access scope** to **Organization**, and save.
-This step is deliberately manual: RFC 7591 has no field for it, and it decides who in your
+Vouch records you as the owner, with access scope Personal, so only you can sign in until you
+widen it. On your Applications page in the Vouch console (`https://us.vouch.sh/applications`),
+set **Access scope** to **Organization** and save. This step is deliberately manual: RFC 7591 has no field for it, and it decides who in your
 organization can use quack.
 
 ### Start it
@@ -684,27 +655,26 @@ workspaces with `quack member add` or on the workspace's Settings page.
 
 ### Why each setting
 
-- **PKCE** makes a stolen authorization code useless, since only quack knows the verifier.
-- **PAR** keeps the sign-in request off the browser: Vouch's discovery lists
-  `https://us.vouch.sh/oauth/par`, so quack pushes the request there automatically.
-- **`private_key_jwt`**: only a holder of the client's key can turn a person's Vouch token
-  into a token for the model API, and the key never leaves quack. Vouch holds only its
-  public half, so there is no shared secret to copy, store, or leak.
+- **PKCE**: only quack knows the verifier, so a stolen authorization code is useless.
+- **PAR**: Vouch's discovery lists `https://us.vouch.sh/oauth/par`, so quack pushes the
+  sign-in request there and keeps it off the browser.
+- **`private_key_jwt`**: only the key's holder can turn a person's Vouch token into a model
+  API token, and there is no shared secret to copy, store, or leak.
 - **Standard profile, not FAPI 2.0**: a FAPI client must send a DPoP proof or a TLS client
-  certificate with every token request, so Vouch binds its tokens to a key, and the model
-  API behind an on-behalf-of provider, which takes bearer tokens, cannot use them.
-- **`actor = false`** is required: Vouch accepts an actor token only when it belongs to a
-  Vouch user, and quack's own token names a client, so Vouch would refuse the exchange with
-  "Actor token user not found". The issued token still names the person as its subject and
-  records quack's `client_id`.
+  certificate with every token request, so Vouch binds its tokens to a key. The model API
+  behind an on-behalf-of provider takes bearer tokens and cannot use them.
+- **`actor = false`** is required: Vouch accepts an actor token only from a Vouch user, and
+  quack's token names a client, so Vouch would refuse the exchange with "Actor token user not
+  found". The issued token still names the person as its subject and records quack's
+  `client_id`.
 
-Vouch offers only the `openid` and `email` scopes and issues no refresh tokens, so a
-sign-in lasts for Vouch's session. Its exchange accepts only tokens Vouch issued as the
-subject, so each person must have signed in to quack through Vouch.
+Vouch offers only the `openid` and `email` scopes and issues no refresh tokens, so a sign-in
+lasts for Vouch's session. Its exchange accepts only Vouch-issued subject tokens, so each
+person must have signed in to quack through Vouch.
 
 ### Rotate the key
 
-Rotate in two steps; quack updates Vouch itself (RFC 7592):
+quack updates Vouch at each of the two steps (RFC 7592):
 
 ```bash
 quack auth jwks --rotate              # Vouch holds the key in use and a new one
@@ -736,25 +706,23 @@ Vouch no longer accepts.
 
    Vouch issues no client secret for it.
 
-3. Add `client_id = "CLIENT_ID"` (the client ID from the console) to both sections, print
-   the key quack makes for that client, and paste it into the application's JWKS in place
-   of the one from step 1:
+3. Add `client_id = "CLIENT_ID"` (from the console) to both sections, print the key quack
+   makes for that client, and paste it into the application's JWKS, replacing step 1's:
 
    ```bash
    quack auth jwks
    ```
 
-quack did not register this client, so it cannot update it at Vouch: rotate its key with
-`quack auth jwks --rotate` and then `--rotate --activate`, pasting each key set it prints
-into the application's JWKS, as [Client authentication with a
-key](#client-authentication-with-a-key-private_key_jwt) describes.
+quack did not register this client, so it cannot update it at Vouch. Rotate its key with
+`quack auth jwks --rotate`, then `--rotate --activate`, pasting each key set it prints into
+the application's JWKS ([Client authentication with a
+key](#client-authentication-with-a-key-private_key_jwt)).
 
 ### With a client secret instead
 
-A Vouch deployment whose console has no Client authentication choice makes a non-FAPI Web
-application with a client secret only. Copy the client ID and the secret it shows once,
-export the secret, and in both sections add `client_id` and replace `client_auth =
-"private_key_jwt"` with:
+A Vouch console with no Client authentication choice gives a non-FAPI Web application a
+client secret only. Copy the client ID and the secret (shown once), export the secret, and in
+both sections add `client_id` and replace `client_auth = "private_key_jwt"` with:
 
 ```toml
 client_secret_env = "VOUCH_CLIENT_SECRET"
@@ -774,14 +742,14 @@ grant = "authorization-code"                    # the default
 # redirect_uri = "http://127.0.0.1:19876/callback"
 ```
 
-`quack auth login gateway` opens the browser and catches the redirect on a loopback
-listener, and PKCE protects the code. Register the loopback `redirect_uri` with the issuer.
-A secret or key would add nothing on a machine where the person can read it anyway.
+`quack auth login gateway` opens the browser, catches the redirect on a loopback listener,
+and protects the code with PKCE. Register the loopback `redirect_uri` with the issuer. A
+secret or key adds nothing where the person can read it anyway.
 
-Use `device-code` only on a headless machine, such as one reached over SSH with no local
-browser. A device code can be phished: an attacker starts a login, sends the victim the
-code, and receives the victim's token when the victim approves. With the browser flow, the
-token goes only to the listener that started the login.
+Use `device-code` only on a headless machine, such as one reached over SSH. A device code can
+be phished: an attacker starts a login, sends the victim the code, and receives the victim's
+token on approval. The browser flow sends the token only to the listener that started the
+login.
 
 ## Where quack keeps secrets
 
@@ -798,128 +766,123 @@ token goes only to the listener that started the login.
 | Client secrets and API keys | the environment variables the config names | the process environment |
 | AWS credentials | the AWS SDK's own locations | the SDK |
 
-The vault seals each value with HPKE, using the suite DHKEM(P-256, HKDF-SHA256),
-HKDF-SHA256, AES-256-GCM: a P-256 elliptic-curve key exchange, a SHA-256 key derivation, and
-AES-256 encryption with authentication. It binds each value to its purpose and its owner, so
-a sealed row copied to another user or provider fails to open. The vault key never sits in
-the database it protects.
+The vault seals each value with HPKE, suite DHKEM(P-256, HKDF-SHA256), HKDF-SHA256,
+AES-256-GCM: a P-256 elliptic-curve key exchange, a SHA-256 key derivation, and authenticated
+AES-256 encryption. It binds each value to its purpose and owner, so a sealed row copied to
+another user or provider fails to open. The vault key never sits in the database it protects.
 
-quack looks for the vault key in the keychain first and then in `vault.key`, and `quack auth
-status` reports the location in the same order. It writes `vault.key` only when the host has
-no usable keychain: no store can be installed, or, as under Docker's seccomp profile, no
-entry can be addressed. A keychain that exists but refuses access, because it is locked or
-quack is denied, is an error that names the keychain. quack does not fall back to the file
-in that case. The keychain may hold the key that sealed the stored tokens, so those would
-not open under a new key; and tokens sealed under a new key in `vault.key` would not open
-once the keychain answered again, since its key comes first. Either way people would have
-to sign in again. Unlock the keychain, or grant quack access, and retry.
+quack looks for the vault key in the keychain, then in `vault.key`, and `quack auth status`
+reports the location in that order. quack writes `vault.key` only when the host has no usable
+keychain: none can be installed, or no entry can be addressed (as under Docker's seccomp
+profile). A keychain that exists but refuses access (locked, or quack denied) is an error
+naming the keychain, never a fallback to the file. The keychain may hold the key that sealed
+the stored tokens, which would not open under a new key; and tokens sealed under a new key in
+`vault.key` would not open once the keychain answered again, since it comes first. Either way
+people would sign in again. Unlock the keychain, or grant quack access, and retry.
 
-Three operational consequences follow. First, Linux keeps the kernel keyring in memory, so
-after a reboot the vault key is gone: users must sign in again, and each OAuth provider
-needs `quack auth login` again. Second, Docker's default seccomp profile (the system-call
-filter on containers) blocks the keyring, so in a container quack writes the key to
-`vault.key` on the data volume. Third, a backup of `control.db` without the vault key cannot
-open the tokens in it, by design. Restore the key with the database, or plan for every user
-to sign in again.
+Operational consequences:
+
+- Linux keeps the kernel keyring in memory, so a reboot loses the vault key: users sign in
+  again, and each OAuth provider needs `quack auth login` again.
+- Docker's default seccomp profile (the system-call filter on containers) blocks the keyring,
+  so in a container quack writes the key to `vault.key` on the data volume.
+- A backup of `control.db` without the vault key cannot open the tokens in it, by design.
+  Restore the key with the database, or plan for every user to sign in again.
 
 ## Provider notes
 
-These settings come from each vendor's documentation as of September 2026. quack has not
-yet been tested against a live tenant of any of them.
+These settings come from each vendor's documentation as of September 2026. quack has not yet
+been tested against a live tenant of any of them.
 
 **Microsoft Entra ID.** Set `issuer_url` to
 `https://login.microsoftonline.com/{tenant_id}/v2.0`. Register
 `https://<server>/auth/oidc/callback` as a Web redirect URI, create a client secret for
-`client_secret_env`, and set `subject_claim = "oid"`, because Entra gives one person a
-different `sub` in each application. To accept access tokens, expose an API on the app
-registration. Set `requestedAccessTokenVersion` to `2` in its manifest; older manifests call
-the setting `accessTokenAcceptedVersion`. Version 1.0 tokens carry the issuer
-`https://sts.windows.net/{tenant_id}/`, which does not match. Set `audience` to the API's
-client ID, a GUID (globally unique identifier). A version 2.0 token's `aud` is always the
+`client_secret_env`, and set `subject_claim = "oid"`: Entra gives one person a different
+`sub` in each application. To accept access tokens, expose an API on the app registration.
+Set `requestedAccessTokenVersion` to `2` in its manifest (older manifests:
+`accessTokenAcceptedVersion`); version 1.0 tokens carry the non-matching issuer
+`https://sts.windows.net/{tenant_id}/`. Set `audience` to the API's
+client ID, a GUID (globally unique identifier): a version 2.0 token's `aud` is always the
 client ID, never the Application ID URI. Entra access tokens carry `scp`. For on-behalf-of,
 set `exchange = "entra"` and list the downstream API's scope, for example `scopes =
-["https://cognitiveservices.azure.com/.default"]`. The person's token must be an access
-token for quack's own API, so add that API's scope (for example
+["https://cognitiveservices.azure.com/.default"]`. The person's token must be an access token
+for quack's own API, so add that API's scope (for example
 `api://<quack-client-id>/access_as_user`) to `[server.oidc].scopes`.
 
-**Okta.** Use a custom authorization server, such as `https://{domain}/oauth2/default`. The
+**Okta.** Use a custom authorization server, such as `https://{domain}/oauth2/default`; the
 org authorization server issues access tokens only for Okta's own APIs. Enable the Refresh
 Token grant on the application so `offline_access` returns a refresh token. Set `audience`
-to the authorization server's Audience; for `default`, that is `api://default`. Okta access
-tokens carry `scp` as an array. For on-behalf-of, create an API Services application with
-the Token Exchange grant, set `client_auth = "client_secret_basic"` to match Okta's default,
-and set `audience` to the downstream authorization server's audience. Token exchange across
-two authorization servers requires Okta's trusted servers. It also requires an NHI
-(non-human identity) subscription bought or renewed on or after August 14, 2026.
+to the authorization server's Audience (`api://default` for `default`). Okta access tokens
+carry `scp` as an array. For on-behalf-of, create an API Services application with the Token
+Exchange grant, set `client_auth = "client_secret_basic"` to match Okta's default, and set
+`audience` to the downstream authorization server's audience. Token exchange across two
+authorization servers requires Okta's trusted servers, and an NHI (non-human identity)
+subscription bought or renewed on or after August 14, 2026.
 
 **Auth0.** Set `issuer_url` to `https://{tenant}.auth0.com/` or to your custom domain. Set
 `audience` to the API's Identifier, and enable "Allow Offline Access" on the API for refresh
-tokens. Auth0 issues a JWT access token only when the client asks for an audience.
-quack's own sign-in cannot ask for one yet. A client that obtains its own token, such as an
-MCP client, can use it with quack. For on-behalf-of, turn on On-Behalf-Of Token Exchange on
-quack's own client (the one that performs the exchange) and set `audience` to the
-downstream API's identifier.
+tokens. Auth0 issues a JWT access token only when the client asks for an audience, which
+quack's own sign-in cannot do yet; a client that obtains its own token, such as an MCP
+client, can use it with quack. For on-behalf-of, turn on On-Behalf-Of Token Exchange on
+quack's own client (the one that performs the exchange) and set `audience` to the downstream
+API's identifier.
 
 **Vouch** ([vouch.sh](https://vouch.sh)). See
-[Recommended: on behalf of each person, with Vouch](#recommended-on-behalf-of-each-person-with-vouch)
-above.
+[Recommended: on behalf of each person, with Vouch](#recommended-on-behalf-of-each-person-with-vouch).
 
 ## Troubleshooting
 
-`quack doctor` checks each configured piece. For every model provider it confirms that the
-endpoint answers, that the credential is accepted, and that the model is listed. For an
-on-behalf-of provider it checks quack's own actor token instead of a user's, and with
-`actor = false` it checks only that the issuer lists the exchange. For
-`[server.oidc]` it checks that the secret variable is set, that the issuer answers discovery
-under its configured name, and, with `audience`, how many signing keys the issuer publishes.
+`quack doctor` checks each configured piece:
+
+- every model provider: the endpoint answers, the credential is accepted, the model is
+  listed. An on-behalf-of provider is checked with quack's own actor token, not a user's, or
+  with `actor = false` only for the issuer listing the exchange.
+- `[server.oidc]`: the secret variable is set, the issuer answers discovery under its
+  configured name, and, with `audience`, how many signing keys the issuer publishes.
+
 `--offline` skips every network check. `quack config` lists every setting in force and where
 each value came from.
 
 Seven errors and their fixes:
 
 - "provider 'X' needs a login" (exit 4, or `503` from the server). Run
-  `quack auth login X` as the operating-system user the server runs as. Use the same data
-  directory.
-- "provider 'X' acts on behalf of the signed-in person and could not". The request came from
+  `quack auth login X` as the server's operating-system user, with the same data directory.
+- "provider 'X' acts on behalf of the signed-in person and could not": the request came from
   the CLI, the terminal, local mode, or a user with no current identity-provider token. Sign
   in through the issuer, or use a provider that does not act on behalf of users.
 - "access token refused: InvalidAudience": the token's `aud` differs from
-  `[server.oidc].audience`. Decode the token (it is a JWT) and compare. For Entra ID, see
-  the client ID note above.
+  `[server.oidc].audience`. Decode the token (a JWT) and compare. For Entra ID, see
+  [Provider notes](#provider-notes).
 - "the discovery document for X names issuer …": `issuer_url` must match the issuer's own
   `issuer` value exactly, apart from a trailing slash.
 - "the sign-in could not be matched to this browser": the state cookie was missing. The
-  sign-in started in another browser or tab, or the browser used a different host name than
-  `redirect_uri`, so it did not send the cookie.
+  sign-in started in another browser or tab, or the browser used a host name other than
+  `redirect_uri`'s.
 - `invalid_client` with `client_auth = "private_key_jwt"`: the issuer does not have quack's
   current public key. Run `quack auth jwks` (with the provider name for a provider) and
-  register its output. Check the log for a warning that the key was replaced. After `quack
-  auth jwks --rotate --activate`, restart `quack serve`, which still signs with the old key
-  the issuer no longer accepts.
-- "the redirect names issuer …, not this one (RFC 9207)": the redirect came from a
-  different server than the configured issuer. Check `issuer_url`, and check for a proxy or
-  a mix of tenants.
+  register its output; the log warns if the key was replaced. After `quack auth jwks --rotate
+  --activate`, restart `quack serve`, which still signs with the old key.
+- "the redirect names issuer …, not this one (RFC 9207)": the redirect came from a server
+  other than the configured issuer. Check `issuer_url`, proxies, and mixed tenants.
 
 ## FAQ
 
-**Can password users and signed-in users coexist?** Yes. Both kinds of login open the same
-kind of session. On-behalf-of providers serve only users who have an identity-provider
-token.
+**Can password users and signed-in users coexist?** Yes. Both logins open the same kind of
+session. On-behalf-of providers serve only users with an identity-provider token.
 
 **Do users need a quack API token to use MCP?** Not when `[server.oidc].audience` is set. An
 MCP client can sign the user in with the identity provider and present that access token.
 
-**What does the model provider see for a background job?** With `grant = "on-behalf-of"`,
-it sees the user who submitted the job. With any other grant, it sees quack.
+**What does the model provider see for a background job?** With `grant = "on-behalf-of"`, it
+sees the user who submitted the job. With any other grant, it sees quack.
 
-**Why does quack refuse instead of falling back to its own identity?** A provider configured
-for on-behalf-of expects to see individual users. Sending some requests as quack would make
-its logs, quotas, and access policies wrong without anyone noticing.
+**Why does quack refuse instead of falling back to its own identity?** An on-behalf-of
+provider expects individual users. Sending some requests as quack would silently corrupt its
+logs, quotas, and access policies.
 
-**Does quack support DPoP?** No. DPoP (RFC 9449) binds a token to a key the client holds, so
-a stolen token is useless on its own. quack sends and accepts bearer tokens only. A token
-bound with DPoP must be presented with a fresh proof on every request, and model APIs accept
-bearer tokens, so a bound on-behalf-of token would be refused by the provider it is for.
-Issuers that support DPoP, Vouch among them, still issue bearer tokens to a client that sends
-no proof, so quack works with them unchanged. The key quack does hold, for
-`private_key_jwt`, authenticates quack to the issuer; it binds no token.
+**Does quack support DPoP?** No; quack sends and accepts bearer tokens only. DPoP makes a
+stolen token useless on its own, but a bound token needs a fresh proof on every request, so
+a model API that accepts bearer tokens would refuse a bound on-behalf-of token. Issuers that
+support DPoP, Vouch among them, still issue bearer tokens to a client that sends no proof, so
+quack works with them unchanged. The `private_key_jwt` key authenticates quack to the issuer;
+it binds no token.
