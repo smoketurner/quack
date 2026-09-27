@@ -28,13 +28,17 @@ cancelled run would leave behind.
     cancelling there would starve every other run's restore.
   - It does not cancel a `merge_group` run, because a cancelled required check drops the
     entry from the queue.
-- **`release.yml` queues.** Its group is the constant `release`, with `cancel-in-progress:
-  false`, so a second tag waits for the first. Two releases in flight would race on the
-  `push-by-digest` uploads to GHCR and on `imagetools create --tag latest`. A cancelled
-  release can leave digests pushed with no index. GitHub holds one pending run per group,
-  so a third release displaces a waiting second; tags are cut by hand, so this does not
-  arise. `reusable-build.yml` needs no group: a called workflow's jobs inherit the
-  caller's.
+- **`release.yml` cancels a run of the same tag and queues a run of another.** One group
+  cannot do both, so the groups are per job:
+  - `gates` and `build` share `release-<ref>` with `cancel-in-progress`. Tags are
+    immutable and a release is created once, so an older run of the same tag would only
+    fail at `publish`, after a full build.
+  - `publish`, `publish-packages`, and `homebrew` are never cancelled by a newer run.
+    After `gh release create`, cutting the run short would leave a release without its
+    packages or formula. A newer run of a tag already past `build` fails at `publish`.
+  - `publish-packages` (`release-packages`), `homebrew` (`release-homebrew`), and
+    `reusable-build.yml`'s `image-index` (`release-image-index`) queue on constant groups,
+    so two tags never race on the git pushes or on `imagetools create --tag latest`.
 
 `ci.yml` and `secure_workflows.yml` scope `push:` to `main`, so a branch with an open pull
 request runs each once, on `pull_request`.

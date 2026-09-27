@@ -19,18 +19,20 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# One release at a time, queued rather than cancelled. The group name is a
-# constant, not derived from the ref, so a second tag serialises behind the
-# first instead of running beside it: two releases in flight would race on the
-# push-by-digest uploads to GHCR and on the `imagetools create --tag latest` in
-# image-index. `cancel-in-progress` stays false because interrupting a release
-# is worse than delaying one — a cancelled run can leave digests pushed with no
-# index pointing at them. Note GitHub holds only one run pending per group, so a
-# third release queued behind a running one and a waiting one displaces the
-# waiting one; releases are hand-cut, so that is not a path we take.
-concurrency:
-  group: release
-  cancel-in-progress: false
+# No workflow-level group: a run of the tag being released is cancelled, a run
+# of another tag waits, and one group cannot do both. Each job that must not
+# overlap names its own group instead:
+#   - gates and build share `release-<ref>` with `cancel-in-progress`, so a
+#     second run of the same tag cancels the first one's build. Tags are
+#     immutable and the release is created once, so the older run could only
+#     have failed at publish anyway, after a full build.
+#   - publish, publish-packages, and homebrew are never cancelled by a newer
+#     run: once `gh release create` has run, cutting the rest short would leave
+#     a release without its packages or formula. publish-packages and homebrew
+#     queue on constant groups because two tags would race on the git push to
+#     smoketurner/packages and smoketurner/homebrew-tap; image-index in
+#     reusable-build.yml does the same for `imagetools create --tag latest`.
+#     A newer run of a tag already past build builds again and fails at publish.
 
 permissions: {}
 
@@ -51,6 +53,9 @@ jobs:
   gates:
     name: Release gates
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
     steps:
@@ -114,6 +119,9 @@ jobs:
   build:
     name: Build
     needs: [gates, version]
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
@@ -193,6 +201,9 @@ jobs:
     if: github.ref_type == 'tag'
     needs: [version, publish]
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-packages
+      cancel-in-progress: false
     permissions: {}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -283,6 +294,9 @@ jobs:
     if: github.ref_type == 'tag'
     needs: [version, publish]
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-homebrew
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
