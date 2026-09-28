@@ -138,40 +138,35 @@ pub enum Renewal {
     Revoked(String),
 }
 
-/// Who a token names, in an ID token or an access token alike.
+/// Who a token names, in an ID token or an access token alike: every claim
+/// the outer struct does not read, so any of them can name the person.
 #[derive(Debug, Deserialize)]
 struct Person {
-    sub: Option<String>,
-    preferred_username: Option<String>,
-    email: Option<String>,
-    /// Every other claim, for a `subject_claim` other than `sub`.
     #[serde(flatten)]
-    rest: serde_json::Map<String, serde_json::Value>,
+    claims: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Person {
-    /// The configured claim that names the person, when it is a non-empty
-    /// string.
-    fn subject(&self, claim: &str) -> Option<OidcSubject> {
-        let value = if claim == OidcConfig::DEFAULT_SUBJECT_CLAIM {
-            self.sub.as_deref()
-        } else {
-            self.rest.get(claim).and_then(serde_json::Value::as_str)
-        };
-        value
+    /// A claim's value, when it is a non-empty string.
+    fn text(&self, claim: &str) -> Option<&str> {
+        self.claims
+            .get(claim)
+            .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(OidcSubject::from)
+    }
+
+    /// The configured claim that names the person.
+    fn subject(&self, claim: &str) -> Option<OidcSubject> {
+        self.text(claim).map(OidcSubject::from)
     }
 
     /// A name for a new user: `preferred_username`, else `email`, else the
     /// subject.
     fn username(&self, subject: &OidcSubject) -> String {
-        [&self.preferred_username, &self.email]
+        ["preferred_username", "email"]
             .into_iter()
-            .flatten()
-            .map(|name| name.trim())
-            .find(|name| !name.is_empty())
+            .find_map(|claim| self.text(claim))
             .unwrap_or(subject.as_str())
             .to_owned()
     }
