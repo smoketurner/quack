@@ -262,6 +262,25 @@ enum Prompt {
     Sql(String),
 }
 
+impl Prompt {
+    fn sql(&self) -> &str {
+        match self {
+            Self::Agent { request, .. } => &request.sql,
+            Self::Sql(sql) => sql,
+        }
+    }
+}
+
+/// What the permission overlay asks about: the front prompt, described when
+/// drawn so it never depends on what the transcript still shows.
+pub(crate) struct PendingWrite<'a> {
+    /// Who asks, named from the session on screen now.
+    pub(crate) heading: String,
+    pub(crate) sql: &'a str,
+    /// Prompts queued behind this one.
+    pub(crate) waiting: usize,
+}
+
 /// An answer to a write prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
@@ -333,6 +352,15 @@ impl Turn {
             self.job.number,
             self.session_id.short()
         )
+    }
+
+    /// Who asks for a write, seen from the session `on_screen`.
+    fn speaker(&self, on_screen: &SessionId) -> String {
+        if &self.session_id == on_screen {
+            String::from("The agent")
+        } else {
+            self.whose()
+        }
     }
 }
 
@@ -1078,6 +1106,29 @@ impl App {
         !self.prompts.is_empty()
     }
 
+    pub(crate) fn pending_write(&self) -> Option<PendingWrite<'_>> {
+        let prompt = self.prompts.front()?;
+        let heading = match prompt {
+            Prompt::Agent { job, .. } => {
+                let speaker = self
+                    .turns
+                    .iter()
+                    .find(|turn| turn.job.id == job.id)
+                    .map_or_else(
+                        || String::from("The agent"),
+                        |turn| turn.speaker(&self.session_id),
+                    );
+                format!("{speaker} wants to run:")
+            }
+            Prompt::Sql(_) => String::from("Your statement modifies the workspace:"),
+        };
+        Some(PendingWrite {
+            heading,
+            sql: prompt.sql(),
+            waiting: self.prompts.len().saturating_sub(1),
+        })
+    }
+
     /// A job changed state, or snapshots were missed (`Lagged`): rebuild
     /// the strip from the queue itself, and settle turns waiting on their
     /// job's end.
@@ -1162,7 +1213,7 @@ impl App {
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished(_) => {}
             AgentEvent::PermissionRequired(request) => {
-                self.ask_for_turn(turn, visible, request);
+                self.ask_for_turn(turn, request);
             }
             AgentEvent::TurnComplete(response) if visible => {
                 turn.progress = turn.progress.ended();
@@ -1200,16 +1251,12 @@ impl App {
 
     /// Queue a turn's write request as a prompt; one from a session not on
     /// screen says whose it is.
-    fn ask_for_turn(&mut self, turn: &mut Turn, visible: bool, request: PermissionRequest) {
-        let whose = if visible {
-            String::from("The agent")
-        } else {
-            turn.whose()
-        };
+    fn ask_for_turn(&mut self, turn: &mut Turn, request: PermissionRequest) {
         self.note(
             MessageKind::System,
             format!(
-                "{whose} wants to run a statement that modifies the workspace:\n{}\n{RUN_IT}",
+                "{} wants to run a statement that modifies the workspace:\n{}\n{RUN_IT}",
+                turn.speaker(&self.session_id),
                 request.sql
             ),
         );
@@ -2922,6 +2969,199 @@ mod tests {
         assert_eq!(assistant.content, "Let me update the table. Done.");
         assert!(turn.streaming.is_none());
         app.turns.clear();
+    }
+
+    /// Have the turn run by `job` ask to run `sql`, as its forwarding task
+    /// does; the handle resolves to the answer.
+    async fn ask_to_write(
+        app: &mut App,
+        job: JobId,
+        sql: &'static str,
+    ) -> tokio::task::JoinHandle<bool> {
+        let (sink, mut rx) = quack_core::analysis::events::channel();
+        let recorder = quack_core::analysis::events::TurnRecorder::new(sink);
+        let pending = tokio::spawn(async move { recorder.ask_permission(sql).await });
+        let request = match rx.recv().await.unwrap_or_else(|| fail("no event")) {
+            AgentEvent::PermissionRequired(request) => request,
+            other => fail(&format!("expected PermissionRequired, got {other:?}")),
+        };
+        app.msg_tx
+            .send(AppMsg::Turn(
+                job,
+                Box::new(AgentEvent::PermissionRequired(request)),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        app.pump();
+        pending
+    }
+
+    /// The input rows of a drawn frame: everything below the transcript's
+    /// last separator.
+    fn overlay(app: &App) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        terminal
+            .draw(|frame| ui::draw(frame, app))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect();
+        let start = rows
+            .iter()
+            .rposition(|row| row.contains("Run this statement?"))
+            .and_then(|end| {
+                rows.iter()
+                    .take(end)
+                    .rposition(|row| row.trim_start().starts_with('\u{2500}'))
+            })
+            .unwrap_or_else(|| fail(&format!("no permission overlay:\n{}", rows.join("\n"))));
+        rows.get(start..).unwrap_or_default().join("\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_overlay_shows_a_pending_agent_write_after_the_transcript_clears() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let turn = waiting_turn(&mut app);
+        let job = turn.job.id;
+        app.turns.push(turn);
+        let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
+
+        app.clear_transcript();
+        assert!(app.messages.is_empty());
+        let drawn = overlay(&app);
+        assert!(drawn.contains("The agent wants to run:"), "{drawn}");
+        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
+
+        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.awaiting_permission());
+        assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_write_stays_on_screen_across_a_new_session() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let turn = waiting_turn(&mut app);
+        let job = turn.job.id;
+        app.turns.push(turn);
+        let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
+
+        app.handle_slash_command("/new");
+        db_settle(&mut app).await;
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("DELETE FROM t")),
+            "the switch cleared the transcript's note"
+        );
+        let drawn = overlay(&app);
+        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
+
+        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.awaiting_permission());
+        assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_resume_the_overlay_names_the_writes_own_session() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let other = app
+            .db
+            .run_at(quack_core::priority::Priority::Interactive, |db| {
+                sessions::create_session(db, "m", ChatMode::Chat, None)
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let turn = waiting_turn(&mut app);
+        let job = turn.job.id;
+        let whose = turn.whose();
+        app.turns.push(turn);
+        let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
+
+        app.handle_slash_command(&format!("/resume {}", other.id));
+        db_settle(&mut app).await;
+        assert_eq!(app.session_id, other.id);
+        let drawn = overlay(&app);
+        assert!(drawn.contains(&format!("{whose} wants to run:")), "{drawn}");
+        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
+
+        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_typed_write_stays_on_screen_when_a_new_session_lands_after_it() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        // Classifying the write and switching sessions are applied in the
+        // order typed: the prompt first, then the clear.
+        app.handle_slash_command("/sql DELETE FROM t");
+        app.handle_slash_command("/new");
+        db_settle(&mut app).await;
+        assert!(matches!(app.prompts.front(), Some(Prompt::Sql(_))));
+        let drawn = overlay(&app);
+        assert!(
+            drawn.contains("Your statement modifies the workspace:"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_overlay_asks_about_the_front_prompt_and_counts_the_rest() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let turn = waiting_turn(&mut app);
+        let job = turn.job.id;
+        app.turns.push(turn);
+        let first = ask_to_write(&mut app, job, "DELETE FROM first_table").await;
+        let second = ask_to_write(&mut app, job, "DELETE FROM second_table").await;
+
+        let drawn = overlay(&app);
+        assert!(drawn.contains("DELETE FROM first_table"), "{drawn}");
+        assert!(!drawn.contains("second_table"), "{drawn}");
+        assert!(drawn.contains("(+1 more waiting)"), "{drawn}");
+
+        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+        let drawn = overlay(&app);
+        assert!(drawn.contains("DELETE FROM second_table"), "{drawn}");
+        assert!(!drawn.contains("more waiting"), "{drawn}");
+        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!first.await.unwrap_or_else(|e| fail(&e.to_string())));
+        assert!(!second.await.unwrap_or_else(|e| fail(&e.to_string())));
+    }
+
+    #[test]
+    fn a_long_statement_is_capped_with_a_count_of_the_rest() {
+        let sql = (0..10)
+            .map(|n| format!("UPDATE t SET a = {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pending = PendingWrite {
+            heading: String::from("The agent wants to run:"),
+            sql: &sql,
+            waiting: 0,
+        };
+        let lines: Vec<String> = pending
+            .lines(80, 4)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert!(
+            lines.get(3).is_some_and(|l| l.contains("SET a = 2")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.get(4).is_some_and(|l| l.contains("7 more lines")),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
