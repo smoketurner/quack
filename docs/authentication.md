@@ -271,6 +271,7 @@ gateway. `grant` decides how:
 type = "openai"
 base_url = "https://{resource}.openai.azure.com/openai/deployments/{deployment}"
 auth = "oauth"
+# headers = { "X-Gateway-Team" = "quack" }      # sent with every model request
 
 [providers.azure.oauth]
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
@@ -287,6 +288,13 @@ quack auth login azure      # a browser, or a device code when no browser can op
 quack auth status           # each OAuth provider: when its token expires, how it renews, where the key is
 quack auth logout azure
 ```
+
+`headers` adds fixed HTTP headers to every model request the provider receives, for a gateway
+that routes or attributes on one. It is not part of the OAuth exchange: token, device, and
+registration requests to the issuer never carry it. `Authorization` and `x-api-key` are
+refused, since the credential comes from `auth`, and `quack config` shows the names only,
+since a value can be a secret. Any provider type takes it
+except Bedrock's `api = "converse"`, which the AWS SDK sends.
 
 quack reuses a token while more than 60 seconds remain, then renews it under one lock that
 concurrent requests share. When a person must sign in but cannot (a server, or print mode),

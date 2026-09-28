@@ -17,8 +17,8 @@ use std::time::Duration;
 use crate::config;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{
-    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName,
-    ProviderType,
+    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderConfig,
+    ProviderName, ProviderType,
 };
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
@@ -706,7 +706,7 @@ async fn check_model(
         ));
         return;
     };
-    let listing = Listing::fetch(http, provider.provider_type, &base, credential.as_deref()).await;
+    let listing = Listing::fetch(http, provider, &base, credential.as_deref()).await;
     report.push(listing_check(area, model, &base, listing));
 }
 
@@ -1002,7 +1002,7 @@ async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
     let pulled = match http {
         Some(http) => match Listing::fetch(
             http,
-            ProviderType::Ollama,
+            &ProviderConfig::new(ProviderType::Ollama),
             &ProviderType::OLLAMA_BASE_URL,
             None,
         )
@@ -1362,28 +1362,32 @@ impl Listing {
     /// One `GET` for the provider's model list.
     async fn fetch(
         http: &reqwest::Client,
-        provider: ProviderType,
+        config: &ProviderConfig,
         base: &BaseUrl,
         credential: Option<&str>,
     ) -> std::result::Result<Self, Probe> {
+        let provider = config.provider_type;
+        let headers = config
+            .header_map()
+            .map_err(|e| Probe::Unexpected(e.to_string()))?;
+        let get = |url: String| http.get(url).headers(headers.clone());
         let request = match provider {
             ProviderType::Ollama => {
-                let request = http.get(format!("{}/api/tags", base.root()));
+                let request = get(format!("{}/api/tags", base.root()));
                 match credential {
                     Some(key) => request.bearer_auth(key),
                     None => request,
                 }
             }
             ProviderType::Openai => {
-                let request = http.get(format!("{}/models", base.trimmed()));
+                let request = get(format!("{}/models", base.trimmed()));
                 match credential {
                     Some(key) => request.bearer_auth(key),
                     None => request,
                 }
             }
             ProviderType::Anthropic => {
-                let request = http
-                    .get(format!("{}/v1/models?limit=1000", base.trimmed()))
+                let request = get(format!("{}/v1/models?limit=1000", base.trimmed()))
                     .header("anthropic-version", "2023-06-01");
                 match credential {
                     Some(key) => request.header("x-api-key", key),
@@ -1675,6 +1679,40 @@ mod tests {
             find(&local, Area::Server).first().unwrap().status,
             Status::Fail
         );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn the_listing_probe_sends_provider_headers_beside_its_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let body = r#"{"data":[{"id":"m"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            drop(stream.write_all(response.as_bytes()).await);
+            String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_ascii_lowercase()
+        });
+        let provider = ProviderConfig {
+            headers: Some(BTreeMap::from([(
+                String::from("X-Gateway-Team"),
+                String::from("quack"),
+            )])),
+            ..ProviderConfig::new(ProviderType::Openai)
+        };
+        let base = BaseUrl::try_from(base).unwrap();
+        let http = reqwest::Client::new();
+        let listing = Listing::fetch(&http, &provider, &base, Some("key")).await;
+        assert!(matches!(listing, Ok(Listing::Ids(ids)) if ids == ["m"]));
+        let request = seen.await.unwrap();
+        assert!(request.contains("x-gateway-team: quack"), "{request}");
+        assert!(request.contains("authorization: bearer key"), "{request}");
     }
 
     /// A mock issuer for the doctor: its discovery document lists `grants`,

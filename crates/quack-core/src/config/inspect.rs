@@ -11,6 +11,7 @@
 //! that hold API keys and client secrets; an [`Inspection`] carries those
 //! names and whether they are set, never their contents.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -445,6 +446,7 @@ const PROVIDER_KEYS: &[&str] = &[
     "api",
     "region",
     "max_concurrent_requests",
+    "headers",
     "oauth",
 ];
 
@@ -570,6 +572,7 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 provider.max_concurrent_requests.map(|n| n.to_string()),
                 Some(provider.default_request_limit().to_string()),
             );
+            s.names_only("headers", provider.headers.as_ref());
         }
         let Some(oauth) = provider.auth.oauth() else {
             continue;
@@ -1179,6 +1182,25 @@ impl Section<'_, '_> {
         );
     }
 
+    /// A table whose values can be secrets, such as a provider's headers:
+    /// its keys alone, both in force and as the file wrote them.
+    fn names_only(&mut self, key: &'static str, value: Option<&BTreeMap<String, String>>) {
+        let names =
+            |keys: Vec<&String>| render_list(&keys.into_iter().cloned().collect::<Vec<_>>());
+        let value = value.map(|table| names(table.keys().collect()));
+        let written = self
+            .inventory
+            .file_value(&self.name, key)
+            .map(|raw| match raw.as_table() {
+                Some(table) => names(table.keys().collect()),
+                None => String::from("(not a table)"),
+            });
+        self.inventory.push(&self.name, key, value, None, None);
+        if let Some(setting) = self.inventory.settings.last_mut() {
+            setting.file_value = written;
+        }
+    }
+
     /// A number or a flag: shown as TOML writes it, unquoted.
     fn literal<T: fmt::Display>(&mut self, key: &'static str, value: T, default: T) {
         self.inventory.push(
@@ -1272,6 +1294,22 @@ top_k = 3
 
         let key_env = setting(&inspection, "providers.ollama.api_key_env");
         assert_eq!(key_env.display_value(), UNSET);
+    }
+
+    #[test]
+    fn provider_headers_are_listed_by_name_only() {
+        let provider = "[providers.p]\ntype = \"ollama\"\nheaders = { \"X-Team\" = \"s3cret\" }\n";
+        let inspection = inspect(provider);
+        let headers = setting(&inspection, "providers.p.headers");
+        assert_eq!(headers.origin, Origin::File);
+        assert_eq!(headers.value.as_deref(), Some("[\"X-Team\"]"));
+        assert_eq!(headers.file_value.as_deref(), Some("[\"X-Team\"]"));
+        let json =
+            serde_json::to_string(&inspection.report(SettingFilter::All)).unwrap_or_default();
+        assert!(
+            json.contains("X-Team") && !json.contains("s3cret"),
+            "{json}"
+        );
     }
 
     #[test]

@@ -657,6 +657,11 @@ pub struct ProviderConfig {
     /// Ollama, which serves one request per model unless
     /// `OLLAMA_NUM_PARALLEL` says otherwise, 8 for hosted APIs.
     pub max_concurrent_requests: Option<RequestLimit>,
+    /// Extra HTTP headers sent with every model request to this provider,
+    /// checked as header names and values when the file is read. The
+    /// credential headers are refused: rig would send one in place of the
+    /// credential `auth` provides.
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 /// `[providers.NAME]` as the file writes it, before `auth` and the keys it
@@ -674,6 +679,7 @@ struct RawProviderConfig {
     region: Option<AwsRegion>,
 
     max_concurrent_requests: Option<RequestLimit>,
+    headers: Option<BTreeMap<String, String>>,
     oauth: Option<OAuthConfig>,
 }
 
@@ -769,15 +775,17 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
                 )));
             }
         };
-        Ok(Self {
+        let provider = Self {
             provider_type: raw.provider_type,
             auth,
             base_url: raw.base_url,
             bedrock: bedrock_config,
             openai_api,
-
             max_concurrent_requests: raw.max_concurrent_requests,
-        })
+            headers: raw.headers.filter(|headers| !headers.is_empty()),
+        };
+        provider.check_headers()?;
+        Ok(provider)
     }
 }
 
@@ -800,7 +808,50 @@ impl ProviderConfig {
                 }),
             openai_api: None,
             max_concurrent_requests: None,
+            headers: None,
         }
+    }
+
+    /// Whether `headers` can be sent: every one a valid header that does
+    /// not carry the credential, and an API that goes through rig.
+    fn check_headers(&self) -> Result<()> {
+        let converse = self
+            .bedrock
+            .as_ref()
+            .is_some_and(|b| b.api == BedrockApi::Converse);
+        if converse && self.headers.is_some() {
+            return Err(Error::Config(String::from(
+                "headers are not sent through api = \"converse\", which the AWS SDK calls; \
+                 use api = \"chat-completions\" or \"responses\", or remove them",
+            )));
+        }
+        self.header_map().map(drop)
+    }
+
+    /// `headers` as HTTP headers; empty when unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Config` error naming a header whose name or value HTTP
+    /// does not allow.
+    pub fn header_map(&self) -> Result<http::HeaderMap> {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in self.headers.iter().flatten() {
+            let header = http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| Error::Config(format!("headers: \"{name}\" is not a header name")))?;
+            if header == http::header::AUTHORIZATION || header == "x-api-key" {
+                return Err(Error::Config(format!(
+                    "headers: \"{name}\" carries the credential, which comes from auth"
+                )));
+            }
+            let value = http::HeaderValue::from_str(value).map_err(|_| {
+                Error::Config(format!(
+                    "headers: the value of \"{name}\" is not a header value"
+                ))
+            })?;
+            map.insert(header, value);
+        }
+        Ok(map)
     }
 
     /// The API a `type = "openai"` provider's chat model is called through:
@@ -2053,6 +2104,55 @@ rerank = "model"
     #[test]
     fn unknown_provider_type_is_rejected() {
         assert!(err_of("[providers.o]\ntype = \"vertex\"\n").contains("vertex"));
+    }
+
+    #[test]
+    fn provider_headers_are_checked_when_read() {
+        let base = "[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"K\"\n";
+        let headers_of = |text: &str| {
+            Config::parse(text)
+                .ok()
+                .and_then(|c| c.providers.get("o").map(|p| p.headers.clone()))
+        };
+        assert_eq!(headers_of(base), Some(None));
+        let set = format!("{base}headers = {{ \"X-Team\" = \"quack\", \"x-trace\" = \"1\" }}\n");
+        assert_eq!(
+            headers_of(&set),
+            Some(Some(BTreeMap::from([
+                (String::from("X-Team"), String::from("quack")),
+                (String::from("x-trace"), String::from("1")),
+            ])))
+        );
+        let map = Config::parse(&set)
+            .ok()
+            .and_then(|c| c.providers.get("o").map(ProviderConfig::header_map))
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        assert_eq!(
+            map.get("x-team").and_then(|v| v.to_str().ok()),
+            Some("quack")
+        );
+        assert_eq!(headers_of(&format!("{base}headers = {{}}\n")), Some(None));
+
+        assert!(err_of(&format!("{base}headers = {{ \"X Team\" = \"q\" }}\n")).contains("X Team"));
+        let value = err_of(&format!("{base}headers = {{ \"X-Team\" = \"a\\nb\" }}\n"));
+        assert!(
+            value.contains("X-Team") && !value.contains("a\nb"),
+            "{value}"
+        );
+        assert!(err_of(&format!("{base}headers = {{ \"X-Team\" = 1 }}\n")).contains("headers"));
+        for credential in ["Authorization", "authorization", "X-Api-Key"] {
+            let err = err_of(&format!("{base}headers = {{ \"{credential}\" = \"k\" }}\n"));
+            assert!(err.contains("credential"), "{err}");
+        }
+    }
+
+    #[test]
+    fn converse_takes_no_headers() {
+        let bedrock = "[providers.b]\ntype = \"bedrock\"\nheaders = { \"X-Team\" = \"q\" }\n";
+        assert!(err_of(bedrock).contains("converse"));
+        let chat = format!("{bedrock}api = \"chat-completions\"\n");
+        assert!(Config::parse(&chat).is_ok());
     }
 
     #[test]
