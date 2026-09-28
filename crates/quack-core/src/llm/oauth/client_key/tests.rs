@@ -213,6 +213,70 @@ async fn a_key_whose_vault_key_is_gone_is_replaced() {
     );
 }
 
+#[tokio::test]
+async fn two_processes_replacing_a_gone_key_agree_on_one() {
+    let dir = temp();
+    let first = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    assert!(first.load_or_create(&name()).await.is_ok());
+    assert!(std::fs::remove_file(dir.path().join("vault.key")).is_ok());
+    let a = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    let b = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    let client = name();
+    let (a, b) = tokio::join!(a.load_or_create(&client), b.load_or_create(&client));
+    let (Ok(a), Ok(b)) = (a, b) else {
+        fail("no replacement key");
+    };
+    assert_eq!(a.thumbprint(), b.thumbprint());
+    let reread = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    assert!(
+        reread
+            .load_or_create(&name())
+            .await
+            .is_ok_and(|k| k.thumbprint() == a.thumbprint())
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_loses_to_a_row_that_changed_first() {
+    let dir = temp();
+    let keys = ClientKeys::new(&config_at(dir.path()), KeySource::File);
+    assert!(keys.load_or_create(&name()).await.is_ok());
+    let Ok(control) = keys.control().await else {
+        fail("no control plane");
+    };
+    let client = name();
+    let owner = SealedOwner::ClientKey(client.as_str());
+    let Ok(Some(stored)) = control.sealed(owner).await else {
+        fail("no stored key");
+    };
+    let Ok(newer) = keys
+        .vault()
+        .seal(Purpose::ClientKey, client.as_str(), b"newer")
+        .await
+    else {
+        fail("sealing failed");
+    };
+    assert!(
+        control
+            .replace_sealed(owner, &stored, &newer)
+            .await
+            .is_ok_and(|kept| kept)
+    );
+    // The row is no longer `stored`, so a second replacement from it is refused.
+    assert!(
+        control
+            .replace_sealed(owner, &stored, &stored)
+            .await
+            .is_ok_and(|kept| !kept)
+    );
+    assert!(
+        control
+            .sealed(owner)
+            .await
+            .is_ok_and(|row| row.is_some_and(|row| row.enc == newer.enc))
+    );
+}
+
 #[test]
 fn a_replacement_is_named_apart_from_every_client() {
     assert_eq!(
