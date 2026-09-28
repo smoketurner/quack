@@ -7,6 +7,7 @@
 )]
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -24,16 +25,22 @@ use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
 use quack_core::llm::oauth::{CachedToken, KeySource};
 use quack_core::oidc::{OidcSubject, Origin};
 use quack_core::storage::control::{
-    AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
+    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
 };
 use quack_core::vault::Vault;
 use quack_core::web_sessions::WebSessions;
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tower::ServiceExt;
 
 use super::Oidc;
 use crate::server::state::{App, AppState, ServeMode};
+
+/// The audit row a test's own setup writes.
+fn setup_audit() -> AuditEntry {
+    AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
+}
 
 #[expect(clippy::panic, reason = "test failure path")]
 fn fail(msg: &str) -> ! {
@@ -429,6 +436,57 @@ impl Harness {
             .await
             .is_ok_and(|t| t.is_some())
     }
+
+    /// Drop a `control.db` table through a connection of its own, so the
+    /// one write that uses it fails.
+    async fn drop_table(&self, table: &str) {
+        let url = format!("sqlite:{}", self.dir.path().join("control.db").display());
+        let options = SqliteConnectOptions::from_str(&url).unwrap_or_else(|e| fail(&e.to_string()));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        pool.close().await;
+    }
+
+    /// A callback for a fresh subject, which the handler answers.
+    async fn sign_in_reply(&self, subject: &str) -> Reply {
+        let (state, nonce, cookie) = self.start().await;
+        let base = self
+            .issuer
+            .lock()
+            .map(|s| s.base.clone())
+            .unwrap_or_default();
+        self.issuer(|s| {
+            s.id_claims = json!({
+                "iss": base, "sub": subject, "aud": "quack",
+                "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+                "nonce": nonce, "preferred_username": subject,
+            });
+        });
+        self.get(
+            &format!("{}?code=c&state={state}", OidcConfig::CALLBACK_PATH),
+            Some(&format!("{}={cookie}", super::STATE_COOKIE)),
+        )
+        .await
+    }
+
+    /// The user a subject's sign-in created.
+    async fn user_of(&self, subject: &str) -> UserId {
+        self.app
+            .control
+            .find_user_by_oidc_subject(&OidcSubject::from(subject))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("the sign-in created no user"))
+            .id
+    }
 }
 
 #[tokio::test]
@@ -485,6 +543,41 @@ async fn a_first_sign_in_creates_a_user_with_no_access_and_a_session() {
     let (_, me) = h.me(&again).await;
     assert_eq!(me["id"], user.id.to_string());
     assert_eq!(me["username"], "ada");
+}
+
+#[tokio::test]
+async fn a_sign_in_whose_audit_row_cannot_be_written_leaves_no_token() {
+    let h = Harness::new().await;
+    h.drop_table("audit_log").await;
+    let reply = h.sign_in_reply("sub-aud").await;
+    assert_eq!(
+        reply.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        reply.body
+    );
+    assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+    assert!(!h.has_token(&h.user_of("sub-aud").await).await);
+}
+
+#[tokio::test]
+async fn a_sign_in_whose_token_cannot_be_stored_is_still_audited() {
+    let h = Harness::new().await;
+    h.drop_table("user_tokens").await;
+    let reply = h.sign_in_reply("sub-cred").await;
+    assert_eq!(
+        reply.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        reply.body
+    );
+    assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+    let user = h.user_of("sub-cred").await;
+    let logins = h.audit("login").await;
+    assert!(
+        logins.contains(&(Outcome::Allowed, Some(user))),
+        "{logins:?}"
+    );
 }
 
 #[tokio::test]
@@ -627,7 +720,7 @@ async fn logging_out_of_the_last_session_forgets_the_token() {
 /// A sign-in that arrives while the last logout is forgetting the user's
 /// token keeps the token it stores: the logout's check and delete, and the
 /// sign-in's store and session, run under one per-user lock, so the sign-in
-/// waits for the delete instead of landing between the check and it (#241).
+/// waits for the delete instead of landing between the check and it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
     let h = Harness::new().await;
@@ -979,7 +1072,7 @@ async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
     let ws = h
         .app
         .control
-        .create_workspace("w")
+        .create_workspace("w", None, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()))
         .id;
@@ -1016,7 +1109,7 @@ async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
     assert!(
         h.app
             .control
-            .set_member(&ws, &user.id, Role::Viewer)
+            .set_member(&ws, &user.id, Role::Viewer, setup_audit())
             .await
             .is_ok()
     );
@@ -1182,6 +1275,7 @@ async fn a_password_user_is_refused_rather_than_sent_as_quack() {
             "pw",
             "secret",
             quack_core::storage::control::UserKind::Standard,
+            setup_audit(),
         )
         .await;
     assert!(created.is_ok());
@@ -1679,7 +1773,7 @@ async fn an_on_behalf_of_refusal_for_a_user_with_no_stored_sign_in_does_not_end_
     let created = h
         .app
         .control
-        .create_user("pw", "secret", UserKind::Standard)
+        .create_user("pw", "secret", UserKind::Standard, setup_audit())
         .await;
     assert!(created.is_ok());
     let login = Request::post("/api/v1/auth/login")

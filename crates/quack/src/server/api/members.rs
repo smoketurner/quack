@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::ids::{UserId, WorkspaceId};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind, Role};
+use quack_core::storage::control::{AuditAction, Outcome, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need};
@@ -72,17 +72,11 @@ impl Access {
             .find_user_by_username(&member.username)
             .await?
             .ok_or_else(|| ApiError::not_found("no such user"))?;
+        let entry = self.entry(AuditAction::Member, Outcome::Allowed);
         app.control
-            .set_member(&self.workspace.id, &user.id, member.role)
+            .set_member(&self.workspace.id, &user.id, member.role, entry.clone())
             .await?;
-        self.audit(
-            app,
-            AuditAction::Member,
-            Some(ResourceKind::User.id(user.id.as_str())),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
+        self.record_detail(app, &entry, None).await?;
         Ok(NewMember {
             user_id: user.id,
             username: user.username,
@@ -95,26 +89,13 @@ impl Access {
     /// for work that succeeded (`Outcome::of`): a no-op removal that
     /// answers `404` is `Error`.
     pub(crate) async fn remove_member(&self, app: &App, user_id: &UserId) -> ApiResult<()> {
+        let entry = self.entry(AuditAction::Member, Outcome::Allowed);
         let removed = app
             .control
-            .remove_member(&self.workspace.id, user_id)
+            .remove_member(&self.workspace.id, user_id, entry.clone())
             .await?;
-        let (outcome, detail) = if removed {
-            (Outcome::Allowed, None)
-        } else {
-            (
-                Outcome::Error,
-                Some(serde_json::json!({ "reason": "not a member" })),
-            )
-        };
-        self.audit(
-            app,
-            AuditAction::Member,
-            Some(ResourceKind::User.id(user_id.as_str())),
-            outcome,
-            detail,
-        )
-        .await?;
+        let detail = (!removed).then(|| serde_json::json!({ "reason": "not a member" }));
+        self.record_detail(app, &entry, detail).await?;
         if removed {
             Ok(())
         } else {

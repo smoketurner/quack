@@ -783,6 +783,12 @@ the stored tokens, which would not open under a new key; and tokens sealed under
 `vault.key` would not open once the keychain answered again, since it comes first. Either way
 people would sign in again. Unlock the keychain, or grant quack access, and retry.
 
+quack makes the vault key while holding an exclusive lock on `<data_dir>/vault.key.lock`, so
+two quack processes that start at once on one data directory agree on one key. The keychain
+entry is shared by every data directory of one OS user, and processes on different data
+directories do not share that lock: start one quack against a new data directory first when
+several will share a keychain.
+
 Operational consequences:
 
 - Linux keeps the kernel keyring in memory, so a reboot loses the vault key: users sign in

@@ -105,17 +105,9 @@ impl Identity {
         if app.control.find_workspace_by_name(name).await?.is_some() {
             return Err(ApiError::conflict("workspace exists"));
         }
-        let ws = app.control.create_workspace(name).await?;
-        if app.mode == ServeMode::Login {
-            app.control
-                .set_member(&ws.id, &self.user_id, Role::Owner)
-                .await?;
-        }
-        let mut entry = self.audit(AuditAction::Workspace, Outcome::Allowed);
-        entry = entry.in_workspace(&ws.id);
-        entry = entry.on(ResourceKind::Workspace.id(ws.id.as_str()));
-        app.control.record_audit(&entry).await?;
-        Ok(ws)
+        let owner = (app.mode == ServeMode::Login).then_some(&self.user_id);
+        let entry = self.audit(AuditAction::Workspace, Outcome::Allowed);
+        Ok(app.control.create_workspace(name, owner, entry).await?)
     }
 }
 

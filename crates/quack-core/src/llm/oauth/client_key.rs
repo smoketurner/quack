@@ -511,8 +511,11 @@ impl ClientKeys {
             .vault
             .seal(Purpose::ClientKey, name.as_str(), &der)
             .await?;
-        if stored.is_some() {
-            control.put_sealed(owner, &sealed).await?;
+        let kept = match &stored {
+            Some(gone) => control.replace_sealed(owner, gone, &sealed).await?,
+            None => control.add_sealed(owner, &sealed).await?,
+        };
+        if kept && stored.is_some() {
             tracing::warn!(
                 client = %name,
                 thumbprint = key.thumbprint(),
@@ -520,7 +523,7 @@ impl ClientKeys {
             );
             return Ok(key);
         }
-        if control.add_sealed(owner, &sealed).await? {
+        if kept {
             tracing::info!(
                 client = %name,
                 thumbprint = key.thumbprint(),
@@ -528,7 +531,7 @@ impl ClientKeys {
             );
             return Ok(key);
         }
-        // Another process stored its key first: use that one.
+        // Another process stored or replaced the key first: use that one.
         let sealed = control
             .sealed(owner)
             .await?

@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::terminal::app::{App, Message, MessageKind};
+use crate::terminal::app::{App, Message, MessageKind, PendingWrite};
 use crate::terminal::chart::ChartData;
 use crate::terminal::commands::Suggestion;
 use quack_core::analysis::events::DetailPreview;
@@ -192,6 +192,19 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let chart_height = app.current_chart.as_ref().map_or(0, ChartData::height);
     let strip = job_strip(app);
     let strip_height = u16::try_from(strip.len()).unwrap_or(u16::MAX);
+    let screen = frame.area();
+    let permission = app.pending_write().map(|pending| {
+        pending.lines(
+            usize::from(screen.width),
+            usize::from(screen.height.checked_div(3).unwrap_or_default()).max(1),
+        )
+    });
+    // The top border plus the overlay's rows, or the one-line input.
+    let input_height = permission.as_ref().map_or(3, |lines| {
+        u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(1)
+    });
 
     let [
         header_area,
@@ -205,10 +218,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Constraint::Min(3),
         Constraint::Length(chart_height),
         Constraint::Length(strip_height),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(screen);
 
     draw_header(frame, header_area, app);
     draw_messages(frame, messages_area, app);
@@ -220,7 +233,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     if strip_height > 0 {
         frame.render_widget(Paragraph::new(Text::from(strip)), jobs_area);
     }
-    draw_input(frame, input_area, app);
+    draw_input(frame, input_area, app, permission);
     draw_status(frame, status_area, app);
     draw_completion(frame, messages_area, jobs_area.y, app);
 }
@@ -363,28 +376,20 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_input(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    permission: Option<Vec<Line<'static>>>,
+) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.awaiting_permission() {
-        let status_line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                "Run this statement?",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  [y] run   [n] refuse   [a] run and allow writes this session",
-                Style::default().fg(Color::Yellow),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(status_line), inner);
+    if let Some(lines) = permission {
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     } else {
         let [prompt_area, text_area] =
             Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).areas(inner);
@@ -445,6 +450,67 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 pub(crate) struct Wrapped {
     pub(crate) key: u64,
     lines: Vec<Line<'static>>,
+}
+
+impl PendingWrite<'_> {
+    /// The overlay: who asks, the statement wrapped to `width` in at most
+    /// `max_rows` rows, and the choices.
+    pub(crate) fn lines(&self, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+        let mut heading = vec![
+            Span::raw(" "),
+            Span::styled(
+                self.heading.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if self.waiting > 0 {
+            heading.push(Span::styled(
+                format!("  (+{} more waiting)", self.waiting),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let rows: Vec<Vec<Span<'static>>> = self
+            .sql
+            .lines()
+            .flat_map(|line| wrap::wrap(&[Span::raw(line.to_owned())], width.saturating_sub(3)))
+            .collect();
+        let mut lines = vec![Line::from(heading)];
+        let shown = if rows.len() > max_rows {
+            max_rows.saturating_sub(1)
+        } else {
+            rows.len()
+        };
+        lines.extend(rows.iter().take(shown).map(|row| {
+            let mut spans = vec![Span::raw("   ")];
+            spans.extend(row.iter().cloned());
+            Line::from(spans)
+        }));
+        if shown < rows.len() {
+            lines.push(Line::styled(
+                format!(
+                    "   \u{2026} {} more lines",
+                    rows.len().saturating_sub(shown)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Run this statement?",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  [y] run   [n] refuse   [a] run and allow writes this session",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+        lines
+    }
 }
 
 /// Every message's lines, wrapped to `width`. Each message's lines are

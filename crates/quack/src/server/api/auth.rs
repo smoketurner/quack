@@ -49,8 +49,8 @@ pub(crate) async fn logout(
 }
 
 impl Identity {
-    /// End this login, from the API or the web console: the session is
-    /// closed, the logout audited, and the session cookie cleared. Only a
+    /// End this login, from the API or the web console: the logout is
+    /// audited, the session closed, and the session cookie cleared. Only a
     /// session is a login that can end; for any other credential (an API
     /// token, an issuer's bearer, local mode) this succeeds and does nothing,
     /// so no `logout` row claims a session ended and a signed-in user's
@@ -59,6 +59,10 @@ impl Identity {
         let Credential::Session(token) = &self.credential else {
             return Ok(jar);
         };
+        // Audited first, so a failed audit write leaves the session open
+        // rather than ended unrecorded.
+        let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
+        app.control.record_audit(&entry).await?;
         app.sessions.close(token.as_str());
         // A signed-in user's token is kept for their sessions; the last one
         // closing is the end of quack's use for it. Checked under the user's
@@ -66,8 +70,6 @@ impl Identity {
         if let Some(oidc) = &app.oidc {
             oidc.forget_unless_signed_in(&self.user_id).await?;
         }
-        let entry = self.audit(AuditAction::Logout, Outcome::Allowed);
-        app.control.record_audit(&entry).await?;
         Ok(jar.remove(SessionCookie::clear()))
     }
 }

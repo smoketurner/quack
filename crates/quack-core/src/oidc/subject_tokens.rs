@@ -119,7 +119,7 @@ impl SubjectTokens {
     /// Keep a person's token from a sign-in, replacing the one before, and
     /// run `then` (opening the session that uses it) under the same per-user
     /// lock. A [`Self::forget_unless`] therefore sees neither or both: it
-    /// never deletes a token whose session is about to open (issue #241).
+    /// never deletes a token whose session is about to open.
     ///
     /// # Errors
     ///

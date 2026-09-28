@@ -634,7 +634,10 @@ CREATE INDEX audit_log_workspace_ts ON audit_log (workspace_id, timestamp);
 append-only: the code has no `UPDATE` or `DELETE` path, and its sqlx connection runs neither
 statement in any query. There is no retention or pruning; rows stay until an operator
 retires the file. Every request naming a workspace writes a row, denials included: a
-non-member opening a workspace, a `viewer` writing, an expired token. `resource_id` is an
+non-member opening a workspace, a `viewer` writing, an expired token. A control-plane change
+(a user, a workspace, a membership, an API token) commits in one transaction with its row, so
+none stands unaudited; a sign-in and a logout write their row before the session opens or
+closes. `resource_id` is an
 opaque UUID or a table name: enough to answer "who read document X" without revealing its
 text. An admin sees that a user queried a workspace and in which session; only members see
 the query text, in `_quack_audit`.
@@ -1698,7 +1701,9 @@ table) are tool errors the client model can read. Resources:
 The terminal is a Claude Code-style single-pane transcript on a named workspace (`-w`,
 resolved through the control plane like every interface). It never blocks its input. It
 shows streaming answers, inline steps, citations as footnotes, and ratatui charts;
-permission prompts take `y`/`n`/`a`. Input starting with `SELECT`/`WITH`/`FROM`/
+permission prompts take `y`/`n`/`a`, one at a time, and the prompt itself shows who asks,
+the statement, and how many more wait, so clearing or scrolling the transcript never hides
+what is being approved. Input starting with `SELECT`/`WITH`/`FROM`/
 `DESCRIBE`/`SHOW`/`PIVOT`/`SUMMARIZE` is direct SQL. Direct SQL and `/sql` pass the agent's
 gate: internal tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown.
 
