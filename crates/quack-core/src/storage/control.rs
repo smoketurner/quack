@@ -1363,6 +1363,43 @@ impl ControlPlane {
         self.insert_sealed(owner, sealed, false).await
     }
 
+    /// Replace `owner`'s sealed value only while it is still `expected`;
+    /// whether this one was kept. Two processes replacing the same value at
+    /// once both call this, and both then use whichever row won.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn replace_sealed(
+        &self,
+        owner: SealedOwner<'_>,
+        expected: &Sealed,
+        sealed: &Sealed,
+    ) -> Result<bool> {
+        let (table, key, id, stamp) = owner.row();
+        let bound = Bound::new(
+            Query::update()
+                .table(table)
+                .values([
+                    (
+                        SealedColumns::KeyId.into_iden(),
+                        sealed.key_id.as_str().into(),
+                    ),
+                    (SealedColumns::Enc.into_iden(), sealed.enc.clone().into()),
+                    (
+                        SealedColumns::Ciphertext.into_iden(),
+                        sealed.ciphertext.clone().into(),
+                    ),
+                    (stamp, Expr::current_timestamp()),
+                ])
+                .and_where(Expr::col(key).eq(id))
+                .and_where(Expr::col(SealedColumns::KeyId).eq(expected.key_id.as_str()))
+                .and_where(Expr::col(SealedColumns::Enc).eq(expected.enc.clone())),
+        )?;
+        let done = bound.query().execute(&self.pool).await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     async fn insert_sealed(
         &self,
         owner: SealedOwner<'_>,

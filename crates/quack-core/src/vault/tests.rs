@@ -109,13 +109,7 @@ async fn a_value_whose_key_is_gone_says_so_and_opening_makes_no_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn two_vaults_concurrent_first_seals_on_a_fresh_key_agree_and_open_after_a_restart() {
-    // The reachable production race: two distinct Vault instances over one
-    // fresh <data_dir>/vault.key seal concurrently (the P_p vs P_q
-    // `ProviderToken` topology for `client_secret` providers). Before the
-    // fix, the two `read_or_create` calls race on the fresh key, last writer
-    // wins in storage, and the loser's seals open as `KeyGone` to a Vault
-    // reading the surviving key. After the fix, the two agree on one key and
-    // both seals open after a restart.
+    // Two Vaults over one fresh data directory, as two providers' token stores are.
     for _ in 0..40 {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let a = std::sync::Arc::new(Vault::new(dir.path(), KeySource::File));
@@ -147,10 +141,7 @@ async fn two_vaults_concurrent_first_seals_on_a_fresh_key_agree_and_open_after_a
             .await
             .unwrap_or_else(|e| fail(&e.to_string()))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        // Before the fix this intermittently diverged; after the fix the two
-        // share the one key that is in storage.
         assert_eq!(sealed_a.key_id, sealed_b.key_id);
-        // A freshly started Vault reads the surviving key and opens both.
         let after = Vault::new(dir.path(), KeySource::File);
         assert_eq!(
             opened(
