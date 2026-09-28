@@ -3,8 +3,9 @@
 //!
 //! A user's token is kept by core's `oidc::SubjectTokens`, sealed in
 //! `control.db`. Its refresh token is what ties a quack session to the
-//! issuer: when the token runs out, the first request that finds it renews
-//! it, and a refusal ends every session the user has.
+//! issuer: when the token runs out, the first request or on-behalf-of
+//! exchange that finds it renews it, and a refusal ends every session the
+//! user has.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,13 +19,13 @@ use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::CachedToken;
 use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::oidc::{
-    Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
+    Origin, Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
 };
-use quack_core::storage::control::{AuditEntry, ControlPlane, UserRow};
+use quack_core::storage::control::{ControlPlane, UserRow};
 use quack_core::vault::Vault;
+use quack_core::web_sessions::{SessionToken, WebSessions};
 
 use super::error::{ApiError, ApiResult};
-use super::state::{AppState, SessionToken, WebSessions};
 
 /// The cookie that ties a callback to the browser that started the sign-in,
 /// so a callback link someone else started cannot sign this browser in.
@@ -40,15 +41,6 @@ const MAX_PENDING: usize = 10_000;
 /// After the issuer could not be reached, how long until it is asked again.
 const RETRY_AFTER: SignedDuration = SignedDuration::from_secs(60);
 
-/// Whether a session's sign-in still stands after a renewal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Standing {
-    Current,
-    /// The issuer refused, or the user's token is gone: every session of the
-    /// user has been closed.
-    Ended,
-}
-
 /// The server's sign-in client and what it keeps.
 pub(crate) struct Oidc {
     sign_in: Arc<SignIn>,
@@ -56,6 +48,7 @@ pub(crate) struct Oidc {
     pending: Mutex<HashMap<String, (Pending, Instant)>>,
     /// Each signed-in user's own token (the on-behalf-of subject).
     subjects: Arc<SubjectTokens>,
+    sessions: Arc<WebSessions>,
 }
 
 impl Oidc {
@@ -67,6 +60,7 @@ impl Oidc {
         vault: Vault,
         control: ControlPlane,
         client_keys: ClientKeys,
+        sessions: Arc<WebSessions>,
     ) -> CoreResult<Self> {
         let sign_in = Arc::new(SignIn::new(config.clone(), client_keys)?);
         Ok(Self {
@@ -74,9 +68,11 @@ impl Oidc {
                 Arc::clone(&sign_in),
                 UserTokens::new(vault),
                 control,
+                Arc::clone(&sessions),
             )),
             sign_in,
             pending: Mutex::new(HashMap::new()),
+            sessions,
         })
     }
 
@@ -84,10 +80,10 @@ impl Oidc {
         self.sign_in.issuer_host()
     }
 
-    /// The acting person for a request by `user`: model requests to an
-    /// on-behalf-of provider exchange their own token.
-    pub(crate) fn acting(&self, user: &UserId) -> Acting {
-        Acting::new(user.clone(), Arc::clone(&self.subjects))
+    /// The acting person for a request by `user` from `origin`: model
+    /// requests to an on-behalf-of provider exchange their own token.
+    pub(crate) fn acting(&self, user: &UserId, origin: Origin) -> Acting {
+        Acting::new(user.clone(), Arc::clone(&self.subjects), origin)
     }
 
     /// Begin a sign-in: the issuer URL to send the browser to, and the
@@ -132,14 +128,14 @@ impl Oidc {
     /// token in between.
     pub(crate) async fn keep_and_open(
         &self,
-        sessions: &WebSessions,
         user: &UserId,
         token: &CachedToken,
     ) -> ApiResult<SessionToken> {
         let renew_at = Self::renewal_time(token);
-        self.subjects
-            .keep_then(user, token, || sessions.open(user, renew_at))
-            .await?
+        Ok(self
+            .subjects
+            .keep_then(user, token, || self.sessions.open(user, renew_at))
+            .await??)
     }
 
     /// When a session on `token` renews it: shortly before it expires, or
@@ -154,56 +150,43 @@ impl Oidc {
     }
 
     /// Renew the sign-in behind `session`, a session of `user` whose renewal
-    /// time has come. A token another session already renewed is reused; an
-    /// issuer that cannot be reached is asked again a minute later, and the
-    /// session goes on meanwhile; a refusal ends every session of the user.
-    pub(crate) async fn renew(
-        &self,
-        sessions: &WebSessions,
-        user: &UserId,
-        session: &str,
-    ) -> ApiResult<Standing> {
-        Ok(match self.subjects.refreshed(user).await? {
-            Stored::Current(token) => {
-                sessions.renew_at(session, Self::renewal_time(&token));
-                Standing::Current
-            }
-            Stored::Unrenewable(_) => {
-                sessions.renew_at(session, None);
-                Standing::Current
-            }
-            Stored::Unreachable(_) => {
-                sessions.renew_at(session, Timestamp::now().checked_add(RETRY_AFTER).ok());
-                Standing::Current
-            }
-            Stored::Missing | Stored::Revoked => {
-                tracing::info!(user = %user, "no current stored sign-in for the session; ending every session of the user");
-                sessions.close_user(user);
-                Standing::Ended
-            }
-        })
-    }
-
-    /// Renew the sign-in behind a session that is due, and refuse the
-    /// request when the issuer has ended it, recording `denied` (the
-    /// caller's address and request id already on it) against the user.
+    /// time has come, and refuse the request once the sign-in is gone. A
+    /// token another session already renewed is reused; an issuer that
+    /// cannot be reached is asked again a minute later, and the session goes
+    /// on meanwhile. A refusal ends every session of the user, recorded once
+    /// as a denied `session` from `origin` by whichever path saw it first.
     pub(crate) async fn require_current(
         &self,
-        app: &AppState,
+        control: &ControlPlane,
         user: &UserId,
         session: &str,
-        mut denied: AuditEntry,
+        origin: &Origin,
     ) -> ApiResult<()> {
-        match self.renew(&app.sessions, user, session).await? {
-            Standing::Current => Ok(()),
-            Standing::Ended => {
-                denied.user_id = Some(user.clone());
-                app.control.record_audit(&denied).await?;
-                Err(ApiError::unauthorized(
-                    "the identity provider ended this sign-in; sign in again",
-                ))
+        match self.subjects.refreshed(user, origin).await? {
+            Stored::Current(token) => {
+                self.sessions.renew_at(session, Self::renewal_time(&token));
+                return Ok(());
+            }
+            Stored::Unrenewable(_) => {
+                self.sessions.renew_at(session, None);
+                return Ok(());
+            }
+            Stored::Unreachable(_) => {
+                self.sessions
+                    .renew_at(session, Timestamp::now().checked_add(RETRY_AFTER).ok());
+                return Ok(());
+            }
+            Stored::Revoked => {}
+            Stored::Missing => {
+                if self.sessions.close_user_of(session, user) {
+                    tracing::info!(user = %user, "no stored sign-in for the session; ending every session of the user");
+                    control.record_audit(&origin.denied_session(user)).await?;
+                }
             }
         }
+        Err(ApiError::unauthorized(
+            "the identity provider ended this sign-in; sign in again",
+        ))
     }
 
     /// Whether access tokens from the issuer are accepted as bearers.
@@ -231,14 +214,10 @@ impl Oidc {
     /// sign-in holds while it stores its token and opens its session, so a
     /// sign-in racing a logout keeps its token. Returns whether
     /// the token was dropped.
-    pub(crate) async fn forget_unless_signed_in(
-        &self,
-        sessions: &WebSessions,
-        user: &UserId,
-    ) -> ApiResult<bool> {
+    pub(crate) async fn forget_unless_signed_in(&self, user: &UserId) -> ApiResult<bool> {
         Ok(self
             .subjects
-            .forget_unless(user, || sessions.has_sessions(user))
+            .forget_unless(user, || self.sessions.has_sessions(user))
             .await?)
     }
 }

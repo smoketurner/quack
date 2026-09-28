@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use secrecy::SecretString;
 
 use crate::ids::UserId;
-use crate::oidc::SubjectTokens;
+use crate::oidc::{Origin, Revocations, SubjectTokens};
 
 /// The person model requests are made for.
 #[derive(Clone)]
@@ -25,8 +25,8 @@ pub struct Acting {
 /// Where the person's own token comes from.
 #[derive(Clone)]
 enum Subject {
-    /// `quack serve`'s signed-in users.
-    Signed(Arc<SubjectTokens>),
+    /// `quack serve`'s signed-in users, and where the request came from.
+    Signed(Arc<SubjectTokens>, Origin),
     /// A token fixed by a test, or the reason there is none.
     #[cfg(test)]
     Fixed(std::result::Result<&'static str, &'static str>),
@@ -49,12 +49,13 @@ tokio::task_local! {
 }
 
 impl Acting {
-    /// `user`, whose own token `tokens` keeps.
+    /// `user`, whose own token `tokens` keeps, acting for a request from
+    /// `origin`.
     #[must_use]
-    pub const fn new(user: UserId, tokens: Arc<SubjectTokens>) -> Self {
+    pub const fn new(user: UserId, tokens: Arc<SubjectTokens>, origin: Origin) -> Self {
         Self {
             user,
-            tokens: Subject::Signed(tokens),
+            tokens: Subject::Signed(tokens, origin),
         }
     }
 
@@ -82,11 +83,21 @@ impl Acting {
     /// Returns why, when there is no current token for them.
     pub async fn subject_token(&self) -> std::result::Result<SecretString, String> {
         match &self.tokens {
-            Subject::Signed(tokens) => tokens.subject_token(&self.user).await,
+            Subject::Signed(tokens, origin) => tokens.subject_token(&self.user, origin).await,
             #[cfg(test)]
             Subject::Fixed(token) => token
                 .map(|t| SecretString::from(t.to_owned()))
                 .map_err(str::to_owned),
+        }
+    }
+
+    /// How many times the issuer has ended the person's sign-in.
+    #[must_use]
+    pub fn revocations(&self) -> Revocations {
+        match &self.tokens {
+            Subject::Signed(tokens, _) => tokens.revocations(&self.user),
+            #[cfg(test)]
+            Subject::Fixed(_) => Revocations::default(),
         }
     }
 

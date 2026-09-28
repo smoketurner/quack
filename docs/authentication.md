@@ -176,12 +176,15 @@ username comes from `preferred_username`, then `email`, then the subject, with a
 taken, so a sign-in never takes over an existing account by name.
 
 quack keeps the person's tokens, refresh token included, sealed in `control.db`, and renews
-the access token on the first request near its expiry. If the issuer refuses (revoked grant,
-disabled account), all the person's sessions end. If it is unreachable, quack retries after 60
-seconds and the session continues. Without a refresh token (no `offline_access`), only
+the access token on the first request or on-behalf-of exchange near its expiry (a background
+job's included). If the issuer refuses (revoked grant, disabled account), all the person's
+sessions end at once, the stored token and any access token they presented are dropped, and
+provider tokens exchanged for them are not reused. If it is unreachable, quack retries after
+60 seconds and the session continues. Without a refresh token (no `offline_access`), only
 quack's 12-hour and 120-minute limits apply. Logging out of the last session deletes the
 stored tokens. `control.db`'s audit log records each sign-in as `login`, and each one the
-issuer ended as a denied `session`.
+issuer ended as one denied `session`, with the address and request id of the request (or of
+the request that submitted the job) that met the refusal.
 
 ### Access tokens from the identity provider (quack as a protected resource)
 

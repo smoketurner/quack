@@ -735,7 +735,7 @@ fn bearer_error(message: impl Into<String>) -> Error {
 mod subject_tokens;
 mod tokens;
 
-pub use subject_tokens::{RENEW_MARGIN, Stored, SubjectTokens};
+pub use subject_tokens::{Origin, RENEW_MARGIN, Revocations, Stored, SubjectTokens};
 pub use tokens::UserTokens;
 
 #[cfg(test)]

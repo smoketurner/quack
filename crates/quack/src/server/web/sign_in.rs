@@ -154,9 +154,7 @@ pub(super) async fn finish(
     // leaves no credential.
     app.control.record_audit(&entry).await?;
     // The token and the session it serves appear together.
-    let token = oidc
-        .keep_and_open(&app.sessions, &user.id, &signed_in.token)
-        .await?;
+    let token = oidc.keep_and_open(&user.id, &signed_in.token).await?;
     Ok((
         jar.add(SessionCookie::issue(&app, peer, token)),
         Redirect::to("/workspaces"),

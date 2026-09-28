@@ -24,3 +24,4 @@ pub mod progress;
 pub mod storage;
 pub mod text;
 pub mod vault;
+pub mod web_sessions;

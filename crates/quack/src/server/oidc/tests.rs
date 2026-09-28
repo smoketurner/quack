@@ -20,13 +20,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
 use quack_core::config::{ClientAuth, Config, OidcConfig};
 use quack_core::ids::UserId;
+use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
 use quack_core::llm::oauth::{CachedToken, KeySource};
-use quack_core::oidc::OidcSubject;
+use quack_core::oidc::{OidcSubject, Origin};
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner,
+    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
 };
 use quack_core::vault::Vault;
+use quack_core::web_sessions::WebSessions;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -253,15 +255,23 @@ impl Harness {
         let control = ControlPlane::open(&config)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
+        let sessions = Arc::new(WebSessions::new(&config.server));
         let oidc = Oidc::new(
             &oidc_config,
             Vault::new(dir.path(), KeySource::File),
             control.clone(),
             ClientKeys::with_control(&config, KeySource::File, control.clone()),
+            Arc::clone(&sessions),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
         config.server.oidc = Some(oidc_config);
-        let app = Arc::new(AppState::new(config, control, ServeMode::Login, Some(oidc)));
+        let app = Arc::new(AppState::new(
+            config,
+            control,
+            ServeMode::Login,
+            sessions,
+            Some(oidc),
+        ));
         let router = crate::server::router(Arc::clone(&app));
         Self {
             dir,
@@ -750,7 +760,7 @@ async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
                     refresh_token: None,
                 };
                 let oidc = app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
-                oidc.keep_and_open(&app.sessions, &who, &token).await
+                oidc.keep_and_open(&who, &token).await
             }));
             // Give the sign-in every chance to run ahead of the delete.
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -772,7 +782,7 @@ async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
 
     // With that session open, logging out another one leaves the token.
     let dropped = oidc
-        .forget_unless_signed_in(&h.app.sessions, &user)
+        .forget_unless_signed_in(&user)
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert!(!dropped);
@@ -821,7 +831,14 @@ async fn without_oidc_there_is_no_button_and_no_route() {
     let control = ControlPlane::open(&config)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let app = Arc::new(AppState::new(config, control, ServeMode::Login, None));
+    let sessions = Arc::new(WebSessions::new(&config.server));
+    let app = Arc::new(AppState::new(
+        config,
+        control,
+        ServeMode::Login,
+        sessions,
+        None,
+    ));
     let router = crate::server::router(app);
     for (uri, status) in [
         ("/login", StatusCode::OK),
@@ -1114,9 +1131,18 @@ async fn obo_token_as(
     app: &App,
     auth: quack_core::config::ClientAuth,
 ) -> Result<String, crate::server::error::ApiError> {
+    use secrecy::ExposeSecret;
+    let manager = obo_manager(app, auth)?;
+    Ok(manager.access_token().await?.expose_secret().to_owned())
+}
+
+/// An on-behalf-of provider exchanging at the harness's issuer.
+fn obo_manager(
+    app: &App,
+    auth: quack_core::config::ClientAuth,
+) -> Result<quack_core::llm::oauth::TokenManager, crate::server::error::ApiError> {
     use quack_core::config::{Exchange, Grant, OAuthConfig};
     use quack_core::llm::oauth::TokenManager;
-    use secrecy::ExposeSecret;
     let issuer = app
         .config
         .server
@@ -1141,8 +1167,12 @@ async fn obo_token_as(
     let name = "model".parse().map_err(|e: quack_core::error::Error| {
         crate::server::error::ApiError::internal(e.to_string())
     })?;
-    let manager = TokenManager::new(&app.config, &name, oauth, KeySource::File)?;
-    Ok(manager.access_token().await?.expose_secret().to_owned())
+    Ok(TokenManager::new(
+        &app.config,
+        &name,
+        oauth,
+        KeySource::File,
+    )?)
 }
 
 async fn probe(
@@ -1517,4 +1547,261 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
         assert!(!form.contains_key("actor_token"), "{form:?}");
         check_assertion(form, key.jwk(), &base, &mut seen);
     }
+}
+
+// --- an issuer's refusal seen by an on-behalf-of exchange -------------------
+
+fn job_origin() -> Origin {
+    Origin {
+        channel: Channel::Api,
+        client_addr: Some(String::from("203.0.113.9")),
+        request_id: Some(String::from("req-obo")),
+    }
+}
+
+impl Harness {
+    async fn user(&self, subject: &str) -> UserId {
+        self.app
+            .control
+            .find_user_by_oidc_subject(&OidcSubject::from(subject))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("no user"))
+            .id
+    }
+
+    /// The person's own token, asked for as a queued job asks: through the
+    /// `Acting` its request captured, with no request of its own.
+    async fn subject_token(&self, user: &UserId) -> Result<String, String> {
+        use secrecy::ExposeSecret;
+        let oidc = self.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+        let acting = oidc.acting(user, job_origin());
+        acting
+            .subject_token()
+            .await
+            .map(|t| t.expose_secret().to_owned())
+    }
+
+    /// Replace the person's stored sign-in with one already due for renewal.
+    async fn store_due_sign_in(&self, user: &UserId) {
+        let oidc = self.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+        let due = CachedToken {
+            access_token: SecretString::from(String::from("due")),
+            expires_at: Timestamp::now()
+                .checked_add(SignedDuration::from_secs(30))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            refresh_token: Some(SecretString::from(String::from("user-refresh"))),
+        };
+        oidc.subjects
+            .keep_then(user, &due, || ())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+
+    fn denied_sessions_of<'a>(
+        rows: &'a [(Outcome, Option<UserId>)],
+        user: &'a UserId,
+    ) -> impl Iterator<Item = &'a (Outcome, Option<UserId>)> {
+        rows.iter()
+            .filter(move |(o, u)| *o == Outcome::Denied && u.as_ref() == Some(user))
+    }
+}
+
+#[tokio::test]
+async fn an_on_behalf_of_refusal_ends_the_sessions_and_records_a_denied_session_at_that_moment() {
+    let h = Harness::new().await;
+    h.issuer(|s| s.lifetime = 30);
+    let session = h.sign_in("sub-obo", "obo").await;
+    let user = h.user("sub-obo").await;
+    assert!(h.app.sessions.has_sessions(&user));
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+
+    let refused = h.subject_token(&user).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("ended this person's sign-in")),
+        "{refused:?}"
+    );
+    assert!(!h.has_token(&user).await);
+    assert!(!h.app.sessions.has_sessions(&user));
+    let rows = h
+        .app
+        .control
+        .query_audit(&AuditFilter {
+            action: Some(String::from("session")),
+            limit: 100,
+            ..AuditFilter::default()
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .rows;
+    let [row] = rows.as_slice() else {
+        fail(&format!("one denied session row, not {rows:?}"));
+    };
+    assert_eq!(row.outcome, Outcome::Denied);
+    assert_eq!(row.user_id.as_ref(), Some(&user));
+    assert_eq!(row.channel, Channel::Api);
+    assert_eq!(row.client_addr.as_deref(), Some("203.0.113.9"));
+    assert_eq!(row.request_id.as_deref(), Some("req-obo"));
+
+    // The cookie names no session now, so no second row is written.
+    assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
+    let later = h.audit("session").await;
+    assert_eq!(
+        Harness::denied_sessions_of(&later, &user).count(),
+        1,
+        "{later:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_renewal_and_an_exchange_meeting_one_refusal_record_it_once() {
+    for exchange_first in [true, false] {
+        let h = Harness::new().await;
+        h.issuer(|s| s.lifetime = 30);
+        let session = h.sign_in("sub-race", "race").await;
+        let user = h.user("sub-race").await;
+        h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+
+        if exchange_first {
+            assert!(h.subject_token(&user).await.is_err());
+            assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
+        } else {
+            assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
+            assert!(h.subject_token(&user).await.is_err());
+        }
+        let rows = h.audit("session").await;
+        assert_eq!(
+            Harness::denied_sessions_of(&rows, &user).count(),
+            1,
+            "exchange first: {exchange_first}: {rows:?}"
+        );
+    }
+
+    let h = Harness::new().await;
+    h.issuer(|s| s.lifetime = 30);
+    let session = h.sign_in("sub-both", "both").await;
+    let user = h.user("sub-both").await;
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+    // The exchange takes the user's lock first; the request has already
+    // found its session and waits for the lock, then finds the token gone.
+    let (exchanged, me) = tokio::join!(h.subject_token(&user), h.me(&session));
+    assert_eq!(me.0, StatusCode::UNAUTHORIZED);
+    assert!(exchanged.is_err());
+    let rows = h.audit("session").await;
+    assert_eq!(
+        Harness::denied_sessions_of(&rows, &user).count(),
+        1,
+        "{rows:?}"
+    );
+    assert_eq!(h.issuer.lock().map(|s| s.refreshes).unwrap_or_default(), 1);
+}
+
+#[tokio::test]
+async fn a_provider_token_exchanged_before_a_refusal_is_not_reused() {
+    use secrecy::ExposeSecret;
+    let h = Harness::new().await;
+    h.sign_in("sub-cache", "cache").await;
+    let user = h.user("sub-cache").await;
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let manager =
+        obo_manager(&h.app, ClientAuth::ClientSecretPost).unwrap_or_else(|e| fail(&e.message));
+    let exchange = || {
+        Acting::scope(
+            Some(oidc.acting(&user, job_origin())),
+            manager.access_token(),
+        )
+    };
+    let first = exchange().await.unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(first.expose_secret(), "obo-user-access");
+    assert_eq!(
+        exchange()
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .expose_secret(),
+        "obo-user-access",
+        "a fresh exchanged token is reused"
+    );
+
+    h.store_due_sign_in(&user).await;
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+    assert!(h.subject_token(&user).await.is_err());
+
+    let after = exchange().await;
+    assert!(
+        after
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("no current sign-in")),
+        "the token exchanged before the refusal was reused: {:?}",
+        after.map(|t| t.expose_secret().to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_presented_bearer_is_not_used_after_a_refusal() {
+    let h = Harness::new().await;
+    h.sign_in("sub-bear", "bear").await;
+    let user = h.user("sub-bear").await;
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let in_an_hour = Timestamp::now()
+        .checked_add(SignedDuration::from_hours(1))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    oidc.subjects
+        .remember_presented(&user, "presented", in_an_hour);
+    h.store_due_sign_in(&user).await;
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+
+    assert!(
+        h.subject_token(&user)
+            .await
+            .is_err_and(|e| e.contains("ended this person's sign-in"))
+    );
+    let after = h.subject_token(&user).await;
+    assert!(
+        after
+            .as_ref()
+            .is_err_and(|e| e.contains("no current sign-in")),
+        "{after:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_on_behalf_of_refusal_for_a_user_with_no_stored_sign_in_does_not_end_sessions() {
+    let h = Harness::new().await;
+    let created = h
+        .app
+        .control
+        .create_user("pw", "secret", UserKind::Standard, setup_audit())
+        .await;
+    assert!(created.is_ok());
+    let login = Request::post("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "username": "pw", "password": "secret" }).to_string(),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let reply = h.send(login).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let user = h
+        .app
+        .control
+        .find_user_by_username("pw")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"))
+        .id;
+    assert!(h.app.sessions.has_sessions(&user));
+
+    let refused = h.subject_token(&user).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("no current sign-in through")),
+        "{refused:?}"
+    );
+    assert!(h.app.sessions.has_sessions(&user));
+    assert!(h.audit("session").await.is_empty());
 }

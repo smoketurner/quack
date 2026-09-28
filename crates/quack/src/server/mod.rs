@@ -42,6 +42,7 @@ use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::llm::oauth::registration::{ClientSection, registered_sections};
 use quack_core::storage::control::ControlPlane;
 use quack_core::vault::Vault;
+use quack_core::web_sessions::WebSessions;
 use state::{App, AppState, ServeMode};
 
 /// How long one request may take. Agent turns can be slow.
@@ -352,6 +353,7 @@ pub(crate) async fn serve(
             .await?;
         tracing::info!(section = %registered.section, issuer = %registered.issuer, client_id, "using the registered OAuth client");
     }
+    let sessions = Arc::new(WebSessions::new(&config.server));
     let oidc = match (&config.server.oidc, mode) {
         (Some(oidc), ServeMode::Login) => Some(
             Oidc::new(
@@ -359,6 +361,7 @@ pub(crate) async fn serve(
                 Vault::new(config.data_dir(), KeySource::Keychain),
                 control.clone(),
                 ClientKeys::with_control(&config, KeySource::Keychain, control.clone()),
+                Arc::clone(&sessions),
             )
             .context("failed to set up [server.oidc] sign-in")?,
         ),
@@ -381,7 +384,7 @@ pub(crate) async fn serve(
         write!(out, "{banner}")?;
         out.flush()?;
     }
-    let app = Arc::new(AppState::new(config, control, mode, oidc));
+    let app = Arc::new(AppState::new(config, control, mode, sessions, oidc));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
