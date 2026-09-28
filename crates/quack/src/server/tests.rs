@@ -30,9 +30,15 @@ use quack_core::llm::CancellationToken;
 use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Outcome, Role, Scope, UserKind,
+    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Outcome,
+    Role, Scope, UserKind,
 };
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
+
+/// The audit row a test's own setup writes.
+fn setup_audit() -> AuditEntry {
+    AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
+}
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -125,7 +131,7 @@ impl Harness {
     async fn user(&self, name: &str, kind: UserKind) -> UserId {
         self.app
             .control
-            .create_user(name, "pw", kind)
+            .create_user(name, "pw", kind, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()))
             .id
@@ -148,12 +154,12 @@ impl Harness {
         let ws = self
             .app
             .control
-            .create_workspace(name)
+            .create_workspace(name, None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         self.app
             .control
-            .set_member(&ws.id, owner, Role::Owner)
+            .set_member(&ws.id, owner, Role::Owner, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         ws.id
@@ -563,7 +569,7 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     let ws = h.workspace("data", &owner).await;
     h.app
         .control
-        .set_member(&ws, &viewer, Role::Viewer)
+        .set_member(&ws, &viewer, Role::Viewer, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let owner_token = h.login("owner").await;
@@ -958,7 +964,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     let read_token = h
         .app
         .control
-        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None, setup_audit())
         .await
         .map_or_else(
             |e| fail(&e.to_string()),
@@ -999,7 +1005,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     } = h
         .app
         .control
-        .create_token(&ws, &owner, "rw", &[Scope::Write], None)
+        .create_token(&ws, &owner, "rw", &[Scope::Write], None, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let write_token = write_token.expose();
@@ -1041,6 +1047,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
             "old",
             &[Scope::Read],
             "2000-01-01 00:00:00".parse().ok(),
+            setup_audit(),
         )
         .await
         .map_or_else(
@@ -1069,7 +1076,7 @@ async fn query_endpoints_fail_cleanly_without_a_chat_model() {
     let ws = h.workspace("q", &owner).await;
     h.app
         .control
-        .set_member(&ws, &viewer, Role::Viewer)
+        .set_member(&ws, &viewer, Role::Viewer, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let owner_token = h.login("owner").await;
@@ -1350,7 +1357,7 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
     for u in [&viewer, &other] {
         h.app
             .control
-            .set_member(&ws, u, Role::Viewer)
+            .set_member(&ws, u, Role::Viewer, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
     }
@@ -1623,7 +1630,7 @@ async fn ontology_is_versioned_over_the_api_and_the_web_page() {
     let ws = h.workspace("o", &owner).await;
     h.app
         .control
-        .set_member(&ws, &viewer, Role::Viewer)
+        .set_member(&ws, &viewer, Role::Viewer, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let owner_token = h.login("owner").await;
@@ -2828,7 +2835,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     let read_token = h
         .app
         .control
-        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None, setup_audit())
         .await
         .map_or_else(
             |e| fail(&e.to_string()),
@@ -2837,7 +2844,14 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     let write_token = h
         .app
         .control
-        .create_token(&ws, &owner, "rw", &[Scope::Read, Scope::Write], None)
+        .create_token(
+            &ws,
+            &owner,
+            "rw",
+            &[Scope::Read, Scope::Write],
+            None,
+            setup_audit(),
+        )
         .await
         .map_or_else(
             |e| fail(&e.to_string()),
@@ -3060,7 +3074,7 @@ async fn a_failed_authorized_mcp_search_is_audited_as_error() {
     let read_token = h
         .app
         .control
-        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None, setup_audit())
         .await
         .map_or_else(
             |e| fail(&e.to_string()),
@@ -3112,7 +3126,7 @@ async fn a_successful_mcp_search_is_audited_as_allowed() {
     let read_token = h
         .app
         .control
-        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None, setup_audit())
         .await
         .map_or_else(
             |e| fail(&e.to_string()),
@@ -3187,7 +3201,7 @@ async fn concurrent_mcp_calls_by_one_user_audit_their_own_token_and_request_id()
         async move {
             h.app
                 .control
-                .create_token(ws, owner, name, &[Scope::Read], None)
+                .create_token(ws, owner, name, &[Scope::Read], None, setup_audit())
                 .await
                 .unwrap_or_else(|e| fail(&e.to_string()))
         }
@@ -3350,7 +3364,13 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
         .await
         .unwrap_or_else(|e| fail(&e.message));
     let ids: std::collections::BTreeSet<&str> = details.iter().map(|d| d.id.as_str()).collect();
-    assert!(rows.iter().all(|r| ids.contains(r.id.as_str())), "{rows:?}");
+    // The harness's setup rows are the CLI's, which writes no detail.
+    assert!(
+        rows.iter()
+            .filter(|r| r.channel != Channel::Cli)
+            .all(|r| ids.contains(r.id.as_str())),
+        "{rows:?}"
+    );
     assert!(
         details.iter().any(|d| {
             d.action == "open"
@@ -4457,7 +4477,7 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
     ] {
         h.app
             .control
-            .set_member(&ws, user, role)
+            .set_member(&ws, user, role, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
     }
@@ -4725,7 +4745,7 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
     let ws = h.workspace("vectors", &owner).await;
     h.app
         .control
-        .set_member(&ws, &viewer, Role::Viewer)
+        .set_member(&ws, &viewer, Role::Viewer, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let owner_token = h.login("owner").await;
@@ -5104,7 +5124,7 @@ async fn only_a_session_logout_is_audited_as_a_logout() {
     let IssuedToken { secret, .. } = h
         .app
         .control
-        .create_token(&ws, &owner, "ro", &[Scope::Read], None)
+        .create_token(&ws, &owner, "ro", &[Scope::Read], None, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let api_token = secret.expose().to_owned();
@@ -5148,6 +5168,34 @@ async fn only_a_session_logout_is_audited_as_a_logout() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_logout_whose_audit_row_cannot_be_written_leaves_the_session_open() {
+    let h = harness(ServeMode::Login).await;
+    h.user("owner", UserKind::Standard).await;
+    let session = h.login("owner").await;
+    let url = format!(
+        "sqlite:{}",
+        h.app.config.general.data_dir.join("control.db").display()
+    );
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    sqlx::query("DROP TABLE audit_log")
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    pool.close().await;
+
+    let (status, _) = h
+        .call(Method::POST, "/api/v1/auth/logout", Some(&session), None)
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _) = h.get("/api/v1/auth/me", &session).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 /// `list`'s token branch filters out a removed non-admin member's workspace,
 /// so `list` agrees with `show` for the same still-valid token, while
 /// preserving the admin-without-membership path (role `null`) and the
@@ -5186,7 +5234,7 @@ async fn list_token_branch_filters_removed_non_admin_member() {
     let IssuedToken { secret, .. } = h
         .app
         .control
-        .create_token(&ws, &former, "ro", &[Scope::Read], None)
+        .create_token(&ws, &former, "ro", &[Scope::Read], None, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let former_ro = secret.expose().to_owned();
@@ -5201,7 +5249,7 @@ async fn list_token_branch_filters_removed_non_admin_member() {
     let removed = h
         .app
         .control
-        .remove_member(&ws, &former)
+        .remove_member(&ws, &former, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(removed);
@@ -5278,7 +5326,7 @@ async fn list_token_branch_filters_removed_non_admin_member() {
     let IssuedToken { secret, .. } = h
         .app
         .control
-        .create_token(&ws2, &root_id, "ro", &[Scope::Read], None)
+        .create_token(&ws2, &root_id, "ro", &[Scope::Read], None, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let admin_ro = secret.expose().to_owned();
@@ -5312,7 +5360,7 @@ async fn list_token_branch_filters_removed_non_admin_member() {
     let IssuedToken { secret, .. } = h
         .app
         .control
-        .create_token(&ws, &keeper, "wo", &[Scope::Write], None)
+        .create_token(&ws, &keeper, "wo", &[Scope::Write], None, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let keeper_wo = secret.expose().to_owned();

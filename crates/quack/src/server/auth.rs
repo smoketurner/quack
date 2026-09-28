@@ -522,13 +522,30 @@ impl Access {
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> ApiResult<AuditId> {
-        let mut entry = self.identity.audit(action, outcome);
-        entry = entry.in_workspace(&self.workspace.id);
+        let mut entry = self.entry(action, outcome);
         if let Some(resource) = resource {
             entry = entry.on(resource);
         }
         app.control.record_audit(&entry).await?;
-        let detail = detail.unwrap_or_else(|| serde_json::json!({}));
+        self.record_detail(app, &entry, detail).await?;
+        Ok(entry.id)
+    }
+
+    /// An `audit_log` entry for this caller in this workspace, for a change
+    /// that commits it itself.
+    pub(crate) fn entry(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
+        self.identity
+            .audit(action, outcome)
+            .in_workspace(&self.workspace.id)
+    }
+
+    /// The `_quack_audit` half of an `audit_log` row already written.
+    pub(crate) async fn record_detail(
+        &self,
+        app: &App,
+        entry: &AuditEntry,
+        detail: Option<serde_json::Value>,
+    ) -> ApiResult<()> {
         // Its own connection: a request never waits for a write in
         // progress on the writer just to record that it happened.
         app.audit_log(&self.workspace.id)
@@ -536,11 +553,11 @@ impl Access {
             .record(AuditDetail {
                 id: entry.id.clone(),
                 user_id: Some(self.identity.user_id.clone()),
-                action: action.to_string(),
-                detail,
+                action: entry.action.to_string(),
+                detail: detail.unwrap_or_else(|| serde_json::json!({})),
             })
             .await?;
-        Ok(entry.id)
+        Ok(())
     }
 
     /// The allowed row for a read that returns a listing or a page:

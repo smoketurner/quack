@@ -1789,7 +1789,8 @@ async fn token_create(
         .filter(|d| *d > 0)
         .map(Expiry::after_days)
         .transpose()?;
-    let IssuedToken { secret, row } = app
+    let entry = access.entry(AuditAction::Token, Outcome::Allowed);
+    let IssuedToken { secret, .. } = app
         .control
         .create_token(
             &id,
@@ -1797,17 +1798,10 @@ async fn token_create(
             form.name.trim(),
             &scopes,
             expires_at,
+            entry.clone(),
         )
         .await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Token,
-            Some(ResourceKind::Token.id(&row.token_hash)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
+    access.record_detail(&app, &entry, None).await?;
     // The secret is shown once in this response body, never in a URL where
     // browser history, proxy logs, or a Referer would keep it.
     html(&SettingsPage::load(&app, &access, Some(secret.expose().to_owned()), None).await?)
@@ -1828,16 +1822,9 @@ async fn token_revoke(
     if !owned {
         return Err(ApiError::not_found("no such token").into());
     }
-    app.control.delete_token(&hash).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Token,
-            Some(ResourceKind::Token.id(&hash)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
+    let entry = access.entry(AuditAction::Token, Outcome::Allowed);
+    app.control.delete_token(&hash, entry.clone()).await?;
+    access.record_detail(&app, &entry, None).await?;
     Ok(Redirect::to(&format!("/w/{id}/settings")).into_response())
 }
 

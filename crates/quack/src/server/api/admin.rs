@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
-    AuditAction, AuditCursor, AuditFilter, AuditRow, Outcome, ResourceKind, UserKind, UserRow,
+    AuditAction, AuditCursor, AuditFilter, AuditRow, Outcome, UserKind, UserRow,
 };
 use serde::Deserialize;
 
@@ -48,14 +48,11 @@ impl Identity {
         if app.mode == ServeMode::Local {
             return Err(ApiError::bad_request("local mode has no users"));
         }
-        let created = app
+        let entry = self.audit(AuditAction::Admin, Outcome::Allowed);
+        Ok(app
             .control
-            .create_user(&user.username, &user.password, user.kind)
-            .await?;
-        let mut entry = self.audit(AuditAction::Admin, Outcome::Allowed);
-        entry = entry.on(ResourceKind::User.id(created.id.as_str()));
-        app.control.record_audit(&entry).await?;
-        Ok(created)
+            .create_user(&user.username, &user.password, user.kind, entry)
+            .await?)
     }
 }
 
