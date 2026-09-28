@@ -190,6 +190,7 @@ pub struct OAuthEmbedding {
     ndims: usize,
     /// The provider's limited client, reused by every rebuild.
     http: LimitedHttp,
+    headers: http::HeaderMap,
 }
 
 impl OAuthEmbedding {
@@ -205,6 +206,7 @@ impl OAuthEmbedding {
             self.base_url.as_ref().map(BaseUrl::as_str),
             token.expose_secret(),
             self.http.clone(),
+            self.headers.clone(),
         )
         .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
         Ok(client.embedding_model_with_ndims(&self.model, self.ndims))
@@ -235,6 +237,7 @@ impl EmbedModel {
                     model: model.model.to_owned(),
                     ndims,
                     http: LimitedHttp::for_provider(name, provider),
+                    headers: provider.header_map()?,
                 }))
             }
             ProviderType::Openai => Ok(Self::OpenAi(
@@ -376,11 +379,13 @@ impl ChatClient {
                 Some(&session.openai_base()),
                 SIGNED_PLACEHOLDER_KEY,
                 session.http(name, provider),
+                provider.header_map()?,
             )?),
             BedrockApi::Responses => Self::Responses(
                 rig::providers::openai::Client::builder()
                     .api_key(SIGNED_PLACEHOLDER_KEY)
                     .http_client(session.http(name, provider))
+                    .http_headers(provider.header_map()?)
                     .base_url(session.openai_base())
                     .build()
                     .map_err(|e| {
@@ -720,7 +725,8 @@ async fn build_ollama_client(
 
     let mut builder = rig::providers::ollama::Client::builder()
         .api_key(key)
-        .http_client(LimitedHttp::for_provider(name, provider));
+        .http_client(LimitedHttp::for_provider(name, provider))
+        .http_headers(provider.header_map()?);
 
     if let Some(base_url) = &provider.base_url {
         builder = builder.base_url(base_url.root());
@@ -750,6 +756,7 @@ async fn build_openai_client(
         provider.base_url.as_ref().map(BaseUrl::as_str),
         &key,
         LimitedHttp::for_provider(name, provider),
+        provider.header_map()?,
     )
 }
 
@@ -772,7 +779,8 @@ async fn build_openai_responses_client(
         })?;
     let mut builder = rig::providers::openai::Client::builder()
         .api_key(&key)
-        .http_client(LimitedHttp::for_provider(name, provider));
+        .http_client(LimitedHttp::for_provider(name, provider))
+        .http_headers(provider.header_map()?);
     if let Some(base_url) = provider.base_url.as_ref() {
         builder = builder.base_url(base_url.as_str());
     }
@@ -788,10 +796,12 @@ fn openai_client_with_key(
     base_url: Option<&str>,
     key: &str,
     http: LimitedHttp,
+    headers: http::HeaderMap,
 ) -> Result<OpenAiClient> {
     let mut builder = rig::providers::openai::CompletionsClient::builder()
         .api_key(key)
-        .http_client(http);
+        .http_client(http)
+        .http_headers(headers);
 
     if let Some(base_url) = base_url {
         builder = builder.base_url(base_url);
@@ -819,7 +829,8 @@ async fn build_anthropic_client(
 
     let mut builder = rig::providers::anthropic::Client::builder()
         .api_key(&key)
-        .http_client(LimitedHttp::for_provider(name, provider));
+        .http_client(LimitedHttp::for_provider(name, provider))
+        .http_headers(provider.header_map()?);
 
     if let Some(base_url) = &provider.base_url {
         builder = builder.base_url(base_url.as_str());
@@ -1212,6 +1223,10 @@ mod tests {
             let bedrock = crate::config::BedrockConfig { api, region: None };
             let provider = ProviderConfig {
                 bedrock: Some(bedrock.clone()),
+                headers: Some(std::collections::BTreeMap::from([(
+                    String::from("X-Gateway-Team"),
+                    String::from("quack"),
+                )])),
                 ..ProviderConfig::new(provider_type)
             };
             let Some(endpoint) = provider_type.bedrock_endpoint() else {
@@ -1244,10 +1259,64 @@ mod tests {
             );
             assert!(request.contains(service), "{request}");
             assert!(!lower.contains("bearer"), "{request}");
+            assert!(lower.contains("x-gateway-team: quack"), "{request}");
             assert!(request.contains("openai.gpt-oss-120b"), "{request}");
             if api == BedrockApi::Responses {
                 assert!(request.contains(r#""store":false"#), "{request}");
             }
+        }
+    }
+
+    /// A provider's `headers` reach the wire on every chat client, beside
+    /// the credential.
+    #[tokio::test]
+    async fn provider_headers_are_sent_beside_the_credential() {
+        // Cargo sets this variable for every test run.
+        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+        // Anthropic calls need a Claude model, which gets `max_tokens`.
+        for (provider, auth, model, path) in [
+            ("type = \"ollama\"\n", "", "m", "POST /api/chat "),
+            (
+                "type = \"openai\"\napi = \"chat-completions\"\n",
+                keyed,
+                "m",
+                "POST /chat/completions ",
+            ),
+            (
+                "type = \"openai\"\napi = \"responses\"\n",
+                keyed,
+                "m",
+                "POST /responses ",
+            ),
+            (
+                "type = \"anthropic\"\n",
+                keyed,
+                "claude-sonnet-5",
+                "POST /v1/messages ",
+            ),
+        ] {
+            let (root, seen) = capture_one().await;
+            let config = parse(&format!(
+                "[general]\nchat_model = \"p/{model}\"\n[providers.p]\n{provider}{auth}\
+                 base_url = \"{root}\"\nheaders = {{ \"X-Gateway-Team\" = \"quack\" }}\n"
+            ));
+            let chat = config
+                .chat_model_ref()
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let client = ChatClient::build(&config, &chat)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let answer = client
+                .one_shot(model, "Answer.", Duration::from_secs(10), "wire test", None)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .answer("hello")
+                .await;
+            assert!(answer.is_err(), "the server answers 400");
+            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+            let lower = request.to_ascii_lowercase();
+            assert!(request.starts_with(path), "{provider}: {request}");
+            assert!(lower.contains("x-gateway-team: quack"), "{request}");
+            assert_eq!(lower.contains("quack-core"), !auth.is_empty(), "{request}");
         }
     }
 

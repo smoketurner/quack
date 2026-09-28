@@ -2028,6 +2028,7 @@ type = "bedrock-mantle"                # api = "responses" (default) or "chat-co
 type = "openai"
 auth = "oauth"
 base_url = "https://{resource}.openai.azure.com/openai/deployments/{deployment}"
+# headers = { "X-Gateway-Team" = "quack" }   # every model request; any type but Bedrock converse
 
 [providers.azure.oauth]
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
