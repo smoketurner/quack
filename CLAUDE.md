@@ -168,7 +168,8 @@ one shared `TokenManager` per provider: PKCE or device-code login via `quack aut
 client-credentials grant, which needs no login; or `on-behalf-of`, which exchanges the
 requesting person's own token per request, the person carried in the `llm::acting::Acting`
 task-local and taken from `oidc::SubjectTokens`), the token sealed by `quack_core::vault` in
-`control.db` (`provider_tokens`; the vault key in the OS keychain or a 0600 `vault.key`),
+`control.db` (`provider_tokens`; the vault key in the OS keychain or a 0600 `vault.key`, made
+under a `vault.key.lock` file lock so every process agrees on one key),
 silent refresh, and `Error::AuthRequired` (exit 4 from every command that reaches a provider) when no flow can run.
 A client with `client_auth = "private_key_jwt"` (a provider or `[server.oidc]`) signs a new ES256
 client assertion for every token-endpoint and PAR request with a vault-sealed P-256 key in
@@ -282,7 +283,9 @@ not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
-`Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); the content
+`Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); a change to
+users, workspaces, membership, or tokens takes its `AuditEntry` and commits the row in the
+same transaction, so no change stands unaudited; the content
 half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace under the
 same UUID v7. Ingestion is `register_document` (status `queued`, or `Registration::Duplicate` when the
 bytes' SHA-256 already belong to a non-failed document whose table or chunks still exist;
@@ -313,7 +316,9 @@ bearer (login session or API token), the session cookie, or `--local` into an `I
 `quack_core::oidc::SignIn`, `server::oidc`, and `web::sign_in`; a first sign-in creates a
 user with no memberships, the user's refresh token is kept HPKE-sealed in `control.db`
 (`oidc::UserTokens` over `quack_core::vault`, whose HPKE key is in the keychain),
-and a session whose token has run out renews it or ends when the issuer refuses),
+and a session whose token has run out renews it; an issuer's refusal, seen by a renewal or
+an on-behalf-of exchange alike, is handled once in `SubjectTokens::refreshed`: the stored and
+presented tokens go, every session ends, and one denied `session` row is written),
 and `Access::resolve` resolves the workspace, checks role and token scope, and writes the denied
 audit row itself, so a handler holding an `Access` is already authorized. Both login paths
 go through one `auth::password_login`, and a browser session expires at
@@ -325,7 +330,9 @@ none on `/healthz` (design doc 12). The same routes carry `no-store` cache heade
 (`server::no_store`) unless the handler set `Cache-Control` itself, as the static assets
 do. Every
 workspace-touching handler then records the allowed row plus its `_quack_audit` detail
-through `Access::audit`. A handler's reads go through `App::read` (a reader-pool
+through `Access::audit`; one that changes the control plane commits the row with the change
+(`Access::entry`) and writes only the detail after (`Access::record_detail`).
+A handler's reads go through `App::read` (a reader-pool
 connection in a read-only transaction, so a read never occupies the writer and a write
 slipped into one is refused); its writes go to the writer through `state::with_db`; and
 its `_quack_audit` detail row goes to the workspace's insert-only audit connection
