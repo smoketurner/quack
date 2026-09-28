@@ -733,7 +733,7 @@ impl TokenManager {
     /// refused, although the winner has stored a good token (#249). An
     /// issuer that answers such reuse by revoking the whole token family
     /// (Okta's and Auth0's reuse detection) leaves nothing to find here;
-    /// `docs/authentication.md` covers that case.
+    /// `docs/providers.md` covers that case.
     async fn renewed_elsewhere(&self, tried: &CachedToken) -> Option<CachedToken> {
         let stored = match self.store.load().await {
             Ok(stored) => stored?,

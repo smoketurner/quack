@@ -94,8 +94,9 @@ type = "ollama"
 quack supports Ollama, OpenAI-compatible endpoints, Anthropic, and Amazon Bedrock. A
 provider takes no auth, an API key, or OAuth. Bedrock uses whatever the AWS CLI would use:
 the environment, `aws_profile` or `AWS_PROFILE`, `aws sso login`, or instance roles.
-[docs/authentication.md](docs/authentication.md) covers how people sign in to
-`quack serve` and how quack authenticates to providers. The Anthropic and OpenAI APIs
+[docs/providers.md](docs/providers.md) covers each provider type and gateway (Bedrock,
+LiteLLM, Azure API Management), and [docs/authentication.md](docs/authentication.md) covers
+how people sign in to `quack serve`. The Anthropic and OpenAI APIs
 directly:
 
 ```toml

@@ -1286,8 +1286,8 @@ it will refresh, asks, and updates them in place (section 5.4).
 
 ### 10.2 Authentication
 
-`docs/authentication.md` is the operator's guide to both directions (signing in to quack,
-and quack authenticating to providers); this section and section 12 hold the design.
+`docs/providers.md` is the operator's guide to connecting to providers and authenticating
+with them; this section holds the design.
 
 Each provider has an `auth` mode: `none`; `api-key` (from the env var named by
 `api_key_env`); or `oauth`, an enterprise IdP access token as the provider's bearer, which
@@ -1391,6 +1391,17 @@ refreshed silently under `refresh_lock`, and the flow restarts on refresh failur
 ingest, and server modes, where no flow can run, the call fails with exit 4 / HTTP 503
 naming the command to run.
 
+The browser flow is the default because a device code can be phished: an attacker starts a
+login, sends the victim the code, and receives the victim's token on approval. The browser
+flow delivers the code only to the loopback listener that started the login.
+
+`refresh_lock` covers one process. Two processes on one data directory can both refresh an
+expiring token; an issuer that rotates refresh tokens refuses the second, which then
+rereads the stored token and uses it if another process stored a different, unexpired one
+(`TokenManager::renewed_elsewhere`). An issuer with reuse detection (Okta, Auth0) instead
+revokes the whole token family, and every process needs a new login; the operator guide
+tells such deployments to make model calls through one long-lived process.
+
 A `client-credentials` provider needs no login: the first request runs the grant, a token
 with 60 s or less left is replaced by rerunning it under the same lock (never a refresh
 token), and a refused secret is an error naming the grant, not a login prompt. `quack auth
@@ -1429,8 +1440,9 @@ The key is P-256, made with aws-lc-rs on first use (`llm::oauth::client_key`), k
 per process, and named `<issuer> <client_id>`, so `[server.oidc]` and a provider registered
 as the same client share one key and one registered JWKS. `quack auth jwks [PROVIDER]` prints
 the public key set to register; `quack auth status` shows the thumbprint and any waiting
-replacement. A key whose vault key is gone is replaced, with a warning to register the new
-one.
+replacement. Entra ID accepts client assertions only for uploaded certificates, named by
+thumbprint in the header, so an Entra client uses a secret. A key whose vault key is gone is
+replaced, with a warning to register the new one.
 
 Rotation takes two steps. `quack auth jwks --rotate` makes a replacement under
 `next <issuer> <client_id>` in `client_keys` and gives the issuer both keys (the same pair if
@@ -1533,6 +1545,14 @@ directory in the OS keychain or a 0600 `vault.key`. Each value is sealed for a p
 HPKE `info`) and a subject (the associated data) and records its key id. The caller stores
 the sealed value where its classification says (signed-in users' tokens: `control.db`,
 section 12).
+
+The keychain comes first, then `vault.key`. quack writes `vault.key` only where no keychain
+is usable at all (none installed, or no entry addressable, as under Docker's default seccomp
+profile). A keychain that exists but refuses access is an error, never a fallback: tokens
+sealed under a second key would stop opening whenever the other key answered first. quack
+makes the key under an exclusive lock on `<data_dir>/vault.key.lock`, so processes starting
+together on one data directory agree on one key; processes on different data directories
+share the keychain entry but not the lock.
 
 SHA-256, AES-256-GCM and randomness come from aws-lc-rs; password hashing is the RustCrypto
 `argon2` crate, salted from `getrandom`. No runtime code links OpenSSL or `ring`:
@@ -1866,7 +1886,7 @@ installers.
 
 ## 12. Server Auth, Roles, and Audit
 
-`docs/authentication.md` covers how to configure each way in.
+`docs/authentication.md` is the operator's guide to each way in; this section holds the design.
 
 - `quack serve --local`: no auth, loopback only, one implicit user. For a laptop that wants
   the browser.
@@ -1945,8 +1965,8 @@ installers.
 - **Rate limiting covers everything a caller can reach.**
   - One `tower_governor` limiter, keyed by peer address, covers the web UI, REST API, and
     MCP. The password endpoints (`POST /login`, `POST /api/v1/auth/login`) add a tighter
-    one, keyed the same way; the general budget suits browsing and is too loose to make
-    guessing expensive.
+    one, keyed the same way (2 requests per second, bursting to 10); the general budget suits
+    browsing and is too loose to make guessing expensive.
   - No limiter keys on what the request says about itself: keyed on the unvalidated
     `Authorization` header, each random bearer got a fresh bucket (issue #237). Everyone
     behind one address (a NAT, a same-host reverse proxy) shares one budget.
