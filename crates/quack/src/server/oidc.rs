@@ -7,7 +7,9 @@
 //! it, and a refusal ends every session the user has.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
@@ -15,16 +17,19 @@ use quack_core::config::OidcConfig;
 use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
+use quack_core::llm::acting::OnRevoked;
 use quack_core::llm::oauth::CachedToken;
 use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::oidc::{
     Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
 };
-use quack_core::storage::control::{AuditEntry, ControlPlane, UserRow};
+use quack_core::storage::control::{
+    AuditAction, AuditEntry, Channel, ControlPlane, Outcome, UserRow,
+};
 use quack_core::vault::Vault;
 
 use super::error::{ApiError, ApiResult};
-use super::state::{AppState, SessionToken, WebSessions};
+use super::state::{App, AppState, SessionToken, WebSessions};
 
 /// The cookie that ties a callback to the browser that started the sign-in,
 /// so a callback link someone else started cannot sign this browser in.
@@ -85,9 +90,18 @@ impl Oidc {
     }
 
     /// The acting person for a request by `user`: model requests to an
-    /// on-behalf-of provider exchange their own token.
-    pub(crate) fn acting(&self, user: &UserId) -> Acting {
-        Acting::new(user.clone(), Arc::clone(&self.subjects))
+    /// on-behalf-of provider exchange their own token. The `Acting` carries
+    /// the [`SessionCloser`] hook, so an exchange that finds the issuer has
+    /// ended the person's sign-in ends their sessions and records the denied
+    /// `session` audit row at that moment, just as the session-renewal
+    /// refusal does in `require_current` — the one path the issuer's refusal
+    /// reaches without `require_current` running first is the job queue, so
+    /// the hook is what makes the documented guarantee hold for it too.
+    pub(crate) fn acting(&self, app: &App, user: &UserId) -> Acting {
+        let on_revoked: Arc<dyn OnRevoked + Send + Sync> = Arc::new(SessionCloser {
+            app: Arc::downgrade(app),
+        });
+        Acting::new(user.clone(), Arc::clone(&self.subjects), Some(on_revoked))
     }
 
     /// Begin a sign-in: the issuer URL to send the browser to, and the
@@ -240,6 +254,51 @@ impl Oidc {
             .subjects
             .forget_unless(user, || sessions.has_sessions(user))
             .await?)
+    }
+}
+
+/// What [`Oidc::acting`] installs on each [`Acting`] so an on-behalf-of
+/// exchange that finds the issuer has ended the person's sign-in ends their
+/// sessions and records a denied `session` audit row at that moment — the
+/// same bookkeeping the session-renewal refusal does in `require_current`.
+///
+/// `SubjectTokens` in `quack-core` clears the stored grant itself (in
+/// `refreshed`, on `invalid_grant`), but it cannot end the person's sessions
+/// or write the session-audit row: it owns neither `WebSessions` nor the
+/// caller's audit context, and the on-behalf-of exchange runs through
+/// `Acting::subject_token` deep in core. The `Oidc` that owns the
+/// `SubjectTokens` therefore installs one of these for every signed-in
+/// caller, so the refusal's second half — ending the sessions and recording
+/// it in the audit log — happens at the moment the issuer is refused, not
+/// deferred to a later session-authenticated request a churned person never
+/// makes (see `docs/authentication.md`). The hook holds a [`Weak`] `App`, so a
+/// shutting-down server does not hold itself open through the hook.
+struct SessionCloser {
+    app: Weak<AppState>,
+}
+
+impl OnRevoked for SessionCloser {
+    fn on_revoked<'user>(
+        &self,
+        user: &'user UserId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'user>> {
+        let app = self.app.clone();
+        let user = user.clone();
+        Box::pin(async move {
+            let Some(app) = app.upgrade() else {
+                return;
+            };
+            app.sessions.close_user(&user);
+            let mut entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, Channel::Web);
+            entry.user_id = Some(user.clone());
+            if let Err(e) = app.control.record_audit(&entry).await {
+                tracing::warn!(
+                    user = %user,
+                    error = %e,
+                    "could not record the denied-session audit row for the refused on-behalf-of exchange",
+                );
+            }
+        })
     }
 }
 

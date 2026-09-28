@@ -19,6 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
 use quack_core::config::{ClientAuth, Config, OidcConfig};
 use quack_core::ids::UserId;
+use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
 use quack_core::llm::oauth::{CachedToken, KeySource};
 use quack_core::oidc::OidcSubject;
@@ -1421,4 +1422,188 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
         assert!(!form.contains_key("actor_token"), "{form:?}");
         check_assertion(form, key.jwk(), &base, &mut seen);
     }
+}
+
+// --- an on-behalf-of refusal: the refused grant's bookkeeping ----------------
+
+/// An on-behalf-of exchange that finds the issuer has ended the person's
+/// sign-in ends their sessions and records a denied `session` audit row at
+/// that moment — the same handling a session-renewal refusal gets — rather
+/// than leaving the bookkeeping to a later session-authenticated request the
+/// churned person may never make.
+///
+/// The HTTP `Identity` extractor runs `require_current` first whenever a
+/// session's renewal is due, so a synchronous request short-circuits with
+/// `401` before the acting flow runs, and the session-renewal test above
+/// already covers that arm. The arm that escapes it is the one the job queue
+/// reaches: the exchange runs as a queued job does, directly through the
+/// `Acting` the request set up, with no `require_current` in between. This
+/// drives it that way and checks the refusal's three guarantees — the
+/// stored token is gone, the person's sessions are ended, and exactly one
+/// denied `session` audit row is recorded against them — hold at the moment
+/// it happens, and that a later request does not record it a second time.
+#[tokio::test]
+async fn an_on_behalf_of_refusal_ends_the_sessions_and_records_a_denied_session_at_that_moment() {
+    let h = Harness::new().await;
+    // A token already inside the renewal margin when it is issued, so an
+    // on-behalf-of exchange — run as a queued job would, with no
+    // session-authenticated HTTP request in between — contacts the issuer
+    // for a refresh.
+    h.issuer(|s| s.lifetime = 30);
+    let session = h.sign_in("sub-obo", "obo").await;
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-obo"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"));
+    assert!(
+        h.app.sessions.has_sessions(&user.id),
+        "the sign-in opened a session"
+    );
+    assert!(h.has_token(&user.id).await, "the sign-in stored a token");
+
+    // The issuer refuses the renewal with `invalid_grant`.
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+
+    // The exchange runs as a queued job would: directly through the `Acting`
+    // the request built (which carries the `SessionCloser` hook), not through
+    // an HTTP request that would run `require_current` first and
+    // short-circuit. This is the reachability path the bug report describes.
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let acting = oidc.acting(&h.app, &user.id);
+    let refused = Acting::scope(Some(acting), async {
+        Acting::current()
+            .unwrap_or_else(|| fail("the acting person is not in scope"))
+            .subject_token()
+            .await
+    })
+    .await;
+    assert!(refused.is_err(), "the exchange did not refuse: {refused:?}");
+    let message = refused.err().unwrap_or_else(|| fail("expected a refusal"));
+    assert!(
+        message.contains("ended this person's sign-in"),
+        "the refusal names the issuer: {message}",
+    );
+
+    // At the moment of the refusal: the stored token is gone, the person's
+    // sessions are ended, and one denied `session` audit row is recorded
+    // against them — not deferred to a later request.
+    assert!(
+        !h.has_token(&user.id).await,
+        "the stored token was not cleared at the refusal"
+    );
+    assert!(
+        !h.app.sessions.has_sessions(&user.id),
+        "the person's sessions were not ended at the refusal"
+    );
+    let denied = h.audit("session").await;
+    assert!(
+        denied.contains(&(Outcome::Denied, Some(user.id.clone()))),
+        "no denied-session audit row recorded at the refusal: {denied:?}",
+    );
+    assert_eq!(
+        denied
+            .iter()
+            .filter(|(_, u)| u == &Some(user.id.clone()))
+            .count(),
+        1,
+        "the refusal wrote exactly one denied-session row, not {denied:?}",
+    );
+
+    // A later session-authenticated request from the same cookie finds the
+    // session already gone (the refusal ended it), so `require_current`
+    // never runs and the refusal is not recorded a second time — the
+    // audit-attribution error the bug report describes is closed.
+    assert_eq!(
+        h.me(&session).await.0,
+        StatusCode::UNAUTHORIZED,
+        "a session closed at the refusal is no longer present",
+    );
+    let later = h.audit("session").await;
+    assert_eq!(
+        later
+            .iter()
+            .filter(|(_, u)| u == &Some(user.id.clone()))
+            .count(),
+        1,
+        "a later request should not record a second denied-session row: {later:?}",
+    );
+}
+
+/// A refused refresh token is not the only reason an on-behalf-of exchange
+/// has no token for the person: a password user, who never signed in through
+/// the issuer, has no stored sign-in either. That refusal must not fire the
+/// revocation hook: the person's sessions (a password user may be signed in
+/// through a password login) stay, and no denied `session` row is written.
+/// Only an issuer refusal of the grant itself ends the sessions.
+#[tokio::test]
+async fn an_on_behalf_of_refusal_for_a_user_with_no_stored_sign_in_does_not_end_sessions() {
+    let h = Harness::new().await;
+    let created = h
+        .app
+        .control
+        .create_user(
+            "pw",
+            "secret",
+            quack_core::storage::control::UserKind::Standard,
+        )
+        .await;
+    assert!(created.is_ok());
+    // Sign the password user in: a `WebSessions` session opens, but no
+    // issuer token is stored for them.
+    let login = Request::post("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "username": "pw", "password": "secret" }).to_string(),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let reply = h.send(login).await;
+    let body: Value = serde_json::from_str(&reply.body).unwrap_or(Value::Null);
+    let token = body["token"].as_str().unwrap_or_default().to_owned();
+    assert!(!token.is_empty(), "{}", reply.body);
+    let user = h
+        .app
+        .control
+        .find_user_by_username("pw")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"));
+    assert!(
+        h.app.sessions.has_sessions(&user.id),
+        "the password login opened a session"
+    );
+    assert!(
+        !h.has_token(&user.id).await,
+        "a password user has no issuer token"
+    );
+
+    // An on-behalf-of exchange for them is refused with "no current
+    // sign-in", but it is not a revocation, so the hook does not fire.
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let acting = oidc.acting(&h.app, &user.id);
+    let refused = Acting::scope(Some(acting), async {
+        Acting::current()
+            .unwrap_or_else(|| fail("the acting person is not in scope"))
+            .subject_token()
+            .await
+    })
+    .await;
+    assert!(refused.is_err());
+    let message = refused.err().unwrap_or_else(|| fail("expected a refusal"));
+    assert!(
+        message.contains("no current sign-in through"),
+        "the refusal explains it: {message}",
+    );
+    assert!(
+        h.app.sessions.has_sessions(&user.id),
+        "a non-revocation refusal does not end the sessions"
+    );
+    assert!(
+        h.audit("session").await.is_empty(),
+        "a non-revocation refusal writes no denied-session row"
+    );
 }

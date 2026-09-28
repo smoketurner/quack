@@ -274,7 +274,7 @@ impl FromRequestParts<App> for Identity {
         if app.mode != ServeMode::Local
             && let Some(oidc) = &app.oidc
         {
-            oidc.acting(&identity.user_id).enter();
+            oidc.acting(app, &identity.user_id).enter();
         }
         Ok(identity)
     }
