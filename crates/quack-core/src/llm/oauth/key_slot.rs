@@ -1,10 +1,13 @@
 //! Where a secret key lives: the OS keychain (`keychain.rs`) when it is
 //! usable, else a key file with mode 0600.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::keychain::{Keychain, KeychainError};
 use crate::error::{Error, Result};
+use tokio::sync::Semaphore;
 
 /// Where the key may be kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +148,21 @@ impl KeySlot {
     /// The stored key, or a new one from `make`, stored where it will be
     /// found again: the keychain when this host has one, else the key file.
     ///
+    /// `serve` builds several distinct `Vault`s that all share one
+    /// `<data_dir>/vault.key` (and one keychain entry `vault`); each has its
+    /// own `OnceCell`, which only serializes that one instance. Two distinct
+    /// instances can therefore race their first seal on a fresh key: both
+    /// `find` a missing key, both `make` a different key, and the two writes
+    /// are last-writer-wins into shared storage, so the losing Vault's seals
+    /// open as `Opened::KeyGone` to every Vault that later reads the survivor.
+    ///
+    /// The race is closed at its source: a single-permit semaphore keyed by
+    /// the key file's path serializes `find` through the write across every
+    /// `KeySlot` in the process, so only one first-seal runs at a time over a
+    /// given key file; the file write itself is an exclusive `create_new`
+    /// (`O_EXCL`) that, if another writer beat it, reuses that key instead of
+    /// overwriting it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the key cannot be made, the keychain refuses
@@ -154,6 +172,12 @@ impl KeySlot {
         &self,
         make: impl FnOnce() -> Result<String>,
     ) -> Result<String> {
+        let semaphore = key_file_lock(&self.file);
+        let _guard = semaphore
+            .acquire()
+            .await
+            .map_err(|e| Error::Vault(format!("the vault key lock is closed: {e}")))?;
+
         let location = match self.find().await? {
             Found::Key(key, _) => return Ok(key),
             Found::Missing(location) => location,
@@ -171,30 +195,70 @@ impl KeySlot {
         if let Some(dir) = self.file.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        write_private(&self.file, key.as_bytes())?;
-        Ok(key)
+        claim_or_read_key(&self.file, &key)
     }
 }
 
-/// Write a file readable only by its owner.
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+/// The per-key-file single-permit semaphore that serializes
+/// [`KeySlot::read_or_create`] across the several distinct `Vault`
+/// instances `serve` builds over one `<data_dir>/vault.key`. The
+/// per-`Vault` `OnceCell` only serializes one instance; this map is what
+/// makes two *different* instances agree on one first seal.
+///
+/// The table is held briefly (a `HashMap` lookup, no `await` inside) so the
+/// std `Mutex` guard it returns is never held across an `.await` — only the
+/// `Semaphore` permit is, and a semaphore permit is not a lock guard for
+/// `await_holding_lock`. Entries live for the process; in tests there is one
+/// per distinct tempdir, bounded by the number of cases.
+fn key_file_lock(file: &Path) -> Arc<Semaphore> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Semaphore>>>> = OnceLock::new();
+    let table = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut table = table
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner); // a poisoned table is still usable
+    table
+        .entry(file.to_path_buf())
+        .or_insert_with(|| Arc::new(Semaphore::new(1)))
+        .clone()
+}
+
+/// Atomically claim the key file for `key`, or, when another writer already
+/// created it, reuse that key instead of overwriting it. A non-exclusive
+/// `create(true).truncate(true)` write is last-writer-wins, which is exactly
+/// what orphans a losing writer's seals under the cold-start race;
+/// `create_new` (`O_EXCL`) makes the loser read the winner back.
+///
+/// The in-process semaphore in [`read_or_create`] makes the pre-existing-file
+/// arm unreachable in normal operation; it is defense-in-depth against a
+/// writer that does not take that lock, and it keeps the file's existing key
+/// (which may have sealed what is stored) instead of clobbering it.
+fn claim_or_read_key(path: &Path, key: &str) -> Result<String> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(key.as_bytes())?;
+            file.flush()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(key.to_owned())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another writer won the file between our `find` and our write;
+            // reuse their key rather than clobbering it.
+            Ok(std::fs::read_to_string(path)?)
+        }
+        Err(e) => Err(e.into()),
     }
-    file.write_all(bytes)?;
-    file.flush()?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -215,7 +279,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let path = dir.path().join("k");
-        assert!(write_private(&path, b"x").is_ok());
+        assert!(claim_or_read_key(&path, "x").is_ok());
         let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
         assert!(mode.is_ok_and(|m| m == 0o600));
     }
@@ -345,5 +409,134 @@ mod tests {
                 .await
                 .is_ok_and(|l| l == KeyLocation::Keychain)
         );
+    }
+
+    #[test]
+    fn claim_or_read_key_creates_a_fresh_file_with_the_given_key() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let path = dir.path().join("v.key");
+        let key = claim_or_read_key(&path, "ours").unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(key, "ours");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&e.to_string())),
+            "ours"
+        );
+    }
+
+    #[test]
+    fn claim_or_read_key_reuses_a_pre_existing_file_instead_of_overwriting() {
+        // The file-path defense-in-depth: a writer that arrives after the key
+        // file already exists reuses that key, never clobbering it. A
+        // `create(true).truncate(true)` write here is the last-writer-wins
+        // that orphans the loser's seals; `create_new` makes it safe.
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let path = dir.path().join("v.key");
+        std::fs::write(&path, "winner").unwrap_or_else(|e| fail(&e.to_string()));
+        let key = claim_or_read_key(&path, "loser").unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(key, "winner");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&e.to_string())),
+            "winner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_slots_first_seal_on_one_fresh_file_agree_on_one_key() {
+        // The cold-start race: two distinct KeySlots over one fresh
+        // <data_dir>/vault.key race their first seal. Before the fix, both
+        // `find` a missing key, both `make` a different key, and the second
+        // write silently overwrites the first; each caches its own key and a
+        // third slot reads the survivor. After the fix, the per-key-file
+        // serialize-across-find-and-write lock makes them agree.
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+            let keyfile = dir.path().join("vault.key");
+            let slot_a = KeySlot::new(String::from("vault"), keyfile.clone(), KeySource::File);
+            let slot_b = KeySlot::new(String::from("vault"), keyfile.clone(), KeySource::File);
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let ha = tokio::spawn({
+                let barrier = barrier.clone();
+                async move {
+                    let _ = barrier.wait().await;
+                    slot_a.read_or_create(|| Ok(String::from("a"))).await
+                }
+            });
+            let hb = tokio::spawn({
+                let barrier = barrier.clone();
+                async move {
+                    let _ = barrier.wait().await;
+                    slot_b.read_or_create(|| Ok(String::from("b"))).await
+                }
+            });
+            let a = ha
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let b = hb
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            // The two slots must agree on the one key that is in the file.
+            assert_eq!(a, b);
+            // A third slot reads that same key back from the file.
+            let slot_c = KeySlot::new(String::from("vault"), keyfile, KeySource::File);
+            assert_eq!(
+                slot_c
+                    .read()
+                    .await
+                    .unwrap_or_else(|e| fail(&e.to_string()))
+                    .as_deref(),
+                Some(a.as_str())
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_slots_first_seal_on_one_fresh_keychain_agree_on_one_key() {
+        // The same race on the keychain path: two distinct KeySlots over one
+        // shared in-memory keychain (the keychain `set` is
+        // last-writer-wins, like the file write). The serialize lock makes
+        // them agree; only one `set` runs before the other's `find` sees it.
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+            let fake = Arc::new(FakeKeychain::new(Mode::Open));
+            let slot_a = KeySlot::with_keychain(
+                String::from("vault"),
+                dir.path().join("vault.key"),
+                Keychain::Fake(Arc::clone(&fake)),
+            );
+            let slot_b = KeySlot::with_keychain(
+                String::from("vault"),
+                dir.path().join("vault.key"),
+                Keychain::Fake(Arc::clone(&fake)),
+            );
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let ha = tokio::spawn({
+                let barrier = barrier.clone();
+                async move {
+                    let _ = barrier.wait().await;
+                    slot_a.read_or_create(|| Ok(String::from("a"))).await
+                }
+            });
+            let hb = tokio::spawn({
+                let barrier = barrier.clone();
+                async move {
+                    let _ = barrier.wait().await;
+                    slot_b.read_or_create(|| Ok(String::from("b"))).await
+                }
+            });
+            let a = ha
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let b = hb
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            assert_eq!(a, b);
+            assert_eq!(fake.peek("vault").as_deref(), Some(a.as_str()));
+            // The keychain won; no key file was written.
+            assert!(!dir.path().join("vault.key").exists());
+        }
     }
 }

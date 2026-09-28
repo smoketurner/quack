@@ -107,6 +107,72 @@ async fn a_value_whose_key_is_gone_says_so_and_opening_makes_no_key() {
     assert!(!dir.path().join("vault.key").exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_vaults_concurrent_first_seals_on_a_fresh_key_agree_and_open_after_a_restart() {
+    // The reachable production race: two distinct Vault instances over one
+    // fresh <data_dir>/vault.key seal concurrently (the P_p vs P_q
+    // `ProviderToken` topology for `client_secret` providers). Before the
+    // fix, the two `read_or_create` calls race on the fresh key, last writer
+    // wins in storage, and the loser's seals open as `KeyGone` to a Vault
+    // reading the surviving key. After the fix, the two agree on one key and
+    // both seals open after a restart.
+    for _ in 0..40 {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let a = std::sync::Arc::new(Vault::new(dir.path(), KeySource::File));
+        let b = std::sync::Arc::new(Vault::new(dir.path(), KeySource::File));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let ha = tokio::spawn({
+            let a = a.clone();
+            let barrier = barrier.clone();
+            async move {
+                let _ = barrier.wait().await;
+                a.seal(Purpose::ProviderToken, "provider-p", b"p's token")
+                    .await
+            }
+        });
+        let hb = tokio::spawn({
+            let b = b.clone();
+            let barrier = barrier.clone();
+            async move {
+                let _ = barrier.wait().await;
+                b.seal(Purpose::ProviderToken, "provider-q", b"q's token")
+                    .await
+            }
+        });
+        let sealed_a = ha
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let sealed_b = hb
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        // Before the fix this intermittently diverged; after the fix the two
+        // share the one key that is in storage.
+        assert_eq!(sealed_a.key_id, sealed_b.key_id);
+        // A freshly started Vault reads the surviving key and opens both.
+        let after = Vault::new(dir.path(), KeySource::File);
+        assert_eq!(
+            opened(
+                after
+                    .open(Purpose::ProviderToken, "provider-p", &sealed_a)
+                    .await
+            )
+            .as_deref(),
+            Some(&b"p's token"[..])
+        );
+        assert_eq!(
+            opened(
+                after
+                    .open(Purpose::ProviderToken, "provider-q", &sealed_b)
+                    .await
+            )
+            .as_deref(),
+            Some(&b"q's token"[..])
+        );
+    }
+}
+
 #[test]
 fn each_purpose_has_its_own_info() {
     let infos: std::collections::BTreeSet<Vec<u8>> =
