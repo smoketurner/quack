@@ -1025,34 +1025,34 @@ impl ControlPlane {
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
-    /// Create a new workspace and return its row.
+    /// Create a new workspace, with `owner` as its owner when given, and
+    /// record `audit` in the same transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error if the insert fails (a duplicate name included).
-    pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceRow> {
-        let id = WorkspaceId::generate();
-
-        let bound = Bound::new(
-            Query::insert()
-                .into_table(Workspaces::Table)
-                .columns([Workspaces::Id, Workspaces::Name, Workspaces::Classification])
-                .values([id.clone().into(), name.into(), "internal".into()])?,
-        )?;
-
-        bound.query().execute(&self.pool).await?;
-
-        tracing::info!(workspace_name = name, workspace_id = %id, "created workspace");
-
-        Ok(WorkspaceRow {
-            id,
-            name: name.to_owned(),
-            classification: String::from("internal"),
-            allowed_providers: AllowedProviders::All,
-        })
+    /// Returns an error if the insert fails (a duplicate name included);
+    /// nothing is then written.
+    pub async fn create_workspace(
+        &self,
+        name: &str,
+        owner: Option<&UserId>,
+        audit: AuditEntry,
+    ) -> Result<WorkspaceRow> {
+        let (ws, insert) = Self::new_workspace(name)?;
+        let mut change = vec![insert];
+        if let Some(owner) = owner {
+            change.push(Self::member_insert(&ws.id, owner, Role::Owner)?);
+        }
+        let audit = audit
+            .in_workspace(&ws.id)
+            .on(ResourceKind::Workspace.id(ws.id.as_str()));
+        self.commit_audited(change, audit).await?;
+        tracing::info!(workspace_name = name, workspace_id = %ws.id, "created workspace");
+        Ok(ws)
     }
 
-    /// Find a workspace by name, creating it if it does not exist.
+    /// Find a workspace by name, creating it if it does not exist. The CLI's
+    /// own workspaces, which it does not audit.
     ///
     /// # Errors
     ///
@@ -1061,7 +1061,27 @@ impl ControlPlane {
         if let Some(ws) = self.find_workspace_by_name(name).await? {
             return Ok(ws);
         }
-        self.create_workspace(name).await
+        let (ws, insert) = Self::new_workspace(name)?;
+        insert.query().execute(&self.pool).await?;
+        tracing::info!(workspace_name = name, workspace_id = %ws.id, "created workspace");
+        Ok(ws)
+    }
+
+    fn new_workspace(name: &str) -> Result<(WorkspaceRow, Bound)> {
+        let id = WorkspaceId::generate();
+        let insert = Bound::new(
+            Query::insert()
+                .into_table(Workspaces::Table)
+                .columns([Workspaces::Id, Workspaces::Name, Workspaces::Classification])
+                .values([id.clone().into(), name.into(), "internal".into()])?,
+        )?;
+        let ws = WorkspaceRow {
+            id,
+            name: name.to_owned(),
+            classification: String::from("internal"),
+            allowed_providers: AllowedProviders::All,
+        };
+        Ok((ws, insert))
     }
 
     /// Change a workspace's classification label and provider allow-list.
@@ -1156,17 +1176,19 @@ impl ControlPlane {
             .to_owned()
     }
 
-    /// Create a user with an argon2id password hash.
+    /// Create a user with an argon2id password hash, and record `audit` in
+    /// the same transaction.
     ///
     /// # Errors
     ///
     /// Returns an error for an empty username or password, a duplicate
-    /// username, or a failed insert.
+    /// username, or a failed insert; nothing is then written.
     pub async fn create_user(
         &self,
         username: &str,
         password: &str,
         kind: UserKind,
+        audit: AuditEntry,
     ) -> Result<UserRow> {
         let username = username.trim();
         if username.is_empty() {
@@ -1196,15 +1218,14 @@ impl ControlPlane {
                     i64::from(bool::from(kind)).into(),
                 ])?,
         )?;
-        bound
-            .query()
-            .execute(&self.pool)
+        let audit = audit.on(ResourceKind::User.id(id.as_str()));
+        self.commit_audited(vec![bound], audit)
             .await
             .map_err(|e| match &e {
-                sqlx::Error::Database(db) if db.is_unique_violation() => {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_unique_violation() => {
                     Error::Config(format!("user '{username}' already exists"))
                 }
-                _ => e.into(),
+                _ => e,
             })?;
         tracing::info!(username, ?kind, "created user");
         self.get_user(&id)
@@ -1676,17 +1697,19 @@ impl ControlPlane {
 
     // --- members ------------------------------------------------------------
 
-    /// Add or change a membership.
+    /// Add or change a membership, and record `audit` in the same
+    /// transaction.
     ///
     /// # Errors
     ///
     /// Returns an error if the workspace or user does not exist or the
-    /// write fails.
+    /// write fails; nothing is then written.
     pub async fn set_member(
         &self,
         workspace_id: &WorkspaceId,
         user_id: &UserId,
         role: Role,
+        audit: AuditEntry,
     ) -> Result<()> {
         let existing = self.member_role(workspace_id, user_id).await?;
         let bound = if existing.is_some() {
@@ -1698,35 +1721,44 @@ impl ControlPlane {
                     .and_where(Expr::col(Members::UserId).eq(user_id)),
             )?
         } else {
-            Bound::new(
-                Query::insert()
-                    .into_table(Members::Table)
-                    .columns([Members::WorkspaceId, Members::UserId, Members::Role])
-                    .values([workspace_id.into(), user_id.into(), role.as_str().into()])?,
-            )?
+            Self::member_insert(workspace_id, user_id, role)?
         };
-        bound
-            .query()
-            .execute(&self.pool)
+        let audit = audit
+            .in_workspace(workspace_id)
+            .on(ResourceKind::User.id(user_id.as_str()));
+        self.commit_audited(vec![bound], audit)
             .await
             .map_err(|e| match &e {
-                sqlx::Error::Database(db) if db.is_foreign_key_violation() => Error::Config(
-                    String::from("membership needs an existing workspace and user"),
-                ),
-                _ => e.into(),
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_foreign_key_violation() => {
+                    Error::Config(String::from(
+                        "membership needs an existing workspace and user",
+                    ))
+                }
+                _ => e,
             })?;
         Ok(())
     }
 
-    /// Remove a membership. Returns whether one existed.
+    fn member_insert(workspace_id: &WorkspaceId, user_id: &UserId, role: Role) -> Result<Bound> {
+        Ok(Bound::new(
+            Query::insert()
+                .into_table(Members::Table)
+                .columns([Members::WorkspaceId, Members::UserId, Members::Role])
+                .values([workspace_id.into(), user_id.into(), role.as_str().into()])?,
+        )?)
+    }
+
+    /// Remove a membership, and record `audit` in the same transaction
+    /// (as `Error` when there was none). Returns whether one existed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the delete fails.
+    /// Returns an error if the delete fails; nothing is then written.
     pub async fn remove_member(
         &self,
         workspace_id: &WorkspaceId,
         user_id: &UserId,
+        audit: AuditEntry,
     ) -> Result<bool> {
         let bound = Bound::new(
             Query::delete()
@@ -1734,8 +1766,10 @@ impl ControlPlane {
                 .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
                 .and_where(Expr::col(Members::UserId).eq(user_id)),
         )?;
-        let done = bound.query().execute(&self.pool).await?;
-        Ok(done.rows_affected() > 0)
+        let audit = audit
+            .in_workspace(workspace_id)
+            .on(ResourceKind::User.id(user_id.as_str()));
+        self.commit_audited(vec![bound], audit).await
     }
 
     /// The user's role in a workspace, if a member.
@@ -1803,13 +1837,14 @@ impl ControlPlane {
             .to_owned()
     }
 
-    /// Mint an API token scoped to one workspace. Returns the token text,
-    /// which is never stored, and the row.
+    /// Mint an API token scoped to one workspace, and record `audit` in the
+    /// same transaction. Returns the token text, which is never stored, and
+    /// the row.
     ///
     /// # Errors
     ///
     /// Returns an error if the workspace or user does not exist or the
-    /// insert fails.
+    /// insert fails; nothing is then written.
     pub async fn create_token(
         &self,
         workspace_id: &WorkspaceId,
@@ -1817,6 +1852,7 @@ impl ControlPlane {
         name: &str,
         scopes: &[Scope],
         expires_at: Option<Expiry>,
+        audit: AuditEntry,
     ) -> Result<IssuedToken> {
         let mut secret = [0u8; 32];
         random_bytes(&mut secret)?;
@@ -1850,15 +1886,16 @@ impl ControlPlane {
                     expires_at.map(|at| at.to_string()).into(),
                 ])?,
         )?;
-        bound
-            .query()
-            .execute(&self.pool)
+        let audit = audit
+            .in_workspace(workspace_id)
+            .on(ResourceKind::Token.id(&hash));
+        self.commit_audited(vec![bound], audit)
             .await
             .map_err(|e| match &e {
-                sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_foreign_key_violation() => {
                     Error::Config(String::from("a token needs an existing workspace and user"))
                 }
-                _ => e.into(),
+                _ => e,
             })?;
         let row = self
             .find_token(&hash)
@@ -1912,19 +1949,20 @@ impl ControlPlane {
         Ok(bound.query_as().fetch_all(&self.pool).await?)
     }
 
-    /// Revoke a token. Returns whether it existed.
+    /// Revoke a token, and record `audit` in the same transaction (as
+    /// `Error` when there was none). Returns whether it existed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the delete fails.
-    pub async fn delete_token(&self, token_hash: &str) -> Result<bool> {
+    /// Returns an error if the delete fails; nothing is then written.
+    pub async fn delete_token(&self, token_hash: &str, audit: AuditEntry) -> Result<bool> {
         let bound = Bound::new(
             Query::delete()
                 .from_table(ApiTokens::Table)
                 .and_where(Expr::col(ApiTokens::TokenHash).eq(token_hash)),
         )?;
-        let done = bound.query().execute(&self.pool).await?;
-        Ok(done.rows_affected() > 0)
+        let audit = audit.on(ResourceKind::Token.id(token_hash));
+        self.commit_audited(vec![bound], audit).await
     }
 
     // --- access audit (append-only) ------------------------------------------
@@ -1935,7 +1973,35 @@ impl ControlPlane {
     ///
     /// Returns an error if the insert fails.
     pub async fn record_audit(&self, entry: &AuditEntry) -> Result<()> {
-        let bound = Bound::new(
+        Self::audit_insert(entry)?
+            .query()
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Run `change`, then `audit`'s row, in one transaction: a change never
+    /// stands unaudited. A change that touched no row is audited as `Error`.
+    /// Returns whether every statement touched a row.
+    async fn commit_audited(&self, change: Vec<Bound>, mut audit: AuditEntry) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let mut changed = true;
+        for statement in change {
+            changed &= statement.query().execute(&mut *tx).await?.rows_affected() > 0;
+        }
+        if !changed {
+            audit.outcome = Outcome::Error;
+        }
+        Self::audit_insert(&audit)?
+            .query()
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    fn audit_insert(entry: &AuditEntry) -> Result<Bound> {
+        Ok(Bound::new(
             Query::insert()
                 .into_table(AuditLog::Table)
                 .columns([
@@ -1964,9 +2030,7 @@ impl ControlPlane {
                     entry.client_addr.as_deref().into(),
                     entry.request_id.as_deref().into(),
                 ])?,
-        )?;
-        bound.query().execute(&self.pool).await?;
-        Ok(())
+        )?)
     }
 
     /// Audit rows matching the filter, newest first.
@@ -2097,6 +2161,11 @@ mod tests {
         panic!("{msg}")
     }
 
+    /// The audit row a test's own setup writes.
+    fn setup_audit() -> AuditEntry {
+        AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
+    }
+
     /// A database from before sqlx migrations: the three sea-query versions
     /// applied, progress recorded in `schema_version`, and rows in the tables
     /// that replaying those versions would destroy.
@@ -2147,7 +2216,7 @@ mod tests {
         let (_dir, cp) = open().await;
         let name = "o'brien\"; DROP TABLE users; --";
         let created = cp
-            .create_workspace(name)
+            .create_workspace(name, None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let found = cp
@@ -2262,7 +2331,7 @@ mod tests {
     async fn workspace_updates_keep_unset_fields() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w")
+            .create_workspace("w", None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let changed = cp
@@ -2303,13 +2372,15 @@ mod tests {
                 .is_err()
         );
         assert!(cp.get_workspace(&ws.id).await.is_ok_and(|w| w.is_some()));
-        assert!(cp.create_workspace("w").await.is_err());
+        assert!(cp.create_workspace("w", None, setup_audit()).await.is_err());
     }
 
     #[tokio::test]
     async fn users_hash_verify_and_reject_duplicates() {
         let (_dir, cp) = open().await;
-        let alice = cp.create_user("alice", "hunter42", UserKind::Admin).await;
+        let alice = cp
+            .create_user("alice", "hunter42", UserKind::Admin, setup_audit())
+            .await;
         assert!(
             alice
                 .as_ref()
@@ -2330,10 +2401,21 @@ mod tests {
                 .await
                 .is_ok_and(|u| u.is_none())
         );
-        let dup = cp.create_user("alice", "x", UserKind::Standard).await.err();
+        let dup = cp
+            .create_user("alice", "x", UserKind::Standard, setup_audit())
+            .await
+            .err();
         assert!(dup.is_some_and(|e| e.to_string().contains("already exists")));
-        assert!(cp.create_user("", "x", UserKind::Standard).await.is_err());
-        assert!(cp.create_user("bob", "", UserKind::Standard).await.is_err());
+        assert!(
+            cp.create_user("", "x", UserKind::Standard, setup_audit())
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.create_user("bob", "", UserKind::Standard, setup_audit())
+                .await
+                .is_err()
+        );
         assert!(cp.list_users().await.is_ok_and(|u| u.len() == 1));
         assert!(
             cp.find_user_by_username(" alice ")
@@ -2345,7 +2427,9 @@ mod tests {
     #[tokio::test]
     async fn a_first_sign_in_creates_a_plain_user_and_never_takes_a_name() {
         let (_dir, cp) = open().await;
-        let existing = cp.create_user("ada", "pw", UserKind::Admin).await;
+        let existing = cp
+            .create_user("ada", "pw", UserKind::Admin, setup_audit())
+            .await;
         assert!(existing.is_ok());
         let ada = OidcSubject::from("sub-ada");
 
@@ -2643,25 +2727,33 @@ mod tests {
     async fn members_need_a_user_and_a_workspace() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w")
+            .create_workspace("w", None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
-            .create_user("bob", "pw", UserKind::Standard)
+            .create_user("bob", "pw", UserKind::Standard, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(
-            cp.set_member(&ws.id, &UserId::from("ghost"), Role::Member)
+            cp.set_member(&ws.id, &UserId::from("ghost"), Role::Member, setup_audit())
                 .await
                 .is_err()
         );
-        assert!(cp.set_member(&ws.id, &bob.id, Role::Viewer).await.is_ok());
+        assert!(
+            cp.set_member(&ws.id, &bob.id, Role::Viewer, setup_audit())
+                .await
+                .is_ok()
+        );
         assert!(
             cp.member_role(&ws.id, &bob.id)
                 .await
                 .is_ok_and(|r| r == Some(Role::Viewer))
         );
-        assert!(cp.set_member(&ws.id, &bob.id, Role::Owner).await.is_ok());
+        assert!(
+            cp.set_member(&ws.id, &bob.id, Role::Owner, setup_audit())
+                .await
+                .is_ok()
+        );
         assert!(
             cp.member_role(&ws.id, &bob.id)
                 .await
@@ -2678,12 +2770,12 @@ mod tests {
                     .is_some_and(|m| m.workspace.name == "w" && m.role == Role::Owner)
         }));
         assert!(
-            cp.remove_member(&ws.id, &bob.id)
+            cp.remove_member(&ws.id, &bob.id, setup_audit())
                 .await
                 .is_ok_and(|removed| removed)
         );
         assert!(
-            cp.remove_member(&ws.id, &bob.id)
+            cp.remove_member(&ws.id, &bob.id, setup_audit())
                 .await
                 .is_ok_and(|removed| !removed)
         );
@@ -2692,14 +2784,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tokens_are_stored_hashed_with_scopes_and_expiry() {
+    async fn an_audited_change_names_what_it_changed_and_a_no_op_is_an_error() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w")
+            .create_workspace("w", None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
-            .create_user("bob", "pw", UserKind::Standard)
+            .create_user("bob", "pw", UserKind::Standard, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let issued = cp
+            .create_token(&ws.id, &bob.id, "t", &[], None, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let removed = cp
+            .remove_member(&ws.id, &bob.id, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(!removed);
+        let rows = cp
+            .query_audit(&AuditFilter {
+                limit: 100,
+                ..AuditFilter::default()
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .rows;
+        let named = |id: &str| rows.iter().find(|r| r.resource_id.as_deref() == Some(id));
+        assert!(
+            named(ws.id.as_str()).is_some_and(
+                |r| r.workspace_id.as_ref() == Some(&ws.id) && r.outcome == Outcome::Allowed
+            ),
+            "{rows:?}"
+        );
+        assert!(
+            named(&issued.row.token_hash).is_some_and(|r| r.workspace_id.as_ref() == Some(&ws.id)),
+            "{rows:?}"
+        );
+        let bob_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.resource_id.as_deref() == Some(bob.id.as_str()))
+            .map(|r| r.outcome)
+            .collect();
+        assert_eq!(bob_rows, [Outcome::Error, Outcome::Allowed], "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn an_audited_change_does_not_stand_without_its_audit_row() {
+        let (_dir, cp) = open().await;
+        let ws = cp
+            .create_workspace("w", None, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let bob = cp
+            .create_user("bob", "pw", UserKind::Standard, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        cp.set_member(&ws.id, &bob.id, Role::Viewer, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let issued = cp
+            .create_token(&ws.id, &bob.id, "t", &[], None, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        sqlx::query("DROP TABLE audit_log")
+            .execute(&cp.pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        assert!(
+            cp.create_workspace("w2", Some(&bob.id), setup_audit())
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.find_workspace_by_name("w2")
+                .await
+                .is_ok_and(|w| w.is_none())
+        );
+        assert!(
+            cp.create_user("carol", "pw", UserKind::Standard, setup_audit())
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.find_user_by_username("carol")
+                .await
+                .is_ok_and(|u| u.is_none())
+        );
+        assert!(
+            cp.set_member(&ws.id, &bob.id, Role::Owner, setup_audit())
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.remove_member(&ws.id, &bob.id, setup_audit())
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.member_role(&ws.id, &bob.id)
+                .await
+                .is_ok_and(|r| r == Some(Role::Viewer))
+        );
+        assert!(
+            cp.create_token(&ws.id, &bob.id, "t2", &[], None, setup_audit())
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.delete_token(&issued.row.token_hash, setup_audit())
+                .await
+                .is_err()
+        );
+        assert!(
+            cp.list_tokens(&ws.id)
+                .await
+                .is_ok_and(|t| t.len() == 1 && t.first().is_some_and(|t| t.name == "t"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tokens_are_stored_hashed_with_scopes_and_expiry() {
+        let (_dir, cp) = open().await;
+        let ws = cp
+            .create_workspace("w", None, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let bob = cp
+            .create_user("bob", "pw", UserKind::Standard, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let minted = cp
@@ -2709,6 +2923,7 @@ mod tests {
                 "ci",
                 &[Scope::Read, Scope::Write],
                 "2000-01-01 00:00:00".parse().ok(),
+                setup_audit(),
             )
             .await;
         let Ok(IssuedToken { secret, row }) = minted else {
@@ -2747,11 +2962,22 @@ mod tests {
         );
         assert!(cp.list_tokens(&ws.id).await.is_ok_and(|t| t.len() == 1));
         assert!(
-            cp.create_token(&WorkspaceId::from("nope"), &bob.id, "x", &[], None)
-                .await
-                .is_err()
+            cp.create_token(
+                &WorkspaceId::from("nope"),
+                &bob.id,
+                "x",
+                &[],
+                None,
+                setup_audit()
+            )
+            .await
+            .is_err()
         );
-        assert!(cp.delete_token(&row.token_hash).await.is_ok_and(|d| d));
+        assert!(
+            cp.delete_token(&row.token_hash, setup_audit())
+                .await
+                .is_ok_and(|d| d)
+        );
         assert!(
             cp.find_token(&row.token_hash)
                 .await

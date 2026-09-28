@@ -150,12 +150,10 @@ pub(super) async fn finish(
         .await?;
     entry.outcome = Outcome::Allowed;
     entry.user_id = Some(user.id.clone());
-    // The audit row is written before the token it documents is committed,
-    // so an audit-write failure leaves no committed, unaudited credential —
-    // the refusal paths above audit before any side effect too.
+    // Audited before the token and session commit, so a failed audit write
+    // leaves no credential.
     app.control.record_audit(&entry).await?;
-    // The token and the session it serves appear together (issue #241),
-    // committed only once the audit row that records their issuance is durable.
+    // The token and the session it serves appear together.
     let token = oidc
         .keep_and_open(&app.sessions, &user.id, &signed_in.token)
         .await?;

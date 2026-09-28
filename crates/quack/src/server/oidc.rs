@@ -129,7 +129,7 @@ impl Oidc {
     /// Keep a signed-in user's token, replacing the one from an earlier
     /// sign-in, and open the session that uses it, both under the user's
     /// lock, so a logout of their last other session cannot forget the new
-    /// token in between (issue #241).
+    /// token in between.
     pub(crate) async fn keep_and_open(
         &self,
         sessions: &WebSessions,
@@ -229,7 +229,7 @@ impl Oidc {
     /// Drop a user's stored token once they have no session left to use it.
     /// The check and the delete happen under the user's lock, the one a
     /// sign-in holds while it stores its token and opens its session, so a
-    /// sign-in racing a logout keeps its token (issue #241). Returns whether
+    /// sign-in racing a logout keeps its token. Returns whether
     /// the token was dropped.
     pub(crate) async fn forget_unless_signed_in(
         &self,
