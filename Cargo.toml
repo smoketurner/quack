@@ -77,7 +77,8 @@ linux-keyutils-keyring-store = { version = "=1.0.0", default-features = false }
 mimalloc             = { version = "=0.1.52", default-features = false }
 mime_guess           = { version = "=2.0.5", default-features = false }
 oauth2               = { version = "=5.0.0", default-features = false }
-pdf_oxide            = { version = "=0.3.78", default-features = false } # Cargo.lock holds office_oxide at 0.1.11: 0.1.12 breaks this version
+office_oxide         = { version = "=0.1.11", default-features = false } # pdf_oxide 0.3.78 does not build against 0.1.12; not used directly
+pdf_oxide            = { version = "=0.3.78", default-features = false }
 proptest             = { version = "=1.11.0", default-features = false }
 pulldown-cmark       = { version = "=0.13.4", default-features = false }
 quick-xml            = { version = "=0.42.0", default-features = false } # calamine's version, to keep one copy
