@@ -8,60 +8,28 @@
 //! nothing else sets one, so the CLI and the terminal act for nobody.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use secrecy::SecretString;
 
 use crate::ids::UserId;
-use crate::oidc::{SubjectRefusal, SubjectTokens};
+use crate::oidc::{Origin, Revocations, SubjectTokens};
 
-/// The person a model request is made for.
+/// The person model requests are made for.
 #[derive(Clone)]
 pub struct Acting {
     user: UserId,
     tokens: Subject,
-    /// What `subject_token` invokes the moment the issuer ends the person's
-    /// sign-in through an on-behalf-of exchange, before it returns the
-    /// refusal: the server ends the person's sessions and records a denied
-    /// `session` audit row, the same bookkeeping the session-renewal refusal
-    /// does in `Oidc::require_current`. `None` for an [`Acting`] the server
-    /// did not build (a test fixed token), or in local mode.
-    on_revoked: Option<Arc<dyn OnRevoked + Send + Sync>>,
 }
 
 /// Where the person's own token comes from.
 #[derive(Clone)]
 enum Subject {
-    /// `quack serve`'s signed-in users.
-    Signed(Arc<SubjectTokens>),
+    /// `quack serve`'s signed-in users, and where the request came from.
+    Signed(Arc<SubjectTokens>, Origin),
     /// A token fixed by a test, or the reason there is none.
     #[cfg(test)]
     Fixed(std::result::Result<&'static str, &'static str>),
-}
-
-/// The bookkeeping the server does the moment an on-behalf-of exchange finds
-/// the issuer has ended the person's sign-in — end every session of the
-/// person, and record a denied `session` audit row — exactly as the
-/// session-renewal refusal does in `Oidc::require_current`.
-///
-/// `SubjectTokens` in `quack-core` cannot itself end sessions or write a
-/// session-audit row: it owns neither `WebSessions` nor the caller's audit
-/// context, and the on-behalf-of exchange runs through `Acting::subject_token`
-/// deep in core, outside the server layer. The server therefore installs one
-/// of these on each `Acting` it builds, so the refusal's bookkeeping happens
-/// at the moment the issuer is refused, rather than at the next
-/// session-authenticated request's convenience (which a churned person never
-/// makes; see `docs/authentication.md`). `Acting::subject_token` awaits it
-/// before it returns the refusal, so the rows are written before the person
-/// sees the error.
-pub trait OnRevoked: Send + Sync {
-    /// End `user`'s sessions and record the denied `session` row, returning a
-    /// future the caller awaits before it surfaces the refusal.
-    fn on_revoked<'user>(
-        &self,
-        user: &'user UserId,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'user>>;
 }
 
 impl std::fmt::Debug for Acting {
@@ -81,21 +49,13 @@ tokio::task_local! {
 }
 
 impl Acting {
-    /// `user`, whose own token `tokens` keeps, with the `on_revoked` hook the
-    /// server installs to end the person's sessions and record the denied
-    /// `session` audit row at the moment an on-behalf-of exchange finds the
-    /// issuer has ended their sign-in (`None` for an `Acting` the server did
-    /// not build — a test fixed token).
+    /// `user`, whose own token `tokens` keeps, acting for a request from
+    /// `origin`.
     #[must_use]
-    pub fn new(
-        user: UserId,
-        tokens: Arc<SubjectTokens>,
-        on_revoked: Option<Arc<dyn OnRevoked + Send + Sync>>,
-    ) -> Self {
+    pub const fn new(user: UserId, tokens: Arc<SubjectTokens>, origin: Origin) -> Self {
         Self {
             user,
-            tokens: Subject::Signed(tokens),
-            on_revoked,
+            tokens: Subject::Signed(tokens, origin),
         }
     }
 
@@ -108,7 +68,6 @@ impl Acting {
         Self {
             user,
             tokens: Subject::Fixed(token),
-            on_revoked: None,
         }
     }
 
@@ -121,27 +80,24 @@ impl Acting {
     ///
     /// # Errors
     ///
-    /// Returns why, when there is no current token for them. If the reason
-    /// is that the issuer refused the renewal, the `on_revoked` hook (if
-    /// any) has already ended the person's sessions and recorded the denied
-    /// `session` audit row by the time this returns, so the caller surfaces
-    /// the refusal after the bookkeeping for it is done.
+    /// Returns why, when there is no current token for them.
     pub async fn subject_token(&self) -> std::result::Result<SecretString, String> {
         match &self.tokens {
-            Subject::Signed(tokens) => match tokens.subject_token(&self.user).await {
-                Ok(token) => Ok(token),
-                Err(SubjectRefusal::Revoked(message)) => {
-                    if let Some(on_revoked) = &self.on_revoked {
-                        on_revoked.on_revoked(&self.user).await;
-                    }
-                    Err(message)
-                }
-                Err(SubjectRefusal::Other(message)) => Err(message),
-            },
+            Subject::Signed(tokens, origin) => tokens.subject_token(&self.user, origin).await,
             #[cfg(test)]
             Subject::Fixed(token) => token
                 .map(|t| SecretString::from(t.to_owned()))
                 .map_err(str::to_owned),
+        }
+    }
+
+    /// How many times the issuer has ended the person's sign-in.
+    #[must_use]
+    pub fn revocations(&self) -> Revocations {
+        match &self.tokens {
+            Subject::Signed(tokens, _) => tokens.revocations(&self.user),
+            #[cfg(test)]
+            Subject::Fixed(_) => Revocations::default(),
         }
     }
 

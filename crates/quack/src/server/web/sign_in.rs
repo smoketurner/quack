@@ -149,9 +149,7 @@ pub(super) async fn finish(
         .oidc_user(&signed_in.subject, &signed_in.username)
         .await?;
     // The token and the session it serves appear together (issue #241).
-    let token = oidc
-        .keep_and_open(&app.sessions, &user.id, &signed_in.token)
-        .await?;
+    let token = oidc.keep_and_open(&user.id, &signed_in.token).await?;
     entry.outcome = Outcome::Allowed;
     entry.user_id = Some(user.id.clone());
     // Nothing unaudited stands: the session the row failed for is closed.

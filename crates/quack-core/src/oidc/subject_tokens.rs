@@ -2,7 +2,8 @@
 //! on-behalf-of exchange trades (RFC 8693). It is their stored sign-in,
 //! renewed when it is due, or else the access token they last presented as
 //! a bearer. Session renewal reads the stored sign-in here too, under the
-//! same lock per user, so two renewals never spend one refresh token.
+//! same lock per user, so two renewals never spend one refresh token, and an
+//! issuer's refusal is handled once, wherever it is seen first.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -14,35 +15,11 @@ use super::{Renewal, SignIn, UserTokens};
 use crate::error::Result;
 use crate::ids::UserId;
 use crate::llm::oauth::CachedToken;
-use crate::storage::control::ControlPlane;
+use crate::storage::control::{AuditAction, AuditEntry, Channel, ControlPlane, Outcome};
+use crate::web_sessions::WebSessions;
 
 /// A token is renewed this long before it expires.
 pub const RENEW_MARGIN: SignedDuration = SignedDuration::from_secs(60);
-
-/// Why [`SubjectTokens::subject_token`] could not return a token for the
-/// person: the issuer refused the renewal of the stored grant, or there is
-/// no current token for any other reason. Each carries the message shown to
-/// the person, so the caller can surface it without a separate path.
-///
-/// `SubjectTokens` lives in `quack-core`, which owns neither the server's
-/// `WebSessions` nor the caller's audit context, so it does not itself end
-/// the person's sessions or write the denied `session` audit row when the
-/// issuer refuses. It distinguishes [`Self::Revoked`] so the server layer
-/// (which does own both, through [`crate::llm::acting::Acting`]'s
-/// `OnRevoked` hook) can do that bookkeeping at the moment the refusal is
-/// observed — the same handling the session-renewal refusal gets — rather
-/// than at the next session-authenticated request's convenience.
-#[derive(Debug)]
-pub enum SubjectRefusal {
-    /// The issuer refused the renewal (`invalid_grant`, a disabled account):
-    /// the stored token is gone. The caller ends the person's sessions and
-    /// records a denied `session` audit row when it sees this.
-    Revoked(String),
-    /// No current token for the person, for any other reason: the stored
-    /// token could not be read or written, or neither a stored sign-in nor a
-    /// presented bearer is current.
-    Other(String),
-}
 
 /// A person's stored sign-in, after renewing it when it was due.
 #[derive(Debug)]
@@ -59,15 +36,43 @@ pub enum Stored {
     Revoked,
 }
 
+/// Where the request that meets an issuer's refusal came from, for the
+/// denied `session` row it records.
+#[derive(Debug, Clone)]
+pub struct Origin {
+    pub channel: Channel,
+    pub client_addr: Option<String>,
+    pub request_id: Option<String>,
+}
+
+impl Origin {
+    /// The denied `session` row for `user`, when their sign-in has ended.
+    #[must_use]
+    pub fn denied_session(&self, user: &UserId) -> AuditEntry {
+        let mut entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, self.channel);
+        entry.user_id = Some(user.clone());
+        entry.client_addr.clone_from(&self.client_addr);
+        entry.request_id.clone_from(&self.request_id);
+        entry
+    }
+}
+
+/// How many times the issuer has ended a person's sign-in: a provider token
+/// exchanged under an earlier count is not reused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Revocations(u64);
+
 /// Every signed-in user's own token, for `quack serve`.
 pub struct SubjectTokens {
     sign_in: Arc<SignIn>,
     tokens: UserTokens,
     control: ControlPlane,
+    sessions: Arc<WebSessions>,
     /// One renewal per person at a time.
     renewing: Mutex<HashMap<UserId, Arc<tokio::sync::Mutex<()>>>>,
     /// The access token each person last presented as a bearer.
     presented: Mutex<HashMap<UserId, CachedToken>>,
+    revocations: Mutex<HashMap<UserId, Revocations>>,
 }
 
 impl std::fmt::Debug for SubjectTokens {
@@ -78,14 +83,32 @@ impl std::fmt::Debug for SubjectTokens {
 
 impl SubjectTokens {
     #[must_use]
-    pub fn new(sign_in: Arc<SignIn>, tokens: UserTokens, control: ControlPlane) -> Self {
+    pub fn new(
+        sign_in: Arc<SignIn>,
+        tokens: UserTokens,
+        control: ControlPlane,
+        sessions: Arc<WebSessions>,
+    ) -> Self {
         Self {
             sign_in,
             tokens,
             control,
+            sessions,
             renewing: Mutex::new(HashMap::new()),
             presented: Mutex::new(HashMap::new()),
+            revocations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// How many times the issuer has ended this person's sign-in.
+    #[must_use]
+    pub fn revocations(&self, user: &UserId) -> Revocations {
+        self.revocations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(user)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn lock_for(&self, user: &UserId) -> Arc<tokio::sync::Mutex<()>> {
@@ -135,13 +158,18 @@ impl SubjectTokens {
         Ok(true)
     }
 
-    /// The person's stored sign-in, renewed first when it is due.
+    /// The person's stored sign-in, renewed first when it is due. When the
+    /// issuer refuses, everything that carried the sign-in goes with it
+    /// before the lock is released: the stored and presented tokens, every
+    /// session, and exchanged provider tokens; and the refusal is audited as
+    /// a denied `session` from `origin`.
     ///
     /// # Errors
     ///
-    /// Returns an error when the stored token cannot be read or written; an
-    /// issuer that refuses or cannot be reached is a [`Stored`] outcome.
-    pub async fn refreshed(&self, user: &UserId) -> Result<Stored> {
+    /// Returns an error when the stored token cannot be read or written, or
+    /// the refusal cannot be audited; an issuer that refuses or cannot be
+    /// reached is a [`Stored`] outcome.
+    pub async fn refreshed(&self, user: &UserId, origin: &Origin) -> Result<Stored> {
         let lock = self.lock_for(user);
         let _renewing = lock.lock().await;
         let Some(token) = self.tokens.load(&self.control, user).await? else {
@@ -161,6 +189,22 @@ impl SubjectTokens {
             Ok(Renewal::Revoked(reason)) => {
                 tracing::info!(user = %user, %reason, "the issuer ended the sign-in");
                 self.tokens.clear(&self.control, user).await?;
+                self.presented
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(user);
+                {
+                    let mut revocations = self
+                        .revocations
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let Revocations(count) = revocations.entry(user.clone()).or_default();
+                    *count = count.saturating_add(1);
+                }
+                self.sessions.close_user(user);
+                self.control
+                    .record_audit(&origin.denied_session(user))
+                    .await?;
                 Ok(Stored::Revoked)
             }
             Err(e) => {
@@ -192,22 +236,18 @@ impl SubjectTokens {
     ///
     /// # Errors
     ///
-    /// Returns a [`SubjectRefusal`], whose message is shown to the person,
-    /// when neither is current. [`SubjectRefusal::Revoked`] — the issuer
-    /// refused the renewal and the stored token is gone — is the signal the
-    /// server uses to end the person's sessions and record the denied
-    /// `session` audit row at that moment; any other outcome is
-    /// [`SubjectRefusal::Other`].
+    /// Returns why, said to the person, when neither is current.
     pub async fn subject_token(
         &self,
         user: &UserId,
-    ) -> std::result::Result<SecretString, SubjectRefusal> {
+        origin: &Origin,
+    ) -> std::result::Result<SecretString, String> {
         let now = Timestamp::now();
         let current = |token: &CachedToken| token.is_fresh(now, RENEW_MARGIN);
         match self
-            .refreshed(user)
+            .refreshed(user, origin)
             .await
-            .map_err(|e| SubjectRefusal::Other(e.to_string()))?
+            .map_err(|e| e.to_string())?
         {
             Stored::Current(token) | Stored::Unrenewable(token) | Stored::Unreachable(token)
                 if current(&token) =>
@@ -215,10 +255,10 @@ impl SubjectTokens {
                 return Ok(token.access_token);
             }
             Stored::Revoked => {
-                return Err(SubjectRefusal::Revoked(format!(
+                return Err(format!(
                     "{} ended this person's sign-in; they sign in again",
                     self.sign_in.issuer_host()
-                )));
+                ));
             }
             Stored::Current(_)
             | Stored::Unrenewable(_)
@@ -232,10 +272,10 @@ impl SubjectTokens {
             .filter(|t| current(t))
             .map(|t| t.access_token.clone())
             .ok_or_else(|| {
-                SubjectRefusal::Other(format!(
+                format!(
                     "this person has no current sign-in through {}; sign in with it to use this provider",
                     self.sign_in.issuer_host()
-                ))
+                )
             })
     }
 }

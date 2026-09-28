@@ -33,6 +33,7 @@ use quack_core::storage::control::{
     AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Outcome, Role, Scope, UserKind,
 };
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
+use quack_core::web_sessions::WebSessions;
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -55,7 +56,8 @@ async fn harness_with(mode: ServeMode, mut config: Config) -> Harness {
     let control = ControlPlane::open(&config)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let app = Arc::new(AppState::new(config, control, mode, None));
+    let sessions = Arc::new(WebSessions::new(&config.server));
+    let app = Arc::new(AppState::new(config, control, mode, sessions, None));
     let router = super::router(Arc::clone(&app));
     Harness {
         _dir: dir,

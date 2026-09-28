@@ -17,18 +17,20 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::config::ServerConfig;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
+use quack_core::oidc::Origin;
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
     WorkspaceRow, sha256_hex,
 };
 use quack_core::storage::sessions::SessionViewer;
+use quack_core::web_sessions::{SessionLookup, SessionToken};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
-use super::state::{App, ServeMode, SessionLookup, SessionToken};
+use super::state::{App, ServeMode};
 
 pub(crate) const SESSION_COOKIE: &str = "quack_session";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -71,6 +73,16 @@ impl Identity {
             Credential::Token(_) | Credential::IdentityProvider => Channel::Api,
             Credential::Local | Credential::Session(_) => Channel::Web,
         })
+    }
+
+    /// Where this request came from, for an audit row recorded later on its
+    /// behalf.
+    pub(crate) fn origin(&self) -> Origin {
+        Origin {
+            channel: self.channel(),
+            client_addr: self.client_addr.clone(),
+            request_id: self.request_id.clone(),
+        }
     }
 
     fn token_hash(&self) -> Option<String> {
@@ -274,7 +286,7 @@ impl FromRequestParts<App> for Identity {
         if app.mode != ServeMode::Local
             && let Some(oidc) = &app.oidc
         {
-            oidc.acting(app, &identity.user_id).enter();
+            oidc.acting(&identity.user_id, identity.origin()).enter();
         }
         Ok(identity)
     }
@@ -313,11 +325,12 @@ impl Identity {
                 renewal_due,
             } => {
                 if renewal_due && let Some(oidc) = &app.oidc {
-                    let mut entry =
-                        AuditEntry::new(AuditAction::Session, Outcome::Denied, Channel::Web);
-                    entry.client_addr.clone_from(&client_addr);
-                    entry.request_id.clone_from(&request_id);
-                    oidc.require_current(app, &user_id, &presented, entry)
+                    let origin = Origin {
+                        channel: Channel::Web,
+                        client_addr: client_addr.clone(),
+                        request_id: request_id.clone(),
+                    };
+                    oidc.require_current(&app.control, &user_id, &presented, &origin)
                         .await?;
                 }
                 let user = app

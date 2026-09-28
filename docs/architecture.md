@@ -44,7 +44,8 @@ nothing in it knows about HTTP, terminals, or windows.
 | `config::inspect` | the file read outside `Config::load` (`quack config`): each recognized setting's value in force and origin, unrecognized keys, the environment variables read | 13 |
 | `crypto` | installs the aws-lc-rs provider once | 14 |
 | `vault` | data at rest sealed with HPKE under one key in the OS keychain, per purpose and subject; callers store the `Sealed` value | 10.3, 12 |
-| `oidc` | server sign-in through an OpenID Connect issuer (`SignIn`), bearer verification of the issuer's access tokens (`SignIn::verify_bearer`), signed-in users' tokens sealed in `control.db` (`UserTokens`), each person's own token for session renewal and on-behalf-of exchanges (`SubjectTokens`) | 10.2, 12 |
+| `oidc` | server sign-in through an OpenID Connect issuer (`SignIn`), bearer verification of the issuer's access tokens (`SignIn::verify_bearer`), signed-in users' tokens sealed in `control.db` (`UserTokens`), each person's own token for session renewal and on-behalf-of exchanges, and the one place an issuer's refusal of it is handled (`SubjectTokens`) | 10.2, 12 |
+| `web_sessions` | `quack serve`'s browser and API-login sessions (`WebSessions`), in core so an issuer's refusal ends them where it is seen | 12 |
 | `doctor` | `quack doctor`'s checks over a `config::inspect` result: config file, crypto module, data directory mode, `control.db`, the workspace, each model's credential and a model-list probe of its provider, the server bind; creates nothing | 11.5 |
 | `error` | the `thiserror` enum every layer returns | |
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |

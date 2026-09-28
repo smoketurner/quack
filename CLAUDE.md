@@ -318,7 +318,7 @@ and `Access::resolve` resolves the workspace, checks role and token scope, and w
 audit row itself, so a handler holding an `Access` is already authorized. Both login paths
 go through one `auth::password_login`, and a browser session expires at
 `[server].session_max_age_hours` or after `session_idle_minutes` unused, whichever is first
-(`state::WebSessions`); its cookie is `HttpOnly`, `SameSite=Lax`, `Max-Age`d to the
+(`quack_core::web_sessions::WebSessions`); its cookie is `HttpOnly`, `SameSite=Lax`, `Max-Age`d to the
 absolute lifetime, and `Secure` unless the request came from loopback. One `tower_governor`
 limiter covers the web UI, the API, and MCP, with a tighter one on the two login routes and
 none on `/healthz` (design doc 12). The same routes carry `no-store` cache headers

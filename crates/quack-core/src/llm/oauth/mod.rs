@@ -55,6 +55,7 @@ use crate::config::{ClientAuth, Config, Exchange, Grant, OAuthConfig, ProviderNa
 use crate::error::{AuthReason, Error, Result};
 use crate::ids::UserId;
 use crate::llm::acting::Acting;
+use crate::oidc::Revocations;
 
 /// RFC 7523's grant, which Entra's On-Behalf-Of flow uses.
 const JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
@@ -525,7 +526,14 @@ pub struct TokenManager {
     refresh_lock: Mutex<()>,
     /// `on-behalf-of`: each person's exchanged token, in memory only, behind
     /// a lock of its own so one person's exchange never waits on another's.
-    delegated: StdMutex<HashMap<UserId, Arc<Mutex<Option<CachedToken>>>>>,
+    delegated: StdMutex<HashMap<UserId, Arc<Mutex<Option<Delegated>>>>>,
+}
+
+/// A person's exchanged token, and their sign-in's revocation count when it
+/// was exchanged: a revocation since then means it is not reused.
+struct Delegated {
+    token: CachedToken,
+    revocations: Revocations,
 }
 
 impl std::fmt::Debug for TokenManager {
@@ -1054,11 +1062,11 @@ impl TokenManager {
             Arc::clone(delegated.entry(acting.user().clone()).or_default())
         };
         let mut held = entry.lock().await;
-        if let Some(token) = held
-            .as_ref()
-            .filter(|t| t.is_fresh(Timestamp::now(), REUSE_MARGIN))
-        {
-            return Ok(token.access_token.clone());
+        let revocations = acting.revocations();
+        if let Some(held) = held.as_ref().filter(|d| {
+            d.revocations == revocations && d.token.is_fresh(Timestamp::now(), REUSE_MARGIN)
+        }) {
+            return Ok(held.token.access_token.clone());
         }
         let subject = acting
             .subject_token()
@@ -1067,7 +1075,7 @@ impl TokenManager {
         let token = self.exchange(&subject).await?;
         tracing::info!(provider = %self.provider, user = %acting.user(), "exchanged a token on behalf of a user");
         let access = token.access_token.clone();
-        *held = Some(token);
+        *held = Some(Delegated { token, revocations });
         Ok(access)
     }
 

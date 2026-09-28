@@ -22,9 +22,12 @@ use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
 use quack_core::llm::oauth::{CachedToken, KeySource};
-use quack_core::oidc::OidcSubject;
-use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome, SealedOwner};
+use quack_core::oidc::{OidcSubject, Origin};
+use quack_core::storage::control::{
+    AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
+};
 use quack_core::vault::Vault;
+use quack_core::web_sessions::WebSessions;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -245,15 +248,23 @@ impl Harness {
         let control = ControlPlane::open(&config)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
+        let sessions = Arc::new(WebSessions::new(&config.server));
         let oidc = Oidc::new(
             &oidc_config,
             Vault::new(dir.path(), KeySource::File),
             control.clone(),
             ClientKeys::with_control(&config, KeySource::File, control.clone()),
+            Arc::clone(&sessions),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
         config.server.oidc = Some(oidc_config);
-        let app = Arc::new(AppState::new(config, control, ServeMode::Login, Some(oidc)));
+        let app = Arc::new(AppState::new(
+            config,
+            control,
+            ServeMode::Login,
+            sessions,
+            Some(oidc),
+        ));
         let router = crate::server::router(Arc::clone(&app));
         Self {
             dir,
@@ -656,7 +667,7 @@ async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
                     refresh_token: None,
                 };
                 let oidc = app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
-                oidc.keep_and_open(&app.sessions, &who, &token).await
+                oidc.keep_and_open(&who, &token).await
             }));
             // Give the sign-in every chance to run ahead of the delete.
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -678,7 +689,7 @@ async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
 
     // With that session open, logging out another one leaves the token.
     let dropped = oidc
-        .forget_unless_signed_in(&h.app.sessions, &user)
+        .forget_unless_signed_in(&user)
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert!(!dropped);
@@ -727,7 +738,14 @@ async fn without_oidc_there_is_no_button_and_no_route() {
     let control = ControlPlane::open(&config)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let app = Arc::new(AppState::new(config, control, ServeMode::Login, None));
+    let sessions = Arc::new(WebSessions::new(&config.server));
+    let app = Arc::new(AppState::new(
+        config,
+        control,
+        ServeMode::Login,
+        sessions,
+        None,
+    ));
     let router = crate::server::router(app);
     for (uri, status) in [
         ("/login", StatusCode::OK),
@@ -1020,9 +1038,18 @@ async fn obo_token_as(
     app: &App,
     auth: quack_core::config::ClientAuth,
 ) -> Result<String, crate::server::error::ApiError> {
+    use secrecy::ExposeSecret;
+    let manager = obo_manager(app, auth)?;
+    Ok(manager.access_token().await?.expose_secret().to_owned())
+}
+
+/// An on-behalf-of provider exchanging at the harness's issuer.
+fn obo_manager(
+    app: &App,
+    auth: quack_core::config::ClientAuth,
+) -> Result<quack_core::llm::oauth::TokenManager, crate::server::error::ApiError> {
     use quack_core::config::{Exchange, Grant, OAuthConfig};
     use quack_core::llm::oauth::TokenManager;
-    use secrecy::ExposeSecret;
     let issuer = app
         .config
         .server
@@ -1047,8 +1074,12 @@ async fn obo_token_as(
     let name = "model".parse().map_err(|e: quack_core::error::Error| {
         crate::server::error::ApiError::internal(e.to_string())
     })?;
-    let manager = TokenManager::new(&app.config, &name, oauth, KeySource::File)?;
-    Ok(manager.access_token().await?.expose_secret().to_owned())
+    Ok(TokenManager::new(
+        &app.config,
+        &name,
+        oauth,
+        KeySource::File,
+    )?)
 }
 
 async fn probe(
@@ -1424,136 +1455,233 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
     }
 }
 
-// --- an on-behalf-of refusal: the refused grant's bookkeeping ----------------
+// --- an issuer's refusal seen by an on-behalf-of exchange -------------------
 
-/// An on-behalf-of exchange that finds the issuer has ended the person's
-/// sign-in ends their sessions and records a denied `session` audit row at
-/// that moment — the same handling a session-renewal refusal gets — rather
-/// than leaving the bookkeeping to a later session-authenticated request the
-/// churned person may never make.
-///
-/// The HTTP `Identity` extractor runs `require_current` first whenever a
-/// session's renewal is due, so a synchronous request short-circuits with
-/// `401` before the acting flow runs, and the session-renewal test above
-/// already covers that arm. The arm that escapes it is the one the job queue
-/// reaches: the exchange runs as a queued job does, directly through the
-/// `Acting` the request set up, with no `require_current` in between. This
-/// drives it that way and checks the refusal's three guarantees — the
-/// stored token is gone, the person's sessions are ended, and exactly one
-/// denied `session` audit row is recorded against them — hold at the moment
-/// it happens, and that a later request does not record it a second time.
+fn job_origin() -> Origin {
+    Origin {
+        channel: Channel::Api,
+        client_addr: Some(String::from("203.0.113.9")),
+        request_id: Some(String::from("req-obo")),
+    }
+}
+
+impl Harness {
+    async fn user(&self, subject: &str) -> UserId {
+        self.app
+            .control
+            .find_user_by_oidc_subject(&OidcSubject::from(subject))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("no user"))
+            .id
+    }
+
+    /// The person's own token, asked for as a queued job asks: through the
+    /// `Acting` its request captured, with no request of its own.
+    async fn subject_token(&self, user: &UserId) -> Result<String, String> {
+        use secrecy::ExposeSecret;
+        let oidc = self.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+        let acting = oidc.acting(user, job_origin());
+        acting
+            .subject_token()
+            .await
+            .map(|t| t.expose_secret().to_owned())
+    }
+
+    /// Replace the person's stored sign-in with one already due for renewal.
+    async fn store_due_sign_in(&self, user: &UserId) {
+        let oidc = self.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+        let due = CachedToken {
+            access_token: SecretString::from(String::from("due")),
+            expires_at: Timestamp::now()
+                .checked_add(SignedDuration::from_secs(30))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            refresh_token: Some(SecretString::from(String::from("user-refresh"))),
+        };
+        oidc.subjects
+            .keep_then(user, &due, || ())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+
+    fn denied_sessions_of<'a>(
+        rows: &'a [(Outcome, Option<UserId>)],
+        user: &'a UserId,
+    ) -> impl Iterator<Item = &'a (Outcome, Option<UserId>)> {
+        rows.iter()
+            .filter(move |(o, u)| *o == Outcome::Denied && u.as_ref() == Some(user))
+    }
+}
+
 #[tokio::test]
 async fn an_on_behalf_of_refusal_ends_the_sessions_and_records_a_denied_session_at_that_moment() {
     let h = Harness::new().await;
-    // A token already inside the renewal margin when it is issued, so an
-    // on-behalf-of exchange — run as a queued job would, with no
-    // session-authenticated HTTP request in between — contacts the issuer
-    // for a refresh.
     h.issuer(|s| s.lifetime = 30);
     let session = h.sign_in("sub-obo", "obo").await;
-    let user = h
-        .app
-        .control
-        .find_user_by_oidc_subject(&OidcSubject::from("sub-obo"))
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| fail("no user"));
-    assert!(
-        h.app.sessions.has_sessions(&user.id),
-        "the sign-in opened a session"
-    );
-    assert!(h.has_token(&user.id).await, "the sign-in stored a token");
-
-    // The issuer refuses the renewal with `invalid_grant`.
+    let user = h.user("sub-obo").await;
+    assert!(h.app.sessions.has_sessions(&user));
     h.issuer(|s| s.refresh_error = Some("invalid_grant"));
 
-    // The exchange runs as a queued job would: directly through the `Acting`
-    // the request built (which carries the `SessionCloser` hook), not through
-    // an HTTP request that would run `require_current` first and
-    // short-circuit. This is the reachability path the bug report describes.
-    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
-    let acting = oidc.acting(&h.app, &user.id);
-    let refused = Acting::scope(Some(acting), async {
-        Acting::current()
-            .unwrap_or_else(|| fail("the acting person is not in scope"))
-            .subject_token()
-            .await
-    })
-    .await;
-    assert!(refused.is_err(), "the exchange did not refuse: {refused:?}");
-    let message = refused.err().unwrap_or_else(|| fail("expected a refusal"));
+    let refused = h.subject_token(&user).await;
     assert!(
-        message.contains("ended this person's sign-in"),
-        "the refusal names the issuer: {message}",
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("ended this person's sign-in")),
+        "{refused:?}"
     );
+    assert!(!h.has_token(&user).await);
+    assert!(!h.app.sessions.has_sessions(&user));
+    let rows = h
+        .app
+        .control
+        .query_audit(&AuditFilter {
+            action: Some(String::from("session")),
+            limit: 100,
+            ..AuditFilter::default()
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .rows;
+    let [row] = rows.as_slice() else {
+        fail(&format!("one denied session row, not {rows:?}"));
+    };
+    assert_eq!(row.outcome, Outcome::Denied);
+    assert_eq!(row.user_id.as_ref(), Some(&user));
+    assert_eq!(row.channel, Channel::Api);
+    assert_eq!(row.client_addr.as_deref(), Some("203.0.113.9"));
+    assert_eq!(row.request_id.as_deref(), Some("req-obo"));
 
-    // At the moment of the refusal: the stored token is gone, the person's
-    // sessions are ended, and one denied `session` audit row is recorded
-    // against them — not deferred to a later request.
-    assert!(
-        !h.has_token(&user.id).await,
-        "the stored token was not cleared at the refusal"
-    );
-    assert!(
-        !h.app.sessions.has_sessions(&user.id),
-        "the person's sessions were not ended at the refusal"
-    );
-    let denied = h.audit("session").await;
-    assert!(
-        denied.contains(&(Outcome::Denied, Some(user.id.clone()))),
-        "no denied-session audit row recorded at the refusal: {denied:?}",
-    );
-    assert_eq!(
-        denied
-            .iter()
-            .filter(|(_, u)| u == &Some(user.id.clone()))
-            .count(),
-        1,
-        "the refusal wrote exactly one denied-session row, not {denied:?}",
-    );
-
-    // A later session-authenticated request from the same cookie finds the
-    // session already gone (the refusal ended it), so `require_current`
-    // never runs and the refusal is not recorded a second time — the
-    // audit-attribution error the bug report describes is closed.
-    assert_eq!(
-        h.me(&session).await.0,
-        StatusCode::UNAUTHORIZED,
-        "a session closed at the refusal is no longer present",
-    );
+    // The cookie names no session now, so no second row is written.
+    assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
     let later = h.audit("session").await;
     assert_eq!(
-        later
-            .iter()
-            .filter(|(_, u)| u == &Some(user.id.clone()))
-            .count(),
+        Harness::denied_sessions_of(&later, &user).count(),
         1,
-        "a later request should not record a second denied-session row: {later:?}",
+        "{later:?}"
     );
 }
 
-/// A refused refresh token is not the only reason an on-behalf-of exchange
-/// has no token for the person: a password user, who never signed in through
-/// the issuer, has no stored sign-in either. That refusal must not fire the
-/// revocation hook: the person's sessions (a password user may be signed in
-/// through a password login) stay, and no denied `session` row is written.
-/// Only an issuer refusal of the grant itself ends the sessions.
+#[tokio::test]
+async fn a_renewal_and_an_exchange_meeting_one_refusal_record_it_once() {
+    for exchange_first in [true, false] {
+        let h = Harness::new().await;
+        h.issuer(|s| s.lifetime = 30);
+        let session = h.sign_in("sub-race", "race").await;
+        let user = h.user("sub-race").await;
+        h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+
+        if exchange_first {
+            assert!(h.subject_token(&user).await.is_err());
+            assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
+        } else {
+            assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
+            assert!(h.subject_token(&user).await.is_err());
+        }
+        let rows = h.audit("session").await;
+        assert_eq!(
+            Harness::denied_sessions_of(&rows, &user).count(),
+            1,
+            "exchange first: {exchange_first}: {rows:?}"
+        );
+    }
+
+    let h = Harness::new().await;
+    h.issuer(|s| s.lifetime = 30);
+    let session = h.sign_in("sub-both", "both").await;
+    let user = h.user("sub-both").await;
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+    // The exchange takes the user's lock first; the request has already
+    // found its session and waits for the lock, then finds the token gone.
+    let (exchanged, me) = tokio::join!(h.subject_token(&user), h.me(&session));
+    assert_eq!(me.0, StatusCode::UNAUTHORIZED);
+    assert!(exchanged.is_err());
+    let rows = h.audit("session").await;
+    assert_eq!(
+        Harness::denied_sessions_of(&rows, &user).count(),
+        1,
+        "{rows:?}"
+    );
+    assert_eq!(h.issuer.lock().map(|s| s.refreshes).unwrap_or_default(), 1);
+}
+
+#[tokio::test]
+async fn a_provider_token_exchanged_before_a_refusal_is_not_reused() {
+    use secrecy::ExposeSecret;
+    let h = Harness::new().await;
+    h.sign_in("sub-cache", "cache").await;
+    let user = h.user("sub-cache").await;
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let manager =
+        obo_manager(&h.app, ClientAuth::ClientSecretPost).unwrap_or_else(|e| fail(&e.message));
+    let exchange = || {
+        Acting::scope(
+            Some(oidc.acting(&user, job_origin())),
+            manager.access_token(),
+        )
+    };
+    let first = exchange().await.unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(first.expose_secret(), "obo-user-access");
+    assert_eq!(
+        exchange()
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .expose_secret(),
+        "obo-user-access",
+        "a fresh exchanged token is reused"
+    );
+
+    h.store_due_sign_in(&user).await;
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+    assert!(h.subject_token(&user).await.is_err());
+
+    let after = exchange().await;
+    assert!(
+        after
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("no current sign-in")),
+        "the token exchanged before the refusal was reused: {:?}",
+        after.map(|t| t.expose_secret().to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_presented_bearer_is_not_used_after_a_refusal() {
+    let h = Harness::new().await;
+    h.sign_in("sub-bear", "bear").await;
+    let user = h.user("sub-bear").await;
+    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
+    let in_an_hour = Timestamp::now()
+        .checked_add(SignedDuration::from_hours(1))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    oidc.subjects
+        .remember_presented(&user, "presented", in_an_hour);
+    h.store_due_sign_in(&user).await;
+    h.issuer(|s| s.refresh_error = Some("invalid_grant"));
+
+    assert!(
+        h.subject_token(&user)
+            .await
+            .is_err_and(|e| e.contains("ended this person's sign-in"))
+    );
+    let after = h.subject_token(&user).await;
+    assert!(
+        after
+            .as_ref()
+            .is_err_and(|e| e.contains("no current sign-in")),
+        "{after:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_on_behalf_of_refusal_for_a_user_with_no_stored_sign_in_does_not_end_sessions() {
     let h = Harness::new().await;
     let created = h
         .app
         .control
-        .create_user(
-            "pw",
-            "secret",
-            quack_core::storage::control::UserKind::Standard,
-        )
+        .create_user("pw", "secret", UserKind::Standard)
         .await;
     assert!(created.is_ok());
-    // Sign the password user in: a `WebSessions` session opens, but no
-    // issuer token is stored for them.
     let login = Request::post("/api/v1/auth/login")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
@@ -1561,9 +1689,7 @@ async fn an_on_behalf_of_refusal_for_a_user_with_no_stored_sign_in_does_not_end_
         ))
         .unwrap_or_else(|e| fail(&e.to_string()));
     let reply = h.send(login).await;
-    let body: Value = serde_json::from_str(&reply.body).unwrap_or(Value::Null);
-    let token = body["token"].as_str().unwrap_or_default().to_owned();
-    assert!(!token.is_empty(), "{}", reply.body);
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let user = h
         .app
         .control
@@ -1571,39 +1697,17 @@ async fn an_on_behalf_of_refusal_for_a_user_with_no_stored_sign_in_does_not_end_
         .await
         .ok()
         .flatten()
-        .unwrap_or_else(|| fail("no user"));
-    assert!(
-        h.app.sessions.has_sessions(&user.id),
-        "the password login opened a session"
-    );
-    assert!(
-        !h.has_token(&user.id).await,
-        "a password user has no issuer token"
-    );
+        .unwrap_or_else(|| fail("no user"))
+        .id;
+    assert!(h.app.sessions.has_sessions(&user));
 
-    // An on-behalf-of exchange for them is refused with "no current
-    // sign-in", but it is not a revocation, so the hook does not fire.
-    let oidc = h.app.oidc.as_ref().unwrap_or_else(|| fail("no oidc"));
-    let acting = oidc.acting(&h.app, &user.id);
-    let refused = Acting::scope(Some(acting), async {
-        Acting::current()
-            .unwrap_or_else(|| fail("the acting person is not in scope"))
-            .subject_token()
-            .await
-    })
-    .await;
-    assert!(refused.is_err());
-    let message = refused.err().unwrap_or_else(|| fail("expected a refusal"));
+    let refused = h.subject_token(&user).await;
     assert!(
-        message.contains("no current sign-in through"),
-        "the refusal explains it: {message}",
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("no current sign-in through")),
+        "{refused:?}"
     );
-    assert!(
-        h.app.sessions.has_sessions(&user.id),
-        "a non-revocation refusal does not end the sessions"
-    );
-    assert!(
-        h.audit("session").await.is_empty(),
-        "a non-revocation refusal writes no denied-session row"
-    );
+    assert!(h.app.sessions.has_sessions(&user));
+    assert!(h.audit("session").await.is_empty());
 }
