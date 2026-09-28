@@ -427,6 +427,33 @@ struct Registry {
     jobs: HashMap<JobId, Entry>,
     /// The number the latest job was given.
     last_number: JobNumber,
+    /// Cleanup waiters for [`JobQueue::when_ended`], present only while the
+    /// job is active: `finish` takes them as it ends the job.
+    ended_waiters: HashMap<JobId, Vec<oneshot::Sender<JobInfo>>>,
+}
+
+impl Registry {
+    /// Drop the oldest finished jobs past `history`.
+    fn evict_past(&mut self, history: usize) {
+        let finished = self
+            .jobs
+            .values()
+            .filter(|e| e.info.state.is_finished())
+            .count();
+        let mut excess = finished.saturating_sub(history);
+        if excess == 0 {
+            return;
+        }
+        let Self { order, jobs, .. } = self;
+        order.retain(|jid| {
+            let drop_it = excess > 0 && jobs.get(jid).is_none_or(|e| e.info.state.is_finished());
+            if drop_it {
+                excess = excess.saturating_sub(1);
+                jobs.remove(jid);
+            }
+            !drop_it
+        });
+    }
 }
 
 struct Inner {
@@ -434,11 +461,6 @@ struct Inner {
     registry: Mutex<Registry>,
     history: usize,
     events: broadcast::Sender<JobInfo>,
-    /// Cleanup waiters for [`JobQueue::when_ended`]: `finish` hands the job's
-    /// final snapshot directly to the waiter through this map, so the callback
-    /// runs even if the job is dropped from the history ring in the same
-    /// `finish` call that announced its end (or the broadcast channel lags).
-    ended_waiters: Mutex<HashMap<JobId, oneshot::Sender<JobInfo>>>,
 }
 
 impl Inner {
@@ -448,71 +470,40 @@ impl Inner {
         self.registry.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Apply `f` to the job and broadcast the result.
+    /// Apply `f` to the job and broadcast the result. The send happens
+    /// under the lock, so subscribers see changes in the order they applied.
     fn update(&self, id: JobId, f: impl FnOnce(&mut JobInfo)) {
-        let snapshot = {
-            let mut registry = self.registry();
-            let Some(entry) = registry.jobs.get_mut(&id) else {
-                return;
-            };
-            f(&mut entry.info);
-            entry.info.clone()
+        let mut registry = self.registry();
+        let Some(entry) = registry.jobs.get_mut(&id) else {
+            return;
         };
+        f(&mut entry.info);
         // No subscribers is fine.
-        drop(self.events.send(snapshot));
+        drop(self.events.send(entry.info.clone()));
     }
 
-    /// Record the job's end and drop the oldest finished jobs past the
-    /// history bound. The finished snapshot is captured before any eviction
-    /// and handed to any [`JobQueue::when_ended`] waiter, so cleanup runs
-    /// even for a job this call drops from the history ring.
+    /// Record the job's end, hand the final snapshot to its
+    /// [`JobQueue::when_ended`] waiters, and drop the oldest finished jobs
+    /// past the history bound, all under one lock so a concurrent finish
+    /// cannot evict the job in between.
     fn finish(&self, id: JobId, state: JobState, outcome: Option<String>) {
-        self.update(id, |info| {
-            info.state = state;
-            info.outcome = outcome;
-            info.finished_at = Some(Timestamp::now());
-        });
-        let snapshot = {
-            let mut registry = self.registry();
-            let snapshot = registry.jobs.get(&id).map(|e| e.info.clone());
-            let finished = registry
-                .jobs
-                .values()
-                .filter(|e| e.info.state.is_finished())
-                .count();
-            let mut excess = finished.saturating_sub(self.history);
-            if excess > 0 {
-                let Registry { order, jobs, .. } = &mut *registry;
-                order.retain(|jid| {
-                    let drop_it =
-                        excess > 0 && jobs.get(jid).is_none_or(|e| e.info.state.is_finished());
-                    if drop_it {
-                        excess = excess.saturating_sub(1);
-                        jobs.remove(jid);
-                    }
-                    !drop_it
-                });
-            }
-            snapshot
+        let mut registry = self.registry();
+        let Some(entry) = registry.jobs.get_mut(&id) else {
+            return;
         };
-        // Deliver the finished snapshot to any registered waiter. The
-        // snapshot was captured before eviction, so a job dropped from the
-        // history ring above still reaches its cleanup callback.
-        if let Some(info) = snapshot
-            && let Some(tx) = self.ended_waiters().remove(&id)
-        {
-            drop(tx.send(info));
+        entry.info.state = state;
+        entry.info.outcome = outcome;
+        entry.info.finished_at = Some(Timestamp::now());
+        let snapshot = entry.info.clone();
+        drop(self.events.send(snapshot.clone()));
+        for waiter in registry.ended_waiters.remove(&id).unwrap_or_default() {
+            drop(waiter.send(snapshot.clone()));
         }
+        registry.evict_past(self.history);
     }
 
     fn lanes(&self) -> std::sync::MutexGuard<'_, HashMap<String, LaneState>> {
         self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn ended_waiters(&self) -> std::sync::MutexGuard<'_, HashMap<JobId, oneshot::Sender<JobInfo>>> {
-        self.ended_waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Take the job's place in its lane, synchronously at submit: a free
@@ -618,7 +609,6 @@ impl JobQueue {
                 registry: Mutex::new(Registry::default()),
                 history: usize::try_from(history.max(1)).unwrap_or(usize::MAX),
                 events,
-                ended_waiters: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -683,9 +673,9 @@ impl JobQueue {
                     cancel: cancel.clone(),
                 },
             );
+            drop(self.inner.events.send(info.clone()));
             info
         };
-        drop(self.inner.events.send(snapshot.clone()));
 
         // The lane place is taken now, so the lane runs in submission order.
         let ticket = spec.lane.as_ref().map(|lane| self.inner.enter_lane(lane));
@@ -750,13 +740,17 @@ impl JobQueue {
     )]
     pub fn cancel(&self, id: JobId) -> bool {
         let token = {
-            let registry = self.inner.registry();
-            match registry.jobs.get(&id) {
-                Some(entry) if !entry.info.state.is_finished() => entry.cancel.clone(),
-                _ => return false,
+            let mut registry = self.inner.registry();
+            let Some(entry) = registry.jobs.get_mut(&id) else {
+                return false;
+            };
+            if entry.info.state.is_finished() {
+                return false;
             }
+            entry.info.cancel_requested = true;
+            drop(self.inner.events.send(entry.info.clone()));
+            entry.cancel.clone()
         };
-        self.inner.update(id, |info| info.cancel_requested = true);
         token.cancel();
         true
     }
@@ -803,50 +797,25 @@ impl JobQueue {
 
     /// Run `record` with the job's final snapshot once it ends, on a task
     /// of its own: for what the work would have recorded itself had it run
-    /// to its end (a job cancelled while queued never runs it). The snapshot
-    /// is delivered by [`Inner::finish`] directly through a oneshot, so
-    /// `record` runs even if the job is dropped from the history ring or the
-    /// broadcast channel has lagged past the finished event. A job that
-    /// ended and was evicted before this is called has no snapshot left to
-    /// deliver, so `record` does not run; the two real callers register
-    /// immediately after [`JobQueue::submit`], so the job is never ended by
-    /// then.
+    /// to its end (a job cancelled while queued never runs it). `record`
+    /// runs even if the job is later dropped from the history or the
+    /// broadcast lags; a job already ended and dropped has no snapshot left,
+    /// so `record` does not run.
     pub fn when_ended<F, Fut>(&self, id: JobId, record: F)
     where
         F: FnOnce(JobInfo) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
-        self.inner.ended_waiters().insert(id, tx);
-        // The job may have already finished (and possibly been evicted)
-        // before this call. `finish` only delivers through the oneshot if it
-        // runs after this insert, so resolve the race here so `record` runs
-        // exactly once.
-        match self.get(id) {
-            Some(info) if info.state.is_finished() => {
-                // Still in the history and finished. If `finish` ran before we
-                // inserted, it did not see our waiter: take it and deliver
-                // `record(info)` ourselves. If `finish` ran after we inserted,
-                // it took the waiter and sent the snapshot to `rx` already --
-                // fall through to await it.
-                if self.inner.ended_waiters().remove(&id).is_some() {
-                    tokio::spawn(async move {
-                        record(info).await;
-                    });
-                    return;
-                }
-            }
-            Some(_) => {
-                // Still queued or running; `finish` will deliver via `rx`.
-            }
-            None => {
-                // Evicted or unknown. If we still hold the waiter, the job
-                // ended and was evicted before this call (no snapshot left):
-                // drop the waiter and do nothing. If `finish` already took it
-                // and sent, fall through to await `rx`.
-                if self.inner.ended_waiters().remove(&id).is_some() {
-                    return;
-                }
+        {
+            let mut registry = self.inner.registry();
+            let Some(entry) = registry.jobs.get(&id) else {
+                return;
+            };
+            if entry.info.state.is_finished() {
+                drop(tx.send(entry.info.clone()));
+            } else {
+                registry.ended_waiters.entry(id).or_default().push(tx);
             }
         }
         tokio::spawn(async move {
@@ -1584,6 +1553,7 @@ mod tests {
             "first was evicted (history = 1)"
         );
 
+        let queue_for_check = queue.clone();
         let called = Arc::new(AtomicBool::new(false));
         let called_for_record = Arc::clone(&called);
         // Wrap the call in a timeout to prove it returns promptly rather than
@@ -1605,6 +1575,10 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "record must not run for an already-evicted job with no snapshot"
+        );
+        assert!(
+            queue_for_check.inner.registry().ended_waiters.is_empty(),
+            "no waiter is left for an evicted job"
         );
     }
 
@@ -1651,5 +1625,100 @@ mod tests {
             queue.get(watched).is_none(),
             "watched was evicted but its snapshot was still delivered"
         );
+    }
+
+    /// Concurrent finishes past a history of one: each finish evicts another
+    /// job's entry, and every registered cleanup must still run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn when_ended_runs_for_every_job_under_concurrent_finishes() {
+        let queue = JobQueue::new(1);
+        let n = 2000_usize;
+        let called = Arc::new(AtomicUsize::new(0));
+        for i in 0..n {
+            let id = queue
+                .submit(JobSpec::new(JobKind::Sql, format!("j{i}")), |_| async {
+                    for _ in 0..3 {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(String::new())
+                })
+                .id;
+            let called_for_record = Arc::clone(&called);
+            queue.when_ended(id, move |_ended| async move {
+                called_for_record.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let all_ran = tokio::time::timeout(Duration::from_secs(10), async {
+            while called.load(Ordering::SeqCst) < n {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let stranded = queue.inner.registry().ended_waiters.len();
+        assert!(
+            all_ran,
+            "{} of {n} cleanups ran; {stranded} waiters stranded",
+            called.load(Ordering::SeqCst)
+        );
+        assert_eq!(stranded, 0, "no waiter outlives its job");
+    }
+
+    /// Two cleanups registered on one job both run.
+    #[tokio::test]
+    async fn when_ended_runs_every_registration_on_one_job() {
+        let queue = JobQueue::new(100);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_work = Arc::clone(&gate);
+        let id = queue
+            .submit(JobSpec::new(JobKind::Sql, "held"), move |_| async move {
+                gate_for_work.notified().await;
+                Ok(String::new())
+            })
+            .id;
+        let called = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let called_for_record = Arc::clone(&called);
+            queue.when_ended(id, move |_ended| async move {
+                called_for_record.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        gate.notify_one();
+        finished(&queue, id).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while called.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| fail("not every registration ran"));
+        assert_eq!(called.load(Ordering::SeqCst), 2);
+        assert!(queue.inner.registry().ended_waiters.is_empty());
+    }
+
+    /// Cancelling a job that already ended reports it inactive and announces
+    /// nothing after its finished snapshot.
+    #[tokio::test]
+    async fn cancel_after_finish_is_refused_without_an_event() {
+        let queue = JobQueue::new(100);
+        let id = queue
+            .submit(JobSpec::new(JobKind::Sql, "done"), |_| async {
+                Ok(String::new())
+            })
+            .id;
+        finished(&queue, id).await;
+        let mut events = queue.subscribe();
+        assert!(!queue.cancel(id), "a finished job is not active");
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "no event follows the finished one"
+        );
+        let Some(info) = queue.get(id) else {
+            fail("job forgotten")
+        };
+        assert!(!info.cancel_requested);
     }
 }
