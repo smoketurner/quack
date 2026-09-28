@@ -451,6 +451,41 @@ fn the_subject_is_the_configured_claim_and_the_username_falls_back() {
 }
 
 #[test]
+fn a_named_field_claim_resolves_as_the_subject_when_configured() {
+    let value = json!({
+        "iss": "i", "aud": "a", "exp": 0,
+        "sub": "s-1", "oid": "o-1",
+        "email": "ada@example.com",
+        "preferred_username": "ada",
+    });
+    let person = claims(&value).person;
+    assert!(
+        !person.rest.contains_key("email"),
+        "email is a named field and must not also live in rest"
+    );
+    assert!(
+        !person.rest.contains_key("preferred_username"),
+        "preferred_username is a named field and must not also live in rest"
+    );
+    assert_eq!(
+        person.subject("email"),
+        Some(OidcSubject::from("ada@example.com"))
+    );
+    assert_eq!(
+        person.subject("preferred_username"),
+        Some(OidcSubject::from("ada"))
+    );
+    assert_eq!(person.subject("tid"), None);
+    let blank = json!({
+        "iss": "i", "aud": "a", "exp": 0,
+        "email": "  ", "preferred_username": "",
+    });
+    let blank_person = claims(&blank).person;
+    assert_eq!(blank_person.subject("email"), None);
+    assert_eq!(blank_person.subject("preferred_username"), None);
+}
+
+#[test]
 fn a_malformed_id_token_is_a_sign_in_error() {
     for token in [
         "not-a-jwt",
@@ -647,6 +682,52 @@ async fn without_an_audience_no_bearer_is_accepted_and_oid_can_name_the_person()
             .await
             .is_ok_and(|b| b.subject == OidcSubject::from("object-1"))
     );
+}
+
+#[tokio::test]
+async fn a_bearer_named_by_email_or_preferred_username_is_accepted() {
+    let issuer = MockIssuer::start().await;
+    let key = TestKey::new("k1");
+    issuer.with(|s| s.jwks = vec![key.jwk.clone()]);
+    let token = key.sign(&access_claims(&issuer.url, |c| {
+        c["email"] = json!("ada@example.com");
+    }));
+
+    let mut config = issuer.sign_in().config;
+    config.subject_claim = String::from("email");
+    let by_email =
+        SignIn::new(config.clone(), issuer.keys()).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        by_email
+            .verify_bearer(&token)
+            .await
+            .is_ok_and(|b| b.subject == OidcSubject::from("ada@example.com")
+                && b.username == "ada"),
+        "subject_claim = \"email\" must name the person from the email claim"
+    );
+
+    config.subject_claim = String::from("preferred_username");
+    let by_username =
+        SignIn::new(config.clone(), issuer.keys()).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        by_username
+            .verify_bearer(&token)
+            .await
+            .is_ok_and(|b| b.subject == OidcSubject::from("ada")),
+        "subject_claim = \"preferred_username\" must name the person from the preferred_username claim"
+    );
+
+    let no_email = key.sign(&access_claims(&issuer.url, |c| {
+        if let Some(map) = c.as_object_mut() {
+            map.remove("email");
+        }
+    }));
+    config.subject_claim = String::from("email");
+    let by_email = SignIn::new(config, issuer.keys()).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(matches!(
+        by_email.verify_bearer(&no_email).await,
+        Err(Error::Bearer(message)) if message.contains("the token has no email claim")
+    ));
 }
 
 // --- private_key_jwt and pushed authorization requests -------------------------

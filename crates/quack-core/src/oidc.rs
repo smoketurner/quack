@@ -153,10 +153,11 @@ impl Person {
     /// The configured claim that names the person, when it is a non-empty
     /// string.
     fn subject(&self, claim: &str) -> Option<OidcSubject> {
-        let value = if claim == OidcConfig::DEFAULT_SUBJECT_CLAIM {
-            self.sub.as_deref()
-        } else {
-            self.rest.get(claim).and_then(serde_json::Value::as_str)
+        let value = match claim {
+            OidcConfig::DEFAULT_SUBJECT_CLAIM => self.sub.as_deref(),
+            "preferred_username" => self.preferred_username.as_deref(),
+            "email" => self.email.as_deref(),
+            _ => self.rest.get(claim).and_then(serde_json::Value::as_str),
         };
         value
             .map(str::trim)
