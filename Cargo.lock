@@ -6683,7 +6683,7 @@ dependencies = [
 
 [[package]]
 name = "quack"
-version = "2026.9.4"
+version = "2026.9.5"
 dependencies = [
  "anyhow",
  "askama",
@@ -6725,7 +6725,7 @@ dependencies = [
 
 [[package]]
 name = "quack-core"
-version = "2026.9.4"
+version = "2026.9.5"
 dependencies = [
  "apple-native-keyring-store",
  "argon2",
