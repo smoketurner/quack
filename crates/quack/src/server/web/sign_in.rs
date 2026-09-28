@@ -148,17 +148,17 @@ pub(super) async fn finish(
         .control
         .oidc_user(&signed_in.subject, &signed_in.username)
         .await?;
-    // The token and the session it serves appear together (issue #241).
+    entry.outcome = Outcome::Allowed;
+    entry.user_id = Some(user.id.clone());
+    // The audit row is written before the token it documents is committed,
+    // so an audit-write failure leaves no committed, unaudited credential —
+    // the refusal paths above audit before any side effect too.
+    app.control.record_audit(&entry).await?;
+    // The token and the session it serves appear together (issue #241),
+    // committed only once the audit row that records their issuance is durable.
     let token = oidc
         .keep_and_open(&app.sessions, &user.id, &signed_in.token)
         .await?;
-    entry.outcome = Outcome::Allowed;
-    entry.user_id = Some(user.id.clone());
-    // Nothing unaudited stands: the session the row failed for is closed.
-    app.control
-        .record_audit(&entry)
-        .await
-        .inspect_err(|_| app.sessions.close(token.as_str()))?;
     Ok((
         jar.add(SessionCookie::issue(&app, peer, token)),
         Redirect::to("/workspaces"),

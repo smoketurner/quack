@@ -7,6 +7,7 @@
 )]
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -26,6 +27,7 @@ use quack_core::storage::control::{AuditFilter, ControlPlane, Outcome, SealedOwn
 use quack_core::vault::Vault;
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tower::ServiceExt;
 
 use super::Oidc;
@@ -473,6 +475,202 @@ async fn a_first_sign_in_creates_a_user_with_no_access_and_a_session() {
     let (_, me) = h.me(&again).await;
     assert_eq!(me["id"], user.id.to_string());
     assert_eq!(me["username"], "ada");
+}
+
+/// A sign-in whose `Login/Allowed` audit row cannot be written leaves no
+/// committed credential. The success path writes the audit row *before* it
+/// stores the sealed token (mirroring the refusal paths above), so an
+/// audit-write failure aborts the sign-in before any credential is
+/// committed. The old order committed the token first and audited second,
+/// and on an audit failure its rollback only closed the just-opened
+/// session — the new, unaudited token stayed in `control.db` for the
+/// user's other sessions to renew against. Dropping `audit_log` is the
+/// one write the success path makes after `oidc_user` has created the
+/// user, so it isolates a `record_audit` failure (against `user_tokens`,
+/// which `keep_and_open` writes) without disturbing the user lookup.
+#[tokio::test]
+async fn a_sign_in_whose_audit_row_cannot_be_written_leaves_no_committed_token() {
+    let h = Harness::new().await;
+    // A second pool on the same WAL-mode `control.db` drops `audit_log`,
+    // the way `control.rs::tests::legacy_control_db` opens its own pool to
+    // set up a legacy database. `audit_log` is written only by
+    // `record_audit`; `oidc_user` (run first) and `keep_and_open` touch
+    // `users` and `user_tokens`.
+    let url = format!("sqlite:{}", h.dir.path().join("control.db").display());
+    let options = SqliteConnectOptions::from_str(&url).unwrap_or_else(|e| fail(&e.to_string()));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    sqlx::query("DROP TABLE audit_log")
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    pool.close().await;
+
+    let (state, nonce, cookie) = h.start().await;
+    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    h.issuer(|s| {
+        s.id_claims = json!({
+            "iss": base, "sub": "sub-aud", "aud": "quack",
+            "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+            "nonce": nonce, "preferred_username": "aud",
+        });
+    });
+    let reply = h
+        .get(
+            &format!("{}?code=c&state={state}", OidcConfig::CALLBACK_PATH),
+            Some(&format!("{}={cookie}", super::STATE_COOKIE)),
+        )
+        .await;
+    // The audit write failed; the handler returns its 500 error page and
+    // issues no session cookie. No `inspect_err` rollback is involved,
+    // because nothing has been committed to roll back.
+    assert_eq!(
+        reply.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.cookie(crate::server::auth::SESSION_COOKIE).is_none(),
+        "a session opened despite the audit write failing"
+    );
+
+    // `oidc_user` ran (and created the user) before the audit write, so the
+    // identity record stands; it carries no credential and is reused by a
+    // later, successful sign-in. The defect the fix addresses is the
+    // committed *token*, not the user row.
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-aud"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("the user was created before the audit write"));
+    // The credential the failed sign-in would have committed is absent:
+    // the audit row is written before `keep_and_open`, so its failure
+    // aborts the sign-in before the sealed token is stored. This is what
+    // distinguishes the fix from the old order, which committed the token
+    // first and left it behind when the audit write then failed.
+    assert!(
+        !h.has_token(&user.id).await,
+        "an audit-write failure left a committed, unaudited token"
+    );
+
+    // Restoring `audit_log` lets a later sign-in complete normally, so the
+    // failed attempt did not strand the user: the same subject signs in
+    // again, this time stores its token, opens a session, and records its
+    // `Login/Allowed` row.
+    let url = format!("sqlite:{}", h.dir.path().join("control.db").display());
+    let options = SqliteConnectOptions::from_str(&url).unwrap_or_else(|e| fail(&e.to_string()));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    sqlx::query(
+        "CREATE TABLE audit_log (\
+             id TEXT NOT NULL PRIMARY KEY, \
+             timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             user_id TEXT, token_hash TEXT, workspace_id TEXT, \
+             action TEXT NOT NULL, resource_type TEXT, resource_id TEXT, \
+             outcome TEXT NOT NULL, channel TEXT NOT NULL, \
+             client_addr TEXT, request_id TEXT)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    pool.close().await;
+
+    let session = h.sign_in("sub-aud", "aud").await;
+    assert_eq!(h.me(&session).await.0, StatusCode::OK);
+    assert!(h.has_token(&user.id).await);
+    let logins = h.audit("login").await;
+    assert!(
+        logins.contains(&(Outcome::Allowed, Some(user.id.clone()))),
+        "{logins:?}"
+    );
+}
+
+/// The companion of the test above, from the other direction: the audit
+/// row is written *before* the credential is committed, so when the
+/// credential store itself fails the `Login/Allowed` audit row is already
+/// durable — the audit precedes the credential (the fix's ordering), and
+/// no orphan credential is left. Dropping `user_tokens` (the table
+/// `keep_and_open` writes through `put_sealed`) isolates a credential-
+/// store failure without disturbing `oidc_user` (`users`) or
+/// `record_audit` (`audit_log`); `user_tokens` has no inbound foreign
+/// keys, so it drops cleanly under `PRAGMA foreign_keys=ON`.
+#[tokio::test]
+async fn a_sign_in_whose_credential_store_fails_still_records_its_allowed_audit_row() {
+    let h = Harness::new().await;
+    let url = format!("sqlite:{}", h.dir.path().join("control.db").display());
+    let options = SqliteConnectOptions::from_str(&url).unwrap_or_else(|e| fail(&e.to_string()));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    sqlx::query("DROP TABLE user_tokens")
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    pool.close().await;
+
+    let (state, nonce, cookie) = h.start().await;
+    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    h.issuer(|s| {
+        s.id_claims = json!({
+            "iss": base, "sub": "sub-cred", "aud": "quack",
+            "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+            "nonce": nonce, "preferred_username": "cred",
+        });
+    });
+    let reply = h
+        .get(
+            &format!("{}?code=c&state={state}", OidcConfig::CALLBACK_PATH),
+            Some(&format!("{}={cookie}", super::STATE_COOKIE)),
+        )
+        .await;
+    // The audit row was written first and succeeded; the credential store
+    // that followed failed, so the handler returns its 500 error page and
+    // issues no session cookie.
+    assert_eq!(
+        reply.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.cookie(crate::server::auth::SESSION_COOKIE).is_none(),
+        "a session opened despite the credential store failing"
+    );
+
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-cred"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("the user was created before the credential store"));
+    // No credential was committed (the store failed), and none can be,
+    // because `user_tokens` is gone for this sign-in.
+    assert!(
+        !h.has_token(&user.id).await,
+        "a credential-store failure left a committed token"
+    );
+    // The `Login/Allowed` audit row was written before the credential
+    // store was attempted, so it stands — the audit precedes the
+    // credential, which is the ordering the fix establishes.
+    let logins = h.audit("login").await;
+    assert!(
+        logins.contains(&(Outcome::Allowed, Some(user.id.clone()))),
+        "the allowed audit row was not recorded before the credential store: {logins:?}"
+    );
 }
 
 #[tokio::test]
