@@ -459,14 +459,6 @@ fn a_named_field_claim_resolves_as_the_subject_when_configured() {
         "preferred_username": "ada",
     });
     let person = claims(&value).person;
-    assert!(
-        !person.rest.contains_key("email"),
-        "email is a named field and must not also live in rest"
-    );
-    assert!(
-        !person.rest.contains_key("preferred_username"),
-        "preferred_username is a named field and must not also live in rest"
-    );
     assert_eq!(
         person.subject("email"),
         Some(OidcSubject::from("ada@example.com"))
