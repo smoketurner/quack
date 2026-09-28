@@ -39,7 +39,7 @@ deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.98.1 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
 crates/               # quack-core (engine), quack (the binary) — see crates/README.md
-docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication
+docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication, providers
 .claude/rules/        # code-standards and development-discipline gates; branching, commits, continuous-improvement conventions
 ```
 
@@ -395,5 +395,5 @@ everything and publishes nothing.
 
 `docs/architecture.md` maps the design to the modules; `docs/migrations.md`,
 `docs/crypto.md`, `docs/web-ui.md`, and `docs/ci-cd.md` cover the schema, TLS, web UI, and
-release layers, and `docs/authentication.md` covers signing in to quack and quack
-authenticating to providers. Read the relevant one before changing that layer.
+release layers, `docs/authentication.md` covers signing in to quack, and `docs/providers.md`
+covers connecting to and authenticating with model providers. Read the relevant one before changing that layer.
