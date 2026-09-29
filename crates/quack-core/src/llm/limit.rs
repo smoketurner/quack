@@ -35,6 +35,7 @@ use tokio::sync::oneshot;
 
 use super::bedrock::Signer;
 use crate::config::{BaseUrl, ProviderConfig, ProviderName, RequestLimit};
+use crate::error::{self, Error};
 
 use crate::priority::Priority;
 
@@ -244,9 +245,36 @@ impl ProviderGates {
 pub struct LimitedHttp {
     inner: reqwest::Client,
     gates: ProviderGates,
-    /// Signs each request with `SigV4` once it has its permit (Bedrock's
-    /// OpenAI-compatible APIs), replacing the bearer rig set.
-    signer: Option<Arc<Signer>>,
+    /// Replaces the credential rig set, once the request has its permit.
+    authorize: Option<Authorize>,
+}
+
+/// How a client authorizes each request in place of rig's own header.
+#[derive(Clone, Debug)]
+enum Authorize {
+    /// `SigV4` (Bedrock's OpenAI-compatible APIs), replacing the bearer.
+    Sign(Arc<Signer>),
+    /// An OAuth token as `Authorization: Bearer`, replacing the `x-api-key`
+    /// rig's Anthropic client always sends, where gateways and Anthropic's
+    /// own OAuth never look. Marked sensitive, so `Debug` hides it.
+    Bearer(http::HeaderValue),
+}
+
+impl Authorize {
+    const API_KEY: http::HeaderName = http::HeaderName::from_static("x-api-key");
+
+    fn bearer(token: &str) -> error::Result<Self> {
+        let mut value = http::HeaderValue::try_from(format!("Bearer {token}"))
+            .map_err(|e| Error::Llm(format!("the OAuth token is not a header value: {e}")))?;
+        value.set_sensitive(true);
+        Ok(Self::Bearer(value))
+    }
+
+    /// Put the bearer in `headers`, in place of any key rig set.
+    fn replace_key(value: &http::HeaderValue, headers: &mut http::HeaderMap) {
+        headers.remove(Self::API_KEY);
+        headers.insert(http::header::AUTHORIZATION, value.clone());
+    }
 }
 
 impl LimitedHttp {
@@ -256,24 +284,39 @@ impl LimitedHttp {
         Self {
             inner: reqwest::Client::default(),
             gates: ProviderGates::for_provider(name, provider),
-            signer: None,
+            authorize: None,
         }
     }
 
     /// This client, signing every request with `signer`.
     #[must_use]
     pub(crate) fn signed(mut self, signer: Arc<Signer>) -> Self {
-        self.signer = Some(signer);
+        self.authorize = Some(Authorize::Sign(signer));
         self
     }
 
-    /// `request`, signed when this client signs.
+    /// This client, sending `token` as `Authorization: Bearer` on every
+    /// request and dropping any `x-api-key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `token` cannot be a header value.
+    pub(crate) fn with_oauth_bearer(mut self, token: &str) -> error::Result<Self> {
+        self.authorize = Some(Authorize::bearer(token)?);
+        Ok(self)
+    }
+
+    /// `request`, authorized the way this client authorizes.
     async fn prepare(
-        signer: Option<Arc<Signer>>,
-        request: Request<Bytes>,
+        authorize: Option<Authorize>,
+        mut request: Request<Bytes>,
     ) -> http_client::Result<Request<Bytes>> {
-        match signer {
-            Some(signer) => signer.sign(request).await,
+        match authorize {
+            Some(Authorize::Sign(signer)) => signer.sign(request).await,
+            Some(Authorize::Bearer(value)) => {
+                Authorize::replace_key(&value, request.headers_mut());
+                Ok(request)
+            }
             None => Ok(request),
         }
     }
@@ -327,10 +370,10 @@ impl HttpClientExt for LimitedHttp {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let permit = self.gates.permit(GateKey::model_of(&body));
-        let signer = self.signer.clone();
+        let authorize = self.authorize.clone();
         async move {
             let permit = permit.await;
-            let request = Self::prepare(signer, Request::from_parts(parts, body)).await?;
+            let request = Self::prepare(authorize, Request::from_parts(parts, body)).await?;
             let response = inner.send(request).await?;
             Ok(body_holding(response, permit))
         }
@@ -338,20 +381,26 @@ impl HttpClientExt for LimitedHttp {
 
     fn send_multipart<U>(
         &self,
-        req: Request<MultipartForm>,
+        mut req: Request<MultipartForm>,
     ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
         U: From<Bytes> + Send + 'static,
     {
         let inner = self.inner.clone();
         let permit = self.gates.permit(None);
-        let signed = self.signer.is_some();
+        let authorize = self.authorize.clone();
         async move {
-            if signed {
+            match authorize {
                 // SigV4 signs the body, and a multipart body is not built yet.
-                return Err(http_client::Error::Instance(
-                    "multipart requests cannot be SigV4-signed".into(),
-                ));
+                Some(Authorize::Sign(_)) => {
+                    return Err(http_client::Error::Instance(
+                        "multipart requests cannot be SigV4-signed".into(),
+                    ));
+                }
+                Some(Authorize::Bearer(value)) => {
+                    Authorize::replace_key(&value, req.headers_mut());
+                }
+                None => {}
             }
             let permit = permit.await;
             let response = inner.send_multipart(req).await?;
@@ -370,10 +419,10 @@ impl HttpClientExt for LimitedHttp {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let permit = self.gates.permit(GateKey::model_of(&body));
-        let signer = self.signer.clone();
+        let authorize = self.authorize.clone();
         async move {
             let permit = permit.await;
-            let request = Self::prepare(signer, Request::from_parts(parts, body)).await?;
+            let request = Self::prepare(authorize, Request::from_parts(parts, body)).await?;
             let response = inner.send_streaming(request).await?;
             Ok(response.map(|stream| -> BoxedStream {
                 Box::pin(Holding {
@@ -586,5 +635,40 @@ mod tests {
         drop(gave_up.await);
         drop(held);
         assert_eq!(gate.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oauth_bearer_replaces_the_api_key_header() {
+        let client = LimitedHttp::for_provider(
+            &name("p"),
+            &provider(ProviderType::Anthropic, None, "http://127.0.0.1:9/"),
+        )
+        .with_oauth_bearer("tok-1")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(!format!("{client:?}").contains("tok-1"));
+        let request = Request::post("http://127.0.0.1:9/v1/messages")
+            .header("x-api-key", "tok-1")
+            .header("anthropic-version", "2023-06-01")
+            .body(Bytes::from_static(b"{}"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let sent = LimitedHttp::prepare(client.authorize, request)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let headers = sent.headers();
+        assert_eq!(
+            headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer tok-1")
+        );
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("anthropic-version").is_some());
+        assert_eq!(sent.body().as_ref(), b"{}");
+    }
+
+    #[test]
+    fn a_token_that_is_no_header_value_is_refused() {
+        let client = LimitedHttp::default().with_oauth_bearer("tok\n1");
+        assert!(client.is_err_and(|e| e.to_string().contains("not a header value")));
     }
 }
