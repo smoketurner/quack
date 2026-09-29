@@ -853,17 +853,40 @@ async fn build_anthropic_client(
     anthropic_client(name, provider, &key)
 }
 
-/// The Anthropic client for `provider` and its resolved credential: an API
-/// key goes as `x-api-key`, as rig sends it; an OAuth token as a bearer.
+/// The header an Anthropic provider's credential goes in, decided once for
+/// every request quack sends one on (completions and the doctor's probe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnthropicCredential {
+    /// `x-api-key`, the scheme Anthropic's API keys use.
+    ApiKey,
+    /// `Authorization: Bearer`, where gateways and Anthropic's own OAuth
+    /// look for an OAuth token.
+    Bearer,
+}
+
+impl AnthropicCredential {
+    /// The header `auth`'s credential goes in.
+    pub(crate) const fn of(auth: &ProviderAuth) -> Self {
+        match auth {
+            ProviderAuth::Oauth(_) => Self::Bearer,
+            ProviderAuth::None | ProviderAuth::ApiKey { .. } | ProviderAuth::Aws { .. } => {
+                Self::ApiKey
+            }
+        }
+    }
+}
+
+/// The Anthropic client for `provider` and its resolved credential, sent
+/// in the header [`AnthropicCredential::of`] names.
 fn anthropic_client(
     name: &ProviderName,
     provider: &ProviderConfig,
     key: &str,
 ) -> Result<AnthropicClient> {
     let http = LimitedHttp::for_provider(name, provider);
-    let http = match &provider.auth {
-        ProviderAuth::Oauth(_) => http.with_oauth_bearer(key)?,
-        ProviderAuth::None | ProviderAuth::ApiKey { .. } | ProviderAuth::Aws { .. } => http,
+    let http = match AnthropicCredential::of(&provider.auth) {
+        AnthropicCredential::Bearer => http.with_oauth_bearer(key)?,
+        AnthropicCredential::ApiKey => http,
     };
     let mut builder = rig::providers::anthropic::Client::builder()
         .api_key(key)
