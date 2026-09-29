@@ -57,8 +57,8 @@ Each provider entry picks one `auth` mode:
 | `auth` | What quack sends | Used for |
 |---|---|---|
 | `none` (default) | nothing | a local Ollama server |
-| `api-key` | a static bearer from the environment variable in `api_key_env` | OpenAI, Anthropic, LiteLLM virtual keys |
-| `oauth` | an access token from the `[providers.NAME.oauth]` issuer | gateways behind Entra ID, Okta, or Auth0 |
+| `api-key` | the key in the environment variable named by `api_key_env`, as `Authorization: Bearer` (`x-api-key` for `type = "anthropic"`) | OpenAI, Anthropic, LiteLLM virtual keys |
+| `oauth` | an access token from the `[providers.NAME.oauth]` issuer, as `Authorization: Bearer` for every type | gateways behind Entra ID, Okta, or Auth0 |
 | `aws` (default for Bedrock) | a SigV4 signature from the AWS SDK's credentials | `bedrock`, `bedrock-mantle` |
 
 `type = "openai"` needs `api-key` or `oauth`. For API keys, quack reads the variable at use

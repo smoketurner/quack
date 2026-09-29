@@ -826,10 +826,24 @@ async fn build_anthropic_client(
                 "provider '{name}' (anthropic) requires auth = \"api-key\" or \"oauth\""
             ))
         })?;
+    anthropic_client(name, provider, &key)
+}
 
+/// The Anthropic client for `provider` and its resolved credential: an API
+/// key goes as `x-api-key`, as rig sends it; an OAuth token as a bearer.
+fn anthropic_client(
+    name: &ProviderName,
+    provider: &ProviderConfig,
+    key: &str,
+) -> Result<AnthropicClient> {
+    let http = LimitedHttp::for_provider(name, provider);
+    let http = match &provider.auth {
+        ProviderAuth::Oauth(_) => http.with_oauth_bearer(key)?,
+        ProviderAuth::None | ProviderAuth::ApiKey { .. } | ProviderAuth::Aws { .. } => http,
+    };
     let mut builder = rig::providers::anthropic::Client::builder()
-        .api_key(&key)
-        .http_client(LimitedHttp::for_provider(name, provider))
+        .api_key(key)
+        .http_client(http)
         .http_headers(provider.header_map()?);
 
     if let Some(base_url) = &provider.base_url {
@@ -1317,6 +1331,51 @@ mod tests {
             assert!(request.starts_with(path), "{provider}: {request}");
             assert!(lower.contains("x-gateway-team: quack"), "{request}");
             assert_eq!(lower.contains("quack-core"), !auth.is_empty(), "{request}");
+        }
+    }
+
+    /// With `auth = "oauth"`, the request carries `Authorization: Bearer
+    /// <token>` and no `x-api-key` header; with `auth = "api-key"`, it
+    /// carries `x-api-key` and no `Authorization` header.
+    #[tokio::test]
+    async fn anthropic_sends_an_oauth_token_as_a_bearer() {
+        let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
+                     issuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n";
+        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+        for (auth, bearer) in [(oauth, true), (keyed, false)] {
+            let (root, seen) = capture_one().await;
+            let config = parse(&format!(
+                "[general]\nchat_model = \"p/claude-sonnet-5\"\n[providers.p]\n\
+                 type = \"anthropic\"\nbase_url = \"{root}\"\n{auth}"
+            ));
+            let chat = config
+                .chat_model_ref()
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let client = anthropic_client(chat.provider_name, chat.provider, "tok-1")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let answer = ChatClient::Anthropic(client)
+                .one_shot(
+                    "claude-sonnet-5",
+                    "Answer.",
+                    Duration::from_secs(10),
+                    "wire test",
+                    None,
+                )
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .answer("hello")
+                .await;
+            assert!(answer.is_err(), "the server answers 400");
+            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+            let lower = request.to_ascii_lowercase();
+            assert!(request.starts_with("POST /v1/messages "), "{request}");
+            assert_eq!(lower.contains("authorization: "), bearer, "{request}");
+            assert_eq!(
+                lower.contains("authorization: bearer tok-1\r\n"),
+                bearer,
+                "{request}"
+            );
+            assert_eq!(lower.contains("x-api-key"), !bearer, "{request}");
+            assert!(lower.contains("anthropic-version: "), "{request}");
         }
     }
 
