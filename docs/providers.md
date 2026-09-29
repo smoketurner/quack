@@ -50,6 +50,42 @@ Three settings apply to every type:
 `"chat-completions"` (the default with a `base_url`, since many compatible servers offer
 nothing else).
 
+## Temperature and reasoning effort
+
+quack sends `temperature` only through Ollama's own API (`type = "ollama"`). Current Claude
+and OpenAI reasoning models reject it with a 400, and every API accepts a request without it.
+
+`[analysis].effort` and `background_effort` go out as the field each API takes:
+`output_config.effort` for Claude, `reasoning.effort` on Responses, `reasoning_effort` on Chat
+Completions, `think` on Ollama. quack knows which levels Claude, OpenAI's reasoning models, and
+gpt-oss take, and refuses any other level before sending a request. A model it does not
+recognize, such as a gateway alias or an open-weight model on vLLM, gets the effort on Chat
+Completions and Responses, and the server decides whether it accepts that level.
+Elsewhere, quack sends no effort and logs a warning; `quack doctor` shows the same warning.
+
+`temperature`, `effort`, and `background_effort` can be set on a provider for all its models,
+or under `models."ID"` for one model. quack takes each key from the model first, then the
+provider, then `[analysis]`:
+
+```toml
+[providers.gateway]
+type = "openai"
+base_url = "https://llm.example.com/v1"
+effort = "medium"                        # every model here, over [analysis].effort
+
+[providers.gateway.models."corp-reasoner-pro"]
+effort = "high"                          # this model, over the provider's
+background_effort = "low"                # graph extraction and ontology induction
+
+[providers.ollama.models."qwen3:32b"]
+temperature = false                      # use the model's own sampling defaults
+```
+
+`temperature = true` sends quack's temperature (0.1 for chat turns, 0.0 for extraction). If only
+some of a gateway's models reason, set `effort` on those models rather than in `[analysis]`,
+because a model that does not reason rejects the field. `quack config` lists every key, and
+`quack doctor` shows what the chat model is sent.
+
 ## Credentials
 
 Each provider entry picks one `auth` mode:

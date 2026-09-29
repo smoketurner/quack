@@ -23,8 +23,8 @@ use crate::embedding::presets::Family;
 
 use super::{
     AuthMode, AwsRegion, BaseUrl, ClientAuth, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR,
-    ENV_MODEL, Effort, Exchange, Grant, ModelSpec, OAuthConfig, OidcConfig, Overrides,
-    ProviderType, config_file_path,
+    ENV_MODEL, Effort, Exchange, Grant, ModelSettings, ModelSpec, OAuthConfig, OidcConfig,
+    Overrides, ProviderType, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -448,7 +448,14 @@ const PROVIDER_KEYS: &[&str] = &[
     "max_concurrent_requests",
     "headers",
     "oauth",
+    "temperature",
+    "effort",
+    "background_effort",
+    "models",
 ];
+
+/// The keys a `[providers.NAME.models."ID"]` table accepts.
+const MODEL_KEYS: &[&str] = &["temperature", "effort", "background_effort"];
 
 /// The keys a `[server.oidc]` table accepts.
 const OIDC_KEYS: &[&str] = &[
@@ -573,6 +580,12 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 Some(provider.default_request_limit().to_string()),
             );
             s.names_only("headers", provider.headers.as_ref());
+            s.model_settings(provider.model_defaults);
+        }
+        for (model, settings) in &provider.models {
+            inventory
+                .section_at(&format!("{section}.models"), model)
+                .model_settings(*settings);
         }
         let Some(oauth) = provider.auth.oauth() else {
             continue;
@@ -1002,6 +1015,18 @@ impl UnknownKey {
                             unknown.push(Self::new(&section, key, PROVIDER_KEYS));
                         }
                     }
+                    let models = entry.get("models").and_then(TomlValue::as_table);
+                    for (model, settings) in models.into_iter().flatten() {
+                        let Some(settings) = settings.as_table() else {
+                            continue;
+                        };
+                        let path = format!("{section}.models.{}", quoted(model));
+                        for key in settings.keys() {
+                            if !MODEL_KEYS.contains(&key.as_str()) {
+                                unknown.push(Self::new(&path, key, MODEL_KEYS));
+                            }
+                        }
+                    }
                     let Some(oauth) = entry.get("oauth").and_then(TomlValue::as_table) else {
                         continue;
                     };
@@ -1044,10 +1069,10 @@ impl UnknownKey {
         unknown
     }
 
-    /// `key` in `section`, which accepts `keys`, with the closest one or
-    /// the section that does accept it.
+    /// `key` in `section`, which accepts `keys`, with the section that
+    /// accepts it exactly, else the closest key here.
     fn new(section: &str, key: &str, keys: &[&str]) -> Self {
-        let suggestion = Self::closest(key, keys).or_else(|| Self::elsewhere(section, key));
+        let suggestion = Self::elsewhere(section, key).or_else(|| Self::closest(key, keys));
         Self {
             path: format!("{section}.{key}"),
             suggestion,
@@ -1097,16 +1122,33 @@ struct Inventory<'a> {
 }
 
 impl<'a> Inventory<'a> {
+    /// The section at a dotted `name` whose parts are all bare keys.
     fn section(&mut self, name: impl Into<String>) -> Section<'_, 'a> {
+        let display: String = name.into();
+        let path = display.split('.').map(str::to_owned).collect();
         Section {
-            name: name.into(),
+            name: SectionName { display, path },
+            inventory: self,
+        }
+    }
+
+    /// The section at `path`, whose last part may be any string, such as a
+    /// model id: it is shown quoted.
+    fn section_at(&mut self, parent: &str, last: &str) -> Section<'_, 'a> {
+        let mut path: Vec<String> = parent.split('.').map(str::to_owned).collect();
+        path.push(last.to_owned());
+        Section {
+            name: SectionName {
+                display: format!("{parent}.{}", quoted(last)),
+                path,
+            },
             inventory: self,
         }
     }
 
     fn push(
         &mut self,
-        section: &str,
+        section: &SectionName,
         key: &'static str,
         value: Option<String>,
         default: Option<String>,
@@ -1119,7 +1161,7 @@ impl<'a> Inventory<'a> {
             _ => Origin::Default,
         };
         self.settings.push(Setting {
-            section: section.to_owned(),
+            section: section.display.clone(),
             key,
             value,
             default,
@@ -1129,19 +1171,25 @@ impl<'a> Inventory<'a> {
         });
     }
 
-    /// The raw value the file gives for a dotted section and key.
-    fn file_value(&self, section: &str, key: &str) -> Option<&'a TomlValue> {
+    /// The raw value the file gives for a section and key.
+    fn file_value(&self, section: &SectionName, key: &str) -> Option<&'a TomlValue> {
         let mut table = self.file?;
-        for part in section.split('.') {
+        for part in &section.path {
             table = table.get(part)?.as_table()?;
         }
         table.get(key)
     }
 }
 
+/// A section as [`Setting::section`] shows it and as the file nests it.
+struct SectionName {
+    display: String,
+    path: Vec<String>,
+}
+
 /// One section's settings, so each call names only the key.
 struct Section<'s, 'a> {
-    name: String,
+    name: SectionName,
     inventory: &'s mut Inventory<'a>,
 }
 
@@ -1199,6 +1247,22 @@ impl Section<'_, '_> {
         if let Some(setting) = self.inventory.settings.last_mut() {
             setting.file_value = written;
         }
+    }
+
+    /// `temperature`, `effort`, and `background_effort`, for a provider or
+    /// one of its models.
+    fn model_settings(&mut self, settings: ModelSettings) {
+        self.optional(
+            "temperature",
+            settings.temperature.map(|t| t.to_string()),
+            None,
+        );
+        self.optional_text("effort", settings.effort.map(Effort::as_str), None);
+        self.optional_text(
+            "background_effort",
+            settings.background_effort.map(Effort::as_str),
+            None,
+        );
     }
 
     /// A number or a flag: shown as TOML writes it, unquoted.
@@ -1460,7 +1524,7 @@ top_k = 3
         let bedrock_only = ["region"];
         for key in PROVIDER_KEYS
             .iter()
-            .filter(|k| **k != "oauth" && !bedrock_only.contains(*k))
+            .filter(|k| !["oauth", "models"].contains(*k) && !bedrock_only.contains(*k))
         {
             assert!(listed.contains(&format!("providers.p.{key}")), "{key}");
         }
@@ -1526,6 +1590,36 @@ top_k = 3
             oauth,
             "[providers.NAME.oauth]"
         );
+        let model: BTreeSet<String> = MODEL_KEYS.iter().map(|k| (*k).to_owned()).collect();
+        assert_eq!(
+            fields_of("[providers.p]\ntype = \"ollama\"\n[providers.p.models.\"m\"]"),
+            model,
+            "[providers.NAME.models.\"ID\"]"
+        );
+    }
+
+    #[test]
+    fn model_settings_are_listed_under_the_quoted_model_id() {
+        let inspection = inspect(
+            "[providers.p]\ntype = \"openai\"\n\
+             [providers.p.models.\"gpt-5.6\"]\ntemperature = false\n\
+             effort = \"high\"\n",
+        );
+        let temperature = setting(&inspection, "providers.p.models.\"gpt-5.6\".temperature");
+        assert_eq!(temperature.origin, Origin::File);
+        assert_eq!(temperature.value.as_deref(), Some("false"));
+        let effort = setting(&inspection, "providers.p.models.\"gpt-5.6\".effort");
+        assert_eq!(effort.value.as_deref(), Some("\"high\""));
+        assert_eq!(effort.file_value.as_deref(), Some("\"high\""));
+
+        let file = "[providers.p]\ntype = \"openai\"\n[providers.p.models.\"m\"]\ntemp = false\n"
+            .parse::<Table>();
+        let unknown = file.map(|f| UnknownKey::find_in(&f)).unwrap_or_default();
+        let found = unknown
+            .iter()
+            .find(|u| u.path == "providers.p.models.\"m\".temp")
+            .unwrap_or_else(|| panic!("{:?}", unknown.iter().map(|u| &u.path).collect::<Vec<_>>()));
+        assert_eq!(found.suggestion.as_deref(), Some("temperature"));
     }
 
     #[test]

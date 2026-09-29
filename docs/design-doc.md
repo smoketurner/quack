@@ -1038,12 +1038,15 @@ drift, propose again.
 0. Before 2, when the model has to be loaded first (Ollama, cold): emit Status { line }
 ```
 
-`max_turns` 15, temperature 0.1. `llm::sampling` adjusts that per model: Claude and `OpenAI`'s
-reasoning models (GPT-5.x, GPT-6, o-series) reject a non-default temperature, so none is sent,
-and Claude gets `max_tokens` 64,000, since thinking counts against it. `[analysis].effort` goes out
+`max_turns` 15, temperature 0.1. `llm::sampling` adjusts that per model. Only Ollama's own API
+is sent the temperature, because Claude and `OpenAI`'s reasoning models (GPT-5.x, GPT-6,
+o-series) reject a non-default one and a gateway's model name need not say which model it is.
+Claude gets `max_tokens` 64,000, since thinking counts against it. `[analysis].effort` goes out
 as each API's field (`output_config.effort` for Claude, `reasoning_effort` or `reasoning.effort`
-for `OpenAI`, `think` on Ollama); a level the model lacks is refused before the call, and a
-GPT-5.6 model on Chat Completions is refused because it cannot call tools there. The turn races a
+for `OpenAI` and unrecognized models on those APIs, `think` on Ollama). A level a known family
+lacks is refused before the call, and so is a GPT-5.6 model on Chat Completions, because it
+cannot call tools there. `temperature`, `effort`, and `background_effort` on a provider, or on
+one of its `models."ID"`, override the defaults and `[analysis]` (`docs/providers.md`). The turn races a
 `CancellationToken`; a cancelled turn keeps the text streamed so far, appends a note, reports `cancelled: true`, and is recorded.
 
 `llm::TurnRequest::run` yields these events on a channel. The web UI turns them into HTML
@@ -2026,6 +2029,11 @@ type = "ollama"
 auth = "none"
 base_url = "http://localhost:11434"
 # max_concurrent_requests = 1          # model requests in flight at once; default 1 for Ollama, 8 otherwise
+# temperature = false                  # send quack's temperature; default true for Ollama only
+# effort = "high"                      # this provider's models, over [analysis]; also background_effort
+
+# [providers.ollama.models."qwen3:32b"]  # one model's temperature, effort, background_effort
+# temperature = false
 
 [providers.anthropic]
 type = "anthropic"

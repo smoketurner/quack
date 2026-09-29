@@ -23,10 +23,9 @@ use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
-use crate::config::Effort;
 use crate::config::{
-    BaseUrl, BedrockApi, Config, ModelRef, ProviderAuth, ProviderConfig, ProviderName,
-    ProviderType, config_file_path,
+    BaseUrl, BedrockApi, Config, ModelRef, ModelSettings, ProviderAuth, ProviderConfig,
+    ProviderName, ProviderType, config_file_path,
 };
 use crate::embedding::{Embedder, Profile};
 use crate::error::{Error, Record, Result};
@@ -411,33 +410,57 @@ impl ChatClient {
     fn one_shot(
         &self,
         model: &str,
+        settings: ModelSettings,
         preamble: &str,
         timeout: Duration,
         label: &'static str,
-        effort: Option<Effort>,
     ) -> Result<OneShotAgent> {
         let wire = self.wire();
         Ok(match self {
             Self::Ollama(client) => OneShotAgent::new(
-                Sampled::new(client.completion_model(model), model, wire, effort)?,
+                Sampled::new(
+                    client.completion_model(model),
+                    model,
+                    wire,
+                    settings.background_effort,
+                    settings.temperature,
+                )?,
                 preamble,
                 timeout,
                 label,
             ),
             Self::OpenAi(client) => OneShotAgent::new(
-                Sampled::new(client.completion_model(model), model, wire, effort)?,
+                Sampled::new(
+                    client.completion_model(model),
+                    model,
+                    wire,
+                    settings.background_effort,
+                    settings.temperature,
+                )?,
                 preamble,
                 timeout,
                 label,
             ),
             Self::Anthropic(client) => OneShotAgent::new(
-                Sampled::new(client.completion_model(model), model, wire, effort)?,
+                Sampled::new(
+                    client.completion_model(model),
+                    model,
+                    wire,
+                    settings.background_effort,
+                    settings.temperature,
+                )?,
                 preamble,
                 timeout,
                 label,
             ),
             Self::Bedrock(client) => OneShotAgent::new(
-                Sampled::new(client.completion_model(model), model, wire, effort)?,
+                Sampled::new(
+                    client.completion_model(model),
+                    model,
+                    wire,
+                    settings.background_effort,
+                    settings.temperature,
+                )?,
                 preamble,
                 timeout,
                 label,
@@ -447,7 +470,8 @@ impl ChatClient {
                     Unstored(client.completion_model(model)),
                     model,
                     wire,
-                    effort,
+                    settings.background_effort,
+                    settings.temperature,
                 )?,
                 preamble,
                 timeout,
@@ -616,10 +640,10 @@ pub async fn graph_extractor(
     let chat = config.chat_model_ref()?;
     Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
         chat.model,
+        config.model_settings(chat),
         &ontology.extraction_prompt(),
         config.analysis.extraction_timeout(),
         "graph extraction",
-        config.analysis.background_effort,
     )?))
 }
 
@@ -633,10 +657,10 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
     let chat = config.chat_model_ref()?;
     Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
         chat.model,
+        config.model_settings(chat),
         documents::EXTRACTION_PROMPT,
         config.analysis.extraction_timeout(),
         "extraction",
-        config.analysis.background_effort,
     )?))
 }
 
@@ -1046,8 +1070,8 @@ async fn dispatch(
     sink: EventSink,
 ) -> Result<AgentResponse> {
     let client = ChatClient::build(config, &chat).await?;
-    let (wire, effort) = (client.wire(), config.analysis.effort);
-    sampling::check_tool_calls(chat.model, wire, effort)?;
+    let (wire, settings) = (client.wire(), config.model_settings(chat));
+    sampling::check_tool_calls(chat.model, wire, settings.effort)?;
     match client {
         ChatClient::Ollama(client) => {
             // A first request after idle loads the model, which took 5
@@ -1075,7 +1099,8 @@ async fn dispatch(
                         client.completion_model(chat.model),
                         chat.model,
                         wire,
-                        effort,
+                        settings.effort,
+                        settings.temperature,
                     )?,
                     sink,
                 )
@@ -1088,7 +1113,8 @@ async fn dispatch(
                         client.completion_model(chat.model),
                         chat.model,
                         wire,
-                        effort,
+                        settings.effort,
+                        settings.temperature,
                     )?,
                     sink,
                 )
@@ -1101,7 +1127,8 @@ async fn dispatch(
                         client.completion_model(chat.model),
                         chat.model,
                         wire,
-                        effort,
+                        settings.effort,
+                        settings.temperature,
                     )?,
                     sink,
                 )
@@ -1113,7 +1140,8 @@ async fn dispatch(
                     client.completion_model(chat.model),
                     chat.model,
                     wire,
-                    effort,
+                    settings.effort,
+                    settings.temperature,
                 )?,
                 sink,
             ))
@@ -1125,7 +1153,8 @@ async fn dispatch(
                     Unstored(client.completion_model(chat.model)),
                     chat.model,
                     wire,
-                    effort,
+                    settings.effort,
+                    settings.temperature,
                 )?,
                 sink,
             ))
@@ -1255,10 +1284,10 @@ mod tests {
             let answer = client
                 .one_shot(
                     "openai.gpt-oss-120b",
+                    ModelSettings::default(),
                     "Answer.",
                     Duration::from_secs(10),
                     "wire test",
-                    None,
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")
@@ -1321,7 +1350,13 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| fail(&e.to_string()));
             let answer = client
-                .one_shot(model, "Answer.", Duration::from_secs(10), "wire test", None)
+                .one_shot(
+                    model,
+                    ModelSettings::default(),
+                    "Answer.",
+                    Duration::from_secs(10),
+                    "wire test",
+                )
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")
                 .await;
@@ -1356,10 +1391,10 @@ mod tests {
             let answer = ChatClient::Anthropic(client)
                 .one_shot(
                     "claude-sonnet-5",
+                    ModelSettings::default(),
                     "Answer.",
                     Duration::from_secs(10),
                     "wire test",
-                    None,
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")
