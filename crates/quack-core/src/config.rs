@@ -216,6 +216,22 @@ impl ProviderType {
     /// Ollama's API when `base_url` is unset.
     pub const OLLAMA_BASE_URL: BaseUrl = BaseUrl(Cow::Borrowed("http://localhost:11434"));
 
+    /// The `api` a type other than the Bedrock ones sets, checked: only
+    /// `openai` takes one, and never Bedrock's `converse`.
+    fn openai_api(self, api: Option<BedrockApi>) -> Result<Option<BedrockApi>> {
+        match (self, api) {
+            (_, None) => Ok(None),
+            (Self::Openai, Some(BedrockApi::Converse)) => Err(Error::Config(String::from(
+                "type = \"openai\" takes api = \"chat-completions\" or \"responses\"; \
+                 converse is Bedrock's own API",
+            ))),
+            (Self::Openai, Some(api)) => Ok(Some(api)),
+            (_, Some(_)) => Err(Error::Config(String::from(
+                "api is only for type = \"openai\", \"bedrock\", and \"bedrock-mantle\"",
+            ))),
+        }
+    }
+
     /// Where the provider's API is when `base_url` is unset: the same
     /// defaults rig's clients use. `None` for Bedrock, whose endpoint
     /// follows its region (`llm::bedrock`).
@@ -662,6 +678,39 @@ pub struct ProviderConfig {
     /// credential headers are refused: rig would send one in place of the
     /// credential `auth` provides.
     pub headers: Option<BTreeMap<String, String>>,
+    /// `temperature`, `effort`, and `background_effort` on
+    /// `[providers.NAME]`: for every model of this provider unless its own
+    /// entry in `models` says.
+    pub model_defaults: ModelSettings,
+    /// `[providers.NAME.models."ID"]`: one model's settings, keyed by the
+    /// model id as `chat_model` names it.
+    pub models: BTreeMap<String, ModelSettings>,
+}
+
+/// What requests to a model carry. A key left unset falls back to the
+/// provider's, then to `[analysis]`'s efforts and `llm::sampling`'s
+/// temperature rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelSettings {
+    /// Whether quack's `temperature` is sent.
+    pub temperature: Option<bool>,
+    /// Reasoning effort for chat turns.
+    pub effort: Option<Effort>,
+    /// Reasoning effort for background calls.
+    pub background_effort: Option<Effort>,
+}
+
+impl ModelSettings {
+    /// These settings, with `fallback`'s for each key left unset.
+    #[must_use]
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            temperature: self.temperature.or(fallback.temperature),
+            effort: self.effort.or(fallback.effort),
+            background_effort: self.background_effort.or(fallback.background_effort),
+        }
+    }
 }
 
 /// `[providers.NAME]` as the file writes it, before `auth` and the keys it
@@ -681,6 +730,11 @@ struct RawProviderConfig {
     max_concurrent_requests: Option<RequestLimit>,
     headers: Option<BTreeMap<String, String>>,
     oauth: Option<OAuthConfig>,
+    temperature: Option<bool>,
+    effort: Option<Effort>,
+    background_effort: Option<Effort>,
+    #[serde(default)]
+    models: BTreeMap<String, ModelSettings>,
 }
 
 impl TryFrom<RawProviderConfig> for ProviderConfig {
@@ -714,20 +768,9 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
             }
             None => None,
         };
-        let openai_api = match (raw.provider_type, endpoint, raw.api) {
-            (_, Some(_), _) | (_, None, None) => None,
-            (ProviderType::Openai, None, Some(BedrockApi::Converse)) => {
-                return Err(Error::Config(String::from(
-                    "type = \"openai\" takes api = \"chat-completions\" or \"responses\"; \
-                     converse is Bedrock's own API",
-                )));
-            }
-            (ProviderType::Openai, None, Some(api)) => Some(api),
-            (_, None, Some(_)) => {
-                return Err(Error::Config(String::from(
-                    "api is only for type = \"openai\", \"bedrock\", and \"bedrock-mantle\"",
-                )));
-            }
+        let openai_api = match endpoint {
+            Some(_) => None,
+            None => raw.provider_type.openai_api(raw.api)?,
         };
         if raw.aws_profile.is_some() && mode != AuthMode::Aws {
             return Err(Error::Config(String::from(
@@ -783,6 +826,12 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
             openai_api,
             max_concurrent_requests: raw.max_concurrent_requests,
             headers: raw.headers.filter(|headers| !headers.is_empty()),
+            model_defaults: ModelSettings {
+                temperature: raw.temperature,
+                effort: raw.effort,
+                background_effort: raw.background_effort,
+            },
+            models: raw.models,
         };
         provider.check_headers()?;
         Ok(provider)
@@ -809,7 +858,20 @@ impl ProviderConfig {
             openai_api: None,
             max_concurrent_requests: None,
             headers: None,
+            model_defaults: ModelSettings::default(),
+            models: BTreeMap::new(),
         }
+    }
+
+    /// `model`'s settings: each key from its `[providers.NAME.models."ID"]`
+    /// entry, else from `[providers.NAME]`.
+    #[must_use]
+    pub fn model_settings(&self, model: &str) -> ModelSettings {
+        self.models
+            .get(model)
+            .copied()
+            .unwrap_or_default()
+            .or(self.model_defaults)
     }
 
     /// Whether `headers` can be sent: every one a valid header that does
@@ -1702,6 +1764,20 @@ impl Config {
         self.resolve_model("chat_model", spec)
     }
 
+    /// What requests to `model` carry: its own settings, else its
+    /// provider's, else `[analysis]`'s efforts.
+    #[must_use]
+    pub fn model_settings(&self, model: ModelRef<'_>) -> ModelSettings {
+        model
+            .provider
+            .model_settings(model.model)
+            .or(ModelSettings {
+                temperature: None,
+                effort: self.analysis.effort,
+                background_effort: self.analysis.background_effort,
+            })
+    }
+
     /// `provider/model` for status lines, or a placeholder.
     #[must_use]
     pub fn chat_model_label(&self) -> String {
@@ -2193,6 +2269,45 @@ rerank = "model"
             .map(|c| (c.analysis.effort, c.analysis.background_effort));
         assert!(set.is_ok_and(|e| e == (Some(Effort::Xhigh), Some(Effort::Low))));
         assert_ne!(err_of("[analysis]\neffort = \"extreme\"\n"), "<ok>");
+    }
+
+    #[test]
+    fn a_model_s_settings_override_its_provider_s_then_analysis_key_by_key() {
+        let config = Config::parse(
+            "[general]\nchat_model = \"gw/Corp.Reasoner-2\"\n\
+             [analysis]\neffort = \"medium\"\nbackground_effort = \"low\"\n\
+             [providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n\
+             temperature = true\neffort = \"high\"\n\
+             [providers.gw.models.\"Corp.Reasoner-2\"]\neffort = \"xhigh\"\n\
+             [providers.gw.models.plain]\ntemperature = false\n",
+        );
+        let config = config.unwrap_or_else(|e| panic_on(&e));
+        let chat = config.chat_model_ref().unwrap_or_else(|e| panic_on(&e));
+        assert_eq!(
+            config.model_settings(chat),
+            ModelSettings {
+                temperature: Some(true),
+                effort: Some(Effort::Xhigh),
+                background_effort: Some(Effort::Low),
+            }
+        );
+        assert_eq!(
+            chat.provider.model_settings("plain"),
+            ModelSettings {
+                temperature: Some(false),
+                effort: Some(Effort::High),
+                background_effort: None,
+            }
+        );
+        assert_eq!(
+            chat.provider.model_settings("other"),
+            chat.provider.model_defaults
+        );
+        let bare = ProviderConfig::new(ProviderType::Openai);
+        assert_eq!(bare.model_settings("any"), ModelSettings::default());
+        let provider = "[providers.gw]\ntype = \"openai\"\n[providers.gw.models.m]\n";
+        assert_ne!(err_of(&format!("{provider}temp = false\n")), "<ok>");
+        assert_ne!(err_of(&format!("{provider}effort = \"extreme\"\n")), "<ok>");
     }
 
     #[test]

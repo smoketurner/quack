@@ -27,6 +27,7 @@ use crate::llm::OllamaRunningModels;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
+use crate::llm::sampling::{Sampling, Wire};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -503,11 +504,32 @@ async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&re
         return;
     };
     match config.chat_model_ref() {
-        Ok(model) => check_model(report, Area::ChatModel, config, model, http).await,
+        Ok(model) => {
+            check_model(report, Area::ChatModel, config, model, http).await;
+            report.push(sampling_check(config, model));
+        }
         Err(e) => report.push(Check::new(
             Area::ChatModel,
             Status::Fail,
             format!("\"{spec}\": {e}"),
+        )),
+    }
+}
+
+/// What a chat turn sends the model: temperature, and the reasoning effort
+/// if it reaches the model at all.
+fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
+    let settings = config.model_settings(model);
+    let wire = Wire::of(model.provider);
+    match Sampling::new(model.model, wire, settings.effort, settings.temperature) {
+        Ok(sampling) => match sampling.unsent_effort() {
+            Some(why) => Check::new(Area::ChatModel, Status::Warn, format!("{model}: {why}")),
+            None => Check::new(Area::ChatModel, Status::Ok, format!("{model}: {sampling}")),
+        },
+        Err(e) => Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}")).fix(format!(
+            "set effort to a level it takes under [providers.{}.models.\"{}\"], \
+             [providers.{}], or [analysis]",
+            model.provider_name, model.model, model.provider_name
         )),
     }
 }
@@ -1495,6 +1517,40 @@ mod tests {
             let config = embedding_config(model, extra);
             let check = prompts_check(&config, config.embedding_model_ref().unwrap().unwrap());
             assert_eq!(check.status, status, "{model}");
+            assert!(check.summary.contains(words), "{}", check.summary);
+        }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn the_chat_model_check_says_what_a_turn_sends() {
+        let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n\
+                       api = \"responses\"\n";
+        for (chat, extra, status, words) in [
+            (
+                "gw/corp-reasoner",
+                "[analysis]\neffort = \"medium\"\n",
+                Status::Ok,
+                "sends no temperature, reasoning effort as {\"reasoning\":{\"effort\":\"medium\"}}",
+            ),
+            (
+                "gw/gpt-oss-120b",
+                "[analysis]\neffort = \"medium\"\n[providers.gw.models.\"gpt-oss-120b\"]\n\
+                 effort = \"xhigh\"\n",
+                Status::Fail,
+                "effort \"xhigh\" is not a level",
+            ),
+            (
+                "ol/llama3.1:8b",
+                "[analysis]\neffort = \"high\"\n[providers.ol]\ntype = \"ollama\"\n",
+                Status::Warn,
+                "is not sent",
+            ),
+        ] {
+            let toml = format!("[general]\nchat_model = \"{chat}\"\n{gateway}{extra}");
+            let config = Config::parse(&toml).unwrap();
+            let check = sampling_check(&config, config.chat_model_ref().unwrap());
+            assert_eq!(check.status, status, "{chat}: {}", check.summary);
             assert!(check.summary.contains(words), "{}", check.summary);
         }
     }
