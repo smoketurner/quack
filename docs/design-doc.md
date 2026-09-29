@@ -1864,9 +1864,10 @@ workspace is reported as missing. `--offline` skips the network; `--format json`
 
 **No model is required.** Without `[general].chat_model`, the terminal opens, runs typed SQL
 and every slash command, and answers a question with how to set a model up. `-q`, ingest,
-import, and the server's SQL and table pages work unchanged. quack creates a data directory
-as `0700` on Unix: it holds every workspace's content, `control.db`, and, where there is no
-OS keychain, the vault key file.
+import, and the server's SQL and table pages work unchanged. quack keeps the data directory
+at `0700` on Unix, creating it that way and tightening an existing one that group or others
+can reach, with a warning: it holds every workspace's content, `control.db`, and, where
+there is no OS keychain, the vault key file.
 
 ### 11.6 Desktop window (`quack desktop`)
 

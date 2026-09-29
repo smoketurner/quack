@@ -1833,23 +1833,34 @@ impl Config {
         self.workspace_dir(workspace_id).join("files")
     }
 
-    /// Ensure the data directory and its subdirectories exist. A data
-    /// directory this call creates is private to the user (0700 on Unix):
-    /// it holds every workspace's content, the control database, and the
-    /// vault key file. An existing one keeps its mode, which
-    /// `quack doctor` reports when others can read it.
+    /// Ensure the data directory and its subdirectories exist, and that the
+    /// data directory is private to the user (0700 on Unix): it holds every
+    /// workspace's content, the control database, and the vault key file.
+    /// One that group or others can reach, such as one made by an older
+    /// build, is tightened with a warning.
     ///
     /// # Errors
     ///
-    /// Returns an error if the directories cannot be created.
+    /// Returns an error if the directories cannot be created or the data
+    /// directory's mode cannot be read or set.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         let data_dir = &self.general.data_dir;
-        if !data_dir.exists() {
-            std::fs::create_dir_all(data_dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
+        let existed = data_dir.exists();
+        std::fs::create_dir_all(data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use tracing::warn;
+            let mode = std::fs::metadata(data_dir)?.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
                 std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+                if existed {
+                    warn!(
+                        "{} was open to other users (mode {mode:o}); set it to 700",
+                        data_dir.display()
+                    );
+                }
             }
         }
         std::fs::create_dir_all(data_dir.join("workspaces"))?;
@@ -2755,5 +2766,34 @@ rerank = "model"
     fn default_dirs_use_xdg_layout() {
         assert!(default_data_dir().to_string_lossy().contains(APP_NAME));
         assert!(default_config_dir().to_string_lossy().contains(APP_NAME));
+    }
+
+    /// A data directory group or others can reach is made private, a new
+    /// one is created private, and a private one is left alone.
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn ensure_dirs_makes_the_data_dir_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().join("data");
+        let data = config.data_dir();
+        let mode = || std::fs::metadata(data).unwrap().permissions().mode() & 0o777;
+
+        config.ensure_dirs().unwrap();
+        assert_eq!(mode(), 0o700);
+        assert!(data.join("workspaces").is_dir());
+
+        for open in [0o755, 0o750, 0o705, 0o777] {
+            std::fs::set_permissions(data, std::fs::Permissions::from_mode(open)).unwrap();
+            config.ensure_dirs().unwrap();
+            assert_eq!(mode(), 0o700, "from {open:o}");
+        }
+
+        std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o500)).unwrap();
+        config.ensure_dirs().unwrap();
+        assert_eq!(mode(), 0o500);
+        std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

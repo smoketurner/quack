@@ -23,11 +23,11 @@ use crate::config::{
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::Error;
-use crate::llm::OllamaRunningModels;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
 use crate::llm::sampling::{Sampling, Wire};
+use crate::llm::{AnthropicCredential, OllamaRunningModels};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -1411,9 +1411,10 @@ impl Listing {
             ProviderType::Anthropic => {
                 let request = get(format!("{}/v1/models?limit=1000", base.trimmed()))
                     .header("anthropic-version", "2023-06-01");
-                match credential {
-                    Some(key) => request.header("x-api-key", key),
-                    None => request,
+                match (credential, AnthropicCredential::of(&config.auth)) {
+                    (Some(key), AnthropicCredential::Bearer) => request.bearer_auth(key),
+                    (Some(key), AnthropicCredential::ApiKey) => request.header("x-api-key", key),
+                    (None, AnthropicCredential::Bearer | AnthropicCredential::ApiKey) => request,
                 }
             }
             // `check_bedrock` asks the AWS SDK instead.
@@ -1737,9 +1738,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// A model list server that answers one request with the model `m` and
+    /// hands back that request, lowercased.
     #[expect(clippy::unwrap_used, reason = "test")]
-    async fn the_listing_probe_sends_provider_headers_beside_its_credential() {
+    async fn one_listing() -> (BaseUrl, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1755,6 +1757,13 @@ mod tests {
             drop(stream.write_all(response.as_bytes()).await);
             String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_ascii_lowercase()
         });
+        (BaseUrl::try_from(base).unwrap(), seen)
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn the_listing_probe_sends_provider_headers_beside_its_credential() {
+        let (base, seen) = one_listing().await;
         let provider = ProviderConfig {
             headers: Some(BTreeMap::from([(
                 String::from("X-Gateway-Team"),
@@ -1762,13 +1771,50 @@ mod tests {
             )])),
             ..ProviderConfig::new(ProviderType::Openai)
         };
-        let base = BaseUrl::try_from(base).unwrap();
         let http = reqwest::Client::new();
         let listing = Listing::fetch(&http, &provider, &base, Some("key")).await;
         assert!(matches!(listing, Ok(Listing::Ids(ids)) if ids == ["m"]));
         let request = seen.await.unwrap();
         assert!(request.contains("x-gateway-team: quack"), "{request}");
         assert!(request.contains("authorization: bearer key"), "{request}");
+    }
+
+    /// An Anthropic provider's probe sends its credential where completions
+    /// do: an OAuth token as a bearer, an API key as `x-api-key`.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn the_anthropic_probe_sends_an_oauth_token_as_a_bearer() {
+        let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
+                     issuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n";
+        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+        for (auth, bearer) in [(oauth, true), (keyed, false)] {
+            let (base, seen) = one_listing().await;
+            let config: Config = toml::from_str(&format!(
+                "[general]\nchat_model = \"p/m\"\n[providers.p]\n\
+                 type = \"anthropic\"\n{auth}"
+            ))
+            .unwrap();
+            let provider = config.chat_model_ref().unwrap().provider;
+            let http = reqwest::Client::new();
+            let listing = Listing::fetch(&http, provider, &base, Some("tok-1")).await;
+            assert!(matches!(listing, Ok(Listing::Ids(ids)) if ids == ["m"]));
+            let request = seen.await.unwrap();
+            assert!(
+                request.starts_with("get /v1/models?limit=1000 "),
+                "{request}"
+            );
+            assert!(request.contains("anthropic-version: "), "{request}");
+            assert_eq!(
+                request.contains("authorization: bearer tok-1\r\n"),
+                bearer,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("x-api-key: tok-1\r\n"),
+                !bearer,
+                "{request}"
+            );
+        }
     }
 
     /// A mock issuer for the doctor: its discovery document lists `grants`,

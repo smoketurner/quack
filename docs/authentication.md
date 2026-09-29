@@ -32,7 +32,8 @@ provider. Design doc section 12 explains the mechanisms behind each step.
 
 Only `quack serve` checks who is calling. The terminal, print mode, `quack ingest`, and
 `quack mcp` on stdio run as the operating-system user who starts them. That user can read the
-whole data directory, so quack creates it with mode `0700`. `quack serve --local` turns
+whole data directory, so quack keeps it at mode `0700`: every command that opens it
+removes any group or other access, with a warning. `quack serve --local` turns
 authentication off for one person's browser and listens on loopback addresses only.
 
 A caller's role in a workspace decides what it may do there: `viewer`, `member`, or `owner`.
