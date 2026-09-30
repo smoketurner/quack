@@ -159,8 +159,9 @@ pub fn check_tool_calls(model: &str, wire: Wire, effort: Option<Effort>) -> Resu
         && effort != Some(Effort::None)
     {
         return Err(Error::Config(format!(
-            "{model} cannot call tools through Chat Completions unless [analysis].effort = \
-             \"none\"; set api = \"responses\" on its provider"
+            "{model} cannot call tools through Chat Completions unless its effort is \
+             \"none\"; set api = \"responses\" on its provider, or effort = \"none\" on \
+             the model, its provider, or [analysis] (the first one set wins)"
         )));
     }
     Ok(())

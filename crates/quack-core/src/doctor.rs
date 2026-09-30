@@ -26,7 +26,7 @@ use crate::error::Error;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
-use crate::llm::sampling::{Sampling, Wire};
+use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
 use crate::llm::{AnthropicCredential, OllamaRunningModels};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
@@ -517,10 +517,13 @@ async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&re
 }
 
 /// What a chat turn sends the model: temperature, and the reasoning effort
-/// if it reaches the model at all.
+/// if it reaches the model at all. A config every turn refuses fails here too.
 fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
     let settings = config.model_settings(model);
     let wire = Wire::of(model.provider);
+    if let Err(e) = check_tool_calls(model.model, wire, settings.effort) {
+        return Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}"));
+    }
     match Sampling::new(model.model, wire, settings.effort, settings.temperature) {
         Ok(sampling) => match sampling.unsent_effort() {
             Some(why) => Check::new(Area::ChatModel, Status::Warn, format!("{model}: {why}")),
@@ -1553,6 +1556,32 @@ mod tests {
             let check = sampling_check(&config, config.chat_model_ref().unwrap());
             assert_eq!(check.status, status, "{chat}: {}", check.summary);
             assert!(check.summary.contains(words), "{}", check.summary);
+        }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn the_chat_model_check_fails_what_every_turn_refuses() {
+        let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n";
+        for (chat, extra, status) in [
+            ("gw/gpt-5.6-sol", "", Status::Fail),
+            ("gw/gpt-5.6-sol", "api = \"responses\"\n", Status::Ok),
+            (
+                "gw/gpt-5.6-sol",
+                "[analysis]\neffort = \"none\"\n",
+                Status::Ok,
+            ),
+            (
+                "gw/gpt-5.6-sol",
+                "effort = \"high\"\n[analysis]\neffort = \"none\"\n",
+                Status::Fail,
+            ),
+            ("gw/gpt-6-luna", "", Status::Ok),
+        ] {
+            let toml = format!("[general]\nchat_model = \"{chat}\"\n{gateway}{extra}");
+            let config = Config::parse(&toml).unwrap();
+            let check = sampling_check(&config, config.chat_model_ref().unwrap());
+            assert_eq!(check.status, status, "{toml}: {}", check.summary);
         }
     }
 
