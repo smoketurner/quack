@@ -25,3 +25,6 @@ pub mod storage;
 pub mod text;
 pub mod vault;
 pub mod web_sessions;
+
+/// The duck on `quack serve`'s startup banner and the browser login page.
+pub const DUCK: [&str; 4] = ["  __", "<(o )___", " ( ._> /", "  `---'"];

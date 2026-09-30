@@ -1010,7 +1010,13 @@ async fn browser_login_rejects_bad_state_then_accepts_the_code() {
         .get(format!("{redirect}?code=the-code&state={state}"))
         .send()
         .await;
-    assert!(good.is_ok_and(|r| r.status() == 200));
+    let Ok(good) = good else {
+        fail("the callback did not answer");
+    };
+    assert_eq!(good.status(), 200);
+    let page = good.text().await.unwrap_or_default();
+    assert!(page.contains("&lt;(o )___"));
+    assert!(page.contains("Login complete. You can close this window and return to quack."));
 
     let token = login.await;
     assert!(token.is_ok_and(|t| t.is_ok_and(|t| t.access_token.expose_secret() == "code-access")));
