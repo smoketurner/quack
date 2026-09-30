@@ -1855,6 +1855,8 @@ needs one:
 - each configured model: credential present; plain HTTP off this machine with a credential
   warns; one `GET` of the provider's model list proves it is reachable, the key is
   accepted, and the model is pulled or listed;
+- the chat model: what a turn sends it; an effort level it lacks, or a GPT-5.6 model on Chat
+  Completions without effort `"none"`, fails, since every turn would be refused;
 - `[server]`: a non-loopback bind warns, `local` off loopback fails, no users yet is noted.
 
 With no chat model, it looks for a local Ollama and suggests a `config.toml` snippet with
