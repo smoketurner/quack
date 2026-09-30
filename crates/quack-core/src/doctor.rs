@@ -26,7 +26,7 @@ use crate::error::Error;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
-use crate::llm::sampling::{Sampling, Wire};
+use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
 use crate::llm::{AnthropicCredential, OllamaRunningModels};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
@@ -517,10 +517,18 @@ async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&re
 }
 
 /// What a chat turn sends the model: temperature, and the reasoning effort
-/// if it reaches the model at all.
+/// if it reaches the model at all. The chat-turn refusal `dispatch` runs
+/// before every turn lives here too, so `quack doctor` flags a config the
+/// first turn would reject rather than reporting it healthy.
 fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
     let settings = config.model_settings(model);
     let wire = Wire::of(model.provider);
+    if let Err(e) = check_tool_calls(model.model, wire, settings.effort) {
+        return Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}")).fix(format!(
+            "set api = \"responses\" on [providers.{}] or [analysis].effort = \"none\"",
+            model.provider_name
+        ));
+    }
     match Sampling::new(model.model, wire, settings.effort, settings.temperature) {
         Ok(sampling) => match sampling.unsent_effort() {
             Some(why) => Check::new(Area::ChatModel, Status::Warn, format!("{model}: {why}")),
@@ -1554,6 +1562,87 @@ mod tests {
             assert_eq!(check.status, status, "{chat}: {}", check.summary);
             assert!(check.summary.contains(words), "{}", check.summary);
         }
+    }
+
+    /// `dispatch` refuses a GPT-5.6 model on Chat Completions before every
+    /// chat turn, because every chat turn sends tools and that family cannot
+    /// call tools there unless `effort = "none"`. The doctor runs the same
+    /// check, so it reports the same `Fail` — with both fixes named — rather
+    /// than `Ok`, and still reports `Ok` where `dispatch` accepts the config.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn the_doctor_catches_the_tool_call_refusal_dispatch_does() {
+        // A `type = "openai"` provider that sets `base_url` defaults to Chat
+        // Completions; with no `[analysis].effort`, `effort` is `None`, which
+        // `check_tool_calls` treats as "not `none`" and refuses.
+        let refused = "[general]\nchat_model = \"gw/gpt-5.6-sol\"\n\
+                       [providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n";
+        let config = Config::parse(refused).unwrap();
+        let model = config.chat_model_ref().unwrap();
+        let check = sampling_check(&config, model);
+        assert_eq!(check.status, Status::Fail, "{}", check.summary);
+        assert!(check.summary.contains("gpt-5.6-sol"), "{}", check.summary);
+        assert!(
+            check.summary.contains("cannot call tools"),
+            "{}",
+            check.summary
+        );
+        let fix = check.fix.as_deref().unwrap();
+        assert!(fix.contains("api = \"responses\""), "{fix}");
+        assert!(fix.contains("[analysis].effort = \"none\""), "{fix}");
+        assert!(
+            check_tool_calls(
+                model.model,
+                Wire::of(model.provider),
+                config.model_settings(model).effort
+            )
+            .is_err(),
+            "dispatch refuses this config and now so does the doctor"
+        );
+
+        // Each fix the message names keeps the model healthy, on both the
+        // doctor and the dispatch path.
+        let healthy = [
+            "[general]\nchat_model = \"gw/gpt-5.6-sol\"\n\
+             [providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n\
+             api = \"responses\"\n",
+            "[general]\nchat_model = \"gw/gpt-5.6-sol\"\n\
+             [providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n\
+             [analysis]\neffort = \"none\"\n",
+        ];
+        for toml in healthy {
+            let config = Config::parse(toml).unwrap();
+            let model = config.chat_model_ref().unwrap();
+            let check = sampling_check(&config, model);
+            assert_eq!(check.status, Status::Ok, "{toml}: {}", check.summary);
+            assert!(
+                check_tool_calls(
+                    model.model,
+                    Wire::of(model.provider),
+                    config.model_settings(model).effort
+                )
+                .is_ok(),
+                "{toml}: dispatch accepts what the doctor accepts"
+            );
+        }
+
+        // The new check does not over-fire: another OpenAI reasoning model on
+        // Chat Completions is not the gpt-5.6 tool-call refusal, so the doctor
+        // reports it as it did before.
+        let neighbor = "[general]\nchat_model = \"gw/gpt-6-luna\"\n\
+                        [providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n";
+        let config = Config::parse(neighbor).unwrap();
+        let model = config.chat_model_ref().unwrap();
+        let check = sampling_check(&config, model);
+        assert_eq!(check.status, Status::Ok, "{}", check.summary);
+        assert!(
+            check_tool_calls(
+                model.model,
+                Wire::of(model.provider),
+                config.model_settings(model).effort
+            )
+            .is_ok()
+        );
     }
 
     fn inspection(dir: &Path, toml: Option<&str>) -> Inspection {
