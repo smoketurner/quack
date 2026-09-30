@@ -25,6 +25,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::routing::get;
+use quack_core::DUCK;
 use quack_core::config::Config;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::KeyExtractor;
@@ -276,13 +277,14 @@ impl fmt::Display for Banner<'_> {
                 None => format!("password and token login, {users} user(s)"),
             },
         };
+        let [top, head, body, feet] = DUCK;
         write!(
             f,
             r"
-     __
-   <(o )___     quack {version}
-    ( ._> /     knowledge engine: documents, tables, graph
-     `---'
+   {top}
+   {head:<13}quack {version}
+   {body:<13}knowledge engine: documents, tables, graph
+   {feet}
 
   listening      http://{addr}/
   mode           {mode}

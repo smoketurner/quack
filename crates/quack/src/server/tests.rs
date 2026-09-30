@@ -2734,6 +2734,8 @@ fn banner_names_the_address_mode_and_models() {
         .to_string()
     };
     let text = banner(ServeMode::Local, 0, 2);
+    assert!(text.contains("\n   <(o )___     quack "));
+    assert!(text.contains("\n    ( ._> /     knowledge engine"));
     assert!(text.contains("http://127.0.0.1:8080/"));
     assert!(text.contains("local: no login"));
     assert!(text.contains("chat model     ollama/llama3"));

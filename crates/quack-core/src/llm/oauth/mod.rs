@@ -51,6 +51,7 @@ use store::ProviderTokens;
 pub use token::CachedToken;
 pub(crate) use token::Plaintext;
 
+use crate::DUCK;
 use crate::config::{ClientAuth, Config, Exchange, Grant, OAuthConfig, ProviderName};
 use crate::error::{AuthReason, Error, Result};
 use crate::ids::UserId;
@@ -1344,8 +1345,24 @@ async fn wait_for_callback(
     }
 }
 
+/// Inline, since the callback listener serves nothing but this one page.
+const CALLBACK_STYLE: &str = "\
+:root{color-scheme:light dark}\
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f8fafc;color:#0f172a;\
+font:16px/1.5 system-ui,sans-serif}\
+main{padding:2rem 1rem;text-align:center}\
+pre{display:inline-block;margin:0 0 1rem;text-align:left;color:#ca8a04;\
+font:20px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace}\
+@media (prefers-color-scheme:dark){body{background:#0f172a;color:#e2e8f0}pre{color:#facc15}}";
+
 async fn respond(stream: &mut tokio::net::TcpStream, status: http::StatusCode, body: &str) {
-    let page = format!("<!doctype html><title>quack</title><p>{body}</p>");
+    let duck = DUCK.join("\n").replace('<', "&lt;").replace('>', "&gt;");
+    let page = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>quack</title><style>{CALLBACK_STYLE}</style></head>\
+<body><main><pre aria-hidden=\"true\">{duck}</pre><p>{body}</p></main></body></html>"
+    );
     let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
         status.as_u16(),
