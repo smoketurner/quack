@@ -2,6 +2,7 @@ pub mod agent;
 pub mod chart;
 pub mod citations;
 pub mod events;
+mod hooks;
 pub mod policy;
 pub mod rerank;
 pub mod text_to_sql;

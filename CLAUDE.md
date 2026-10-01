@@ -163,7 +163,9 @@ terminal's included, is a plain task on the runtime. Tests that also read throug
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes
-it. `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
+it. Two rig hooks (`analysis::hooks`) keep a turn going: an unknown tool name is repaired or
+retried with the real names (twice at most), and an empty reply is asked for once more;
+`tests/agent_turn.rs` drives whole turns with rig's scripted model. `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
 prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
 clients themselves. Every chat model is wrapped in `llm::sampling::Sampled`: only Ollama's API
 gets a `temperature`, Claude gets `max_tokens` 64,000, and `[analysis].effort` /
