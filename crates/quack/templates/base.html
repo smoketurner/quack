@@ -10,11 +10,12 @@
   <script src="/static/js/app.js" defer></script>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
+  <a href="#main" class="sr-only rounded bg-blue-600 px-3 py-2 text-white focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-10">Skip to content</a>
   <header class="border-b border-slate-800 bg-slate-900">
     <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
       <a href="/workspaces" class="text-lg font-semibold tracking-tight">quack</a>
       {% if let Some(ws) = page.workspace %}
-      <nav class="flex flex-wrap items-center gap-1 text-sm">
+      <nav aria-label="Workspace" class="flex flex-wrap items-center gap-1 text-sm">
         <span class="mr-2 max-w-[16rem] truncate rounded bg-slate-800 px-2 py-1 font-medium" title="{{ ws.name }}">{{ ws.name }} <span class="text-slate-400">· {{ ws.role }}</span></span>
         {% for tab in Tab::WORKSPACE %}
         <a class="rounded px-2 py-1 {% if page.tab == tab %}bg-blue-500/15 font-medium text-blue-300{% else %}hover:bg-slate-800{% endif %}" href="/w/{{ ws.id }}/{{ tab.path() }}"{% if page.tab == tab %} aria-current="page"{% endif %}>{{ tab.label() }}</a>
@@ -23,8 +24,10 @@
       {% endif %}
       <div class="ml-auto flex items-center gap-3 text-sm text-slate-400">
         {% if page.is_admin %}
+        <nav aria-label="Administration" class="flex items-center gap-3">
         <a class="{% if page.tab == Tab::Users %}font-medium text-blue-300{% else %}hover:underline{% endif %}" href="/admin/users"{% if page.tab == Tab::Users %} aria-current="page"{% endif %}>Users</a>
         <a class="{% if page.tab == Tab::Audit %}font-medium text-blue-300{% else %}hover:underline{% endif %}" href="/admin/audit"{% if page.tab == Tab::Audit %} aria-current="page"{% endif %}>Audit</a>
+        </nav>
         {% endif %}
         <span>{{ page.username }}</span>
         {% if !page.local %}
@@ -33,7 +36,7 @@
       </div>
     </div>
   </header>
-  <main class="mx-auto max-w-6xl px-4 py-6">
+  <main id="main" class="mx-auto max-w-6xl px-4 py-6">
     {% block content %}{% endblock %}
   </main>
 </body>

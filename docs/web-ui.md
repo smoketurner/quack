@@ -64,6 +64,14 @@ Users or Audit link, with `aria-current="page"`.
   today and the date before that, refreshed every 30 seconds and after every htmx swap.
   Chat messages show when they were asked or answered, and an answer how many milliseconds it
   took (`duration_ms` on the response object and the assistant message's metadata).
+- **Accessibility.** Every page starts with a "Skip to content" link to `<main id="main">`;
+  the workspace tabs and the admin links are named `<nav>` landmarks, and the current tab or
+  chat session carries `aria-current="page"`. A control with only a placeholder has an
+  `aria-label`; table headers carry `scope="col"`, and a table with no header row has an
+  `aria-label`. Errors are `role="alert"`, notices and "refreshes itself" lines
+  `role="status"`, and the SQL result is `aria-live="polite"`. The conversation is a polite
+  `role="log"`; a streaming answer stays `aria-busy` until it completes, so a screen reader
+  reads it once. Charts and graphs are `role="img"` with a label naming what they show.
 - **Fragments that htmx swaps** (`documents_rows.html`, `sql_result.html`) are their own
   structs, rendered to a string and inserted with `|safe`. askama escapes everything else.
 

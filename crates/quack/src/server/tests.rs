@@ -2523,7 +2523,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("<th class=\"px-3 py-2 font-mono whitespace-nowrap\">n</th>")
+        html.contains("<th scope=\"col\" class=\"px-3 py-2 font-mono whitespace-nowrap\">n</th>")
             && html.contains("<div class=\"max-w-xs truncate\" title=\"a\">a</div>")
             && html.contains("Download CSV"),
         "{html}"
@@ -2542,7 +2542,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         .form(&format!("/w/{ws}/sql"), Some(&cookie), "sql=SELEC+broken")
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("text-red-300"), "{html}");
+    assert!(html.contains("<p role=\"alert\""), "{html}");
 
     // Context, settings, tables, admin pages all render.
     let (status, _, headers) = h
@@ -2558,6 +2558,13 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{html}");
     assert!(html.contains("aria-current=\"page\">Context</a>"), "{html}");
+    assert!(
+        html.contains("href=\"#main\"")
+            && html.contains("<main id=\"main\"")
+            && html.contains("<nav aria-label=\"Workspace\"")
+            && html.contains("aria-label=\"Workspace context\""),
+        "{html}"
+    );
     assert!(
         html.contains("Be brief.") && html.contains("by root"),
         "{html}"

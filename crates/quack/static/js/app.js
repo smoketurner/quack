@@ -31,6 +31,9 @@
 
   function renderChart(el, spec) {
     if (!window.echarts || !spec) return;
+    // The canvas says nothing to a screen reader; the name says what it shows.
+    el.setAttribute("role", "img");
+    el.setAttribute("aria-label", (spec.title || spec.kind + " chart") + ": " + spec.series.map(function (s) { return s.name; }).join(", ") + " by " + spec.x.label);
     var chart = initChart(el);
     chart.setOption(chartOption(spec));
     window.addEventListener("resize", function () { chart.resize(); });
@@ -75,6 +78,10 @@
 
   function renderGraph(el, result) {
     if (!window.echarts) return;
+    if (!el.hasAttribute("aria-label")) {
+      el.setAttribute("role", "img");
+      el.setAttribute("aria-label", "Graph: " + result.nodes.length + " entities and " + result.edges.length + " relations");
+    }
     var chart = initChart(el);
     chart.setOption(graphOption(result));
     chart.on("click", function (p) {
@@ -172,6 +179,9 @@
 
   function startAssistant(messages) {
     var article = el("article", "rounded border border-slate-800 bg-slate-900 p-4 msg-assistant");
+    // Busy until complete, so a screen reader reads the finished answer
+    // once instead of every streamed fragment.
+    article.setAttribute("aria-busy", "true");
     var header = messageHeader("assistant");
     article.appendChild(header);
     var details = el("details", "mt-2 text-sm hidden");
@@ -184,6 +194,7 @@
     article.appendChild(body);
     var working = el("div", "mt-2 flex items-center gap-2 text-sm text-slate-400");
     var dot = el("span", "inline-block h-2.5 w-2.5 animate-pulse rounded-full bg-blue-600");
+    dot.setAttribute("aria-hidden", "true");
     working.appendChild(dot);
     working.appendChild(el("span", null, "Thinking…"));
     article.appendChild(working);
@@ -201,6 +212,8 @@
     var li = el("li", "group flex items-start gap-1");
     var a = el("a", "block min-w-0 flex-1 truncate rounded bg-slate-800 px-2 py-1");
     a.href = "/w/" + ws + "/chat?session=" + sessionId;
+    a.setAttribute("aria-current", "page");
+    a.title = prompt;
     a.textContent = prompt.length > 80 ? prompt.slice(0, 80) : prompt;
     a.appendChild(el("span", "block text-xs text-slate-400", "just now · " + document.getElementById("ask").mode.value));
     li.appendChild(a);
@@ -211,6 +224,7 @@
     var button = el("button", "rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400", "×");
     button.type = "submit";
     button.title = "Delete session";
+    button.setAttribute("aria-label", "Delete session");
     form.appendChild(button);
     li.appendChild(form);
     list.insertBefore(li, list.firstChild);
@@ -222,6 +236,7 @@
   }
 
   function finishWorking(view) {
+    view.article.removeAttribute("aria-busy");
     if (view.working && view.working.parentNode) view.working.parentNode.removeChild(view.working);
     view.working = null;
   }

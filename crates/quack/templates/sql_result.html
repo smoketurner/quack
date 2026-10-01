@@ -1,5 +1,5 @@
 {% if let Some(error) = error %}
-<p class="rounded border border-red-900 bg-red-950 px-3 py-2 font-mono text-sm text-red-300">{{ error }}</p>
+<p role="alert" class="rounded border border-red-900 bg-red-950 px-3 py-2 font-mono text-sm text-red-300">{{ error }}</p>
 {% else %}
 <div class="flex items-center gap-4 text-sm text-slate-400">
   <span>{{ row_count }} rows{% if truncated %} (showing {{ rows.len() }}){% endif %}</span>
@@ -7,7 +7,7 @@
 </div>
 <div class="mt-2 overflow-x-auto rounded border border-slate-800 bg-slate-900">
   <table class="min-w-full text-sm">
-    <thead><tr class="border-b border-slate-700 text-left">{% for c in columns %}<th class="px-3 py-2 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead>
+    <thead><tr class="border-b border-slate-700 text-left">{% for c in columns %}<th scope="col" class="px-3 py-2 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead>
     <tbody>{% for r in rows %}<tr class="border-b border-slate-800">{% for v in r %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
   </table>
 </div>
