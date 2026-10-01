@@ -1017,7 +1017,7 @@ estimate and sample. The run is permission-gated and audited.
 actions: accept, rename, merge into an existing class or relation, reparent, reject.
 Accepting writes a new ontology version. Scripts use `PUT .../ontology/candidates/{id}` and
 `quack ontology accept ID...`; `POST .../ontology/candidates` with `{accept: [ids], reject:
-[ids]}` decides many at once, like the page's tick boxes. The page shows fifty candidates at
+[ids]}` decides many at once, like the page's checkboxes. The page shows fifty candidates at
 a time, pending or low-support (a filter link, never hidden). A mapped table counts as
 covered: its rows belong to the mapping's class, so no class or mapping is proposed for it,
 and a column its mapping already relates proposes no relation. New columns still propose
@@ -1623,7 +1623,7 @@ askama templates; Tailwind from the standalone binary (no Node.js; the built CSS
 committed, so `cargo build` needs no Tailwind); htmx; ECharts (the full minified build,
 vendored; a trimmed custom build needs Node and can replace it later). The chat's permission
 step is an "allow the agent to change tables" checkbox on the message, since an HTTP
-response cannot ask a question back mid-stream. A refused write tells the user to tick it
+response cannot ask a question back mid-stream. A refused write tells the user to check it
 and ask again. The UI covers:
 
 - Workspace list and switcher; workspace settings (classification label, allowed providers,

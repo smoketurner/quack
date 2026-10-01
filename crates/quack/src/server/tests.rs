@@ -2581,6 +2581,15 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     let (status, html, _) = h.page("/workspaces", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("team") && html.contains("owner"), "{html}");
+    assert!(
+        html.contains("&#60;(o )___"),
+        "the header carries the duck: {html}"
+    );
+    // Creating it was audited, so it counts as used from then on.
+    assert!(
+        html.contains("Last used") && html.matches("just now").count() == 2,
+        "{html}"
+    );
     let (status, html, _) = h.page(&chat_url, Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -2624,7 +2633,8 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         html.contains("hx-post=\"/w/") && html.contains("/pin\""),
         "{html}"
     );
-    // The poll swaps in statuses only: no file names, no table.
+    // The poll swaps in statuses and the pending note only: no file names,
+    // no table. The upload may still be running, so any status will do.
     let (status, html, _) = h
         .page(&format!("/w/{ws}/documents/status"), Some(&cookie))
         .await;
@@ -2632,7 +2642,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     assert!(
         html.contains("id=\"status-")
             && html.contains("hx-swap-oob=\"true\"")
-            && html.contains("ready"),
+            && html.contains("id=\"doc-pending\""),
         "{html}"
     );
     assert!(

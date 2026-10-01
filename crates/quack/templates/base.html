@@ -13,7 +13,8 @@
   <a href="#main" class="sr-only rounded bg-blue-600 px-3 py-2 text-white focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-10">Skip to content</a>
   <header class="border-b border-slate-800 bg-slate-900">
     <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
-      <a href="/workspaces" class="text-lg font-semibold tracking-tight">quack</a>
+      <a href="/workspaces" class="flex items-center gap-2 text-lg font-semibold tracking-tight"><pre aria-hidden="true" class="font-mono text-[9px] font-normal leading-[9px] text-yellow-400">{% for line in quack_core::DUCK %}{{ line }}{% if !loop.last %}
+{% endif %}{% endfor %}</pre>quack</a>
       {% if let Some(ws) = page.workspace %}
       <nav aria-label="Workspace" class="flex flex-wrap items-center gap-1 text-sm">
         <span class="mr-2 max-w-[16rem] truncate rounded bg-slate-800 px-2 py-1 font-medium" title="{{ ws.name }}">{{ ws.name }} <span class="text-slate-400">· {{ ws.role }}</span></span>

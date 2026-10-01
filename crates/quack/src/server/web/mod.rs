@@ -38,7 +38,7 @@ use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditCursor, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow,
     Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserRow,
-    WorkspaceChanges,
+    WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
@@ -300,6 +300,7 @@ struct WsItem {
     name: String,
     classification: String,
     role: Standing,
+    times: Option<WorkspaceTimes>,
 }
 
 #[derive(Template)]
@@ -1011,6 +1012,7 @@ async fn workspaces(
     WebUser(identity): WebUser,
     flash: Flashed,
 ) -> WebResult<Response> {
+    let mut times = app.control.workspace_times().await?;
     let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.is_admin {
         let mine = if app.mode == ServeMode::Local {
             Vec::new()
@@ -1027,6 +1029,7 @@ async fn workspaces(
                 } else {
                     Standing::of(mine.iter().find(|m| m.workspace.id == w.id).map(|m| m.role))
                 },
+                times: times.remove(&w.id),
                 id: w.id.into_string(),
                 name: w.name,
                 classification: w.classification,
@@ -1038,6 +1041,7 @@ async fn workspaces(
             .await?
             .into_iter()
             .map(|Membership { workspace: w, role }| WsItem {
+                times: times.remove(&w.id),
                 id: w.id.into_string(),
                 name: w.name,
                 classification: w.classification,
@@ -1730,7 +1734,7 @@ async fn ontology_page(
     })
 }
 
-/// Accept or reject every ticked candidate at once (issue #55).
+/// Accept or reject every selected candidate at once (issue #55).
 async fn ontology_decide_many(
     State(app): State<App>,
     WebUser(identity): WebUser,

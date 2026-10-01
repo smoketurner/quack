@@ -12,7 +12,7 @@ use sea_query::{Cond, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Que
 use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{FromRow, Row, SqlitePool};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
@@ -187,6 +187,14 @@ impl fmt::Debug for TokenSecret {
 pub struct Membership {
     pub workspace: WorkspaceRow,
     pub role: Role,
+}
+
+/// When a workspace was created and last reached, as stored UTC text.
+#[derive(Debug, Clone)]
+pub struct WorkspaceTimes {
+    pub created_at: String,
+    /// `None` until a request first touches the workspace.
+    pub last_accessed_at: Option<String>,
 }
 
 /// A server user. The password hash never leaves this module.
@@ -1166,6 +1174,46 @@ impl ControlPlane {
                     workspace: WorkspaceRow::from_row(r)?,
                     role: parsed(r, "role")?,
                 })
+            })
+            .collect()
+    }
+
+    /// When each workspace was created and last reached, by id. The last
+    /// access is the newest `audit_log` row naming the workspace, allowed or
+    /// denied, so each lookup is one seek on `audit_log_workspace_ts`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn workspace_times(&self) -> Result<HashMap<WorkspaceId, WorkspaceTimes>> {
+        let last_access = Query::select()
+            .expr(Expr::col((AuditLog::Table, AuditLog::Timestamp)).max())
+            .from(AuditLog::Table)
+            .and_where(
+                Expr::col((AuditLog::Table, AuditLog::WorkspaceId))
+                    .equals((Workspaces::Table, Workspaces::Id)),
+            )
+            .to_owned();
+        let bound = Bound::new(
+            Query::select()
+                .column((Workspaces::Table, Workspaces::Id))
+                .column((Workspaces::Table, Workspaces::CreatedAt))
+                .expr_as(
+                    Expr::SubQuery(None, Box::new(last_access.into())),
+                    "last_accessed_at",
+                )
+                .from(Workspaces::Table),
+        )?;
+        let rows = bound.query().fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("id")?,
+                    WorkspaceTimes {
+                        created_at: r.try_get("created_at")?,
+                        last_accessed_at: r.try_get("last_accessed_at")?,
+                    },
+                ))
             })
             .collect()
     }
@@ -3081,6 +3129,40 @@ mod tests {
             .await
             .map(|page| page.rows);
         assert!(none.is_ok_and(|r| r.is_empty()));
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test setup")]
+    async fn workspace_times_carry_the_newest_access_of_each_workspace() {
+        let (_dir, cp) = open().await;
+        let used = cp
+            .create_workspace("used", None, setup_audit())
+            .await
+            .unwrap();
+        let idle = cp.find_or_create_workspace("idle").await.unwrap();
+        let denied = AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Api)
+            .in_workspace(&used.id);
+        cp.record_audit(&denied).await.unwrap();
+        let mut times = cp.workspace_times().await.unwrap();
+        assert_eq!(times.len(), 2);
+        let newest = cp
+            .query_audit(&AuditFilter {
+                workspace_id: Some(used.id.clone()),
+                limit: 1,
+                ..AuditFilter::default()
+            })
+            .await
+            .unwrap()
+            .rows;
+        let used = times.remove(&used.id).unwrap();
+        assert_eq!(
+            used.last_accessed_at.as_deref(),
+            newest.first().map(|r| r.timestamp.as_str())
+        );
+        assert!(!used.created_at.is_empty());
+        let idle = times.remove(&idle.id).unwrap();
+        assert_eq!(idle.last_accessed_at, None);
+        assert!(!idle.created_at.is_empty());
     }
 
     #[tokio::test]
