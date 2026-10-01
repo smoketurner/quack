@@ -9,7 +9,7 @@
   <tr id="doc-{{ d.id }}" class="border-b border-slate-800">
     <td class="font-medium wrap-anywhere">{{ d.filename }}{% if let Some(title) = d.title %} <span class="font-normal text-slate-400">{{ title }}</span>{% endif %}{% if d.pinned %} <span class="rounded bg-amber-900 px-1.5 py-0.5 text-xs text-amber-200">pinned</span>{% endif %}</td>
     <td class="whitespace-nowrap text-slate-400">{{ d.source }}</td>
-    <td class="wrap-anywhere"><span class="whitespace-nowrap">{{ d.status }}</span>{% if let Some(err) = d.error_message %} <span class="text-red-400">{{ err }}</span>{% endif %}</td>
+    <td class="wrap-anywhere"><span id="status-{{ d.id }}">{% include "document_status.html" %}</span></td>
     <td class="whitespace-nowrap text-right tabular-nums">{{ d.size_bytes.unwrap_or(0) }}</td>
     <td class="whitespace-nowrap text-slate-400">{{ When::Relative.html(d.ingested_at.as_str())|safe }}</td>
     <td class="whitespace-nowrap text-right">
@@ -27,5 +27,5 @@
   </tbody>
 </table>
 </div>
-{% if pending %}<p role="status" class="mt-2 text-xs text-slate-400" data-pending>Processing… this list refreshes itself.</p>{% endif %}
+{% include "documents_pending.html" %}
 {% endif %}
