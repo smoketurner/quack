@@ -268,12 +268,49 @@ impl From<Error> for ToolError {
     }
 }
 
-/// What a read-only tool is built from: the workspace's reader, and the
-/// turn it records its steps in.
+/// What one turn's tools share, handed to each call as a runtime scope of
+/// rig's `ToolContext` ([`Turn::context`]): the record of steps, citations,
+/// and cached embeddings; the write policy and whether a write was refused;
+/// the statements `run_sql` ran; and the chart and graph results the
+/// response carries. The tools hold only the workspace and its settings.
 #[derive(Clone)]
-pub struct ToolDeps {
-    pub db: ReaderDb,
+pub struct Turn {
     pub recorder: TurnRecorder,
+    pub policy: WritePolicy,
+    pub refused: RefusalFlag,
+    pub chart: TurnSlot<ChartSpec>,
+    pub graph: GraphResults,
+    /// Each statement `run_sql` ran with its parse tree blanked of literals
+    /// (`WorkspaceDb::statement_shape`), to spot the model re-running one
+    /// statement once per value.
+    shapes: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl Turn {
+    #[must_use]
+    pub fn new(recorder: TurnRecorder, policy: WritePolicy) -> Self {
+        Self {
+            recorder,
+            policy,
+            refused: RefusalFlag::default(),
+            chart: TurnSlot::default(),
+            graph: Arc::new(Mutex::new(Vec::new())),
+            shapes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The context the turn's run hands its tools.
+    #[must_use]
+    pub fn context(&self) -> ToolContext {
+        ToolContext::new().with_scope(Arc::new(self.clone()))
+    }
+
+    /// The turn a tool call belongs to.
+    fn of(context: &ToolContext) -> Result<Arc<Self>, ToolError> {
+        context.scope::<Self>().ok_or_else(|| {
+            ToolError::Analysis(String::from("the tool was called outside an agent turn"))
+        })
+    }
 }
 
 /// A tool's arguments, whose JSON schema is what the model is shown.
@@ -407,6 +444,15 @@ enum Gate {
     Reject(String),
 }
 
+/// Who decides whether a write runs.
+#[derive(Clone, Copy)]
+enum Writes<'a> {
+    /// The turn's write policy, and its refusal flag when it says no.
+    Turn(&'a Turn),
+    /// No write runs, and a refusal is not the turn's: a chart only reads.
+    Never,
+}
+
 /// What a statement from the agent passes before it runs: no internal
 /// tables, a valid parse, and for a write, no temp object and the write
 /// policy.
@@ -415,26 +461,12 @@ struct SqlGate {
     /// Where the statement is classified: a parse, so a reader serves,
     /// never the writer's line.
     db: ReaderDb,
-    policy: WritePolicy,
-    refused: RefusalFlag,
-    recorder: TurnRecorder,
 }
 
 impl SqlGate {
-    /// A gate that lets no write through and records no refusal: for
-    /// charts, which only ever read.
-    fn read_only(db: ReaderDb, recorder: TurnRecorder) -> Self {
-        Self {
-            db,
-            policy: WritePolicy::Deny,
-            refused: RefusalFlag::default(),
-            recorder,
-        }
-    }
-
-    /// Classify `sql` and apply the write policy. A permission prompt holds
-    /// no connection while it waits.
-    async fn check(&self, sql: &str) -> Result<Gate, ToolError> {
+    /// Classify `sql` and apply `writes`. A permission prompt holds no
+    /// connection while it waits.
+    async fn check(&self, sql: &str, writes: Writes<'_>) -> Result<Gate, ToolError> {
         let sql_owned = sql.to_owned();
         let kind = self
             .db
@@ -452,23 +484,26 @@ impl SqlGate {
             StatementKind::Read => Ok(Gate::Read),
             StatementKind::Invalid(msg) => Ok(Gate::Reject(format!("SQL syntax error: {msg}"))),
             StatementKind::Write => {
+                let Writes::Turn(turn) = writes else {
+                    return Ok(Gate::Reject(String::from(WRITE_REFUSED)));
+                };
                 if creates_temp_object(sql) {
                     // A mutating statement the caller wanted to run did
                     // not run, same as WRITE_REFUSED:
                     // AgentResponse::write_refused should say so.
-                    self.refused.set();
+                    turn.refused.set();
                     tracing::info!(sql, "refused a statement that would create a temp object");
                     return Ok(Gate::Reject(String::from(TEMP_OBJECT_REFUSED)));
                 }
-                let allowed = match self.policy {
+                let allowed = match turn.policy {
                     WritePolicy::Allow => true,
                     WritePolicy::Deny => false,
-                    WritePolicy::Ask => self.recorder.ask_permission(sql).await,
+                    WritePolicy::Ask => turn.recorder.ask_permission(sql).await,
                 };
                 if allowed {
                     Ok(Gate::Write)
                 } else {
-                    self.refused.set();
+                    turn.refused.set();
                     tracing::info!(sql, "refused write statement from agent");
                     Ok(Gate::Reject(String::from(WRITE_REFUSED)))
                 }
@@ -488,32 +523,15 @@ pub struct RunSqlTool {
     /// reads through it.
     gate: SqlGate,
     max_query_rows: u32,
-    /// Each statement run this turn with its parse tree blanked of
-    /// literals (`WorkspaceDb::statement_shape`), to spot the model
-    /// re-running one statement once per value.
-    shapes: Mutex<Vec<(String, String)>>,
 }
 
 impl RunSqlTool {
     #[must_use]
-    pub fn new(
-        db: SharedDb,
-        reader_db: ReaderDb,
-        max_query_rows: u32,
-        policy: WritePolicy,
-        refused: RefusalFlag,
-        recorder: TurnRecorder,
-    ) -> Self {
+    pub const fn new(db: SharedDb, reader_db: ReaderDb, max_query_rows: u32) -> Self {
         Self {
             db,
-            gate: SqlGate {
-                db: reader_db,
-                policy,
-                refused,
-                recorder,
-            },
+            gate: SqlGate { db: reader_db },
             max_query_rows,
-            shapes: Mutex::new(Vec::new()),
         }
     }
 
@@ -522,9 +540,9 @@ impl RunSqlTool {
     /// the turn (a 20B model asked for deaths by state and weather ran the
     /// same GROUP BY once per state until it hit `max_turns`). Records
     /// `sql` for the calls after it.
-    fn repeated_note(&self, sql: &str, shape: Option<String>) -> Option<String> {
+    fn repeated_note(turn: &Turn, sql: &str, shape: Option<String>) -> Option<String> {
         let shape = shape?;
-        let mut shapes = self.shapes.lock().ok()?;
+        let mut shapes = turn.shapes.lock().ok()?;
         let earlier = shapes
             .iter()
             .find(|(earlier, earlier_shape)| {
@@ -571,14 +589,12 @@ impl Tool for RunSqlTool {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self
-            .gate
-            .recorder
-            .start(ToolName::RunSql, args.query.trim());
-        let read_only = match self.gate.check(&args.query).await? {
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(ToolName::RunSql, args.query.trim());
+        let read_only = match self.gate.check(&args.query, Writes::Turn(&turn)).await? {
             Gate::Reject(message) => {
                 step.finish("refused");
                 return Ok(message);
@@ -619,13 +635,13 @@ impl Tool for RunSqlTool {
             Ok(results) => {
                 step.finish_rows(u64::try_from(results.total_rows).unwrap_or(u64::MAX));
                 let mut text = results.to_model_text()?;
-                if let Some(note) = self.repeated_note(&args.query, shape) {
+                if let Some(note) = Self::repeated_note(&turn, &args.query, shape) {
                     text.push('\n');
                     text.push_str(&note);
                     text.push('\n');
                 }
                 text.push('\n');
-                text.push_str(&self.gate.recorder.budget_note());
+                text.push_str(&turn.recorder.budget_note());
                 Ok(text)
             }
             // A failed statement is a result, not a tool failure: rig
@@ -666,7 +682,6 @@ pub struct SearchDocumentsTool<M> {
     default_top_k: u32,
     rrf_k: u32,
     rerank: Option<Rerank>,
-    recorder: TurnRecorder,
     /// Whether the graph has nodes, so the `entity` argument can resolve.
     /// Without one the argument is left out of the tool's schema and
     /// description: a model shown it tries it, is refused, and spends a
@@ -677,11 +692,10 @@ pub struct SearchDocumentsTool<M> {
 
 impl<M> SearchDocumentsTool<M> {
     /// The tool with `retrieval`'s `top_k` and `rrf_k`, and no reranker.
-    pub fn new(
+    pub const fn new(
         db: ReaderDb,
         embedding_model: Option<Embedder<M>>,
         retrieval: &RetrievalConfig,
-        recorder: TurnRecorder,
     ) -> Self {
         Self {
             db,
@@ -689,7 +703,6 @@ impl<M> SearchDocumentsTool<M> {
             default_top_k: retrieval.top_k,
             rrf_k: retrieval.rrf_k,
             rerank: None,
-            recorder,
             modeled: Modeled::Nothing,
         }
     }
@@ -702,9 +715,8 @@ impl<M> SearchDocumentsTool<M> {
         rerank_model: Option<RerankModel>,
         embedding_model: Option<Embedder<M>>,
         retrieval: &RetrievalConfig,
-        recorder: TurnRecorder,
     ) -> Self {
-        let search = Self::new(db, embedding_model, retrieval, recorder);
+        let search = Self::new(db, embedding_model, retrieval);
         let reranker: Arc<dyn Reranker> = match (retrieval.rerank, rerank_model) {
             (RerankMode::None, _) => return search,
             (RerankMode::Model, _) => Arc::new(ModelReranker::new(completion_model.clone())),
@@ -792,9 +804,10 @@ where
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
         let entity = args.entity.get();
         let detail = match (args.document_ids.is_empty(), entity) {
             (true, None) => args.query.clone(),
@@ -806,11 +819,11 @@ where
                 args.document_ids.join(", ")
             ),
         };
-        let step = self.recorder.start(ToolName::SearchDocuments, &detail);
+        let step = turn.recorder.start(ToolName::SearchDocuments, &detail);
         let query_vec: Option<Vector> = match &self.embedding_model {
             None => None,
             Some(model) => {
-                match self
+                match turn
                     .recorder
                     .embed_cached(model, Input::Query(args.query.clone()))
                     .await
@@ -836,7 +849,7 @@ where
         // resolves the same label again this turn.
         let entity_vec = match entity {
             Some(entity) => {
-                self.recorder
+                turn.recorder
                     .embed_label(self.embedding_model.as_ref(), entity)
                     .await?
             }
@@ -897,7 +910,7 @@ where
             .with_db(move |db| graph::store::entities_of_chunks(db, &chunk_ids, CHUNK_ENTITIES))
             .await
             .unwrap_or_default();
-        let markers = self.recorder.citations().register(&results);
+        let markers = turn.recorder.citations().register(&results);
         format_search_results(&results, markers, &entities).map_err(Into::into)
     }
 }
@@ -984,7 +997,7 @@ pub fn format_search_results(
 // describe_table
 // ---------------------------------------------------------------------------
 
-pub struct DescribeTableTool(pub ToolDeps);
+pub struct DescribeTableTool(pub ReaderDb);
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DescribeTableArgs {
@@ -1015,17 +1028,16 @@ impl Tool for DescribeTableTool {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self
-            .0
+        let turn = Turn::of(context)?;
+        let step = turn
             .recorder
             .start(ToolName::DescribeTable, &args.table_name);
         let table_name = args.table_name.clone();
         let outcome = self
             .0
-            .db
             .with_db(move |db| {
                 Ok(match db.describe_table(&table_name) {
                     Ok(d) => Ok(d),
@@ -1078,7 +1090,7 @@ impl Tool for DescribeTableTool {
 // list_tables
 // ---------------------------------------------------------------------------
 
-pub struct ListTablesTool(pub ToolDeps);
+pub struct ListTablesTool(pub ReaderDb);
 
 impl Tool for ListTablesTool {
     const NAME: &'static str = ToolName::ListTables.as_str();
@@ -1101,17 +1113,17 @@ impl Tool for ListTablesTool {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.0.recorder.start(ToolName::ListTables, "");
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(ToolName::ListTables, "");
         // One reader round trip for the listing and every table's row
         // count, rather than one per table; each count is its own
         // timeout-guarded statement, so one huge table cannot pin the
         // transaction indefinitely.
         let tables: Vec<(String, Option<i64>)> = self
             .0
-            .db
             .with_db(|db| {
                 let tables = db.list_tables()?;
                 Ok(tables
@@ -1142,7 +1154,7 @@ impl Tool for ListTablesTool {
 // list_documents
 // ---------------------------------------------------------------------------
 
-pub struct ListDocumentsTool(pub ToolDeps);
+pub struct ListDocumentsTool(pub ReaderDb);
 
 impl Tool for ListDocumentsTool {
     const NAME: &'static str = ToolName::ListDocuments.as_str();
@@ -1166,11 +1178,12 @@ impl Tool for ListDocumentsTool {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         _args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self.0.recorder.start(ToolName::ListDocuments, "");
-        let docs = self.0.db.with_db(WorkspaceDb::list_documents).await?;
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(ToolName::ListDocuments, "");
+        let docs = self.0.with_db(WorkspaceDb::list_documents).await?;
         step.finish(format!("{} documents", docs.len()));
         if docs.is_empty() {
             return Ok(String::from("No documents found in this workspace."));
@@ -1232,15 +1245,13 @@ impl<T> TurnSlot<T> {
 pub struct CreateChartTool {
     /// Charts only read: the gate lets no write through.
     gate: SqlGate,
-    chart: TurnSlot<ChartSpec>,
 }
 
 impl CreateChartTool {
     #[must_use]
-    pub fn new(db: ReaderDb, chart: TurnSlot<ChartSpec>, recorder: TurnRecorder) -> Self {
+    pub const fn new(db: ReaderDb) -> Self {
         Self {
-            gate: SqlGate::read_only(db, recorder),
-            chart,
+            gate: SqlGate { db },
         }
     }
 }
@@ -1281,14 +1292,12 @@ impl Tool for CreateChartTool {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let step = self
-            .gate
-            .recorder
-            .start(ToolName::CreateChart, args.sql.trim());
-        if let Gate::Reject(message) = self.gate.check(&args.sql).await? {
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(ToolName::CreateChart, args.sql.trim());
+        if let Gate::Reject(message) = self.gate.check(&args.sql, Writes::Never).await? {
             step.finish("rejected");
             return Ok(format!("Chart query rejected. {message}"));
         }
@@ -1323,7 +1332,7 @@ impl Tool for CreateChartTool {
             args.y,
             args.x
         );
-        self.chart.put(spec);
+        turn.chart.put(spec);
 
         step.finish(format!("{} points", results.rows.len()));
         Ok(format!(
@@ -1820,18 +1829,32 @@ mod tests {
         panic!("in-memory DuckDB failed to open: {msg}");
     }
 
-    /// A gate over `db` with `policy`.
+    /// A gate over `db`, writes decided by a turn with `policy` that
+    /// records refusals in `refused`.
+    struct Gated {
+        gate: SqlGate,
+        turn: Turn,
+    }
+
+    impl Gated {
+        async fn check(&self, sql: &str) -> Result<Gate, ToolError> {
+            self.gate.check(sql, Writes::Turn(&self.turn)).await
+        }
+    }
+
     fn gate(
         db: &SharedDb,
         policy: WritePolicy,
         refused: &RefusalFlag,
         recorder: &TurnRecorder,
-    ) -> SqlGate {
-        SqlGate {
-            db: ReaderDb::new(Arc::clone(db)),
-            policy,
-            refused: refused.clone(),
-            recorder: recorder.clone(),
+    ) -> Gated {
+        let mut turn = Turn::new(recorder.clone(), policy);
+        turn.refused = refused.clone();
+        Gated {
+            gate: SqlGate {
+                db: ReaderDb::new(Arc::clone(db)),
+            },
+            turn,
         }
     }
 
@@ -1842,6 +1865,26 @@ mod tests {
             rrf_k: 60,
             ..RetrievalConfig::default()
         }
+    }
+
+    /// A tool reads its turn from the context rig hands each call; without
+    /// one it does not run.
+    #[tokio::test]
+    async fn a_tool_called_outside_a_turn_says_so() {
+        let tool = ListTablesTool(ReaderDb::new(shared_db()));
+        let outcome = tool.call(&mut ToolContext::new(), NoArgs).await;
+        assert!(
+            matches!(&outcome, Err(ToolError::Analysis(m)) if m.contains("outside an agent turn")),
+            "{outcome:?}"
+        );
+        let (sink, _rx) = events::channel();
+        let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
+        assert!(tool.call(&mut turn.context(), NoArgs).await.is_ok());
+        assert_eq!(
+            turn.recorder.steps().len(),
+            1,
+            "the step landed in the turn"
+        );
     }
 
     #[tokio::test]
@@ -1955,17 +1998,11 @@ mod tests {
             let reader_db = ReaderDb::open(&db, 2).await;
             let (sink, _rx) = events::channel();
             let recorder = TurnRecorder::new(sink);
-            let tool = RunSqlTool::new(
-                Arc::clone(&db),
-                reader_db.clone(),
-                100,
-                WritePolicy::Allow,
-                RefusalFlag::default(),
-                recorder,
-            );
+            let turn = Turn::new(recorder, WritePolicy::Allow);
+            let tool = RunSqlTool::new(Arc::clone(&db), reader_db.clone(), 100);
             let out = tool
                 .call(
-                    &mut ToolContext::new(),
+                    &mut turn.context(),
                     RunSqlArgs {
                         query: String::from(bypass),
                     },
@@ -2027,15 +2064,15 @@ mod tests {
         seed_hail_chunks(&db).await;
         let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
+        let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
         let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
             &retrieval(),
-            recorder.clone(),
         );
         let text = tool
             .call(
-                &mut ToolContext::new(),
+                &mut turn.context(),
                 SearchDocumentsArgs {
                     query: String::from("hail"),
                     top_k: None,
@@ -2057,7 +2094,6 @@ mod tests {
             ReaderDb::new(Arc::clone(&db)),
             None,
             &retrieval(),
-            recorder.clone(),
         )
         .with_reranker(Rerank {
             reranker: Arc::new(Reverse),
@@ -2065,7 +2101,7 @@ mod tests {
         });
         let text = reranked
             .call(
-                &mut ToolContext::new(),
+                &mut turn.context(),
                 SearchDocumentsArgs {
                     query: String::from("hail"),
                     top_k: None,
@@ -2090,13 +2126,8 @@ mod tests {
 
     #[test]
     fn search_documents_offers_the_entity_argument_only_with_a_graph() {
-        let (sink, _rx) = events::channel();
-        let tool = SearchDocumentsTool::<EmbedModel>::new(
-            ReaderDb::new(shared_db()),
-            None,
-            &retrieval(),
-            TurnRecorder::new(sink),
-        );
+        let tool =
+            SearchDocumentsTool::<EmbedModel>::new(ReaderDb::new(shared_db()), None, &retrieval());
         let has_entity = |tool: &SearchDocumentsTool<EmbedModel>| {
             tool.parameters().pointer("/properties/entity").is_some()
         };
@@ -2134,16 +2165,15 @@ mod tests {
         .await
         .unwrap_or_else(|e| fail_test(&e.to_string()));
         let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
+        let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
         let tool = SearchDocumentsTool::<EmbedModel>::new(
             ReaderDb::new(Arc::clone(&db)),
             None,
             &retrieval(),
-            recorder,
         );
         let text = tool
             .call(
-                &mut ToolContext::new(),
+                &mut turn.context(),
                 SearchDocumentsArgs {
                     query: String::from("hail"),
                     // Twice the cap and then some: a model is free to ask
@@ -2169,17 +2199,11 @@ mod tests {
         let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink);
         let db = shared_db();
-        let tool = RunSqlTool::new(
-            Arc::clone(&db),
-            ReaderDb::new(db),
-            2,
-            WritePolicy::Deny,
-            RefusalFlag::default(),
-            recorder.clone(),
-        );
+        let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
+        let tool = RunSqlTool::new(Arc::clone(&db), ReaderDb::new(db), 2);
         let out = tool
             .call(
-                &mut ToolContext::new(),
+                &mut turn.context(),
                 RunSqlArgs {
                     query: String::from("SELECT range AS n FROM range(5)"),
                 },
@@ -2207,22 +2231,13 @@ mod tests {
         let (sink, _rx) = events::channel();
         let recorder = TurnRecorder::new(sink).with_turn_limit(15);
         let db = shared_db();
-        let tool = RunSqlTool::new(
-            Arc::clone(&db),
-            ReaderDb::new(db),
-            100,
-            WritePolicy::Deny,
-            RefusalFlag::default(),
-            recorder,
-        );
+        let turn = Turn::new(recorder, WritePolicy::Deny);
+        let tool = RunSqlTool::new(Arc::clone(&db), ReaderDb::new(db), 100);
         let run = |query: &str| {
             let query = query.to_owned();
-            let tool = &tool;
+            let (tool, turn) = (&tool, &turn);
             async move {
-                match tool
-                    .call(&mut ToolContext::new(), RunSqlArgs { query })
-                    .await
-                {
+                match tool.call(&mut turn.context(), RunSqlArgs { query }).await {
                     Ok(text) => text,
                     Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
                 }
@@ -2262,17 +2277,11 @@ mod tests {
                 .await
                 .is_ok()
         );
-        let tool = RunSqlTool::new(
-            Arc::clone(&db),
-            ReaderDb::new(Arc::clone(&db)),
-            100,
-            WritePolicy::Deny,
-            RefusalFlag::default(),
-            recorder.clone(),
-        );
+        let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
+        let tool = RunSqlTool::new(Arc::clone(&db), ReaderDb::new(Arc::clone(&db)), 100);
         let out = tool
             .call(
-                &mut ToolContext::new(),
+                &mut turn.context(),
                 RunSqlArgs {
                     query: String::from("SELECT count(*) FROM trips WHERE distance > 10"),
                 },
@@ -2292,13 +2301,10 @@ mod tests {
         );
 
         // A missing table names the tables that do exist.
-        let describe = DescribeTableTool(ToolDeps {
-            db: ReaderDb::new(Arc::clone(&db)),
-            recorder: recorder.clone(),
-        });
+        let describe = DescribeTableTool(ReaderDb::new(Arc::clone(&db)));
         let out = describe
             .call(
-                &mut ToolContext::new(),
+                &mut turn.context(),
                 DescribeTableArgs {
                     table_name: String::from("trip"),
                 },
@@ -2314,7 +2320,7 @@ mod tests {
         // And a good statement still returns rows, with the count in the step.
         let out = tool
             .call(
-                &mut ToolContext::new(),
+                &mut turn.context(),
                 RunSqlArgs {
                     query: String::from("SELECT count(*) AS n FROM trips WHERE trip_distance > 10"),
                 },
@@ -2479,8 +2485,6 @@ pub struct GraphTools<M> {
     pub options: graph::GraphOptions,
     /// Query mode does not answer from provisional nodes.
     pub mode: ChatMode,
-    pub results: GraphResults,
-    pub recorder: TurnRecorder,
 }
 
 /// A graph result as the turn's mode may show it.
@@ -2505,8 +2509,8 @@ impl<M> GraphTools<M> {
     }
 
     /// Keep `result` for the turn's response.
-    fn keep(&self, result: GraphResult) {
-        if let Ok(mut results) = self.results.lock() {
+    fn keep(turn: &Turn, result: GraphResult) {
+        if let Ok(mut results) = turn.graph.lock() {
             results.push(result);
         }
     }
@@ -2554,17 +2558,18 @@ where
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let tools = &self.0;
+        let turn = Turn::of(context)?;
         let detail = match (args.entity.get(), args.class.get()) {
             (Some(e), Some(c)) => format!("{e} ({c})"),
             (Some(e), None) => e.to_owned(),
             (None, Some(c)) => format!("class {c}"),
             (None, None) => String::new(),
         };
-        let step = tools.recorder.start(ToolName::SearchGraph, &detail);
+        let step = turn.recorder.start(ToolName::SearchGraph, &detail);
         let query = match GraphQuery::new(
             args.entity.get(),
             args.class.get(),
@@ -2576,8 +2581,7 @@ where
         };
         let embedding = match query.entity.as_deref() {
             Some(e) => {
-                tools
-                    .recorder
+                turn.recorder
                     .embed_label(tools.embedding_model.as_ref(), e)
                     .await?
             }
@@ -2612,7 +2616,7 @@ where
             };
             step.finish(empty.summary());
             let text = empty.text()?;
-            tools.keep(result);
+            GraphTools::<M>::keep(&turn, result);
             return Ok(text);
         }
         let of = match result.total_nodes.filter(|_| result.truncated) {
@@ -2624,8 +2628,8 @@ where
             result.nodes.len(),
             result.edges.len()
         ));
-        let text = format_graph_result(&result, &tools.recorder, &tools.db).await?;
-        tools.keep(result);
+        let text = format_graph_result(&result, &turn.recorder, &tools.db).await?;
+        GraphTools::<M>::keep(&turn, result);
         Ok(text)
     }
 }
@@ -2664,11 +2668,12 @@ where
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let tools = &self.0;
-        let step = tools.recorder.start(
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(
             ToolName::FindPath,
             &format!("{} -> {}", args.from.trim(), args.to.trim()),
         );
@@ -2677,11 +2682,11 @@ where
             Err(e) => return Err(step.fail(e.into())),
         };
         let ends = PathEnds {
-            from: tools
+            from: turn
                 .recorder
                 .embed_label(tools.embedding_model.as_ref(), &query.from)
                 .await?,
-            to: tools
+            to: turn
                 .recorder
                 .embed_label(tools.embedding_model.as_ref(), &query.to)
                 .await?,
@@ -2717,8 +2722,8 @@ where
             ));
         }
         step.finish(format!("{} hops", result.edges.len()));
-        let text = format_graph_result(&result, &tools.recorder, &tools.db).await?;
-        tools.keep(result);
+        let text = format_graph_result(&result, &turn.recorder, &tools.db).await?;
+        GraphTools::<M>::keep(&turn, result);
         Ok(text)
     }
 }
@@ -2892,7 +2897,7 @@ async fn format_graph_result(
 /// Sample entity labels `describe_class` shows for a class.
 const CLASS_SAMPLES: u32 = 10;
 
-pub struct DescribeClassTool(pub ToolDeps);
+pub struct DescribeClassTool(pub ReaderDb);
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DescribeClassArgs {
@@ -2922,14 +2927,14 @@ impl Tool for DescribeClassTool {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
         let class_id = args.class_id.trim().to_owned();
-        let step = self.0.recorder.start(ToolName::DescribeClass, &class_id);
+        let step = turn.recorder.start(ToolName::DescribeClass, &class_id);
         let text = self
             .0
-            .db
             .with_db(move |db| {
                 let ontology = ontology_store::current(db)?;
                 OntologyId::Class(&class_id).check(ontology.as_ref())?;
