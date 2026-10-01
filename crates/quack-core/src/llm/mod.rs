@@ -11,12 +11,15 @@ pub mod oauth;
 pub mod sampling;
 
 use jiff::Timestamp;
+use rig::agent::OutputMode;
 use rig::embeddings::Embedding;
 use rig::providers::{anthropic, ollama, openai};
 use rig::streaming::{Item, StreamEvent};
 use rig::{DynModel, ProviderError, operation};
+use schemars::{Schema, schema_for};
 use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,8 +36,8 @@ use crate::config::{
 };
 use crate::embedding::{Embedder, EmbeddingModel, Profile};
 use crate::error::{Error, Record, Result};
-use crate::extraction::{Extract, ExtractFuture, parse_answer};
-use crate::graph::extract::Extraction;
+use crate::extraction::{Extract, ExtractFuture};
+use crate::graph::extract::{Extraction, ExtractionAnswer};
 use crate::ids::SessionId;
 use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
@@ -570,19 +573,18 @@ impl ChatClient {
         })
     }
 
-    fn one_shot(
+    /// A background call to `model` whose answer `schema` shapes.
+    fn schema_call<A>(
         &self,
         model: &str,
         settings: ModelSettings,
-        preamble: &str,
-        timeout: Duration,
-        label: &'static str,
-    ) -> Result<OneShotAgent> {
-        Ok(OneShotAgent::new(
+        task: Task<'_>,
+        schema: Schema,
+    ) -> Result<SchemaCall<A>> {
+        Ok(SchemaCall::new(
             self.chat_model(model, settings.background_effort, settings.temperature)?,
-            preamble,
-            timeout,
-            label,
+            task,
+            schema,
         ))
     }
 }
@@ -641,29 +643,42 @@ impl<W: rig::wire::Wire<Op = operation::Completion>> rig::wire::Wire for Unstore
     }
 }
 
-/// A tool-less agent at temperature 0 (where the model takes one; see
-/// [`sampling`]) that answers one prompt at a time,
-/// streamed and collected. Streaming is the path the chat agent uses and
-/// the one Ollama answers reliably, and it keeps long generations from
-/// tripping the HTTP client's read timeout. Extraction and reranking are
-/// both one of these with their own preamble.
-pub struct OneShotAgent {
+/// What one background call is for: its preamble, how long it may take,
+/// and the name errors and logs give it.
+#[derive(Clone, Copy)]
+pub struct Task<'a> {
+    pub preamble: &'a str,
+    pub timeout: Duration,
+    pub label: &'static str,
+}
+
+/// One tool-less model call whose answer a JSON schema shapes: rig sends the
+/// schema as the provider's structured output (Ollama's `format`, `OpenAI`'s
+/// `response_format` or `text.format`, Anthropic's and Bedrock's output
+/// configuration), and the whole answer parses as `A`. Streamed and
+/// collected under the task's timeout: streaming is the path the chat agent
+/// uses and the one Ollama answers reliably, and an answer the output limit
+/// cut is refused by name.
+pub struct SchemaCall<A> {
     agent: Agent,
     timeout: Duration,
     label: &'static str,
+    answer: PhantomData<fn() -> A>,
 }
 
-impl OneShotAgent {
-    /// `label` names the call in errors and logs.
+impl<A> SchemaCall<A> {
     #[must_use]
-    pub fn new(model: ChatModel, preamble: &str, timeout: Duration, label: &'static str) -> Self {
+    pub fn new(model: ChatModel, task: Task<'_>, schema: Schema) -> Self {
         Self {
             agent: AgentBuilder::new(model)
-                .preamble(preamble)
+                .preamble(task.preamble)
                 .temperature(0.0)
+                .output_schema_raw(schema)
+                .output_mode(OutputMode::Native)
                 .build(),
-            timeout,
-            label,
+            timeout: task.timeout,
+            label: task.label,
+            answer: PhantomData,
         }
     }
 
@@ -671,9 +686,24 @@ impl OneShotAgent {
     ///
     /// # Errors
     ///
-    /// Returns an error when the call fails or produces nothing within the
-    /// timeout.
-    pub async fn answer(&self, text: &str) -> Result<String> {
+    /// Returns an error when the call fails, its answer was cut off, it
+    /// produces nothing within the timeout, or the answer does not fit the
+    /// schema.
+    pub async fn answer(&self, text: &str) -> Result<A>
+    where
+        A: DeserializeOwned,
+    {
+        let answer = self.text(text).await?;
+        tracing::debug!(call = self.label, answer = %answer, "structured answer");
+        serde_json::from_str(answer.trim()).map_err(|e| {
+            Error::Llm(format!(
+                "the {} answer does not fit its schema: {e}",
+                self.label
+            ))
+        })
+    }
+
+    async fn text(&self, text: &str) -> Result<String> {
         use futures::StreamExt;
         let what = self.label;
         let collect = async {
@@ -732,13 +762,13 @@ impl OneShotAgent {
     }
 }
 
-impl<T: DeserializeOwned + Send> Extract<T> for OneShotAgent {
+/// An extractor whose answer is `A`, handed on as the `T` it converts to.
+impl<A, T> Extract<T> for SchemaCall<A>
+where
+    A: DeserializeOwned + Into<T>,
+{
     fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a, T> {
-        Box::pin(async move {
-            let answer = self.answer(text).await?;
-            tracing::debug!(call = self.label, answer = %answer, "extraction answer");
-            parse_answer(&answer)
-        })
+        Box::pin(async move { self.answer(text).await.map(Into::into) })
     }
 }
 
@@ -754,13 +784,17 @@ pub async fn graph_extractor(
     ontology: &Ontology,
 ) -> Result<Box<dyn Extract<Extraction>>> {
     let chat = config.chat_model_ref()?;
-    Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
+    let call: SchemaCall<ExtractionAnswer> = ChatClient::build(config, &chat).await?.schema_call(
         chat.model,
         config.model_settings(chat),
-        &ontology.extraction_prompt(),
-        config.analysis.extraction_timeout(),
-        "graph extraction",
-    )?))
+        Task {
+            preamble: &ontology.extraction_prompt(),
+            timeout: config.analysis.extraction_timeout(),
+            label: "graph extraction",
+        },
+        ontology.extraction_schema(),
+    )?;
+    Ok(Box::new(call))
 }
 
 /// The configured chat model as an open extractor for ontology induction.
@@ -771,13 +805,17 @@ pub async fn graph_extractor(
 /// cannot be built (a missing key, a needed login).
 pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtraction>>> {
     let chat = config.chat_model_ref()?;
-    Ok(Box::new(ChatClient::build(config, &chat).await?.one_shot(
+    let call: SchemaCall<OpenExtraction> = ChatClient::build(config, &chat).await?.schema_call(
         chat.model,
         config.model_settings(chat),
-        documents::EXTRACTION_PROMPT,
-        config.analysis.extraction_timeout(),
-        "extraction",
-    )?))
+        Task {
+            preamble: documents::EXTRACTION_PROMPT,
+            timeout: config.analysis.extraction_timeout(),
+            label: "extraction",
+        },
+        schema_for!(OpenExtraction),
+    )?;
+    Ok(Box::new(call))
 }
 
 impl ProviderAuth {
@@ -1299,8 +1337,11 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::rerank::RerankAnswer;
     use crate::config::BedrockConfig;
     use crate::embedding::Dimension;
+    use crate::ids::{ClassId, RelationId};
+    use crate::ontology::Relation;
     use crate::storage::workspace::WorkspaceDb;
     use crate::storage::writer::Writer;
 
@@ -1371,6 +1412,55 @@ mod tests {
         assert!(models.get("gpt-oss:20b").is_some());
         assert!(models.get("gpt-oss").is_none());
         assert_eq!(models.closest("gpt-os:20b").first(), Some(&"gpt-oss:20b"));
+    }
+
+    /// Graph extraction sends the ontology's schema as the provider's
+    /// structured output, so the model is held to its class and relation
+    /// ids: Ollama's `format`, Chat Completions' strict `response_format`.
+    #[tokio::test]
+    async fn graph_extraction_sends_the_ontology_schema() {
+        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+        for (provider, field) in [
+            ("type = \"ollama\"\n", r#""format":{"#),
+            (
+                "type = \"openai\"\napi = \"chat-completions\"\n",
+                r#""response_format":{"json_schema":{"#,
+            ),
+        ] {
+            let (root, seen) = capture_one().await;
+            let auth = if provider.contains("openai") {
+                keyed
+            } else {
+                ""
+            };
+            let config = parse(&format!(
+                "[general]\nchat_model = \"p/m\"\n[providers.p]\n{provider}{auth}base_url = \"{root}\"\n"
+            ));
+            let mut ontology = Ontology::default();
+            ontology.relations.push(Relation {
+                id: RelationId::from("ships_to"),
+                label: None,
+                description: None,
+                domain: ClassId::from("entity"),
+                range: ClassId::from("entity"),
+            });
+            let extractor = graph_extractor(&config, &ontology)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            assert!(extractor.extract("Orgenics ships to Kenya.").await.is_err());
+            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+            assert!(request.contains(field), "{provider}: {request}");
+            assert!(
+                request.contains(r#""enum":["mentions","ships_to"]"#)
+                    && request.contains(r#""enum":["entity"]"#),
+                "{provider}: {request}"
+            );
+        }
+    }
+
+    /// A small schema the wire tests send.
+    fn test_schema() -> Schema {
+        schema_for!(RerankAnswer)
     }
 
     /// One request's head and body, read off a loopback socket that
@@ -1502,12 +1592,15 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| fail(&e.to_string()));
             let answer = client
-                .one_shot(
+                .schema_call::<serde_json::Value>(
                     "m",
                     ModelSettings::default(),
-                    "Answer.",
-                    Duration::from_secs(10),
-                    "graph extraction",
+                    Task {
+                        preamble: "Answer.",
+                        timeout: Duration::from_secs(10),
+                        label: "graph extraction",
+                    },
+                    test_schema(),
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")
@@ -1620,12 +1713,15 @@ mod tests {
             let client = ChatClient::bedrock(&session, &name, &provider)
                 .unwrap_or_else(|e| fail(&e.to_string()));
             let answer = client
-                .one_shot(
+                .schema_call::<serde_json::Value>(
                     "openai.gpt-oss-120b",
                     ModelSettings::default(),
-                    "Answer.",
-                    Duration::from_secs(10),
-                    "wire test",
+                    Task {
+                        preamble: "Answer.",
+                        timeout: Duration::from_secs(10),
+                        label: "wire test",
+                    },
+                    test_schema(),
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")
@@ -1688,12 +1784,15 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| fail(&e.to_string()));
             let answer = client
-                .one_shot(
+                .schema_call::<serde_json::Value>(
                     model,
                     ModelSettings::default(),
-                    "Answer.",
-                    Duration::from_secs(10),
-                    "wire test",
+                    Task {
+                        preamble: "Answer.",
+                        timeout: Duration::from_secs(10),
+                        label: "wire test",
+                    },
+                    test_schema(),
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")
@@ -1727,12 +1826,15 @@ mod tests {
             let client = anthropic_client(chat.provider_name, chat.provider, "tok-1")
                 .unwrap_or_else(|e| fail(&e.to_string()));
             let answer = ChatClient::Anthropic(client)
-                .one_shot(
+                .schema_call::<serde_json::Value>(
                     "claude-sonnet-5",
                     ModelSettings::default(),
-                    "Answer.",
-                    Duration::from_secs(10),
-                    "wire test",
+                    Task {
+                        preamble: "Answer.",
+                        timeout: Duration::from_secs(10),
+                        label: "wire test",
+                    },
+                    test_schema(),
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()))
                 .answer("hello")

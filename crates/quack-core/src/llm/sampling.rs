@@ -1,16 +1,17 @@
-//! Per-model request settings the agent and one-shot builders cannot know.
+//! Per-model request settings the agent and schema-call builders cannot know.
 //!
-//! The agent asks for temperature 0.1 and the one-shot calls for 0.0. Only
+//! The agent asks for temperature 0.1 and the schema calls for 0.0. Only
 //! Ollama's own API gets it. Current Claude models (Opus 4.7 and later,
 //! Sonnet 5) answer a non-default `temperature` with a 400, and so do
 //! `OpenAI`'s reasoning models (GPT-5.x, GPT-6, the o-series) at any effort
 //! but `none`; every API accepts a request without one, and a gateway's
 //! model name need not say which model is behind it.
 //!
-//! Claude also needs `max_tokens` on every request: rig knows the Claude 4
-//! families only and refuses to send a request for any other model without
-//! one, and Bedrock's Converse default is sized for replies, not for
-//! adaptive thinking, which counts against it.
+//! Claude also needs `max_tokens` on every request: rig's Anthropic client
+//! knows the Claude 4 and 5 families by id, but refuses to send a request for
+//! any other model without one (a gateway alias, a deployment name), and
+//! Bedrock's Converse default is sized for replies, not for adaptive
+//! thinking, which counts against it.
 //!
 //! The same module turns `[analysis].effort` and `background_effort` into the
 //! field each API takes, and refuses a level the model family lacks before

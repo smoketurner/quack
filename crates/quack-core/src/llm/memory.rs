@@ -12,7 +12,10 @@ use rig::memory::{CompactingMemory, Compactor, ConversationMemory, MemoryError, 
 use rig::message::Message;
 use rig::wasm_compat::WasmBoxedFuture;
 
-use super::{ChatClient, OneShotAgent};
+use schemars::{JsonSchema, schema_for};
+use serde::Deserialize;
+
+use super::{ChatClient, SchemaCall, Task};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
@@ -24,7 +27,14 @@ use crate::text::Tokens;
 const SUMMARY_PROMPT: &str = "You summarize the earlier part of a conversation between a person \
     and a data assistant, so the conversation can go on without it. Keep the questions asked, \
     the names of tables, documents, and entities, the numbers found, and the conclusions. \
-    Write plain prose with no preamble.";
+    Answer with the summary, in plain prose, in `summary`.";
+
+/// The summarizing model's answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[schemars(title = "history_summary")]
+struct SummaryAnswer {
+    summary: String,
+}
 
 /// How long one summary call may run.
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -48,12 +58,15 @@ impl History {
         let budget = config.analysis.history_token_budget;
         let compactor = if config.analysis.compact_history {
             let chat = config.chat_model_ref()?;
-            let summarizer = ChatClient::build(config, &chat).await?.one_shot(
+            let summarizer = ChatClient::build(config, &chat).await?.schema_call(
                 chat.model,
                 config.model_settings(chat),
-                SUMMARY_PROMPT,
-                SUMMARY_TIMEOUT,
-                "history summary",
+                Task {
+                    preamble: SUMMARY_PROMPT,
+                    timeout: SUMMARY_TIMEOUT,
+                    label: "history summary",
+                },
+                schema_for!(SummaryAnswer),
             )?;
             Some(SessionCompactor {
                 db: Arc::clone(&db),
@@ -101,7 +114,7 @@ impl History {
 /// messages evicted since are summarized again, with it.
 pub struct SessionCompactor {
     db: Arc<Writer>,
-    summarizer: Arc<OneShotAgent>,
+    summarizer: Arc<SchemaCall<SummaryAnswer>>,
     /// The most a summary may hold, outside the window's own budget.
     max_tokens: Tokens,
 }
@@ -201,6 +214,7 @@ impl Compactor for SessionCompactor {
                 .await
                 .map_err(MemoryError::backend)?;
             let text: String = answer
+                .summary
                 .trim()
                 .chars()
                 .take(self.max_tokens.chars())
@@ -265,11 +279,14 @@ mod tests {
             budget: Tokens::new(budget),
             compactor: Some(SessionCompactor {
                 db: Arc::clone(db),
-                summarizer: Arc::new(OneShotAgent::new(
+                summarizer: Arc::new(SchemaCall::new(
                     model.clone().erase(),
-                    SUMMARY_PROMPT,
-                    SUMMARY_TIMEOUT,
-                    "history summary",
+                    Task {
+                        preamble: SUMMARY_PROMPT,
+                        timeout: SUMMARY_TIMEOUT,
+                        label: "history summary",
+                    },
+                    schema_for!(SummaryAnswer),
                 )),
                 max_tokens: Tokens::new(100),
             }),
@@ -281,7 +298,7 @@ mod tests {
         let (db, id) = session().await;
         // One scripted summary: a second model call would fail the test.
         let model = MockCompletionModel::from_stream_turns([[
-            MockStreamEvent::text("They asked questions 1 to 3."),
+            MockStreamEvent::text(r#"{"summary": "They asked questions 1 to 3."}"#),
             MockStreamEvent::final_response(Usage::default()),
         ]]);
         // Each turn is 3 + 2 tokens, so 10 keeps the last two.

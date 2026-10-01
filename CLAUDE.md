@@ -245,8 +245,9 @@ The knowledge graph (`quack_core::graph`, design doc 6.4) lives in `_quack_graph
 `_quack_graph_edges`, `_quack_provenance`, and `_quack_graph_merges`. `graph::tables`
 turns mapped rows into nodes and edges deterministically; `graph::extract` sends each
 chunk its `ChunkPlan` names (every unextracted one, or an even sample chosen in SQL by
-`WorkspaceDb::sample_chunk_ids`, reading text a page at a time) to the chat model (`llm::graph_extractor`, preamble from
-`Ontology::extraction_prompt`) and validates the answer against the ontology, counting unknown
+`WorkspaceDb::sample_chunk_ids`, reading text a page at a time) to the chat model (`llm::graph_extractor`, a `llm::SchemaCall` whose preamble is
+`Ontology::extraction_prompt` and whose structured-output schema is `Ontology::extraction_schema`,
+the ontology's class and relation ids enumerated) and validates the answer against the ontology, counting unknown
 classes and relations as drift in `_quack_meta.graph_drift`; `graph::resolve` embeds
 node labels, merges near-identical labels of one class, and queues the rest as merge
 proposals; `graph::traverse` resolves an entry point (exact label, alias, then embedding)
