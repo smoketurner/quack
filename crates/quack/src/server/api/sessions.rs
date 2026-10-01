@@ -108,13 +108,14 @@ pub(crate) async fn update(
     if body.shared.is_none() && body.mode.is_none() {
         return Err(ApiError::bad_request("give shared or mode"));
     }
-    let mut session = None;
-    if let Some(sharing) = body.shared {
-        session = Some(access.set_session_sharing(&app, &sid, sharing).await?);
-    }
-    if let Some(mode) = body.mode {
-        session = Some(access.set_session_mode(&app, &sid, mode).await?);
-    }
+    let shared = match body.shared {
+        Some(sharing) => Some(access.set_session_sharing(&app, &sid, sharing).await?),
+        None => None,
+    };
+    let session = match body.mode {
+        Some(mode) => Some(access.set_session_mode(&app, &sid, mode).await?),
+        None => shared,
+    };
     let session = session.ok_or_else(|| ApiError::from(Record::Session.missing(sid.as_str())))?;
     Ok(Json(serde_json::to_value(session)?))
 }

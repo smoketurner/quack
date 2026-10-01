@@ -25,7 +25,7 @@ text_enum!(ChartKind, "chart kind", {
     Pie => "pie",
 });
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Axis {
     pub label: String,
     /// Category labels, one per point (or per pie slice).

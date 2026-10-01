@@ -71,10 +71,7 @@ impl RunControl<'_> {
     /// # Errors
     ///
     /// `work`'s error, or [`Error::Cancelled`].
-    pub async fn or_cancelled<T>(
-        &self,
-        work: impl std::future::Future<Output = Result<T>>,
-    ) -> Result<T> {
+    pub async fn or_cancelled<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
         match self.cancel {
             None => work.await,
             Some(token) => tokio::select! {

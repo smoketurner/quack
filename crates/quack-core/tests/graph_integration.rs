@@ -20,7 +20,7 @@ use quack_core::graph::{
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
-use quack_core::progress::RunControl;
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
     DocumentStatus, NewChunk, NewDocument, SamplePool, WorkspaceDb,
 };
@@ -69,7 +69,7 @@ impl EmbeddingModel for LetterEmbedding {
     fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
         let mut out = Vec::new();
         for text in texts {
             let first = text.to_lowercase().chars().next().unwrap_or('z');
@@ -899,7 +899,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     // Dropping the country class and the delivered_to relation from the
     // ontology makes the graph stale; revalidate removes what no longer
     // fits and records the new version.
-    let mut edited = current.clone();
+    let mut edited = current;
     edited.classes.retain(|c| c.id != "country");
     edited
         .relations
@@ -960,7 +960,7 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
 
     // `supplied_by` now ends at a country, so every shipment -> vendor
     // edge of it no longer fits.
-    let mut edited = current.clone();
+    let mut edited = current;
     for relation in &mut edited.relations {
         if relation.id == "supplied_by" {
             relation.range = ClassId::from("country");
@@ -1086,7 +1086,7 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
     let plan = ChunkPlan::new(&db, None).unwrap();
     assert_eq!(plan, ChunkPlan::All { total: 152 });
     let seen = std::sync::Mutex::new(Vec::new());
-    let progress = |done: quack_core::progress::ChunkDone| {
+    let progress = |done: ChunkDone| {
         seen.lock().unwrap().push(done.done);
     };
     let control = RunControl {

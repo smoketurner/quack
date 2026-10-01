@@ -1290,6 +1290,7 @@ mod tests {
     use super::*;
     use crate::embedding::Dimension;
     use crate::graph::{Properties, Standing, store as graph_store};
+    use crate::ids::{AuditId, UserId};
     use crate::ontology::induction::ItemKind;
     use crate::ontology::store::Revision;
     use crate::storage::audit;
@@ -1407,7 +1408,7 @@ mod tests {
         let db = WorkspaceDb::open_in_memory(Dimension::new(4))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         let mut ontology = Ontology::builtin_default();
-        ontology.classes.push(ontology::Class {
+        ontology.classes.push(Class {
             id: ClassId::from("harbour"),
             parent: ClassId::from(String::from(ontology::ROOT_CLASS)),
             label: None,
@@ -1415,7 +1416,7 @@ mod tests {
             key: None,
             properties: Vec::new(),
         });
-        ontology.relations.push(ontology::Relation {
+        ontology.relations.push(Relation {
             id: RelationId::from("near"),
             label: None,
             description: None,
@@ -1425,8 +1426,8 @@ mod tests {
         let saved = ontology_store::save(&db, &ontology, Revision::reviewed(None, None))
             .unwrap_or_else(|e| unreachable_db(&e.to_string()));
         audit::AuditDetail {
-            id: crate::ids::AuditId::from("a1"),
-            user_id: Some(crate::ids::UserId::from("u")),
+            id: AuditId::from("a1"),
+            user_id: Some(UserId::from("u")),
             action: String::from("sql"),
             detail: serde_json::json!({"sql": "SELECT secret"}),
         }

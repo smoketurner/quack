@@ -15,8 +15,11 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use quack_core::config::{BaseUrl, Config, ProviderConfig, ProviderName, ProviderType};
+use quack_core::config::{
+    BaseUrl, Config, ProviderConfig, ProviderName, ProviderType, SecureCookies,
+};
 use quack_core::embedding::{Dimension, Vector};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -758,7 +761,7 @@ async fn read_requests_never_wait_for_the_writer() {
     let busy = tokio::spawn(async move {
         writer
             .run(move |_| {
-                hold.recv().ok();
+                hold.recv().unwrap_or_default();
                 Ok(())
             })
             .await
@@ -1249,7 +1252,7 @@ async fn a_failed_authorized_search_is_audited_as_error() {
     let events = rows
         .iter()
         .map(AuditRow::to_ocsf)
-        .collect::<quack_core::error::Result<Vec<_>>>()
+        .collect::<CoreResult<Vec<_>>>()
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(
         events
@@ -2714,7 +2717,7 @@ fn banner_names_the_address_mode_and_models() {
     config.general.chat_model = Some(
         "ollama/llama3"
             .parse()
-            .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
+            .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
     );
     config.providers.insert(
         "ollama"
@@ -2783,7 +2786,7 @@ async fn mcp_call(
             .filter_map(|line| line.strip_prefix("data: "))
             .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
             .next_back()
-            .unwrap_or(serde_json::Value::String(text.to_owned())),
+            .unwrap_or_else(|| serde_json::Value::String(text.to_owned())),
         None => body,
     };
     (status, body, session)
@@ -4322,7 +4325,7 @@ async fn the_session_cookie_is_secure_off_loopback_and_carries_max_age() {
 #[tokio::test(flavor = "multi_thread")]
 async fn secure_cookies_always_marks_loopback_cookies_secure() {
     let mut config = Config::default();
-    config.server.secure_cookies = quack_core::config::SecureCookies::Always;
+    config.server.secure_cookies = SecureCookies::Always;
     let h = harness_with(ServeMode::Login, config).await;
     h.user("root", UserKind::Admin).await;
     let (status, _, headers) = h
@@ -4729,7 +4732,7 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
     config.embedding.model = Some(
         "ollama/embeddinggemma"
             .parse()
-            .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
+            .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
     );
     config.providers.insert(
         "ollama"

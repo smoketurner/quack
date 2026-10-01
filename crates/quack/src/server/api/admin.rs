@@ -4,6 +4,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use quack_core::error::Result as CoreResult;
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
     AuditAction, AuditCursor, AuditFilter, AuditRow, Outcome, UserKind, UserRow,
@@ -116,7 +117,7 @@ pub(crate) async fn audit(
             page.rows
                 .iter()
                 .map(AuditRow::to_ocsf)
-                .collect::<quack_core::error::Result<_>>()?,
+                .collect::<CoreResult<_>>()?,
         ),
     };
     Ok(Json(

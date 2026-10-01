@@ -58,7 +58,7 @@ use super::LimitedHttp;
 use super::limit::{GatePermit, ProviderGates};
 use crate::config::bedrock::is_fips_host;
 use crate::config::{
-    BaseUrl, BedrockApi, BedrockConfig, BedrockEndpoint, ProviderConfig, ProviderName,
+    AwsRegion, BaseUrl, BedrockApi, BedrockConfig, BedrockEndpoint, ProviderConfig, ProviderName,
 };
 use crate::error::{Error, Result};
 
@@ -336,9 +336,9 @@ async fn root(
             "provider '{name}': FIPS endpoints are required (use_fips_endpoint), and \
              bedrock-mantle has none; use a type = \"bedrock\" provider"
         ))),
-        BedrockEndpoint::Mantle => Ok(BedrockEndpoint::mantle_root(
-            &crate::config::AwsRegion::try_from(region.to_owned())?,
-        )),
+        BedrockEndpoint::Mantle => Ok(BedrockEndpoint::mantle_root(&AwsRegion::try_from(
+            region.to_owned(),
+        )?)),
         BedrockEndpoint::Runtime => {
             // An endpoint-URL override the AWS SDK honours (the same
             // `Builder::from(&sdk)` resolves for the Converse client): honor it
@@ -1155,7 +1155,7 @@ mod tests {
 
     impl HttpConnector for RecordingConnector {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            let uri = request.uri().to_string();
+            let uri = request.uri().to_owned();
             self.uris
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

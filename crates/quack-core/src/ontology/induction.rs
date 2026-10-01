@@ -36,7 +36,7 @@ impl Default for TableEvidenceOptions {
 }
 
 /// What one candidate proposes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Proposal {
     Class(Class),
@@ -915,7 +915,7 @@ mod tests {
         assert!(again.is_empty(), "{}", again.len());
         // A table mapped to a class named differently from the table is
         // covered too: nothing is proposed for it (issue #55).
-        let mut renamed = ontology.clone();
+        let mut renamed = ontology;
         for class in &mut renamed.classes {
             if class.id == "claim" {
                 class.id = ClassId::from("insurance_claim");

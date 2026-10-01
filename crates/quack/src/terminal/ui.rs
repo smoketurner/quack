@@ -146,10 +146,7 @@ impl JobRow<'_> {
         } else {
             ("\u{00B7}", Style::default().fg(Color::DarkGray))
         };
-        let mut detail = String::new();
-        if let Some(p) = job.progress {
-            detail = format!("  {p}");
-        }
+        let mut detail = job.progress.map_or_else(String::new, |p| format!("  {p}"));
         if let Some(status) = job.status.as_deref() {
             detail.push_str("  ");
             detail.push_str(status);

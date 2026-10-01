@@ -1251,7 +1251,7 @@ impl App {
 
     /// Queue a turn's write request as a prompt; one from a session not on
     /// screen says whose it is.
-    fn ask_for_turn(&mut self, turn: &mut Turn, request: PermissionRequest) {
+    fn ask_for_turn(&mut self, turn: &Turn, request: PermissionRequest) {
         self.note(
             MessageKind::System,
             format!(
@@ -2231,7 +2231,7 @@ impl App {
     where
         T: Send + 'static,
         W: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
-        A: FnOnce(&mut App, CoreResult<T>) + Send + 'static,
+        A: FnOnce(&mut Self, CoreResult<T>) + Send + 'static,
     {
         let db = Arc::clone(&self.db);
         let reader = self.reader_db.clone();
@@ -2242,7 +2242,7 @@ impl App {
                     Side::Read => reader.with_db(work).await,
                     Side::Write => db.run_at(Priority::Interactive, work).await,
                 };
-                drop(tx.send(AppMsg::Apply(Box::new(move |app: &mut App| {
+                drop(tx.send(AppMsg::Apply(Box::new(move |app: &mut Self| {
                     apply(app, result);
                 }))));
             })
@@ -2269,7 +2269,7 @@ impl App {
     where
         T: Send + 'static,
         W: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
-        A: FnOnce(&mut App, T) + Send + 'static,
+        A: FnOnce(&mut Self, T) + Send + 'static,
     {
         self.on_db(side, work, move |app, result| match result {
             Ok(value) => apply(app, value),
@@ -2536,12 +2536,12 @@ mod tests {
 
     /// An app over a real workspace file (the background jobs open it
     /// again by id), driven without a terminal.
-    fn app(dir: &std::path::Path) -> App {
+    fn app(dir: &Path) -> App {
         app_with(dir, Config::default())
     }
 
     /// `app` under `config`, its data directory moved to `dir`.
-    fn app_with(dir: &std::path::Path, mut config: Config) -> App {
+    fn app_with(dir: &Path, mut config: Config) -> App {
         config.general.data_dir = dir.to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
@@ -2593,7 +2593,7 @@ mod tests {
     }
 
     /// A turn for a job that waits until it is cancelled.
-    fn waiting_turn(app: &mut App) -> Turn {
+    fn waiting_turn(app: &App) -> Turn {
         let job = app.jobs.submit(
             JobSpec::new(JobKind::Chat, "question")
                 .lane(Lane::serial(&LaneKey::Session(SessionId::from("test")))),
@@ -2715,7 +2715,7 @@ mod tests {
     async fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        let mut turn = waiting_turn(&mut app);
+        let mut turn = waiting_turn(&app);
         app.handle_turn_event(
             &mut turn,
             AgentEvent::ToolStarted {
@@ -2822,7 +2822,7 @@ mod tests {
     async fn a_turn_with_text_then_a_tool_then_text_keeps_one_assistant_message() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        let mut turn = waiting_turn(&mut app);
+        let mut turn = waiting_turn(&app);
 
         // The common preamble before the first tool call.
         app.handle_turn_event(
@@ -2899,7 +2899,7 @@ mod tests {
     async fn a_turn_with_text_then_a_write_permission_then_text_keeps_one_assistant_message() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        let mut turn = waiting_turn(&mut app);
+        let mut turn = waiting_turn(&app);
 
         app.handle_turn_event(
             &mut turn,
@@ -2914,8 +2914,8 @@ mod tests {
         );
         // A real `PermissionRequired` from a `TurnRecorder` so its answer
         // oneshot is live and the terminal's `y` resolves it.
-        let (sink, mut rx) = quack_core::analysis::events::channel();
-        let recorder = quack_core::analysis::events::TurnRecorder::new(sink);
+        let (sink, mut rx) = events::channel();
+        let recorder = events::TurnRecorder::new(sink);
         let pending = tokio::spawn(async move { recorder.ask_permission("DELETE FROM t").await });
         let request = match rx
             .recv()
@@ -2978,8 +2978,8 @@ mod tests {
         job: JobId,
         sql: &'static str,
     ) -> tokio::task::JoinHandle<bool> {
-        let (sink, mut rx) = quack_core::analysis::events::channel();
-        let recorder = quack_core::analysis::events::TurnRecorder::new(sink);
+        let (sink, mut rx) = events::channel();
+        let recorder = events::TurnRecorder::new(sink);
         let pending = tokio::spawn(async move { recorder.ask_permission(sql).await });
         let request = match rx.recv().await.unwrap_or_else(|| fail("no event")) {
             AgentEvent::PermissionRequired(request) => request,
@@ -3026,7 +3026,7 @@ mod tests {
     async fn the_overlay_shows_a_pending_agent_write_after_the_transcript_clears() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        let turn = waiting_turn(&mut app);
+        let turn = waiting_turn(&app);
         let job = turn.job.id;
         app.turns.push(turn);
         let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
@@ -3046,7 +3046,7 @@ mod tests {
     async fn an_agent_write_stays_on_screen_across_a_new_session() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        let turn = waiting_turn(&mut app);
+        let turn = waiting_turn(&app);
         let job = turn.job.id;
         app.turns.push(turn);
         let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
@@ -3073,12 +3073,12 @@ mod tests {
         let mut app = app(dir.path());
         let other = app
             .db
-            .run_at(quack_core::priority::Priority::Interactive, |db| {
+            .run_at(Priority::Interactive, |db| {
                 sessions::create_session(db, "m", ChatMode::Chat, None)
             })
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let turn = waiting_turn(&mut app);
+        let turn = waiting_turn(&app);
         let job = turn.job.id;
         let whose = turn.whose();
         app.turns.push(turn);
@@ -3117,7 +3117,7 @@ mod tests {
     async fn the_overlay_asks_about_the_front_prompt_and_counts_the_rest() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        let turn = waiting_turn(&mut app);
+        let turn = waiting_turn(&app);
         let job = turn.job.id;
         app.turns.push(turn);
         let first = ask_to_write(&mut app, job, "DELETE FROM first_table").await;
@@ -3405,7 +3405,7 @@ mod tests {
         config.embedding.model = Some(
             "ollama/embeddinggemma"
                 .parse()
-                .unwrap_or_else(|e: quack_core::error::Error| fail(&e.to_string())),
+                .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
         );
         config.providers.insert(
             "ollama"

@@ -20,6 +20,7 @@ use toml::{Table, Value as TomlValue};
 
 use crate::embedding::ResolvedPrompts;
 use crate::embedding::presets::Family;
+use crate::error;
 
 use super::{
     AuthMode, AwsRegion, BaseUrl, ClientAuth, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR,
@@ -234,13 +235,14 @@ impl Inspection {
     ///
     /// Returns an error when `control.db` exists but cannot be opened or
     /// read.
-    pub async fn resolve_registered(&mut self) -> crate::error::Result<()> {
+    pub async fn resolve_registered(&mut self) -> error::Result<()> {
         use crate::llm::oauth::registration::{ClientSection, registered_sections};
+        use crate::storage::control::ControlPlane;
         let sections = registered_sections(&self.config);
         if sections.is_empty() || !self.config.control_db_path().exists() {
             return Ok(());
         }
-        let control = crate::storage::control::ControlPlane::open(&self.config).await?;
+        let control = ControlPlane::open(&self.config).await?;
         for registered in sections {
             let Some(row) = control.registration(registered.issuer.as_str()).await? else {
                 continue;

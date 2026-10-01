@@ -19,7 +19,7 @@ use crate::llm::Embeddings;
 use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
 /// What open extraction returns for one chunk.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenExtraction {
     #[serde(default)]
     pub entities: Vec<OpenEntity>,
@@ -29,21 +29,21 @@ pub struct OpenExtraction {
     pub attributes: Vec<OpenAttribute>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenEntity {
     pub name: String,
     #[serde(rename = "type")]
     pub type_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRelation {
     pub subject: String,
     pub relation: String,
     pub object: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAttribute {
     pub entity: String,
     pub name: String,
@@ -245,8 +245,8 @@ pub async fn run(
         }
         None => None,
     };
-    let lookup = |a: &str, b: &str| table.as_ref().is_some_and(|t| t.same(a, b));
-    let similarity: Similarity<'_> = if table.is_some() { Some(&lookup) } else { None };
+    let lookup: &dyn Fn(&str, &str) -> bool = &|a, b| table.as_ref().is_some_and(|t| t.same(a, b));
+    let similarity: Similarity<'_> = table.is_some().then_some(lookup);
     let candidates = propose(&observations, current, options, similarity);
     let low = u32::try_from(candidates.iter().filter(|c| c.low_support).count()).unwrap_or(0);
     let summary = RunSummary {

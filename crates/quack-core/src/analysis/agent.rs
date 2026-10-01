@@ -167,13 +167,13 @@ pub struct Analysis<'a, M> {
     pub graph_options: GraphOptions,
     pub write_policy: WritePolicy,
     pub prompt: PromptOptions,
-    pub history: Vec<rig::message::Message>,
+    pub history: Vec<Message>,
     pub message: &'a str,
 }
 
 impl<M> Analysis<'_, M>
 where
-    M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
+    M: EmbeddingModel + Clone + Send + Sync + 'static,
 {
     /// Run the rig agent with all analysis tools, emitting `AgentEvent`s
     /// on `sink` as the turn progresses.
@@ -189,7 +189,7 @@ where
     /// the model call fails.
     pub async fn run(
         self,
-        completion_model: impl rig::completion::CompletionModel + Clone + 'static,
+        completion_model: impl CompletionModel + Clone + 'static,
         sink: EventSink,
     ) -> Result<AgentResponse> {
         let max_turns = usize::try_from(self.config.max_turns)
@@ -269,12 +269,7 @@ impl OllamaWindow {
     /// loads a model with a 4,096-token window unless the request says
     /// otherwise and truncates the front of a longer prompt, which is where
     /// the tool guidance is.
-    fn for_turn(
-        cap: Tokens,
-        system_prompt: &str,
-        history: &[rig::message::Message],
-        user_message: &str,
-    ) -> Self {
+    fn for_turn(cap: Tokens, system_prompt: &str, history: &[Message], user_message: &str) -> Self {
         let history_chars = serde_json::to_string(history).map_or(0, |h| h.len());
         let prompt = Tokens::of_chars(
             system_prompt
@@ -305,11 +300,11 @@ impl OllamaWindow {
 
 impl<M> Analysis<'_, M>
 where
-    M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
+    M: EmbeddingModel + Clone + Send + Sync + 'static,
 {
     async fn run_inner(
         self,
-        completion_model: impl rig::completion::CompletionModel + Clone + 'static,
+        completion_model: impl CompletionModel + Clone + 'static,
         recorder: &TurnRecorder,
     ) -> Result<AgentResponse> {
         let Self {
@@ -385,23 +380,21 @@ where
                 }
             };
             match item {
-                rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::Text(text),
-                ) => {
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
                     streamed.push_str(&text.text);
                     recorder.emit(AgentEvent::TextDelta(text.text));
                 }
-                rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
+                MultiTurnStreamItem::FinalResponse(response) => {
                     if response.usage.has_values() {
                         aggregate = Some(response.usage.into());
                     }
                     final_text = Some(response.output);
                 }
-                rig::agent::MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
-                rig::agent::MultiTurnStreamItem::StreamAssistantItem(_)
-                | rig::agent::MultiTurnStreamItem::StreamUserItem(_)
-                | rig::agent::MultiTurnStreamItem::ToolExecutionCommitted { .. }
-                | rig::agent::MultiTurnStreamItem::ModelTurnRetried { .. } => {}
+                MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
+                MultiTurnStreamItem::StreamAssistantItem(_)
+                | MultiTurnStreamItem::StreamUserItem(_)
+                | MultiTurnStreamItem::ToolExecutionCommitted { .. }
+                | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
             }
         }
 
@@ -548,12 +541,12 @@ impl BuildContext<'_> {
     /// The rig agent with every tool this workspace and mode register.
     fn build_agent<M>(
         &self,
-        completion_model: impl rig::completion::CompletionModel + Clone + 'static,
+        completion_model: impl CompletionModel + Clone + 'static,
         embedding_model: Option<Embedder<M>>,
         system_prompt: &str,
-    ) -> Result<rig::agent::Agent>
+    ) -> Result<Agent>
     where
-        M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
+        M: EmbeddingModel + Clone + Send + Sync + 'static,
     {
         let ctx = self;
         let search = SearchDocumentsTool::from_config(
@@ -683,7 +676,7 @@ mod tests {
         let limit = prompt_error(PromptError::MaxTurnsError {
             max_turns: 10,
             chat_history: Box::new(Vec::new()),
-            prompt: Box::new(rig::message::Message::user("q")),
+            prompt: Box::new(Message::user("q")),
         });
         let text = StreamStop(&limit).explain(config.max_turns, Window::Provider);
         assert!(
@@ -691,9 +684,9 @@ mod tests {
             "{text}"
         );
 
-        let provider = rig::agent::StreamingError::Completion(
-            rig::completion::CompletionError::ProviderError(String::from("connection refused")),
-        );
+        let provider = rig::agent::StreamingError::Completion(CompletionError::ProviderError(
+            String::from("connection refused"),
+        ));
         assert!(!StreamStop(&provider).by_agent_loop());
         let text = StreamStop(&provider).explain(config.max_turns, Window::Provider);
         assert!(text.contains("connection refused"), "{text}");

@@ -116,19 +116,19 @@ async fn two_vaults_concurrent_first_seals_on_a_fresh_key_agree_and_open_after_a
         let b = std::sync::Arc::new(Vault::new(dir.path(), KeySource::File));
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let ha = tokio::spawn({
-            let a = a.clone();
-            let barrier = barrier.clone();
+            let a = std::sync::Arc::clone(&a);
+            let barrier = std::sync::Arc::clone(&barrier);
             async move {
-                let _ = barrier.wait().await;
+                barrier.wait().await;
                 a.seal(Purpose::ProviderToken, "provider-p", b"p's token")
                     .await
             }
         });
         let hb = tokio::spawn({
-            let b = b.clone();
-            let barrier = barrier.clone();
+            let b = std::sync::Arc::clone(&b);
+            let barrier = std::sync::Arc::clone(&barrier);
             async move {
-                let _ = barrier.wait().await;
+                barrier.wait().await;
                 b.seal(Purpose::ProviderToken, "provider-q", b"q's token")
                     .await
             }

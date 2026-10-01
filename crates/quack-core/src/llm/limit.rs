@@ -539,7 +539,7 @@ mod tests {
         }
         for call in calls {
             let body = call.await.unwrap_or_else(|e| fail(&e.to_string()));
-            assert_eq!(&body[..], b"ok");
+            assert_eq!(&*body, b"ok");
         }
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         let gate = limited
@@ -578,7 +578,7 @@ mod tests {
         let embed = tokio::spawn(call(client.clone(), url.clone(), r#"{"model":"embed"}"#));
         for handle in [chat, embed] {
             assert_eq!(
-                &handle.await.unwrap_or_else(|e| fail(&e.to_string()))[..],
+                &*handle.await.unwrap_or_else(|e| fail(&e.to_string())),
                 b"ok"
             );
         }

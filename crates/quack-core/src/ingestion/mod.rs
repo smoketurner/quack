@@ -632,6 +632,10 @@ impl EmbedPlan<'_> {
         // Batches are collected before the futures are built: a closure that
         // takes the slice by reference would tie each future's type to that
         // borrow and fail the `Send` check the server's handlers need.
+        #[expect(
+            clippy::needless_collect,
+            reason = "the owned batches keep the futures Send"
+        )]
         let batches_input: Vec<(Vec<ChunkId>, Vec<Input>)> = chunk_ids
             .chunks(batch_size)
             .zip(chunks.chunks(batch_size))

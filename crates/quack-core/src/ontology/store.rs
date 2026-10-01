@@ -150,7 +150,7 @@ pub fn current(db: &WorkspaceDb) -> Result<Option<Ontology>> {
             .map(|v| serde_json::from_str(&v))
             .transpose()?
             .unwrap_or_default();
-        properties.entry(id.clone()).or_insert(Property {
+        properties.entry(id.clone()).or_insert_with(|| Property {
             id: id.clone(),
             label,
             kind,
@@ -294,7 +294,7 @@ fn write_version(
         let kept = existed
             .then(|| prior_since.get(&(kind, id.to_owned())).copied())
             .flatten();
-        i64::from(kept.unwrap_or(version.get()))
+        i64::from(kept.unwrap_or_else(|| version.get()))
     };
     for table in [
         "_quack_ontology_classes",
@@ -405,7 +405,7 @@ fn write_property_rows(
                     } else {
                         Some(serde_json::to_string(&property.values)?)
                     },
-                    i64::from(kept.unwrap_or(version.get()))
+                    i64::from(kept.unwrap_or_else(|| version.get()))
                 ],
             )?;
         }
@@ -557,7 +557,7 @@ mod tests {
             |c| c.properties == ["title", "email"] || c.properties == ["email", "title"]
         ));
 
-        let mut edited = live.clone();
+        let mut edited = live;
         edited.classes.push(Class {
             id: ClassId::from("vendor"),
             parent: ClassId::from("organization"),

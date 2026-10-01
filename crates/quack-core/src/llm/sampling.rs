@@ -168,7 +168,7 @@ pub fn check_tool_calls(model: &str, wire: Wire, effort: Option<Effort>) -> Resu
 }
 
 /// What a request to one model carries.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sampling {
     /// Whether the requested `temperature` is sent.
     temperature: bool,
@@ -358,7 +358,7 @@ impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for S
     fn completion(
         &self,
         request: rig::completion::CompletionRequest,
-    ) -> impl std::future::Future<
+    ) -> impl Future<
         Output = std::result::Result<
             rig::completion::CompletionResponse,
             rig::completion::CompletionError,
@@ -370,7 +370,7 @@ impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for S
     fn stream(
         &self,
         request: rig::completion::CompletionRequest,
-    ) -> impl std::future::Future<
+    ) -> impl Future<
         Output = std::result::Result<
             rig::streaming::StreamingCompletionResponse,
             rig::completion::CompletionError,

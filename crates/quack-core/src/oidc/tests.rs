@@ -16,6 +16,8 @@ use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPai
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
 use super::*;
+use crate::config::Config;
+use crate::llm::oauth::KeySource;
 use crate::llm::oauth::client_key::{ClientKeyName, PublicJwk, tests::verify};
 
 /// The `aud` the test sign-in accepts on access tokens.
@@ -81,9 +83,9 @@ impl MockIssuer {
 
     /// The client keys of this issuer's data directory.
     fn keys(&self) -> ClientKeys {
-        let mut config = crate::config::Config::default();
+        let mut config = Config::default();
         config.general.data_dir = self.dir.path().to_path_buf();
-        ClientKeys::new(&config, crate::llm::oauth::KeySource::File)
+        ClientKeys::new(&config, KeySource::File)
     }
 
     fn with(&self, change: impl FnOnce(&mut IssuerState)) {
@@ -860,10 +862,10 @@ async fn a_confidential_client_pushes_with_its_secret_and_without_par_nothing_is
 #[tokio::test]
 async fn the_sign_in_and_a_provider_registered_as_the_same_client_share_one_key() {
     use crate::config::{Exchange, Grant, OAuthConfig};
-    use crate::llm::oauth::{KeySource, TokenManager};
+    use crate::llm::oauth::TokenManager;
     let issuer = MockIssuer::start().await;
     let sign_in = issuer.sign_in_with_key().await;
-    let mut config = crate::config::Config::default();
+    let mut config = Config::default();
     config.general.data_dir = issuer.dir.path().to_path_buf();
     let oauth = OAuthConfig {
         // The same client, written with a trailing slash.

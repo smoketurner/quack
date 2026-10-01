@@ -23,6 +23,7 @@ use crate::config::{
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::Error;
+use crate::llm::bedrock;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
@@ -625,11 +626,7 @@ struct OllamaShow {
 }
 
 impl OllamaShow {
-    async fn fetch(
-        http: &reqwest::Client,
-        base: &BaseUrl,
-        model: &str,
-    ) -> std::result::Result<Self, Probe> {
+    async fn fetch(http: &reqwest::Client, base: &BaseUrl, model: &str) -> Result<Self, Probe> {
         let url = format!("{}/api/show", base.root());
         let response = http
             .post(url)
@@ -663,7 +660,7 @@ impl OllamaShow {
 fn width_check(
     model: ModelRef<'_>,
     configured: Dimension,
-    show: std::result::Result<OllamaShow, Probe>,
+    show: Result<OllamaShow, Probe>,
 ) -> Option<Check> {
     let reported = show.ok()?.embedding_length()?;
     Some(if reported == configured.get() {
@@ -763,7 +760,7 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
             format!("{model}: {surface} (not probed: --offline)"),
         );
     }
-    let session = match crate::llm::bedrock::session(name, provider).await {
+    let session = match bedrock::session(name, provider).await {
         Ok(session) => session,
         Err(e) => {
             return Check::new(area, Status::Fail, format!("{model}: {e}")).fix(
@@ -825,7 +822,7 @@ async fn model_credential(
     area: Area,
     config: &Config,
     model: ModelRef<'_>,
-) -> std::result::Result<Option<String>, Box<Check>> {
+) -> Result<Option<String>, Box<Check>> {
     let provider = model.provider;
     let name = model.provider_name;
     Ok(match &provider.auth {
@@ -890,7 +887,7 @@ fn listing_check(
     area: Area,
     model: ModelRef<'_>,
     base: &BaseUrl,
-    listing: std::result::Result<Listing, Probe>,
+    listing: Result<Listing, Probe>,
 ) -> Check {
     let provider = model.provider;
     let name = model.provider_name;
@@ -978,7 +975,7 @@ async fn oauth_token(
     config: &Config,
     name: &ProviderName,
     oauth: &OAuthConfig,
-) -> std::result::Result<OAuthProbe, String> {
+) -> Result<OAuthProbe, String> {
     let manager = TokenManager::shared(config, name, oauth).map_err(|e| e.to_string())?;
     let supported = manager.issuer_supports_grant().await;
     if matches!(supported, Ok(Some(false))) {
@@ -1390,7 +1387,7 @@ impl Listing {
         config: &ProviderConfig,
         base: &BaseUrl,
         credential: Option<&str>,
-    ) -> std::result::Result<Self, Probe> {
+    ) -> Result<Self, Probe> {
         let provider = config.provider_type;
         let headers = config
             .header_map()

@@ -48,13 +48,13 @@ pub struct WorkspaceRow {
 }
 
 impl FromRow<'_, SqliteRow> for WorkspaceRow {
-    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
         Ok(Self {
-            id: r.try_get("id")?,
-            name: r.try_get("name")?,
-            classification: r.try_get("classification")?,
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            classification: row.try_get("classification")?,
             allowed_providers: AllowedProviders::from_column(
-                r.try_get::<Option<String>, _>("allowed_providers")?
+                row.try_get::<Option<String>, _>("allowed_providers")?
                     .as_deref(),
             ),
         })
@@ -65,7 +65,7 @@ impl FromRow<'_, SqliteRow> for WorkspaceRow {
 /// parse is a decode error for the column, not a silent default.
 fn parsed<T>(r: &SqliteRow, column: &str) -> sqlx::Result<T>
 where
-    T: std::str::FromStr<Err = Error>,
+    T: FromStr<Err = Error>,
 {
     r.try_get::<String, _>(column)?
         .parse()
@@ -176,8 +176,8 @@ impl TokenSecret {
     }
 }
 
-impl std::fmt::Debug for TokenSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TokenSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("TokenSecret(<redacted>)")
     }
 }
@@ -199,12 +199,12 @@ pub struct UserRow {
 }
 
 impl FromRow<'_, SqliteRow> for UserRow {
-    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
         Ok(Self {
-            id: r.try_get("id")?,
-            username: r.try_get("username")?,
-            is_admin: r.try_get("is_admin")?,
-            created_at: r.try_get("created_at")?,
+            id: row.try_get("id")?,
+            username: row.try_get("username")?,
+            is_admin: row.try_get("is_admin")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 }
@@ -240,13 +240,13 @@ pub struct MemberRow {
 }
 
 impl FromRow<'_, SqliteRow> for MemberRow {
-    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
         Ok(Self {
-            workspace_id: r.try_get("workspace_id")?,
-            user_id: r.try_get("user_id")?,
-            username: r.try_get("username")?,
-            role: parsed(r, "role")?,
-            created_at: r.try_get("created_at")?,
+            workspace_id: row.try_get("workspace_id")?,
+            user_id: row.try_get("user_id")?,
+            username: row.try_get("username")?,
+            role: parsed(row, "role")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 }
@@ -280,20 +280,20 @@ pub struct TokenRow {
 }
 
 impl FromRow<'_, SqliteRow> for TokenRow {
-    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
-        let scopes: String = r.try_get("scopes")?;
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
+        let scopes: String = row.try_get("scopes")?;
         Ok(Self {
-            token_hash: r.try_get("token_hash")?,
-            workspace_id: r.try_get("workspace_id")?,
-            user_id: r.try_get("user_id")?,
-            name: r.try_get("name")?,
+            token_hash: row.try_get("token_hash")?,
+            workspace_id: row.try_get("workspace_id")?,
+            user_id: row.try_get("user_id")?,
+            name: row.try_get("name")?,
             scopes: serde_json::from_str(&scopes).map_err(|e| sqlx::Error::ColumnDecode {
                 index: String::from("scopes"),
                 source: Box::new(e),
             })?,
-            created_at: r.try_get("created_at")?,
-            expires_at: r.try_get("expires_at")?,
-            last_used_at: r.try_get("last_used_at")?,
+            created_at: row.try_get("created_at")?,
+            expires_at: row.try_get("expires_at")?,
+            last_used_at: row.try_get("last_used_at")?,
         })
     }
 }
@@ -609,20 +609,20 @@ pub struct AuditRow {
 }
 
 impl FromRow<'_, SqliteRow> for AuditRow {
-    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
         Ok(Self {
-            id: r.try_get("id")?,
-            timestamp: r.try_get("timestamp")?,
-            user_id: r.try_get("user_id")?,
-            token_hash: r.try_get("token_hash")?,
-            workspace_id: r.try_get("workspace_id")?,
-            action: r.try_get("action")?,
-            resource_type: r.try_get("resource_type")?,
-            resource_id: r.try_get("resource_id")?,
-            outcome: parsed(r, "outcome")?,
-            channel: parsed(r, "channel")?,
-            client_addr: r.try_get("client_addr")?,
-            request_id: r.try_get("request_id")?,
+            id: row.try_get("id")?,
+            timestamp: row.try_get("timestamp")?,
+            user_id: row.try_get("user_id")?,
+            token_hash: row.try_get("token_hash")?,
+            workspace_id: row.try_get("workspace_id")?,
+            action: row.try_get("action")?,
+            resource_type: row.try_get("resource_type")?,
+            resource_id: row.try_get("resource_id")?,
+            outcome: parsed(row, "outcome")?,
+            channel: parsed(row, "channel")?,
+            client_addr: row.try_get("client_addr")?,
+            request_id: row.try_get("request_id")?,
         })
     }
 }
@@ -833,14 +833,14 @@ pub struct RegistrationRow {
 }
 
 impl FromRow<'_, SqliteRow> for RegistrationRow {
-    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
-        let key_id: Option<String> = r.try_get("key_id")?;
-        let enc: Option<Vec<u8>> = r.try_get("enc")?;
-        let ciphertext: Option<Vec<u8>> = r.try_get("ciphertext")?;
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
+        let key_id: Option<String> = row.try_get("key_id")?;
+        let enc: Option<Vec<u8>> = row.try_get("enc")?;
+        let ciphertext: Option<Vec<u8>> = row.try_get("ciphertext")?;
         Ok(Self {
-            name: r.try_get("name")?,
-            client_id: r.try_get("client_id")?,
-            registration_client_uri: r.try_get("registration_client_uri")?,
+            name: row.try_get("name")?,
+            client_id: row.try_get("client_id")?,
+            registration_client_uri: row.try_get("registration_client_uri")?,
             token: match (key_id, enc, ciphertext) {
                 (Some(key_id), Some(enc), Some(ciphertext)) => Some(Sealed {
                     key_id,
@@ -876,11 +876,11 @@ pub enum Previous<'a> {
 
 /// A sealed-token row: the sealed value, as `vault::Sealed` is.
 impl FromRow<'_, SqliteRow> for Sealed {
-    fn from_row(r: &SqliteRow) -> sqlx::Result<Self> {
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
         Ok(Self {
-            key_id: r.try_get("key_id")?,
-            enc: r.try_get("enc")?,
-            ciphertext: r.try_get("ciphertext")?,
+            key_id: row.try_get("key_id")?,
+            enc: row.try_get("enc")?,
+            ciphertext: row.try_get("ciphertext")?,
         })
     }
 }

@@ -280,7 +280,7 @@ impl fmt::Display for Banner<'_> {
         let [top, head, body, feet] = DUCK;
         write!(
             f,
-            r"
+            "
    {top}
    {head:<13}quack {version}
    {body:<13}knowledge engine: documents, tables, graph

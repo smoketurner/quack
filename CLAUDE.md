@@ -48,7 +48,13 @@ docs/                 # design-doc.md (the product), architecture, migrations, c
 - **Lints are strict and inherited.** Every crate uses `[lints] workspace = true`. The
   baseline denies panics (`unwrap`/`expect`/`panic`/`todo`), panic-prone indexing/slicing,
   lossy casts, and `arithmetic_side_effects`, and warns on all of clippy `pedantic`. In
-  tests, opt out narrowly: `#[expect(clippy::unwrap_used, reason = "...")]`.
+  tests, opt out narrowly: `#[expect(clippy::unwrap_used, reason = "...")]`; `#[allow]` is
+  denied, so every opt-out is an `#[expect]` with a reason.
+- **Import, don't spell paths.** `clippy::absolute_paths` denies any `crate::` or
+  `quack_core::` path longer than two segments outside a `use`: import the type, or import
+  a function's parent module and call `module::function`. External crates are exempt
+  through `absolute-paths-allowed-crates` in `.clippy.toml`; a new dependency named by a
+  full path goes on that list.
 - **Dependencies are pinned** to exact versions in `[workspace.dependencies]` with
   `default-features = false`. Crates opt into features explicitly. When adding a dependency,
   look up the current version and add it there, not in the member crate.

@@ -186,8 +186,7 @@ impl EmbeddingModel for HashEmbedder {
     fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl std::future::Future<Output = std::result::Result<Vec<Embedding>, EmbeddingError>> + Send
-    {
+    ) -> impl Future<Output = std::result::Result<Vec<Embedding>, EmbeddingError>> + Send {
         let embeddings = texts
             .into_iter()
             .map(|text| {

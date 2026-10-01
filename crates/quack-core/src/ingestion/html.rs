@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn html_yields_title_and_heading_sections() {
-        let page = r"<!doctype html><html><head><title> Renewal  Guide </title>
+        let page = "<!doctype html><html><head><title> Renewal  Guide </title>
 <style>p{color:red}</style><script>var x = 1;</script></head>
 <body><nav>Home | About</nav>
 <p>Intro paragraph.</p>
