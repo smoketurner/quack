@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use futures::StreamExt;
 use rig::prelude::*;
@@ -93,6 +94,10 @@ pub struct AgentResponse {
     /// turn that cost nothing.
     #[serde(default)]
     pub usage: Option<TokenUsage>,
+    /// Milliseconds from the question to the answer, prompt assembly
+    /// included. `None` on a response no turn timed.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
@@ -145,6 +150,7 @@ impl AgentResponse {
             "write_refused": self.write_refused,
             "cancelled": self.cancelled,
             "usage": self.usage,
+            "duration_ms": self.duration_ms,
             "session_id": session_id,
         })
     }
@@ -169,6 +175,8 @@ pub struct Analysis<'a, M> {
     pub prompt: PromptOptions,
     pub history: Vec<Message>,
     pub message: &'a str,
+    /// When the question arrived; the answer's `duration_ms` counts from here.
+    pub asked: Instant,
 }
 
 impl<M> Analysis<'_, M>
@@ -318,6 +326,7 @@ where
             prompt,
             history,
             message: user_message,
+            asked,
         } = self;
         let PromptAndModel {
             system_prompt,
@@ -402,6 +411,7 @@ where
         Ok(outputs.finish(
             recorder.citations().validate(&raw),
             aggregate.or_else(|| per_call.reported()),
+            asked,
         ))
     }
 }
@@ -506,7 +516,12 @@ impl TurnOutputs {
 
     /// The response once the stream has ended: the checked answer, the
     /// chart and graph results the tools left behind, and the steps.
-    fn finish(&self, answer: CitedAnswer, usage: Option<TokenUsage>) -> AgentResponse {
+    fn finish(
+        &self,
+        answer: CitedAnswer,
+        usage: Option<TokenUsage>,
+        asked: Instant,
+    ) -> AgentResponse {
         let graph = std::mem::take(&mut *self.graph.lock().unwrap_or_else(PoisonError::into_inner));
         AgentResponse {
             content: answer.text,
@@ -517,6 +532,7 @@ impl TurnOutputs {
             write_refused: self.refused.was_refused(),
             cancelled: false,
             usage,
+            duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
         }
     }
 }

@@ -9,12 +9,13 @@ pub mod bedrock;
 pub mod oauth;
 pub mod sampling;
 
+use jiff::Timestamp;
 use rig::client::EmbeddingsClient;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rig::prelude::*;
 
@@ -936,6 +937,8 @@ impl TurnRequest<'_> {
             sink,
             cancel,
         } = self;
+        let asked = Instant::now();
+        let asked_at = Timestamp::now();
         // A failure before the turn begins is the turn's failure too, so an
         // interface that only reads the events still sees why.
         let StartedTurn {
@@ -986,6 +989,7 @@ impl TurnRequest<'_> {
             prompt,
             history,
             message,
+            asked,
         };
         let turn = Priority::Interactive.scope(dispatch(config, chat, analysis, inner_sink));
         let outcome = tokio::select! {
@@ -1007,6 +1011,7 @@ impl TurnRequest<'_> {
             let response = AgentResponse {
                 content,
                 cancelled: true,
+                duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
                 ..AgentResponse::default()
             };
             tracing::info!(session = %session_id, "agent turn cancelled");
@@ -1016,7 +1021,7 @@ impl TurnRequest<'_> {
 
         let (session, text, recorded) =
             (session_id.to_owned(), message.to_owned(), response.clone());
-        db.run(move |guard| sessions::record_turn(guard, &session, &text, &recorded))
+        db.run(move |guard| sessions::record_turn(guard, &session, &text, asked_at, &recorded))
             .await?;
         Ok(response)
     }
@@ -1600,9 +1605,13 @@ mod tests {
         .unwrap_or_else(|e| fail(&e.to_string()));
         assert!(response.cancelled);
         assert_eq!(response.content, CANCELLED_NOTE);
+        assert!(
+            response.duration_ms.is_some(),
+            "a cancelled turn is timed too"
+        );
         let last = events.recv().await;
         assert!(
-            matches!(&last, Some(AgentEvent::TurnComplete(r)) if r.cancelled),
+            matches!(&last, Some(AgentEvent::TurnComplete(r)) if r.cancelled && r.duration_ms.is_some()),
             "{last:?}"
         );
         let id = session.id.clone();
@@ -1621,7 +1630,8 @@ mod tests {
         assert!(
             messages
                 .last()
-                .is_some_and(|m| m.content.contains("Cancelled by the user"))
+                .is_some_and(|m| m.content.contains("Cancelled by the user")
+                    && m.assistant().and_then(|a| a.duration_ms).is_some())
         );
     }
 }

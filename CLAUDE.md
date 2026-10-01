@@ -200,7 +200,7 @@ temporary client stays recorded (sealed) until deleted, so an interrupted run le
 each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
 client (`unregister`).
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
-labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `session_id`); a write refused
+labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200 plus a `write_refused` SSE event, MCP structured
 content, print exit 3). `usage` is `AgentResponse::usage`, the provider's own
 `input_tokens`/`output_tokens`/`total_tokens` for the turn taken off rig's final response

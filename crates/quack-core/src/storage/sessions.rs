@@ -7,6 +7,8 @@
 
 use std::fmt::Write as _;
 
+use jiff::Timestamp;
+
 use crate::analysis::agent::{AgentResponse, TokenUsage};
 use crate::analysis::chart::ChartSpec;
 use crate::analysis::citations::Citation;
@@ -177,6 +179,9 @@ pub struct AssistantMeta {
     pub graph: Vec<GraphResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    /// How long the turn took, in milliseconds; absent on turns recorded before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl AssistantMeta {
@@ -190,6 +195,7 @@ impl AssistantMeta {
             write_refused: response.write_refused,
             graph: response.graph.clone(),
             usage: response.usage,
+            duration_ms: response.duration_ms,
         };
         (meta != Self::default()).then_some(meta)
     }
@@ -468,9 +474,9 @@ pub fn messages(db: &WorkspaceDb, session_id: &SessionId) -> Result<Vec<MessageR
     Ok(out)
 }
 
-/// Record a completed turn: the user message, one tool message per step,
-/// and the assistant answer. Sets the session title from the first user
-/// message.
+/// Record a completed turn: the user message, stamped `asked_at`, one tool
+/// message per step, and the assistant answer. Sets the session title from
+/// the first user message.
 ///
 /// # Errors
 ///
@@ -479,12 +485,23 @@ pub fn record_turn(
     db: &WorkspaceDb,
     session_id: &SessionId,
     user_message: &str,
+    asked_at: Timestamp,
     response: &AgentResponse,
 ) -> Result<()> {
     let session =
         get_session(db, session_id)?.ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
 
-    append_message(db, session_id, MessageRole::User, user_message, None)?;
+    // The turn is recorded once it ends; the question keeps the time it was asked.
+    let seq = append_message(db, session_id, MessageRole::User, user_message, None)?;
+    db.connection().execute(
+        "UPDATE _quack_messages SET created_at = CAST(? AS TIMESTAMP) \
+         WHERE session_id = ? AND seq = ?",
+        duckdb::params![
+            asked_at.strftime("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+            session_id,
+            seq
+        ],
+    )?;
 
     for step in &response.steps {
         append_message(
@@ -754,6 +771,7 @@ mod tests {
             write_refused: false,
             cancelled: false,
             usage: None,
+            duration_ms: None,
         }
     }
 
@@ -857,6 +875,7 @@ mod tests {
             &db,
             &session.id,
             "  how many   claims are open?  ",
+            Timestamp::now(),
             &response(
                 "There are 4 open claims.",
                 vec![step(
@@ -898,7 +917,7 @@ mod tests {
             output_tokens: 57,
             total_tokens: 1_261,
         });
-        record_turn(&db, &session.id, "how many?", &answer).unwrap();
+        record_turn(&db, &session.id, "how many?", Timestamp::now(), &answer).unwrap();
 
         let rows = messages(&db, &session.id).unwrap();
         let assistant = rows
@@ -915,6 +934,49 @@ mod tests {
         );
     }
 
+    /// The question keeps the time it was asked, not the time the turn was
+    /// recorded, and the answer keeps how long it took. Both columns hold
+    /// UTC, which the web UI turns into the viewer's time zone.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn a_turn_keeps_when_it_was_asked_and_how_long_it_took() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        let asked = Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_secs(90))
+            .unwrap();
+        let mut answer = response("4", vec![]);
+        answer.duration_ms = Some(2_345);
+        record_turn(&db, &session.id, "how many?", asked, &answer).unwrap();
+
+        let rows = messages(&db, &session.id).unwrap();
+        let utc = |text: &str| {
+            text.parse::<jiff::civil::DateTime>()
+                .unwrap()
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .unwrap()
+                .timestamp()
+        };
+        let question = rows.iter().find(|r| r.role == MessageRole::User).unwrap();
+        assert_eq!(
+            utc(&question.created_at).as_microsecond(),
+            asked.as_microsecond()
+        );
+        let assistant = rows
+            .iter()
+            .find(|r| r.role == MessageRole::Assistant)
+            .unwrap();
+        let recorded = utc(&assistant.created_at);
+        assert!(
+            Timestamp::now().duration_since(recorded).abs() < jiff::SignedDuration::from_secs(60),
+            "the default now() is not UTC: {recorded}"
+        );
+        assert_eq!(
+            assistant.assistant().and_then(|m| m.duration_ms),
+            Some(2_345)
+        );
+    }
+
     /// The typed metadata writes the same JSON keys the column always held,
     /// leaving out what a message did not have, and reads it back.
     #[test]
@@ -926,7 +988,7 @@ mod tests {
         sql.rows = Some(1);
         let mut answer = response("One.", vec![sql]);
         answer.write_refused = true;
-        record_turn(&db, &session.id, "one?", &answer).unwrap();
+        record_turn(&db, &session.id, "one?", Timestamp::now(), &answer).unwrap();
 
         let stored: Vec<String> = {
             let conn = db.connection();
@@ -989,7 +1051,14 @@ mod tests {
     fn a_turn_without_reported_usage_records_no_usage_key() {
         let db = db();
         let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
-        record_turn(&db, &session.id, "q", &response("a", vec![])).unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "q",
+            Timestamp::now(),
+            &response("a", vec![]),
+        )
+        .unwrap();
 
         let rows = messages(&db, &session.id).unwrap();
         let assistant = rows
@@ -1008,7 +1077,14 @@ mod tests {
         let first = create_session(&db, "m", ChatMode::Query, None).unwrap();
         let second = create_session(&db, "m", ChatMode::Query, None).unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, second.id);
-        record_turn(&db, &first.id, "q", &response("a", vec![])).unwrap();
+        record_turn(
+            &db,
+            &first.id,
+            "q",
+            Timestamp::now(),
+            &response("a", vec![]),
+        )
+        .unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, first.id);
         assert_eq!(list_sessions(&db, 10).unwrap().len(), 2);
     }
@@ -1035,6 +1111,7 @@ mod tests {
             &db,
             &session.id,
             "first question",
+            Timestamp::now(),
             &response(
                 "first answer",
                 vec![step(ToolName::RunSql, "SELECT 1", "1 rows")],
@@ -1045,6 +1122,7 @@ mod tests {
             &db,
             &session.id,
             "second question",
+            Timestamp::now(),
             &response("second answer", vec![]),
         )
         .unwrap();
@@ -1069,6 +1147,7 @@ mod tests {
             &db,
             &session.id,
             "first question",
+            Timestamp::now(),
             &response(
                 "first answer",
                 vec![step(ToolName::RunSql, "SELECT 1", "1 rows")],
@@ -1079,6 +1158,7 @@ mod tests {
             &db,
             &session.id,
             "second question",
+            Timestamp::now(),
             &response("second answer", vec![]),
         )
         .unwrap();
@@ -1121,6 +1201,7 @@ mod tests {
                 &db,
                 &session.id,
                 question,
+                Timestamp::now(),
                 &response(answer, vec![step(ToolName::RunSql, "SELECT 1", "1 rows")]),
             )
             .unwrap();
@@ -1181,6 +1262,7 @@ mod tests {
             &db,
             &session.id,
             "open claims?",
+            Timestamp::now(),
             &response(
                 "4",
                 vec![
@@ -1211,7 +1293,7 @@ mod tests {
         let db = db();
         let empty = create_session(&db, "m", ChatMode::Query, None).unwrap();
         let used = create_session(&db, "m", ChatMode::Query, None).unwrap();
-        record_turn(&db, &used.id, "q", &response("a", vec![])).unwrap();
+        record_turn(&db, &used.id, "q", Timestamp::now(), &response("a", vec![])).unwrap();
         assert!(delete_if_empty(&db, &empty.id).unwrap());
         assert!(!delete_if_empty(&db, &used.id).unwrap());
         assert!(!delete_if_empty(&db, &SessionId::from("missing")).unwrap());
@@ -1227,6 +1309,7 @@ mod tests {
             &db,
             &session.id,
             "open claims?",
+            Timestamp::now(),
             &response("Four.", vec![step(ToolName::RunSql, "SELECT 1", "1 rows")]),
         )
         .unwrap();

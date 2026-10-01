@@ -3465,6 +3465,7 @@ mod tests {
                     db,
                     &session,
                     "how many storms?",
+                    jiff::Timestamp::now(),
                     &AgentResponse {
                         content: String::from("Twelve storms."),
                         ..AgentResponse::default()

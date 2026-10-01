@@ -479,7 +479,7 @@ CREATE TABLE _quack_messages (
     seq        INTEGER NOT NULL,
     role       TEXT NOT NULL,                -- user | assistant | tool
     content    TEXT NOT NULL,
-    metadata   JSON,                         -- tool: ToolMeta (tool, detail, duration_ms, rows); assistant: AssistantMeta (chart, citations, write_refused, graph, usage)
+    metadata   JSON,                         -- tool: ToolMeta (tool, detail, duration_ms, rows); assistant: AssistantMeta (chart, citations, write_refused, graph, usage, duration_ms)
     created_at TIMESTAMP DEFAULT now(),
     UNIQUE (session_id, seq)
 );
@@ -1170,7 +1170,7 @@ write. Statements referencing `_quack_` tables are refused regardless.
 Every interface returns one response object (11.2), built by `AgentResponse::to_json`:
 `answer`, `citations` (each with `n`, `chunk_id`, `document_id`, `filename`, `chunk_index`,
 `page`, `heading`, `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
-`cancelled`, `usage`, `session_id`. `AuthRequired` is exit code 4 from every command that
+`cancelled`, `usage`, `duration_ms`, `session_id`. `AuthRequired` is exit code 4 from every command that
 reaches a provider.
 
 `usage` is the provider's report for the turn (`input_tokens`, `output_tokens`,
@@ -1179,6 +1179,11 @@ per-request counts when the turn derailed before a final response. It is `null`,
 when the provider reported nothing, as local models often do. The counts also go on the
 assistant message's metadata in `_quack_messages`, so session exports carry them. They are a
 record, not an input: the history trim and Ollama's `num_ctx` estimate before the call.
+
+`duration_ms` is the turn's wall-clock time, from the question's arrival (prompt assembly
+included) to the answer, cancelled turns too. It goes on the assistant message's metadata
+beside `usage`. The turn is recorded when it ends, so the user message's `created_at` is set
+to the time it was asked rather than left at the insert's `now()`.
 
 **Limits.** The agent's connection runs with `SET memory_limit` and `SET threads` from
 config. A statement runs on the calling thread (for the agent, a `spawn_blocking` one) while
@@ -1611,6 +1616,7 @@ mode emits:
   "write_refused": false,
   "cancelled": false,
   "usage": {"input_tokens": 1204, "output_tokens": 57, "total_tokens": 1261},
+  "duration_ms": 2345,
   "session_id": "..."
 }
 ```
