@@ -1166,6 +1166,9 @@ pub struct ServerConfig {
     pub session_idle_minutes: u32,
     /// When the session and sign-in cookies carry `Secure`.
     pub secure_cookies: SecureCookies,
+    /// How long a streamed turn waits for a person to decide a write the
+    /// agent wants to run before it goes on without it.
+    pub permission_timeout_seconds: u32,
     /// Sign-in through the organization's `OpenID` Connect issuer, beside
     /// password login.
     pub oidc: Option<OidcConfig>,
@@ -1335,6 +1338,7 @@ impl Default for ServerConfig {
             session_max_age_hours: 12,
             session_idle_minutes: 120,
             secure_cookies: SecureCookies::Auto,
+            permission_timeout_seconds: 300,
             oidc: None,
         }
     }
@@ -1345,6 +1349,12 @@ impl ServerConfig {
     #[must_use]
     pub fn session_max_age(&self) -> Duration {
         Duration::from_secs(u64::from(self.session_max_age_hours).saturating_mul(3600))
+    }
+
+    /// How long a write waits for a person's decision, at least one second.
+    #[must_use]
+    pub fn permission_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.permission_timeout_seconds.max(1)))
     }
 
     /// How long a session may sit unused before it is dropped.

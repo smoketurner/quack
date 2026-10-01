@@ -404,6 +404,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "session_max_age_hours",
             "session_idle_minutes",
             "secure_cookies",
+            "permission_timeout_seconds",
         ],
     ),
     (
@@ -832,6 +833,11 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         server.secure_cookies.as_str(),
         default.secure_cookies.as_str(),
         None,
+    );
+    s.literal(
+        "permission_timeout_seconds",
+        server.permission_timeout_seconds,
+        default.permission_timeout_seconds,
     );
     let Some(oidc) = &server.oidc else {
         return;

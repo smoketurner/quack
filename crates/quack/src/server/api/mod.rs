@@ -32,7 +32,7 @@ pub(crate) enum StreamEvent {
     Text,
     ToolStarted,
     ToolFinished,
-    WriteRefused,
+    PermissionRequired,
     Complete,
     Error,
     Jobs,
@@ -46,7 +46,7 @@ impl StreamEvent {
             Self::Text => "text",
             Self::ToolStarted => "tool_started",
             Self::ToolFinished => "tool_finished",
-            Self::WriteRefused => "write_refused",
+            Self::PermissionRequired => "permission_required",
             Self::Complete => "complete",
             Self::Error => "error",
             Self::Jobs => "jobs",
@@ -129,6 +129,10 @@ pub(crate) fn router() -> Router<App> {
         .route(
             "/workspaces/{id}/sessions/{sid}/export",
             get(sessions::export),
+        )
+        .route(
+            "/workspaces/{id}/sessions/{sid}/permissions/{request}",
+            post(sessions::decide),
         )
         .route(
             "/workspaces/{id}/members",

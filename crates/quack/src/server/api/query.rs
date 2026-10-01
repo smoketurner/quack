@@ -53,11 +53,15 @@ struct PreparedTurn {
 impl PreparedTurn {
     /// Everything a turn needs before the model is called: the
     /// authorization, the provider check, and the session (existing or new).
+    /// `unasked` is the write policy without `allow_write`: `Ask` when the
+    /// turn streams, so the person can answer, else `Deny`. A caller who
+    /// may not write is never asked.
     async fn prepare(
         app: &App,
         identity: Identity,
         workspace_id: &WorkspaceId,
         body: &QueryRequest,
+        unasked: WritePolicy,
     ) -> ApiResult<Self> {
         let access = Access::resolve(app, identity, workspace_id, Need::READ).await?;
         if body.allow_write && !access.permits(Need::WRITE) {
@@ -104,7 +108,12 @@ impl PreparedTurn {
             }
         })
         .await?;
-        let policy = WritePolicy::Deny.allowed_if(body.allow_write);
+        let unasked = if access.permits(Need::WRITE) {
+            unasked
+        } else {
+            WritePolicy::Deny
+        };
+        let policy = unasked.allowed_if(body.allow_write);
         Ok(Self {
             access,
             db,
@@ -254,7 +263,7 @@ pub(crate) async fn query(
 ) -> ApiResult<Json<serde_json::Value>> {
     // A client that disconnects drops this future, and the turn's guard
     // with it, which cancels the turn.
-    let mut turn = PreparedTurn::prepare(&app, identity, &id, &body)
+    let mut turn = PreparedTurn::prepare(&app, identity, &id, &body, WritePolicy::Deny)
         .await?
         .start(&app);
     let mut failure = None;
@@ -289,7 +298,7 @@ pub(crate) async fn stream(
     Path(id): Path<WorkspaceId>,
     Json(body): Json<QueryRequest>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
-    let turn = PreparedTurn::prepare(&app, identity, &id, &body)
+    let turn = PreparedTurn::prepare(&app, identity, &id, &body, WritePolicy::Ask)
         .await?
         .start(&app);
     let stream = futures::stream::unfold((turn, app), |(mut turn, app)| async move {
@@ -306,10 +315,19 @@ pub(crate) async fn stream(
                 .json_data(&step)
                 .unwrap_or_default(),
             AgentEvent::PermissionRequired(request) => {
-                request.deny();
-                StreamEvent::WriteRefused
+                let sql = request.sql.clone();
+                let held = app
+                    .permissions
+                    .hold(&app, &turn.access, &turn.session_id, request);
+                StreamEvent::PermissionRequired
                     .event()
-                    .data("writes are off for this request")
+                    .json_data(serde_json::json!({
+                        "request": held.request,
+                        "session_id": turn.session_id,
+                        "sql": sql,
+                        "expires_at": held.expires_at.to_string(),
+                    }))
+                    .unwrap_or_default()
             }
             AgentEvent::TurnComplete(response) => {
                 turn.record(&app, TurnEnd::Answered(&response)).await;

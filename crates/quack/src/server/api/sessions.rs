@@ -6,13 +6,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::error::Record;
-use quack_core::ids::{SessionId, WorkspaceId};
+use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
 use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
+use crate::server::permissions::Answer;
 use crate::server::state::{App, with_db};
 
 #[derive(Deserialize)]
@@ -282,4 +283,50 @@ pub(crate) async fn export(
         ExportFormat::Markdown => "text/markdown; charset=utf-8",
     };
     Ok(([(header::CONTENT_TYPE, content_type)], text).into_response())
+}
+
+/// A person's answer to a write their streamed turn is waiting on.
+#[derive(Deserialize)]
+pub(crate) struct Decision {
+    pub decision: Answer,
+}
+
+/// Answer the write `request` that the caller's turn in session `sid` is
+/// waiting on. Only the person whose question asked may answer, and only
+/// with write access; every answer is audited with the statement.
+pub(crate) async fn decide(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, sid, request)): Path<(WorkspaceId, SessionId, PermissionId)>,
+    Json(body): Json<Decision>,
+) -> ApiResult<axum::http::StatusCode> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let answer = body.decision;
+    let resource = Some(ResourceKind::Session.id(&sid));
+    match app.permissions.decide(&request, &access, &sid, answer) {
+        Ok(sql) => {
+            access
+                .audit(
+                    &app,
+                    AuditAction::Permission,
+                    resource,
+                    answer.outcome(),
+                    Some(answer.detail(&request, &sql)),
+                )
+                .await?;
+            Ok(axum::http::StatusCode::NO_CONTENT)
+        }
+        Err(refusal) => {
+            access
+                .audit(
+                    &app,
+                    AuditAction::Permission,
+                    resource,
+                    Outcome::Denied,
+                    None,
+                )
+                .await?;
+            Err(refusal.into())
+        }
+    }
 }

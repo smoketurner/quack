@@ -450,6 +450,8 @@ pub enum AuditAction {
     Share,
     Mode,
     Cancel,
+    /// A person's decision on a write the agent wanted to run.
+    Permission,
 }
 
 text_enum!(AuditAction, "audit action", {
@@ -486,6 +488,7 @@ text_enum!(AuditAction, "audit action", {
     Share => "share",
     Mode => "mode",
     Cancel => "cancel",
+    Permission => "permission",
 });
 
 /// The kinds of resource an audit row names by opaque id.

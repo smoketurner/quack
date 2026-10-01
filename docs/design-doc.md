@@ -149,7 +149,7 @@ Every interface calls the same core entry points:
 | Graph | `graph::traverse::{neighborhood,path}` | graph page | `GET .../graph/*` | `search_graph` | `/graph`, `quack graph` |
 | Ontology | `ontology::store::{current,save,versions,restore}`, `ontology::candidates` | ontology page | `.../ontology/*` | resource | `quack ontology` |
 | Context | `storage::context::{current,set,history,combined}` | context page | `.../context` | resource | `/context` |
-| Permission | `analysis::policy::WritePolicy` | prompt; `write_refused` on the answer | 200, `write_refused: true`, SSE `write_refused` | `write_refused: true` plus a sentence | y/n/a prompt / exit 3 |
+| Permission | `analysis::policy::WritePolicy` | an approval card; `write_refused` on the answer | SSE `permission_required` answered by `POST .../permissions/{request}`; otherwise 200, `write_refused: true` | `write_refused: true` plus a sentence | y/n/a prompt / exit 3 |
 
 The LLM layer is `rig`. `quack-core::llm` builds rig clients from config and exposes
 `ChatModel` and `EmbedModel` enums, so the rest of the core is provider-agnostic.
@@ -1196,7 +1196,7 @@ write. Statements referencing `_quack_` tables are refused regardless.
 |-----------|------|-------|
 | TUI | run | prompt `y`/`n`/`a` showing the SQL; `a` covers the rest of the turn and the session |
 | Print mode | run | refuse unless `--allow-write`; the answer completes and the exit code is 3 |
-| Web / REST | run | refuse unless `allow_write: true` from a member with the write scope (a request that asks for `allow_write` without it is 403); a refusal inside the turn is not a failed request: 200 with `write_refused: true` on the response object and a `write_refused` SSE event; the web page shows a banner offering the checkbox |
+| Web / REST | run | `allow_write: true` from a member with the write scope runs every write (asked for without it, 403). Otherwise a streamed turn (`query/stream`) from someone who may write asks: the turn holds the write in memory (`server::permissions::Permissions`) and sends a `permission_required` event (`{request, session_id, sql, expires_at}`); the person who asked answers with `POST .../sessions/{sid}/permissions/{request}` `{"decision": "allow" \| "deny" \| "allow_turn"}` (204; 404 unknown or expired; 409 already answered; 403 for anyone else or without write access), and the turn goes on. No answer within `[server].permission_timeout_seconds` (300) refuses the write; a restart ends the waiting turn. The web chat shows the statement with Run it, Don't run it, and Allow for this turn, and when the turn stops waiting; "Run changes without asking" sets `allow_write`. Each answer, refusal, and expiry writes an `audit_log` row (action `permission`) and a `_quack_audit` detail `{request, sql, decision}`. A non-streamed `query`, or a caller who may not write, is refused as before: 200 with `write_refused: true` |
 | MCP | run | refuse unless `quack mcp --allow-write` set the policy at launch (stdio has no tokens); `write_refused: true` in the structured content and a sentence in the text. Over HTTP the token's `write` scope decides |
 | Desktop | planned | native confirm dialog (section 11.6) |
 
@@ -1676,6 +1676,7 @@ PATCH  /api/v1/workspaces/{id}                    settings
 POST   /api/v1/auth/login  POST /api/v1/auth/logout  GET /api/v1/auth/me
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
 POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn
+POST   /api/v1/workspaces/{id}/sessions/{sid}/permissions/{request}  {decision}: answer a write the turn waits on
 POST   /api/v1/workspaces/{id}/sql                {sql}
 POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents
@@ -2222,6 +2223,7 @@ local = false
 workers_per_workspace = 1               # uploads processed at once per workspace (a lane)
 session_max_age_hours = 12              # a browser session dies this long after login
 session_idle_minutes = 120              # ... or this long after its last request
+permission_timeout_seconds = 300        # how long a streamed turn waits for a person to approve a write
 secure_cookies = "auto"                 # "always": Secure cookies on loopback too (same-host TLS proxy)
 
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
