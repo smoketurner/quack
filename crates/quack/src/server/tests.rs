@@ -2587,7 +2587,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         html.contains("id=\"chat\"") && html.contains(&format!("data-workspace=\"{ws}\"")),
         "{html}"
     );
-    assert!(html.contains("Allow the agent to change tables"));
+    assert!(html.contains("Run changes without asking"));
     // The empty state names what there is to ask about (issue #59): nothing
     // yet, then the pasted document below.
     assert!(
@@ -5723,4 +5723,158 @@ async fn list_token_branch_filters_removed_non_admin_member() {
         body["workspaces"][0]["role"], "member",
         "a current member's write-only token still lists its role; got {body}"
     );
+}
+
+/// A write a streamed turn waits on: only the person who asked may answer,
+/// once, and only with write access; an unknown request is not found; and
+/// nobody answering in time refuses it. Every answer is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_write_is_answered_once_by_its_asker_or_expires() {
+    use quack_core::analysis::events::{self, AgentEvent, TurnRecorder};
+
+    let mut config = Config::default();
+    config.server.permission_timeout_seconds = 1;
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let other = h.user("other", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
+    let ws = h.workspace("approvals", &owner).await;
+    for (user, role) in [(&other, Role::Member), (&viewer, Role::Viewer)] {
+        h.app
+            .control
+            .set_member(&ws, user, role, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let (owner_token, other_token, viewer_token) = (
+        h.login("owner").await,
+        h.login("other").await,
+        h.login("viewer").await,
+    );
+    let workspace = h
+        .app
+        .control
+        .get_workspace(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("the workspace was just created"));
+    let access = Access {
+        identity: Identity {
+            user_id: owner.clone(),
+            username: String::from("owner"),
+            is_admin: false,
+            credential: Credential::Local,
+            client_addr: None,
+            request_id: None,
+            channel: None,
+        },
+        workspace,
+        role: Some(Role::Owner),
+    };
+    let session = SessionId::from("s1");
+
+    // A turn asks, as run_sql does under WritePolicy::Ask.
+    let ask = |sql: &'static str| {
+        let (sink, mut events) = events::channel();
+        let asked = tokio::spawn(async move { TurnRecorder::new(sink).ask_permission(sql).await });
+        async move {
+            match events.recv().await {
+                Some(AgentEvent::PermissionRequired(request)) => (request, asked),
+                _ => fail("no permission request"),
+            }
+        }
+    };
+    let harness = &h;
+    let decide = |request: &str, token: &str, decision: &str| {
+        let path = format!("/api/v1/workspaces/{ws}/sessions/s1/permissions/{request}");
+        let body = serde_json::json!({ "decision": decision });
+        let token = token.to_owned();
+        async move { harness.post(&path, &token, body).await.0 }
+    };
+
+    let (request, asked) = ask("INSERT INTO t VALUES (1)").await;
+    let held = h.app.permissions.hold(&h.app, &access, &session, request);
+    let id = held.request.to_string();
+    assert_eq!(
+        decide(&id, &viewer_token, "allow").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        decide(&id, &other_token, "allow").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        decide("nope", &owner_token, "allow").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        decide(&id, &owner_token, "allow").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(asked.await.unwrap_or_default(), "the write runs");
+    assert_eq!(
+        decide(&id, &owner_token, "deny").await,
+        StatusCode::CONFLICT
+    );
+
+    let (request, asked) = ask("DELETE FROM t").await;
+    let id = h
+        .app
+        .permissions
+        .hold(&h.app, &access, &session, request)
+        .request
+        .to_string();
+    assert_eq!(
+        decide(&id, &owner_token, "deny").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(!asked.await.unwrap_or(true), "the write is refused");
+
+    // Nobody answers: refused when the time is up, and then unknown.
+    let (request, asked) = ask("DROP TABLE t").await;
+    let id = h
+        .app
+        .permissions
+        .hold(&h.app, &access, &session, request)
+        .request
+        .to_string();
+    assert!(
+        !asked.await.unwrap_or(true),
+        "an unanswered write is refused"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        decide(&id, &owner_token, "allow").await,
+        StatusCode::NOT_FOUND
+    );
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("permission")),
+            ..AuditFilter::default()
+        })
+        .await;
+    let mut outcomes: Vec<&str> = rows.iter().map(|r| r.outcome.as_str()).collect();
+    outcomes.sort_unstable();
+    // allow; deny; expiry; and the refused answers (other, unknown, the
+    // second answer, the late one; the viewer is refused before it).
+    assert_eq!(
+        outcomes.iter().filter(|o| **o == "allowed").count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().filter(|o| **o == "denied").count() >= 6,
+        "{outcomes:?}"
+    );
+    let (status, body) = h
+        .get(&format!("/api/v1/workspaces/{ws}/audit"), &owner_token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let details = body.to_string();
+    for decision in ["\"allow\"", "\"deny\"", "\"expired\""] {
+        assert!(details.contains(decision), "{decision}: {details}");
+    }
+    assert!(details.contains("DROP TABLE t"), "{details}");
 }

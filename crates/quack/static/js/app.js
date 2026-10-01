@@ -391,7 +391,7 @@
         view.article.appendChild(ol);
       }
       if (r.write_refused) {
-        view.article.appendChild(el("p", "mt-2 text-sm text-amber-200", "A change to the tables was refused. Tick “Allow the agent to change tables” and ask again to permit it."));
+        view.article.appendChild(el("p", "mt-2 text-sm text-amber-200", "A change to the tables was not run."));
       }
       if (!chat.getAttribute("data-session") && r.session_id) {
         chat.setAttribute("data-session", r.session_id);
@@ -403,9 +403,54 @@
       view.body.textContent = "Error: " + data;
       view.article.classList.add("border-red-800");
       finishWorking(view);
-    } else if (event === "write_refused") {
-      status.textContent = data;
+    } else if (event === "permission_required") {
+      askPermission(view, JSON.parse(data), chat.getAttribute("data-workspace"));
     }
+  }
+
+  // A write the agent wants to run waits for the person: the statement,
+  // three answers, and the time the turn stops waiting. The answer goes to
+  // the API; the step that follows shows what happened.
+  function askPermission(view, p, ws) {
+    var expires = new Date(p.expires_at);
+    var card = el("div", "mt-3 rounded border border-amber-700 p-3 text-sm");
+    card.appendChild(el("p", "font-medium", "This statement changes the workspace:"));
+    card.appendChild(el("pre", "mt-2 whitespace-pre-wrap font-mono text-slate-200", p.sql));
+    var buttons = el("div", "mt-3 flex flex-wrap gap-2");
+    var note = el("p", "mt-2 text-slate-400", "The agent waits until " + expires.toLocaleTimeString() + ".");
+    var timer = setTimeout(function () {
+      buttons.remove();
+      note.textContent = "Not run: no answer by " + expires.toLocaleTimeString() + ".";
+    }, Math.max(0, expires - new Date()));
+    [["allow", "Run it", "rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500"],
+     ["deny", "Don't run it", "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800"],
+     ["allow_turn", "Allow for this turn", "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800"]
+    ].forEach(function (choice) {
+      var b = el("button", choice[2], choice[1]);
+      b.type = "button";
+      b.addEventListener("click", function () {
+        clearTimeout(timer);
+        buttons.remove();
+        note.textContent = choice[0] === "deny" ? "Not run." : "Running it…";
+        fetch("/api/v1/workspaces/" + ws + "/sessions/" + p.session_id + "/permissions/" + p.request, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ decision: choice[0] }),
+          credentials: "same-origin"
+        }).then(function (res) {
+          if (res.ok) {
+            if (choice[0] !== "deny") note.textContent = "Ran it.";
+            return;
+          }
+          return errorMessage(res).then(function (message) { note.textContent = "Not run: " + message; });
+        });
+      });
+      buttons.appendChild(b);
+    });
+    card.appendChild(buttons);
+    card.appendChild(note);
+    view.article.appendChild(card);
+    setWorking(view, "Waiting for your answer…");
   }
 
   // The Jobs page follows the job stream instead of polling: every change

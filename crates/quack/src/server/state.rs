@@ -17,6 +17,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
+use super::permissions::Permissions;
 use super::queue::UploadJob;
 use super::resource::ProtectedResource;
 use super::web::flash::Flashes;
@@ -76,6 +77,8 @@ pub(crate) struct AppState {
     extractions: Mutex<HashSet<WorkspaceId>>,
     /// Messages between a form's redirect and the page it lands on.
     pub flashes: Flashes,
+    /// Writes streamed turns are waiting on a person to decide.
+    pub permissions: Permissions,
 }
 
 /// Holds a workspace's extraction slot; dropping it frees the slot.
@@ -126,6 +129,7 @@ impl AppState {
             mcp: tokio::sync::Mutex::new(HashMap::new()),
             extractions: Mutex::new(HashSet::new()),
             flashes: Flashes::default(),
+            permissions: Permissions::default(),
         }
     }
 

@@ -6,6 +6,7 @@ pub(crate) mod auth;
 mod error;
 mod mcp_http;
 pub(crate) mod oidc;
+mod permissions;
 mod queue;
 mod resource;
 mod run;

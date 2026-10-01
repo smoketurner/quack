@@ -126,7 +126,9 @@ row is processing (marked `data-pending`).
   Ctrl/Cmd+Enter runs the statement.
 - `static/js/app.js` is quack's own. It posts to `/api/v1/workspaces/{id}/query/stream`,
   parses the SSE events, and renders the steps block, the answer, citations as links to the
-  document list, and the chart spec as an ECharts option. On page load it renders stored
+  document list, and the chart spec as an ECharts option. A `permission_required` event
+  becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
+  `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. On page load it renders stored
   charts and draws the graph page's result as an ECharts force graph (nodes coloured by
   class; a click scrolls to the inspector entry).
 

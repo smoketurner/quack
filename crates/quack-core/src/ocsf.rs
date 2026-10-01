@@ -74,6 +74,7 @@ impl EventClass {
             | AuditAction::Share
             | AuditAction::Mode
             | AuditAction::Cancel
+            | AuditAction::Permission
             | AuditAction::GraphReview
             | AuditAction::GraphRevalidate
             | AuditAction::GraphMerge

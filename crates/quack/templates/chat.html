@@ -60,7 +60,7 @@
             <option value="chat">chat</option><option value="query">query (sources only)</option>
           </select></label>
         {% if ws.can_write %}
-        <label class="flex items-center gap-1"><input type="checkbox" name="allow_write"> Allow the agent to change tables</label>
+        <label class="flex items-center gap-1"><input type="checkbox" name="allow_write"> Run changes without asking</label>
         {% endif %}
         <button type="button" id="stop" class="ml-auto hidden rounded border border-slate-700 px-3 py-2 text-slate-300 hover:bg-slate-800">Stop</button>
         <button type="submit" class="rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Send</button>
