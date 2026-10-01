@@ -294,7 +294,11 @@ records nothing.
 
 Internal tables are prefixed `_quack_`, hidden from the agent's table listing, and refused
 to user and agent SQL: `classify_user_statement` returns "internal tables are not
-accessible", with no opt-in flag. IDs are UUID v7 via `uuid::Uuid::now_v7()`.
+accessible", with no opt-in flag. Nor do errors name them: every workspace connection reports
+errors as JSON (`SET GLOBAL errors_as_json` while it is confined, so reader and audit clones
+inherit it), and `Error::DuckDb` renders them through `storage::workspace::DuckDbMessage`,
+which rebuilds DuckDB's "Did you mean" and "Candidate bindings" suggestions from the report's
+`candidates` without `_quack_` names. IDs are UUID v7 via `uuid::Uuid::now_v7()`.
 
 ```sql
 -- workspace metadata

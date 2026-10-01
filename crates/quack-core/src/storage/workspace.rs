@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,8 +70,8 @@ impl VectorTable {
     }
 }
 
-impl std::fmt::Display for VectorTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for VectorTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -709,9 +710,14 @@ impl WorkspaceDb {
                 self.conn.execute("SET allowed_directories = []", [])?;
             }
         }
+        // Errors as JSON, for every connection to the database (the reader
+        // and audit clones included): it keeps the names `DuckDB` suggests
+        // apart from the message, so `DuckDbMessage` can leave quack's
+        // internal tables out of them.
         self.conn.execute_batch(
             "SET enable_external_access = false;\n\
              SET allow_persistent_secrets = false;\n\
+             SET GLOBAL errors_as_json = true;\n\
              SET lock_configuration = true;",
         )?;
         Ok(())
@@ -3301,6 +3307,72 @@ fn is_internal_name(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with(INTERNAL_PREFIX)
 }
 
+/// A `DuckDB` error as quack shows it. Workspace connections report errors
+/// as JSON (`errors_as_json`, set as they open), which keeps the names
+/// `DuckDB` suggests ("Did you mean ...?") apart from the message, so the
+/// message is rebuilt here without quack's internal tables: otherwise every
+/// misspelled table name would offer `_quack_meta` to the person and the
+/// model. An error that is not that JSON is shown as `DuckDB` wrote it.
+pub struct DuckDbMessage<'a>(pub &'a duckdb::Error);
+
+/// The fields of a JSON error report that quack shows.
+#[derive(serde::Deserialize)]
+struct ErrorReport {
+    exception_type: String,
+    exception_message: String,
+    /// The names `DuckDB` suggests, comma-separated.
+    #[serde(default)]
+    candidates: Option<String>,
+}
+
+impl fmt::Display for DuckDbMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = self.0.to_string();
+        // A parser error comes as `Parser Error: {...}`, any other as the
+        // bare report.
+        let report = serde_json::from_str::<ErrorReport>(&text).ok().or_else(|| {
+            text.split_once(": ")
+                .and_then(|(_, rest)| serde_json::from_str(rest).ok())
+        });
+        match report {
+            Some(report) => report.fmt(f),
+            None => f.write_str(&text),
+        }
+    }
+}
+
+impl fmt::Display for ErrorReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match &self.candidates {
+            // `DuckDB` appends its suggestions below the message's first line.
+            Some(_) => self
+                .exception_message
+                .split_once('\n')
+                .map_or(self.exception_message.as_str(), |(first, _)| first),
+            None => self.exception_message.as_str(),
+        };
+        write!(f, "{} Error: {message}", self.exception_type)?;
+        let shown: Vec<String> = self
+            .candidates
+            .iter()
+            .flat_map(|names| names.split(','))
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty() && !name.rsplit('.').next().is_some_and(is_internal_name)
+            })
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        if shown.is_empty() {
+            return Ok(());
+        }
+        if self.exception_type == "Binder" {
+            write!(f, "\nCandidate bindings: {}", shown.join(", "))
+        } else {
+            write!(f, "\nDid you mean {}?", shown.join(" or "))
+        }
+    }
+}
+
 fn mentions_internal_table_token(sql: &str) -> bool {
     sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(is_internal_name)
@@ -3861,6 +3933,58 @@ mod tests {
         assert_ne!(nevada, shape("SELECT x FROM t WHERE s = 'NEVADA' LIMIT 5"));
         assert_eq!(shape("CREATE TABLE t2 AS SELECT 1"), None);
         assert_eq!(shape("SELECT FROM WHERE"), None);
+    }
+
+    /// An error never suggests one of quack's internal tables, on the
+    /// writer or a reader clone: a misspelled name gets the user's own near
+    /// matches or none, and every other error reads as `DuckDB` wrote it.
+    #[test]
+    fn errors_never_suggest_internal_tables() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_query("CREATE TABLE orders (id INTEGER, customer VARCHAR, customers VARCHAR)")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let reader = db
+            .try_clone_reader()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        for conn in [&db, &reader] {
+            let error = |sql: &str| {
+                conn.execute_query(sql)
+                    .err()
+                    .map_or_else(|| fail(&format!("{sql} ran")), |e| e.to_string())
+            };
+            // The only near match is internal: no suggestion at all.
+            assert_eq!(
+                error("SELECT * FROM _quack_meto"),
+                "Catalog Error: Table with name _quack_meto does not exist!"
+            );
+            let missing = error("SELECT * FROM no_such_table");
+            assert!(
+                missing.starts_with("Catalog Error: Table with name no_such_table does not exist!")
+                    && !missing.contains("_quack_"),
+                "{missing}"
+            );
+            // The user's own near matches still come through.
+            assert_eq!(
+                error("SELECT * FROM orderz"),
+                "Catalog Error: Table with name orderz does not exist!\nDid you mean \"orders\"?"
+            );
+            assert_eq!(
+                error("SELECT customr FROM orders"),
+                "Binder Error: Referenced column \"customr\" not found in FROM clause!\n\
+                 Candidate bindings: \"customer\", \"customers\""
+            );
+            // Everything else reads as it always did.
+            assert_eq!(
+                error("SELEC 1"),
+                "Parser Error: syntax error at or near \"SELEC\""
+            );
+            assert_eq!(
+                error("INSERT INTO orders VALUES ('x', 'a', 'b')"),
+                "Conversion Error: Could not convert string 'x' to INT32"
+            );
+        }
     }
 
     /// Design doc 7.4: a read-classified statement may still name a file, so

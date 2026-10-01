@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::storage::workspace::DuckDbMessage;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("configuration error: {0}")]
@@ -11,8 +13,10 @@ pub enum Error {
     #[error(transparent)]
     Sqlite(#[from] sqlx::Error),
 
-    #[error(transparent)]
-    DuckDb(#[from] duckdb::Error),
+    /// Shown through `DuckDbMessage`, and not a `source`, so nothing that
+    /// walks the error chain prints the raw report with its suggestions.
+    #[error("{}", DuckDbMessage(.0))]
+    DuckDb(duckdb::Error),
 
     #[error("workspace not found: {0}")]
     WorkspaceNotFound(String),
@@ -148,6 +152,12 @@ pub enum Error {
 
     #[error("format error: {0}")]
     Fmt(#[from] fmt::Error),
+}
+
+impl From<duckdb::Error> for Error {
+    fn from(error: duckdb::Error) -> Self {
+        Self::DuckDb(error)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
