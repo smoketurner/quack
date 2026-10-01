@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 {% if let Some(ws) = page.workspace %}
-<div class="grid gap-6 md:grid-cols-[16rem_minmax(0,1fr)]">
+<div class="grid grid-cols-1 gap-6 md:grid-cols-[16rem_minmax(0,1fr)]">
   <aside aria-label="Sessions">
     <div class="flex items-center justify-between">
       <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Sessions</h2>
@@ -10,7 +10,7 @@
     <ul id="sessions" class="mt-2 space-y-1 text-sm">
       {% for s in sessions %}
       <li class="group flex items-start gap-1">
-        <a class="block min-w-0 flex-1 truncate rounded px-2 py-1 hover:bg-slate-800{% if let Some(c) = current %}{% if c.id == s.id %} bg-slate-800{% endif %}{% endif %}" href="/w/{{ ws.id }}/chat?session={{ s.id }}"{% if let Some(c) = current %}{% if c.id == s.id %} aria-current="page"{% endif %}{% endif %} title="{{ s.title.as_deref().unwrap_or("(untitled)") }}">{{ s.title.as_deref().unwrap_or("(untitled)") }}<span class="block text-xs text-slate-400">{% if let Some(at) = Moment::from_utc_text(s.updated_at.as_str()) %}<time datetime="{{ at.iso() }}" data-when="relative">{{ at.utc() }}</time>{% else %}{{ s.updated_at }}{% endif %} · {{ s.mode.as_str() }}{% if s.shared %} · shared{% endif %}{% if s.created_by.is_none() %} · cli{% endif %}</span></a>
+        <a class="block min-w-0 flex-1 truncate rounded px-2 py-1 hover:bg-slate-800{% if let Some(c) = current %}{% if c.id == s.id %} bg-slate-800{% endif %}{% endif %}" href="/w/{{ ws.id }}/chat?session={{ s.id }}"{% if let Some(c) = current %}{% if c.id == s.id %} aria-current="page"{% endif %}{% endif %} title="{{ s.title.as_deref().unwrap_or("(untitled)") }}">{{ s.title.as_deref().unwrap_or("(untitled)") }}<span class="block text-xs text-slate-400">{{ When::Relative.html(s.updated_at.as_str())|safe }} · {{ s.mode.as_str() }}{% if s.shared %} · shared{% endif %}{% if s.created_by.is_none() %} · cli{% endif %}</span></a>
         {% if s.shared %}
         <form method="post" action="/w/{{ ws.id }}/chat/{{ s.id }}/unshare"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300" title="Stop sharing" aria-label="Stop sharing">●</button></form>
         {% else %}
@@ -34,7 +34,7 @@
     <div id="messages" class="space-y-4" role="log" aria-label="Conversation" aria-live="polite">
       {% for m in messages %}
       <article class="rounded border border-slate-800 bg-slate-900 p-4 msg-{{ m.role }}">
-        <div class="flex flex-wrap items-baseline gap-x-2 text-xs text-slate-400"><span class="font-semibold uppercase">{{ m.role }}</span>{% if let Some(at) = m.at %}<time datetime="{{ at.iso() }}" data-when="clock">{{ at.utc() }}</time>{% endif %}{% if let Some(ms) = m.duration_ms %}<span>· answered in {{ ms }} ms</span>{% endif %}</div>
+        <div class="flex flex-wrap items-baseline gap-x-2 text-xs text-slate-400"><span class="font-semibold uppercase">{{ m.role }}</span>{% if let Some(at) = m.at %}{{ When::Clock.element(at)|safe }}{% endif %}{% if let Some(ms) = m.duration_ms %}<span>· answered in {{ ms }} ms</span>{% endif %}</div>
         {% if !m.steps.is_empty() %}
         <details class="mt-2 text-sm"><summary class="cursor-pointer text-slate-400">{{ m.steps.len() }} steps</summary>
           <ol class="mt-1 space-y-1 font-mono text-xs wrap-anywhere">

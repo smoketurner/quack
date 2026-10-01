@@ -1,8 +1,8 @@
 {% if let Some(error) = error %}
-<p role="alert" class="rounded border border-red-900 bg-red-950 px-3 py-2 font-mono text-sm text-red-300">{{ error }}</p>
+<p role="alert" class="rounded border border-red-900 bg-red-950 px-3 py-2 font-mono text-sm whitespace-pre-wrap text-red-300 wrap-anywhere">{{ error }}</p>
 {% else %}
 <div class="flex items-center gap-4 text-sm text-slate-400">
-  <span>{{ row_count }} rows{% if truncated %} (showing {{ rows.len() }}){% endif %}</span>
+  <span>{{ row_count }} rows{% if truncated %} (showing {{ rows.len() }}){% endif %} in {{ duration_ms }} ms</span>
   <a class="text-blue-400 hover:underline" href="{{ csv_href }}">Download CSV</a>
 </div>
 <div class="mt-2 overflow-x-auto rounded border border-slate-800 bg-slate-900">

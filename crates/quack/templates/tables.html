@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 {% if let Some(ws) = page.workspace %}
-<div class="grid gap-6 md:grid-cols-[14rem_minmax(0,1fr)]">
+<div class="grid grid-cols-1 gap-6 md:grid-cols-[14rem_minmax(0,1fr)]">
   <aside aria-label="Tables">
     <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Tables</h2>
     {% if tables.is_empty() %}<p class="mt-2 text-sm text-slate-400">No tables. Upload a CSV, TSV, Parquet, JSON, or Excel file, or import from a database.</p>{% endif %}
@@ -14,7 +14,7 @@
     <h1 class="font-mono text-xl font-semibold wrap-anywhere">{{ t.name }}</h1>
     <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Schema</h2>
     <table class="data-table mt-1 text-sm" aria-label="Columns of {{ t.name }}"><tbody>
-      {% for c in t.columns %}<tr><td class="font-mono wrap-anywhere">{{ c.0 }}</td><td class="font-mono text-slate-400 wrap-anywhere">{{ c.1 }}</td></tr>{% endfor %}
+      {% for c in t.columns %}<tr><td class="font-mono wrap-anywhere">{{ c.0 }}</td><td class="font-mono text-slate-400"><div class="max-w-[24rem] truncate" title="{{ c.1 }}">{{ c.1 }}</div></td></tr>{% endfor %}
     </tbody></table>
     <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Sample rows</h2>
     <div class="mt-1 overflow-x-auto rounded border border-slate-800 bg-slate-900">
@@ -31,8 +31,8 @@
     <form method="post" action="/w/{{ ws.id }}/import" class="mt-6 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
       <h2 class="font-medium">Import from a database or a URL</h2>
       <p class="mt-1 text-xs text-slate-400">postgres://user:password@host/db, sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). The password is used once and never stored.</p>
-      {% if let Some(error) = error %}<p role="alert" class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300">{{ error }}</p>{% endif %}
-      <div class="mt-2 grid gap-2 md:grid-cols-2">
+      {% if let Some(error) = error %}<p role="alert" class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
+      <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
         <input aria-label="Source URL" name="url" placeholder="source URL" required class="rounded border border-slate-700 px-2 py-1 md:col-span-2">
         <input aria-label="Workspace table name" name="table" placeholder="workspace table name" required class="rounded border border-slate-700 px-2 py-1">
         <input aria-label="Source table" name="source_table" placeholder="source table (or leave empty and give a query)" class="rounded border border-slate-700 px-2 py-1">

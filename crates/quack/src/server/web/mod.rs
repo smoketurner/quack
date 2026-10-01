@@ -313,8 +313,12 @@ struct WorkspacesPage {
 struct Moment(Timestamp);
 
 impl Moment {
-    /// A `DuckDB` `TIMESTAMP` cast to text, which holds UTC.
+    /// Stored UTC text: an RFC 3339 instant, or a `DuckDB` or `SQLite`
+    /// timestamp with no zone, which both hold UTC.
     fn from_utc_text(text: &str) -> Option<Self> {
+        if let Ok(at) = text.parse::<Timestamp>() {
+            return Some(Self(at));
+        }
         let civil: DateTime = text.parse().ok()?;
         civil
             .to_zoned(TimeZone::UTC)
@@ -328,6 +332,46 @@ impl Moment {
 
     fn utc(&self) -> String {
         self.0.strftime("%Y-%m-%d %H:%M UTC").to_string()
+    }
+}
+
+/// How `app.js` words a time: the time of day (with the date when not
+/// today), or how long ago for today and the date before that.
+#[derive(Debug, Clone, Copy)]
+enum When {
+    Clock,
+    Relative,
+}
+
+impl When {
+    const fn attr(self) -> &'static str {
+        match self {
+            Self::Clock => "clock",
+            Self::Relative => "relative",
+        }
+    }
+
+    /// The `<time>` element for `at`.
+    fn element(self, at: &Moment) -> String {
+        format!(
+            "<time datetime=\"{}\" data-when=\"{}\">{}</time>",
+            at.iso(),
+            self.attr(),
+            at.utc()
+        )
+    }
+
+    /// The `<time>` element for stored UTC text, or the text itself,
+    /// escaped, when it is not a time.
+    fn html(self, text: &str) -> String {
+        Moment::from_utc_text(text).map_or_else(
+            || {
+                askama::filters::escape(text, askama::filters::Html)
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
+            },
+            |at| self.element(&at),
+        )
     }
 }
 
@@ -445,6 +489,7 @@ struct SqlResult {
     rows: Vec<Vec<String>>,
     row_count: usize,
     truncated: bool,
+    duration_ms: u64,
     error: Option<String>,
     csv_href: String,
 }
@@ -1316,6 +1361,7 @@ impl SqlResult {
                     .collect(),
                 row_count: outcome.row_count,
                 truncated: outcome.truncated,
+                duration_ms: outcome.duration_ms,
                 error: None,
                 csv_href,
             },
@@ -1324,6 +1370,7 @@ impl SqlResult {
                 rows: Vec::new(),
                 row_count: 0,
                 truncated: false,
+                duration_ms: 0,
                 error: Some(e.message),
                 csv_href,
             },
@@ -2119,6 +2166,32 @@ mod tests {
         );
         assert!(Moment::from_utc_text("").is_none());
         assert!(Moment::from_utc_text("yesterday").is_none());
+        // control.db keeps SQLite's CURRENT_TIMESTAMP text and RFC 3339 expiries.
+        assert_eq!(
+            Moment::from_utc_text("2026-10-01T02:37:57Z")
+                .map(|m| m.iso())
+                .as_deref(),
+            Some("2026-10-01T02:37:57Z")
+        );
+    }
+
+    /// A stored time becomes a `<time>` element the browser localizes; text
+    /// that is not a time is shown as it is, escaped.
+    #[test]
+    fn when_renders_time_elements_and_escapes_anything_else() {
+        assert_eq!(
+            When::Relative.html("2026-10-01 02:37:57"),
+            "<time datetime=\"2026-10-01T02:37:57Z\" data-when=\"relative\">2026-10-01 02:37 UTC</time>"
+        );
+        assert!(
+            When::Clock
+                .html("2026-10-01 02:37:57")
+                .contains("data-when=\"clock\"")
+        );
+        assert_eq!(
+            When::Clock.html("<b>soon</b>"),
+            "&#60;b&#62;soon&#60;/b&#62;"
+        );
     }
 
     /// An answer shows how long it took; a question and an answer recorded

@@ -3,8 +3,8 @@
 {% if let Some(ws) = page.workspace %}
 <h1 class="text-xl font-semibold">Knowledge graph</h1>
 <p class="mt-1 text-sm text-slate-400">Entities typed by the ontology's classes, relations between them, and for every node and edge the document chunk or table row it came from.</p>
-{% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300">{{ error }}</p>{% endif %}
-{% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300">{{ notice }}</p>{% endif %}
+{% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
+{% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300 wrap-anywhere">{{ notice }}</p>{% endif %}
 <p class="mt-3 text-sm text-slate-300">{{ status.nodes }} nodes, {{ status.edges }} edges · ontology version {% if let Some(v) = status.ontology_version %}{{ v }}{% else %}none{% endif %}, {% if let Some(v) = status.built_with_version %}graph built with {{ v }}{% else %}graph never built{% endif %}</p>
 {% if status.provisional() %}
 <div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
@@ -29,7 +29,7 @@
 </div>
 {% endif %}
 
-<div class="mt-4 grid gap-4 md:grid-cols-2">
+<div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
   <form method="get" action="/w/{{ ws.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
     <h2 class="font-medium">Explore</h2>
     <div class="mt-2 flex flex-wrap items-center gap-2">
@@ -101,7 +101,7 @@
   <p class="mt-2 text-sm text-slate-400">Nothing matched.</p>
   {% else %}
   <div role="img" aria-label="{{ r.title }}: {{ r.nodes.len() }} entities and {{ r.edges.len() }} relations, listed below" class="graph mt-2 h-96 rounded border border-slate-800 bg-slate-900" data-graph='{{ r.json }}'></div>
-  <div class="mt-4 grid gap-4 md:grid-cols-2">
+  <div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
     <div>
       <h3 class="text-xs font-semibold uppercase text-slate-400">Nodes</h3>
       <ul class="mt-1 space-y-2 text-sm wrap-anywhere">

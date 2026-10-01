@@ -55,15 +55,22 @@ Users or Audit link, with `aria-current="page"`.
   cells, from `input.css`); prose and names wrap with `wrap-anywhere`; short fixed values
   (status, sizes, times) are `whitespace-nowrap`; data grids (sample rows, SQL results) and
   opaque ids keep one line per cell, cut at a width with "…", and carry the full value in a
-  `title` tooltip. A sidebar layout's content track is `minmax(0,1fr)`, so a wide grid
-  scrolls inside its own box instead of widening the page.
-- **Times are localized in the browser.** A page renders `<time datetime="…Z"
-  data-when="clock|relative">` with UTC text (`web::Moment`); `app.js` rewrites each in the
-  viewer's zone, with the full date and time as the tooltip. `clock` (chat messages) is the
-  time of day, with the date when not today; `relative` (the Jobs page) is "5 min ago" for
-  today and the date before that, refreshed every 30 seconds and after every htmx swap.
+  `title` tooltip. Every grid track is `minmax(0,1fr)` (`grid-cols-1` below `md`), so a
+  wide grid or a long name scrolls or truncates inside its own box instead of widening the
+  page, on a phone too; the Documents and Jobs tables scroll sideways in their own box.
+- **Times are localized in the browser; no page prints a raw timestamp.** Every stored time
+  goes through `web::When` (`Clock` or `Relative`), which renders `<time datetime="…Z"
+  data-when="clock|relative">` with UTC text from `web::Moment` (DuckDB and SQLite timestamp
+  text, or RFC 3339), and falls back to the escaped text when a value is not a time. `app.js`
+  rewrites each in the viewer's zone, with the full local date and time as the tooltip.
+  `clock` (chat messages, versions, the audit log, token expiry) is the time of day, with the
+  date when not today; `relative` (jobs, documents, sessions, token last use) is "5 min ago"
+  for today and the date before that, refreshed every 30 seconds and after every htmx swap.
   Chat messages show when they were asked or answered, and an answer how many milliseconds it
-  took (`duration_ms` on the response object and the assistant message's metadata).
+  took (`duration_ms` on the response object and the assistant message's metadata). A SQL
+  result shows its row count and the statement's own run time in milliseconds
+  (`SqlOutcome::duration_ms`, also in the `POST .../sql` body), timed on the connection's
+  thread so a wait for the writer is not counted.
 - **Accessibility.** Every page starts with a "Skip to content" link to `<main id="main">`;
   the workspace tabs and the admin links are named `<nav>` landmarks, and the current tab or
   chat session carries `aria-current="page"`. A control with only a placeholder has an
