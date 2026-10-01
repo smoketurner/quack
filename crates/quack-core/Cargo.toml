@@ -48,6 +48,7 @@ secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
 sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "any", "migrate", "macros", "tls-rustls-aws-lc-rs"] }
+strsim        = { workspace = true }
 tar           = { workspace = true }
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }

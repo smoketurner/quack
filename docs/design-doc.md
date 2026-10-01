@@ -1369,7 +1369,8 @@ SigV4-signs each request for the endpoint's service (`bedrock`, `bedrock-mantle`
 permit, caching credentials until five minutes before expiry. Every Responses request sends
 `store: false`, since Bedrock otherwise keeps responses 30 days, outside the workspace file
 (section 5); quack replays history itself. `quack doctor` resolves the session and, on
-mantle, lists models (`GET /v1/models`) to confirm the model exists.
+mantle, lists models through rig's OpenAI client over the signing transport to confirm the
+model exists.
 
 ```rust
 pub struct OAuthConfig {
@@ -1762,6 +1763,8 @@ Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/a
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/sessions`,
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
 `/jobs`, `/cancel N`, `/chart [N]`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
+`/model` shows the configured models, then lists each provider's models as a job
+(`llm::ModelCatalog`).
 `/ontology` and `/graph` are the `quack ontology` and `quack graph` verbs, parsed by the
 same clap definitions; they run in the background, print to the transcript, and answer yes
 to anything that would ask on stdin.
@@ -1880,8 +1883,13 @@ needs one:
 - `control.db`: opens and migrates;
 - workspace: opens; embedding dimension agrees;
 - each configured model: credential present; plain HTTP off this machine with a credential
-  warns; one `GET` of the provider's model list proves it is reachable, the key is
-  accepted, and the model is pulled or listed;
+  warns; the provider's model list, fetched through the rig client a turn uses
+  (`llm::ChatClient::models`, so the same `LimitedHttp`, headers, and bearer), proves it is
+  reachable, the key is accepted, and the model is pulled or listed; a model missing from
+  the list names the closest ids it does list;
+- the chat model's context window, where the listing reports one: warns when
+  `[analysis].history_token_budget`, `[retrieval].pinned_token_budget`, and
+  `[context].max_tokens` together exceed it;
 - the chat model: what a turn sends it; an effort level it lacks, or a GPT-5.6 model on Chat
   Completions without effort `"none"`, fails, since every turn would be refused;
 - `[server]`: a non-loopback bind warns, `local` off loopback fails, no users yet is noted.

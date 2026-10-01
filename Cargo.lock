@@ -4154,6 +4154,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "strsim",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
