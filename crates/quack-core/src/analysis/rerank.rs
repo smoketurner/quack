@@ -10,9 +10,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use rig::operation::RerankRequest;
+use schemars::{JsonSchema, schema_for};
+use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::llm::{ChatModel, OneShotAgent, RerankModel};
+use crate::llm::{ChatModel, RerankModel, SchemaCall, Task};
 use crate::storage::workspace::ChunkSearchResult;
 
 /// Boxed future so implementations can be trait objects.
@@ -100,9 +102,28 @@ fn reorder(candidates: Vec<ChunkSearchResult>, order: &[usize]) -> Vec<ChunkSear
 
 /// Preamble for the chat model as a listwise reranker.
 pub const RERANK_PROMPT: &str = "You rank passages by how well they answer a question. \
-    You will get the question and numbered passages. Reply with only a JSON array of the \
-    passage numbers, most relevant first, leaving out passages that do not help answer the \
-    question. No prose.";
+    You will get the question and numbered passages. Answer with the passage numbers in \
+    `order`, most relevant first, leaving out passages that do not help answer the question.";
+
+/// The chat model's ranking: passage numbers, 1-based, best first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[schemars(title = "rerank")]
+pub struct RerankAnswer {
+    pub order: Vec<u16>,
+}
+
+impl RerankAnswer {
+    /// The order as 0-based indices below `len`; numbers out of range are
+    /// dropped.
+    fn indices(&self, len: usize) -> Vec<usize> {
+        self.order
+            .iter()
+            .map(|&n| usize::from(n))
+            .filter(|&n| n >= 1 && n <= len)
+            .map(|n| n.saturating_sub(1))
+            .collect()
+    }
+}
 
 /// Characters of each passage shown to the ranking model.
 pub const PASSAGE_CHARS: usize = 1200;
@@ -114,14 +135,22 @@ const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// query and numbered passages, answered with the passage numbers in
 /// order.
 pub struct ModelReranker {
-    agent: OneShotAgent,
+    call: SchemaCall<RerankAnswer>,
 }
 
 impl ModelReranker {
     #[must_use]
     pub fn new(model: ChatModel) -> Self {
         Self {
-            agent: OneShotAgent::new(model, RERANK_PROMPT, RERANK_TIMEOUT, "rerank"),
+            call: SchemaCall::new(
+                model,
+                Task {
+                    preamble: RERANK_PROMPT,
+                    timeout: RERANK_TIMEOUT,
+                    label: "rerank",
+                },
+                schema_for!(RerankAnswer),
+            ),
         }
     }
 
@@ -140,39 +169,14 @@ impl ModelReranker {
         }
         text
     }
-
-    /// The model's answer, read leniently: the first JSON array of numbers
-    /// in it, 1-based, mapped to 0-based indices below `len`.
-    fn ranking(answer: &str, len: usize) -> Result<Vec<usize>> {
-        let start = answer.find('[');
-        let end = answer.rfind(']');
-        let (Some(start), Some(end)) = (start, end) else {
-            return Err(Error::Analysis(String::from(
-                "the reranker returned no JSON array",
-            )));
-        };
-        let slice = answer.get(start..=end).unwrap_or(answer);
-        let numbers: Vec<serde_json::Value> = serde_json::from_str(slice)
-            .map_err(|e| Error::Analysis(format!("the reranker's array does not parse: {e}")))?;
-        let mut order = Vec::with_capacity(numbers.len());
-        for value in numbers {
-            let Some(n) = value.as_u64().and_then(|n| usize::try_from(n).ok()) else {
-                continue;
-            };
-            if n >= 1 && n <= len {
-                order.push(n.saturating_sub(1));
-            }
-        }
-        Ok(order)
-    }
 }
 
 impl Reranker for ModelReranker {
     fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
         Box::pin(async move {
             let request = Self::request(query, candidates, PASSAGE_CHARS);
-            let answer = self.agent.answer(&request).await?;
-            Self::ranking(&answer, candidates.len())
+            let answer = self.call.answer(&request).await?;
+            Ok(answer.indices(candidates.len()))
         })
     }
 
@@ -380,17 +384,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_ranking_is_lenient_and_one_based() {
-        assert_eq!(
-            ModelReranker::ranking("Sure: [3, 1, 7, 0, 2]", 3).unwrap_or_default(),
-            vec![2, 0, 1]
-        );
-        assert_eq!(
-            ModelReranker::ranking("[]", 3).unwrap_or_default(),
-            Vec::<usize>::new()
-        );
-        assert!(ModelReranker::ranking("no numbers here", 3).is_err());
-        assert!(ModelReranker::ranking("[1, 2", 3).is_err());
+    fn the_ranking_is_one_based_and_drops_numbers_out_of_range() {
+        let answer: RerankAnswer =
+            serde_json::from_str(r#"{"order": [3, 1, 7, 0, 2]}"#).unwrap_or_default();
+        assert_eq!(answer.indices(3), [2, 0, 1]);
+        assert!(RerankAnswer::default().indices(3).is_empty());
+        assert!(serde_json::from_str::<RerankAnswer>("[1, 2]").is_err());
+        let schema = serde_json::to_string(&schema_for!(RerankAnswer)).unwrap_or_default();
+        assert!(schema.contains("\"order\""), "{schema}");
     }
 
     #[test]

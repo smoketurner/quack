@@ -9,10 +9,9 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt as _};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::progress::{ChunkDone, Progress, RunControl};
 
 /// Boxed future so an extractor can be a trait object.
@@ -31,21 +30,6 @@ pub struct ExtractionRun<'a, T> {
     pub extractor: &'a dyn Extract<T>,
     pub concurrency: u32,
     pub control: RunControl<'a>,
-}
-
-/// A model's answer read leniently: the first `{` to the last `}`, as `T`.
-///
-/// # Errors
-///
-/// Returns an error when no JSON object of that shape parses.
-pub fn parse_answer<T: DeserializeOwned>(answer: &str) -> Result<T> {
-    let (Some(start), Some(end)) = (answer.find('{'), answer.rfind('}')) else {
-        return Err(Error::Ontology(String::from(
-            "the model returned no JSON object",
-        )));
-    };
-    serde_json::from_str(answer.get(start..=end).unwrap_or(answer))
-        .map_err(|e| Error::Ontology(format!("the model's JSON does not parse: {e}")))
 }
 
 /// A passage an extraction run reads.
@@ -200,21 +184,6 @@ impl Tally {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Debug, PartialEq, Deserialize)]
-    struct Shape {
-        n: u32,
-    }
-
-    #[test]
-    fn an_answer_is_read_from_its_first_brace_to_its_last() {
-        assert_eq!(
-            parse_answer::<Shape>("Sure: {\"n\": 3} hope that helps").ok(),
-            Some(Shape { n: 3 })
-        );
-        assert!(parse_answer::<Shape>("no json here").is_err());
-        assert!(parse_answer::<Shape>("{\"m\": 1}").is_err());
-    }
 
     #[test]
     fn a_tally_counts_and_merges() {

@@ -914,11 +914,17 @@ succeed); extraction skips it, and `graph status` lists it under `missing_tables
 
 **Extraction from documents.** On demand (`quack graph extract`, `POST .../graph/extract`,
 the graph page), permission-gated, with cost (chunk count, model) shown first. Each chunk
-goes to the chat model with the ontology-derived prompt and must return JSON `{nodes:
-[{label, class, properties}], edges: [{source, target, relation, properties}]}`. Parsing is
-deliberately lenient, because models wrap JSON in prose: first `{` to last `}`, every list
-defaulting to empty. A chunk that still fails is logged and skipped, never retried in a
-loop. Each chunk of a ready document goes to the model once: `_quack_graph_extracted`
+goes to the chat model with the ontology-derived prompt, and its answer is held to
+`Ontology::extraction_schema` through the provider's structured output (rig's
+`output_schema`: Ollama's `format`, `OpenAI`'s strict `response_format` or `text.format`,
+Anthropic's and Bedrock's output configuration; `llm::SchemaCall`): `{nodes: [{label, class,
+properties}], edges: [{source, target, relation, properties}]}`, with `class` and `relation`
+enumerated from the ontology's ids and properties as name and value pairs, since a strict
+schema has no free-key objects. The whole answer parses; nothing is scanned out of prose.
+The ontology's document pass (`OpenExtraction`'s derived schema), the model reranker (`{order:
+[n]}`), and history summaries (`{summary}`) are the same kind of call. Drift is still
+counted, for a provider that does not enforce the schema. A chunk that fails is logged and
+skipped, never retried in a loop. Each chunk of a ready document goes to the model once: `_quack_graph_extracted`
 records every chunk processed (with the ontology version and its yield), so a later run
 sends only new chunks, and `--reset` starts over. A sample of N takes chunks spaced evenly
 across documents, not the first N ingested. The raw answer and parse outcome are logged at

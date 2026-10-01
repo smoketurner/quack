@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use futures::StreamExt as _;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::induction::{Candidate, Proposal};
@@ -18,8 +19,10 @@ use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
 use crate::llm::Embeddings;
 use crate::storage::workspace::{DocumentStatus, SamplePool, WorkspaceDb};
 
-/// What open extraction returns for one chunk.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What open extraction returns for one chunk; the schema it derives is
+/// what the model is held to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "open_extraction")]
 pub struct OpenExtraction {
     #[serde(default)]
     pub entities: Vec<OpenEntity>,
@@ -29,33 +32,32 @@ pub struct OpenExtraction {
     pub attributes: Vec<OpenAttribute>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpenEntity {
     pub name: String,
     #[serde(rename = "type")]
     pub type_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpenRelation {
     pub subject: String,
     pub relation: String,
     pub object: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpenAttribute {
     pub entity: String,
     pub name: String,
     pub value: String,
 }
 
-/// The extraction prompt the model answers with JSON.
-pub const EXTRACTION_PROMPT: &str = "Read the passage and list what it mentions. Return only JSON with this shape and \
-nothing else:\n\
-{\"entities\": [{\"name\": \"...\", \"type\": \"...\"}], \
-\"relations\": [{\"subject\": \"...\", \"relation\": \"...\", \"object\": \"...\"}], \
-\"attributes\": [{\"entity\": \"...\", \"name\": \"...\", \"value\": \"...\"}]}\n\
+/// The open extractor's preamble; [`OpenExtraction`]'s schema carries the
+/// answer's shape.
+pub const EXTRACTION_PROMPT: &str = "Read the passage and list what it mentions: its \
+`entities` (each a `name` and a `type`), the `relations` between them (a `subject`, a \
+`relation`, and an `object`), and `attributes` (an `entity`, a `name`, and a `value`).\n\
 Types and relation names are short lowercase nouns or verbs (organization, vendor, \
 country, shipped_to, issued_by). Subjects and objects of relations must be entity names \
 from the list. Attributes are facts with a value (amount: 4500, effective_date: 2024-03-01). \
@@ -772,10 +774,11 @@ fn propose_attributes(
 mod tests {
     use super::*;
     use crate::embedding::Dimension;
-    use crate::extraction::{Extract, ExtractFuture, parse_answer};
+    use crate::extraction::{Extract, ExtractFuture};
     use crate::progress::ChunkDone;
     use crate::progress::RunControl;
     use crate::storage::workspace::{NewChunk, NewDocument};
+    use schemars::schema_for;
 
     struct Canned;
 
@@ -785,12 +788,13 @@ mod tests {
                 if text.contains("FAIL") {
                     return Err(Error::Ontology(String::from("boom")));
                 }
-                parse_answer::<OpenExtraction>(&format!(
-                    r#"Sure! {{"entities": [{{"name": "Orgenics", "type": "vendor"}}, {{"name": "Orgenics", "type": "organization"}}, {{"name": "USAID", "type": "organization"}}, {{"name": "Kenya", "type": "country"}}, {{"name": "{}", "type": "Shipment"}}],
+                serde_json::from_str::<OpenExtraction>(&format!(
+                    r#"{{"entities": [{{"name": "Orgenics", "type": "vendor"}}, {{"name": "Orgenics", "type": "organization"}}, {{"name": "USAID", "type": "organization"}}, {{"name": "Kenya", "type": "country"}}, {{"name": "{}", "type": "Shipment"}}],
 "relations": [{{"subject": "Orgenics", "relation": "ships to", "object": "Kenya"}}],
 "attributes": [{{"entity": "Orgenics", "name": "founded", "value": "1983"}}, {{"entity": "Kenya", "name": "region", "value": "East Africa"}}]}}"#,
                     text.split_whitespace().next().unwrap_or("x")
                 ))
+                .map_err(|e| Error::Ontology(e.to_string()))
             })
         }
     }
@@ -1091,16 +1095,14 @@ mod tests {
         };
         let clustered = Vocabulary::build(&counts, Some(&near));
         assert_eq!(clustered.id("supplier"), "vendor", "the frequent name wins");
-        assert_eq!(
-            parse_answer::<OpenExtraction>("junk")
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default(),
-            "ontology error: the model returned no JSON object"
-        );
         assert!(
-            parse_answer::<OpenExtraction>("{\"entities\": [{\"name\": \"x\"}]}").is_err(),
+            serde_json::from_str::<OpenExtraction>("{\"entities\": [{\"name\": \"x\"}]}").is_err(),
             "type is required"
+        );
+        let schema = serde_json::to_string(&schema_for!(OpenExtraction)).unwrap_or_default();
+        assert!(
+            schema.contains("\"entities\"") && schema.contains("\"subject\""),
+            "{schema}"
         );
         assert_eq!(
             PropertyType::infer(&[String::from("2024-01-05"), String::from("3 May 2020")]),

@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use futures::StreamExt as _;
+use schemars::Schema;
 use serde::{Deserialize, Serialize};
 
 use super::store::{self, ChunkYield, NewNode, Source};
@@ -42,15 +43,143 @@ pub struct ExtractedEdge {
     pub properties: Properties,
 }
 
+/// What the model answers for one chunk, as [`Ontology::extraction_schema`]
+/// describes it. Properties are name and value pairs: a strict
+/// structured-output schema (`OpenAI`'s, Anthropic's) cannot describe an
+/// object with free keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ExtractionAnswer {
+    #[serde(default)]
+    nodes: Vec<NodeAnswer>,
+    #[serde(default)]
+    edges: Vec<EdgeAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct NodeAnswer {
+    label: String,
+    class: String,
+    #[serde(default)]
+    properties: Vec<PropertyAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct EdgeAnswer {
+    source: String,
+    target: String,
+    relation: String,
+    #[serde(default)]
+    properties: Vec<PropertyAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct PropertyAnswer {
+    name: String,
+    value: String,
+}
+
+impl From<Vec<PropertyAnswer>> for Properties {
+    fn from(pairs: Vec<PropertyAnswer>) -> Self {
+        Self::from(serde_json::Value::Object(
+            pairs
+                .into_iter()
+                .map(|p| (p.name, serde_json::Value::String(p.value)))
+                .collect(),
+        ))
+    }
+}
+
+impl From<ExtractionAnswer> for Extraction {
+    fn from(answer: ExtractionAnswer) -> Self {
+        Self {
+            nodes: answer
+                .nodes
+                .into_iter()
+                .map(|n| ExtractedNode {
+                    label: n.label,
+                    class: n.class,
+                    properties: n.properties.into(),
+                })
+                .collect(),
+            edges: answer
+                .edges
+                .into_iter()
+                .map(|e| ExtractedEdge {
+                    source: e.source,
+                    target: e.target,
+                    relation: e.relation,
+                    properties: e.properties.into(),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl Ontology {
+    /// The shape the graph extractor's answer must have: `class` one of
+    /// this ontology's class ids, `relation` one of its relation ids
+    /// (`mentions` among them), and property names its property ids. A
+    /// provider that holds the model to it leaves nothing to count as drift.
+    #[must_use]
+    pub fn extraction_schema(&self) -> Schema {
+        let mut names: Vec<&str> = self.properties.iter().map(|p| p.id.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let name = if names.is_empty() {
+            serde_json::json!({ "type": "string" })
+        } else {
+            serde_json::json!({ "type": "string", "enum": names })
+        };
+        let properties = serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": { "name": name, "value": { "type": "string" } },
+                "required": ["name", "value"],
+            },
+        });
+        Schema::try_from(serde_json::json!({
+            "title": "graph_extraction",
+            "type": "object",
+            "properties": {
+                "nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string" },
+                            "class": { "type": "string", "enum": self.class_ids() },
+                            "properties": properties,
+                        },
+                        "required": ["label", "class", "properties"],
+                    },
+                },
+                "edges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source": { "type": "string" },
+                            "target": { "type": "string" },
+                            "relation": { "type": "string", "enum": self.relation_ids() },
+                            "properties": properties,
+                        },
+                        "required": ["source", "target", "relation", "properties"],
+                    },
+                },
+            },
+            "required": ["nodes", "edges"],
+        }))
+        .unwrap_or_default()
+    }
+
     /// The graph extractor's preamble, with this ontology rendered into it.
     #[must_use]
     pub fn extraction_prompt(&self) -> String {
         let mut prompt = String::from(
             "Extract the entities and relations a passage states, using only this ontology. \
-         Return only JSON with this shape and nothing else:\n\
-         {\"nodes\": [{\"label\": \"...\", \"class\": \"...\", \"properties\": {}}], \
-         \"edges\": [{\"source\": \"...\", \"target\": \"...\", \"relation\": \"...\", \"properties\": {}}]}\n\
+         Answer with `nodes` (each a `label`, a `class`, and `properties` as name and value \
+         pairs) and `edges` (each a `source`, a `target`, a `relation`, and `properties`).\n\
          Rules: `class` must be one of the class ids below and `relation` one of the relation \
          ids (use `mentions` when the passage links two entities without a listed relation). \
          `source` and `target` must be labels from `nodes`. Labels are the entity's name as \
@@ -432,7 +561,6 @@ pub fn store_validated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extraction::parse_answer;
     use crate::ids::RelationId;
     use crate::ontology::{Class, Relation};
 
@@ -474,8 +602,8 @@ mod tests {
 
     #[test]
     fn validate_keeps_what_fits_and_counts_the_rest() {
-        let extraction = parse_answer::<Extraction>(
-            r#"Here you go: {"nodes": [
+        let extraction = serde_json::from_str::<Extraction>(
+            r#"{"nodes": [
                 {"label": "Orgenics", "class": "Vendor"},
                 {"label": "Kenya", "class": "country", "properties": {"region": "East Africa"}},
                 {"label": "MV Hope", "class": "vessel"},
@@ -514,14 +642,66 @@ mod tests {
         assert!(v.edges.iter().all(|e| e.properties.is_empty()));
     }
 
+    /// The ids an `enum` in the schema at `path` allows.
+    fn allowed(schema: &Schema, path: &str) -> Vec<String> {
+        schema
+            .as_value()
+            .pointer(path)
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn parse_rejects_prose_and_the_wrong_shape() {
-        assert!(parse_answer::<Extraction>("no json here").is_err());
-        assert!(parse_answer::<Extraction>(r#"{"nodes": "nope"}"#).is_err());
+    fn the_schema_allows_exactly_the_ontologys_ids() {
+        let mut ontology = ontology();
+        ontology.properties.push(ontology::Property {
+            id: String::from("region"),
+            label: None,
+            kind: ontology::PropertyType::String,
+            values: Vec::new(),
+        });
+        let schema = ontology.extraction_schema();
         assert_eq!(
-            parse_answer::<Extraction>("{}").map_or(9, |e| e.nodes.len()),
-            0
+            allowed(&schema, "/properties/nodes/items/properties/class/enum"),
+            ["entity", "organization", "vendor", "country"]
         );
+        assert_eq!(
+            allowed(&schema, "/properties/edges/items/properties/relation/enum"),
+            ["mentions", "ships_to"]
+        );
+        assert_eq!(
+            allowed(
+                &schema,
+                "/properties/nodes/items/properties/properties/items/properties/name/enum"
+            ),
+            ["region"]
+        );
+    }
+
+    #[test]
+    fn an_answer_reads_its_property_pairs_as_properties() {
+        let answer: ExtractionAnswer = serde_json::from_str(
+            r#"{"nodes": [{"label": "Kenya", "class": "country",
+                 "properties": [{"name": "region", "value": "East Africa"}]}],
+               "edges": [{"source": "Orgenics", "target": "Kenya", "relation": "ships_to",
+                 "properties": []}]}"#,
+        )
+        .unwrap_or_default();
+        let extraction = Extraction::from(answer);
+        assert_eq!(
+            extraction
+                .nodes
+                .first()
+                .and_then(|n| n.properties.get("region")),
+            Some(&serde_json::json!("East Africa"))
+        );
+        assert_eq!(extraction.edges.len(), 1);
+        assert!(serde_json::from_str::<ExtractionAnswer>(r#"{"nodes": "nope"}"#).is_err());
     }
 
     #[test]
