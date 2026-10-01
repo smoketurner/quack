@@ -64,7 +64,7 @@ use crate::error::{Error, Result};
 
 /// rig's Bedrock client: completions over the Converse API, embeddings
 /// over `InvokeModel` (Titan Text Embeddings V2's request shape).
-pub type BedrockClient = rig::bedrock::client::Client;
+pub type BedrockClient = rig::bedrock::client::BedrockRuntime;
 
 /// A Bedrock provider, resolved: where it sends, what signs its requests,
 /// and, on the runtime endpoint, the AWS SDK client for Converse and
@@ -162,6 +162,10 @@ impl Session {
     ///
     /// Returns rig's HTTP error: a non-success status, or a transport,
     /// signing, or decoding failure.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's HTTP error, which HttpClientExt returns; it keeps the failed response's headers"
+    )]
     pub(crate) async fn models(
         &self,
         name: &ProviderName,
@@ -512,6 +516,10 @@ impl Signer {
 
     /// `request`, signed: any `Authorization` it carried (rig's clients
     /// always set a bearer) is replaced by the `SigV4` one.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's HTTP error, which HttpClientExt returns; it keeps the failed response's headers"
+    )]
     pub(crate) async fn sign(
         &self,
         mut request: http::Request<Bytes>,

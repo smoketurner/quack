@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use rig::embeddings::EmbeddingModel;
+use crate::embedding::EmbeddingModel;
 
 use super::{GraphOptions, Node, store};
 use crate::embedding::{Embedder, Input};

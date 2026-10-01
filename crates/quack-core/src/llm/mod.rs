@@ -1,7 +1,7 @@
 //! LLM provider construction on top of rig.
 //!
 //! Everything that turns a `[providers.<name>]` config entry plus a
-//! `PROVIDER/MODEL` reference into a rig client lives here, so the interfaces
+//! `PROVIDER/MODEL` reference into a rig model lives here, so the interfaces
 //! never build providers themselves.
 
 pub mod acting;
@@ -10,8 +10,10 @@ pub mod oauth;
 pub mod sampling;
 
 use jiff::Timestamp;
-use rig::client::EmbeddingsClient;
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
+use rig::embeddings::Embedding;
+use rig::providers::{anthropic, ollama, openai};
+use rig::streaming::{Item, StreamEvent};
+use rig::{DynModel, ProviderError, operation};
 use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
 use std::sync::{Arc, Mutex};
@@ -25,10 +27,10 @@ use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
-    BaseUrl, BedrockApi, Config, ModelRef, ModelSettings, ProviderAuth, ProviderConfig,
+    BaseUrl, BedrockApi, Config, Effort, ModelRef, ModelSettings, ProviderAuth, ProviderConfig,
     ProviderName, ProviderType, config_file_path,
 };
-use crate::embedding::{Embedder, Profile};
+use crate::embedding::{Embedder, EmbeddingModel, Profile};
 use crate::error::{Error, Record, Result};
 use crate::extraction::{Extract, ExtractFuture, parse_answer};
 use crate::graph::extract::Extraction;
@@ -44,17 +46,14 @@ pub mod limit;
 
 pub use limit::LimitedHttp;
 
-/// Every rig client quack builds sends through [`LimitedHttp`], so each
-/// provider's `max_concurrent_requests` bounds the model requests in flight.
-type OllamaClient = rig::providers::ollama::Client<LimitedHttp>;
-type OpenAiClient = rig::providers::openai::CompletionsClient<LimitedHttp>;
-type AnthropicClient = rig::providers::anthropic::Client<LimitedHttp>;
-/// The `OpenAI` Responses API client (Bedrock's `api = "responses"`).
-type ResponsesClient = rig::providers::openai::Client<LimitedHttp>;
-type OpenAiEmbeddingModel = rig::providers::openai::GenericEmbeddingModel<
-    rig::providers::openai::OpenAICompletionsExt,
-    LimitedHttp,
->;
+/// A chat model with its wire and transport erased: what the agent and the
+/// one-shot calls run on. Every one quack builds is [`Sampled`], and every
+/// HTTP one sends through [`LimitedHttp`], so each provider's
+/// `max_concurrent_requests` bounds the model requests in flight.
+pub type ChatModel = DynModel<operation::Completion>;
+
+/// One of rig's embedding models with its wire and transport erased.
+type RigEmbeddingModel = DynModel<operation::Embedding>;
 
 /// How long every Ollama request asks the server to keep the model loaded.
 /// Ollama's own default is 5 minutes (`OLLAMA_KEEP_ALIVE`), which a gap
@@ -68,16 +67,64 @@ pub const OLLAMA_KEEP_ALIVE: &str = "30m";
 /// no input is longer than a chunk.
 const OLLAMA_EMBED_MIN_CTX: u32 = 2048;
 
+/// An Ollama server as a provider reaches it: rig's settings for it (its
+/// root and bearer) on the provider's limited client.
+#[derive(Clone)]
+pub struct OllamaEndpoint {
+    settings: ollama::OllamaConfig,
+    http: LimitedHttp,
+}
+
+impl OllamaEndpoint {
+    async fn build(
+        config: &Config,
+        name: &ProviderName,
+        provider: &ProviderConfig,
+    ) -> Result<Self> {
+        let mut settings = ollama::OllamaConfig::new();
+        if let Some(key) = provider.auth.credential(config, name).await? {
+            settings = settings.with_api_key(key);
+        }
+        if let Some(base_url) = &provider.base_url {
+            settings = settings.with_base_url(base_url.root());
+        }
+        Ok(Self {
+            settings,
+            http: LimitedHttp::for_provider(name, provider).with_headers(provider.header_map()?),
+        })
+    }
+
+    /// rig's client for the server.
+    fn client(&self) -> ollama::Ollama {
+        self.settings.clone().connect(self.http.clone())
+    }
+
+    /// A request to `path` on the server, with the bearer when there is one.
+    fn request(&self, method: http::Method, path: &str) -> http::request::Builder {
+        let builder = http::Request::builder()
+            .method(method)
+            .uri(format!("{}/{path}", self.settings.base_url))
+            .header(http::header::CONTENT_TYPE, "application/json");
+        if self.settings.api_key.is_empty() {
+            builder
+        } else {
+            builder.header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", self.settings.api_key.expose()),
+            )
+        }
+    }
+}
+
 /// Ollama's `/api/embed`, with the two load options rig's own embedding
-/// client never sends: `num_ctx`, sized to the longest input quack embeds
+/// wire never sends: `num_ctx`, sized to the longest input quack embeds
 /// (a chunk) instead of the model's maximum, and `keep_alive`, so the
 /// embedding model stays resident between the query embedding and the
 /// chat call of one turn instead of lapsing on Ollama's 5-minute default.
 #[derive(Clone)]
 pub struct OllamaEmbedder {
-    client: OllamaClient,
+    endpoint: OllamaEndpoint,
     model: String,
-    ndims: usize,
     num_ctx: u32,
 }
 
@@ -113,45 +160,23 @@ struct OllamaEmbedResponse {
 }
 
 impl EmbeddingModel for OllamaEmbedder {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = OllamaClient;
-
-    fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
-        Self {
-            client: client.clone(),
-            model: model.into(),
-            ndims: dims.unwrap_or_default(),
-            num_ctx: OLLAMA_EMBED_MIN_CTX,
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        self.ndims
-    }
-
     async fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> std::result::Result<Vec<Embedding>, EmbeddingError> {
-        use rig::http_client::{self, HttpClientExt};
+        texts: Vec<String>,
+    ) -> std::result::Result<Vec<Embedding>, ProviderError> {
+        use rig::http_client::HttpClientExt;
 
-        let texts: Vec<String> = texts.into_iter().collect();
         let body = serde_json::to_vec(&self.request_body(&texts))?;
         let request = self
-            .client
-            .post("api/embed")?
-            .body(body)
-            .map_err(|e| EmbeddingError::HttpError(e.into()))?;
-        let response = self.client.send::<_, Vec<u8>>(request).await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = http_client::text(response).await?;
-            return Err(EmbeddingError::from_http_response(status, text));
-        }
+            .endpoint
+            .request(http::Method::POST, "api/embed")
+            .body(body)?;
+        // A non-success status is the transport's error, body and all.
+        let response = self.endpoint.http.send::<_, Vec<u8>>(request).await?;
         let bytes: Vec<u8> = response.into_body().await?;
         let parsed: OllamaEmbedResponse = serde_json::from_slice(&bytes)?;
         if parsed.embeddings.len() != texts.len() {
-            return Err(EmbeddingError::ResponseError(format!(
+            return Err(ProviderError::Response(format!(
                 "ollama returned {} embeddings for {} inputs",
                 parsed.embeddings.len(),
                 texts.len()
@@ -174,9 +199,9 @@ pub type Embeddings = Embedder<EmbedModel>;
 #[derive(Clone)]
 pub enum EmbedModel {
     Ollama(OllamaEmbedder),
-    OpenAi(OpenAiEmbeddingModel),
+    OpenAi(RigEmbeddingModel),
     OpenAiOAuth(OAuthEmbedding),
-    Bedrock(rig::bedrock::embedding::EmbeddingModel),
+    Bedrock(RigEmbeddingModel),
 }
 
 /// An OpenAI-compatible embedding endpoint behind OAuth: the bearer can
@@ -190,26 +215,27 @@ pub struct OAuthEmbedding {
     ndims: usize,
     /// The provider's limited client, reused by every rebuild.
     http: LimitedHttp,
-    headers: http::HeaderMap,
 }
 
 impl OAuthEmbedding {
     /// The embedding model with the current token.
-    async fn model(&self) -> std::result::Result<OpenAiEmbeddingModel, EmbeddingError> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's ProviderError, which the embedding call it feeds returns"
+    )]
+    async fn model(&self) -> std::result::Result<RigEmbeddingModel, ProviderError> {
         let token = self
             .manager
             .access_token()
             .await
-            .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
-        let client = openai_client_with_key(
-            self.manager.provider(),
+            .map_err(|e| ProviderError::Provider(e.to_string()))?;
+        Ok(openai_client(
             self.base_url.as_ref().map(BaseUrl::as_str),
             token.expose_secret(),
             self.http.clone(),
-            self.headers.clone(),
         )
-        .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
-        Ok(client.embedding_model_with_ndims(&self.model, self.ndims))
+        .embedding(&self.model, Some(self.ndims))
+        .erase())
     }
 }
 
@@ -221,9 +247,8 @@ impl EmbedModel {
         let (name, provider) = (model.provider_name, model.provider);
         match provider.provider_type {
             ProviderType::Ollama => Ok(Self::Ollama(OllamaEmbedder {
-                client: build_ollama_client(config, name, provider).await?,
+                endpoint: OllamaEndpoint::build(config, name, provider).await?,
                 model: model.model.to_owned(),
-                ndims,
                 num_ctx: OllamaEmbedder::context_window(config.ingestion.chunk_size_tokens),
             })),
             ProviderType::Openai if let Some(oauth) = provider.auth.oauth() => {
@@ -236,14 +261,15 @@ impl EmbedModel {
                     base_url: provider.base_url.clone(),
                     model: model.model.to_owned(),
                     ndims,
-                    http: LimitedHttp::for_provider(name, provider),
-                    headers: provider.header_map()?,
+                    http: LimitedHttp::for_provider(name, provider)
+                        .with_headers(provider.header_map()?),
                 }))
             }
             ProviderType::Openai => Ok(Self::OpenAi(
                 build_openai_client(config, name, provider)
                     .await?
-                    .embedding_model_with_ndims(model.model, ndims),
+                    .embedding(model.model, Some(ndims))
+                    .erase(),
             )),
             ProviderType::Anthropic => Err(Error::Config(format!(
                 "[embedding].model '{model}': anthropic does not serve embeddings"
@@ -252,7 +278,8 @@ impl EmbedModel {
                 bedrock::session(name, provider)
                     .await?
                     .converse(name)?
-                    .embedding_model_with_ndims(model.model, ndims),
+                    .embedding(model.model, Some(ndims))
+                    .erase(),
             )),
         }
     }
@@ -295,53 +322,38 @@ impl Embeddings {
 }
 
 impl EmbeddingModel for EmbedModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = OllamaClient;
-
-    fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
-        Self::Ollama(OllamaEmbedder::make(client, model, dims))
-    }
-
-    fn ndims(&self) -> usize {
-        match self {
-            Self::Ollama(m) => m.ndims(),
-            Self::OpenAi(m) => m.ndims(),
-            Self::OpenAiOAuth(oauth) => oauth.ndims,
-            Self::Bedrock(m) => m.ndims(),
-        }
-    }
-
     async fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> std::result::Result<Vec<Embedding>, EmbeddingError> {
+        texts: Vec<String>,
+    ) -> std::result::Result<Vec<Embedding>, ProviderError> {
         #[expect(
             clippy::disallowed_methods,
             reason = "dispatch to the provider's model; callers reach this through an Embedder role"
         )]
-        match self {
-            Self::Ollama(m) => m.embed_texts(texts).await,
-            Self::OpenAi(m) => m.embed_texts(texts).await,
-            Self::OpenAiOAuth(oauth) => oauth.model().await?.embed_texts(texts).await,
-            // Boxed: the AWS SDK's request future is ~25 KB, which every
-            // caller's future would otherwise carry.
-            Self::Bedrock(m) => Box::pin(m.embed_texts(texts)).await,
-        }
+        // Boxed: each provider's request future is several KB, which every
+        // caller's future would otherwise carry.
+        let response = match self {
+            Self::Ollama(m) => return Box::pin(m.embed_texts(texts)).await,
+            Self::OpenAi(m) | Self::Bedrock(m) => Box::pin(m.call(texts)).await?,
+            Self::OpenAiOAuth(oauth) => Box::pin(oauth.model().await?.call(texts)).await?,
+        };
+        Ok(response.embeddings)
     }
 }
 
 /// The chat provider's rig client, one variant per provider type, so a
-/// caller builds it once and matches only where the model type matters.
+/// caller builds it once and matches only where the provider matters.
 enum ChatClient {
-    Ollama(OllamaClient),
-    OpenAi(OpenAiClient),
-    Anthropic(AnthropicClient),
+    Ollama(OllamaEndpoint),
+    /// OpenAI-compatible Chat Completions.
+    OpenAi(openai::OpenAI),
+    Anthropic(anthropic::Anthropic),
     /// Bedrock's Converse API through the AWS SDK. Bedrock's Chat
     /// Completions is [`Self::OpenAi`] over a signing client.
     Bedrock(bedrock::BedrockClient),
     /// An OpenAI-compatible Responses API: Bedrock's, signed, or a
     /// `type = "openai"` provider's with `api = "responses"`.
-    Responses(ResponsesClient),
+    Responses(openai::OpenAI),
 }
 
 impl ChatClient {
@@ -349,10 +361,10 @@ impl ChatClient {
         let (name, provider) = (chat.provider_name, chat.provider);
         Ok(match provider.provider_type {
             ProviderType::Ollama => {
-                Self::Ollama(build_ollama_client(config, name, provider).await?)
+                Self::Ollama(OllamaEndpoint::build(config, name, provider).await?)
             }
             ProviderType::Openai if provider.openai_chat_api() == BedrockApi::Responses => {
-                Self::Responses(build_openai_responses_client(config, name, provider).await?)
+                Self::Responses(build_openai_client(config, name, provider).await?)
             }
             ProviderType::Openai => {
                 Self::OpenAi(build_openai_client(config, name, provider).await?)
@@ -372,28 +384,19 @@ impl ChatClient {
         name: &ProviderName,
         provider: &ProviderConfig,
     ) -> Result<Self> {
-        Ok(match session.api() {
-            BedrockApi::Converse => Self::Bedrock(session.converse(name)?),
-            BedrockApi::ChatCompletions => Self::OpenAi(openai_client_with_key(
-                name,
+        let signed = || -> Result<openai::OpenAI> {
+            Ok(openai_client(
                 Some(&session.openai_base()),
                 SIGNED_PLACEHOLDER_KEY,
-                session.http(name, provider),
-                provider.header_map()?,
-            )?),
-            BedrockApi::Responses => Self::Responses(
-                rig::providers::openai::Client::builder()
-                    .api_key(SIGNED_PLACEHOLDER_KEY)
-                    .http_client(session.http(name, provider))
-                    .http_headers(provider.header_map()?)
-                    .base_url(session.openai_base())
-                    .build()
-                    .map_err(|e| {
-                        Error::Llm(format!(
-                            "failed to build Responses client for '{name}': {e}"
-                        ))
-                    })?,
-            ),
+                session
+                    .http(name, provider)
+                    .with_headers(provider.header_map()?),
+            ))
+        };
+        Ok(match session.api() {
+            BedrockApi::Converse => Self::Bedrock(session.converse(name)?),
+            BedrockApi::ChatCompletions => Self::OpenAi(signed()?),
+            BedrockApi::Responses => Self::Responses(signed()?),
         })
     }
 
@@ -408,6 +411,41 @@ impl ChatClient {
         }
     }
 
+    /// The chat model `model`, [`Sampled`] for its API at `effort`.
+    fn chat_model(
+        &self,
+        model: &str,
+        effort: Option<Effort>,
+        temperature: Option<bool>,
+    ) -> Result<ChatModel> {
+        let wire = self.wire();
+        Ok(match self {
+            Self::Ollama(endpoint) => Sampled::model(
+                endpoint.client().completion(model),
+                model,
+                wire,
+                effort,
+                temperature,
+            )?,
+            Self::OpenAi(client) => {
+                Sampled::model(client.chat(model), model, wire, effort, temperature)?
+            }
+            Self::Anthropic(client) => {
+                Sampled::model(client.completion(model), model, wire, effort, temperature)?
+            }
+            Self::Bedrock(client) => {
+                Sampled::model(client.completion(model), model, wire, effort, temperature)?
+            }
+            Self::Responses(client) => Sampled::model(
+                Unstored::model(client.responses(model)),
+                model,
+                wire,
+                effort,
+                temperature,
+            )?,
+        })
+    }
+
     fn one_shot(
         &self,
         model: &str,
@@ -416,69 +454,12 @@ impl ChatClient {
         timeout: Duration,
         label: &'static str,
     ) -> Result<OneShotAgent> {
-        let wire = self.wire();
-        Ok(match self {
-            Self::Ollama(client) => OneShotAgent::new(
-                Sampled::new(
-                    client.completion_model(model),
-                    model,
-                    wire,
-                    settings.background_effort,
-                    settings.temperature,
-                )?,
-                preamble,
-                timeout,
-                label,
-            ),
-            Self::OpenAi(client) => OneShotAgent::new(
-                Sampled::new(
-                    client.completion_model(model),
-                    model,
-                    wire,
-                    settings.background_effort,
-                    settings.temperature,
-                )?,
-                preamble,
-                timeout,
-                label,
-            ),
-            Self::Anthropic(client) => OneShotAgent::new(
-                Sampled::new(
-                    client.completion_model(model),
-                    model,
-                    wire,
-                    settings.background_effort,
-                    settings.temperature,
-                )?,
-                preamble,
-                timeout,
-                label,
-            ),
-            Self::Bedrock(client) => OneShotAgent::new(
-                Sampled::new(
-                    client.completion_model(model),
-                    model,
-                    wire,
-                    settings.background_effort,
-                    settings.temperature,
-                )?,
-                preamble,
-                timeout,
-                label,
-            ),
-            Self::Responses(client) => OneShotAgent::new(
-                Sampled::new(
-                    Unstored(client.completion_model(model)),
-                    model,
-                    wire,
-                    settings.background_effort,
-                    settings.temperature,
-                )?,
-                preamble,
-                timeout,
-                label,
-            ),
-        })
+        Ok(OneShotAgent::new(
+            self.chat_model(model, settings.background_effort, settings.temperature)?,
+            preamble,
+            timeout,
+            label,
+        ))
     }
 }
 
@@ -486,15 +467,20 @@ impl ChatClient {
 /// replaces their `Authorization` header with a `SigV4` one.
 const SIGNED_PLACEHOLDER_KEY: &str = "sigv4";
 
-/// A Responses API model asked to keep nothing: every request carries
+/// A Responses API wire asked to keep nothing: every request carries
 /// `store: false`, so neither Bedrock nor `OpenAI` retains a copy of the
 /// conversation (Bedrock keeps one for 30 days by default) and no workspace content leaves the
 /// workspace file's boundary to be stored (design doc section 5). quack
 /// replays history itself and never uses `previous_response_id`.
 #[derive(Clone)]
-struct Unstored<M>(M);
+struct Unstored<W>(W);
 
-impl<M> Unstored<M> {
+impl<W> Unstored<W> {
+    /// `model`, asking to store nothing.
+    fn model<T>(model: Model<W, T>) -> Model<Self, T> {
+        Model::new(Self(model.wire), model.transport)
+    }
+
     fn request(
         mut request: rig::completion::CompletionRequest,
     ) -> rig::completion::CompletionRequest {
@@ -508,27 +494,26 @@ impl<M> Unstored<M> {
     }
 }
 
-impl<M: CompletionModel> CompletionModel for Unstored<M> {
-    fn completion(
-        &self,
-        request: rig::completion::CompletionRequest,
-    ) -> impl Future<
-        Output = std::result::Result<rig::completion::CompletionResponse, CompletionError>,
-    > + Send {
-        self.0.completion(Self::request(request))
+impl<W: rig::wire::Wire<Op = operation::Completion>> rig::wire::Wire for Unstored<W> {
+    type Op = operation::Completion;
+    type Payload = W::Payload;
+    type Frame = W::Frame;
+    type Decoder<'id> = W::Decoder<'id>;
+
+    fn describe(&self) -> rig::wire::Descriptor<'_> {
+        self.0.describe()
     }
 
-    fn stream(
+    fn encode(
         &self,
         request: rig::completion::CompletionRequest,
-    ) -> impl Future<
-        Output = std::result::Result<rig::streaming::StreamingCompletionResponse, CompletionError>,
-    > + Send {
-        self.0.stream(Self::request(request))
+        mode: rig::wire::Mode,
+    ) -> std::result::Result<W::Payload, rig::error::EncodeError> {
+        self.0.encode(Self::request(request), mode)
     }
 
-    fn capabilities(&self) -> rig::completion::ProviderCapabilities {
-        self.0.capabilities()
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        self.0.decoder()
     }
 }
 
@@ -546,12 +531,10 @@ pub struct OneShotAgent {
 
 impl OneShotAgent {
     /// `label` names the call in errors and logs.
-    pub fn new<M>(model: M, preamble: &str, timeout: Duration, label: &'static str) -> Self
-    where
-        M: CompletionModel + Clone + Send + Sync + 'static,
-    {
+    #[must_use]
+    pub fn new(model: ChatModel, preamble: &str, timeout: Duration, label: &'static str) -> Self {
         Self {
-            agent: rig::agent::AgentBuilder::new(model)
+            agent: AgentBuilder::new(model)
                 .preamble(preamble)
                 .temperature(0.0)
                 .build(),
@@ -568,19 +551,21 @@ impl OneShotAgent {
     /// timeout.
     pub async fn answer(&self, text: &str) -> Result<String> {
         use futures::StreamExt;
-        use rig::streaming::StreamedAssistantContent;
         let what = self.label;
         let collect = async {
-            let mut stream = self.agent.stream_chat(text, Vec::<Message>::new()).await;
+            let mut stream = self.agent.prompt(text).stream();
             let mut answer = String::new();
             let mut final_text: Option<String> = None;
             while let Some(item) = stream.next().await {
                 match item.map_err(|e| Error::Llm(format!("{what} call failed: {e}")))? {
-                    MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
-                        answer.push_str(&t.text);
+                    MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                        text,
+                        ..
+                    })) => {
+                        answer.push_str(&text);
                     }
                     MultiTurnStreamItem::FinalResponse(r) => {
-                        if r.usage.has_values() {
+                        if r.usage.is_reported() {
                             tracing::debug!(
                                 call = what,
                                 input_tokens = r.usage.input_tokens,
@@ -609,8 +594,6 @@ impl OneShotAgent {
     }
 }
 
-/// A chunk that produces nothing within the timeout is an error the run
-/// skips.
 impl<T: DeserializeOwned + Send> Extract<T> for OneShotAgent {
     fn extract<'a>(&'a self, text: &'a str) -> ExtractFuture<'a, T> {
         Box::pin(async move {
@@ -706,12 +689,14 @@ pub(crate) struct OllamaRunningModel {
 impl OllamaRunningModels {
     /// The models Ollama has in memory (`GET /api/ps`).
     async fn loaded(
-        client: &OllamaClient,
+        endpoint: &OllamaEndpoint,
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use rig::http_client::HttpClientExt;
 
-        let request = client.get("api/ps")?.body(Vec::new())?;
-        let response = client.send::<_, Vec<u8>>(request).await?;
+        let request = endpoint
+            .request(http::Method::GET, "api/ps")
+            .body(Vec::new())?;
+        let response = endpoint.http.send::<_, Vec<u8>>(request).await?;
         let bytes: Vec<u8> = response.into_body().await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
@@ -730,37 +715,11 @@ impl OllamaRunningModels {
     }
 }
 
-async fn build_ollama_client(
-    config: &Config,
-    name: &ProviderName,
-    provider: &ProviderConfig,
-) -> Result<OllamaClient> {
-    let key = provider
-        .auth
-        .credential(config, name)
-        .await?
-        .map(rig::providers::ollama::OllamaApiKey::from)
-        .unwrap_or_default();
-
-    let mut builder = rig::providers::ollama::Client::builder()
-        .api_key(key)
-        .http_client(LimitedHttp::for_provider(name, provider))
-        .http_headers(provider.header_map()?);
-
-    if let Some(base_url) = &provider.base_url {
-        builder = builder.base_url(base_url.root());
-    }
-
-    builder
-        .build()
-        .map_err(|e| Error::Llm(format!("failed to build Ollama client for '{name}': {e}")))
-}
-
 async fn build_openai_client(
     config: &Config,
     name: &ProviderName,
     provider: &ProviderConfig,
-) -> Result<OpenAiClient> {
+) -> Result<openai::OpenAI> {
     let key = provider
         .auth
         .credential(config, name)
@@ -770,72 +729,29 @@ async fn build_openai_client(
                 "provider '{name}' (openai) requires auth = \"api-key\" or \"oauth\""
             ))
         })?;
-    openai_client_with_key(
-        name,
+    Ok(openai_client(
         provider.base_url.as_ref().map(BaseUrl::as_str),
         &key,
-        LimitedHttp::for_provider(name, provider),
-        provider.header_map()?,
-    )
+        LimitedHttp::for_provider(name, provider).with_headers(provider.header_map()?),
+    ))
 }
 
-/// The Responses client of a `type = "openai"` provider set to
-/// `api = "responses"`, with the same key, base URL, and request limits as
-/// its Chat Completions client.
-async fn build_openai_responses_client(
-    config: &Config,
-    name: &ProviderName,
-    provider: &ProviderConfig,
-) -> Result<ResponsesClient> {
-    let key = provider
-        .auth
-        .credential(config, name)
-        .await?
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "provider '{name}' (openai) requires auth = \"api-key\" or \"oauth\""
-            ))
-        })?;
-    let mut builder = rig::providers::openai::Client::builder()
-        .api_key(&key)
-        .http_client(LimitedHttp::for_provider(name, provider))
-        .http_headers(provider.header_map()?);
-    if let Some(base_url) = provider.base_url.as_ref() {
-        builder = builder.base_url(base_url.as_str());
-    }
-    builder.build().map_err(|e| {
-        Error::Llm(format!(
-            "failed to build Responses client for '{name}': {e}"
-        ))
-    })
-}
-
-fn openai_client_with_key(
-    name: &ProviderName,
-    base_url: Option<&str>,
-    key: &str,
-    http: LimitedHttp,
-    headers: http::HeaderMap,
-) -> Result<OpenAiClient> {
-    let mut builder = rig::providers::openai::CompletionsClient::builder()
-        .api_key(key)
-        .http_client(http)
-        .http_headers(headers);
-
+/// rig's `OpenAI` client for `key` at `base_url` (`OpenAI`'s own when
+/// `None`), sending through `http`. It serves both Chat Completions and
+/// Responses.
+fn openai_client(base_url: Option<&str>, key: &str, http: LimitedHttp) -> openai::OpenAI {
+    let mut settings = openai::OpenAIConfig::new(key);
     if let Some(base_url) = base_url {
-        builder = builder.base_url(base_url);
+        settings = settings.with_base_url(base_url);
     }
-
-    builder
-        .build()
-        .map_err(|e| Error::Llm(format!("failed to build OpenAI client for '{name}': {e}")))
+    settings.connect(http)
 }
 
 async fn build_anthropic_client(
     config: &Config,
     name: &ProviderName,
     provider: &ProviderConfig,
-) -> Result<AnthropicClient> {
+) -> Result<anthropic::Anthropic> {
     let key = provider
         .auth
         .credential(config, name)
@@ -877,26 +793,17 @@ fn anthropic_client(
     name: &ProviderName,
     provider: &ProviderConfig,
     key: &str,
-) -> Result<AnthropicClient> {
-    let http = LimitedHttp::for_provider(name, provider);
+) -> Result<anthropic::Anthropic> {
+    let http = LimitedHttp::for_provider(name, provider).with_headers(provider.header_map()?);
     let http = match AnthropicCredential::of(&provider.auth) {
         AnthropicCredential::Bearer => http.with_oauth_bearer(key)?,
         AnthropicCredential::ApiKey => http,
     };
-    let mut builder = rig::providers::anthropic::Client::builder()
-        .api_key(key)
-        .http_client(http)
-        .http_headers(provider.header_map()?);
-
+    let mut settings = anthropic::AnthropicConfig::new(key);
     if let Some(base_url) = &provider.base_url {
-        builder = builder.base_url(base_url.as_str());
+        settings = settings.with_base_url(base_url.as_str());
     }
-
-    builder.build().map_err(|e| {
-        Error::Llm(format!(
-            "failed to build Anthropic client for '{name}': {e}"
-        ))
-    })
+    Ok(settings.connect(http))
 }
 
 /// One agent turn an interface asks for: the workspace's writer and
@@ -1094,95 +1001,29 @@ async fn dispatch(
     let client = ChatClient::build(config, &chat).await?;
     let (wire, settings) = (client.wire(), config.model_settings(chat));
     sampling::check_tool_calls(chat.model, wire, settings.effort)?;
-    match client {
-        ChatClient::Ollama(client) => {
-            // A first request after idle loads the model, which took 5
-            // seconds for a 12 GB model measured live and shows the user
-            // nothing meanwhile, so the turn says so first. Any failure to
-            // ask counts as loaded: the chat call that follows reports the
-            // real error.
-            let resident = match OllamaRunningModels::loaded(&client).await {
-                Ok(running) => running.holds(chat.model),
-                Err(e) => {
-                    tracing::debug!(error = %e, "could not list Ollama's loaded models");
-                    true
-                }
-            };
-            if !resident {
-                drop(sink.send(AgentEvent::Status(format!(
-                    "loading {}, then thinking; Ollama loads a model on its first request and keeps it \
-                     for {OLLAMA_KEEP_ALIVE}",
-                    chat.model
-                ))));
+    if let ChatClient::Ollama(endpoint) = &client {
+        // A first request after idle loads the model, which took 5
+        // seconds for a 12 GB model measured live and shows the user
+        // nothing meanwhile, so the turn says so first. Any failure to
+        // ask counts as loaded: the chat call that follows reports the
+        // real error.
+        let resident = match OllamaRunningModels::loaded(endpoint).await {
+            Ok(running) => running.holds(chat.model),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not list Ollama's loaded models");
+                true
             }
-            analysis
-                .run(
-                    Sampled::new(
-                        client.completion_model(chat.model),
-                        chat.model,
-                        wire,
-                        settings.effort,
-                        settings.temperature,
-                    )?,
-                    sink,
-                )
-                .await
-        }
-        ChatClient::OpenAi(client) => {
-            analysis
-                .run(
-                    Sampled::new(
-                        client.completion_model(chat.model),
-                        chat.model,
-                        wire,
-                        settings.effort,
-                        settings.temperature,
-                    )?,
-                    sink,
-                )
-                .await
-        }
-        ChatClient::Anthropic(client) => {
-            analysis
-                .run(
-                    Sampled::new(
-                        client.completion_model(chat.model),
-                        chat.model,
-                        wire,
-                        settings.effort,
-                        settings.temperature,
-                    )?,
-                    sink,
-                )
-                .await
-        }
-        ChatClient::Bedrock(client) => {
-            Box::pin(analysis.run(
-                Sampled::new(
-                    client.completion_model(chat.model),
-                    chat.model,
-                    wire,
-                    settings.effort,
-                    settings.temperature,
-                )?,
-                sink,
-            ))
-            .await
-        }
-        ChatClient::Responses(client) => {
-            Box::pin(analysis.run(
-                Sampled::new(
-                    Unstored(client.completion_model(chat.model)),
-                    chat.model,
-                    wire,
-                    settings.effort,
-                    settings.temperature,
-                )?,
-                sink,
-            ))
-            .await
+        };
+        if !resident {
+            drop(sink.send(AgentEvent::Status(format!(
+                "loading {}, then thinking; Ollama loads a model on its first request and keeps it \
+                 for {OLLAMA_KEEP_ALIVE}",
+                chat.model
+            ))));
         }
     }
+    let model = client.chat_model(chat.model, settings.effort, settings.temperature)?;
+    Box::pin(analysis.run(model, sink)).await
 }
 
 #[cfg(test)]
@@ -1441,7 +1282,6 @@ mod tests {
     fn responses_requests_ask_bedrock_to_store_nothing() {
         let request = |params: Option<serde_json::Value>| rig::completion::CompletionRequest {
             model: None,
-            preamble: None,
             chat_history: Vec::new(),
             documents: Vec::new(),
             tools: Vec::new(),

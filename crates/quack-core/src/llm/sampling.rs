@@ -28,8 +28,11 @@
 //! that hosts the model: the Anthropic API, Bedrock's Converse and
 //! OpenAI-compatible APIs, `OpenAI` itself, and any OpenAI-compatible gateway.
 
+use rig::driver::{Exchange, Opening, Transport};
+use rig::operation::Completion;
 use serde_json::{Map, Value, json};
 
+use super::ChatModel;
 use crate::config::{BedrockApi, Effort, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
 
@@ -323,64 +326,78 @@ fn merge(params: &mut Map<String, Value>, extra: &Map<String, Value>) {
     }
 }
 
-/// A chat model whose requests follow its [`Sampling`].
+/// A chat model's wire whose requests follow its [`Sampling`].
 #[derive(Clone)]
-pub struct Sampled<M> {
-    model: M,
+pub struct Sampled<W> {
+    inner: W,
     sampling: Sampling,
 }
 
-impl<M> Sampled<M> {
+impl<W: rig::wire::Wire<Op = Completion>> Sampled<W> {
     /// `model`, served as the model named `id` through `wire` at `effort`,
-    /// sent `temperature` as [`Sampling::new`] decides. An effort that is
-    /// not sent is logged as a warning, since the setting then does nothing.
+    /// sent `temperature` as [`Sampling::new`] decides, with its type
+    /// erased. An effort that is not sent is logged as a warning, since the
+    /// setting then does nothing.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Config`] when `effort` is a level the model does not
     /// take on `wire`.
-    pub fn new(
-        model: M,
+    pub fn model<T: Transport<W>>(
+        model: rig::Model<W, T>,
         id: &str,
         wire: Wire,
         effort: Option<Effort>,
         temperature: Option<bool>,
-    ) -> Result<Self> {
+    ) -> Result<ChatModel> {
         let sampling = Sampling::new(id, wire, effort, temperature)?;
         if let Some(why) = sampling.unsent_effort() {
             tracing::warn!("{why}");
         }
-        Ok(Self { model, sampling })
+        let sampled = Self {
+            inner: model.wire,
+            sampling,
+        };
+        Ok(rig::Model::new(sampled, Via(model.transport)).erase())
     }
 }
 
-impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for Sampled<M> {
-    fn completion(
-        &self,
-        request: rig::completion::CompletionRequest,
-    ) -> impl Future<
-        Output = std::result::Result<
-            rig::completion::CompletionResponse,
-            rig::completion::CompletionError,
-        >,
-    > + Send {
-        self.model.completion(self.sampling.apply(request))
+impl<W: rig::wire::Wire<Op = Completion>> rig::wire::Wire for Sampled<W> {
+    type Op = Completion;
+    type Payload = W::Payload;
+    type Frame = W::Frame;
+    type Decoder<'id> = W::Decoder<'id>;
+
+    fn describe(&self) -> rig::wire::Descriptor<'_> {
+        self.inner.describe()
     }
 
-    fn stream(
+    fn encode(
         &self,
         request: rig::completion::CompletionRequest,
-    ) -> impl Future<
-        Output = std::result::Result<
-            rig::streaming::StreamingCompletionResponse,
-            rig::completion::CompletionError,
-        >,
-    > + Send {
-        self.model.stream(self.sampling.apply(request))
+        mode: rig::wire::Mode,
+    ) -> std::result::Result<W::Payload, rig::error::EncodeError> {
+        self.inner.encode(self.sampling.apply(request), mode)
     }
 
-    fn capabilities(&self) -> rig::completion::ProviderCapabilities {
-        self.model.capabilities()
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        self.inner.decoder()
+    }
+}
+
+/// The transport of the wire a [`Sampled`] wraps. rig implements each
+/// transport for the wires it carries, so this one hands the wrapped
+/// wire's payload to it unchanged.
+#[derive(Clone)]
+struct Via<T>(T);
+
+impl<W, T> Transport<Sampled<W>> for Via<T>
+where
+    W: rig::wire::Wire<Op = Completion>,
+    T: Transport<W>,
+{
+    fn send(&self, payload: W::Payload, exchange: Exchange) -> Opening<W::Frame> {
+        self.0.send(payload, exchange)
     }
 }
 
@@ -396,7 +413,6 @@ mod tests {
     fn request() -> rig::completion::CompletionRequest {
         rig::completion::CompletionRequest {
             model: None,
-            preamble: None,
             chat_history: Vec::new(),
             documents: Vec::new(),
             tools: Vec::new(),

@@ -799,16 +799,12 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
         .await
         .map(Listing::Ids)
         .map_err(|e| match e {
-            rig::http_client::Error::InvalidStatusCode(status)
-            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
-            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. }
+            rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. }
                 if matches!(status.as_u16(), 401 | 403) =>
             {
                 Probe::Rejected(status.as_u16())
             }
-            rig::http_client::Error::InvalidStatusCode(status)
-            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
-            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. } => {
+            rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. } => {
                 Probe::Unexpected(format!("HTTP {}", status.as_u16()))
             }
             other => Probe::Unreachable(ErrorChain(&other).to_string()),
