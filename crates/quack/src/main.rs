@@ -1527,6 +1527,9 @@ fn init_logging() {
 fn init_logging_at(default: &str) {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // A line is its time, level, span, and message; `RUST_LOG` still
+        // filters by module.
+        .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),

@@ -35,7 +35,7 @@ use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tower_http::trace::{OnResponse, TraceLayer};
 
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
@@ -217,7 +217,7 @@ pub(crate) fn router(app: App) -> Router {
                         request_id
                     )
                 })
-                .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
+                .on_response(ResponseLog),
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
@@ -440,5 +440,24 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => tracing::info!("received Ctrl-C; finishing in-flight requests"),
         () = terminate => tracing::info!("received SIGTERM; finishing in-flight requests"),
+    }
+}
+
+/// One short line per response, inside the request's span (which names the
+/// method, route, and request id): `latency=44 ms status=200`.
+#[derive(Clone, Copy)]
+struct ResponseLog;
+
+impl<B> OnResponse<B> for ResponseLog {
+    fn on_response(
+        self,
+        response: &axum::http::Response<B>,
+        latency: Duration,
+        _span: &tracing::Span,
+    ) {
+        tracing::info!(
+            latency = %format!("{} ms", latency.as_millis()),
+            status = response.status().as_u16()
+        );
     }
 }
