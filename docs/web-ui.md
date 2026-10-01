@@ -44,6 +44,10 @@ Users, Audit, or About link, with `aria-current="page"`. Users and Audit show to
 About (`/about`: the running version and the projects quack is built with) shows to every
 signed-in user and reads no workspace, so it writes no audit row.
 
+- **`workspaces.html`** lists each workspace with its classification, the caller's role,
+  when it was created, and when a request last touched it (`ControlDb::workspace_times`:
+  the newest `audit_log` row naming it, allowed or denied; "never used" for a workspace
+  the CLI made and nothing has opened through the server), one column each.
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
   editor; the version list with the diff to the previous version; the propose form; and the
   paged review queue with bulk accept and reject.

@@ -7,15 +7,22 @@
 {% if workspaces.is_empty() %}
 <p class="mt-4 text-slate-400">No workspaces yet.</p>
 {% else %}
-<ul class="mt-4 divide-y divide-slate-800 rounded border border-slate-800 bg-slate-900">
+<div class="mt-4 overflow-x-auto rounded border border-slate-800 bg-slate-900 px-4">
+<table class="data-table w-full table-fixed border-collapse text-sm">
+  <thead><tr class="border-b border-slate-700 text-left text-xs uppercase text-slate-400"><th scope="col">Workspace</th><th scope="col" class="w-32">Classification</th><th scope="col" class="w-32">Created</th><th scope="col" class="w-32">Last used</th><th scope="col" class="w-24 text-right">Role</th></tr></thead>
+  <tbody>
   {% for ws in workspaces %}
-  <li class="flex items-center gap-4 px-4 py-3">
-    <a class="min-w-0 truncate font-medium text-blue-400 hover:underline" href="/w/{{ ws.id }}/chat" title="{{ ws.name }}">{{ ws.name }}</a>
-    <span class="text-sm text-slate-400">{{ ws.classification }}</span>
-    <span class="ml-auto shrink-0 rounded bg-slate-800 px-2 py-0.5 text-xs">{{ ws.role }}</span>
-  </li>
+  <tr class="border-b border-slate-800 last:border-0">
+    <td class="truncate"><a class="font-medium text-blue-400 hover:underline" href="/w/{{ ws.id }}/chat" title="{{ ws.name }}">{{ ws.name }}</a></td>
+    <td class="whitespace-nowrap text-slate-400">{{ ws.classification }}</td>
+    <td class="whitespace-nowrap text-slate-400">{% if let Some(t) = ws.times %}{{ When::Relative.html(t.created_at.as_str())|safe }}{% endif %}</td>
+    <td class="whitespace-nowrap text-slate-400">{% if let Some(t) = ws.times %}{% if let Some(at) = t.last_accessed_at %}{{ When::Relative.html(at.as_str())|safe }}{% else %}never{% endif %}{% endif %}</td>
+    <td class="text-right"><span class="rounded bg-slate-800 px-2 py-0.5 text-xs">{{ ws.role }}</span></td>
+  </tr>
   {% endfor %}
-</ul>
+  </tbody>
+</table>
+</div>
 {% endif %}
 {% if can_create %}
 <form method="post" action="/workspaces" class="mt-6 flex items-end gap-2">
