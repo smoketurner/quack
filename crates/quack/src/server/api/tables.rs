@@ -8,7 +8,7 @@ use quack_core::storage::control::{AuditAction, Outcome};
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
-use quack_core::storage::workspace::{INTERNAL_PREFIX, TableDescription, WorkspaceDb};
+use quack_core::storage::workspace::{INTERNAL_PREFIX, SqlSchema, TableDescription, WorkspaceDb};
 use serde::Deserialize;
 
 pub(crate) async fn list(
@@ -20,6 +20,19 @@ pub(crate) async fn list(
     access.audit_read(&app, AuditAction::List, "tables").await?;
     let tables = app.read(&id, WorkspaceDb::list_tables).await?;
     Ok(Json(serde_json::json!({ "tables": tables })))
+}
+
+/// Every user table with its columns, each name as a statement writes it,
+/// for the SQL editor's completion. Capped (`SqlSchema::MAX_TABLES` and
+/// `MAX_COLUMNS`), with `truncated` set when something was left out.
+pub(crate) async fn schema(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Json<SqlSchema>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.audit_read(&app, AuditAction::List, "schema").await?;
+    Ok(Json(app.read(&id, WorkspaceDb::sql_schema).await?))
 }
 
 /// The table to describe. In the body, not the path: a table's name is

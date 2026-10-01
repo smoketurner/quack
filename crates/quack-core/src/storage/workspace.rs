@@ -2419,6 +2419,63 @@ impl WorkspaceDb {
         }
     }
 
+    /// The user tables and their columns, for SQL completion: at most
+    /// [`SqlSchema::MAX_TABLES`] tables in name order and
+    /// [`SqlSchema::MAX_COLUMNS`] columns each, never an internal table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn sql_schema(&self) -> Result<SqlSchema> {
+        let reserved: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT keyword_name FROM duckdb_keywords() WHERE keyword_category = 'reserved'",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<duckdb::Result<_>>()?;
+        let mut stmt = self.conn.prepare(
+            "WITH columns AS (
+                 SELECT table_name, column_name,
+                        dense_rank() OVER (ORDER BY table_name) AS table_rank,
+                        row_number() OVER (PARTITION BY table_name ORDER BY ordinal_position) AS column_rank
+                 FROM information_schema.columns
+                 WHERE table_schema = 'main' AND NOT starts_with(table_name, ?)
+             )
+             SELECT table_name, column_name, table_rank > ? OR column_rank > ? AS cut
+             FROM columns
+             WHERE table_rank <= ? + 1 AND column_rank <= ? + 1
+             ORDER BY table_rank, column_rank",
+        )?;
+        let (tables, columns) = (SqlSchema::MAX_TABLES, SqlSchema::MAX_COLUMNS);
+        let mut rows = stmt.query(duckdb::params![
+            INTERNAL_PREFIX,
+            tables,
+            columns,
+            tables,
+            columns
+        ])?;
+        let mut schema = SqlSchema::default();
+        while let Some(row) = rows.next()? {
+            let (table, column, cut): (String, String, bool) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            if cut {
+                schema.truncated = true;
+                continue;
+            }
+            if schema.tables.last().is_none_or(|t| t.name.name != table) {
+                schema.tables.push(TableColumns {
+                    name: SqlName::new(table, &reserved),
+                    columns: Vec::new(),
+                });
+            }
+            if let Some(last) = schema.tables.last_mut() {
+                last.columns.push(SqlName::new(column, &reserved));
+            }
+        }
+        Ok(schema)
+    }
+
     /// List all user-created tables in the workspace (excludes internal tables).
     ///
     /// # Errors
@@ -2537,6 +2594,55 @@ impl WorkspaceDb {
 pub struct ColumnInfo {
     pub name: String,
     pub column_type: String,
+}
+
+/// The user tables and columns SQL completion offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SqlSchema {
+    pub tables: Vec<TableColumns>,
+    /// Some tables or columns were left out to stay within the caps.
+    pub truncated: bool,
+}
+
+impl SqlSchema {
+    /// The most tables one schema carries.
+    pub const MAX_TABLES: u32 = 500;
+    /// The most columns one table carries.
+    pub const MAX_COLUMNS: u32 = 200;
+}
+
+/// One table's name and its columns, in column order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TableColumns {
+    pub name: SqlName,
+    pub columns: Vec<SqlName>,
+}
+
+/// An identifier and how a statement writes it: bare when `DuckDB` reads
+/// it unquoted as the same name (lowercase letters, digits, and
+/// underscores, not a reserved keyword), quoted otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SqlName {
+    pub name: String,
+    pub sql: String,
+}
+
+impl SqlName {
+    fn new(name: String, reserved: &[String]) -> Self {
+        let plain = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        let sql = if plain && !reserved.contains(&name) {
+            name.clone()
+        } else {
+            quote_ident(&name)
+        };
+        Self { name, sql }
+    }
 }
 
 /// Full table description with schema and sample data.
@@ -3758,6 +3864,53 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    #[test]
+    fn the_sql_schema_quotes_what_needs_it_and_hides_internal_tables() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let wide: Vec<String> = (0..=SqlSchema::MAX_COLUMNS)
+            .map(|i| format!("1 AS c{i}"))
+            .collect();
+        for sql in [
+            String::from(
+                "CREATE TABLE sales (region VARCHAR, \"Revenue\" INTEGER, \"select\" INTEGER)",
+            ),
+            String::from("CREATE TABLE \"Order Items\" (id INTEGER)"),
+            format!("CREATE TABLE wide AS SELECT {}", wide.join(", ")),
+        ] {
+            db.execute_statement(&sql)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let schema = db.sql_schema().unwrap_or_else(|e| fail(&e.to_string()));
+        let names: Vec<(&str, &str)> = schema
+            .tables
+            .iter()
+            .map(|t| (t.name.name.as_str(), t.name.sql.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Order Items", "\"Order Items\""),
+                ("sales", "sales"),
+                ("wide", "wide")
+            ]
+        );
+        let columns = |at: usize| -> Vec<&str> {
+            schema
+                .tables
+                .get(at)
+                .map(|t| t.columns.iter().map(|c| c.sql.as_str()).collect())
+                .unwrap_or_default()
+        };
+        let sales = columns(1);
+        assert_eq!(sales, ["region", "\"Revenue\"", "\"select\""]);
+        assert_eq!(
+            columns(2).len(),
+            usize::try_from(SqlSchema::MAX_COLUMNS).unwrap_or_default()
+        );
+        assert!(schema.truncated, "the wide table's last column was cut");
     }
 
     /// A row from before `tables` was recorded drops the one table named

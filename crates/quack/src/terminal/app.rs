@@ -13,7 +13,7 @@ use crossterm::event::{
 };
 use futures::future::BoxFuture;
 use ratatui::style::{Color, Style};
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::{broadcast, mpsc};
 
 use quack_core::analysis::agent::AgentResponse;
@@ -40,7 +40,9 @@ use quack_core::storage::context;
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
 };
-use quack_core::storage::workspace::{Pinning, QueryCanceller, StatementKind, WorkspaceDb};
+use quack_core::storage::workspace::{
+    Pinning, QueryCanceller, SqlSchema, StatementKind, WorkspaceDb,
+};
 
 use crate::ModeArg;
 use crate::confirm::Confirm;
@@ -781,6 +783,9 @@ pub(crate) struct App {
     last_sql: Option<String>,
     history: InputHistory,
     popup: Popup,
+    /// The tables and columns SQL completion offers, read at startup and
+    /// again after anything that can change them.
+    sql_schema: Arc<SqlSchema>,
     config: Arc<Config>,
     workspace_id: WorkspaceId,
     db: SharedDb,
@@ -844,6 +849,7 @@ impl App {
             last_sql: None,
             history: InputHistory::load(config.data_dir().join("terminal_history")),
             popup: Popup::Open { selected: 0 },
+            sql_schema: Arc::new(SqlSchema::default()),
             config: Arc::new(config),
             workspace_id,
             db,
@@ -868,6 +874,12 @@ impl App {
         let id = self.session_id.clone();
         let replay = self.db.run(move |db| Replay::load(db, &id)).await?;
         self.apply_replay(replay);
+        Ok(())
+    }
+
+    /// Read the tables and columns SQL completion offers, at startup.
+    pub(crate) async fn load_sql_schema(&mut self) -> Result<()> {
+        self.sql_schema = Arc::new(self.reader_db.with_db(WorkspaceDb::sql_schema).await?);
         Ok(())
     }
 
@@ -1217,10 +1229,12 @@ impl App {
             }
             AgentEvent::TurnComplete(response) if visible => {
                 turn.progress = turn.progress.ended();
+                self.refresh_sql_schema();
                 self.handle_turn_complete(turn, response);
             }
             AgentEvent::TurnComplete(response) => {
                 turn.progress = turn.progress.ended();
+                self.refresh_sql_schema();
                 let ended = if response.cancelled {
                     "was cancelled"
                 } else {
@@ -1552,9 +1566,10 @@ impl App {
         self.execute_direct_sql(sql, Side::Write);
     }
 
-    /// What the command popup offers for the input, if it is showing:
-    /// one line with the cursor at its end, not recalled from history, and
-    /// not hidden with Esc.
+    /// What the popup offers for the input, if it is showing: one line
+    /// not recalled from history and not hidden with Esc; a `/` command
+    /// with the cursor at its end, or a SQL statement with the cursor
+    /// anywhere in it.
     pub(crate) fn completion(&self) -> Option<Completion> {
         if self.popup == Popup::Hidden || self.history.browsing() || self.awaiting_permission() {
             return None;
@@ -1562,10 +1577,26 @@ impl App {
         let [line] = self.textarea.lines() else {
             return None;
         };
-        if self.textarea.cursor() != (0, line.chars().count()) {
-            return None;
+        let cursor = self.textarea.cursor().1;
+        if line.starts_with('/') {
+            return (cursor == line.chars().count())
+                .then(|| Completion::for_line(line))
+                .flatten();
         }
-        Completion::for_line(line)
+        Completion::for_sql(line, cursor, &self.sql_schema)
+    }
+
+    /// Read the tables and columns again, on the reader, after a statement, an ingest, an import, or an agent turn, any of
+    /// which may have changed them. A failed read keeps the last schema.
+    fn refresh_sql_schema(&mut self) {
+        self.on_db(
+            Side::Read,
+            WorkspaceDb::sql_schema,
+            |app, read| match read {
+                Ok(schema) => app.sql_schema = Arc::new(schema),
+                Err(e) => tracing::debug!(error = %e, "could not read the schema for completion"),
+            },
+        );
     }
 
     /// The highlighted entry of the command popup.
@@ -1614,12 +1645,16 @@ impl App {
                     return false;
                 };
                 let line = self.textarea.lines().concat();
-                let filled = completion.apply(&line, item);
+                let (filled, cursor) = completion.apply(&line, item);
                 if code == KeyCode::Enter && filled.trim_end() == line.trim_end() {
                     return false;
                 }
                 let send = code == KeyCode::Enter && item.finishes();
                 self.set_input(&filled);
+                self.textarea.move_cursor(CursorMove::Jump(
+                    0,
+                    u16::try_from(cursor).unwrap_or(u16::MAX),
+                ));
                 if send {
                     self.submit_message();
                 }
@@ -2493,6 +2528,11 @@ impl App {
     }
 
     fn handle_background_result(&mut self, job: JobId, result: BackgroundResult) {
+        if self.jobs.get(job).is_some_and(|info| {
+            matches!(info.kind, JobKind::Sql | JobKind::Ingest | JobKind::Import)
+        }) {
+            self.refresh_sql_schema();
+        }
         match result {
             BackgroundResult::Done { kind, text } => self.note(kind, text),
             BackgroundResult::Failed(err) => match self.jobs.get(job) {
@@ -3326,6 +3366,57 @@ mod tests {
         );
     }
 
+    /// The words the popup offers for the input as it stands.
+    fn offered(app: &App) -> Vec<String> {
+        app.completion()
+            .map(|c| c.items.into_iter().map(|s| s.word).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_completion_follows_ingests_and_typed_statements() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.load_sql_schema()
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        app.set_input("SELECT * FROM sa");
+        assert!(offered(&app).is_empty(), "no tables yet");
+
+        let file = dir.path().join("sales.csv");
+        std::fs::write(&file, "region,revenue\nnorth,10\n")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        app.run_job(CliJob::Ingest(file));
+        settle(&mut app).await;
+        db_settle(&mut app).await;
+        app.set_input("SELECT * FROM sa");
+        assert_eq!(offered(&app), ["sales"]);
+        app.set_input("SELECT * FROM sales s WHERE s.re");
+        assert_eq!(offered(&app), ["region", "revenue"]);
+
+        app.allow_write.store(true, Ordering::Relaxed);
+        app.handle_slash_command("/sql CREATE TABLE stores (id INTEGER)");
+        settle(&mut app).await;
+        db_settle(&mut app).await;
+        app.set_input("SELECT * FROM st");
+        assert_eq!(offered(&app), ["stores"]);
+        assert!(
+            app.sql_schema
+                .tables
+                .iter()
+                .all(|t| !t.name.name.starts_with("_quack_")),
+            "{:?}",
+            app.sql_schema
+        );
+
+        // Tab fills the name in where the cursor is, and leaves the rest.
+        app.set_input("SELECT re FROM sales");
+        app.textarea.move_cursor(CursorMove::Jump(0, 9));
+        assert!(app.handle_completion_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.textarea.lines().concat(), "SELECT region FROM sales");
+        assert_eq!(app.textarea.cursor().1, 13);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn database_commands_run_in_order_off_the_loop_and_input_waits_for_a_switch() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -3335,6 +3426,8 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()));
         app.run_job(CliJob::Ingest(file));
         settle(&mut app).await;
+        // The ingest refreshed the completion schema on the worker.
+        db_settle(&mut app).await;
 
         // A write then a read, sent back to back, answer in that order: the
         // listing sees the pin.

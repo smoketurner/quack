@@ -10,7 +10,7 @@ use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use quack_core::graph::traverse::Hops;
 use quack_core::ingestion::parser::FileType;
 use quack_core::jobs::JobNumber;
-use quack_core::storage::workspace::looks_like_direct_sql;
+use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
 
 use crate::embeddings_cli::EmbeddingsAction;
 use crate::graph_cli::GraphAction;
@@ -495,8 +495,24 @@ pub(crate) struct Suggestion {
     /// How the popup shows it, with any arguments it takes.
     pub(crate) label: String,
     pub(crate) about: String,
-    /// Whether anything may follow, so accepting it adds a space.
-    more: bool,
+    follows: Follows,
+}
+
+/// What may come after an accepted entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Follows {
+    /// More arguments: accepting it adds a space.
+    Arguments,
+    /// Nothing: Enter sends the line.
+    Nothing,
+    /// The rest of a statement: accepting it adds nothing and sends nothing.
+    Statement,
+}
+
+impl Follows {
+    const fn after(more: bool) -> Self {
+        if more { Self::Arguments } else { Self::Nothing }
+    }
 }
 
 impl Suggestion {
@@ -511,7 +527,7 @@ impl Suggestion {
             word: command.get_name().to_owned(),
             label,
             about: about(command),
-            more: takes_more(command),
+            follows: Follows::after(takes_more(command)),
         }
     }
 
@@ -521,7 +537,17 @@ impl Suggestion {
             label: name.clone(),
             word: name,
             about: about(command),
-            more: takes_more(command),
+            follows: Follows::after(takes_more(command)),
+        }
+    }
+
+    /// A table or column name, written as a statement needs it.
+    pub(crate) fn sql(name: &SqlName, about: &str) -> Self {
+        Self {
+            word: name.sql.clone(),
+            label: name.name.clone(),
+            about: about.to_owned(),
+            follows: Follows::Statement,
         }
     }
 
@@ -536,21 +562,22 @@ impl Suggestion {
             word: flag,
             label,
             about: arg.get_help().map(ToString::to_string).unwrap_or_default(),
-            more: true,
+            follows: Follows::Arguments,
         }
     }
 
     /// Whether accepting it leaves nothing more to type.
     pub(crate) fn finishes(&self) -> bool {
-        !self.more
+        self.follows == Follows::Nothing
     }
 }
 
-/// The suggestions for a line being typed, and where the word they
-/// complete starts.
+/// The suggestions for a line being typed, and the byte range of the word
+/// they replace: from where it starts to the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Completion {
     start: usize,
+    end: usize,
     pub(crate) items: Vec<Suggestion>,
 }
 
@@ -588,7 +615,11 @@ impl Completion {
             }
             Self::after(command, arguments, &flags, word)
         };
-        (!items.is_empty()).then_some(Self { start, items })
+        (!items.is_empty()).then(|| Self::at(start, line.len(), items))
+    }
+
+    pub(crate) const fn at(start: usize, end: usize, items: Vec<Suggestion>) -> Self {
+        Self { start, end, items }
     }
 
     /// What may follow `command` once `arguments` positionals and `flags`
@@ -624,7 +655,7 @@ impl Completion {
                             .get_help()
                             .map(ToString::to_string)
                             .unwrap_or_default(),
-                        more: false,
+                        follows: Follows::Nothing,
                     });
                 }
             }
@@ -638,11 +669,19 @@ impl Completion {
     }
 
     /// `line` with the word being typed replaced by `item`, and a space
-    /// after it when something may follow.
-    pub(crate) fn apply(&self, line: &str, item: &Suggestion) -> String {
+    /// after it when arguments may follow; with the cursor's character
+    /// position after what was filled in.
+    pub(crate) fn apply(&self, line: &str, item: &Suggestion) -> (String, usize) {
         let head = line.get(..self.start).unwrap_or_default();
-        let space = if item.more { " " } else { "" };
-        format!("{head}{}{space}", item.word)
+        let tail = line.get(self.end..).unwrap_or_default();
+        let space = if item.follows == Follows::Arguments {
+            " "
+        } else {
+            ""
+        };
+        let filled = format!("{head}{}{space}", item.word);
+        let cursor = filled.chars().count();
+        (format!("{filled}{tail}"), cursor)
     }
 }
 
@@ -734,7 +773,7 @@ mod tests {
         let apply = |line: &str| {
             let completion = Completion::for_line(line)?;
             let item = completion.get(0)?;
-            Some((completion.apply(line, item), item.finishes()))
+            Some((completion.apply(line, item).0, item.finishes()))
         };
         assert_eq!(apply("/sch"), Some((String::from("/schema "), false)));
         assert_eq!(apply("/he"), Some((String::from("/help"), true)));

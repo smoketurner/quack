@@ -115,6 +115,15 @@ row is processing (marked `data-pending`).
   commit it whenever a template changes classes.
 - `static/js/htmx.min.js` (htmx 4.0.0) and `static/js/echarts.min.js` (ECharts 6.1.0) are
   vendored so the binary works air-gapped.
+- `static/js/sql-editor.min.js` is the SQL page's editor: CodeMirror 6 with
+  `@codemirror/lang-sql`, highlighting SQL and completing the table and column names that
+  `GET /api/v1/workspaces/{id}/tables/schema` returns (audited, `no-store`, never a
+  `_quack_` table), each inserted as SQL writes it. Its source is `editor/sql-editor.js`
+  with pinned versions in `editor/package.json` and `pnpm-lock.yaml`; `make editor-build`
+  bundles it with esbuild, and the bundle is **committed** like the CSS. It hides the
+  page's `textarea` and keeps it in sync, so the htmx run, the sort swap, and the CSV
+  download post it as before, and without JavaScript the textarea is the editor.
+  Ctrl/Cmd+Enter runs the statement.
 - `static/js/app.js` is quack's own. It posts to `/api/v1/workspaces/{id}/query/stream`,
   parses the SSE events, and renders the steps block, the answer, citations as links to the
   document list, and the chart spec as an ECharts option. On page load it renders stored

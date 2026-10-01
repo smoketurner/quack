@@ -354,8 +354,9 @@ and run on the work queue in a lane of `[server].workers_per_workspace` per work
 serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
 and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
-of a 401; the built Tailwind CSS is committed (`make css-build` after template edits) and
-htmx and ECharts are vendored (`docs/web-ui.md`). Tests drive the router with
+of a 401; the built Tailwind CSS is committed (`make css-build` after template edits),
+htmx and ECharts are vendored, and the SQL page's CodeMirror editor is bundled from
+`crates/quack/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). Tests drive the router with
 `tower::ServiceExt::oneshot` and no model. The full CLI (`quack -p`, `quack serve`, `quack mcp`,
 `quack ontology propose`, ...) is specified in design doc section 11.
 

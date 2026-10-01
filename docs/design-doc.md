@@ -1592,8 +1592,8 @@ and ask again. The UI covers:
   to the document's row, charts and graph results inline, the allow-writes checkbox, a
   mode selector for new sessions, Stop, an empty state that lists what the workspace holds.
 - Documents: upload (multi-file), paste text, status with progress, pin, delete.
-- Tables: list with schema and sample rows, and the import form; a SQL page with result grid
-  and download.
+- Tables: list with schema and sample rows, and the import form; a SQL page with an editor
+  that highlights SQL and completes table and column names, a result grid, and download.
 - Graph: search box, ECharts graph with class colors, node inspector with properties and
   provenance, merge review queue, provisional and stale banners.
 - Ontology: class, relation, property, and mapping editors with inline validation;
@@ -1647,6 +1647,7 @@ PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
 DELETE /api/v1/workspaces/{id}/documents/{doc}
 GET    /api/v1/workspaces/{id}/tables
 POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns, row count, sample rows
+GET    /api/v1/workspaces/{id}/tables/schema    every user table's columns, each name as SQL writes it (capped)
 POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops?}
 POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
@@ -1770,6 +1771,16 @@ own), fixed choices such as `/mode chat|query`, and long flags once a word start
 Up/Down move the highlight; Tab fills it in. Enter fills it in and runs it when nothing more
 may follow, or sends the line as typed when there is nothing to fill in. Esc hides the popup
 until the next keystroke.
+
+A line that starts like a statement (`SELECT`, `WITH`, `FROM`, `DESCRIBE`, ...) gets table
+and column names at the cursor, anywhere in the line (`terminal::sql`, over sqlparser's
+`DuckDB` tokenizer): tables after `FROM`, `JOIN`, `DESCRIBE`, `SUMMARIZE`, or a comma in a
+`FROM` list; after `t.`, that table's or alias's columns only; elsewhere in an expression,
+the named tables' columns and table names. A name that needs quoting is filled in quoted. An
+alias, a whole keyword, a string, or a number gets nothing, and a name typed in full is
+listed first, so Enter still runs a finished statement. The names come from
+`WorkspaceDb::sql_schema` (never a `_quack_` table; at most 500 tables of 200 columns),
+read at startup and again after a statement, an ingest, an import, or a turn.
 
 **Jobs** (section 4.1). Questions, statements, files, imports, and ontology or graph verbs
 are each a job; the prompt takes the next line at once. A follow-up asked while an answer
