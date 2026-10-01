@@ -1,44 +1,44 @@
 {% extends "base.html" %}
 {% block content %}
 {% if let Some(ws) = page.workspace %}
-<div class="grid gap-6 md:grid-cols-[14rem_1fr]">
+<div class="grid gap-6 md:grid-cols-[14rem_minmax(0,1fr)]">
   <aside>
-    <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Tables</h2>
-    {% if tables.is_empty() %}<p class="mt-2 text-sm text-slate-600">No tables. Upload a CSV, TSV, Parquet, JSON, or Excel file, or import from a database.</p>{% endif %}
+    <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Tables</h2>
+    {% if tables.is_empty() %}<p class="mt-2 text-sm text-slate-400">No tables. Upload a CSV, TSV, Parquet, JSON, or Excel file, or import from a database.</p>{% endif %}
     <ul class="mt-2 space-y-1 text-sm">
-      {% for t in tables %}<li><a class="block rounded px-2 py-1 font-mono hover:bg-slate-100" href="/w/{{ ws.id }}/tables/{{ t }}">{{ t }}</a></li>{% endfor %}
+      {% for t in tables %}<li><a class="block truncate rounded px-2 py-1 font-mono hover:bg-slate-800" href="/w/{{ ws.id }}/tables/{{ t }}" title="{{ t }}">{{ t }}</a></li>{% endfor %}
     </ul>
   </aside>
-  <section>
+  <section class="min-w-0">
     {% if let Some(t) = selected %}
-    <h1 class="font-mono text-xl font-semibold">{{ t.name }}</h1>
-    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-500">Schema</h2>
-    <table class="mt-1 text-sm"><tbody>
-      {% for c in t.columns %}<tr><td class="pr-6 font-mono">{{ c.0 }}</td><td class="text-slate-600">{{ c.1 }}</td></tr>{% endfor %}
+    <h1 class="font-mono text-xl font-semibold wrap-anywhere">{{ t.name }}</h1>
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Schema</h2>
+    <table class="data-table mt-1 text-sm"><tbody>
+      {% for c in t.columns %}<tr><td class="font-mono wrap-anywhere">{{ c.0 }}</td><td class="font-mono text-slate-400 wrap-anywhere">{{ c.1 }}</td></tr>{% endfor %}
     </tbody></table>
-    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-500">Sample rows</h2>
-    <div class="mt-1 overflow-x-auto rounded border border-slate-200 bg-white">
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Sample rows</h2>
+    <div class="mt-1 overflow-x-auto rounded border border-slate-800 bg-slate-900">
       <table class="min-w-full text-sm">
-        <thead><tr class="border-b border-slate-300 text-left">{% for c in t.sample_columns %}<th class="px-3 py-2 font-mono">{{ c }}</th>{% endfor %}</tr></thead>
-        <tbody>{% for r in t.sample_rows %}<tr class="border-b border-slate-100">{% for v in r %}<td class="px-3 py-1">{{ v }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+        <thead><tr class="border-b border-slate-700 text-left">{% for c in t.sample_columns %}<th class="px-3 py-2 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead>
+        <tbody>{% for r in t.sample_rows %}<tr class="border-b border-slate-800">{% for v in r %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
       </table>
     </div>
-    <p class="mt-4 text-sm"><a class="text-blue-700 hover:underline" href="/w/{{ ws.id }}/sql">Query it in SQL</a></p>
+    <p class="mt-4 text-sm"><a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/sql">Query it in SQL</a></p>
     {% else %}
-    <p class="text-slate-600">Pick a table to see its schema and sample rows.</p>
+    <p class="text-slate-400">Pick a table to see its schema and sample rows.</p>
     {% endif %}
     {% if ws.can_write %}
-    <form method="post" action="/w/{{ ws.id }}/import" class="mt-6 rounded border border-slate-200 bg-white p-3 text-sm">
+    <form method="post" action="/w/{{ ws.id }}/import" class="mt-6 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
       <h2 class="font-medium">Import from a database or a URL</h2>
-      <p class="mt-1 text-xs text-slate-500">postgres://user:password@host/db, sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). The password is used once and never stored.</p>
-      {% if let Some(error) = error %}<p class="mt-2 rounded border border-red-200 bg-red-50 px-2 py-1 text-red-800">{{ error }}</p>{% endif %}
+      <p class="mt-1 text-xs text-slate-400">postgres://user:password@host/db, sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). The password is used once and never stored.</p>
+      {% if let Some(error) = error %}<p class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300">{{ error }}</p>{% endif %}
       <div class="mt-2 grid gap-2 md:grid-cols-2">
-        <input name="url" placeholder="source URL" required class="rounded border border-slate-300 px-2 py-1 md:col-span-2">
-        <input name="table" placeholder="workspace table name" required class="rounded border border-slate-300 px-2 py-1">
-        <input name="source_table" placeholder="source table (or leave empty and give a query)" class="rounded border border-slate-300 px-2 py-1">
-        <textarea name="query" rows="2" placeholder="SELECT ... (optional)" class="rounded border border-slate-300 px-2 py-1 font-mono text-xs md:col-span-2"></textarea>
+        <input name="url" placeholder="source URL" required class="rounded border border-slate-700 px-2 py-1 md:col-span-2">
+        <input name="table" placeholder="workspace table name" required class="rounded border border-slate-700 px-2 py-1">
+        <input name="source_table" placeholder="source table (or leave empty and give a query)" class="rounded border border-slate-700 px-2 py-1">
+        <textarea name="query" rows="2" placeholder="SELECT ... (optional)" class="rounded border border-slate-700 px-2 py-1 font-mono text-xs md:col-span-2"></textarea>
       </div>
-      <button type="submit" class="mt-2 rounded bg-slate-900 px-3 py-1 text-white hover:bg-slate-700">Import</button>
+      <button type="submit" class="mt-2 rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Import</button>
     </form>
     {% endif %}
   </section>

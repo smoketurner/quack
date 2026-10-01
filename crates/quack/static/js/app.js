@@ -22,9 +22,16 @@
     };
   }
 
+  // The page is dark; charts take ECharts' dark theme over its background.
+  function initChart(el) {
+    var chart = window.echarts.init(el, "dark");
+    chart.setOption({ backgroundColor: "transparent" });
+    return chart;
+  }
+
   function renderChart(el, spec) {
     if (!window.echarts || !spec) return;
-    var chart = window.echarts.init(el);
+    var chart = initChart(el);
     chart.setOption(chartOption(spec));
     window.addEventListener("resize", function () { chart.resize(); });
   }
@@ -68,7 +75,7 @@
 
   function renderGraph(el, result) {
     if (!window.echarts) return;
-    var chart = window.echarts.init(el);
+    var chart = initChart(el);
     chart.setOption(graphOption(result));
     chart.on("click", function (p) {
       if (p.dataType !== "node") return;
@@ -102,6 +109,60 @@
     return e;
   }
 
+  // Times arrive as UTC instants in time[datetime] and are shown in the
+  // viewer's zone. "clock" is the time of day, with the date when it is not
+  // today; "relative" is how long ago for today and the date before that.
+  // The title always holds the full local date and time.
+  function sameDay(a, b) {
+    return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  }
+
+  function dateText(d, now) {
+    var opts = { month: "short", day: "numeric" };
+    if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
+    return d.toLocaleDateString(undefined, opts);
+  }
+
+  function clockText(d, now) {
+    var time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    return sameDay(d, now) ? time : dateText(d, now) + ", " + time;
+  }
+
+  function relativeText(d, now) {
+    if (!sameDay(d, now)) return dateText(d, now);
+    var minutes = Math.floor((now - d) / 60000);
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return minutes + " min ago";
+    return Math.floor(minutes / 60) + " h ago";
+  }
+
+  function formatTime(t, now) {
+    var d = new Date(t.getAttribute("datetime"));
+    if (isNaN(d)) return;
+    t.textContent = t.getAttribute("data-when") === "relative" ? relativeText(d, now) : clockText(d, now);
+    t.title = d.toLocaleString();
+  }
+
+  function formatTimes(root) {
+    var now = new Date();
+    (root || document).querySelectorAll("time[data-when]").forEach(function (t) { formatTime(t, now); });
+  }
+
+  function timeEl(date, when) {
+    var t = el("time");
+    t.setAttribute("datetime", date.toISOString());
+    t.setAttribute("data-when", when);
+    formatTime(t, new Date());
+    return t;
+  }
+
+  // A message's header line: the role, then when, then how long an answer took.
+  function messageHeader(role) {
+    var header = el("div", "flex flex-wrap items-baseline gap-x-2 text-xs text-slate-400");
+    header.appendChild(el("span", "font-semibold uppercase", role));
+    return header;
+  }
+
   function citationLabel(c) {
     var label = c.filename || "";
     if (c.page) label += ", page " + c.page;
@@ -110,24 +171,25 @@
   }
 
   function startAssistant(messages) {
-    var article = el("article", "rounded border border-slate-200 bg-white p-4 msg-assistant");
-    article.appendChild(el("div", "text-xs font-semibold uppercase text-slate-500", "assistant"));
+    var article = el("article", "rounded border border-slate-800 bg-slate-900 p-4 msg-assistant");
+    var header = messageHeader("assistant");
+    article.appendChild(header);
     var details = el("details", "mt-2 text-sm hidden");
-    var summary = el("summary", "cursor-pointer text-slate-600", "0 steps");
+    var summary = el("summary", "cursor-pointer text-slate-400", "0 steps");
     details.appendChild(summary);
-    var steps = el("ol", "mt-1 space-y-1 font-mono text-xs");
+    var steps = el("ol", "mt-1 space-y-1 font-mono text-xs wrap-anywhere");
     details.appendChild(steps);
     article.appendChild(details);
     var body = el("div", "answer mt-2 whitespace-pre-wrap");
     article.appendChild(body);
-    var working = el("div", "mt-2 flex items-center gap-2 text-sm text-slate-500");
+    var working = el("div", "mt-2 flex items-center gap-2 text-sm text-slate-400");
     var dot = el("span", "inline-block h-2.5 w-2.5 animate-pulse rounded-full bg-blue-600");
     working.appendChild(dot);
     working.appendChild(el("span", null, "Thinking…"));
     article.appendChild(working);
     messages.appendChild(article);
     article.scrollIntoView({ block: "end" });
-    return { article: article, details: details, summary: summary, steps: steps, body: body, working: working, count: 0 };
+    return { article: article, header: header, details: details, summary: summary, steps: steps, body: body, working: working, count: 0 };
   }
 
   // The sidebar lists sessions at render time; a session started from this
@@ -137,16 +199,16 @@
     if (!list) return;
     var ws = chat.getAttribute("data-workspace");
     var li = el("li", "group flex items-start gap-1");
-    var a = el("a", "block min-w-0 flex-1 truncate rounded bg-slate-100 px-2 py-1");
+    var a = el("a", "block min-w-0 flex-1 truncate rounded bg-slate-800 px-2 py-1");
     a.href = "/w/" + ws + "/chat?session=" + sessionId;
     a.textContent = prompt.length > 80 ? prompt.slice(0, 80) : prompt;
-    a.appendChild(el("span", "block text-xs text-slate-500", "just now · " + document.getElementById("ask").mode.value));
+    a.appendChild(el("span", "block text-xs text-slate-400", "just now · " + document.getElementById("ask").mode.value));
     li.appendChild(a);
     var form = el("form");
     form.method = "post";
     form.action = "/w/" + ws + "/chat/" + sessionId + "/delete";
     form.onsubmit = function () { return confirm("Delete this session?"); };
-    var button = el("button", "rounded px-2 py-1 text-slate-400 hover:bg-red-50 hover:text-red-700", "×");
+    var button = el("button", "rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400", "×");
     button.type = "submit";
     button.title = "Delete session";
     form.appendChild(button);
@@ -198,9 +260,11 @@
     var status = document.getElementById("status");
     var prompt = form.prompt.value.trim();
     if (!prompt) return;
-    var user = el("article", "rounded border border-slate-200 bg-white p-4 msg-user");
-    user.appendChild(el("div", "text-xs font-semibold uppercase text-slate-500", "user"));
-    user.appendChild(el("div", "mt-2 whitespace-pre-wrap", prompt));
+    var user = el("article", "rounded border border-slate-800 bg-slate-900 p-4 msg-user");
+    var header = messageHeader("user");
+    header.appendChild(timeEl(new Date(), "clock"));
+    user.appendChild(header);
+    user.appendChild(el("div", "answer mt-2 whitespace-pre-wrap", prompt));
     messages.appendChild(user);
     form.prompt.value = "";
     var view = startAssistant(messages);
@@ -246,7 +310,7 @@
         return;
       }
       view.body.textContent = "Error: " + err.message;
-      view.article.classList.add("border-red-300");
+      view.article.classList.add("border-red-800");
     }).then(function () {
       if (stop) stop.removeEventListener("click", onStop);
       finishWorking(view);
@@ -277,10 +341,12 @@
       var pending = view.steps.querySelector("li[data-pending]");
       if (pending) {
         pending.removeAttribute("data-pending");
-        pending.appendChild(el("span", "text-slate-500", " → " + f.summary + ", " + f.duration_ms + " ms"));
+        pending.appendChild(el("span", "text-slate-400", " → " + f.summary + ", " + f.duration_ms + " ms"));
       }
     } else if (event === "complete") {
       var r = JSON.parse(data);
+      view.header.appendChild(timeEl(new Date(), "clock"));
+      if (r.duration_ms != null) view.header.appendChild(el("span", null, "· answered in " + r.duration_ms + " ms"));
       if (r.answer_html) {
         // Rendered server-side from the Markdown, with raw HTML escaped.
         view.body.classList.remove("whitespace-pre-wrap");
@@ -294,15 +360,15 @@
         renderChart(c, r.chart);
       }
       (r.graph || []).forEach(function (result) {
-        var g = el("div", "graph mt-3 h-72 rounded border border-slate-200");
+        var g = el("div", "graph mt-3 h-72 rounded border border-slate-800");
         view.article.appendChild(g);
         renderGraph(g, result);
       });
       if (r.citations && r.citations.length) {
-        var ol = el("ol", "mt-3 space-y-1 text-sm text-slate-600");
+        var ol = el("ol", "mt-3 space-y-1 text-sm text-slate-400");
         r.citations.forEach(function (cit) {
           var li = el("li", null, "[" + cit.n + "] ");
-          var a = el("a", "text-blue-700 hover:underline", citationLabel(cit));
+          var a = el("a", "text-blue-400 hover:underline", citationLabel(cit));
           a.href = "/w/" + chat.getAttribute("data-workspace") + "/documents#doc-" + cit.document_id;
           li.appendChild(a);
           ol.appendChild(li);
@@ -310,7 +376,7 @@
         view.article.appendChild(ol);
       }
       if (r.write_refused) {
-        view.article.appendChild(el("p", "mt-2 text-sm text-amber-800", "A change to the tables was refused. Tick “Allow the agent to change tables” and ask again to permit it."));
+        view.article.appendChild(el("p", "mt-2 text-sm text-amber-200", "A change to the tables was refused. Tick “Allow the agent to change tables” and ask again to permit it."));
       }
       if (!chat.getAttribute("data-session") && r.session_id) {
         chat.setAttribute("data-session", r.session_id);
@@ -320,7 +386,7 @@
       finishWorking(view);
     } else if (event === "error") {
       view.body.textContent = "Error: " + data;
-      view.article.classList.add("border-red-300");
+      view.article.classList.add("border-red-800");
       finishWorking(view);
     } else if (event === "write_refused") {
       status.textContent = data;
@@ -346,7 +412,12 @@
     source.addEventListener("jobs", refresh);
   }
 
+  // Relative times go stale; swapped-in rows arrive as UTC.
+  setInterval(function () { formatTimes(); }, 30000);
+  document.addEventListener("htmx:after:swap", function () { formatTimes(); });
+
   document.addEventListener("DOMContentLoaded", function () {
+    formatTimes();
     renderStoredCharts();
     renderGraphs();
     followJobs();

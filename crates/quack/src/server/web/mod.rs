@@ -18,6 +18,9 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use axum_extra::extract::CookieJar;
+use jiff::Timestamp;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
 // Multi-valued fields (checkboxes) need serde_html_form, which axum's own
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
@@ -236,8 +239,36 @@ struct WorkspacesPage {
     error: Option<String>,
 }
 
+/// A point in time as a page shows it: `app.js` rewrites every
+/// `time[data-when]` in the viewer's time zone, and the UTC text stands
+/// for a page without scripts.
+struct Moment(Timestamp);
+
+impl Moment {
+    /// A `DuckDB` `TIMESTAMP` cast to text, which holds UTC.
+    fn from_utc_text(text: &str) -> Option<Self> {
+        let civil: DateTime = text.parse().ok()?;
+        civil
+            .to_zoned(TimeZone::UTC)
+            .ok()
+            .map(|z| Self(z.timestamp()))
+    }
+
+    fn iso(&self) -> String {
+        self.0.to_string()
+    }
+
+    fn utc(&self) -> String {
+        self.0.strftime("%Y-%m-%d %H:%M UTC").to_string()
+    }
+}
+
 struct MessageView {
     role: String,
+    /// When the question was asked or the answer finished.
+    at: Option<Moment>,
+    /// How long the answer took; `None` for questions and older answers.
+    duration_ms: Option<u64>,
     /// Rendered HTML for assistant answers; escaped text for user messages.
     content_html: String,
     steps: Vec<ToolStep>,
@@ -295,7 +326,7 @@ struct JobView {
     can_cancel: bool,
     progress: String,
     outcome: Option<String>,
-    queued_at: String,
+    queued_at: Moment,
 }
 
 #[derive(Template)]
@@ -752,6 +783,8 @@ impl MessageView {
     fn question(row: &MessageRow) -> Self {
         Self {
             role: String::from("user"),
+            at: Moment::from_utc_text(&row.created_at),
+            duration_ms: None,
             content_html: askama::filters::escape(&row.content, askama::filters::Html)
                 .map(|e| e.to_string())
                 .unwrap_or_default(),
@@ -766,6 +799,8 @@ impl MessageView {
         let meta = row.assistant().cloned().unwrap_or_default();
         Self {
             role: String::from("assistant"),
+            at: Moment::from_utc_text(&row.created_at),
+            duration_ms: meta.duration_ms,
             content_html: markdown::to_html(&row.content),
             steps,
             citations: meta
@@ -911,7 +946,7 @@ impl JobRows {
                 active: !j.state.is_finished(),
                 progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
                 outcome: j.outcome.or(j.status),
-                queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+                queued_at: Moment(j.queued_at),
             })
             .collect();
         let pending = jobs.iter().any(|j| j.active);
@@ -1990,6 +2025,57 @@ mod tests {
                 ("assistant", vec![]),
             ]
         );
+    }
+
+    /// A stored `TIMESTAMP` is UTC text; the page gets an instant the
+    /// browser can localize, and text it cannot parse shows no time at all.
+    #[test]
+    fn moments_read_duckdb_timestamps_as_utc() {
+        let at = Moment::from_utc_text("2026-09-30 14:03:22.123456");
+        assert_eq!(
+            at.as_ref().map(Moment::iso).as_deref(),
+            Some("2026-09-30T14:03:22.123456Z")
+        );
+        assert_eq!(
+            at.as_ref().map(Moment::utc).as_deref(),
+            Some("2026-09-30 14:03 UTC")
+        );
+        assert_eq!(
+            Moment::from_utc_text("2026-09-30 14:03:22")
+                .map(|m| m.iso())
+                .as_deref(),
+            Some("2026-09-30T14:03:22Z")
+        );
+        assert!(Moment::from_utc_text("").is_none());
+        assert!(Moment::from_utc_text("yesterday").is_none());
+    }
+
+    /// An answer shows how long it took; a question and an answer recorded
+    /// before durations were kept show none.
+    #[test]
+    fn transcript_carries_the_answer_duration() {
+        let row = |seq: i64, role: MessageRole, metadata: Option<MessageMeta>| MessageRow {
+            id: MessageId::from(format!("m{seq}")),
+            session_id: SessionId::from("s"),
+            seq,
+            role,
+            content: String::from("x"),
+            metadata,
+            created_at: String::from("2026-09-30 14:03:22"),
+        };
+        let timed = Some(MessageMeta::Assistant(AssistantMeta {
+            duration_ms: Some(2_345),
+            ..AssistantMeta::default()
+        }));
+        let views = MessageView::transcript(&[
+            row(1, MessageRole::User, None),
+            row(2, MessageRole::Assistant, timed),
+            row(3, MessageRole::User, None),
+            row(4, MessageRole::Assistant, None),
+        ]);
+        let durations: Vec<Option<u64>> = views.iter().map(|v| v.duration_ms).collect();
+        assert_eq!(durations, vec![None, Some(2_345), None, None]);
+        assert!(views.iter().all(|v| v.at.is_some()));
     }
 }
 

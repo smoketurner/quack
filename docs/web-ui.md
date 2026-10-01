@@ -47,6 +47,22 @@ context, ontology, graph, settings.
 - **`graph.html`** shows status banners (provisional, stale, missing mapped tables,
   drift), the search and path forms, the ECharts result with a node inspector, the merge
   queue, and the extract, revalidate, and review buttons.
+- **Dark only.** `styles/input.css` sets `color-scheme: dark`, so native controls and the
+  file picker follow; panels are `slate-900` on a `slate-950` page and primary buttons are
+  `blue-600`. Charts and the graph use ECharts' built-in `dark` theme.
+- **Tables never let columns touch or overrun.** Listing tables carry `data-table` (padded
+  cells, from `input.css`); prose and names wrap with `wrap-anywhere`; short fixed values
+  (status, sizes, times) are `whitespace-nowrap`; data grids (sample rows, SQL results) and
+  opaque ids keep one line per cell, cut at a width with "…", and carry the full value in a
+  `title` tooltip. A sidebar layout's content track is `minmax(0,1fr)`, so a wide grid
+  scrolls inside its own box instead of widening the page.
+- **Times are localized in the browser.** A page renders `<time datetime="…Z"
+  data-when="clock|relative">` with UTC text (`web::Moment`); `app.js` rewrites each in the
+  viewer's zone, with the full date and time as the tooltip. `clock` (chat messages) is the
+  time of day, with the date when not today; `relative` (the Jobs page) is "5 min ago" for
+  today and the date before that, refreshed every 30 seconds and after every htmx swap.
+  Chat messages show when they were asked or answered, and an answer how many milliseconds it
+  took (`duration_ms` on the response object and the assistant message's metadata).
 - **Fragments that htmx swaps** (`documents_rows.html`, `sql_result.html`) are their own
   structs, rendered to a string and inserted with `|safe`. askama escapes everything else.
 
