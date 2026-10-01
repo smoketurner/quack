@@ -391,6 +391,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "reader_pool_size",
             "effort",
             "background_effort",
+            "compact_history",
         ],
     ),
     (
@@ -795,6 +796,11 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "background_effort",
         analysis.background_effort.map(Effort::as_str),
         None,
+    );
+    s.literal(
+        "compact_history",
+        analysis.compact_history,
+        default.compact_history,
     );
 }
 

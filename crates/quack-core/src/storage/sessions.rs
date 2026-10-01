@@ -6,6 +6,7 @@
 //! resumed, listed, and exported without leaving the classification boundary.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use jiff::Timestamp;
 
@@ -15,10 +16,15 @@ use crate::analysis::citations::Citation;
 use crate::analysis::events::{ToolName, ToolStep};
 use crate::error::{Error, Record, Result};
 use crate::graph::GraphResult;
-use crate::ids::{MessageId, SessionId, UserId};
+use crate::ids::{MessageId, SessionId, SummaryId, UserId};
 use crate::text::Tokens;
+use rig::id::ConversationId;
+use rig::memory::{ConversationMemory, MemoryError, MemoryPolicy, TokenWindowMemory};
+use rig::message::{AssistantContent, Message, UserContent};
+use rig::wasm_compat::WasmBoxedFuture;
 
 use super::workspace::WorkspaceDb;
+use super::writer::Writer;
 
 /// How the agent may answer in a session.
 #[derive(
@@ -538,55 +544,188 @@ pub fn record_turn(
     Ok(())
 }
 
-/// Prior turns to replay to the model, newest last, trimmed from the
-/// oldest end to fit `token_budget`. A turn is its question and its answer,
-/// kept or dropped together, so the thread opens on a question and
-/// alternates; tool messages are not replayed, since the answer already
-/// describes what the tools found. A turn with no text on either side is
-/// skipped: it tells the model nothing, and a provider that drops empty
-/// text blocks (Anthropic) would be left with a message of no content and
-/// refuse every later turn of the session.
+/// The session's turns to replay to the model, oldest first: each question
+/// and its answer, tool rows skipped (the answer already says what the
+/// tools found). A turn with no text on either side is left out whole: it
+/// tells the model nothing, and a provider that drops empty text blocks
+/// (Anthropic) would be left with a message of no content and refuse every
+/// later turn of the session.
 ///
 /// # Errors
 ///
 /// Returns an error if the messages cannot be read.
-pub fn history_for_model(
-    db: &WorkspaceDb,
-    session_id: &SessionId,
-    token_budget: Tokens,
-) -> Result<Vec<rig::message::Message>> {
+pub fn session_turns(db: &WorkspaceDb, session_id: &SessionId) -> Result<Vec<Message>> {
     let stored = messages(db, session_id)?;
-    let mut turns: Vec<(&MessageRow, &MessageRow)> = Vec::new();
+    let mut turns = Vec::new();
     let mut question = None;
     for row in &stored {
         match row.role {
             MessageRole::User => question = Some(row),
             MessageRole::Assistant => {
-                if let Some(asked) = question.take() {
-                    turns.push((asked, row));
+                let Some(asked) = question.take() else {
+                    continue;
+                };
+                if asked.content.trim().is_empty() || row.content.trim().is_empty() {
+                    continue;
                 }
+                turns.push(Message::user(asked.content.clone()));
+                turns.push(Message::assistant(row.content.clone()));
             }
             MessageRole::Tool => {}
         }
     }
+    Ok(turns)
+}
 
-    let mut kept: Vec<rig::message::Message> = Vec::new();
-    let mut used = Tokens::default();
-    for (asked, answered) in turns.iter().rev() {
-        if asked.content.trim().is_empty() || answered.content.trim().is_empty() {
-            continue;
-        }
-        let cost =
-            Tokens::estimate(&asked.content).saturating_add(Tokens::estimate(&answered.content));
-        if used.saturating_add(cost) > token_budget {
-            break;
-        }
-        used = used.saturating_add(cost);
-        kept.push(rig::message::Message::assistant(answered.content.clone()));
-        kept.push(rig::message::Message::user(asked.content.clone()));
+/// A session's replayable turns as rig's [`ConversationMemory`], under the
+/// session's id: `load` reads [`session_turns`]. quack records each turn
+/// itself ([`record_turn`]: the checked answer, its tool rows, and its
+/// usage), so `append` and `clear` store nothing, and a turn is in the next
+/// `load` as soon as it is recorded.
+pub struct SessionMemory {
+    db: Arc<Writer>,
+}
+
+impl SessionMemory {
+    #[must_use]
+    pub const fn new(db: Arc<Writer>) -> Self {
+        Self { db }
     }
-    kept.reverse();
-    Ok(kept)
+}
+
+impl ConversationMemory for SessionMemory {
+    fn load<'a>(
+        &'a self,
+        conversation_id: &'a ConversationId,
+    ) -> WasmBoxedFuture<'a, std::result::Result<Vec<Message>, MemoryError>> {
+        let session = SessionId::from(conversation_id.as_str());
+        Box::pin(async move {
+            self.db
+                .run(move |db| session_turns(db, &session))
+                .await
+                .map_err(MemoryError::backend)
+        })
+    }
+
+    fn append<'a>(
+        &'a self,
+        _conversation_id: &'a ConversationId,
+        _messages: Vec<Message>,
+    ) -> WasmBoxedFuture<'a, std::result::Result<(), MemoryError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn clear<'a>(
+        &'a self,
+        _conversation_id: &'a ConversationId,
+    ) -> WasmBoxedFuture<'a, std::result::Result<(), MemoryError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The history window: rig's [`TokenWindowMemory`] over
+/// `[analysis].history_token_budget`, counting four characters per token
+/// ([`Tokens::estimate`]) so budgets read as before, then the window's
+/// leading answer dropped when its question fell outside: a replayed thread
+/// opens on a question.
+pub struct TranscriptWindow(TokenWindowMemory);
+
+impl TranscriptWindow {
+    #[must_use]
+    pub fn new(budget: Tokens) -> Self {
+        let budget = usize::try_from(budget.get()).unwrap_or(usize::MAX);
+        Self(TokenWindowMemory::new(budget, |message: &Message| {
+            let text = match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|part| match part {
+                        UserContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .filter_map(|part| match part {
+                        AssistantContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                Message::System { content } => content.clone(),
+            };
+            usize::try_from(Tokens::estimate(&text).get()).unwrap_or(usize::MAX)
+        }))
+    }
+}
+
+impl MemoryPolicy for TranscriptWindow {
+    fn apply(&self, messages: Vec<Message>) -> std::result::Result<Vec<Message>, MemoryError> {
+        Ok(self.apply_with_demoted(messages)?.0)
+    }
+
+    fn apply_with_demoted(
+        &self,
+        messages: Vec<Message>,
+    ) -> std::result::Result<(Vec<Message>, Vec<Message>), MemoryError> {
+        let (mut kept, mut demoted) = self.0.apply_with_demoted(messages)?;
+        let answers = kept
+            .iter()
+            .take_while(|m| matches!(m, Message::Assistant { .. }))
+            .count();
+        demoted.extend(kept.drain(..answers));
+        Ok((kept, demoted))
+    }
+}
+
+/// A summary of a session's earliest replayable messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSummary {
+    /// How many of [`session_turns`]' messages, oldest first, it covers.
+    pub covers: usize,
+    pub text: String,
+}
+
+/// The session's newest summary, if one was made.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn latest_summary(db: &WorkspaceDb, session_id: &SessionId) -> Result<Option<StoredSummary>> {
+    let mut stmt = db.connection().prepare(
+        "SELECT covers, summary FROM _quack_session_summaries WHERE session_id = ? \
+         ORDER BY covers DESC, id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(duckdb::params![session_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let covers: i64 = row.get(0)?;
+    Ok(Some(StoredSummary {
+        covers: usize::try_from(covers).unwrap_or_default(),
+        text: row.get(1)?,
+    }))
+}
+
+/// Keep a new summary of the session's first `covers` replayable messages.
+///
+/// # Errors
+///
+/// Returns an error if the insert fails.
+pub fn save_summary(
+    db: &WorkspaceDb,
+    session_id: &SessionId,
+    covers: usize,
+    text: &str,
+) -> Result<()> {
+    db.connection().execute(
+        "INSERT INTO _quack_session_summaries (id, session_id, covers, summary) VALUES (?, ?, ?, ?)",
+        duckdb::params![
+            SummaryId::generate(),
+            session_id,
+            i64::try_from(covers).unwrap_or(i64::MAX),
+            text
+        ],
+    )?;
+    Ok(())
 }
 
 /// How a session is exported.
@@ -716,6 +855,10 @@ pub fn delete_session(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool> 
         duckdb::params![session_id],
     )?;
     db.connection().execute(
+        "DELETE FROM _quack_session_summaries WHERE session_id = ?",
+        duckdb::params![session_id],
+    )?;
+    db.connection().execute(
         "DELETE FROM _quack_sessions WHERE id = ?",
         duckdb::params![session_id],
     )?;
@@ -746,6 +889,86 @@ pub fn delete_if_empty(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool>
 mod tests {
     use super::*;
     use crate::embedding::Dimension;
+
+    /// The history the window keeps of a session's turns under `budget`.
+    fn windowed(db: &WorkspaceDb, session: &SessionId, budget: u32) -> Result<Vec<Message>> {
+        let turns = session_turns(db, session)?;
+        TranscriptWindow::new(Tokens::new(budget))
+            .apply(turns)
+            .map_err(|e| Error::Analysis(e.to_string()))
+    }
+
+    /// The trim the window replaced: whole turns, newest first, until the
+    /// next one would pass the budget.
+    fn turn_by_turn(turns: &[Message], budget: u32) -> Vec<Message> {
+        let mut kept: Vec<Message> = Vec::new();
+        let mut used = Tokens::default();
+        for pair in turns.chunks(2).rev() {
+            let cost = pair.iter().fold(Tokens::default(), |sum, m| {
+                sum.saturating_add(Tokens::estimate(&text_of(m)))
+            });
+            if used.saturating_add(cost) > Tokens::new(budget) {
+                break;
+            }
+            used = used.saturating_add(cost);
+            kept.splice(0..0, pair.iter().cloned());
+        }
+        kept
+    }
+
+    fn text_of(message: &Message) -> String {
+        match message {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|part| match part {
+                    UserContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Message::Assistant { content, .. } => content
+                .iter()
+                .filter_map(|part| match part {
+                    AssistantContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Message::System { content } => content.clone(),
+        }
+    }
+
+    /// rig's token window keeps exactly what the turn-by-turn trim kept,
+    /// at every budget.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn the_window_keeps_what_the_turn_by_turn_trim_kept() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        for (question, answer) in [
+            ("a", "bbbbbbbbbbbbbbbbbbbb"),
+            ("cccccccccccccccc", "d"),
+            ("eeeeeeee", "ffffffff"),
+            ("g", "h"),
+            ("iiiiiiiiiiiiiiiiiiiiiiii", "jjjjjjjjjjjj"),
+            ("kkk", "llllll"),
+        ] {
+            record_turn(
+                &db,
+                &session.id,
+                question,
+                Timestamp::now(),
+                &response(answer, vec![]),
+            )
+            .unwrap();
+        }
+        let turns = session_turns(&db, &session.id).unwrap();
+        for budget in 0..=128 {
+            assert_eq!(
+                windowed(&db, &session.id, budget).unwrap(),
+                turn_by_turn(&turns, budget),
+                "budget {budget}"
+            );
+        }
+    }
 
     /// A flag enum reads the JSON boolean an API body carries and gives
     /// the same boolean back.
@@ -1136,14 +1359,14 @@ mod tests {
         )
         .unwrap();
 
-        let all = history_for_model(&db, &session.id, Tokens::new(10_000)).unwrap();
+        let all = windowed(&db, &session.id, 10_000).unwrap();
         assert_eq!(all.len(), 4);
 
         // "second question" + "second answer" ≈ 8 tokens; budget of 9 keeps only those two.
-        let trimmed = history_for_model(&db, &session.id, Tokens::new(9)).unwrap();
+        let trimmed = windowed(&db, &session.id, 9).unwrap();
         assert_eq!(trimmed.len(), 2);
 
-        let none = history_for_model(&db, &session.id, Tokens::new(1)).unwrap();
+        let none = windowed(&db, &session.id, 1).unwrap();
         assert!(none.is_empty());
     }
 
@@ -1177,16 +1400,13 @@ mod tests {
         // would be an orphaned Assistant; it must be dropped, leaving an empty
         // history rather than one that opens with an answer whose question
         // was cut for budget.
-        let trimmed = history_for_model(&db, &session.id, Tokens::new(4)).unwrap();
+        let trimmed = windowed(&db, &session.id, 4).unwrap();
         assert!(
             trimmed.is_empty(),
             "expected empty history, got {trimmed:?}"
         );
         assert!(
-            !matches!(
-                trimmed.first(),
-                Some(rig::message::Message::Assistant { .. })
-            ),
+            !matches!(trimmed.first(), Some(Message::Assistant { .. })),
             "orphaned Assistant first: {trimmed:?}"
         );
     }
@@ -1220,13 +1440,13 @@ mod tests {
         )
         .unwrap();
 
-        let history = history_for_model(&db, &session.id, Tokens::new(10_000)).unwrap();
+        let history = windowed(&db, &session.id, 10_000).unwrap();
         let texts: Vec<String> = history
             .iter()
             .map(|m| match m {
-                rig::message::Message::User { .. } => format!("user: {m:?}"),
-                rig::message::Message::Assistant { .. } => format!("assistant: {m:?}"),
-                rig::message::Message::System { .. } => format!("system: {m:?}"),
+                Message::User { .. } => format!("user: {m:?}"),
+                Message::Assistant { .. } => format!("assistant: {m:?}"),
+                Message::System { .. } => format!("system: {m:?}"),
             })
             .collect();
         assert_eq!(history.len(), 4, "{texts:#?}");
@@ -1265,25 +1485,19 @@ mod tests {
         }
 
         for budget in 0..=128u32 {
-            let trimmed = history_for_model(&db, &session.id, Tokens::new(budget)).unwrap();
+            let trimmed = windowed(&db, &session.id, budget).unwrap();
             assert!(
-                matches!(
-                    trimmed.first(),
-                    None | Some(rig::message::Message::User { .. })
-                ),
+                matches!(trimmed.first(), None | Some(Message::User { .. })),
                 "budget {budget}: history opens with an orphaned Assistant: {trimmed:?}"
             );
             if !trimmed.is_empty() {
                 assert!(
-                    matches!(
-                        trimmed.last(),
-                        Some(rig::message::Message::Assistant { .. })
-                    ),
+                    matches!(trimmed.last(), Some(Message::Assistant { .. })),
                     "budget {budget}: history does not end on an Assistant: {trimmed:?}"
                 );
                 let mut want_user = true;
                 for message in &trimmed {
-                    let is_user = matches!(message, rig::message::Message::User { .. });
+                    let is_user = matches!(message, Message::User { .. });
                     assert_eq!(
                         is_user, want_user,
                         "budget {budget}: non-alternating role {message:?}"
@@ -1293,21 +1507,11 @@ mod tests {
             }
         }
 
-        assert!(
-            history_for_model(&db, &session.id, Tokens::new(0))
-                .unwrap()
-                .is_empty()
-        );
-        let full = history_for_model(&db, &session.id, Tokens::new(1_000)).unwrap();
+        assert!(windowed(&db, &session.id, 0).unwrap().is_empty());
+        let full = windowed(&db, &session.id, 1_000).unwrap();
         assert_eq!(full.len(), 10);
-        assert!(matches!(
-            full.first(),
-            Some(rig::message::Message::User { .. })
-        ));
-        assert!(matches!(
-            full.last(),
-            Some(rig::message::Message::Assistant { .. })
-        ));
+        assert!(matches!(full.first(), Some(Message::User { .. })));
+        assert!(matches!(full.last(), Some(Message::Assistant { .. })));
     }
 
     #[test]

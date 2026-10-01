@@ -197,6 +197,11 @@ id_type!(
 );
 
 id_type!(
+    /// A stored summary of a session's earlier turns.
+    SummaryId
+);
+
+id_type!(
     /// One background run: an induction run whose candidates are stored
     /// together, or a server run from its start audit row to its closing one.
     RunId

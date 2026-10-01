@@ -47,6 +47,17 @@ const ONTOLOGY_ACCEPTANCE: u32 = 10;
 /// row, keeping the more-decided one so a reviewer's rejection is not lost.
 const MERGE_DEDUP: u32 = 11;
 
+/// Summaries of the turns a session's history window leaves out
+/// (`[analysis].compact_history`), each with how many replayable messages,
+/// oldest first, it covers.
+const SESSION_SUMMARIES_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_session_summaries (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    covers INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT now()
+);";
+
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
 const WORKSPACE_SCHEMA_VERSION: u32 = MERGE_DEDUP;
@@ -988,6 +999,7 @@ impl WorkspaceDb {
             );"
         );
         self.conn.execute_batch(&sql)?;
+        self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
         self.upgrade_data(dim)?;
