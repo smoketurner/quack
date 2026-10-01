@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -15,12 +15,12 @@ use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
-use super::policy::{RefusalFlag, WritePolicy};
+use super::policy::WritePolicy;
 use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
 use super::tools::{
-    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphResults, GraphTools,
+    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphTools,
     ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
-    SharedDb, ToolDeps, TurnSlot,
+    SharedDb, Turn,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphOptions, GraphResult, store as graph_store};
@@ -416,7 +416,7 @@ where
             asked,
         } = self;
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
-        let outputs = TurnOutputs::new(recorder.clone());
+        let turn = Turn::new(recorder.clone(), write_policy);
         let Replay { history, dropped } = Replay::check(history);
         let window = Window::for_turn(&prompt, &read.system_prompt, &history, user_message);
         let agent = BuildContext {
@@ -427,9 +427,7 @@ where
             graph_options,
             modeled: read.modeled,
             mode: prompt.mode,
-            write_policy,
             window,
-            outputs: outputs.clone(),
             rerank_model,
         }
         .build_agent(completion_model, embedding_model, &read.system_prompt)?;
@@ -441,6 +439,7 @@ where
             .history(history)
             .max_turns(max_turns)
             .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
+            .tool_context(turn.context())
             .stream();
 
         let mut streamed = String::new();
@@ -511,7 +510,7 @@ where
             answer.text.push_str(&note);
             answer.text.push(')');
         }
-        Ok(outputs.finish(answer, aggregate.or_else(|| per_call.reported()), asked))
+        Ok(turn.finish(answer, aggregate.or_else(|| per_call.reported()), asked))
     }
 }
 
@@ -632,25 +631,7 @@ impl StreamStop<'_> {
     }
 }
 
-/// What the tools leave for the response, and the turn's record of steps.
-#[derive(Clone)]
-struct TurnOutputs {
-    chart: TurnSlot<ChartSpec>,
-    graph: GraphResults,
-    refused: RefusalFlag,
-    recorder: TurnRecorder,
-}
-
-impl TurnOutputs {
-    fn new(recorder: TurnRecorder) -> Self {
-        Self {
-            chart: TurnSlot::default(),
-            graph: Arc::new(Mutex::new(Vec::new())),
-            refused: RefusalFlag::default(),
-            recorder,
-        }
-    }
-
+impl Turn {
     /// The response once the stream has ended: the checked answer, the
     /// chart and graph results the tools left behind, and the steps.
     fn finish(
@@ -685,9 +666,7 @@ struct BuildContext<'a> {
     graph_options: GraphOptions,
     modeled: Modeled,
     mode: ChatMode,
-    write_policy: WritePolicy,
     window: Window,
-    outputs: TurnOutputs,
     rerank_model: Option<RerankModel>,
 }
 
@@ -709,32 +688,21 @@ impl BuildContext<'_> {
             ctx.rerank_model.clone(),
             embedding_model.clone(),
             ctx.retrieval_config,
-            ctx.outputs.recorder.clone(),
         )
         .with_model(ctx.modeled);
-        let deps = ToolDeps {
-            db: ctx.reader_db.clone(),
-            recorder: ctx.outputs.recorder.clone(),
-        };
+        let reader = || ctx.reader_db.clone();
         let mut builder = AgentBuilder::new(completion_model)
             .preamble(system_prompt)
             .tool(search)
             .tool(RunSqlTool::new(
                 Arc::clone(&ctx.shared_db),
-                ctx.reader_db.clone(),
+                reader(),
                 ctx.analysis_config.max_query_rows,
-                ctx.write_policy,
-                ctx.outputs.refused.clone(),
-                ctx.outputs.recorder.clone(),
             ))
-            .tool(DescribeTableTool(deps.clone()))
-            .tool(ListTablesTool(deps.clone()))
-            .tool(ListDocumentsTool(deps.clone()))
-            .tool(CreateChartTool::new(
-                ctx.reader_db.clone(),
-                ctx.outputs.chart.clone(),
-                ctx.outputs.recorder.clone(),
-            ))
+            .tool(DescribeTableTool(reader()))
+            .tool(ListTablesTool(reader()))
+            .tool(ListDocumentsTool(reader()))
+            .tool(CreateChartTool::new(reader()))
             .temperature(0.1)
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);
@@ -760,7 +728,7 @@ impl BuildContext<'_> {
         // is capped, so a class the model wants the detail of may not be in it
         // even when nothing has been extracted into the graph yet.
         if ctx.modeled.has_ontology() {
-            builder = builder.tool(DescribeClassTool(deps));
+            builder = builder.tool(DescribeClassTool(reader()));
         }
 
         if ctx.modeled.has_graph() {
@@ -769,8 +737,6 @@ impl BuildContext<'_> {
                 embedding_model: embedding_model.clone(),
                 options: ctx.graph_options,
                 mode: ctx.mode,
-                results: Arc::clone(&ctx.outputs.graph),
-                recorder: ctx.outputs.recorder.clone(),
             };
             builder = builder
                 .tool(SearchGraphTool(graph.clone()))
