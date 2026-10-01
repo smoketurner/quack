@@ -5265,6 +5265,38 @@ async fn web_session(h: &Harness, username: &str) -> String {
         .to_owned()
 }
 
+#[tokio::test]
+async fn about_page_credits_the_projects_to_every_signed_in_user() {
+    let h = harness(ServeMode::Login).await;
+    h.user("bob", UserKind::Standard).await;
+    let (status, _, headers) = h.page("/about", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/login");
+
+    let cookie = web_session(&h, "bob").await;
+    let (status, html, _) = h.page("/about", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(env!("CARGO_PKG_VERSION")), "{html}");
+    for site in [
+        "https://ratatui.rs",
+        "https://duckdb.org",
+        "https://rig.rs",
+        "https://ollama.com",
+    ] {
+        assert!(
+            html.contains(&format!("href=\"{site}\" rel=\"noopener noreferrer\"")),
+            "{site}: {html}"
+        );
+    }
+    assert!(
+        html.contains("href=\"/about\" aria-current=\"page\""),
+        "{html}"
+    );
+    // Every signed-in page links to it, not just the admin ones.
+    let (_, html, _) = h.page("/workspaces", Some(&cookie)).await;
+    assert!(html.contains("href=\"/about\""), "{html}");
+}
+
 /// The web console and the API run one operation each, so the rules the
 /// API enforces hold on the web too, with the reason in the page's flash
 /// slot rather than as an error page.

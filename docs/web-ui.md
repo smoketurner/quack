@@ -40,7 +40,9 @@ Every page struct carries a `page: Page`: title, its `Tab`, username, admin flag
 and the current workspace with its role and what the caller may do. `base.html` reads it for
 the header and the workspace tabs (`Tab::WORKSPACE`: chat, documents, tables with the import
 form, SQL, context, ontology, graph, jobs, settings), highlighting the page's tab, or the
-Users or Audit link, with `aria-current="page"`.
+Users, Audit, or About link, with `aria-current="page"`. Users and Audit show to admins;
+About (`/about`: the running version and the projects quack is built with) shows to every
+signed-in user and reads no workspace, so it writes no audit row.
 
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
   editor; the version list with the diff to the previous version; the propose form; and the
