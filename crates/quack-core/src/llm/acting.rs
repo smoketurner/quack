@@ -29,7 +29,7 @@ enum Subject {
     Signed(Arc<SubjectTokens>, Origin),
     /// A token fixed by a test, or the reason there is none.
     #[cfg(test)]
-    Fixed(std::result::Result<&'static str, &'static str>),
+    Fixed(Result<&'static str, &'static str>),
 }
 
 impl std::fmt::Debug for Acting {
@@ -61,10 +61,7 @@ impl Acting {
 
     /// `user` with a fixed token (`Ok`) or none (`Err`, the reason).
     #[cfg(test)]
-    pub(crate) const fn fixed(
-        user: UserId,
-        token: std::result::Result<&'static str, &'static str>,
-    ) -> Self {
+    pub(crate) const fn fixed(user: UserId, token: Result<&'static str, &'static str>) -> Self {
         Self {
             user,
             tokens: Subject::Fixed(token),
@@ -81,7 +78,7 @@ impl Acting {
     /// # Errors
     ///
     /// Returns why, when there is no current token for them.
-    pub async fn subject_token(&self) -> std::result::Result<SecretString, String> {
+    pub async fn subject_token(&self) -> Result<SecretString, String> {
         match &self.tokens {
             Subject::Signed(tokens, origin) => tokens.subject_token(&self.user, origin).await,
             #[cfg(test)]

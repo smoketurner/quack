@@ -256,7 +256,7 @@ mod tests {
             tokio::spawn(async move {
                 writer
                     .run(move |_| {
-                        hold.recv().ok();
+                        hold.recv().unwrap_or_default();
                         Ok(())
                     })
                     .await

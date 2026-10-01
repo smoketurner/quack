@@ -124,7 +124,7 @@ mod tests {
         let second = AuditId::generate();
         assert!(
             AuditDetail {
-                id: first.clone(),
+                id: first,
                 user_id: Some(UserId::from("u1")),
                 action: String::from("sql"),
                 detail: serde_json::json!({"sql": "SELECT 1"})

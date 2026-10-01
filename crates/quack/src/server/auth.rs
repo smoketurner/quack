@@ -269,10 +269,10 @@ impl FromRequestParts<App> for Identity {
 
     /// Who is calling. When quack is a protected resource, a 401 says where
     /// to get a token, and `invalid_token` when one was presented.
-    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        let identity = Self::resolve(parts, app)
+    async fn from_request_parts(parts: &mut Parts, state: &App) -> Result<Self, Self::Rejection> {
+        let identity = Self::resolve(parts, state)
             .await
-            .map_err(|e| match &app.resource {
+            .map_err(|e| match &state.resource {
                 Some(resource) if e.status == StatusCode::UNAUTHORIZED => {
                     let refused = parts.headers.contains_key(header::AUTHORIZATION)
                         || SessionCookie::read(&parts.headers).is_some();
@@ -283,8 +283,8 @@ impl FromRequestParts<App> for Identity {
             })?;
         // Model requests this request makes, and jobs it submits, act for
         // this person at an on-behalf-of provider. Local mode is nobody's.
-        if app.mode != ServeMode::Local
-            && let Some(oidc) = &app.oidc
+        if state.mode != ServeMode::Local
+            && let Some(oidc) = &state.oidc
         {
             oidc.acting(&identity.user_id, identity.origin()).enter();
         }

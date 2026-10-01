@@ -136,7 +136,7 @@ pub enum Error {
     SeaQuery(#[from] sea_query::error::Error),
 
     #[error("format error: {0}")]
-    Fmt(#[from] std::fmt::Error),
+    Fmt(#[from] fmt::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

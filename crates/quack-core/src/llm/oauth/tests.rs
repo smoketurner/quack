@@ -35,7 +35,7 @@ struct MockState {
     grants: StdMutex<Option<Vec<String>>>,
     /// Run once before a refused refresh is answered: another process
     /// finishing its own refresh of the same token meanwhile.
-    before_refusal: tokio::sync::Mutex<Option<BeforeRefusal>>,
+    before_refusal: Mutex<Option<BeforeRefusal>>,
     /// The public key registered for `client-1`'s `private_key_jwt`.
     client_jwk: StdMutex<Vec<PublicJwk>>,
     /// Every assertion `jti` accepted so far: the issuer spends them.
@@ -73,7 +73,7 @@ struct MockState {
     rotate_registration_token: std::sync::atomic::AtomicBool,
 }
 
-type BeforeRefusal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+type BeforeRefusal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 struct MockIdp {
     issuer: String,
@@ -726,7 +726,7 @@ async fn expiring_token_is_refreshed_once_under_concurrency() {
 
 #[tokio::test]
 async fn refresh_keeps_the_old_refresh_token_when_the_issuer_omits_one() {
-    let response: oauth2::basic::BasicTokenResponse =
+    let response: BasicTokenResponse =
         serde_json::from_str(&token_json("a", None)).unwrap_or_else(|e| fail(&e.to_string()));
     let token = CachedToken::from_response(&response);
     assert!(token.refresh_token.is_none());

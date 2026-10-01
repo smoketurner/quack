@@ -17,7 +17,7 @@ use crate::storage::workspace::{ChunkSearchResult, SamplePool, WorkspaceDb};
 use crate::storage::writer::Writer;
 
 /// What the model returns for one chunk.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extraction {
     #[serde(default)]
     pub nodes: Vec<ExtractedNode>,
@@ -25,7 +25,7 @@ pub struct Extraction {
     pub edges: Vec<ExtractedEdge>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedNode {
     pub label: String,
     pub class: String,
@@ -33,7 +33,7 @@ pub struct ExtractedNode {
     pub properties: Properties,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedEdge {
     pub source: String,
     pub target: String,
@@ -65,7 +65,7 @@ impl Ontology {
 
 /// An extraction filtered against the ontology: what to store, and what
 /// the passage tried to say that the ontology has no place for.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Validated {
     pub nodes: Vec<ExtractedNode>,
     pub edges: Vec<ExtractedEdge>,

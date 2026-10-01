@@ -1243,7 +1243,7 @@ pub struct CreateChartArgs {
     /// Kind of chart: bar, line, scatter, or pie. The schema lists the kinds;
     /// the text is parsed leniently so a near miss comes back as a message
     /// the model can act on rather than a rejected call.
-    #[schemars(with = "crate::analysis::chart::ChartKind")]
+    #[schemars(with = "ChartKind")]
     pub kind: String,
     /// Column for the x axis (category labels; slice names for pie)
     pub x: String,
@@ -1350,7 +1350,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl rig::embeddings::EmbeddingModel for CountingEmbeddingModel {
+    impl EmbeddingModel for CountingEmbeddingModel {
         const MAX_DOCUMENTS: usize = 1024;
         type Client = ();
 
@@ -1367,7 +1367,7 @@ mod tests {
         fn embed_texts(
             &self,
             texts: impl IntoIterator<Item = String> + Send,
-        ) -> impl std::future::Future<
+        ) -> impl Future<
             Output = Result<Vec<rig::embeddings::Embedding>, rig::embeddings::EmbeddingError>,
         > + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -2019,10 +2019,10 @@ mod tests {
         impl Reranker for Reverse {
             fn rank<'a>(
                 &'a self,
-                _q: &'a str,
-                c: &'a [ChunkSearchResult],
+                _query: &'a str,
+                candidates: &'a [ChunkSearchResult],
             ) -> rerank::RankFuture<'a> {
-                Box::pin(async move { Ok((0..c.len()).rev().collect()) })
+                Box::pin(async move { Ok((0..candidates.len()).rev().collect()) })
             }
             fn name(&self) -> &'static str {
                 "reverse"

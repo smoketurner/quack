@@ -11,8 +11,9 @@ under `crates/`: `quack-core`, the library, and `quack`, the one binary. The roo
 - `[workspace.package]`: edition 2024, the MSRV.
 - `[workspace.dependencies]`: every dependency pinned to an exact version, default features
   off; members opt in.
-- `[workspace.lints]`: panic, cast, and arithmetic denies plus clippy `pedantic`. Every
-  member declares `[lints] workspace = true`.
+- `[workspace.lints]`: panic, cast, and arithmetic denies, clippy `pedantic`, and selected
+  restriction and nursery lints (own-crate absolute paths, untyped `let _`, ref-counted
+  `.clone()`, `#[allow]` without `#[expect]`). Every member declares `[lints] workspace = true`.
 
 There are no Cargo features: every build contains every surface.
 

@@ -87,8 +87,8 @@ pub(crate) struct WebUser(pub Identity);
 impl FromRequestParts<App> for WebUser {
     type Rejection = Redirect;
 
-    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        Identity::from_request_parts(parts, app)
+    async fn from_request_parts(parts: &mut Parts, state: &App) -> Result<Self, Self::Rejection> {
+        Identity::from_request_parts(parts, state)
             .await
             .map(WebUser)
             .map_err(|_| Redirect::to("/login"))
@@ -1522,7 +1522,7 @@ impl CandidateView {
                 },
             ),
         };
-        CandidateView {
+        Self {
             id: c.id,
             kind: c.kind,
             proposal_id: c.proposal.id().to_owned(),

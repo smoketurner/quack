@@ -3,14 +3,14 @@
 
 use super::*;
 use crate::config::inspect::{Inspection, Origin};
-use crate::doctor::{Area, Probing, Report, Status};
+use crate::doctor::{self, Area, Probing, Report, Status};
 use crate::llm::oauth::client_key::ClientKey;
 use crate::llm::oauth::registration::{
     ClientMetadata, ReadBack, Registered, Registrar, RegistrationName, Removal,
-    SignIn as SignInWith, TemporaryClient, metadata_for,
+    SignIn as SignInWith, SignedInRegistration, TemporaryClient, metadata_for,
 };
 use crate::oidc::SignIn;
-use crate::storage::control::ControlPlane;
+use crate::storage::control::{ControlPlane, SealedOwner};
 
 /// quack's configuration for one Vouch-like issuer: sign-in and an
 /// on-behalf-of provider without an actor, both without a `client_id`, and
@@ -186,7 +186,7 @@ async fn an_open_registration_sends_the_union_of_what_the_clients_need_and_no_be
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(
         control
-            .sealed(crate::storage::control::SealedOwner::ClientKey(&idp.issuer))
+            .sealed(SealedOwner::ClientKey(&idp.issuer))
             .await
             .is_ok_and(|k| k.is_none())
     );
@@ -631,14 +631,14 @@ async fn doctor_checks_the_registration_is_kept_and_still_readable() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let online = Probing::Online {
-        timeout: std::time::Duration::from_secs(5),
+        timeout: Duration::from_secs(5),
     };
     let doctor = |probing: Probing| {
         let config = config.clone();
         let control = control.clone();
         async move {
             let mut report = Report::default();
-            crate::doctor::check_registrations(
+            doctor::check_registrations(
                 &mut report,
                 &config,
                 Some(&control),
@@ -900,7 +900,7 @@ async fn sign_in_and_register(
     registrar: &Registrar,
     issuer: &RegistrationName,
     metadata: &ClientMetadata,
-) -> Result<crate::llm::oauth::registration::SignedInRegistration> {
+) -> Result<SignedInRegistration> {
     registrar
         .register_signed_in(
             issuer,
@@ -1018,7 +1018,7 @@ async fn a_temporary_client_left_behind_is_recorded_and_deleted_later() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let mut report = Report::default();
-    crate::doctor::check_registrations(
+    doctor::check_registrations(
         &mut report,
         &config,
         Some(&control),

@@ -469,18 +469,18 @@ mod tests {
             let keyfile = dir.path().join("vault.key");
             let slot_a = KeySlot::new(String::from("vault"), keyfile.clone(), KeySource::File);
             let slot_b = KeySlot::new(String::from("vault"), keyfile.clone(), KeySource::File);
-            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
             let ha = tokio::spawn({
-                let barrier = barrier.clone();
+                let barrier = Arc::clone(&barrier);
                 async move {
-                    let _ = barrier.wait().await;
+                    barrier.wait().await;
                     slot_a.read_or_create(|| Ok(String::from("a"))).await
                 }
             });
             let hb = tokio::spawn({
-                let barrier = barrier.clone();
+                let barrier = Arc::clone(&barrier);
                 async move {
-                    let _ = barrier.wait().await;
+                    barrier.wait().await;
                     slot_b.read_or_create(|| Ok(String::from("b"))).await
                 }
             });
@@ -521,18 +521,18 @@ mod tests {
                 dir.path().join("vault.key"),
                 Keychain::Fake(Arc::clone(&fake)),
             );
-            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
             let ha = tokio::spawn({
-                let barrier = barrier.clone();
+                let barrier = Arc::clone(&barrier);
                 async move {
-                    let _ = barrier.wait().await;
+                    barrier.wait().await;
                     slot_a.read_or_create(|| Ok(String::from("a"))).await
                 }
             });
             let hb = tokio::spawn({
-                let barrier = barrier.clone();
+                let barrier = Arc::clone(&barrier);
                 async move {
-                    let _ = barrier.wait().await;
+                    barrier.wait().await;
                     slot_b.read_or_create(|| Ok(String::from("b"))).await
                 }
             });

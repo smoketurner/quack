@@ -19,10 +19,11 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
 use quack_core::config::{ClientAuth, Config, OidcConfig};
+use quack_core::error::Error as CoreError;
 use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
-use quack_core::llm::oauth::{CachedToken, KeySource};
+use quack_core::llm::oauth::{CachedToken, KeySource, TokenManager};
 use quack_core::oidc::{OidcSubject, Origin};
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
@@ -35,6 +36,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tower::ServiceExt;
 
 use super::Oidc;
+use crate::server;
+use crate::server::auth::{Identity, SESSION_COOKIE};
+use crate::server::error::ApiError;
 use crate::server::state::{App, AppState, ServeMode};
 
 /// The audit row a test's own setup writes.
@@ -272,7 +276,7 @@ impl Harness {
             sessions,
             Some(oidc),
         ));
-        let router = crate::server::router(Arc::clone(&app));
+        let router = server::router(Arc::clone(&app));
         Self {
             dir,
             app,
@@ -383,7 +387,7 @@ impl Harness {
         self.issuer(|s| {
             s.id_claims = json!({
                 "iss": base, "sub": subject, "aud": "quack",
-                "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+                "exp": Timestamp::now().as_second().saturating_add(3600),
                 "nonce": nonce, "preferred_username": username,
             });
         });
@@ -396,9 +400,9 @@ impl Harness {
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
         assert_eq!(reply.location, "/workspaces");
         let session = reply
-            .cookie(crate::server::auth::SESSION_COOKIE)
+            .cookie(SESSION_COOKIE)
             .unwrap_or_else(|| fail("no session cookie"));
-        format!("{}={session}", crate::server::auth::SESSION_COOKIE)
+        format!("{SESSION_COOKIE}={session}")
     }
 
     async fn me(&self, session: &str) -> (StatusCode, Value) {
@@ -465,7 +469,7 @@ impl Harness {
         self.issuer(|s| {
             s.id_claims = json!({
                 "iss": base, "sub": subject, "aud": "quack",
-                "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+                "exp": Timestamp::now().as_second().saturating_add(3600),
                 "nonce": nonce, "preferred_username": subject,
             });
         });
@@ -556,7 +560,7 @@ async fn a_sign_in_whose_audit_row_cannot_be_written_leaves_no_token() {
         "{}",
         reply.body
     );
-    assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+    assert!(reply.cookie(SESSION_COOKIE).is_none());
     assert!(!h.has_token(&h.user_of("sub-aud").await).await);
 }
 
@@ -571,7 +575,7 @@ async fn a_sign_in_whose_token_cannot_be_stored_is_still_audited() {
         "{}",
         reply.body
     );
-    assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+    assert!(reply.cookie(SESSION_COOKIE).is_none());
     let user = h.user_of("sub-cred").await;
     let logins = h.audit("login").await;
     assert!(
@@ -602,7 +606,7 @@ async fn a_callback_this_browser_did_not_start_is_refused_and_audited() {
             "{} lacks {text}",
             reply.location
         );
-        assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+        assert!(reply.cookie(SESSION_COOKIE).is_none());
     };
     refused(&h.get(&callback, None).await, "could not be matched");
     refused(
@@ -736,7 +740,7 @@ async fn a_sign_in_racing_the_last_logout_keeps_its_token() {
         .id;
     // The logout has closed the user's last session.
     let session = cookie
-        .strip_prefix(&format!("{}=", crate::server::auth::SESSION_COOKIE))
+        .strip_prefix(&format!("{SESSION_COOKIE}="))
         .unwrap_or_else(|| fail("not a session cookie"));
     h.app.sessions.close(session);
     assert!(h.has_token(&user).await);
@@ -807,7 +811,7 @@ async fn a_bearer_logout_keeps_the_stored_token_and_audits_nothing() {
     // The browser session ends without a logout (a restart, an expiry), so
     // the stored token outlives every session.
     let session = cookie
-        .strip_prefix(&format!("{}=", crate::server::auth::SESSION_COOKIE))
+        .strip_prefix(&format!("{SESSION_COOKIE}="))
         .unwrap_or_else(|| fail("not a session cookie"));
     h.app.sessions.close(session);
     assert!(h.has_token(&user.id).await);
@@ -839,7 +843,7 @@ async fn without_oidc_there_is_no_button_and_no_route() {
         sessions,
         None,
     ));
-    let router = crate::server::router(app);
+    let router = server::router(app);
     for (uri, status) in [
         ("/login", StatusCode::OK),
         (OidcConfig::START_PATH, StatusCode::NOT_FOUND),
@@ -901,7 +905,7 @@ impl IssuerKey {
         header.kid = Some(String::from("k1"));
         let claims = json!({
             "iss": issuer, "aud": aud, "sub": subject, "scp": "quack.use",
-            "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+            "exp": Timestamp::now().as_second().saturating_add(3600),
             "preferred_username": subject,
         });
         jsonwebtoken::encode(&header, &claims, &self.encoding)
@@ -1122,27 +1126,20 @@ async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
 
 /// A token for an on-behalf-of provider at the mock issuer, as the request's
 /// caller: what a turn's model request would send.
-async fn obo_token(app: &App) -> Result<String, crate::server::error::ApiError> {
-    obo_token_as(app, quack_core::config::ClientAuth::ClientSecretPost).await
+async fn obo_token(app: &App) -> Result<String, ApiError> {
+    obo_token_as(app, ClientAuth::ClientSecretPost).await
 }
 
 /// As [`obo_token`], with the provider's client authenticating by `auth`.
-async fn obo_token_as(
-    app: &App,
-    auth: quack_core::config::ClientAuth,
-) -> Result<String, crate::server::error::ApiError> {
+async fn obo_token_as(app: &App, auth: ClientAuth) -> Result<String, ApiError> {
     use secrecy::ExposeSecret;
     let manager = obo_manager(app, auth)?;
     Ok(manager.access_token().await?.expose_secret().to_owned())
 }
 
 /// An on-behalf-of provider exchanging at the harness's issuer.
-fn obo_manager(
-    app: &App,
-    auth: quack_core::config::ClientAuth,
-) -> Result<quack_core::llm::oauth::TokenManager, crate::server::error::ApiError> {
+fn obo_manager(app: &App, auth: ClientAuth) -> Result<TokenManager, ApiError> {
     use quack_core::config::{Exchange, Grant, OAuthConfig};
-    use quack_core::llm::oauth::TokenManager;
     let issuer = app
         .config
         .server
@@ -1164,9 +1161,9 @@ fn obo_manager(
         resource: None,
         actor: false,
     };
-    let name = "model".parse().map_err(|e: quack_core::error::Error| {
-        crate::server::error::ApiError::internal(e.to_string())
-    })?;
+    let name = "model"
+        .parse()
+        .map_err(|e: CoreError| ApiError::internal(e.to_string()))?;
     Ok(TokenManager::new(
         &app.config,
         &name,
@@ -1175,26 +1172,17 @@ fn obo_manager(
     )?)
 }
 
-async fn probe(
-    axum::extract::State(app): axum::extract::State<App>,
-    _caller: crate::server::auth::Identity,
-) -> Result<String, crate::server::error::ApiError> {
+async fn probe(State(app): State<App>, _caller: Identity) -> Result<String, ApiError> {
     obo_token(&app).await
 }
 
 /// The same, for a provider that signs client assertions.
-async fn probe_key(
-    axum::extract::State(app): axum::extract::State<App>,
-    _caller: crate::server::auth::Identity,
-) -> Result<String, crate::server::error::ApiError> {
+async fn probe_key(State(app): State<App>, _caller: Identity) -> Result<String, ApiError> {
     obo_token_as(&app, ClientAuth::PrivateKeyJwt).await
 }
 
 /// The same, from inside a background job the caller submits.
-async fn probe_job(
-    axum::extract::State(app): axum::extract::State<App>,
-    _caller: crate::server::auth::Identity,
-) -> Result<String, crate::server::error::ApiError> {
+async fn probe_job(State(app): State<App>, _caller: Identity) -> Result<String, ApiError> {
     use quack_core::jobs::{JobKind, JobSpec};
     let worker = Arc::clone(&app);
     let job = app
@@ -1206,9 +1194,8 @@ async fn probe_job(
         .jobs
         .wait(job.id)
         .await
-        .ok_or_else(|| crate::server::error::ApiError::internal("job forgotten"))?;
-    done.outcome
-        .ok_or_else(|| crate::server::error::ApiError::internal("no outcome"))
+        .ok_or_else(|| ApiError::internal("job forgotten"))?;
+    done.outcome.ok_or_else(|| ApiError::internal("no outcome"))
 }
 
 impl Harness {
@@ -1218,7 +1205,7 @@ impl Harness {
             .route("/probe", get(probe))
             .route("/probe-job", get(probe_job))
             .route("/probe-key", get(probe_key))
-            .layer(axum::middleware::from_fn(crate::server::acting_slot))
+            .layer(axum::middleware::from_fn(server::acting_slot))
             .with_state(Arc::clone(&self.app));
         let request = Request::get(uri)
             .header(credential.0, credential.1)
@@ -1271,12 +1258,7 @@ async fn a_password_user_is_refused_rather_than_sent_as_quack() {
     let created = h
         .app
         .control
-        .create_user(
-            "pw",
-            "secret",
-            quack_core::storage::control::UserKind::Standard,
-            setup_audit(),
-        )
+        .create_user("pw", "secret", UserKind::Standard, setup_audit())
         .await;
     assert!(created.is_ok());
     let login = Request::post("/api/v1/auth/login")
@@ -1320,7 +1302,7 @@ async fn a_callback_naming_another_issuer_is_refused() {
         "{}",
         reply.location
     );
-    assert!(reply.cookie(crate::server::auth::SESSION_COOKIE).is_none());
+    assert!(reply.cookie(SESSION_COOKIE).is_none());
 }
 
 /// Issue #246: a TLS-terminating proxy on the same host reaches quack over
@@ -1353,7 +1335,7 @@ async fn an_https_public_url_makes_loopback_cookies_secure() {
     h.issuer(|s| {
         s.id_claims = json!({
             "iss": base, "sub": "sub-ada", "aud": "quack",
-            "exp": jiff::Timestamp::now().as_second().saturating_add(3600),
+            "exp": Timestamp::now().as_second().saturating_add(3600),
             "nonce": nonce, "preferred_username": "ada",
         });
     });
@@ -1368,7 +1350,7 @@ async fn an_https_public_url_makes_loopback_cookies_secure() {
     let session = reply
         .cookies
         .iter()
-        .find(|c| c.starts_with(&format!("{}=", crate::server::auth::SESSION_COOKIE)))
+        .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
         .cloned()
         .unwrap_or_else(|| fail("no session cookie"));
     assert!(session.contains("Secure"), "{session}");
@@ -1509,7 +1491,7 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
         .await;
     assert_eq!(callback.status, StatusCode::SEE_OTHER, "{}", callback.body);
     let session = callback
-        .cookie(crate::server::auth::SESSION_COOKIE)
+        .cookie(SESSION_COOKIE)
         .unwrap_or_else(|| fail("no session cookie"));
 
     // On behalf of the person: the provider shares the sign-in's key and
@@ -1517,10 +1499,7 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
     let obo = h
         .probe(
             "/probe-key",
-            (
-                "cookie",
-                &format!("{}={session}", crate::server::auth::SESSION_COOKIE),
-            ),
+            ("cookie", &format!("{SESSION_COOKIE}={session}")),
         )
         .await;
     assert_eq!(obo.status, StatusCode::OK, "{}", obo.body);

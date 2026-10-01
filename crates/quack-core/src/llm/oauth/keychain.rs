@@ -34,7 +34,7 @@ fn platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
 /// first outcome, so an unavailable keychain stays unavailable instead of
 /// flapping between the keychain and the key file.
 fn ensure_store() -> keyring_core::Result<()> {
-    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
         if keyring_core::get_default_store().is_some() {
             return Ok(());
@@ -104,7 +104,7 @@ enum Stage {
 pub(super) enum Keychain {
     Os,
     #[cfg(test)]
-    Fake(std::sync::Arc<fake::FakeKeychain>),
+    Fake(Arc<fake::FakeKeychain>),
 }
 
 impl Keychain {

@@ -439,7 +439,7 @@ impl StepInProgress {
 
     /// Finish as `error: ...` and hand the error back, for the caller to
     /// return or show the model.
-    pub fn fail<E: std::fmt::Display>(self, error: E) -> E {
+    pub fn fail<E: fmt::Display>(self, error: E) -> E {
         self.finish(format!("error: {error}"));
         error
     }

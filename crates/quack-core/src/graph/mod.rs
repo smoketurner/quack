@@ -39,7 +39,7 @@ pub enum Standing {
 flag_enum!(Standing, false => Reviewed, true => Provisional);
 
 /// A stored node.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub label: String,
@@ -96,7 +96,7 @@ const ALIASES: &str = "aliases";
 /// A node's or edge's properties: always an object. Whatever else a model
 /// answered or a column held reads as no properties, so no caller checks
 /// the shape again.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Properties(serde_json::Map<String, serde_json::Value>);
 
@@ -241,7 +241,7 @@ impl fmt::Display for Properties {
 
 /// Where a node or edge came from. Serialized flat into [`Provenance`],
 /// as `document_id` and `chunk_id` or `table_name` and `row_key`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Origin {
     /// A chunk of a document.
@@ -373,7 +373,7 @@ impl Drift {
 /// What the interfaces show about the graph: size, whether it is
 /// provisional (built from an auto-accepted ontology) or stale (the
 /// ontology moved on), and the drift the corpus expressed.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphStatus {
     pub nodes: u64,
     pub edges: u64,

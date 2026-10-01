@@ -34,7 +34,7 @@ use super::{LoginFlow, LoginPrompt, OAuthHttp, TokenManager};
 use crate::config::{ClientAuth, Config, Exchange, Grant, OAuthConfig, ProviderName};
 use crate::error::{Error, Result};
 use crate::storage::control::{KeyChange, Previous, RegistrationRow};
-use crate::vault::{Opened, Purpose};
+use crate::vault::{Opened, Purpose, Sealed};
 
 /// The metadata RFC 7592 says a client must leave out of an update: the
 /// server's own bookkeeping, which it sets.
@@ -1079,11 +1079,7 @@ impl Registrar {
 
     /// A registration access token sealed for keeping under the record
     /// `name`, when there is one.
-    async fn seal_token(
-        &self,
-        name: &str,
-        token: Option<&str>,
-    ) -> Result<Option<crate::vault::Sealed>> {
+    async fn seal_token(&self, name: &str, token: Option<&str>) -> Result<Option<Sealed>> {
         match token {
             Some(token) => Ok(Some(
                 self.keys

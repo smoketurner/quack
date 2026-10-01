@@ -16,7 +16,7 @@ use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::FileType;
 use quack_core::llm::CancellationToken;
-use quack_core::progress::RunControl;
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{
     ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
@@ -74,7 +74,7 @@ impl EmbeddingModel for BatchRecordingModel {
     fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
         let texts: Vec<String> = texts.into_iter().collect();
         if let Ok(mut batches) = self.batches.lock() {
             batches.push(texts.len());
@@ -107,7 +107,7 @@ impl EmbeddingModel for FailingEmbeddingModel {
     fn embed_texts(
         &self,
         _texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
         std::future::ready(Err(EmbeddingError::ProviderError(String::from(
             "connection refused",
         ))))
@@ -129,7 +129,7 @@ impl EmbeddingModel for MockEmbeddingModel {
     fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
         let mut result = Vec::new();
         for text in texts {
             result.push(Embedding {
@@ -310,7 +310,7 @@ impl EmbeddingModel for InFlightModel {
     fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
         use std::sync::atomic::Ordering;
         let texts: Vec<String> = texts.into_iter().collect();
         async move {
@@ -426,7 +426,7 @@ async fn embedding_batch_size_bounds_every_embed_request() {
         .collect();
     let data = sections.join("\n");
     let reported = std::sync::Mutex::new(Vec::new());
-    let progress = |done: quack_core::progress::ChunkDone| {
+    let progress = |done: ChunkDone| {
         reported.lock().unwrap().push((done.done, done.total));
     };
     let control = RunControl {
@@ -2780,7 +2780,7 @@ impl EmbeddingModel for SlowModel {
     fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
         let texts: Vec<String> = texts.into_iter().collect();
         let delay = self.delay;
         async move {

@@ -52,7 +52,7 @@ fn add_row_provenance(db: &WorkspaceDb, id: &(impl AsRef<str> + ?Sized)) {
     graph_store::add_provenance(db, id, &graph_store::Source::row("t", "k")).unwrap();
 }
 
-fn candidate_ids(candidates: &[quack_core::ontology::induction::Candidate]) -> Vec<String> {
+fn candidate_ids(candidates: &[ontology::induction::Candidate]) -> Vec<String> {
     candidates
         .iter()
         .map(|c| format!("{}:{}", c.proposal.kind(), c.proposal.id()))

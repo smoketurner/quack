@@ -274,14 +274,16 @@ fn row_from(row: &duckdb::Row<'_>) -> duckdb::Result<CandidateRow> {
     Ok(CandidateRow {
         id: row.get(0)?,
         kind: row.get(1)?,
-        proposal: serde_json::from_str(&proposal).unwrap_or(Proposal::Class(Class {
-            id: ClassId::from("unparseable"),
-            parent: ClassId::from(String::from(ROOT_CLASS)),
-            label: None,
-            description: None,
-            key: None,
-            properties: Vec::new(),
-        })),
+        proposal: serde_json::from_str(&proposal).unwrap_or_else(|_| {
+            Proposal::Class(Class {
+                id: ClassId::from("unparseable"),
+                parent: ClassId::from(String::from(ROOT_CLASS)),
+                label: None,
+                description: None,
+                key: None,
+                properties: Vec::new(),
+            })
+        }),
         evidence: serde_json::from_str(&evidence).unwrap_or(serde_json::Value::Null),
         confidence: row.get(4)?,
         status: row.get(5)?,

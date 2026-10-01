@@ -11,6 +11,92 @@ too-many-lines-threshold       = 100
 # Short names that are acceptable below the min-chars threshold.
 allowed-idents-below-min-chars = ["x", "y", "z", "i", "j", "k", "n", "s", "e", "id", "db", "tx", "rx", "ok"]
 
+# Items from our own crates are brought in with `use`, not spelled inline as
+# `crate::storage::workspace::WorkspaceDb` or `quack_core::llm::Provider`: import
+# the type, trait, or const directly, and import a function's parent module
+# (`use crate::text;` then `text::tokens(..)`). `clippy::absolute_paths` flags any
+# path of more than two segments rooted at a crate; every external crate is
+# listed below so the lint reports only `crate::` and `quack_core::` paths. The
+# lint is denied in `[workspace.lints.clippy]`; a new external dependency named
+# by an absolute path belongs in this list.
+absolute-paths-max-segments = 2
+absolute-paths-allowed-crates = [
+    "std",
+    "core",
+    "alloc",
+    "proc_macro",
+    "anyhow",
+    "apple_native_keyring_store",
+    "argon2",
+    "askama",
+    "aws_config",
+    "aws_credential_types",
+    "aws_lc_rs",
+    "aws_sdk_bedrockruntime",
+    "aws_sigv4",
+    "aws_smithy_http_client",
+    "aws_smithy_runtime_api",
+    "aws_smithy_types",
+    "aws_types",
+    "axum",
+    "axum_extra",
+    "base64",
+    "bytes",
+    "calamine",
+    "clap",
+    "criterion",
+    "crossterm",
+    "csv",
+    "dirs",
+    "duckdb",
+    "ego_tree",
+    "futures",
+    "http",
+    "http_body",
+    "jiff",
+    "jsonwebtoken",
+    "keyring_core",
+    "linux_keyutils_keyring_store",
+    "mimalloc",
+    "mime_guess",
+    "oauth2",
+    "office_oxide",
+    "pdf_oxide",
+    "pulldown_cmark",
+    "quick_xml",
+    "ratatui",
+    "ratatui_textarea",
+    "reqwest",
+    "rig",
+    "rmcp",
+    "rust_embed",
+    "rust_stemmers",
+    "rustls",
+    "schemars",
+    "scraper",
+    "sea_query",
+    "secrecy",
+    "serde",
+    "serde_json",
+    "shlex",
+    "sqlx",
+    "tar",
+    "tempfile",
+    "thiserror",
+    "tiktoken",
+    "tokio",
+    "tokio_util",
+    "toml",
+    "tower",
+    "tower_governor",
+    "tower_http",
+    "tracing",
+    "tracing_subscriber",
+    "uuid",
+    "windows_native_keyring_store",
+    "zip",
+]
+
 # MSRV is read automatically from the workspace `rust-version` field.
 
 # Embedding goes through `quack_core::embedding::Embedder`, which names the

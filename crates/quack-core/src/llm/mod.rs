@@ -507,15 +507,12 @@ impl<M> Unstored<M> {
     }
 }
 
-impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for Unstored<M> {
+impl<M: CompletionModel> CompletionModel for Unstored<M> {
     fn completion(
         &self,
         request: rig::completion::CompletionRequest,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<
-            rig::completion::CompletionResponse,
-            rig::completion::CompletionError,
-        >,
+    ) -> impl Future<
+        Output = std::result::Result<rig::completion::CompletionResponse, CompletionError>,
     > + Send {
         self.0.completion(Self::request(request))
     }
@@ -523,11 +520,8 @@ impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for U
     fn stream(
         &self,
         request: rig::completion::CompletionRequest,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<
-            rig::streaming::StreamingCompletionResponse,
-            rig::completion::CompletionError,
-        >,
+    ) -> impl Future<
+        Output = std::result::Result<rig::streaming::StreamingCompletionResponse, CompletionError>,
     > + Send {
         self.0.stream(Self::request(request))
     }
@@ -544,7 +538,7 @@ impl<M: rig::completion::CompletionModel> rig::completion::CompletionModel for U
 /// tripping the HTTP client's read timeout. Extraction and reranking are
 /// both one of these with their own preamble.
 pub struct OneShotAgent {
-    agent: rig::agent::Agent,
+    agent: Agent,
     timeout: Duration,
     label: &'static str,
 }
@@ -553,7 +547,7 @@ impl OneShotAgent {
     /// `label` names the call in errors and logs.
     pub fn new<M>(model: M, preamble: &str, timeout: Duration, label: &'static str) -> Self
     where
-        M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
+        M: CompletionModel + Clone + Send + Sync + 'static,
     {
         Self {
             agent: rig::agent::AgentBuilder::new(model)
@@ -581,10 +575,10 @@ impl OneShotAgent {
             let mut final_text: Option<String> = None;
             while let Some(item) = stream.next().await {
                 match item.map_err(|e| Error::Llm(format!("{what} call failed: {e}")))? {
-                    rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                        StreamedAssistantContent::Text(t),
-                    ) => answer.push_str(&t.text),
-                    rig::agent::MultiTurnStreamItem::FinalResponse(r) => {
+                    MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
+                        answer.push_str(&t.text);
+                    }
+                    MultiTurnStreamItem::FinalResponse(r) => {
                         if r.usage.has_values() {
                             tracing::debug!(
                                 call = what,
@@ -1189,6 +1183,7 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BedrockConfig;
     use crate::embedding::Dimension;
     use crate::storage::workspace::WorkspaceDb;
     use crate::storage::writer::Writer;
@@ -1286,7 +1281,7 @@ mod tests {
             ),
         ] {
             let (root, seen) = capture_one().await;
-            let bedrock = crate::config::BedrockConfig { api, region: None };
+            let bedrock = BedrockConfig { api, region: None };
             let provider = ProviderConfig {
                 bedrock: Some(bedrock.clone()),
                 headers: Some(std::collections::BTreeMap::from([(

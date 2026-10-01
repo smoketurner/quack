@@ -378,7 +378,7 @@ impl JobCounts {
 }
 
 /// What the work returns: a one-line summary, or the error to show.
-pub type JobResult = std::result::Result<String, String>;
+pub type JobResult = Result<String, String>;
 
 /// Handed to the work: its id, its cancel token, and a way to report.
 #[derive(Clone)]
@@ -1188,7 +1188,7 @@ mod tests {
         }
         // One cancelled while queued is skipped, not waited on.
         let skipped = ids.get(10).copied().unwrap_or_else(|| fail("no job 10"));
-        let _ = queue.cancel(skipped);
+        queue.cancel(skipped);
         for id in ids {
             finished(&queue, id).await;
         }
@@ -1610,7 +1610,7 @@ mod tests {
                 Ok(String::new())
             })
             .id;
-        let _ = finished(&queue, later).await;
+        drop(finished(&queue, later).await);
         match tokio::time::timeout(Duration::from_secs(5), done.notified()).await {
             Ok(()) => {}
             Err(_) => fail("when_ended did not run for an evicted job"),

@@ -166,4 +166,4 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
-pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;

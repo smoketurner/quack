@@ -30,7 +30,7 @@ use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
-use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager};
+use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
@@ -1162,12 +1162,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
 }
 
 /// What `quack auth status` says of one provider's token.
-fn token_state(
-    name: &str,
-    token: Option<quack_core::llm::oauth::TokenStatus>,
-    grant: Grant,
-    sends_actor: bool,
-) -> String {
+fn token_state(name: &str, token: Option<TokenStatus>, grant: Grant, sends_actor: bool) -> String {
     match (token, grant) {
         // Without an actor token quack has no token of its own here; one
         // stored before `actor = false` is unused.
@@ -1841,6 +1836,7 @@ mod tests {
     use super::*;
     use quack_core::embedding::Dimension;
     use quack_core::error::AuthReason;
+    use quack_core::llm::oauth::Renewal;
     use quack_core::storage::workspace::NewDocument;
 
     /// A closed reader surfaces as an `io::Error`, a `serde_json` or `csv`
@@ -1911,9 +1907,9 @@ mod tests {
 
     #[test]
     fn auth_status_names_the_actor_only_when_one_is_sent() {
-        let token = quack_core::llm::oauth::TokenStatus {
+        let token = TokenStatus {
             expires_at: jiff::Timestamp::UNIX_EPOCH,
-            renewal: quack_core::llm::oauth::Renewal::Regrant,
+            renewal: Renewal::Regrant,
         };
         let with_actor = token_state("gw", Some(token), Grant::OnBehalfOf, true);
         assert!(with_actor.contains("(the actor)"), "{with_actor}");

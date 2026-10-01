@@ -496,7 +496,7 @@ impl WorkspaceDb {
         // The columns keep the width they were created with until the
         // reconciliation below decides otherwise.
         let column_dimension = Self::recorded_dimension(&conn)?
-            .or(profile.as_ref().map(|p| p.dimension))
+            .or_else(|| profile.as_ref().map(|p| p.dimension))
             .unwrap_or(DEFAULT_EMBEDDING_DIMENSION);
 
         let db = Self {
@@ -2934,11 +2934,11 @@ impl HybridLimits {
 /// whatever the connection runs next. A cancel before the work starts makes
 /// it fail at once. How the work queue stops a running SQL job.
 #[derive(Clone, Default)]
-pub struct QueryCanceller(std::sync::Arc<std::sync::Mutex<CancelSlot>>);
+pub struct QueryCanceller(Arc<std::sync::Mutex<CancelSlot>>);
 
 #[derive(Default)]
 struct CancelSlot {
-    running: Option<std::sync::Arc<duckdb::InterruptHandle>>,
+    running: Option<Arc<duckdb::InterruptHandle>>,
     cancelled: bool,
 }
 

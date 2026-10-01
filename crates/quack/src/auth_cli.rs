@@ -307,7 +307,7 @@ async fn register_signed_in(
     metadata: &ClientMetadata,
     replace: bool,
     sign_in: SignIn<'_>,
-    interrupt: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
+    interrupt: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>,
 ) -> Result<Registered> {
     writeln!(
         out,
@@ -433,7 +433,7 @@ pub(crate) struct SignInWith<'a> {
     pub(crate) notify: &'a (dyn Fn(LoginPrompt) + Sync),
     /// Completes when the person interrupts (Ctrl-C on the terminal): the
     /// sign-in stops, and its temporary client is deleted.
-    pub(crate) interrupt: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
+    pub(crate) interrupt: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
 }
 
 fn write_registered(

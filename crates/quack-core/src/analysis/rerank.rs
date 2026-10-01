@@ -200,8 +200,12 @@ mod tests {
 
     struct Reverse;
     impl Reranker for Reverse {
-        fn rank<'a>(&'a self, _q: &'a str, c: &'a [ChunkSearchResult]) -> RankFuture<'a> {
-            Box::pin(async move { Ok((0..c.len()).rev().collect()) })
+        fn rank<'a>(
+            &'a self,
+            _query: &'a str,
+            candidates: &'a [ChunkSearchResult],
+        ) -> RankFuture<'a> {
+            Box::pin(async move { Ok((0..candidates.len()).rev().collect()) })
         }
         fn name(&self) -> &'static str {
             "reverse"
@@ -210,7 +214,11 @@ mod tests {
 
     struct Broken;
     impl Reranker for Broken {
-        fn rank<'a>(&'a self, _q: &'a str, _c: &'a [ChunkSearchResult]) -> RankFuture<'a> {
+        fn rank<'a>(
+            &'a self,
+            _query: &'a str,
+            _candidates: &'a [ChunkSearchResult],
+        ) -> RankFuture<'a> {
             Box::pin(async move { Err(Error::Analysis(String::from("boom"))) })
         }
         fn name(&self) -> &'static str {
