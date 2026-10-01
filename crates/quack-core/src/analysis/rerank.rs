@@ -1,15 +1,18 @@
 //! Reranking hook for retrieval: hybrid search over-fetches candidates,
 //! a [`Reranker`] orders them by relevance to the query, and the top `k`
-//! go to the model. The hook is a no-op unless `[retrieval].rerank`
-//! names a provider; today that is `model`, the chat model ranking the
-//! candidates listwise, so the air-gapped setup needs nothing beyond what
-//! it already runs. A cross-encoder provider fits the same trait.
+//! go to the model. The hook is a no-op unless `[retrieval].rerank` names
+//! one: `model`, the chat model ranking the candidates listwise, which an
+//! air-gapped setup already runs; or `reranker`, a dedicated rerank model
+//! (a cross-encoder) scoring each candidate through rig's `Rerank`
+//! operation.
 
 use std::future::Future;
 use std::pin::Pin;
 
+use rig::operation::RerankRequest;
+
 use crate::error::{Error, Result};
-use crate::llm::{ChatModel, OneShotAgent};
+use crate::llm::{ChatModel, OneShotAgent, RerankModel};
 use crate::storage::workspace::ChunkSearchResult;
 
 /// Boxed future so implementations can be trait objects.
@@ -178,10 +181,53 @@ impl Reranker for ModelReranker {
     }
 }
 
+/// A dedicated rerank model: one `/rerank` call scores every candidate
+/// against the query, and the order is the scores', best first.
+pub struct ScoredReranker {
+    model: RerankModel,
+}
+
+impl ScoredReranker {
+    #[must_use]
+    pub const fn new(model: RerankModel) -> Self {
+        Self { model }
+    }
+}
+
+impl Reranker for ScoredReranker {
+    fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
+        Box::pin(async move {
+            let request = RerankRequest {
+                query: query.to_owned(),
+                documents: candidates.iter().map(|c| c.content.clone()).collect(),
+            };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a rerank call, not an embedding; the lint guards embedding prefixes"
+            )]
+            let call = self.model.call(request);
+            let mut response = tokio::time::timeout(RERANK_TIMEOUT, call)
+                .await
+                .map_err(|_| Error::Llm(String::from("the rerank model did not answer in time")))?
+                .map_err(|e| Error::Llm(format!("the rerank model failed: {e}")))?;
+            response
+                .results
+                .sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+            Ok(response.results.into_iter().map(|r| r.index).collect())
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "reranker"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::ids::{ChunkId, DocumentId};
+    use crate::llm;
 
     fn hit(n: u32) -> ChunkSearchResult {
         ChunkSearchResult {
@@ -256,6 +302,74 @@ mod tests {
         } = apply(&Reverse, "q", Vec::new(), 5).await;
         assert_eq!(outcome, RerankOutcome::Skipped);
         assert!(kept.is_empty());
+    }
+
+    /// A server that answers one request with `reply` and hands back the
+    /// request it read, lowercased head and body.
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn answer_once(reply: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut read = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while let Ok(n) = stream.read(&mut buf).await {
+                read.extend_from_slice(buf.get(..n).unwrap_or_default());
+                let text = String::from_utf8_lossy(&read).to_string();
+                if n == 0 || text.ends_with('}') {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            drop(stream.write_all(response.as_bytes()).await);
+            String::from_utf8_lossy(&read).to_ascii_lowercase()
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn a_rerank_model_scores_the_candidates_and_its_order_is_kept() {
+        let (base, seen) = answer_once(
+            r#"{"results":[{"index":0,"relevance_score":0.2},{"index":2,"relevance_score":0.9},{"index":1,"relevance_score":-1.5}]}"#,
+        )
+        .await;
+        let config = Config::parse(&format!(
+            "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"tei/bge-reranker\"\n\
+             [providers.tei]\ntype = \"openai\"\nbase_url = \"{base}\"\n\
+             [providers.tei.headers]\nX-Team = \"quack\"\n"
+        ))
+        .unwrap();
+        let model = config.rerank_model_ref().unwrap().unwrap();
+        let reranker = ScoredReranker::new(llm::rerank_model_with(model, None).unwrap());
+        let Reranked { results, outcome } =
+            apply(&reranker, "refunds?", vec![hit(1), hit(2), hit(3)], 2).await;
+        assert_eq!(outcome, RerankOutcome::Reranked("reranker"));
+        let ids: Vec<&str> = results.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["c3", "c1"]);
+
+        let request = seen.await.unwrap();
+        assert!(request.starts_with("post /v1/rerank "), "{request}");
+        assert!(request.contains("x-team: quack"), "{request}");
+        assert!(
+            !request.contains("authorization:"),
+            "no key, no bearer: {request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "bge-reranker",
+                "query": "refunds?",
+                "documents": ["passage 1", "passage 2", "passage 3"],
+            })
+        );
     }
 
     #[test]

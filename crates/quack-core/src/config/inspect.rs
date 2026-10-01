@@ -373,6 +373,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "always_retrieve",
             "rerank",
             "rerank_candidates",
+            "rerank_model",
         ],
     ),
     ("context", &["max_tokens"]),
@@ -734,6 +735,8 @@ fn retrieval(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         retrieval.rerank_candidates,
         default.rerank_candidates,
     );
+    let rerank_model = retrieval.rerank_model.as_ref().map(ToString::to_string);
+    s.optional_text("rerank_model", rerank_model.as_deref(), None);
 }
 
 fn context(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {

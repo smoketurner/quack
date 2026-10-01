@@ -28,13 +28,14 @@ use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
 use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
-use crate::llm::{ChatClient, ProviderModels};
+use crate::llm::{self, ChatClient, ProviderModels};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::Count;
 use rig::ProviderError;
 use rig::error::ErrorKind;
+use rig::operation::RerankRequest;
 use secrecy::ExposeSecret;
 use serde::Serialize;
 
@@ -71,6 +72,8 @@ pub enum Area {
     #[serde(rename = "chat model")]
     ChatModel,
     Embeddings,
+    /// The dedicated rerank model, when `[retrieval].rerank = "reranker"`.
+    Reranker,
     Server,
     /// The OAuth clients quack registered itself (`quack auth register`).
     Auth,
@@ -84,6 +87,7 @@ text_enum!(Area, "doctor area", {
     Workspace => "workspace",
     ChatModel => "chat model",
     Embeddings => "embeddings",
+    Reranker => "reranker",
     Server => "server",
     Auth => "auth",
 });
@@ -216,6 +220,7 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
     check_workspace(&mut report, config, control.as_ref(), options).await;
     check_chat_model(&mut report, config, options.probing).await;
     check_embedding_model(&mut report, config, options.probing).await;
+    check_reranker(&mut report, config, options.probing).await;
     check_server(&mut report, config, control.as_ref()).await;
     check_sign_in(&mut report, config, options.probing).await;
     check_registrations(
@@ -584,6 +589,67 @@ async fn check_embedding_model(report: &mut Report, config: &Config, probing: Pr
     }
 }
 
+/// The rerank model, when `[retrieval].rerank = "reranker"`: the setting
+/// resolves, the provider lists the model, and one small rerank call is
+/// answered.
+async fn check_reranker(report: &mut Report, config: &Config, probing: Probing) {
+    let model = match config.rerank_model_ref() {
+        Ok(Some(model)) => model,
+        Ok(None) => return,
+        Err(e) => {
+            report.push(Check::new(Area::Reranker, Status::Fail, e.to_string()));
+            return;
+        }
+    };
+    check_model(report, Area::Reranker, config, model, probing).await;
+    let Some(timeout) = probing.timeout() else {
+        return;
+    };
+    let answered = match model
+        .provider
+        .auth
+        .credential(config, model.provider_name)
+        .await
+    {
+        Ok(key) => match llm::rerank_model_with(model, key.as_deref()) {
+            Ok(reranker) => {
+                let request = RerankRequest {
+                    query: String::from("quack doctor"),
+                    documents: vec![String::from("a probe"), String::from("another probe")],
+                };
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a rerank probe, not an embedding; the lint guards embedding prefixes"
+                )]
+                let call = reranker.call(request);
+                match tokio::time::timeout(timeout, call).await {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(ErrorChain(&e).to_string()),
+                    Err(_) => Err(format!("no answer within {} seconds", timeout.as_secs())),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
+    };
+    report.push(match answered {
+        Ok(()) => Check::new(
+            Area::Reranker,
+            Status::Ok,
+            format!("{model}: a rerank call was answered"),
+        ),
+        Err(e) => Check::new(
+            Area::Reranker,
+            Status::Fail,
+            format!("{model}: a rerank call failed: {e}"),
+        )
+        .fix(format!(
+            "check that the server at [providers.{}].base_url serves /rerank for {}",
+            model.provider_name, model.model
+        )),
+    });
+}
+
 /// Which input prefixes the embedding model gets, and where they come
 /// from.
 fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
@@ -733,7 +799,11 @@ async fn check_model(
         ));
         return;
     };
-    let client = ChatClient::connect(name, provider, credential.as_deref());
+    let client = if area == Area::Reranker {
+        ChatClient::rerank_server(name, provider, credential.as_deref()).map(ChatClient::OpenAi)
+    } else {
+        ChatClient::connect(name, provider, credential.as_deref())
+    };
     let listing = Probe::listing(client, timeout).await;
     report.push(listing_check(area, model, &base, &listing));
     if area == Area::ChatModel
@@ -849,7 +919,8 @@ async fn model_credential(
         // The AWS SDK signs Bedrock's requests; `check_bedrock` covers it.
         ProviderAuth::Aws { .. } => None,
         ProviderAuth::None => {
-            if provider.provider_type != ProviderType::Ollama {
+            // A local rerank server (vLLM, llama.cpp) often runs keyless.
+            if provider.provider_type != ProviderType::Ollama && area != Area::Reranker {
                 return Err(Box::new(
                     Check::new(
                         area,
@@ -1893,6 +1964,83 @@ mod tests {
         assert!(window_check(&config, model, &roomy).is_none());
         let unreported = listed(&[("small", None)]);
         assert!(window_check(&config, model, &unreported).is_none());
+    }
+
+    /// A rerank server: `GET /v1/models` lists `bge-reranker`, and `POST
+    /// /v1/rerank` scores the documents. Serves `requests` connections.
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn rerank_server(requests: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_string();
+                let body = if head.starts_with("GET /v1/models") {
+                    r#"{"data":[{"id":"bge-reranker"}]}"#
+                } else {
+                    r#"{"results":[{"index":1,"relevance_score":0.7},{"index":0,"relevance_score":0.1}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                drop(stream.write_all(response.as_bytes()).await);
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn the_rerank_model_is_listed_and_answers_a_probe() {
+        let config = |base: &str, model: &str| -> Config {
+            toml::from_str(&format!(
+                "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"tei/{model}\"\n\
+                 [providers.tei]\ntype = \"openai\"\nbase_url = \"{base}\"\n"
+            ))
+            .unwrap()
+        };
+        let probing = Probing::Online {
+            timeout: Duration::from_secs(5),
+        };
+        let base = rerank_server(2).await;
+        let mut report = Report::default();
+        check_reranker(&mut report, &config(&base, "bge-reranker"), probing).await;
+        let checks = find(&report, Area::Reranker);
+        let summaries: Vec<(Status, &str)> = checks
+            .iter()
+            .map(|c| (c.status, c.summary.as_str()))
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                (
+                    Status::Ok,
+                    "tei/bge-reranker: reachable, credential accepted, model listed"
+                ),
+                (Status::Ok, "tei/bge-reranker: a rerank call was answered"),
+            ]
+        );
+
+        // A model the server does not list is named with what it does.
+        let base = rerank_server(2).await;
+        let mut report = Report::default();
+        check_reranker(&mut report, &config(&base, "bge-rerank"), probing).await;
+        let listing = find(&report, Area::Reranker);
+        assert!(
+            listing.first().is_some_and(|c| c.status == Status::Warn
+                && c.summary.ends_with("the closest it lists: bge-reranker")),
+            "{listing:?}"
+        );
+
+        // Nothing to check in another mode.
+        let mut report = Report::default();
+        check_reranker(&mut report, &Config::default(), probing).await;
+        assert!(find(&report, Area::Reranker).is_empty());
     }
 
     /// A mock issuer for the doctor: its discovery document lists `grants`,

@@ -24,7 +24,7 @@ use super::tools::{
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphOptions, GraphResult, store as graph_store};
-use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE};
+use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE, RerankModel};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
@@ -172,6 +172,8 @@ pub struct Analysis<'a, M> {
     pub db: SharedDb,
     pub reader_db: ReaderDb,
     pub embedder: Option<Embedder<M>>,
+    /// The dedicated rerank model, when `[retrieval].rerank = "reranker"`.
+    pub rerank_model: Option<RerankModel>,
     pub config: &'a AnalysisConfig,
     pub retrieval_config: &'a RetrievalConfig,
     pub graph_options: GraphOptions,
@@ -403,6 +405,7 @@ where
             db: shared_db,
             reader_db,
             embedder: embedding_model,
+            rerank_model,
             config: analysis_config,
             retrieval_config,
             graph_options,
@@ -412,26 +415,24 @@ where
             message: user_message,
             asked,
         } = self;
-        let PromptAndModel {
-            system_prompt,
-            modeled,
-        } = PromptAndModel::read(&reader_db, &prompt).await?;
+        let read = PromptAndModel::read(&reader_db, &prompt).await?;
         let outputs = TurnOutputs::new(recorder.clone());
         let Replay { history, dropped } = Replay::check(history);
-        let window = Window::for_turn(&prompt, &system_prompt, &history, user_message);
+        let window = Window::for_turn(&prompt, &read.system_prompt, &history, user_message);
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
             reader_db,
             analysis_config,
             retrieval_config,
             graph_options,
-            modeled,
+            modeled: read.modeled,
             mode: prompt.mode,
             write_policy,
             window,
             outputs: outputs.clone(),
+            rerank_model,
         }
-        .build_agent(completion_model, embedding_model, &system_prompt)?;
+        .build_agent(completion_model, embedding_model, &read.system_prompt)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
 
@@ -687,6 +688,7 @@ struct BuildContext<'a> {
     write_policy: WritePolicy,
     window: Window,
     outputs: TurnOutputs,
+    rerank_model: Option<RerankModel>,
 }
 
 impl BuildContext<'_> {
@@ -704,6 +706,7 @@ impl BuildContext<'_> {
         let search = SearchDocumentsTool::from_config(
             ctx.reader_db.clone(),
             &completion_model,
+            ctx.rerank_model.clone(),
             embedding_model.clone(),
             ctx.retrieval_config,
             ctx.outputs.recorder.clone(),

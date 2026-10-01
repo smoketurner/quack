@@ -778,8 +778,13 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
 - *Reranking:* `analysis::rerank::Reranker` sits between fusion and the answer, off by
   default (`[retrieval].rerank = "none"`). `"model"` over-fetches `rerank_candidates` (24)
   and has the chat model order them listwise in one tool-less call, so an air-gapped
-  deployment reranks with the model it already runs. A failed ranking call keeps the fused
-  order, and the tool step says so. A cross-encoder provider fits the same trait.
+  deployment reranks with the model it already runs. `"reranker"` sends the same
+  candidates to a dedicated rerank model (a cross-encoder) through rig's `Rerank`
+  operation (`analysis::rerank::ScoredReranker`): `[retrieval].rerank_model` names a
+  `type = "openai"` provider whose `base_url` serves `/rerank` (vLLM, llama.cpp, Text
+  Embeddings Inference), reached over `LimitedHttp` with the turn's priority, and the
+  scores give the order. Other provider types are refused at config load. A failed ranking
+  call keeps the fused order, and the tool step says so.
 
 **Citations.** Every retrieved chunk carries `document_id`, `filename`, `title`, `page`,
 `heading`, and its fused score. The agent cites with `[n]` markers mapped to these chunks.
@@ -2121,8 +2126,10 @@ dimension = 768                          # the width of its vectors (1024 for Be
 [retrieval]
 top_k = 8
 rrf_k = 60
-rerank = "none"          # or "model": the chat model orders rerank_candidates listwise
+rerank = "none"          # or "model": the chat model orders rerank_candidates listwise;
+                         # or "reranker": rerank_model scores them
 rerank_candidates = 24
+# rerank_model = "tei/BAAI/bge-reranker-v2-m3"   # a type = "openai" provider serving /rerank
 pinned_token_budget = 8000   # full text of pinned documents in the prompt
 always_retrieve = false      # retrieve every turn, not only when the model asks
 
@@ -2572,7 +2579,7 @@ Every gap is a GitHub issue unless the item says otherwise.
 1. AnythingLLM import command (workspaces, documents, system prompts, threads via its API)
 2. Data connectors: GitHub, Confluence, SharePoint (fetching a data file over http(s)
    already ships in `quack import`)
-3. Cross-encoder reranking provider
+3. ~~Cross-encoder reranking provider~~ (`[retrieval].rerank = "reranker"`)
 4. OCR for scanned PDFs
 5. Postgres + pgvector storage backend, which now also means building the seam section 15
    item 4 describes

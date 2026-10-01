@@ -21,12 +21,12 @@ use super::chart::{ChartKind, ChartSpec};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
-use super::rerank::{self, ModelReranker, Reranker};
+use super::rerank::{self, ModelReranker, Reranker, ScoredReranker};
 use super::text_to_sql::Modeled;
 use crate::config::{RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
-use crate::llm::ChatModel;
+use crate::llm::{ChatModel, RerankModel};
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::text::NonBlankText;
@@ -694,23 +694,32 @@ impl<M> SearchDocumentsTool<M> {
         }
     }
 
-    /// The tool as `[retrieval]` configures it, with the chat model as
-    /// reranker when `rerank = "model"`.
+    /// The tool as `[retrieval]` configures it: the chat model as reranker
+    /// when `rerank = "model"`, `rerank_model` when `rerank = "reranker"`.
     pub fn from_config(
         db: ReaderDb,
         completion_model: &ChatModel,
+        rerank_model: Option<RerankModel>,
         embedding_model: Option<Embedder<M>>,
         retrieval: &RetrievalConfig,
         recorder: TurnRecorder,
     ) -> Self {
         let search = Self::new(db, embedding_model, retrieval, recorder);
-        match retrieval.rerank {
-            RerankMode::None => search,
-            RerankMode::Model => search.with_reranker(Rerank {
-                reranker: Arc::new(ModelReranker::new(completion_model.clone())),
-                candidates: retrieval.rerank_candidates,
-            }),
-        }
+        let reranker: Arc<dyn Reranker> = match (retrieval.rerank, rerank_model) {
+            (RerankMode::None, _) => return search,
+            (RerankMode::Model, _) => Arc::new(ModelReranker::new(completion_model.clone())),
+            (RerankMode::Reranker, Some(model)) => Arc::new(ScoredReranker::new(model)),
+            (RerankMode::Reranker, None) => {
+                tracing::warn!(
+                    "rerank = \"reranker\" without a rerank model; keeping the fused order"
+                );
+                return search;
+            }
+        };
+        search.with_reranker(Rerank {
+            reranker,
+            candidates: retrieval.rerank_candidates,
+        })
     }
 
     /// Offer the `entity` argument when `modeled` has a graph.

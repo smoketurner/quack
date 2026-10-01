@@ -257,6 +257,31 @@ type = "bedrock-mantle"               # bedrock-mantle
 `quack doctor` resolves the credentials and the endpoint for each entry, and on
 `bedrock-mantle` confirms the model is listed.
 
+## Recipe: a dedicated rerank model
+
+`[retrieval].rerank = "reranker"` orders search results with a cross-encoder instead of
+the chat model: one fast `/rerank` call per search, which leaves the chat model's request
+permits free. Serve the model with vLLM (`vllm serve BAAI/bge-reranker-v2-m3`), llama.cpp
+(`llama-server --reranking`), or Text Embeddings Inference, and add that server as a
+`type = "openai"` provider with its `base_url`:
+
+```toml
+[retrieval]
+rerank = "reranker"
+rerank_model = "rerank/BAAI/bge-reranker-v2-m3"
+
+[providers.rerank]
+type = "openai"
+base_url = "http://localhost:8000/v1"   # quack posts to {base_url}/rerank
+# auth = "api-key"                      # only when the server requires a key
+# api_key_env = "RERANK_API_KEY"
+```
+
+The bearer is sent only when the provider has a key, since `llama-server` refuses one it
+was not started with. Ollama, Anthropic, and Bedrock serve no rerank endpoint, so quack
+refuses them for `rerank_model` when it loads the config. `quack doctor` checks that the
+server lists the model and answers one small rerank call.
+
 ## Recipe: LiteLLM
 
 A LiteLLM proxy speaks the OpenAI API, so quack reaches it as one `openai` provider with a
