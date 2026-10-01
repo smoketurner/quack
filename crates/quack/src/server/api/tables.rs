@@ -9,6 +9,7 @@ use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 use quack_core::storage::workspace::{INTERNAL_PREFIX, TableDescription, WorkspaceDb};
+use serde::Deserialize;
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -21,13 +22,21 @@ pub(crate) async fn list(
     Ok(Json(serde_json::json!({ "tables": tables })))
 }
 
+/// The table to describe. In the body, not the path: a table's name is
+/// workspace content, and a URL ends up in logs.
+#[derive(Deserialize)]
+pub(crate) struct DescribeTable {
+    pub name: String,
+}
+
 pub(crate) async fn describe(
     State(app): State<App>,
     identity: Identity,
-    Path((id, name)): Path<(WorkspaceId, String)>,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<DescribeTable>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let described = access.describe_table(&app, &name).await?;
+    let described = access.describe_table(&app, &body.name).await?;
     let columns: Vec<serde_json::Value> = described
         .columns
         .iter()

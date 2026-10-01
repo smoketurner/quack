@@ -3,7 +3,7 @@
 //! the streamed chat (design doc 11.1). Everything a page does, the API can
 //! do; the handlers here only shape the response as HTML.
 
-mod flash;
+pub(crate) mod flash;
 pub(crate) mod markdown;
 mod sign_in;
 
@@ -42,12 +42,12 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
-    DocumentInfo, DocumentSource, Pinning, ResultSort, SamplePool, SortDirection,
+    DocumentInfo, DocumentSource, Pinning, ResultSort, SamplePool, SortDirection, TableDescription,
 };
 use rust_embed::Embed;
 use serde::Deserialize;
 
-use self::flash::Flash;
+use self::flash::{Flash, Flashed};
 use super::api::admin::CreateUser;
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
@@ -467,6 +467,26 @@ struct TableView {
     sample_rows: Vec<Vec<String>>,
 }
 
+impl TableView {
+    fn of(described: TableDescription) -> Self {
+        Self {
+            name: described.table_name,
+            columns: described
+                .columns
+                .into_iter()
+                .map(|c| (c.name, c.column_type))
+                .collect(),
+            sample_columns: described.sample_rows.columns,
+            sample_rows: described
+                .sample_rows
+                .rows
+                .iter()
+                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "tables.html")]
 struct TablesPage {
@@ -474,6 +494,37 @@ struct TablesPage {
     tables: Vec<String>,
     selected: Option<TableView>,
     error: Option<String>,
+}
+
+impl TablesPage {
+    /// The table list, with `open` described beside it when one is asked
+    /// for (a click, or an import that just made it).
+    async fn render(
+        app: &App,
+        identity: Identity,
+        id: &WorkspaceId,
+        open: Option<String>,
+        error: Option<String>,
+    ) -> WebResult<Response> {
+        let access = Access::resolve(app, identity, id, Need::READ).await?;
+        let selected = if let Some(name) = open {
+            Some(TableView::of(access.describe_table(app, &name).await?))
+        } else {
+            access.audit_read(app, AuditAction::Page, "tables").await?;
+            None
+        };
+        let list = app.read(id, WorkspaceDb::list_tables).await?;
+        let mut page = Page::in_workspace(app, Tab::Tables, &access);
+        if let Some(table) = &selected {
+            page.title.clone_from(&table.name);
+        }
+        html(&Self {
+            page,
+            tables: list,
+            selected,
+            error,
+        })
+    }
 }
 
 #[derive(Template)]
@@ -659,8 +710,6 @@ const CANDIDATES_PER_PAGE: usize = 50;
 
 #[derive(Deserialize, Default)]
 struct OntologyQuery {
-    error: Option<String>,
-    notice: Option<String>,
     /// The main queue unless `low_support` is asked for.
     #[serde(default, deserialize_with = "blank_as_none")]
     status: Option<Queue>,
@@ -804,9 +853,8 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/jobs", get(jobs_page))
         .route("/w/{id}/jobs/rows", get(job_rows))
         .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
-        .route("/w/{id}/tables", get(tables))
+        .route("/w/{id}/tables", get(tables).post(table))
         .route("/w/{id}/import", post(import_submit))
-        .route("/w/{id}/tables/{name}", get(table))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
         .route("/w/{id}/sql.csv", post(sql_csv))
         .route("/w/{id}/context", get(context_page).post(context_save))
@@ -816,7 +864,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/ontology/candidates", post(ontology_decide_many))
         .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
         .route("/w/{id}/ontology/{v}/restore", post(ontology_restore))
-        .route("/w/{id}/graph", get(graph_page))
+        .route("/w/{id}/graph", get(graph_page).post(graph_search))
         .route("/w/{id}/graph/extract", post(graph_extract))
         .route("/w/{id}/graph/revalidate", post(graph_revalidate))
         .route("/w/{id}/graph/review", post(graph_review))
@@ -873,17 +921,12 @@ async fn index() -> Redirect {
     Redirect::to("/workspaces")
 }
 
-#[derive(Deserialize)]
-struct LoginQuery {
-    error: Option<String>,
-}
-
-async fn login_page(State(app): State<App>, Query(q): Query<LoginQuery>) -> WebResult<Response> {
+async fn login_page(State(app): State<App>, flash: Flashed) -> WebResult<Response> {
     if app.mode == ServeMode::Local {
         return Ok(Redirect::to("/workspaces").into_response());
     }
     html(&LoginPage {
-        error: q.error,
+        error: flash.error(),
         sign_in: app.oidc.as_ref().map(Oidc::issuer_host),
     })
 }
@@ -923,17 +966,10 @@ async fn logout(
     Ok((jar, Redirect::to("/login")).into_response())
 }
 
-#[derive(Deserialize)]
-struct FlashQuery {
-    error: Option<String>,
-    /// A success message: the same flash slot, green.
-    notice: Option<String>,
-}
-
 async fn workspaces(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.is_admin {
         let mine = if app.mode == ServeMode::Local {
@@ -973,7 +1009,7 @@ async fn workspaces(
         can_create: identity.is_admin,
         page: Page::new(&app, &identity, Tab::Workspaces),
         workspaces: items,
-        error: q.error,
+        error: flash.error(),
     })
 }
 
@@ -1232,7 +1268,7 @@ async fn documents(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -1243,8 +1279,8 @@ async fn documents(
     html(&DocumentsPage {
         page: Page::in_workspace(&app, Tab::Documents, &access),
         rows,
-        error: q.error,
-        notice: q.notice,
+        error: flash.error(),
+        notice: flash.notice(),
         embeddings_note,
     })
 }
@@ -1376,17 +1412,25 @@ async fn tables(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
-    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Page, "tables").await?;
-    let list = app.read(&id, WorkspaceDb::list_tables).await?;
-    html(&TablesPage {
-        page: Page::in_workspace(&app, Tab::Tables, &access),
-        tables: list,
-        selected: None,
-        error: q.error,
-    })
+    TablesPage::render(&app, identity, &id, flash.table(), flash.error()).await
+}
+
+/// The Tables page's choice: the table to open. Posted, never in the URL:
+/// a table's name is workspace content, and a URL ends up in logs.
+#[derive(Deserialize)]
+struct TableChoice {
+    name: String,
+}
+
+async fn table(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(choice): Form<TableChoice>,
+) -> WebResult<Response> {
+    TablesPage::render(&app, identity, &id, Some(choice.name), None).await
 }
 
 async fn import_submit(
@@ -1399,7 +1443,7 @@ async fn import_submit(
     let request = ImportRequest::from(form);
     Ok(
         match import_api::run_import(&app, &access, &request).await {
-            Ok(summary) => Flash::to(format!("/w/{id}/tables/{}", summary.table)),
+            Ok(summary) => Flash::to(format!("/w/{id}/tables")).opening(summary.table),
             Err(e) => Flash::error(format!("/w/{id}/tables"), e.message),
         }
         .into_response(),
@@ -1418,39 +1462,6 @@ impl fmt::Display for JsonText<'_> {
             other => write!(f, "{other}"),
         }
     }
-}
-
-async fn table(
-    State(app): State<App>,
-    WebUser(identity): WebUser,
-    Path((id, name)): Path<(WorkspaceId, String)>,
-) -> WebResult<Response> {
-    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let described = access.describe_table(&app, &name).await?;
-    let list = app.read(&id, WorkspaceDb::list_tables).await?;
-    html(&TablesPage {
-        page: Page {
-            title: name.clone(),
-            ..Page::in_workspace(&app, Tab::Tables, &access)
-        },
-        tables: list,
-        error: None,
-        selected: Some(TableView {
-            name: described.table_name,
-            columns: described
-                .columns
-                .into_iter()
-                .map(|c| (c.name, c.column_type))
-                .collect(),
-            sample_columns: described.sample_rows.columns,
-            sample_rows: described
-                .sample_rows
-                .rows
-                .iter()
-                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
-                .collect(),
-        }),
-    })
 }
 
 async fn sql_page(
@@ -1595,6 +1606,7 @@ async fn ontology_page(
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<OntologyQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -1658,8 +1670,8 @@ async fn ontology_page(
         pending_total,
         low_support_total,
         has_tables,
-        error: q.error,
-        notice: q.notice,
+        error: flash.error(),
+        notice: flash.notice(),
     })
 }
 
@@ -1952,11 +1964,6 @@ async fn context_save(
     Ok(Flash::to(format!("/w/{id}/context")).into_response())
 }
 
-#[derive(Deserialize)]
-struct SettingsQuery {
-    error: Option<String>,
-}
-
 impl SettingsPage {
     /// The settings page: providers, and for owners the members and tokens;
     /// `new_token` is a token just created, shown once.
@@ -1997,13 +2004,13 @@ async fn settings(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<SettingsQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit_read(&app, AuditAction::Page, "settings")
         .await?;
-    html(&SettingsPage::load(&app, &access, None, q.error).await?)
+    html(&SettingsPage::load(&app, &access, None, flash.error()).await?)
 }
 
 #[derive(Deserialize)]
@@ -2130,13 +2137,13 @@ async fn token_revoke(
 async fn admin_users(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     identity.require_admin()?;
     html(&AdminUsersPage {
         page: Page::new(&app, &identity, Tab::Users),
         users: app.control.list_users().await?,
-        error: q.error,
+        error: flash.error(),
     })
 }
 
@@ -2371,8 +2378,10 @@ mod tests {
 
 // --- graph ----------------------------------------------------------------------
 
+/// The graph page's explore or path form. Posted, never a query string:
+/// entity names are workspace content, and a URL ends up in logs.
 #[derive(Deserialize, Default)]
-struct GraphPageQuery {
+struct GraphSearch {
     entity: Option<String>,
     class: Option<String>,
     relation: Option<String>,
@@ -2380,14 +2389,12 @@ struct GraphPageQuery {
     from: Option<String>,
     to: Option<String>,
     max_hops: Option<u32>,
-    error: Option<String>,
-    notice: Option<String>,
 }
 
 impl GraphQueryView {
     /// The page's query: blank fields are empty strings, which the form
     /// shows as they are; hops at their defaults when not given.
-    fn from_query(q: &GraphPageQuery) -> Self {
+    fn from_query(q: &GraphSearch) -> Self {
         let given = |value: Option<&String>| {
             value
                 .and_then(|v| v.non_blank())
@@ -2410,18 +2417,39 @@ async fn graph_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<GraphPageQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
-    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Page, "graph").await?;
+    render_graph(&app, identity, &id, &GraphSearch::default(), &flash).await
+}
+
+async fn graph_search(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    flash: Flashed,
+    Form(q): Form<GraphSearch>,
+) -> WebResult<Response> {
+    render_graph(&app, identity, &id, &q, &flash).await
+}
+
+/// The graph page, with `q`'s search or path result when it asks for one.
+async fn render_graph(
+    app: &App,
+    identity: Identity,
+    id: &WorkspaceId,
+    q: &GraphSearch,
+    flash: &Flashed,
+) -> WebResult<Response> {
+    let access = Access::resolve(app, identity, id, Need::READ).await?;
+    access.audit_read(app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
-    let query = GraphQueryView::from_query(&q);
-    let ask = GraphAsk::of(&q, &app).await?;
+    let query = GraphQueryView::from_query(q);
+    let ask = GraphAsk::of(q, app).await?;
     let data = app
-        .read(&id, move |db| GraphPageData::read(db, &ask, &options))
+        .read(id, move |db| GraphPageData::read(db, &ask, &options))
         .await?;
     // An unknown class or entity is shown on the page, not as a failed page.
-    let mut error = q.error;
+    let mut error = flash.error();
     let result = match data.result {
         Some(GraphAnswer {
             title,
@@ -2449,7 +2477,7 @@ async fn graph_page(
         .collect();
     drift.sort();
     html(&GraphPage {
-        page: Page::in_workspace(&app, Tab::Graph, &access),
+        page: Page::in_workspace(app, Tab::Graph, &access),
         status,
         drift,
         has_ontology: data.has_ontology,
@@ -2458,7 +2486,7 @@ async fn graph_page(
         query,
         result,
         error,
-        notice: q.notice,
+        notice: flash.notice(),
     })
 }
 
@@ -2473,7 +2501,7 @@ enum GraphAsk {
 impl GraphAsk {
     /// A path when both ends are given, else a search when an entity or a
     /// class is.
-    async fn of(q: &GraphPageQuery, app: &App) -> WebResult<Self> {
+    async fn of(q: &GraphSearch, app: &App) -> WebResult<Self> {
         let path = PathQuery::new(
             q.from.as_deref().unwrap_or_default(),
             q.to.as_deref().unwrap_or_default(),

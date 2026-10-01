@@ -639,7 +639,11 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["tables"], serde_json::json!(["t"]));
     let (status, body) = h
-        .get(&format!("/api/v1/workspaces/{ws}/tables/t"), &viewer_token)
+        .post(
+            &format!("/api/v1/workspaces/{ws}/tables/describe"),
+            &viewer_token,
+            serde_json::json!({ "name": "t" }),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["columns"][0]["name"], "a");
@@ -892,9 +896,10 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
     assert_eq!(body["pinned"], true);
 
     let (status, body) = h
-        .get(
-            &format!("/api/v1/workspaces/{ws}/search?query=flood"),
+        .post(
+            &format!("/api/v1/workspaces/{ws}/search"),
             &token,
+            serde_json::json!({ "query": "flood" }),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1135,9 +1140,10 @@ async fn query_endpoints_fail_cleanly_without_a_chat_model() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = h
-        .get(
-            &format!("/api/v1/workspaces/{ws}/search?query="),
+        .post(
+            &format!("/api/v1/workspaces/{ws}/search"),
             &owner_token,
+            serde_json::json!({ "query": "" }),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1217,10 +1223,10 @@ async fn a_failed_authorized_search_is_audited_as_error() {
     // READ is granted, but `embed_interactive` cannot reach the provider.
     let (status, _body) = h
         .call(
-            Method::GET,
-            &format!("/api/v1/workspaces/{ws}/search?query=hello"),
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/search"),
             None,
-            None,
+            Some(serde_json::json!({ "query": "hello" })),
         )
         .await;
     assert!(
@@ -1283,9 +1289,10 @@ async fn a_failed_authorized_search_on_a_db_error_is_audited_as_error() {
         .unwrap_or_else(|e| fail(&e.to_string()));
 
     let (status, _body) = h
-        .get(
-            &format!("/api/v1/workspaces/{ws}/search?query=hello"),
+        .post(
+            &format!("/api/v1/workspaces/{ws}/search"),
             &token,
+            serde_json::json!({ "query": "hello" }),
         )
         .await;
     assert!(
@@ -1325,11 +1332,17 @@ async fn a_failed_authorized_graph_search_is_audited_as_error() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
 
-    for uri in [
-        format!("/api/v1/workspaces/{ws}/graph/search?entity=acme"),
-        format!("/api/v1/workspaces/{ws}/graph/path?from=acme&to=globex"),
+    for (uri, ask) in [
+        (
+            format!("/api/v1/workspaces/{ws}/graph/search"),
+            serde_json::json!({ "entity": "acme" }),
+        ),
+        (
+            format!("/api/v1/workspaces/{ws}/graph/path"),
+            serde_json::json!({ "from": "acme", "to": "globex" }),
+        ),
     ] {
-        let (status, body) = h.get(&uri, &token).await;
+        let (status, body) = h.post(&uri, &token, ask).await;
         assert!(
             status.is_server_error(),
             "expected 5xx from the missing nodes table for {uri}, got {status}: {body}"
@@ -1749,11 +1762,9 @@ async fn ontology_is_versioned_over_the_api_and_the_web_page() {
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).contains("error="),
-        "{}",
-        location(&headers)
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(html.contains("role=\"alert\""), "{html}");
     let (status, _, headers) = h
         .form(&format!("/w/{ws}/ontology/2/restore"), Some(&cookie), "")
         .await;
@@ -2361,6 +2372,38 @@ impl Harness {
         )
     }
 
+    /// A form's redirect followed as a browser would: where it went, and
+    /// that page fetched with the session and the flash cookie the redirect
+    /// set, so a message is checked where the person sees it.
+    async fn land(
+        &self,
+        redirect: &axum::http::HeaderMap,
+        session: Option<&str>,
+    ) -> (String, String) {
+        let to = location(redirect);
+        let flash = redirect
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|c| c.strip_prefix("quack_flash="))
+            .and_then(|c| c.split(';').next())
+            .map(|id| format!("quack_flash={id}"));
+        let cookies: Vec<String> = session
+            .map(|token| format!("quack_session={token}"))
+            .into_iter()
+            .chain(flash)
+            .collect();
+        let mut builder = Request::builder().uri(&to);
+        if !cookies.is_empty() {
+            builder = builder.header(header::COOKIE, cookies.join("; "));
+        }
+        let request = builder
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (_, body, _) = self.send(request).await;
+        (to, body.as_str().unwrap_or_default().to_owned())
+    }
+
     /// A form POST that arrives from `peer`, so the handler sees the same
     /// `ConnectInfo` the real server sets.
     async fn form_from(
@@ -2446,7 +2489,12 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     );
     let (status, _, headers) = h.form("/login", None, "username=root&password=wrong").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(location(&headers).starts_with("/login?error="));
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, "/login");
+    assert!(html.contains("wrong username or password"), "{html}");
+    // A flash shows once: the page again has no message.
+    let (_, html, _) = h.page("/login", None).await;
+    assert!(!html.contains("wrong username or password"), "{html}");
     let (status, _, headers) = h.form("/login", None, "username=root&password=pw").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), "/workspaces");
@@ -2663,13 +2711,8 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let refused = location(&headers);
-    assert!(
-        refused.starts_with(&format!("/w/{ws}/settings?error=")),
-        "{refused}"
-    );
-    let (status, html, _) = h.page(&refused, Some(&cookie)).await;
-    assert_eq!(status, StatusCode::OK);
+    let (refused, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(refused, format!("/w/{ws}/settings"));
     assert!(html.contains("not a configured provider"), "{html}");
     let unchanged = h.app.control.get_workspace(&ws).await;
     assert!(
@@ -3127,6 +3170,28 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
             .is_some_and(|m| m.contains("no resource")),
         "{body}"
     );
+    // control.db's access log names the resource by its template: a table's
+    // name, and whatever an unknown URI says, stay in the workspace.
+    let opened: Vec<Option<String>> = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("open")),
+            ..AuditFilter::default()
+        })
+        .await
+        .into_iter()
+        .map(|r| r.resource_id)
+        .collect();
+    assert!(
+        opened.contains(&Some(String::from(
+            "quack://workspace/tables/{name}/schema"
+        ))) && opened.contains(&None)
+            && opened
+                .iter()
+                .flatten()
+                .all(|id| !id.contains("tables/t/") && !id.contains("nothing")),
+        "{opened:?}"
+    );
 
     let sql_rows = h
         .audit(AuditFilter {
@@ -3402,7 +3467,6 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
     assert_eq!(status, StatusCode::OK);
     for path in [
         "tables",
-        "tables/customer_secrets",
         "documents",
         "sessions",
         "ontology/versions",
@@ -3415,6 +3479,14 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
             .await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
     }
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/tables/describe"),
+            &token,
+            serde_json::json!({ "name": "customer_secrets" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
     let cookie = headers
         .get(header::SET_COOKIE)
@@ -3424,7 +3496,11 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
         .unwrap_or_default()
         .to_owned();
     let (status, _, _) = h
-        .page(&format!("/w/{ws}/tables/customer_secrets"), Some(&cookie))
+        .form(
+            &format!("/w/{ws}/tables"),
+            Some(&cookie),
+            "name=customer_secrets",
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3587,7 +3663,11 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
 
     // Search, class listing, and path.
     let (status, body) = h
-        .get(&format!("{base}/search?entity=Kenya&hops=1"), "")
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "entity": "Kenya", "hops": 1 }),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let labels: Vec<&str> = body["nodes"]
@@ -3600,23 +3680,33 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
     );
     assert!(!labels.contains(&"Orgenics"));
     assert!(body["provenance"].as_array().is_some_and(|p| !p.is_empty()));
-    let (status, body) = h.get(&format!("{base}/search?class=vendor"), "").await;
+    let (status, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "class": "vendor" }),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["nodes"].as_array().map(Vec::len), Some(2));
-    let (status, _) = h.get(&format!("{base}/search"), "").await;
+    let (status, _) = h
+        .post(&format!("{base}/search"), "", serde_json::json!({}))
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, body) = h
-        .get(
-            &format!("{base}/path?from=Uganda&to=Aurobindo&max_hops=6"),
+        .post(
+            &format!("{base}/path"),
             "",
+            serde_json::json!({ "from": "Uganda", "to": "Aurobindo", "max_hops": 6 }),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["edges"].as_array().map(Vec::len), Some(6), "{body}");
     let (_, body) = h
-        .get(
-            &format!("{base}/path?from=Uganda&to=Aurobindo&max_hops=2"),
+        .post(
+            &format!("{base}/path"),
             "",
+            serde_json::json!({ "from": "Uganda", "to": "Aurobindo", "max_hops": 2 }),
         )
         .await;
     assert_eq!(body["nodes"].as_array().map(Vec::len), Some(0));
@@ -3680,14 +3770,14 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
         .form(&format!("/w/{ws}/graph/merges/nope"), None, "action=acept")
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).contains("unknown+merge+decision"),
-        "{}",
-        location(&headers)
-    );
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/graph"));
+    assert!(html.contains("unknown merge decision"), "{html}");
 
     // The web page renders the status and a search result.
-    let (status, html, _) = h.page(&format!("/w/{ws}/graph?entity=Kenya"), None).await;
+    let (status, html, _) = h
+        .form(&format!("/w/{ws}/graph"), None, "entity=Kenya")
+        .await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Knowledge graph"), "{html}");
     assert!(html.contains("5 nodes, 3 edges"), "{html}");
@@ -3695,7 +3785,9 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
         html.contains("Nothing matched"),
         "Kenya was dropped: {html}"
     );
-    let (status, html, _) = h.page(&format!("/w/{ws}/graph?class=vendor"), None).await;
+    let (status, html, _) = h
+        .form(&format!("/w/{ws}/graph"), None, "class=vendor")
+        .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("Orgenics") && html.contains("Aurobindo") && html.contains("data-graph="),
@@ -4264,7 +4356,12 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), format!("/w/{ws}/tables/vendors2"));
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/tables"));
+    assert!(
+        html.contains(">vendors2</h1>"),
+        "the imported table opens: {html}"
+    );
     let (status, _, headers) = h
         .form(
             &format!("/w/{ws}/import"),
@@ -4273,7 +4370,9 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(location(&headers).contains("/tables?error="));
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/tables"));
+    assert!(html.contains("role=\"alert\""), "{html}");
 
     let imports = h
         .audit(AuditFilter {
@@ -5018,11 +5117,8 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).contains("background"),
-        "{}",
-        location(&headers)
-    );
+    let (_, html) = h.land(&headers, Some(&owner_token)).await;
+    assert!(html.contains("background"), "{html}");
 }
 
 /// What the stand-in work reports when it succeeds.
@@ -5182,28 +5278,27 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
     // Workspace names: the API's validation and message.
     let (status, _, headers) = h.form("/workspaces", Some(&cookie), "name=a.b").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).starts_with("/workspaces?error=workspace+name+must+be+non-empty"),
-        "{}",
-        location(&headers)
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, "/workspaces");
+    assert!(html.contains("workspace name must be non-empty"), "{html}");
     let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
     let ws = location(&headers)
         .trim_start_matches("/w/")
         .trim_end_matches("/chat")
         .to_owned();
     let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
-    assert_eq!(location(&headers), "/workspaces?error=workspace+exists");
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, "/workspaces");
+    assert!(html.contains("workspace exists"), "{html}");
 
     // Removing someone who is not a member says so; it used to pass silently.
     let (status, _, headers) = h
         .form(&format!("/w/{ws}/members/nobody/remove"), Some(&cookie), "")
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/settings?error=not+a+member")
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/settings"));
+    assert!(html.contains("not a member"), "{html}");
 
     // Bulk decisions need at least one candidate.
     let (_, _, headers) = h
@@ -5213,18 +5308,21 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
             "bulk=accept",
         )
         .await;
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/ontology?error=choose+at+least+one+candidate+to+accept+or+reject")
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(
+        html.contains("choose at least one candidate to accept or reject"),
+        "{html}"
     );
 
     // Proposing over no tables queues nothing and says so.
     let (_, _, headers) = h
         .form(&format!("/w/{ws}/ontology/propose"), Some(&cookie), "")
         .await;
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/ontology?notice=nothing+to+propose%3A+the+tables+are+already+covered")
+    let (_, html) = h.land(&headers, Some(&cookie)).await;
+    assert!(
+        html.contains("nothing to propose: the tables are already covered"),
+        "{html}"
     );
 
     // A second init is refused with the API's reason.
@@ -5235,10 +5333,9 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
     let (_, _, headers) = h
         .form(&format!("/w/{ws}/ontology/init"), Some(&cookie), "")
         .await;
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/ontology?error=an+ontology+already+exists")
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(html.contains("an ontology already exists"), "{html}");
 }
 
 /// Local mode has no logins, so no users can be added from the API

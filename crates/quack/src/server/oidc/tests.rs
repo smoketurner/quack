@@ -291,6 +291,15 @@ impl Harness {
         }
     }
 
+    /// The page a redirect lands on, fetched with the flash cookie it set:
+    /// a refusal's reason is there, never in the URL.
+    async fn landing(&self, reply: &Reply) -> String {
+        let flash = reply
+            .cookie("quack_flash")
+            .map(|id| format!("quack_flash={id}"));
+        self.get(&reply.location, flash.as_deref()).await.body
+    }
+
     async fn get(&self, uri: &str, cookie: Option<&str>) -> Reply {
         let mut request = Request::get(uri);
         if let Some(cookie) = cookie {
@@ -590,38 +599,28 @@ async fn a_callback_this_browser_did_not_start_is_refused_and_audited() {
     let (state, _, cookie) = h.start().await;
     let callback = format!("{}?code=c&state={state}", OidcConfig::CALLBACK_PATH);
 
-    let refused = |reply: &Reply, text: &str| {
+    let refused = async |reply: Reply, text: &str| {
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
-        assert!(
-            reply.location.starts_with("/login?error="),
-            "{}",
-            reply.location
-        );
-        assert!(
-            reply
-                .location
-                .replace("%20", " ")
-                .replace('+', " ")
-                .contains(text),
-            "{} lacks {text}",
-            reply.location
-        );
+        assert_eq!(reply.location, "/login");
         assert!(reply.cookie(SESSION_COOKIE).is_none());
+        let page = h.landing(&reply).await;
+        assert!(page.contains(text), "the login page lacks {text}: {page}");
     };
-    refused(&h.get(&callback, None).await, "could not be matched");
+    refused(h.get(&callback, None).await, "could not be matched").await;
     refused(
-        &h.get(&callback, Some(&format!("{}=other", super::STATE_COOKIE)))
+        h.get(&callback, Some(&format!("{}=other", super::STATE_COOKIE)))
             .await,
         "could not be matched",
-    );
+    )
+    .await;
     let error = format!(
         "{}?error=access_denied&error_description=no&state={state}",
         OidcConfig::CALLBACK_PATH
     );
     let with_cookie = format!("{}={cookie}", super::STATE_COOKIE);
-    refused(&h.get(&error, Some(&with_cookie)).await, "access_denied");
+    refused(h.get(&error, Some(&with_cookie)).await, "access_denied").await;
     // The state was spent by that callback; replaying it finds nothing.
-    refused(&h.get(&callback, Some(&with_cookie)).await, "already used");
+    refused(h.get(&callback, Some(&with_cookie)).await, "already used").await;
 
     let denied = h.audit("login").await;
     assert_eq!(denied.len(), 4, "{denied:?}");
@@ -1297,11 +1296,9 @@ async fn a_callback_naming_another_issuer_is_refused() {
         )
         .await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
-    assert!(
-        reply.location.starts_with("/login?error=") && reply.location.contains("9207"),
-        "{}",
-        reply.location
-    );
+    assert_eq!(reply.location, "/login");
+    let page = h.landing(&reply).await;
+    assert!(page.contains("9207"), "{page}");
     assert!(reply.cookie(SESSION_COOKIE).is_none());
 }
 

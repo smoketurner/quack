@@ -143,7 +143,7 @@ Every interface calls the same core entry points:
 | Operation | Core | Web | REST | MCP | TUI / print |
 |-----------|------|-----|------|-----|-------------|
 | Ask | `llm::TurnRequest::run` (event stream) | SSE fragments | SSE or JSON | `query` tool | inline / stdout+stderr |
-| Retrieve | `WorkspaceDb::search_hybrid_chunks`, `analysis::rerank` | via agent, `/search` page | `GET .../search` | `search` tool | via agent |
+| Retrieve | `WorkspaceDb::search_hybrid_chunks`, `analysis::rerank` | via agent, `/search` page | `POST .../search` | `search` tool | via agent |
 | SQL | `WorkspaceDb::execute_query{,_capped}` | SQL page | `POST .../sql` | `sql` tool | `/sql`, `-q` |
 | Ingest | `ingestion::ingest_file` | upload | `POST .../documents` | - | `/ingest`, `quack ingest` |
 | Graph | `graph::traverse::{neighborhood,path}` | graph page | `GET .../graph/*` | `search_graph` | `/graph`, `quack graph` |
@@ -1633,7 +1633,7 @@ POST   /api/v1/auth/login  POST /api/v1/auth/logout  GET /api/v1/auth/me
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
 POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn
 POST   /api/v1/workspaces/{id}/sql                {sql}
-GET    /api/v1/workspaces/{id}/search?query=&top_k=   hybrid retrieval, no LLM (the MCP `search` tool's names)
+POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
                                                   (identical bytes: status "duplicate";
@@ -1641,9 +1641,10 @@ POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 2
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
 PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
 DELETE /api/v1/workspaces/{id}/documents/{doc}
-GET    /api/v1/workspaces/{id}/tables[/{name}]
-GET    /api/v1/workspaces/{id}/graph/search?entity=&class=&relation=&hops=
-GET    /api/v1/workspaces/{id}/graph/path?from=&to=
+GET    /api/v1/workspaces/{id}/tables
+POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns, row count, sample rows
+POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops?}
+POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
 POST   /api/v1/workspaces/{id}/graph/extract       tables now; documents -> 202 with the cost, one run per workspace (409 while one runs)
 POST   /api/v1/workspaces/{id}/graph/revalidate
@@ -1678,7 +1679,13 @@ GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal
 
 Uploads, extraction, and proposals return `202` with a `job` id and run on the work queue
 (section 4.1); clients poll the resource or the job. Agent turns run there too, in their
-session's lane. Rate limiting is in section 12. Errors:
+session's lane. Rate limiting is in section 12.
+
+Workspace content never travels in a URL: search text, entity names, table names, and SQL
+go in a request body, since request logs, proxies, and browser history keep URLs and all of
+them sit outside the workspace file. Paths and query strings carry only ids, versions,
+fixed-set values, and paging. The request log records each request's route template
+(`/api/v1/workspaces/{id}/documents/{doc}`), never its URI. Errors:
 
 - An unknown value for a fixed-set field (`mode`, `role`, `scopes`, an audit `outcome`, a
   merge or candidate `action`, an extraction `source`) is refused while the request is

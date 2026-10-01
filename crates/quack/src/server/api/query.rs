@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
@@ -441,12 +441,13 @@ pub(crate) struct SearchQuery {
 }
 
 /// Hybrid retrieval with no model call: the embedding provider when one is
-/// configured, else keyword search alone.
+/// configured, else keyword search alone. The query is in the body: search
+/// text is workspace content, and a URL ends up in logs.
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<SearchQuery>,
+    Json(q): Json<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = q.query.trim().to_owned();

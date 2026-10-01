@@ -95,9 +95,14 @@ Users or Audit link, with `aria-current="page"`.
 
 A form handler calls the same typed operation as the REST handler (a method on `Access` or
 `Identity` in `server::api`), so both apply the same validation and audit rows. The API
-wraps the result in JSON; the web handler in a `web::flash::Flash` redirect. Redirects carry
-outcomes in the query string: `?error=` renders red and `?notice=` green, so a started
-background pass or a revalidation count does not look like a failure. The documents list polls its rows fragment only while a
+wraps the result in JSON; the web handler in a `web::flash::Flash` redirect. A redirect's
+outcome (an error in red, a notice in green, so a started background pass or a revalidation
+count does not look like a failure), and for the Tables page the table to open, can name
+workspace content, so it never goes in the URL: `web::flash::keep` stashes it in this
+process's memory (`Flashes`, one minute) under a random id, and the browser carries only the
+id in an `HttpOnly` `quack_flash` cookie; the landing page's `Flashed` extractor takes it, so
+it shows once. The graph page's searches and the Tables page's choice of table are posted
+forms for the same reason. The documents list polls its rows fragment only while a
 row is processing (marked `data-pending`).
 
 ## Assets
