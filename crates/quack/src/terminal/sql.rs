@@ -26,6 +26,105 @@ enum Slot {
     Qualified(String),
 }
 
+/// What a word leads into: a table name or a clause of expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Context {
+    /// `FROM`, `JOIN`, `DESCRIBE`, `SUMMARIZE`, `UPDATE`, `INTO`.
+    Tables,
+    /// `SELECT`, `WHERE`, `BY`, `ON`, `HAVING`, `QUALIFY`, `SET`, `USING`,
+    /// `RETURNING`.
+    Expressions,
+}
+
+impl Context {
+    fn of(word: &Word) -> Option<Self> {
+        match word.keyword {
+            Keyword::FROM | Keyword::JOIN | Keyword::DESCRIBE | Keyword::UPDATE | Keyword::INTO => {
+                Some(Self::Tables)
+            }
+            Keyword::SELECT
+            | Keyword::WHERE
+            | Keyword::BY
+            | Keyword::ON
+            | Keyword::HAVING
+            | Keyword::QUALIFY
+            | Keyword::SET
+            | Keyword::USING
+            | Keyword::RETURNING => Some(Self::Expressions),
+            // sqlparser has no SUMMARIZE keyword.
+            _ if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("summarize") => {
+                Some(Self::Tables)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A statement's tokens without whitespace and comments.
+struct Statement(Vec<Token>);
+
+impl Statement {
+    /// `sql` tokenized, or `None` when the tokenizer refuses it (an
+    /// unterminated string or quoted name) or it ends inside a comment.
+    fn read(sql: &str) -> Option<Self> {
+        let tokens = Tokenizer::new(&DuckDbDialect {}, sql).tokenize().ok()?;
+        if let Some(Token::Whitespace(
+            Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_),
+        )) = tokens.last()
+        {
+            return None;
+        }
+        Some(Self(
+            tokens
+                .into_iter()
+                .filter(|t| !matches!(t, Token::Whitespace(_)))
+                .collect(),
+        ))
+    }
+
+    /// The tables the statement names after `FROM` or `JOIN`, each with the
+    /// name it goes by there (its alias, else itself).
+    fn named_tables<'s>(&self, schema: &'s SqlSchema) -> Vec<(String, &'s TableColumns)> {
+        let mut named = Vec::new();
+        let mut tokens = self.0.iter().peekable();
+        while let Some(token) = tokens.next() {
+            let Token::Word(word) = token else {
+                continue;
+            };
+            if !matches!(word.keyword, Keyword::FROM | Keyword::JOIN) {
+                continue;
+            }
+            while let Some(Token::Word(table)) = tokens.next() {
+                let Some(columns) = schema.table(&table.value) else {
+                    break;
+                };
+                if let Some(Token::Word(w)) = tokens.peek()
+                    && w.keyword == Keyword::AS
+                {
+                    tokens.next();
+                }
+                let alias = match tokens.peek() {
+                    Some(Token::Word(w))
+                        if w.keyword == Keyword::NoKeyword || w.quote_style.is_some() =>
+                    {
+                        let alias = w.value.clone();
+                        tokens.next();
+                        alias
+                    }
+                    _ => table.value.clone(),
+                };
+                named.push((alias, columns));
+                if tokens.peek() == Some(&&Token::Comma) {
+                    tokens.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        named
+    }
+}
+
 /// A statement's tokens, the word at the cursor, and what it names.
 struct Typed {
     /// The tokens before the word being typed, whitespace and comments
@@ -41,7 +140,7 @@ impl Typed {
     /// `prefix` read up to its end, or `None` inside a string, quoted
     /// name, comment, or number, where no name belongs.
     fn read(prefix: &str) -> Option<Self> {
-        let mut tokens = significant(prefix)?;
+        let Statement(mut tokens) = Statement::read(prefix)?;
         let trailing_space = prefix.ends_with(|c: char| c.is_whitespace());
         let (word, keyword) = match tokens.last() {
             Some(Token::Word(Word {
@@ -76,120 +175,27 @@ impl Typed {
             };
         }
         if let Token::Word(word) = previous
-            && opens_table(word)
+            && Context::of(word) == Some(Context::Tables)
         {
             return Some(Slot::Table);
         }
-        let clause = self.before.iter().rev().find_map(|token| match token {
-            Token::Word(word) if opens_table(word) || is_clause(word.keyword) => Some(word),
+        let context = self.before.iter().rev().find_map(|token| match token {
+            Token::Word(word) => Context::of(word),
             _ => None,
         })?;
-        if opens_table(clause) {
-            // In a FROM list a name follows a comma; anything else there
-            // is an alias being typed.
-            return (*previous == Token::Comma).then_some(Slot::Table);
-        }
-        match previous {
+        match (context, previous) {
+            // In a FROM list a name follows a comma; anything else there is
+            // an alias being typed.
+            (Context::Tables, _) => (*previous == Token::Comma).then_some(Slot::Table),
             // An alias after AS, or after a name with none.
-            Token::Word(word) if word.keyword == Keyword::AS => None,
-            Token::Word(word) if word.keyword == Keyword::NoKeyword => None,
-            _ => (!self.word.is_empty()).then_some(Slot::Column),
-        }
-    }
-}
-
-/// The statement's tokens without whitespace and comments, or `None` when
-/// the tokenizer refuses it (an unterminated string or quoted name).
-fn significant(sql: &str) -> Option<Vec<Token>> {
-    let tokens = Tokenizer::new(&DuckDbDialect {}, sql).tokenize().ok()?;
-    if let Some(Token::Whitespace(
-        Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_),
-    )) = tokens.last()
-    {
-        return None;
-    }
-    Some(
-        tokens
-            .into_iter()
-            .filter(|t| !matches!(t, Token::Whitespace(_)))
-            .collect(),
-    )
-}
-
-/// A word after which a table name comes.
-fn opens_table(word: &Word) -> bool {
-    matches!(
-        word.keyword,
-        Keyword::FROM | Keyword::JOIN | Keyword::DESCRIBE | Keyword::UPDATE | Keyword::INTO
-    ) || (word.quote_style.is_none() && word.value.eq_ignore_ascii_case("summarize"))
-}
-
-/// A keyword that starts a clause of expressions.
-const fn is_clause(keyword: Keyword) -> bool {
-    matches!(
-        keyword,
-        Keyword::SELECT
-            | Keyword::WHERE
-            | Keyword::BY
-            | Keyword::ON
-            | Keyword::HAVING
-            | Keyword::QUALIFY
-            | Keyword::SET
-            | Keyword::USING
-            | Keyword::RETURNING
-    )
-}
-
-/// The tables a statement names after `FROM` or `JOIN`, each with the
-/// name it goes by there (its alias, else itself).
-fn named_tables<'s>(line: &str, schema: &'s SqlSchema) -> Vec<(String, &'s TableColumns)> {
-    let Some(tokens) = significant(line) else {
-        return Vec::new();
-    };
-    let mut named = Vec::new();
-    let mut tokens = tokens.iter().peekable();
-    while let Some(token) = tokens.next() {
-        let Token::Word(word) = token else {
-            continue;
-        };
-        if !matches!(word.keyword, Keyword::FROM | Keyword::JOIN) {
-            continue;
-        }
-        while let Some(Token::Word(table)) = tokens.next() {
-            let Some(columns) = find_table(schema, &table.value) else {
-                break;
-            };
-            if let Some(Token::Word(w)) = tokens.peek()
-                && w.keyword == Keyword::AS
+            (Context::Expressions, Token::Word(word))
+                if word.keyword == Keyword::AS || word.keyword == Keyword::NoKeyword =>
             {
-                tokens.next();
+                None
             }
-            let alias = match tokens.peek() {
-                Some(Token::Word(w))
-                    if w.keyword == Keyword::NoKeyword || w.quote_style.is_some() =>
-                {
-                    let alias = w.value.clone();
-                    tokens.next();
-                    alias
-                }
-                _ => table.value.clone(),
-            };
-            named.push((alias, columns));
-            if tokens.peek() == Some(&&Token::Comma) {
-                tokens.next();
-            } else {
-                break;
-            }
+            (Context::Expressions, _) => (!self.word.is_empty()).then_some(Slot::Column),
         }
     }
-    named
-}
-
-fn find_table<'s>(schema: &'s SqlSchema, name: &str) -> Option<&'s TableColumns> {
-    schema
-        .tables
-        .iter()
-        .find(|t| t.name.name.eq_ignore_ascii_case(name))
 }
 
 impl Completion {
@@ -208,6 +214,13 @@ impl Completion {
         let typed = Typed::read(prefix)?;
         let slot = typed.slot()?;
         let start = end.checked_sub(typed.word.len())?;
+        // The whole line names the tables, the part after the cursor too.
+        let line_statement = Statement::read(line);
+        let named = |schema| {
+            line_statement
+                .as_ref()
+                .map_or_else(Vec::new, |statement| statement.named_tables(schema))
+        };
         let matches = |name: &SqlName| {
             name.name
                 .to_lowercase()
@@ -224,11 +237,11 @@ impl Completion {
         match slot {
             Slot::Table => items.extend(tables()),
             Slot::Qualified(qualifier) => {
-                let table = named_tables(line, schema)
+                let table = named(schema)
                     .into_iter()
                     .find(|(alias, _)| alias.eq_ignore_ascii_case(&qualifier))
                     .map(|(_, table)| table)
-                    .or_else(|| find_table(schema, &qualifier))?;
+                    .or_else(|| schema.table(&qualifier))?;
                 let about = format!("column of {}", table.name.name);
                 items.extend(
                     table
@@ -239,7 +252,7 @@ impl Completion {
                 );
             }
             Slot::Column => {
-                for (_, table) in named_tables(line, schema) {
+                for (_, table) in named(schema) {
                     let about = format!("column of {}", table.name.name);
                     for column in table.columns.iter().filter(|c| matches(c)) {
                         if !items.iter().any(|i| i.word == column.sql) {

@@ -58,34 +58,57 @@ pub type ChatModel = DynModel<operation::Completion>;
 
 /// A dedicated rerank model with its wire and transport erased, sending
 /// through [`LimitedHttp`] like every model quack builds.
-pub type RerankModel = DynModel<operation::Rerank>;
+#[derive(Clone)]
+pub struct RerankModel(DynModel<operation::Rerank>);
 
-/// The rerank model `[retrieval].rerank = "reranker"` names, or `None` in
-/// any other mode.
-///
-/// # Errors
-///
-/// Returns an error if the setting is invalid or the provider's credential
-/// cannot be resolved.
-pub async fn rerank_model(config: &Config) -> Result<Option<RerankModel>> {
-    let Some(model) = config.rerank_model_ref()? else {
-        return Ok(None);
-    };
-    let key = model
-        .provider
-        .auth
-        .credential(config, model.provider_name)
-        .await?;
-    rerank_model_with(model, key.as_deref()).map(Some)
-}
+impl RerankModel {
+    /// The rerank model `[retrieval].rerank = "reranker"` names, or `None`
+    /// in any other mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the setting is invalid or the provider's
+    /// credential cannot be resolved.
+    pub async fn from_config(config: &Config) -> Result<Option<Self>> {
+        let Some(model) = config.rerank_model_ref()? else {
+            return Ok(None);
+        };
+        let key = model
+            .provider
+            .auth
+            .credential(config, model.provider_name)
+            .await?;
+        Self::with_key(model, key.as_deref()).map(Some)
+    }
 
-/// `model` with `key`, already resolved, on [`ChatClient::rerank_server`].
-pub(crate) fn rerank_model_with(model: ModelRef<'_>, key: Option<&str>) -> Result<RerankModel> {
-    Ok(
-        ChatClient::rerank_server(model.provider_name, model.provider, key)?
-            .rerank(model.model)
-            .erase(),
-    )
+    /// `model` with `key`, already resolved, on [`ChatClient::rerank_server`].
+    pub(crate) fn with_key(model: ModelRef<'_>, key: Option<&str>) -> Result<Self> {
+        Ok(Self(
+            ChatClient::rerank_server(model.provider_name, model.provider, key)?
+                .rerank(model.model)
+                .erase(),
+        ))
+    }
+
+    /// Score `request`'s documents against its query.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's error when the call fails.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's ProviderError, which the call returns; it keeps the failed response"
+    )]
+    pub async fn rank(
+        &self,
+        request: operation::RerankRequest,
+    ) -> std::result::Result<rig::rerank::RerankResponse, ProviderError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a rerank call, not an embedding; the lint guards embedding prefixes"
+        )]
+        self.0.call(request).await
+    }
 }
 
 /// One of rig's embedding models with its wire and transport erased.
@@ -1258,7 +1281,7 @@ async fn start_turn<'c>(
     // Without an embedding provider the agent still runs: document search
     // is keyword-only and graph entry is exact (issue #58).
     let embedding_model = Embeddings::from_config(config).await?;
-    let rerank_model = rerank_model(config).await?;
+    let rerank_model = RerankModel::from_config(config).await?;
     // On the blocking pool, in the writer's interactive line: an async
     // worker never waits on the connection.
     let session_id = session_id.to_owned();

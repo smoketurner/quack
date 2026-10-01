@@ -19,7 +19,7 @@ use super::{ChatClient, SchemaCall, Task};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
-use crate::storage::sessions::{self, SessionMemory, TranscriptWindow};
+use crate::storage::sessions::{self, SessionMemory, SpokenText, TranscriptWindow};
 use crate::storage::writer::Writer;
 use crate::text::Tokens;
 
@@ -136,8 +136,8 @@ impl SessionCompactor {
         }
         for message in messages {
             let (who, said) = match message {
-                Message::User { .. } => ("Person", message_text(message)),
-                Message::Assistant { .. } => ("Assistant", message_text(message)),
+                Message::User { .. } => ("Person", message.spoken_text()),
+                Message::Assistant { .. } => ("Assistant", message.spoken_text()),
                 Message::System { content } => ("Summary", content.clone()),
             };
             text.push_str(who);
@@ -146,28 +146,6 @@ impl SessionCompactor {
             text.push('\n');
         }
         text
-    }
-}
-
-/// The text parts of a message, joined.
-fn message_text(message: &Message) -> String {
-    use rig::message::{AssistantContent, UserContent};
-    match message {
-        Message::User { content } => content
-            .iter()
-            .filter_map(|part| match part {
-                UserContent::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect(),
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|part| match part {
-                AssistantContent::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect(),
-        Message::System { content } => content.clone(),
     }
 }
 
@@ -306,7 +284,7 @@ mod tests {
             .load(&id)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let shown: Vec<String> = history.iter().map(message_text).collect();
+        let shown: Vec<String> = history.iter().map(SpokenText::spoken_text).collect();
         assert_eq!(
             shown,
             [
@@ -368,7 +346,7 @@ mod tests {
         .load(&id)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-        let shown: Vec<String> = history.iter().map(message_text).collect();
+        let shown: Vec<String> = history.iter().map(SpokenText::spoken_text).collect();
         assert_eq!(shown, ["question 4", "answer 4", "question 5", "answer 5"]);
     }
 }
