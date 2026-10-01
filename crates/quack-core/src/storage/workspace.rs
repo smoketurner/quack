@@ -3272,16 +3272,17 @@ fn display_json_value(val: &serde_json::Value) -> String {
 }
 
 impl QueryResults {
-    /// The rows with every text cell longer than `max_chars` cut, with an
-    /// ellipsis.
+    /// The rows with every cell whose printed text is longer than
+    /// `max_chars` cut, with an ellipsis. A nested value (a `STRUCT`, a
+    /// `LIST`) is cut by the text `write_table` prints for it, so one JSON
+    /// column cannot make a row any wider than a long string can.
     #[must_use]
     pub fn with_cells_cut(&self, max_chars: usize) -> Self {
         let mut out = self.clone();
         for row in &mut out.rows {
             for cell in row.iter_mut() {
-                if let serde_json::Value::String(text) = cell
-                    && text.chars().count() > max_chars
-                {
+                let text = display_json_value(cell);
+                if text.chars().count() > max_chars {
                     let mut cut: String = text.chars().take(max_chars).collect();
                     cut.push('\u{2026}');
                     *cell = serde_json::Value::String(cut);
@@ -4975,6 +4976,32 @@ mod tests {
         assert_eq!(
             single.rows.first().and_then(|r| r.first()),
             Some(&serde_json::json!("rejected"))
+        );
+    }
+
+    /// Sample rows in the system prompt are cut per cell: nested values
+    /// too, which once put a 58,000-character JSON cell (and a header
+    /// padded to match) into every turn's prompt.
+    #[test]
+    fn cells_are_cut_whatever_their_type() {
+        let long = "x".repeat(100);
+        let results = QueryResults {
+            columns: vec![String::from("s"), String::from("j"), String::from("n")],
+            rows: vec![vec![
+                serde_json::Value::String(long.clone()),
+                serde_json::json!({ "a": [long.clone(), long] }),
+                serde_json::json!(12_345),
+            ]],
+        };
+        let cut = results.with_cells_cut(10);
+        let cells: Vec<String> = cut.rows.iter().flatten().map(display_json_value).collect();
+        assert_eq!(
+            cells,
+            vec![
+                format!("{}\u{2026}", "x".repeat(10)),
+                String::from("{\"a\":[\"xxx\u{2026}"),
+                String::from("12345"),
+            ]
         );
     }
 }
