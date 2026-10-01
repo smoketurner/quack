@@ -38,7 +38,7 @@ office_oxide  = { workspace = true }
 pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
-rig           = { workspace = true, features = ["agent", "bedrock", "derive", "reqwest"] } # rig's transport takes its TLS from reqwest's features above
+rig           = { workspace = true, features = ["agent", "bedrock", "derive", "memory", "reqwest"] } # rig's transport takes its TLS from reqwest's features above
 rust-stemmers = { workspace = true }
 rustls        = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 schemars      = { workspace = true, features = ["derive"] }

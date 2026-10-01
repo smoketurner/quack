@@ -4618,6 +4618,7 @@ dependencies = [
  "rig-cassette",
  "rig-core",
  "rig-derive",
+ "rig-memory",
  "rig-reqwest",
  "rig-typesafeai",
 ]
@@ -4733,6 +4734,16 @@ dependencies = [
  "mime",
  "thiserror 2.0.21",
  "url",
+]
+
+[[package]]
+name = "rig-memory"
+version = "0.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9b7e4b48e4f589b9ba55f460e23691faa89b4de24549822f7445c0d126c91cf"
+dependencies = [
+ "rig-core",
+ "tracing",
 ]
 
 [[package]]

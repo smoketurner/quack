@@ -163,7 +163,7 @@ impl AgentResponse {
 /// One question for the agent: the workspace handles, the embedding model
 /// (none for keyword-only search), the analysis settings, the write
 /// policy, the prompt options, the history to replay (see
-/// `storage::sessions::history_for_model`), and the message. `reader_db`
+/// `llm::memory::History`), and the message. `reader_db`
 /// is the workspace handle's reader, built once for its whole lifetime by
 /// [`ReaderDb::open`]: acquiring one per turn would make every turn wait
 /// on the writer before it can start, exactly when a slow write is most

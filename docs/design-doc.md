@@ -487,6 +487,14 @@ CREATE TABLE _quack_messages (
     created_at TIMESTAMP DEFAULT now(),
     UNIQUE (session_id, seq)
 );
+-- [analysis].compact_history: summaries of the turns the history window leaves out
+CREATE TABLE _quack_session_summaries (
+    id TEXT PRIMARY KEY,                        -- UUID v7
+    session_id TEXT NOT NULL,
+    covers INTEGER NOT NULL,                    -- replayable messages it summarizes, oldest first
+    summary TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT now()
+);
 
 -- workspace audit detail (section 12): what was done, inside the boundary
 CREATE TABLE _quack_audit (
@@ -1264,7 +1272,17 @@ message.
   answers, and a note where a chart is attached). Export is audited because it moves content
   across the boundary.
 - History sent to the model is trimmed to `history_token_budget` (32,000), oldest first.
-  Tool messages are never replayed; only user and assistant text goes back.
+  Tool messages are never replayed; only user and assistant text goes back. It loads through
+  rig's conversation memory (`llm::memory::History`): `storage::sessions::SessionMemory`
+  reads the session's turns (quack records each turn itself, so its `append` stores
+  nothing), and `TranscriptWindow` is rig's `TokenWindowMemory` at four characters per token
+  that also drops an answer whose question fell outside. With
+  `[analysis].compact_history = true` (off by default), rig's `CompactingMemory` hands the
+  turns the window leaves out to `SessionCompactor`, which has the chat model summarize
+  them (at most a quarter of the budget) and keeps the summary in
+  `_quack_session_summaries` with how many messages it covers; the next turn reuses it and
+  summarizes only what left the window since. The summary leads the history as a system
+  message. Deleting a session deletes its summaries.
 - Server mode: sessions carry `created_by`. Members see their own, any marked `shared`, and
   any with no creator (started from the CLI or the TUI). `owner` sees all sessions in the
   workspace for audit.
@@ -2162,6 +2180,7 @@ memory_limit_mb = 256
 threads = 4
 max_turns = 15
 history_token_budget = 32000
+compact_history = false                 # summarize the turns the budget leaves out instead of dropping them
 max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
 extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
 extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL

@@ -109,8 +109,11 @@ cargo run --bin quack -- mcp [-w ws] [--allow-write]                            
 ```
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
-file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model, trimmed
-to `[analysis].history_token_budget`. Retrieval is hybrid (exact cosine scan plus quack's own
+file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through
+rig's conversation memory (`llm::memory::History`: `SessionMemory` under `TranscriptWindow`,
+rig's token window over `[analysis].history_token_budget`), and with
+`[analysis].compact_history` the turns it leaves out become a chat-model summary kept in
+`_quack_session_summaries`. Retrieval is hybrid (exact cosine scan plus quack's own
 BM25 over `_quack_terms` with Snowball-stemmed tokens, reciprocal rank fusion in
 `WorkspaceDb::search_hybrid_chunks`;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker

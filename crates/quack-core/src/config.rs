@@ -1537,8 +1537,14 @@ pub struct AnalysisConfig {
     /// Reasoning effort for chat turns. Unset: the model's own default.
     pub effort: Option<Effort>,
     /// Reasoning effort for background calls: graph extraction, the
-    /// ontology's document pass, and reranking. Unset: the model's default.
+    /// ontology's document pass, reranking, and history summaries. Unset:
+    /// the model's default.
     pub background_effort: Option<Effort>,
+    /// Replace the turns that fall outside `history_token_budget` with a
+    /// summary the chat model writes, kept in the workspace, instead of
+    /// dropping them. Off by default: each new summary is one more model
+    /// call before a turn.
+    pub compact_history: bool,
 }
 
 impl AnalysisConfig {
@@ -1570,6 +1576,7 @@ impl Default for AnalysisConfig {
             reader_pool_size: 4,
             effort: None,
             background_effort: None,
+            compact_history: false,
         }
     }
 }

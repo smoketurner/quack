@@ -6,6 +6,7 @@
 
 pub mod acting;
 pub mod bedrock;
+pub mod memory;
 pub mod oauth;
 pub mod sampling;
 
@@ -1227,9 +1228,10 @@ async fn start_turn<'c>(
     let context_max_tokens = config.context.max_tokens;
     let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
         .then_some(config.analysis.max_context_tokens);
-    let history_budget = config.analysis.history_token_budget;
-    let (prompt, history) = db
+    let read = session_id.clone();
+    let prompt = db
         .run(move |guard| {
+            let session_id = read;
             let session = sessions::get_session(guard, &session_id)?
                 .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
             let prompt = PromptOptions {
@@ -1240,11 +1242,12 @@ async fn start_turn<'c>(
                 context_max_tokens,
                 ollama_context_cap,
             };
-            Ok((
-                prompt,
-                sessions::history_for_model(guard, &session_id, history_budget)?,
-            ))
+            Ok(prompt)
         })
+        .await?;
+    let history = memory::History::from_config(config, Arc::clone(db))
+        .await?
+        .load(&session_id)
         .await?;
     Ok(StartedTurn {
         chat,
