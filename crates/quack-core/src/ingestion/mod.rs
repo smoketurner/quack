@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rig::embeddings::EmbeddingModel;
+use crate::embedding::EmbeddingModel;
 
 use crate::config::Config;
 use crate::embedding::{Embedder, Input};

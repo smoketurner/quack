@@ -9,7 +9,7 @@ use quack_core::config::{
     RetrievalConfig, ServerConfig,
 };
 use quack_core::embedding::refresh::{Plan, Retype};
-use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
+use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
@@ -24,7 +24,8 @@ use quack_core::storage::workspace::{
 };
 use quack_core::storage::writer::Writer;
 use quack_core::{import, ingestion};
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
+use rig::ProviderError;
+use rig::embeddings::Embedding;
 
 const TEST_DIM: usize = 4;
 const TEST_DIM_U32: u32 = 4;
@@ -58,24 +59,10 @@ struct BatchRecordingModel {
 }
 
 impl EmbeddingModel for BatchRecordingModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self {
-            batches: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
-        let texts: Vec<String> = texts.into_iter().collect();
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         if let Ok(mut batches) = self.batches.lock() {
             batches.push(texts.len());
         }
@@ -93,43 +80,21 @@ impl EmbeddingModel for BatchRecordingModel {
 struct FailingEmbeddingModel;
 
 impl EmbeddingModel for FailingEmbeddingModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        _texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
-        std::future::ready(Err(EmbeddingError::ProviderError(String::from(
+        _texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
+        std::future::ready(Err(ProviderError::Provider(String::from(
             "connection refused",
         ))))
     }
 }
 
 impl EmbeddingModel for MockEmbeddingModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self { dim: TEST_DIM }
-    }
-
-    fn ndims(&self) -> usize {
-        self.dim
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         let mut result = Vec::new();
         for text in texts {
             result.push(Embedding {
@@ -292,27 +257,11 @@ struct InFlightModel {
 }
 
 impl EmbeddingModel for InFlightModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self {
-            in_flight: std::sync::atomic::AtomicUsize::new(0),
-            peak: std::sync::atomic::AtomicUsize::new(0),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         use std::sync::atomic::Ordering;
-        let texts: Vec<String> = texts.into_iter().collect();
         async move {
             let now = self
                 .in_flight
@@ -381,7 +330,11 @@ async fn embedding_concurrency_overlaps_requests_and_keeps_vectors_with_their_ch
     let mut config = test_config(dir.path());
     config.ingestion.embedding_batch_size = 1;
     config.ingestion.embedding_concurrency = 3;
-    let model = embedder(InFlightModel::make(&(), "mock", None));
+    let model = embedder(InFlightModel {
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
 
     let (db, result) = ingest_six_sections(&config, "ws-concurrent", &model).await;
 
@@ -400,7 +353,11 @@ async fn embedding_concurrency_of_one_stays_serial() {
     let mut config = test_config(dir.path());
     config.ingestion.embedding_batch_size = 1;
     config.ingestion.embedding_concurrency = 1;
-    let model = embedder(InFlightModel::make(&(), "mock", None));
+    let model = embedder(InFlightModel {
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
 
     let (db, _) = ingest_six_sections(&config, "ws-serial", &model).await;
 
@@ -418,7 +375,9 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let writer = writer_of(&db);
-    let model = embedder(BatchRecordingModel::make(&(), "mock", None));
+    let model = embedder(BatchRecordingModel {
+        batches: std::sync::Mutex::new(Vec::new()),
+    });
 
     // Five headed sections, each its own chunk at 50 tokens.
     let sections: Vec<String> = (1..=5)
@@ -2907,24 +2866,10 @@ struct SlowModel {
 }
 
 impl EmbeddingModel for SlowModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self {
-            delay: std::time::Duration::from_secs(60),
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
-        let texts: Vec<String> = texts.into_iter().collect();
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         let delay = self.delay;
         async move {
             tokio::time::sleep(delay).await;

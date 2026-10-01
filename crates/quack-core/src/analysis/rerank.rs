@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::llm::OneShotAgent;
+use crate::llm::{ChatModel, OneShotAgent};
 use crate::storage::workspace::ChunkSearchResult;
 
 /// Boxed future so implementations can be trait objects.
@@ -115,10 +115,8 @@ pub struct ModelReranker {
 }
 
 impl ModelReranker {
-    pub fn new<M>(model: M) -> Self
-    where
-        M: rig::completion::CompletionModel + Clone + Send + Sync + 'static,
-    {
+    #[must_use]
+    pub fn new(model: ChatModel) -> Self {
         Self {
             agent: OneShotAgent::new(model, RERANK_PROMPT, RERANK_TIMEOUT, "rerank"),
         }

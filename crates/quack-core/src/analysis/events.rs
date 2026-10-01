@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
-use crate::embedding::{Embedder, Input, Vector};
+use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
 
 /// A turn's embeddings, by input (the role is part of it).
@@ -316,7 +316,7 @@ impl TurnRecorder {
     /// # Errors
     ///
     /// Returns the model's error.
-    pub async fn embed_cached<M: rig::embeddings::EmbeddingModel>(
+    pub async fn embed_cached<M: EmbeddingModel>(
         &self,
         embedder: &Embedder<M>,
         input: Input,
@@ -336,7 +336,7 @@ impl TurnRecorder {
     /// # Errors
     ///
     /// Returns the model's error, as an analysis error naming it.
-    pub async fn embed_label<M: rig::embeddings::EmbeddingModel>(
+    pub async fn embed_label<M: EmbeddingModel>(
         &self,
         embedder: Option<&Embedder<M>>,
         label: &str,

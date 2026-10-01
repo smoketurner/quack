@@ -22,7 +22,8 @@ use std::fmt;
 use std::slice;
 use std::sync::Arc;
 
-use rig::embeddings::EmbeddingModel;
+use rig::ProviderError;
+use rig::embeddings::Embedding;
 use serde::{Deserialize, Serialize};
 
 pub use status::{EmbeddingStatus, StaleVectors};
@@ -199,6 +200,17 @@ impl fmt::Display for Profile {
     }
 }
 
+/// A model that embeds texts: every provider's (`llm::EmbedModel`), and
+/// the doubles tests use. Callers embed through an [`Embedder`], which
+/// adds each role's prefix and checks the width.
+pub trait EmbeddingModel: Send + Sync {
+    /// One embedding per text, in order.
+    fn embed_texts(
+        &self,
+        texts: Vec<String>,
+    ) -> impl Future<Output = std::result::Result<Vec<Embedding>, ProviderError>> + Send;
+}
+
 /// An embedding model under a [`Profile`]: every input names its role, and
 /// every vector that comes back is checked against the profile's width.
 #[derive(Clone)]
@@ -281,11 +293,14 @@ impl<M: EmbeddingModel> Embedder<M> {
             clippy::disallowed_methods,
             reason = "the one place a raw embedding call is made: every caller goes through an Input"
         )]
-        let embeddings = self
-            .model
-            .embed_texts(texts)
-            .await
-            .map_err(|e| Error::Embedding(e.to_string()))?;
+        let embeddings = self.model.embed_texts(texts).await.map_err(|e| match e {
+            ProviderError::MismatchedDimensions { returned, .. } => WidthMismatch {
+                expected: self.profile.dimension,
+                actual: returned,
+            }
+            .for_model(&self.profile.model),
+            other => Error::Embedding(other.to_string()),
+        })?;
         if embeddings.len() != inputs.len() {
             return Err(Error::Embedding(format!(
                 "{} returned {} embeddings for {} inputs",
@@ -310,7 +325,6 @@ impl<M: EmbeddingModel> Embedder<M> {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
-    use rig::embeddings::{Embedding, EmbeddingError};
     use std::sync::Mutex;
 
     /// Records every input and answers with vectors of `width`.
@@ -321,26 +335,11 @@ mod tests {
     }
 
     impl EmbeddingModel for Recording {
-        const MAX_DOCUMENTS: usize = 64;
-        type Client = ();
-
-        fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-            Self {
-                width: 4,
-                inputs: Arc::default(),
-            }
-        }
-
-        fn ndims(&self) -> usize {
-            self.width
-        }
-
         fn embed_texts(
             &self,
-            texts: impl IntoIterator<Item = String> + Send,
-        ) -> impl Future<Output = std::result::Result<Vec<Embedding>, EmbeddingError>> + Send
+            texts: Vec<String>,
+        ) -> impl Future<Output = std::result::Result<Vec<Embedding>, ProviderError>> + Send
         {
-            let texts: Vec<String> = texts.into_iter().collect();
             self.inputs.lock().unwrap().extend(texts.iter().cloned());
             std::future::ready(Ok(texts
                 .into_iter()

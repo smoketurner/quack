@@ -27,9 +27,9 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::Stream;
-use rig::http_client::sse::BoxedStream;
 use rig::http_client::{
-    self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
+    self, BoxedStream, HttpClientExt, LazyBody, MultipartForm, Request, ReqwestClient, Response,
+    StreamingResponse,
 };
 use tokio::sync::oneshot;
 
@@ -238,13 +238,14 @@ impl ProviderGates {
 }
 
 /// A reqwest client that takes a permit of its provider's limit for the
-/// request's model before each request. `Default` (required by rig's
-/// provider bounds) is unlimited; quack always builds one with
-/// [`LimitedHttp::for_provider`].
+/// request's model before each request. `Default` is unlimited; quack
+/// always builds one with [`LimitedHttp::for_provider`].
 #[derive(Clone, Default, Debug)]
 pub struct LimitedHttp {
-    inner: reqwest::Client,
+    inner: ReqwestClient,
     gates: ProviderGates,
+    /// The provider's `headers`, sent on every request beside rig's own.
+    headers: http::HeaderMap,
     /// Replaces the credential rig set, once the request has its permit.
     authorize: Option<Authorize>,
 }
@@ -282,10 +283,19 @@ impl LimitedHttp {
     #[must_use]
     pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
-            inner: reqwest::Client::default(),
+            inner: ReqwestClient::from(reqwest::Client::default()),
             gates: ProviderGates::for_provider(name, provider),
+            headers: http::HeaderMap::new(),
             authorize: None,
         }
+    }
+
+    /// This client, sending `headers` (a provider's `headers`) on every
+    /// request beside the ones rig sets.
+    #[must_use]
+    pub(crate) fn with_headers(mut self, headers: http::HeaderMap) -> Self {
+        self.headers = headers;
+        self
     }
 
     /// This client, signing every request with `signer`.
@@ -306,11 +316,27 @@ impl LimitedHttp {
         Ok(self)
     }
 
-    /// `request`, authorized the way this client authorizes.
+    /// Add the provider's `headers` to `request`, keeping any rig set.
+    fn add_headers(headers: &http::HeaderMap, request: &mut http::HeaderMap) {
+        for (name, value) in headers {
+            if !request.contains_key(name) {
+                request.insert(name.clone(), value.clone());
+            }
+        }
+    }
+
+    /// `request` with the provider's `headers`, authorized the way this
+    /// client authorizes.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's HTTP error, which HttpClientExt returns; it keeps the failed response's headers"
+    )]
     async fn prepare(
         authorize: Option<Authorize>,
+        headers: &http::HeaderMap,
         mut request: Request<Bytes>,
     ) -> http_client::Result<Request<Bytes>> {
+        Self::add_headers(headers, request.headers_mut());
         match authorize {
             Some(Authorize::Sign(signer)) => signer.sign(request).await,
             Some(Authorize::Bearer(value)) => {
@@ -371,9 +397,11 @@ impl HttpClientExt for LimitedHttp {
         let body: Bytes = body.into();
         let permit = self.gates.permit(GateKey::model_of(&body));
         let authorize = self.authorize.clone();
+        let headers = self.headers.clone();
         async move {
             let permit = permit.await;
-            let request = Self::prepare(authorize, Request::from_parts(parts, body)).await?;
+            let request =
+                Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
             let response = inner.send(request).await?;
             Ok(body_holding(response, permit))
         }
@@ -389,6 +417,7 @@ impl HttpClientExt for LimitedHttp {
         let inner = self.inner.clone();
         let permit = self.gates.permit(None);
         let authorize = self.authorize.clone();
+        Self::add_headers(&self.headers, req.headers_mut());
         async move {
             match authorize {
                 // SigV4 signs the body, and a multipart body is not built yet.
@@ -420,9 +449,11 @@ impl HttpClientExt for LimitedHttp {
         let body: Bytes = body.into();
         let permit = self.gates.permit(GateKey::model_of(&body));
         let authorize = self.authorize.clone();
+        let headers = self.headers.clone();
         async move {
             let permit = permit.await;
-            let request = Self::prepare(authorize, Request::from_parts(parts, body)).await?;
+            let request =
+                Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
             let response = inner.send_streaming(request).await?;
             Ok(response.map(|stream| -> BoxedStream {
                 Box::pin(Holding {
@@ -651,7 +682,7 @@ mod tests {
             .header("anthropic-version", "2023-06-01")
             .body(Bytes::from_static(b"{}"))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let sent = LimitedHttp::prepare(client.authorize, request)
+        let sent = LimitedHttp::prepare(client.authorize, &client.headers, request)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let headers = sent.headers();

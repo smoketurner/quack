@@ -3,10 +3,10 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use rig::prelude::*;
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{Item, StreamEvent};
 
 use crate::config::{AnalysisConfig, RetrievalConfig};
-use crate::embedding::Embedder;
+use crate::embedding::{Embedder, EmbeddingModel};
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
 use crate::text::Tokens;
@@ -23,7 +23,7 @@ use super::tools::{
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphOptions, GraphResult, store as graph_store};
-use crate::llm::OLLAMA_KEEP_ALIVE;
+use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
@@ -46,12 +46,14 @@ pub struct TokenUsage {
     pub total_tokens: u64,
 }
 
+/// A counter the provider did not report counts as zero here; a turn where
+/// it reported none at all is `None` (see [`TokenUsage::reported`]).
 impl From<rig::completion::Usage> for TokenUsage {
     fn from(usage: rig::completion::Usage) -> Self {
         Self {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens,
+            input_tokens: usage.input_tokens.unwrap_or_default(),
+            output_tokens: usage.output_tokens.unwrap_or_default(),
+            total_tokens: usage.total_tokens.unwrap_or_default(),
         }
     }
 }
@@ -60,13 +62,14 @@ impl TokenUsage {
     /// Add one completion request's counts, for the turns that never reach
     /// a final response.
     fn add(&mut self, usage: rig::completion::Usage) {
+        let usage = Self::from(usage);
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
     }
 
-    /// The counts, unless every one is zero — rig's sentinel for a provider
-    /// that reported no usage at all.
+    /// The counts, unless every one is zero: a provider that reported no
+    /// usage at all, or only zeroes.
     fn reported(self) -> Option<Self> {
         (self != Self::default()).then_some(self)
     }
@@ -195,11 +198,7 @@ where
     ///
     /// Returns an error if system prompt generation, agent building, or
     /// the model call fails.
-    pub async fn run(
-        self,
-        completion_model: impl CompletionModel + Clone + 'static,
-        sink: EventSink,
-    ) -> Result<AgentResponse> {
+    pub async fn run(self, completion_model: ChatModel, sink: EventSink) -> Result<AgentResponse> {
         let max_turns = usize::try_from(self.config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
         let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
@@ -312,7 +311,7 @@ where
 {
     async fn run_inner(
         self,
-        completion_model: impl CompletionModel + Clone + 'static,
+        completion_model: ChatModel,
         recorder: &TurnRecorder,
     ) -> Result<AgentResponse> {
         let Self {
@@ -358,9 +357,10 @@ where
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
 
         let mut stream = agent
-            .stream_chat(user_message, history)
+            .prompt(user_message)
+            .history(history)
             .max_turns(max_turns)
-            .await;
+            .stream();
 
         let mut streamed = String::new();
         let mut final_text: Option<String> = None;
@@ -389,12 +389,15 @@ where
                 }
             };
             match item {
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
-                    streamed.push_str(&text.text);
-                    recorder.emit(AgentEvent::TextDelta(text.text));
+                MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                    text,
+                    ..
+                })) => {
+                    streamed.push_str(&text);
+                    recorder.emit(AgentEvent::TextDelta(text));
                 }
                 MultiTurnStreamItem::FinalResponse(response) => {
-                    if response.usage.has_values() {
+                    if response.usage.is_reported() {
                         aggregate = Some(response.usage.into());
                     }
                     final_text = Some(response.output);
@@ -402,6 +405,7 @@ where
                 MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
                 MultiTurnStreamItem::StreamAssistantItem(_)
                 | MultiTurnStreamItem::StreamUserItem(_)
+                | MultiTurnStreamItem::ToolCall { .. }
                 | MultiTurnStreamItem::ToolExecutionCommitted { .. }
                 | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
             }
@@ -465,7 +469,7 @@ impl StreamStop<'_> {
     fn explain(&self, max_turns: u32, window: Window) -> String {
         use rig::completion::PromptError;
         match self.0 {
-            rig::agent::StreamingError::Prompt(prompt_error) => match prompt_error.as_ref() {
+            rig::agent::StreamingError::Prompt(prompt_error) => match prompt_error {
                 PromptError::UnknownToolCall { tool_name, .. } => format!(
                     "The model called a tool that does not exist ({tool_name}), so the turn \
                      stopped.{}",
@@ -487,9 +491,13 @@ impl StreamStop<'_> {
                 }
                 PromptError::CompletionError(e) => format!("The model call failed: {e}"),
                 PromptError::MemoryError(e) => format!("The turn failed: {e}"),
+                PromptError::Report(report) => format!("The turn failed: {report}"),
             },
             rig::agent::StreamingError::Completion(e) => {
                 format!("The model call failed part way through: {e}")
+            }
+            rig::agent::StreamingError::Report(report) => {
+                format!("The turn failed: {report}")
             }
         }
     }
@@ -557,7 +565,7 @@ impl BuildContext<'_> {
     /// The rig agent with every tool this workspace and mode register.
     fn build_agent<M>(
         &self,
-        completion_model: impl CompletionModel + Clone + 'static,
+        completion_model: ChatModel,
         embedding_model: Option<Embedder<M>>,
         system_prompt: &str,
     ) -> Result<Agent>
@@ -577,8 +585,7 @@ impl BuildContext<'_> {
             db: ctx.reader_db.clone(),
             recorder: ctx.outputs.recorder.clone(),
         };
-        let mut builder = completion_model
-            .into_agent_builder()
+        let mut builder = AgentBuilder::new(completion_model)
             .preamble(system_prompt)
             .tool(search)
             .tool(RunSqlTool::new(
@@ -669,7 +676,7 @@ mod tests {
     use rig::completion::PromptError;
 
     fn prompt_error(e: PromptError) -> rig::agent::StreamingError {
-        rig::agent::StreamingError::Prompt(Box::new(e))
+        rig::agent::StreamingError::Prompt(e)
     }
 
     #[test]
@@ -679,7 +686,7 @@ mod tests {
             tool_name: String::from("container.exec"),
             available_tools: vec![String::from("run_sql")],
             allowed_tools: vec![String::from("run_sql")],
-            chat_history: Box::new(Vec::new()),
+            chat_history: Vec::new(),
         });
         assert!(StreamStop(&unknown).by_agent_loop());
         let text =
@@ -691,8 +698,8 @@ mod tests {
 
         let limit = prompt_error(PromptError::MaxTurnsError {
             max_turns: 10,
-            chat_history: Box::new(Vec::new()),
-            prompt: Box::new(Message::user("q")),
+            chat_history: Vec::new(),
+            prompt: Message::user("q"),
         });
         let text = StreamStop(&limit).explain(config.max_turns, Window::Provider);
         assert!(
@@ -700,7 +707,7 @@ mod tests {
             "{text}"
         );
 
-        let provider = rig::agent::StreamingError::Completion(CompletionError::ProviderError(
+        let provider = rig::agent::StreamingError::Completion(ProviderError::Provider(
             String::from("connection refused"),
         ));
         assert!(!StreamStop(&provider).by_agent_loop());
@@ -772,13 +779,10 @@ mod tests {
     #[test]
     fn per_call_usage_accumulates_across_a_turns_completion_requests() {
         let call = |input: u64, output: u64| rig::completion::Usage {
-            input_tokens: input,
-            output_tokens: output,
-            total_tokens: input.saturating_add(output),
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            total_tokens: Some(input.saturating_add(output)),
+            ..rig::completion::Usage::default()
         };
         let mut usage = TokenUsage::default();
         usage.add(call(400, 20));
@@ -795,7 +799,7 @@ mod tests {
         // A provider that reports nothing leaves the accumulator at its
         // default, which `run_inner` reads as "no counts", not zero cost.
         let mut none = TokenUsage::default();
-        none.add(call(0, 0));
+        none.add(rig::completion::Usage::default());
         assert_eq!(none, TokenUsage::default());
         assert_eq!(none.reported(), None);
     }

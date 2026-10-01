@@ -128,9 +128,9 @@ runs submitted jobs with optional lanes that keep submission order (a chat sessi
 serial lane, so a follow-up waits for the answer before it; a workspace's uploads, graph
 extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
 broadcast of `JobInfo` snapshots every interface reports from. There is no job pool:
-resources are limited where they are used. Every rig client is built over
-`llm::LimitedHttp`, which holds one permit of the process-wide gate for the provider and
-the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
+resources are limited where they are used. Every rig HTTP client sends through
+`llm::LimitedHttp` (rig's reqwest transport, plus the provider's `headers`), which holds
+one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
 background ones. Bedrock is two provider types, one per endpoint
@@ -269,7 +269,8 @@ its role: `Query` (search), `Document { title, text }` (a chunk under its headin
 `Similarity` (entity labels and names, ontology type names). It adds the input prefixes the
 model family was trained with (`presets::Family::of`, from each model card; `[embedding]`
 overrides any role, `ResolvedPrompts::for_model`) and returns `Vector`s checked against the
-profile's `Dimension`; `.clippy.toml` disallows rig's raw `embed_text`/`embed_texts`.
+profile's `Dimension`; `.clippy.toml` disallows calling a model directly
+(`embedding::EmbeddingModel::embed_texts`, rig's `DynModel::call` and `Model::call`).
 Every long run (ingestion, import, graph extraction, the ontology's document pass,
 embeddings refresh) takes one `progress::RunControl`: progress per unit, and the cancel
 token it checks between units and races model calls against. The model, width, and

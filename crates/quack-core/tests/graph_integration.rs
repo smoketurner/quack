@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts, Vector};
+use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
@@ -25,9 +25,8 @@ use quack_core::storage::workspace::{
     DocumentStatus, NewChunk, NewDocument, SamplePool, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
-
-const DIM: usize = 4;
+use rig::ProviderError;
+use rig::embeddings::Embedding;
 
 /// A writer over a second connection to `db`'s database, for the steps
 /// that take one, while the test reads and writes through `db`.
@@ -55,21 +54,10 @@ fn letters() -> Embedder<LetterEmbedding> {
 }
 
 impl EmbeddingModel for LetterEmbedding {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self
-    }
-
-    fn ndims(&self) -> usize {
-        DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         let mut out = Vec::new();
         for text in texts {
             let first = text.to_lowercase().chars().next().unwrap_or('z');

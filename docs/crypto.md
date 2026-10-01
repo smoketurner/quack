@@ -28,7 +28,8 @@ to cross-compile for the static musl build, and one certain rustls backend at ru
   resolved from headers at build time, so the log line asks `CryptoProvider::fips()` what
   rustls actually installed.
 - Features:
-  - `reqwest` and `rig` with `rustls`.
+  - `reqwest` with `rustls`; `rig` sends through it (its `reqwest` transport, which
+    takes TLS from those features).
   - `sqlx` with `tls-rustls-aws-lc-rs` (the Postgres import).
   - The AWS SDK behind the Bedrock provider (`aws-config` and `aws-sdk-bedrockruntime`
     with `default-https-client`) on `aws-smithy-http-client`'s `rustls-aws-lc`. Linux adds
