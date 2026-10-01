@@ -2621,6 +2621,14 @@ impl SqlSchema {
     pub const MAX_TABLES: u32 = 500;
     /// The most columns one table carries.
     pub const MAX_COLUMNS: u32 = 200;
+
+    /// The table named `name`, compared without regard to case.
+    #[must_use]
+    pub fn table(&self, name: &str) -> Option<&TableColumns> {
+        self.tables
+            .iter()
+            .find(|t| t.name.name.eq_ignore_ascii_case(name))
+    }
 }
 
 /// One table's name and its columns, in column order.

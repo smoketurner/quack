@@ -623,6 +623,34 @@ impl ConversationMemory for SessionMemory {
     }
 }
 
+/// The words a message says: its text parts joined, without tool calls,
+/// tool results, images, or reasoning.
+pub trait SpokenText {
+    fn spoken_text(&self) -> String;
+}
+
+impl SpokenText for Message {
+    fn spoken_text(&self) -> String {
+        match self {
+            Self::User { content } => content
+                .iter()
+                .filter_map(|part| match part {
+                    UserContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            Self::Assistant { content, .. } => content
+                .iter()
+                .filter_map(|part| match part {
+                    AssistantContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            Self::System { content } => content.clone(),
+        }
+    }
+}
+
 /// The history window: rig's [`TokenWindowMemory`] over
 /// `[analysis].history_token_budget`, counting four characters per token
 /// ([`Tokens::estimate`]) so budgets read as before, then the window's
@@ -635,24 +663,7 @@ impl TranscriptWindow {
     pub fn new(budget: Tokens) -> Self {
         let budget = usize::try_from(budget.get()).unwrap_or(usize::MAX);
         Self(TokenWindowMemory::new(budget, |message: &Message| {
-            let text = match message {
-                Message::User { content } => content
-                    .iter()
-                    .filter_map(|part| match part {
-                        UserContent::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<String>(),
-                Message::Assistant { content, .. } => content
-                    .iter()
-                    .filter_map(|part| match part {
-                        AssistantContent::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<String>(),
-                Message::System { content } => content.clone(),
-            };
-            usize::try_from(Tokens::estimate(&text).get()).unwrap_or(usize::MAX)
+            usize::try_from(Tokens::estimate(&message.spoken_text()).get()).unwrap_or(usize::MAX)
         }))
     }
 }
@@ -905,7 +916,7 @@ mod tests {
         let mut used = Tokens::default();
         for pair in turns.chunks(2).rev() {
             let cost = pair.iter().fold(Tokens::default(), |sum, m| {
-                sum.saturating_add(Tokens::estimate(&text_of(m)))
+                sum.saturating_add(Tokens::estimate(&m.spoken_text()))
             });
             if used.saturating_add(cost) > Tokens::new(budget) {
                 break;
@@ -914,26 +925,6 @@ mod tests {
             kept.splice(0..0, pair.iter().cloned());
         }
         kept
-    }
-
-    fn text_of(message: &Message) -> String {
-        match message {
-            Message::User { content } => content
-                .iter()
-                .filter_map(|part| match part {
-                    UserContent::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-                .collect(),
-            Message::Assistant { content, .. } => content
-                .iter()
-                .filter_map(|part| match part {
-                    AssistantContent::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-                .collect(),
-            Message::System { content } => content.clone(),
-        }
     }
 
     /// rig's token window keeps exactly what the turn-by-turn trim kept,

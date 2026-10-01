@@ -28,7 +28,7 @@ use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
 use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
-use crate::llm::{self, ChatClient, ProviderModels};
+use crate::llm::{ChatClient, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
@@ -110,6 +110,36 @@ impl Check {
             summary: summary.into(),
             fix: None,
         }
+    }
+
+    /// Whether a turn's budgets fit the context window the listing reports
+    /// for the chat model: the replayed history, the pinned documents, and
+    /// the workspace context are each capped, and together they can fill it.
+    fn context_window(
+        config: &Config,
+        model: ModelRef<'_>,
+        models: &ProviderModels,
+    ) -> Option<Self> {
+        let window = models.get(model.model)?.context_length?;
+        let history = config.analysis.history_token_budget.get();
+        let pinned = config.retrieval.pinned_token_budget.get();
+        let context = config.context.max_tokens.get();
+        let budgets = history.saturating_add(pinned).saturating_add(context);
+        (budgets > window).then(|| {
+            Self::new(
+                Area::ChatModel,
+                Status::Warn,
+                format!(
+                    "{model}: a turn may replay {history} tokens of history beside {pinned} of \
+                     pinned documents and {context} of workspace context, {budgets} in all, but \
+                     the model's context window is {window}"
+                ),
+            )
+            .fix(format!(
+                "lower [analysis].history_token_budget, [retrieval].pinned_token_budget, or \
+                 [context].max_tokens so they total under {window}"
+            ))
+        })
     }
 
     fn fix(mut self, fix: impl Into<String>) -> Self {
@@ -611,18 +641,13 @@ async fn check_reranker(report: &mut Report, config: &Config, probing: Probing) 
         .credential(config, model.provider_name)
         .await
     {
-        Ok(key) => match llm::rerank_model_with(model, key.as_deref()) {
+        Ok(key) => match RerankModel::with_key(model, key.as_deref()) {
             Ok(reranker) => {
                 let request = RerankRequest {
                     query: String::from("quack doctor"),
                     documents: vec![String::from("a probe"), String::from("another probe")],
                 };
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "a rerank probe, not an embedding; the lint guards embedding prefixes"
-                )]
-                let call = reranker.call(request);
-                match tokio::time::timeout(timeout, call).await {
+                match tokio::time::timeout(timeout, reranker.rank(request)).await {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(e)) => Err(ErrorChain(&e).to_string()),
                     Err(_) => Err(format!("no answer within {} seconds", timeout.as_secs())),
@@ -808,36 +833,10 @@ async fn check_model(
     report.push(listing_check(area, model, &base, &listing));
     if area == Area::ChatModel
         && let Ok(models) = &listing
-        && let Some(check) = window_check(config, model, models)
+        && let Some(check) = Check::context_window(config, model, models)
     {
         report.push(check);
     }
-}
-
-/// Whether a turn's budgets fit the context window the listing reports
-/// for the chat model: the replayed history, the pinned documents, and
-/// the workspace context are each capped, and together they can fill it.
-fn window_check(config: &Config, model: ModelRef<'_>, models: &ProviderModels) -> Option<Check> {
-    let window = models.get(model.model)?.context_length?;
-    let history = config.analysis.history_token_budget.get();
-    let pinned = config.retrieval.pinned_token_budget.get();
-    let context = config.context.max_tokens.get();
-    let budgets = history.saturating_add(pinned).saturating_add(context);
-    (budgets > window).then(|| {
-        Check::new(
-            Area::ChatModel,
-            Status::Warn,
-            format!(
-                "{model}: a turn may replay {history} tokens of history beside {pinned} of \
-                 pinned documents and {context} of workspace context, {budgets} in all, but \
-                 the model's context window is {window}"
-            ),
-        )
-        .fix(format!(
-            "lower [analysis].history_token_budget, [retrieval].pinned_token_budget, or \
-             [context].max_tokens so they total under {window}"
-        ))
-    })
 }
 
 /// Whether the AWS SDK finds a region and credentials for a Bedrock
@@ -1953,7 +1952,7 @@ mod tests {
             .saturating_add(config.retrieval.pinned_token_budget.get())
             .saturating_add(config.context.max_tokens.get());
         let small = listed(&[("small", Some(budgets.saturating_sub(1)))]);
-        let check = window_check(&config, model, &small).unwrap();
+        let check = Check::context_window(&config, model, &small).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(
             check.summary.contains(&format!("{budgets} in all")),
@@ -1961,9 +1960,9 @@ mod tests {
             check.summary
         );
         let roomy = listed(&[("small", Some(budgets))]);
-        assert!(window_check(&config, model, &roomy).is_none());
+        assert!(Check::context_window(&config, model, &roomy).is_none());
         let unreported = listed(&[("small", None)]);
-        assert!(window_check(&config, model, &unreported).is_none());
+        assert!(Check::context_window(&config, model, &unreported).is_none());
     }
 
     /// A rerank server: `GET /v1/models` lists `bge-reranker`, and `POST

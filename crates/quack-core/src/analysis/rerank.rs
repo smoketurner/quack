@@ -205,12 +205,7 @@ impl Reranker for ScoredReranker {
                 query: query.to_owned(),
                 documents: candidates.iter().map(|c| c.content.clone()).collect(),
             };
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "a rerank call, not an embedding; the lint guards embedding prefixes"
-            )]
-            let call = self.model.call(request);
-            let mut response = tokio::time::timeout(RERANK_TIMEOUT, call)
+            let mut response = tokio::time::timeout(RERANK_TIMEOUT, self.model.rank(request))
                 .await
                 .map_err(|_| Error::Llm(String::from("the rerank model did not answer in time")))?
                 .map_err(|e| Error::Llm(format!("the rerank model failed: {e}")))?;
@@ -231,7 +226,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::ids::{ChunkId, DocumentId};
-    use crate::llm;
 
     fn hit(n: u32) -> ChunkSearchResult {
         ChunkSearchResult {
@@ -350,7 +344,7 @@ mod tests {
         ))
         .unwrap();
         let model = config.rerank_model_ref().unwrap().unwrap();
-        let reranker = ScoredReranker::new(llm::rerank_model_with(model, None).unwrap());
+        let reranker = ScoredReranker::new(RerankModel::with_key(model, None).unwrap());
         let Reranked { results, outcome } =
             apply(&reranker, "refunds?", vec![hit(1), hit(2), hit(3)], 2).await;
         assert_eq!(outcome, RerankOutcome::Reranked("reranker"));
