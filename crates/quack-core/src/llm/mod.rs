@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use rig::prelude::*;
 
-use crate::analysis::agent::{AgentResponse, Analysis};
+use crate::analysis::agent::{AgentResponse, Analysis, Cutoff};
 use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
@@ -556,8 +556,17 @@ impl OneShotAgent {
             let mut stream = self.agent.prompt(text).stream();
             let mut answer = String::new();
             let mut final_text: Option<String> = None;
+            let mut cutoff: Option<Cutoff> = None;
             while let Some(item) = stream.next().await {
-                match item.map_err(|e| Error::Llm(format!("{what} call failed: {e}")))? {
+                let item = match item {
+                    Ok(item) => item,
+                    Err(_) if let Some(cut) = cutoff => return Err(cut.refusal(what)),
+                    Err(e) => return Err(Error::Llm(format!("{what} call failed: {e}"))),
+                };
+                match item {
+                    MultiTurnStreamItem::CompletionCall(call) => {
+                        cutoff = Cutoff::of(call.finish_reason.as_ref());
+                    }
                     MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
                         text,
                         ..
@@ -577,6 +586,11 @@ impl OneShotAgent {
                     }
                     _ => {}
                 }
+            }
+            // A cut-off answer is not one to parse: say so, rather than let
+            // the caller fail on half a JSON document.
+            if let Some(cut) = cutoff {
+                return Err(cut.refusal(what));
             }
             Ok::<String, Error>(match final_text {
                 Some(t) if answer.trim().is_empty() => t,
@@ -1099,6 +1113,158 @@ mod tests {
             String::from_utf8_lossy(&read).to_string()
         });
         (format!("http://{addr}"), seen)
+    }
+
+    /// A loopback Ollama that answers every request with `stream`, an
+    /// NDJSON chat stream, so a test can script how the model stops.
+    async fn scripted_ollama(stream: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut read = Vec::new();
+                let mut buf = [0_u8; 8192];
+                while let Ok(n) = socket.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    read.extend_from_slice(buf.get(..n).unwrap_or_default());
+                    let text = String::from_utf8_lossy(&read).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or_default())
+                            })
+                            .unwrap_or_default();
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{stream}",
+                    stream.len()
+                );
+                drop(socket.write_all(reply.as_bytes()).await);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A model that thinks until it hits the output limit, answering nothing.
+    const THOUGHT_ONLY: &str = concat!(
+        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"","thinking":"Let me work through every table first."},"done":false}"#,
+        "\n",
+        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"length","prompt_eval_count":10,"eval_count":5}"#,
+        "\n",
+    );
+
+    /// A model that starts answering and is cut off at the output limit.
+    const CUT_SHORT: &str = concat!(
+        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"The regions are north, south"},"done":false}"#,
+        "\n",
+        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"length","prompt_eval_count":10,"eval_count":5}"#,
+        "\n",
+    );
+
+    /// A one-shot call (extraction, reranking) whose answer the output limit
+    /// cut, or never let start, is refused by name rather than handed on as
+    /// half a JSON document or as rig's advice to raise a `max_tokens`
+    /// quack has no setting for.
+    #[tokio::test]
+    async fn a_one_shot_answer_cut_at_the_output_limit_is_refused() {
+        for stream in [THOUGHT_ONLY, CUT_SHORT] {
+            let root = scripted_ollama(stream).await;
+            let config = parse(&format!(
+                "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"{root}\"\n"
+            ));
+            let chat = config
+                .chat_model_ref()
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let client = ChatClient::build(&config, &chat)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let answer = client
+                .one_shot(
+                    "m",
+                    ModelSettings::default(),
+                    "Answer.",
+                    Duration::from_secs(10),
+                    "graph extraction",
+                )
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .answer("hello")
+                .await;
+            let message = answer.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(
+                message.contains(
+                    "the graph extraction answer was cut off at the model's output limit"
+                ) && message.contains("[analysis].max_context_tokens")
+                    && !message.contains("max_tokens for this request"),
+                "{message}"
+            );
+        }
+    }
+
+    /// An agent turn the output limit stopped says so in quack's words: no
+    /// answer at all points at the Ollama window setting, and a partial one
+    /// is kept with a note that it was cut off.
+    #[tokio::test]
+    async fn a_turn_cut_at_the_output_limit_says_so() {
+        for (stream, kept, note) in [
+            (
+                THOUGHT_ONLY,
+                "",
+                "The model reached its output limit before it answered.",
+            ),
+            (
+                CUT_SHORT,
+                "The regions are north, south",
+                "The answer was cut off at the model's output limit.",
+            ),
+        ] {
+            let root = scripted_ollama(stream).await;
+            let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+            let mut config = parse(&format!(
+                "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"{root}\"\n"
+            ));
+            config.general.data_dir = dir.path().to_path_buf();
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            let session = sessions::create_session(&db, "o/m", sessions::ChatMode::Chat, None)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+            let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+            let (sink, _events) = events::channel();
+            let response = TurnRequest {
+                db: Arc::clone(&db),
+                reader_db,
+                session_id: &session.id,
+                policy: WritePolicy::Deny,
+                message: "list the regions",
+                sink,
+                cancel: CancellationToken::new(),
+            }
+            .run(&config)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+            assert!(
+                response.content.starts_with(kept)
+                    && response.content.contains(note)
+                    && response.content.contains("[analysis].max_context_tokens")
+                    && !response.content.contains("max_tokens for this request"),
+                "{}",
+                response.content
+            );
+        }
     }
 
     /// The whole chat path for Bedrock's OpenAI-compatible APIs, up to the

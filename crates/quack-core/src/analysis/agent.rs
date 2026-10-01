@@ -239,6 +239,71 @@ impl PromptAndModel {
     }
 }
 
+/// A model call that stopped before its answer was whole: rig's
+/// normalized `Length` or `ContentFilter` finish reason. rig ends a call
+/// that stopped so with no answer at all as an error of its own, whose
+/// advice ("raise `max_tokens`") names no setting quack has; this is what
+/// quack says instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cutoff {
+    /// The output limit, which with Ollama is the context window.
+    Length,
+    /// The provider's content filter.
+    Filtered,
+}
+
+impl Cutoff {
+    pub(crate) fn of(reason: Option<&rig::completion::FinishReason>) -> Option<Self> {
+        use rig::completion::FinishReason;
+        match reason? {
+            FinishReason::Length => Some(Self::Length),
+            FinishReason::ContentFilter => Some(Self::Filtered),
+            FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Other(_) => None,
+        }
+    }
+
+    /// The note a turn carries; `answered` when part of the answer came
+    /// through before the stop.
+    fn note(self, answered: bool, window: Window) -> String {
+        let advice = match window {
+            Window::Ollama(_) => {
+                " With Ollama the answer shares the context window with the prompt and the \
+                 model's reasoning; raise [analysis].max_context_tokens or ask a narrower \
+                 question."
+            }
+            Window::Provider => " Ask a narrower question.",
+        };
+        match (self, answered) {
+            (Self::Length, false) => {
+                format!("The model reached its output limit before it answered.{advice}")
+            }
+            (Self::Length, true) => {
+                format!("The answer was cut off at the model's output limit.{advice}")
+            }
+            (Self::Filtered, false) => {
+                String::from("The provider's content filter stopped the answer before it began.")
+            }
+            (Self::Filtered, true) => {
+                String::from("The provider's content filter cut the answer off.")
+            }
+        }
+    }
+
+    /// Why a one-shot call's answer cannot be used: a cut-off answer is
+    /// not one to parse.
+    pub(crate) fn refusal(self, what: &str) -> Error {
+        Error::Llm(match self {
+            Self::Length => format!(
+                "the {what} answer was cut off at the model's output limit (with Ollama, the \
+                 context window: [analysis].max_context_tokens)"
+            ),
+            Self::Filtered => {
+                format!("the {what} answer was stopped by the provider's content filter")
+            }
+        })
+    }
+}
+
 /// Who sizes the model's context window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Window {
@@ -370,6 +435,8 @@ where
         // which is exactly the turn whose cost is worth knowing.
         let mut aggregate: Option<TokenUsage> = None;
         let mut per_call = TokenUsage::default();
+        // How the latest model call stopped, when it stopped short.
+        let mut cutoff: Option<Cutoff> = None;
 
         while let Some(item) = stream.next().await {
             let item = match item {
@@ -384,7 +451,10 @@ where
                         return Err(Error::Analysis(e.to_string()));
                     }
                     tracing::warn!(error = %e, "agent turn stopped early");
-                    stopped = Some(stop.explain(analysis_config.max_turns, window));
+                    stopped = Some(cutoff.map_or_else(
+                        || stop.explain(analysis_config.max_turns, window),
+                        |cut| cut.note(!streamed.trim().is_empty(), window),
+                    ));
                     break;
                 }
             };
@@ -402,7 +472,10 @@ where
                     }
                     final_text = Some(response.output);
                 }
-                MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
+                MultiTurnStreamItem::CompletionCall(call) => {
+                    per_call.add(call.usage);
+                    cutoff = Cutoff::of(call.finish_reason.as_ref());
+                }
                 MultiTurnStreamItem::StreamAssistantItem(_)
                 | MultiTurnStreamItem::StreamUserItem(_)
                 | MultiTurnStreamItem::ToolCall { .. }
@@ -411,30 +484,36 @@ where
             }
         }
 
-        let raw = turn_text(streamed, final_text, stopped, window);
-        Ok(outputs.finish(
-            recorder.citations().validate(&raw),
-            aggregate.or_else(|| per_call.reported()),
-            asked,
-        ))
+        // A turn that answered but was cut short says so; rig counts a
+        // partial answer as a valid one.
+        let stopped = stopped.or_else(|| cutoff.map(|cut| cut.note(true, window)));
+        let answer = turn_text(streamed, final_text, stopped, window, |text| {
+            recorder.citations().validate(text)
+        });
+        Ok(outputs.finish(answer, aggregate.or_else(|| per_call.reported()), asked))
     }
 }
 
-/// The answer text: what the model streamed for the last turn, else the
-/// aggregated final text when a provider did not stream deltas, with a
-/// note when the turn stopped early or produced nothing.
+/// The answer: what the model streamed for the last turn, else the
+/// aggregated final text when a provider did not stream deltas, put through
+/// `check` (the citation check), then quack's own note when the turn
+/// stopped early or the check left no text. The note goes on after the
+/// check, which drops leaked channel tokens such as `[analysis]` and would
+/// otherwise eat quack's references to `[analysis]` settings.
 fn turn_text(
     streamed: String,
     final_text: Option<String>,
     stopped: Option<String>,
     window: Window,
-) -> String {
-    let mut raw = match final_text {
+    check: impl FnOnce(&str) -> CitedAnswer,
+) -> CitedAnswer {
+    let raw = match final_text {
         Some(text) if streamed.trim().is_empty() => text,
         Some(_) | None => streamed,
     };
+    let mut answer = check(&raw);
     let note = stopped.or_else(|| {
-        raw.trim().is_empty().then(|| {
+        answer.text.trim().is_empty().then(|| {
             String::from(if matches!(window, Window::Ollama(_)) {
                 "The model returned no text. With Ollama this usually means the answer or the \
                  prompt did not fit the context window; raise [analysis].max_context_tokens or \
@@ -445,14 +524,14 @@ fn turn_text(
         })
     });
     if let Some(reason) = note {
-        if !raw.trim().is_empty() {
-            raw.push_str("\n\n");
+        if !answer.text.trim().is_empty() {
+            answer.text.push_str("\n\n");
         }
-        raw.push('(');
-        raw.push_str(&reason);
-        raw.push(')');
+        answer.text.push('(');
+        answer.text.push_str(&reason);
+        answer.text.push(')');
     }
-    raw
+    answer
 }
 
 /// Why a turn's stream ended early.
@@ -660,6 +739,7 @@ impl BuildContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::citations::CitationRegistry;
 
     #[test]
     fn the_ollama_window_rounds_up_within_bounds() {
@@ -806,32 +886,58 @@ mod tests {
 
     #[test]
     fn turn_text_keeps_streamed_text_and_notes_early_stops() {
-        assert_eq!(
+        let as_is = |text: &str| CitedAnswer {
+            text: text.to_owned(),
+            citations: Vec::new(),
+        };
+        let text = |streamed: &str, final_text: Option<&str>, stopped: Option<&str>, window| {
             turn_text(
-                String::from("so far"),
-                None,
-                Some(String::from("why")),
-                Window::Provider
-            ),
+                streamed.to_owned(),
+                final_text.map(str::to_owned),
+                stopped.map(str::to_owned),
+                window,
+                as_is,
+            )
+            .text
+        };
+        assert_eq!(
+            text("so far", None, Some("why"), Window::Provider),
             "so far\n\n(why)"
         );
-        assert_eq!(
-            turn_text(
-                String::new(),
-                Some(String::from("final")),
-                None,
-                Window::Provider
-            ),
-            "final"
-        );
-        let empty = turn_text(
-            String::new(),
-            Some(String::new()),
+        assert_eq!(text("", Some("final"), None, Window::Provider), "final");
+        let empty = text("", Some(""), None, Window::Ollama(OllamaWindow(8_192)));
+        assert!(empty.contains("[analysis].max_context_tokens"), "{empty}");
+        let empty = text("", None, None, Window::Provider);
+        assert!(!empty.contains("Ollama"), "{empty}");
+    }
+
+    /// The note goes on after the citation check: an answer the check
+    /// empties (a lone invented marker) gets the no-text note, and the
+    /// check, which drops leaked `[analysis]` channel tokens, never sees
+    /// quack's own `[analysis]` setting names.
+    #[test]
+    fn notes_are_added_after_the_citation_check() {
+        let check = |text: &str| CitationRegistry::default().validate(text);
+        let answer = turn_text(
+            String::from("[7]"),
+            None,
             None,
             Window::Ollama(OllamaWindow(8_192)),
+            check,
         );
-        assert!(empty.contains("max_context_tokens"), "{empty}");
-        let empty = turn_text(String::new(), None, None, Window::Provider);
-        assert!(!empty.contains("Ollama"), "{empty}");
+        assert!(
+            answer.text.starts_with("(The model returned no text.")
+                && answer.text.contains("raise [analysis].max_context_tokens"),
+            "{}",
+            answer.text
+        );
+        let answer = turn_text(
+            String::from("Partly [analysis]answered"),
+            None,
+            Some(String::from("see [analysis].max_turns")),
+            Window::Provider,
+            check,
+        );
+        assert_eq!(answer.text, "Partly answered\n\n(see [analysis].max_turns)");
     }
 }
