@@ -147,7 +147,7 @@ struct Page {
     workspace: Option<WsNav>,
 }
 
-/// A header link: the workspace tabs, then the admin pages.
+/// A header link: the workspace tabs, the admin pages, then About.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Workspaces,
@@ -162,6 +162,7 @@ enum Tab {
     Settings,
     Users,
     Audit,
+    About,
 }
 
 impl Tab {
@@ -192,6 +193,7 @@ impl Tab {
             Self::Settings => "Settings",
             Self::Users => "Users",
             Self::Audit => "Audit",
+            Self::About => "About",
         }
     }
 
@@ -207,7 +209,7 @@ impl Tab {
             Self::Graph => "graph",
             Self::Jobs => "jobs",
             Self::Settings => "settings",
-            Self::Workspaces | Self::Users | Self::Audit => "",
+            Self::Workspaces | Self::Users | Self::Audit | Self::About => "",
         }
     }
 }
@@ -812,6 +814,13 @@ struct AdminAuditPage {
     workspace_id: String,
 }
 
+#[derive(Template)]
+#[template(path = "about.html")]
+struct AboutPage {
+    page: Page,
+    version: &'static str,
+}
+
 // --- routes ------------------------------------------------------------------
 
 /// The embedded stylesheet, scripts, and icon. They sit outside the rate
@@ -876,6 +885,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/tokens/{hash}/revoke", post(token_revoke))
         .route("/admin/users", get(admin_users).post(admin_user_add))
         .route("/admin/audit", get(admin_audit))
+        .route("/about", get(about))
 }
 
 /// Embedded assets with an `ETag` from the content hash and `no-cache`, so a
@@ -2218,6 +2228,15 @@ async fn admin_audit(
             .workspace_id
             .map(WorkspaceId::into_string)
             .unwrap_or_default(),
+    })
+}
+
+/// The running version and the projects quack is built with. It reads no
+/// workspace, so it writes no audit row.
+async fn about(State(app): State<App>, WebUser(identity): WebUser) -> WebResult<Response> {
+    html(&AboutPage {
+        page: Page::new(&app, &identity, Tab::About),
+        version: env!("CARGO_PKG_VERSION"),
     })
 }
 

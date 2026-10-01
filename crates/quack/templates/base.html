@@ -29,6 +29,7 @@
         <a class="{% if page.tab == Tab::Audit %}font-medium text-blue-300{% else %}hover:underline{% endif %}" href="/admin/audit"{% if page.tab == Tab::Audit %} aria-current="page"{% endif %}>Audit</a>
         </nav>
         {% endif %}
+        <a class="{% if page.tab == Tab::About %}font-medium text-blue-300{% else %}hover:underline{% endif %}" href="/about"{% if page.tab == Tab::About %} aria-current="page"{% endif %}>About</a>
         <span>{{ page.username }}</span>
         {% if !page.local %}
         <form method="post" action="/logout"><button class="rounded border border-slate-700 px-2 py-1 hover:bg-slate-800" type="submit">Log out</button></form>
