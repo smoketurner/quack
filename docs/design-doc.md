@@ -1108,9 +1108,19 @@ Otherwise Ollama loads the model at full length (measured: 32k for qwen3-embeddi
 of cache against 2.1 GB, same throughput). On a host that cannot fit both models at full
 size, this stops them evicting each other every turn.
 
-A turn the model derails (a call to a nonexistent tool, the `max_turns` limit), or that
-fails after text streamed, keeps its text, gains a note saying what happened, and is
-recorded. Only an unreachable model is an error.
+The agent recovers before it gives up (`analysis::hooks`, rig's agent hooks). A call to a
+tool that does not exist is repaired when the name matches a registered tool after
+trimming and lowercasing; otherwise the model is told which tools exist and asked again,
+at most twice a turn, as it is for arguments that are not JSON. A reply with no text and
+no tool call is asked for once more, unless the output limit or a content filter cut it
+off. A replayed history that rig's `transcript::validate_canonical` refuses is dropped,
+and the answer says so. Every retry counts against `max_turns`.
+
+A turn the model derails anyway (a nonexistent tool past those retries, the `max_turns`
+limit), or that fails after text streamed, keeps its text, gains a note saying what
+happened, and is recorded. Only an unreachable model is an error.
+`crates/quack-core/tests/agent_turn.rs` runs whole turns through rig against its scripted
+model (`test-utils`, a dev-dependency feature only).
 
 ### 7.3 Tools
 

@@ -14,6 +14,7 @@ use crate::text::Tokens;
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
+use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
 use super::policy::{RefusalFlag, WritePolicy};
 use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
 use super::tools::{
@@ -313,6 +314,25 @@ enum Window {
     Ollama(OllamaWindow),
 }
 
+impl Window {
+    /// Ollama's window when the prompt options cap one, else the provider's.
+    fn for_turn(
+        prompt: &PromptOptions,
+        system_prompt: &str,
+        history: &[Message],
+        user_message: &str,
+    ) -> Self {
+        prompt.ollama_context_cap.map_or(Self::Provider, |cap| {
+            Self::Ollama(OllamaWindow::for_turn(
+                cap,
+                system_prompt,
+                history,
+                user_message,
+            ))
+        })
+    }
+}
+
 /// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
 /// room for tool results and the answer, rounded up to 8,192, between
 /// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
@@ -397,14 +417,8 @@ where
             modeled,
         } = PromptAndModel::read(&reader_db, &prompt).await?;
         let outputs = TurnOutputs::new(recorder.clone());
-        let window = prompt.ollama_context_cap.map_or(Window::Provider, |cap| {
-            Window::Ollama(OllamaWindow::for_turn(
-                cap,
-                &system_prompt,
-                &history,
-                user_message,
-            ))
-        });
+        let Replay { history, dropped } = Replay::check(history);
+        let window = Window::for_turn(&prompt, &system_prompt, &history, user_message);
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
             reader_db,
@@ -425,6 +439,7 @@ where
             .prompt(user_message)
             .history(history)
             .max_turns(max_turns)
+            .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
             .stream();
 
         let mut streamed = String::new();
@@ -487,10 +502,44 @@ where
         // A turn that answered but was cut short says so; rig counts a
         // partial answer as a valid one.
         let stopped = stopped.or_else(|| cutoff.map(|cut| cut.note(true, window)));
-        let answer = turn_text(streamed, final_text, stopped, window, |text| {
+        let mut answer = turn_text(streamed, final_text, stopped, window, |text| {
             recorder.citations().validate(text)
         });
+        if let Some(note) = dropped {
+            answer.text.push_str("\n\n(");
+            answer.text.push_str(&note);
+            answer.text.push(')');
+        }
         Ok(outputs.finish(answer, aggregate.or_else(|| per_call.reported()), asked))
+    }
+}
+
+/// The history a turn replays. One rig would refuse mid-turn is dropped up
+/// front, with the note the answer carries, so the question still gets an
+/// answer.
+struct Replay {
+    history: Vec<Message>,
+    dropped: Option<String>,
+}
+
+impl Replay {
+    fn check(history: Vec<Message>) -> Self {
+        match rig::transcript::validate_canonical(&history) {
+            Ok(()) => Self {
+                history,
+                dropped: None,
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "the session history is malformed; running without it");
+                Self {
+                    history: Vec::new(),
+                    dropped: Some(format!(
+                        "The session's earlier messages could not be replayed ({e}), so this \
+                         answer does not take them into account."
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -683,7 +732,9 @@ impl BuildContext<'_> {
                 ctx.outputs.chart.clone(),
                 ctx.outputs.recorder.clone(),
             ))
-            .temperature(0.1);
+            .temperature(0.1)
+            .add_hook(InvalidToolCalls)
+            .add_hook(EmptyAnswer);
         if let Window::Ollama(OllamaWindow(num_ctx)) = ctx.window {
             // `keep_alive` is Ollama-only too (rig lifts it out of
             // `additional_params` into the request's top-level field, never
