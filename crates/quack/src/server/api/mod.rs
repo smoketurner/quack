@@ -95,37 +95,13 @@ pub(crate) fn router() -> Router<App> {
         )
         .route("/workspaces/{id}/tables", get(tables::list))
         .route("/workspaces/{id}/tables/describe", post(tables::describe))
+        .route("/workspaces/{id}/tables/schema", get(tables::schema))
         .route(
             "/workspaces/{id}/context",
             get(context::show).put(context::replace),
         )
         .route("/workspaces/{id}/context/versions", get(context::versions))
-        .route(
-            "/workspaces/{id}/ontology",
-            get(ontology::show).put(ontology::replace),
-        )
-        .route("/workspaces/{id}/ontology/init", post(ontology::init))
-        .route("/workspaces/{id}/ontology/propose", post(ontology::propose))
-        .route(
-            "/workspaces/{id}/ontology/candidates",
-            get(ontology::list_candidates).post(ontology::decide_many),
-        )
-        .route(
-            "/workspaces/{id}/ontology/candidates/{cid}",
-            axum::routing::put(ontology::decide),
-        )
-        .route(
-            "/workspaces/{id}/ontology/versions",
-            get(ontology::versions),
-        )
-        .route(
-            "/workspaces/{id}/ontology/versions/{v}",
-            get(ontology::version),
-        )
-        .route(
-            "/workspaces/{id}/ontology/versions/{v}/restore",
-            post(ontology::restore),
-        )
+        .merge(ontology_routes())
         .route("/workspaces/{id}/okf", get(okf::export))
         .route("/workspaces/{id}/import", post(import::import))
         .route("/workspaces/{id}/graph/search", post(graph::search))
@@ -161,4 +137,35 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/members/{user}", delete(members::remove))
         .route("/admin/users", get(admin::users).post(admin::create_user))
         .route("/admin/audit", get(admin::audit))
+}
+
+/// The ontology's routes: the current one, its candidates, and its versions.
+fn ontology_routes() -> Router<App> {
+    Router::new()
+        .route(
+            "/workspaces/{id}/ontology",
+            get(ontology::show).put(ontology::replace),
+        )
+        .route("/workspaces/{id}/ontology/init", post(ontology::init))
+        .route("/workspaces/{id}/ontology/propose", post(ontology::propose))
+        .route(
+            "/workspaces/{id}/ontology/candidates",
+            get(ontology::list_candidates).post(ontology::decide_many),
+        )
+        .route(
+            "/workspaces/{id}/ontology/candidates/{cid}",
+            axum::routing::put(ontology::decide),
+        )
+        .route(
+            "/workspaces/{id}/ontology/versions",
+            get(ontology::versions),
+        )
+        .route(
+            "/workspaces/{id}/ontology/versions/{v}",
+            get(ontology::version),
+        )
+        .route(
+            "/workspaces/{id}/ontology/versions/{v}/restore",
+            post(ontology::restore),
+        )
 }

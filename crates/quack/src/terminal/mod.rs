@@ -3,6 +3,7 @@
 mod app;
 mod chart;
 mod commands;
+mod sql;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -37,6 +38,7 @@ pub(crate) async fn run(setup: SessionSetup) -> Result<()> {
     let mut tui_app = app::App::new(setup);
     tui_app.load_current_session().await?;
     tui_app.note_embedding_status().await?;
+    tui_app.load_sql_schema().await?;
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     // Mouse capture for wheel scrolling; ratatui's restore does not undo

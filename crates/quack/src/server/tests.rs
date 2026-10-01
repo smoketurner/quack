@@ -686,6 +686,71 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert!(access_rows.iter().all(|r| r.request_id.is_some()));
 }
 
+/// The SQL editor's schema: members read every user table's columns as a
+/// statement writes them, never an internal table; anyone else is refused,
+/// and both are audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sql_schema_is_for_members_and_names_no_internal_table() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let outsider = h.user("outsider", UserKind::Standard).await;
+    let ws = h.workspace("data", &owner).await;
+    let owner_token = h.login("owner").await;
+    let outsider_token = h.login("outsider").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &owner_token,
+            serde_json::json!({ "sql": "CREATE TABLE sales (region VARCHAR, \"Revenue\" INTEGER)" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let path = format!("/api/v1/workspaces/{ws}/tables/schema");
+    let (status, body) = h.get(&path, &owner_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "tables": [{
+                "name": { "name": "sales", "sql": "sales" },
+                "columns": [
+                    { "name": "region", "sql": "region" },
+                    { "name": "Revenue", "sql": "\"Revenue\"" },
+                ],
+            }],
+            "truncated": false,
+        })
+    );
+    assert!(!body.to_string().contains("_quack_"), "{body}");
+    let (status, _) = h.get(&path, &outsider_token).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("list")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        rows.iter()
+            .any(|r| r.outcome == Outcome::Allowed && r.user_id.as_ref() == Some(&owner)),
+        "{rows:?}"
+    );
+    let denied = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        denied.iter().any(|r| r.user_id.as_ref() == Some(&outsider)),
+        "{denied:?}"
+    );
+}
+
 /// The obvious `CREATE TEMP TABLE` case never reaches the writer: `POST
 /// /sql` refuses it up front, the same as `run_sql`.
 #[tokio::test]
@@ -2559,6 +2624,20 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         html.contains("hx-post=\"/w/") && html.contains("/pin\""),
         "{html}"
     );
+
+    // The SQL page: the editor loads its schema from the API and enhances
+    // the textarea, which stays for a browser without JavaScript.
+    let (status, html, _) = h.page(&format!("/w/{ws}/sql"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(&format!(
+            "data-schema=\"/api/v1/workspaces/{ws}/tables/schema\""
+        )) && html.contains("<script src=\"/static/js/sql-editor.min.js\" defer></script>")
+            && html.contains("<textarea id=\"sql-input\""),
+        "{html}"
+    );
+    let (status, _, _) = h.page("/static/js/sql-editor.min.js", None).await;
+    assert_eq!(status, StatusCode::OK);
 
     // SQL grid and CSV download.
     let (status, html, _) = h

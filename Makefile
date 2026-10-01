@@ -20,7 +20,7 @@ WORKSPACE ?= storms
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack
 
-.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build run run-server demo-data help
+.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build editor-build run run-server demo-data help
 
 all: build
 
@@ -86,6 +86,9 @@ css-dev: ## Watch and rebuild Tailwind CSS for the web UI (commit the result)
 
 css-build: ## Build minified Tailwind CSS for the web UI (commit the result)
 	cd crates/$(SERVER_CRATE) && tailwindcss -i styles/input.css -o static/css/output.css --minify
+
+editor-build: ## Bundle the web console's SQL editor (CodeMirror) with pnpm (commit the result)
+	cd crates/$(SERVER_CRATE)/editor && pnpm install --frozen-lockfile && pnpm run build
 
 ##@ Run
 
