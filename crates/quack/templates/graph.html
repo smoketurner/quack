@@ -1,7 +1,22 @@
 {% extends "base.html" %}
 {% block content %}
 {% if let Some(ws) = page.workspace %}
-<h1 class="text-xl font-semibold">Knowledge graph</h1>
+<div class="relative flex items-center gap-2">
+  <h1 class="text-xl font-semibold">Knowledge graph</h1>
+  <details class="group">
+    <summary class="inline-flex h-6 w-6 cursor-pointer list-none items-center justify-center rounded-full border border-slate-600 text-sm text-slate-300 hover:bg-slate-800" title="How this page works"><span aria-hidden="true">?</span><span class="sr-only">How this page works</span></summary>
+    <div class="absolute left-0 top-full z-10 mt-2 max-w-3xl rounded border border-slate-700 bg-slate-900 p-4 text-sm text-slate-300 shadow-lg">
+      <p>The knowledge graph is a map of the <strong>people, companies, places, and other things</strong> in your workspace and <strong>how they are connected</strong>. Each one is typed by your ontology, and each links back to the document passage or table row it came from, so you can check it.</p>
+      <ol class="mt-3 list-decimal space-y-1 pl-5">
+        <li><strong>Set up the ontology first.</strong> The graph only holds the kinds of things and relationships the Ontology page defines.</li>
+        <li><strong>Extract.</strong> <em>Extract</em> fills the graph from your mapped tables (instant, no AI) and has the AI read your documents (it shows how many passages first, and asks).</li>
+        <li><strong>Explore.</strong> Type a name to see what it connects to, or pick a kind to list everything of that kind. <em>Path</em> finds how two things are linked. Click a dot to see its details and sources.</li>
+        <li><strong>Clean up.</strong> When the same thing appears under two names, it shows up in <em>Merge review</em>: merge it or keep both.</li>
+      </ol>
+      <p class="mt-3">A <strong>provisional</strong> banner means the ontology was accepted without review; questions in query mode ignore the graph until someone marks it reviewed. A <strong>stale</strong> banner means the ontology changed since the last extraction: <em>Revalidate</em> drops what no longer fits, and extracting again adds what is new.</p>
+    </div>
+  </details>
+</div>
 <p class="mt-1 text-sm text-slate-400">Entities typed by the ontology's classes, relations between them, and for every node and edge the document chunk or table row it came from.</p>
 {% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
 {% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300 wrap-anywhere">{{ notice }}</p>{% endif %}

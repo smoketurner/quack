@@ -35,7 +35,7 @@ use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tower_http::trace::TraceLayer;
 
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
@@ -217,7 +217,17 @@ pub(crate) fn router(app: App) -> Router {
                         request_id
                     )
                 })
-                .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
+                .on_response(
+                    |response: &axum::http::Response<_>,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        tracing::debug!(
+                            latency_ms = latency.as_millis(),
+                            status = response.status().as_u16(),
+                            "finished processing request"
+                        );
+                    },
+                ),
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,

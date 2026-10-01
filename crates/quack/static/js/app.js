@@ -118,7 +118,7 @@
 
   // Times arrive as UTC instants in time[datetime] and are shown in the
   // viewer's zone. "clock" is the time of day, with the date when it is not
-  // today; "relative" is how long ago for today and the date before that.
+  // today; "relative" is written by the server and left as it is.
   // The title always holds the full local date and time.
   function sameDay(a, b) {
     return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
@@ -135,18 +135,12 @@
     return sameDay(d, now) ? time : dateText(d, now) + ", " + time;
   }
 
-  function relativeText(d, now) {
-    if (!sameDay(d, now)) return dateText(d, now);
-    var minutes = Math.floor((now - d) / 60000);
-    if (minutes < 1) return "just now";
-    if (minutes < 60) return minutes + " min ago";
-    return Math.floor(minutes / 60) + " h ago";
-  }
-
   function formatTime(t, now) {
     var d = new Date(t.getAttribute("datetime"));
     if (isNaN(d)) return;
-    t.textContent = t.getAttribute("data-when") === "relative" ? relativeText(d, now) : clockText(d, now);
+    // A relative time is written by the server and left as it is, so the
+    // page does not change under the reader; it gains the local time on hover.
+    if (t.getAttribute("data-when") !== "relative") t.textContent = clockText(d, now);
     t.title = d.toLocaleString();
   }
 

@@ -66,8 +66,11 @@ signed-in user and reads no workspace, so it writes no audit row.
   text, or RFC 3339), and falls back to the escaped text when a value is not a time. `app.js`
   rewrites each in the viewer's zone, with the full local date and time as the tooltip.
   `clock` (chat messages, versions, the audit log, token expiry) is the time of day, with the
-  date when not today; `relative` (jobs, documents, sessions, token last use) is "5 min ago"
-  for today and the date before that, refreshed every 30 seconds and after every htmx swap.
+  date when not today; `relative` (jobs, documents, sessions, token last use) is written by the
+  server as "5 min ago", "3 h ago", or the date, and the page leaves it as written, so nothing
+  changes under the reader. While a document processes, the Documents page polls
+  `.../documents/status` and swaps in only each row's status and the note (`hx-swap-oob`),
+  never the whole table.
   Chat messages show when they were asked or answered, and an answer how many milliseconds it
   took (`duration_ms` on the response object and the assistant message's metadata). A SQL
   result shows its row count and the statement's own run time in milliseconds
@@ -125,7 +128,9 @@ row is processing (marked `data-pending`).
   `JOIN`, `DESCRIBE`, `SUMMARIZE`, or a comma in a `FROM` list; after `t.`, that table's or
   alias's columns (lang-sql's own source); in an expression, the columns of every table the
   statement names (before or after the cursor) first, then table names, then keywords and
-  functions; nothing at an alias. The editor is built at once, at the textarea's size and on
+  functions, offered before a letter is typed where an expression must follow (after
+  `SELECT`, `WHERE`, `AND`, a comma, `=`); nothing at an alias. The popup opens as you type;
+  Ctrl+Space opens it anywhere. The editor is built at once, at the textarea's size and on
   its background, and the schema plugs in when it arrives, so the box does not flash. It
   hides the page's `textarea` and keeps it in sync, so the htmx run, the sort swap, and the CSV
   download post it as before, and without JavaScript the textarea is the editor.

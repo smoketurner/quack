@@ -337,6 +337,22 @@ impl Moment {
     fn utc(&self) -> String {
         self.0.strftime("%Y-%m-%d %H:%M UTC").to_string()
     }
+
+    /// How long ago, as of `now`: minutes or hours within a day, else the
+    /// date. Written by the server so the page never rewrites it.
+    fn ago(&self, now: Timestamp) -> String {
+        let minutes = now
+            .duration_since(self.0)
+            .as_secs()
+            .checked_div(60)
+            .unwrap_or(0);
+        match minutes {
+            ..1 => String::from("just now"),
+            1..60 => format!("{minutes} min ago"),
+            60..1440 => format!("{} h ago", minutes.checked_div(60).unwrap_or(0)),
+            _ => self.0.strftime("%Y-%m-%d").to_string(),
+        }
+    }
 }
 
 /// How `app.js` words a time: the time of day (with the date when not
@@ -355,13 +371,17 @@ impl When {
         }
     }
 
-    /// The `<time>` element for `at`.
+    /// The `<time>` element for `at`. A relative time is final as written;
+    /// `app.js` words a clock time in the reader's zone.
     fn element(self, at: &Moment) -> String {
+        let text = match self {
+            Self::Clock => at.utc(),
+            Self::Relative => at.ago(Timestamp::now()),
+        };
         format!(
-            "<time datetime=\"{}\" data-when=\"{}\">{}</time>",
+            "<time datetime=\"{}\" data-when=\"{}\">{text}</time>",
             at.iso(),
             self.attr(),
-            at.utc()
         )
     }
 
@@ -458,6 +478,15 @@ struct JobRows {
 struct DocumentRows {
     ws_id: String,
     can_write: bool,
+    documents: Vec<DocumentInfo>,
+    pending: bool,
+}
+
+/// What the Documents page polls while something processes: each row's
+/// status and the note, nothing else, so the rest of the table holds still.
+#[derive(Template)]
+#[template(path = "documents_status.html")]
+struct DocumentStatuses {
     documents: Vec<DocumentInfo>,
     pending: bool,
 }
@@ -855,6 +884,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/chat/{sid}/unshare", post(unshare_session))
         .route("/w/{id}/documents", get(documents).post(upload))
         .route("/w/{id}/documents/rows", get(document_rows))
+        .route("/w/{id}/documents/status", get(document_status))
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
@@ -1327,6 +1357,21 @@ async fn document_rows(
         .audit_read(&app, AuditAction::Page, "document_rows")
         .await?;
     Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
+}
+
+async fn document_status(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::Page, "document_status")
+        .await?;
+    let DocumentRows {
+        documents, pending, ..
+    } = DocumentRows::load(&app, &access).await?;
+    Ok(Html(DocumentStatuses { documents, pending }.render()?).into_response())
 }
 
 async fn upload(
@@ -2352,9 +2397,21 @@ mod tests {
     #[test]
     fn when_renders_time_elements_and_escapes_anything_else() {
         assert_eq!(
-            When::Relative.html("2026-10-01 02:37:57"),
-            "<time datetime=\"2026-10-01T02:37:57Z\" data-when=\"relative\">2026-10-01 02:37 UTC</time>"
+            When::Relative.html("2020-01-01 02:37:57"),
+            "<time datetime=\"2020-01-01T02:37:57Z\" data-when=\"relative\">2020-01-01</time>"
         );
+        let now: Timestamp = "2026-10-01T12:00:00Z"
+            .parse()
+            .unwrap_or(Timestamp::UNIX_EPOCH);
+        let ago = |at: &str| {
+            Moment::from_utc_text(at)
+                .map(|m| m.ago(now))
+                .unwrap_or_default()
+        };
+        assert_eq!(ago("2026-10-01 11:59:30"), "just now");
+        assert_eq!(ago("2026-10-01 11:55:00"), "5 min ago");
+        assert_eq!(ago("2026-10-01 09:00:00"), "3 h ago");
+        assert_eq!(ago("2026-09-29 12:00:00"), "2026-09-29");
         assert!(
             When::Clock
                 .html("2026-10-01 02:37:57")

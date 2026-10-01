@@ -34,8 +34,9 @@
   </form>
 </div>
 {% endif %}
-<div id="rows" class="mt-6" hx-get="/w/{{ ws.id }}/documents/rows" hx-trigger="every 3s [document.querySelector('#rows [data-pending]')]" hx-swap="innerHTML">
+<div id="rows" class="mt-6">
 {{ rows|safe }}
 </div>
+<div hidden hx-get="/w/{{ ws.id }}/documents/status" hx-trigger="every 3s [document.querySelector('#doc-pending[data-pending]')]" hx-swap="innerHTML"></div>
 {% endif %}
 {% endblock %}

@@ -2624,6 +2624,21 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         html.contains("hx-post=\"/w/") && html.contains("/pin\""),
         "{html}"
     );
+    // The poll swaps in statuses only: no file names, no table.
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/status"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("id=\"status-")
+            && html.contains("hx-swap-oob=\"true\"")
+            && html.contains("ready"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("notes.md") && !html.contains("<table"),
+        "{html}"
+    );
 
     // The SQL page: the editor loads its schema from the API and enhances
     // the textarea, which stays for a browser without JavaScript.

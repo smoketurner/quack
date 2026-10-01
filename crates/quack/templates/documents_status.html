@@ -1,0 +1,3 @@
+{# Polled while a document is processing: only each row's status and the note, swapped into place by id. #}
+{% for d in documents %}<span id="status-{{ d.id }}" hx-swap-oob="true">{% include "document_status.html" %}</span>
+{% endfor %}{% include "documents_pending.html" %}

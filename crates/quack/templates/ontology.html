@@ -1,7 +1,21 @@
 {% extends "base.html" %}
 {% block content %}
 {% if let Some(ws) = page.workspace %}
-<h1 class="text-xl font-semibold">Ontology</h1>
+<div class="relative flex items-center gap-2">
+  <h1 class="text-xl font-semibold">Ontology</h1>
+  <details class="group">
+    <summary class="inline-flex h-6 w-6 cursor-pointer list-none items-center justify-center rounded-full border border-slate-600 text-sm text-slate-300 hover:bg-slate-800" title="How this page works"><span aria-hidden="true">?</span><span class="sr-only">How this page works</span></summary>
+    <div class="absolute left-0 top-full z-10 mt-2 max-w-3xl rounded border border-slate-700 bg-slate-900 p-4 text-sm text-slate-300 shadow-lg">
+      <p>The ontology is the list of <strong>kinds of things</strong> your workspace talks about (vendors, shipments, countries), the <strong>relationships</strong> between them (a vendor <em>ships to</em> a country), and the <strong>facts</strong> each kind has (a vendor's founding year). The knowledge graph is built from it, and the assistant uses it to answer questions about how things connect.</p>
+      <ol class="mt-3 list-decimal space-y-1 pl-5">
+        <li><strong>Get a first draft.</strong> <em>Propose</em> turns your tables into kinds, facts, and relationships (no AI involved). Tick <em>also from the documents</em> to have the AI read a sample of your documents too; that runs in the background. With no tables yet, <em>Install the built-in ontology</em> gives you a general starting point.</li>
+        <li><strong>Review the suggestions.</strong> Each one waits in the <em>Review queue</em>. Tick the ones that make sense and press <em>Accept selected</em>, or <em>Reject selected</em> for the rest. Suggestions marked <em>low support</em> were seen in only a few documents; accept those you know to be right.</li>
+        <li><strong>Build the graph.</strong> Once the ontology looks right, go to the Graph page and extract.</li>
+      </ol>
+      <p class="mt-3">Every accepted change makes a new <strong>version</strong>; you can compare versions and restore an older one at any time. To edit everything at once, use <em>Edit as JSON</em>.</p>
+    </div>
+  </details>
+</div>
 <p class="mt-1 text-sm text-slate-400">The schema of the knowledge graph: classes with single inheritance from <code>entity</code>, relations with a domain and a range, typed properties, and table mappings. Every accepted change is a new version.</p>
 {% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
 {% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300 wrap-anywhere">{{ notice }}</p>{% endif %}

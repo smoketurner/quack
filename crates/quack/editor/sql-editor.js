@@ -44,6 +44,12 @@ const TABLE_WORDS = new Set(["from", "join", "describe", "summarize", "update", 
 const EXPRESSION_WORDS = new Set([
   "select", "where", "by", "on", "having", "qualify", "set", "using", "returning",
 ]);
+// After these an expression must come, so a blank word is offered names
+// (not `*`, which may be `SELECT *`).
+const EXPRESSION_STARTS = new Set([
+  ...EXPRESSION_WORDS, "and", "or", "not", "case", "when", "then", "else",
+  ",", "(", "=", "<>", "!=", "<", ">", "<=", ">=", "+", "-", "/",
+]);
 
 // The tokens of the statement around `pos`, as CodeMirror's SQL parser read
 // them: each with its node name and lowercased text.
@@ -95,7 +101,10 @@ function namesSource(schema) {
     }
     // An alias after AS or after a name, and a blank word, get nothing.
     if (previous.text === "as" || /Identifier$/.test(previous.name)) return null;
-    if (word.from === word.to && !context.explicit) return null;
+    // A blank word gets names only where an expression must follow.
+    if (word.from === word.to && !context.explicit && !EXPRESSION_STARTS.has(previous.text)) {
+      return null;
+    }
     // The columns of every table the statement names, before or after the
     // cursor, first; then table names; then keywords and functions.
     const named = new Set();

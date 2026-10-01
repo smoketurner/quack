@@ -1819,7 +1819,8 @@ A line that starts like a statement (`SELECT`, `WITH`, `FROM`, `DESCRIBE`, ...) 
 and column names at the cursor, anywhere in the line (`terminal::sql`, over sqlparser's
 `DuckDB` tokenizer): tables after `FROM`, `JOIN`, `DESCRIBE`, `SUMMARIZE`, or a comma in a
 `FROM` list; after `t.`, that table's or alias's columns only; elsewhere in an expression,
-the named tables' columns and table names. A name that needs quoting is filled in quoted. An
+the named tables' columns and table names, even before a letter is typed where an expression
+must follow (after `SELECT`, `WHERE`, `AND`, a comma, `=`, ...). A name that needs quoting is filled in quoted. An
 alias, a whole keyword, a string, or a number gets nothing, and a name typed in full is
 listed first, so Enter still runs a finished statement. The names come from
 `WorkspaceDb::sql_schema` (never a `_quack_` table; at most 500 tables of 200 columns),
