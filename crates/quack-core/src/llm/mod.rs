@@ -52,6 +52,38 @@ pub use limit::LimitedHttp;
 /// `max_concurrent_requests` bounds the model requests in flight.
 pub type ChatModel = DynModel<operation::Completion>;
 
+/// A dedicated rerank model with its wire and transport erased, sending
+/// through [`LimitedHttp`] like every model quack builds.
+pub type RerankModel = DynModel<operation::Rerank>;
+
+/// The rerank model `[retrieval].rerank = "reranker"` names, or `None` in
+/// any other mode.
+///
+/// # Errors
+///
+/// Returns an error if the setting is invalid or the provider's credential
+/// cannot be resolved.
+pub async fn rerank_model(config: &Config) -> Result<Option<RerankModel>> {
+    let Some(model) = config.rerank_model_ref()? else {
+        return Ok(None);
+    };
+    let key = model
+        .provider
+        .auth
+        .credential(config, model.provider_name)
+        .await?;
+    rerank_model_with(model, key.as_deref()).map(Some)
+}
+
+/// `model` with `key`, already resolved, on [`ChatClient::rerank_server`].
+pub(crate) fn rerank_model_with(model: ModelRef<'_>, key: Option<&str>) -> Result<RerankModel> {
+    Ok(
+        ChatClient::rerank_server(model.provider_name, model.provider, key)?
+            .rerank(model.model)
+            .erase(),
+    )
+}
+
 /// One of rig's embedding models with its wire and transport erased.
 type RigEmbeddingModel = DynModel<operation::Embedding>;
 
@@ -387,6 +419,26 @@ impl ChatClient {
                 provider.auth.credential(config, name).await?.as_deref(),
             ),
         }
+    }
+
+    /// A rerank server's client, with `key` already resolved: rig's
+    /// OpenAI-compatible client on llama.cpp's dialect, whose rerank path is
+    /// `/rerank` under the base URL, where vLLM, llama.cpp, and Text
+    /// Embeddings Inference all serve it. The bearer goes only when there
+    /// is a key, since llama.cpp refuses one it was not started with. Sends
+    /// through the provider's [`LimitedHttp`] and headers.
+    pub(crate) fn rerank_server(
+        name: &ProviderName,
+        provider: &ProviderConfig,
+        key: Option<&str>,
+    ) -> Result<openai::OpenAI> {
+        let mut settings =
+            openai::OpenAIConfig::with_key(&openai::wire::LLAMACPP, key.unwrap_or_default());
+        if let Some(base_url) = &provider.base_url {
+            settings = settings.with_base_url(base_url.as_str());
+        }
+        let http = LimitedHttp::for_provider(name, provider).with_headers(provider.header_map()?);
+        Ok(settings.connect(http))
     }
 
     /// The client for a provider reached over plain HTTPS, with `key`
@@ -1060,6 +1112,7 @@ impl TurnRequest<'_> {
         let StartedTurn {
             chat,
             embedding_model,
+            rerank_model,
             prompt,
             history,
         } = match start_turn(config, &db, session_id, policy).await {
@@ -1098,6 +1151,7 @@ impl TurnRequest<'_> {
             db: Arc::clone(&db),
             reader_db,
             embedder: embedding_model,
+            rerank_model,
             config: &config.analysis,
             retrieval_config: &config.retrieval,
             graph_options: config.graph.options(),
@@ -1148,6 +1202,8 @@ struct StartedTurn<'c> {
     chat: ModelRef<'c>,
     /// `None` when no embedding model is configured.
     embedding_model: Option<Embeddings>,
+    /// `None` unless `[retrieval].rerank = "reranker"`.
+    rerank_model: Option<RerankModel>,
     prompt: PromptOptions,
     /// The session's earlier messages, replayed to the model.
     history: Vec<Message>,
@@ -1163,6 +1219,7 @@ async fn start_turn<'c>(
     // Without an embedding provider the agent still runs: document search
     // is keyword-only and graph entry is exact (issue #58).
     let embedding_model = Embeddings::from_config(config).await?;
+    let rerank_model = rerank_model(config).await?;
     // On the blocking pool, in the writer's interactive line: an async
     // worker never waits on the connection.
     let session_id = session_id.to_owned();
@@ -1192,6 +1249,7 @@ async fn start_turn<'c>(
     Ok(StartedTurn {
         chat,
         embedding_model,
+        rerank_model,
         prompt,
         history,
     })

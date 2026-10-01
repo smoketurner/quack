@@ -1442,11 +1442,16 @@ pub struct RetrievalConfig {
     /// Off by default: retrieval should be a visible tool call the model
     /// chooses, not an invisible prefix on every turn.
     pub always_retrieve: bool,
-    /// Reranking after hybrid fusion: `none` (the default) or `model`, the
-    /// chat model ordering the candidates listwise.
+    /// Reranking after hybrid fusion: `none` (the default); `model`, the
+    /// chat model ordering the candidates listwise; or `reranker`, the
+    /// dedicated rerank model `rerank_model` names scoring each one.
     pub rerank: RerankMode,
     /// Candidates fetched for reranking before the top `k` are kept.
     pub rerank_candidates: u32,
+    /// `PROVIDER/MODEL` of a rerank model served at an OpenAI-compatible
+    /// `/rerank` endpoint (vLLM, llama.cpp, Text Embeddings Inference),
+    /// for `rerank = "reranker"`.
+    pub rerank_model: Option<ModelSpec>,
 }
 
 impl Default for RetrievalConfig {
@@ -1458,6 +1463,7 @@ impl Default for RetrievalConfig {
             always_retrieve: false,
             rerank: RerankMode::None,
             rerank_candidates: 24,
+            rerank_model: None,
         }
     }
 }
@@ -1468,11 +1474,13 @@ impl Default for RetrievalConfig {
 pub enum RerankMode {
     None,
     Model,
+    Reranker,
 }
 
 text_enum!(RerankMode, "rerank mode", {
     None => "none",
     Model => "model",
+    Reranker => "reranker",
 });
 
 /// How long a reasoning model thinks before it answers (`[analysis].effort`
@@ -1715,6 +1723,7 @@ impl Config {
             }
             self.embedding_dimension()?;
         }
+        self.rerank_model_ref()?;
         // Unlike the other [analysis] numbers, this one allocates OS-level
         // DuckDB connections at workspace open, one spawn_blocking round
         // trip and one writer-mutex acquisition each — an unreasonable
@@ -1783,6 +1792,43 @@ impl Config {
     pub fn chat_model_label(&self) -> String {
         self.chat_model_ref()
             .map_or_else(|_| String::from("no chat model"), |m| m.to_string())
+    }
+
+    /// The dedicated rerank model, when `[retrieval].rerank = "reranker"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if that mode is set without `rerank_model`, or the
+    /// model's provider is unknown or has no `/rerank` endpoint.
+    pub fn rerank_model_ref(&self) -> Result<Option<ModelRef<'_>>> {
+        if self.retrieval.rerank != RerankMode::Reranker {
+            return Ok(None);
+        }
+        let spec = self.retrieval.rerank_model.as_ref().ok_or_else(|| {
+            Error::Config(String::from(
+                "[retrieval].rerank = \"reranker\" needs rerank_model = \"PROVIDER/MODEL\"",
+            ))
+        })?;
+        let model = self.resolve_model("[retrieval].rerank_model", spec)?;
+        match model.provider.provider_type {
+            ProviderType::Openai if model.provider.base_url.is_none() => {
+                Err(Error::Config(format!(
+                    "[retrieval].rerank_model '{model}': set base_url under [providers.{}] to the \
+                 server that serves /rerank",
+                    model.provider_name
+                )))
+            }
+            ProviderType::Openai => Ok(Some(model)),
+            other @ (ProviderType::Ollama
+            | ProviderType::Anthropic
+            | ProviderType::Bedrock
+            | ProviderType::BedrockMantle) => Err(Error::Config(format!(
+                "[retrieval].rerank_model '{model}': {other} has no rerank endpoint; serve the \
+                 model with vLLM, llama.cpp, or Text Embeddings Inference and add that server \
+                 as a type = \"openai\" provider with its base_url, or set rerank = \"model\" \
+                 to rank with the chat model"
+            ))),
+        }
     }
 
     /// The embedding model, if configured.
@@ -2192,6 +2238,21 @@ rerank = "model"
         assert!(err_of("[providers.o]\ntype = \"ollama\"\nmodel = \"x\"\n").contains("model"));
         assert!(err_of("[retrieval]\ntopk = 1\n").contains("topk"));
         assert!(err_of("[retrieval]\nrerank = \"bge\"\n").contains("bge"));
+        let reranker = |provider: &str| {
+            err_of(&format!(
+                "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"r/bge\"\n[providers.r]\n{provider}"
+            ))
+        };
+        let ollama = reranker("type = \"ollama\"\n");
+        assert!(
+            ollama.contains("ollama has no rerank endpoint") && ollama.contains("vLLM"),
+            "{ollama}"
+        );
+        assert!(reranker("type = \"openai\"\n").contains("set base_url"));
+        assert!(
+            err_of("[retrieval]\nrerank = \"reranker\"\n").contains("needs rerank_model"),
+            "the mode without its model"
+        );
         assert!(err_of("[analysis]\nthread = 1\n").contains("thread"));
     }
 

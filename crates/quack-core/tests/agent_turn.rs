@@ -135,6 +135,7 @@ async fn run_turn(
         db: Arc::clone(db),
         reader_db: ReaderDb::new(Arc::clone(db)),
         embedder: None::<Embedder<NoEmbedding>>,
+        rerank_model: None,
         config: &analysis_config,
         retrieval_config: &retrieval_config,
         graph_options: GraphOptions::default(),
