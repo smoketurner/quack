@@ -444,15 +444,6 @@ enum Gate {
     Reject(String),
 }
 
-/// Who decides whether a write runs.
-#[derive(Clone, Copy)]
-enum Writes<'a> {
-    /// The turn's write policy, and its refusal flag when it says no.
-    Turn(&'a Turn),
-    /// No write runs, and a refusal is not the turn's: a chart only reads.
-    Never,
-}
-
 /// What a statement from the agent passes before it runs: no internal
 /// tables, a valid parse, and for a write, no temp object and the write
 /// policy.
@@ -464,29 +455,17 @@ struct SqlGate {
 }
 
 impl SqlGate {
-    /// Classify `sql` and apply `writes`. A permission prompt holds no
-    /// connection while it waits.
-    async fn check(&self, sql: &str, writes: Writes<'_>) -> Result<Gate, ToolError> {
-        let sql_owned = sql.to_owned();
-        let kind = self
-            .db
-            .with_db(move |db| {
-                if db.references_internal_table(&sql_owned)? {
-                    return Ok(None);
-                }
-                db.classify_statement(&sql_owned).map(Some)
-            })
-            .await?;
-        let Some(kind) = kind else {
+    /// Classify `sql` for `run_sql`: a write runs only if `turn`'s write
+    /// policy allows it, and a refusal is recorded on the turn. A
+    /// permission prompt holds no connection while it waits.
+    async fn check(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
+        let Some(kind) = self.classify(sql).await? else {
             return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
         };
         match kind {
             StatementKind::Read => Ok(Gate::Read),
             StatementKind::Invalid(msg) => Ok(Gate::Reject(format!("SQL syntax error: {msg}"))),
             StatementKind::Write => {
-                let Writes::Turn(turn) = writes else {
-                    return Ok(Gate::Reject(String::from(WRITE_REFUSED)));
-                };
                 if creates_temp_object(sql) {
                     // A mutating statement the caller wanted to run did
                     // not run, same as WRITE_REFUSED:
@@ -509,6 +488,32 @@ impl SqlGate {
                 }
             }
         }
+    }
+
+    /// Classify `sql` for a chart, which only reads: any write is
+    /// rejected, and that is not the turn's refused write.
+    async fn check_read_only(&self, sql: &str) -> Result<Gate, ToolError> {
+        Ok(match self.classify(sql).await? {
+            None => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
+            Some(StatementKind::Read) => Gate::Read,
+            Some(StatementKind::Invalid(msg)) => Gate::Reject(format!("SQL syntax error: {msg}")),
+            Some(StatementKind::Write) => Gate::Reject(String::from(WRITE_REFUSED)),
+        })
+    }
+
+    /// The statement's kind on a reader, or `None` when it names an
+    /// internal table.
+    async fn classify(&self, sql: &str) -> Result<Option<StatementKind>, ToolError> {
+        let sql = sql.to_owned();
+        Ok(self
+            .db
+            .with_db(move |db| {
+                if db.references_internal_table(&sql)? {
+                    return Ok(None);
+                }
+                db.classify_statement(&sql).map(Some)
+            })
+            .await?)
     }
 }
 
@@ -594,7 +599,7 @@ impl Tool for RunSqlTool {
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
         let step = turn.recorder.start(ToolName::RunSql, args.query.trim());
-        let read_only = match self.gate.check(&args.query, Writes::Turn(&turn)).await? {
+        let read_only = match self.gate.check(&args.query, &turn).await? {
             Gate::Reject(message) => {
                 step.finish("refused");
                 return Ok(message);
@@ -1297,7 +1302,7 @@ impl Tool for CreateChartTool {
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
         let step = turn.recorder.start(ToolName::CreateChart, args.sql.trim());
-        if let Gate::Reject(message) = self.gate.check(&args.sql, Writes::Never).await? {
+        if let Gate::Reject(message) = self.gate.check_read_only(&args.sql).await? {
             step.finish("rejected");
             return Ok(format!("Chart query rejected. {message}"));
         }
@@ -1838,7 +1843,7 @@ mod tests {
 
     impl Gated {
         async fn check(&self, sql: &str) -> Result<Gate, ToolError> {
-            self.gate.check(sql, Writes::Turn(&self.turn)).await
+            self.gate.check(sql, &self.turn).await
         }
     }
 
