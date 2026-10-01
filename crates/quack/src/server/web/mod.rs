@@ -1734,7 +1734,7 @@ async fn ontology_page(
     })
 }
 
-/// Accept or reject every ticked candidate at once (issue #55).
+/// Accept or reject every selected candidate at once (issue #55).
 async fn ontology_decide_many(
     State(app): State<App>,
     WebUser(identity): WebUser,
