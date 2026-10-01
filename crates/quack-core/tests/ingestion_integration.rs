@@ -506,6 +506,143 @@ async fn ingest_csv_structured() {
     assert_eq!(count, &serde_json::Value::Number(3.into()));
 }
 
+/// Delimited files load with their sniffed dialect, and a one-column sniff
+/// is checked against the type's own separator: a genuine one-column file
+/// loads, in either type.
+#[tokio::test]
+async fn delimited_files_load_by_their_dialect() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-dialects";
+    std::fs::create_dir_all(config.workspace_files_dir(workspace_id)).unwrap();
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
+    let ingest = |name: &'static str, bytes: &'static [u8]| {
+        let (config, writer) = (&config, &writer);
+        async move {
+            ingestion::ingest_file::<MockEmbeddingModel>(
+                config,
+                writer,
+                workspace_id,
+                &ingestion::NewFile::new(name, bytes),
+                None,
+            )
+            .await
+            .map(|outcome| outcome.ingested().unwrap())
+        }
+    };
+    let shape = |table: &str| {
+        let columns = db
+            .execute_query(&format!("SELECT * FROM \"{table}\" LIMIT 0"))
+            .unwrap()
+            .columns;
+        let rows = db
+            .execute_query(&format!("SELECT count(*) FROM \"{table}\""))
+            .unwrap()
+            .rows;
+        (columns, rows.first().unwrap().first().unwrap().clone())
+    };
+
+    for (name, bytes, table, columns, rows) in [
+        (
+            "single.csv",
+            &b"name\nalpha\nbeta\n"[..],
+            "single",
+            vec!["name"],
+            2,
+        ),
+        (
+            "semi.csv",
+            &b"a;b\n1;2\n3;4\n"[..],
+            "semi",
+            vec!["a", "b"],
+            2,
+        ),
+        (
+            "tabbed.tsv",
+            &b"a\tb\n1\t2\n"[..],
+            "tabbed",
+            vec!["a", "b"],
+            1,
+        ),
+        ("lone.tsv", &b"only\nx\n"[..], "lone", vec!["only"], 1),
+        (
+            "header_only.csv",
+            &b"a,b,c\n"[..],
+            "header_only",
+            vec!["a", "b", "c"],
+            0,
+        ),
+    ] {
+        let result = ingest(name, bytes).await.unwrap();
+        assert_eq!(result.tables, [table], "{name}");
+        assert_eq!(
+            shape(table),
+            (
+                columns.iter().map(|c| (*c).to_owned()).collect(),
+                serde_json::json!(rows)
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        ingest("tabbed2.tsv", b"x\ty\n1\t2\n")
+            .await
+            .unwrap()
+            .file_type,
+        FileType::Tsv
+    );
+}
+
+/// A file no separator splits consistently is refused instead of loading
+/// its raw lines, and an empty file is refused before anything is written.
+#[tokio::test]
+async fn malformed_and_empty_delimited_files_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-dialects";
+    std::fs::create_dir_all(config.workspace_files_dir(workspace_id)).unwrap();
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
+    let ingest = |name: &'static str, bytes: &'static [u8]| {
+        let (config, writer) = (&config, &writer);
+        async move {
+            ingestion::ingest_file::<MockEmbeddingModel>(
+                config,
+                writer,
+                workspace_id,
+                &ingestion::NewFile::new(name, bytes),
+                None,
+            )
+            .await
+            .map(|outcome| outcome.ingested().unwrap())
+        }
+    };
+
+    let malformed = ingest("malformed.csv", b"a,b\n1,2,3,4\n\"unterminated,5\n6\n").await;
+    assert!(
+        matches!(&malformed, Err(Error::Ingestion(m)) if m.contains("'malformed.csv' does not parse as comma-separated values")),
+        "{malformed:?}"
+    );
+    assert!(
+        !db.list_tables()
+            .unwrap()
+            .contains(&String::from("malformed"))
+    );
+
+    let empty = ingest("empty.csv", b"").await;
+    assert!(
+        matches!(&empty, Err(Error::EmptyFile(name)) if name == "empty.csv"),
+        "{empty:?}"
+    );
+    assert!(
+        db.list_documents()
+            .unwrap()
+            .iter()
+            .all(|d| d.filename != "empty.csv")
+    );
+}
+
 #[tokio::test]
 async fn ingest_json_structured() {
     let dir = tempfile::tempdir().unwrap();
@@ -570,8 +707,10 @@ async fn ingest_unknown_file_type_returns_error() {
     );
 }
 
+/// An empty file of a chunked type is refused like an empty table file:
+/// a document with nothing in it would only ever answer "no results".
 #[tokio::test]
-async fn ingest_empty_text_file() {
+async fn ingest_empty_text_file_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let workspace_id = "ws-empty";
@@ -587,13 +726,13 @@ async fn ingest_empty_text_file() {
         &ingestion::NewFile::new("empty.txt", b""),
         None,
     )
-    .await
-    .unwrap()
-    .ingested()
-    .unwrap();
+    .await;
 
-    assert_eq!(result.file_type, FileType::Text);
-    assert_eq!(result.chunks_stored, 0);
+    assert!(
+        matches!(&result, Err(Error::EmptyFile(name)) if name == "empty.txt"),
+        "{result:?}"
+    );
+    assert!(db.list_documents().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1057,8 +1196,12 @@ fn long_running_statement_is_interrupted_at_timeout() {
     let elapsed = started.elapsed();
     let err = result.err().unwrap();
     assert!(
-        err.to_string().to_lowercase().contains("interrupt"),
+        matches!(err, Error::QueryTimeout { timeout } if timeout == std::time::Duration::from_millis(200)),
         "unexpected error: {err}"
+    );
+    assert!(
+        err.to_string().contains("200ms query timeout"),
+        "unexpected message: {err}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(10),

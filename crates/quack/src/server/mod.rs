@@ -160,7 +160,8 @@ pub(crate) fn router(app: App) -> Router {
     // Everything a caller can reach is rate limited, not just the API: the
     // web UI drives the same handlers, and MCP drives the agent. `/healthz`
     // stays outside, because a throttled health check reads as a dead
-    // server to whatever is watching it.
+    // server to whatever is watching it, and so do the static assets
+    // (`web::assets`), which reveal nothing and cost nothing to serve.
     let mut limited = Router::new()
         .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
         .route(resource::METADATA_PATH, get(resource::metadata))
@@ -182,6 +183,7 @@ pub(crate) fn router(app: App) -> Router {
         .layer(axum::middleware::from_fn(acting_slot));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .merge(web::assets())
         .merge(limited)
         .layer(DefaultBodyLimit::max(upload_limit))
         // One span per request, carrying the id the request-id layer set

@@ -2487,8 +2487,10 @@ Every gap is a GitHub issue unless the item says otherwise.
     - Done: the terminal, the web chat, REST `query`, uploads, graph extraction, and the
       document pass run on `quack_core::jobs`. `llm::LimitedHttp` limits model requests per
       provider and model, interactive first. Ingest and import stop on cancel, mid-embedding
-      included. A workspace with 64 uploads waiting answers the next with 503 and
-      `Retry-After: 30`. The web Jobs page follows `.../jobs/stream` instead of polling; the
+      included. A queued upload's bytes wait on disk in the workspace's `uploads/`
+      directory until its job ends (`server::queue::UploadJob`), so a batch of any size is
+      queued; an earlier process's leftovers are failed and deleted when the workspace
+      opens. The web Jobs page follows `.../jobs/stream` instead of polling; the
       terminal re-renders only changed messages.
     - Done: the writer is an actor (section 4.1), so no runtime worker blocks on the
       database. Ingestion, import, extraction, and the CLI commands take the `Writer` (the

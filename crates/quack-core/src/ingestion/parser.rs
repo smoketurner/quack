@@ -12,6 +12,7 @@ use crate::text::NonBlankText;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Csv,
+    Tsv,
     Parquet,
     Json,
     Xlsx,
@@ -48,24 +49,54 @@ pub enum TextFormat {
 /// A `DuckDB` reader for a data file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reader {
-    Csv,
+    /// Delimited text: the dialect is sniffed, and the separator is the
+    /// one the file's type names, which a one-column sniff is checked
+    /// against.
+    Csv(Separator),
     Parquet,
     Json,
 }
 
+/// The field separator a delimited file's type names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Separator {
+    Comma,
+    Tab,
+}
+
+impl Separator {
+    /// The `delim` value `read_csv` takes.
+    #[must_use]
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Comma => ",",
+            Self::Tab => "\t",
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Comma => "comma",
+            Self::Tab => "tab",
+        }
+    }
+}
+
 impl Reader {
-    /// The table function that reads the file.
+    /// The table function that reads the file with a sniffed dialect.
     #[must_use]
     pub fn sql_fn(self) -> &'static str {
         match self {
-            Self::Csv => "read_csv_auto",
+            Self::Csv(_) => "read_csv_auto",
             Self::Parquet => "read_parquet",
             Self::Json => "read_json_auto",
         }
     }
 
     /// The reader for bytes of no known name: Parquet by its magic, JSON
-    /// when they start with `{` or `[`, else CSV (its delimiter sniffed).
+    /// when they start with `{` or `[`, else comma-separated text (its
+    /// dialect sniffed).
     #[must_use]
     pub fn sniff(data: &[u8]) -> Self {
         if data.starts_with(b"PAR1") {
@@ -73,7 +104,7 @@ impl Reader {
         }
         match data.iter().find(|b| !b.is_ascii_whitespace()) {
             Some(b'{' | b'[') => Self::Json,
-            _ => Self::Csv,
+            _ => Self::Csv(Separator::Comma),
         }
     }
 }
@@ -97,7 +128,8 @@ impl FileType {
     #[must_use]
     pub fn load(self) -> Load {
         match self {
-            Self::Csv => Load::Table(Reader::Csv),
+            Self::Csv => Load::Table(Reader::Csv(Separator::Comma)),
+            Self::Tsv => Load::Table(Reader::Csv(Separator::Tab)),
             Self::Parquet => Load::Table(Reader::Parquet),
             Self::Json => Load::Table(Reader::Json),
             Self::Xlsx => Load::Workbook,
@@ -122,6 +154,7 @@ impl FileType {
     pub fn mime_type(self) -> &'static str {
         match self {
             Self::Csv => "text/csv",
+            Self::Tsv => "text/tab-separated-values",
             Self::Parquet => "application/vnd.apache.parquet",
             Self::Json => "application/json",
             Self::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -141,6 +174,7 @@ impl std::fmt::Display for FileType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
             Self::Csv => "CSV",
+            Self::Tsv => "TSV",
             Self::Parquet => "Parquet",
             Self::Json => "JSON",
             Self::Xlsx => "Excel",
@@ -206,7 +240,7 @@ pub struct Section {
 /// Every extension quack reads, lowercase, and the type it is read as.
 const EXTENSIONS: &[(&str, FileType)] = &[
     ("csv", FileType::Csv),
-    ("tsv", FileType::Csv),
+    ("tsv", FileType::Tsv),
     ("parquet", FileType::Parquet),
     ("pq", FileType::Parquet),
     ("json", FileType::Json),

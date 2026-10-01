@@ -26,10 +26,9 @@ use tower::ServiceExt;
 
 use super::state::{App, AppState, ServeMode, with_db};
 use crate::server::auth::{Access, Credential, Identity};
-use crate::server::queue::MAX_WAITING_UPLOADS;
+use crate::server::queue::UploadJob;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
 use quack_core::jobs::LaneKey;
-use quack_core::llm::CancellationToken;
 use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
@@ -2523,13 +2522,92 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("<th scope=\"col\" class=\"px-3 py-2 font-mono whitespace-nowrap\">n</th>")
+        html.contains("aria-sort=\"none\"")
+            && html.contains("hx-vals='{\"sort\": 1, \"dir\": \"asc\"}'")
             && html.contains("<div class=\"max-w-xs truncate\" title=\"a\">a</div>")
             && html.contains("Download CSV"),
         "{html}"
     );
-    let (status, csv, headers) = h
+
+    // Rows come back in the statement's own order until a header asks for
+    // another; a click sorts by that column, and the next click reverses it.
+    let values =
+        "SELECT+*+FROM+(VALUES+(2%2C+%27b%27)%2C+(1%2C+%27a%27)%2C+(3%2C+%27c%27))+v(n%2C+s)";
+    let order = |html: &str| -> Vec<char> {
+        ["a", "b", "c"]
+            .iter()
+            .filter_map(|v| html.find(&format!("title=\"{v}\"")).map(|at| (at, v)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .filter_map(|v| v.chars().next())
+            .collect()
+    };
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            &format!("sql={values}"),
+        )
+        .await;
+    assert_eq!(order(&html), ['b', 'a', 'c'], "{html}");
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            &format!("sql={values}&sort=1&dir=asc"),
+        )
+        .await;
+    assert_eq!(order(&html), ['a', 'b', 'c'], "{html}");
+    // The sort is the statement's own ORDER BY: the editor takes the
+    // rewritten SQL, and the CSV link and the next click carry it.
+    assert!(
+        html.contains("aria-sort=\"ascending\"")
+            && html.contains("hx-vals='{\"sort\": 1, \"dir\": \"desc\"}'")
+            && html.contains("id=\"sql-input\"")
+            && html.contains("hx-swap-oob=\"true\"")
+            && html.contains("v(n, s) ORDER BY n ASC NULLS LAST</textarea>")
+            && html.contains("ORDER BY n ASC NULLS LAST\">"),
+        "{html}"
+    );
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            &format!("sql={values}&sort=2&dir=desc"),
+        )
+        .await;
+    assert_eq!(order(&html), ['c', 'b', 'a'], "{html}");
+    let (_, csv, _) = h
+        .form(
+            &format!("/w/{ws}/sql.csv"),
+            Some(&cookie),
+            &format!("sql={values}&sort=1&dir=desc"),
+        )
+        .await;
+    assert_eq!(csv, "n,s\n3,c\n2,b\n1,a\n");
+    // A write has no rows to reorder: no sort buttons, and a stray sort is ignored.
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            "sql=DROP+TABLE+IF+EXISTS+no_such_table&sort=1&dir=asc",
+        )
+        .await;
+    assert!(
+        !html.contains("aria-sort") && !html.contains("role=\"alert\""),
+        "{html}"
+    );
+    // The download is a POST: a statement never travels in a URL.
+    let (status, _, _) = h
         .page(&format!("/w/{ws}/sql.csv?sql=SELECT+1+AS+n"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (status, csv, headers) = h
+        .form(
+            &format!("/w/{ws}/sql.csv"),
+            Some(&cookie),
+            "sql=SELECT+1+AS+n",
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -4475,6 +4553,45 @@ async fn rotating_the_authorization_header_does_not_escape_the_login_limit() {
     );
 }
 
+/// Static assets sit outside the general limiter: a caller who has spent
+/// its budget is refused the API but still gets the stylesheet, so a page
+/// it is allowed never renders unstyled.
+#[tokio::test(flavor = "multi_thread")]
+async fn static_assets_are_not_rate_limited() {
+    let h = harness(ServeMode::Login).await;
+    let peer: std::net::SocketAddr = "192.0.2.45:53001"
+        .parse()
+        .unwrap_or_else(|e| fail(&format!("{e}")));
+    let request = |uri: &str| {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        h.send(request)
+    };
+    let spent = (0..(super::RATE_BURST + 4)).map(|_| request("/api/v1/workspaces"));
+    let refused = futures::future::join_all(spent)
+        .await
+        .into_iter()
+        .filter(|(status, _, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        refused >= 3,
+        "{refused} requests were refused; the budget was not spent"
+    );
+    for asset in [
+        "/static/css/output.css",
+        "/static/js/app.js",
+        "/static/favicon.svg",
+    ] {
+        let (status, _, _) = request(asset).await;
+        assert_eq!(status, StatusCode::OK, "{asset}");
+    }
+}
+
 // --- jobs ----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4616,67 +4733,76 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
     assert!(!html.contains("Cancel</button>"), "{html}");
 }
 
+/// A queued upload waits on disk, not in memory, so one request may carry
+/// more files than any in-memory line would hold: each is queued and
+/// processed, and its spooled bytes are gone once its job ends.
 #[tokio::test(flavor = "multi_thread")]
-async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
-    use quack_core::jobs::{JobKind, JobSpec, Lane};
-
+async fn a_large_batch_of_uploads_is_spooled_and_processed() {
     let h = harness(ServeMode::Login).await;
     let owner = h.user("owner", UserKind::Standard).await;
-    let ws = h.workspace("busy", &owner).await;
+    let ws = h.workspace("batch", &owner).await;
     let token = h.login("owner").await;
-    let release = CancellationToken::new();
-    let lane = LaneKey::Ingest(ws.clone());
-    for n in 0..MAX_WAITING_UPLOADS {
-        let release = release.clone();
-        h.app.jobs.submit(
-            JobSpec::new(JobKind::Ingest, format!("held {n}"))
-                .workspace(ws.clone())
-                .lane(Lane::new(&lane, 1)),
-            move |_| async move {
-                release.cancelled().await;
-                Ok(String::new())
-            },
-        );
-    }
+    let files = 80;
+    let boundary = "quackbatch";
+    let body: String = (0..files)
+        .map(|n| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"note-{n}.md\"\r\nContent-Type: text/markdown\r\n\r\n# Note {n}\n\nNumber {n}.\r\n"
+            )
+        })
+        .chain(std::iter::once(format!("--{boundary}--\r\n")))
+        .collect();
     let request = Request::builder()
         .method(Method::POST)
         .uri(format!("/api/v1/workspaces/{ws}/documents"))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::json!({ "text": "one more", "title": "late" }).to_string(),
-        ))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let (status, body, headers) = h.send(request).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(
-        headers
-            .get(header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()),
-        Some("30")
-    );
-    // Nothing was registered for the refused upload.
-    let (_, listed) = h
-        .get(&format!("/api/v1/workspaces/{ws}/documents"), &token)
-        .await;
-    assert_eq!(listed["documents"].as_array().map(Vec::len), Some(0));
-
-    // Once the line drains, uploads are taken again.
-    release.cancel();
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let ids: Vec<String> = body["documents"]
+        .as_array()
+        .map(|docs| {
+            docs.iter()
+                .filter_map(|d| d["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(ids.len(), files);
+    for id in &ids {
+        let ready = h.wait_ready(&ws, id, &token).await;
+        assert_eq!(ready["status"], "ready", "{ready}");
+    }
+    let lane = LaneKey::Ingest(ws.clone());
     for _ in 0..100 {
         if h.app.jobs.lane_active(&lane) == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let (status, body) = h
-        .post(
-            &format!("/api/v1/workspaces/{ws}/documents"),
-            &token,
-            serde_json::json!({ "text": "one more", "title": "late" }),
-        )
-        .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let spool = h.app.config.workspace_uploads_dir(ws.as_str());
+    let left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+    assert_eq!(left, 0, "spooled uploads left in {}", spool.display());
+}
+
+/// What an earlier process spooled and never processed is deleted when the
+/// workspace opens; a workspace with nothing spooled opens the same way.
+#[test]
+fn stale_spooled_uploads_are_cleared() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut config = Config::default();
+    config.general.data_dir = dir.path().to_path_buf();
+    let ws = WorkspaceId::from("ws-spool");
+    assert!(UploadJob::clear_stale(&config, &ws).is_ok());
+    let spool = config.workspace_uploads_dir(ws.as_str());
+    std::fs::create_dir_all(&spool).unwrap_or_else(|e| fail(&e.to_string()));
+    std::fs::write(spool.join("doc-1"), b"left behind").unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(UploadJob::clear_stale(&config, &ws).is_ok());
+    assert!(!spool.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

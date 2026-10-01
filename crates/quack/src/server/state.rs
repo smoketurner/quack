@@ -17,6 +17,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
+use super::queue::UploadJob;
 use super::resource::ProtectedResource;
 use crate::mcp::McpServer;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
@@ -192,12 +193,14 @@ impl AppState {
         cell.get_or_try_init(|| async move {
             let (db, audit) = tokio::task::spawn_blocking(move || {
                 let db = WorkspaceDb::open(&config, id.as_str())?;
-                // Uploads a previous process took but never finished cannot
-                // be resumed: their bytes are gone with it.
+                // Uploads a previous process took but never finished are
+                // failed, and their spooled bytes deleted: the person who
+                // sent them is told to send them again.
                 let stale = db.fail_stale_uploads()?;
                 if stale > 0 {
                     tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
                 }
+                UploadJob::clear_stale(&config, &id)?;
                 let audit = AuditLog::open(&db)?;
                 Ok::<_, CoreError>((db, audit))
             })

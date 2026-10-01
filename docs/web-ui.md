@@ -71,6 +71,17 @@ Users or Audit link, with `aria-current="page"`.
   result shows its row count and the statement's own run time in milliseconds
   (`SqlOutcome::duration_ms`, also in the `POST .../sql` body), timed on the connection's
   thread so a wait for the writer is not counted.
+- **SQL results sort by rewriting the statement.** A header is a button that posts the
+  statement that ran back with `sort` (the 1-based column) and `dir`. When the statement is
+  one `SELECT`-shaped query (`WorkspaceDb::sortable`, from `json_serialize_sql`),
+  `WorkspaceDb::sort_statement` sets its own top-level `ORDER BY` in `DuckDB`'s parse tree,
+  replacing any it had and placing it before a `LIMIT`, and `json_deserialize_sql` prints it
+  back; the column is named when that name is unique and resolves, and given by position
+  otherwise. Nulls sort last both ways. The rewritten SQL runs, and the response swaps it
+  into the editor (`hx-swap-oob`), so what ran is what the person sees and keeps editing.
+  Without a click, rows come back in the statement's own order. Anything else (a write,
+  several statements) runs as typed with plain headers. "Download CSV" is a `POST` of the
+  same statement: SQL never travels in a URL, where request logs and proxies would keep it.
 - **Accessibility.** Every page starts with a "Skip to content" link to `<main id="main">`;
   the workspace tabs and the admin links are named `<nav>` landmarks, and the current tab or
   chat session carries `aria-current="page"`. A control with only a placeholder has an

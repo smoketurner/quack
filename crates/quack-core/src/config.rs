@@ -1833,6 +1833,13 @@ impl Config {
         self.workspace_dir(workspace_id).join("files")
     }
 
+    /// Where `quack serve` keeps a queued upload's bytes until its job
+    /// runs: inside the workspace, since they are its content.
+    #[must_use]
+    pub fn workspace_uploads_dir(&self, workspace_id: &str) -> PathBuf {
+        self.workspace_dir(workspace_id).join("uploads")
+    }
+
     /// Ensure the data directory and its subdirectories exist, and that the
     /// data directory is private to the user (0700 on Unix): it holds every
     /// workspace's content, the control database, and the vault key file.

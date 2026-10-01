@@ -9,6 +9,7 @@ mod sign_in;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use askama::Template;
 use axum::extract::{FromRequestParts, Multipart, Path, Query, State};
@@ -40,11 +41,13 @@ use quack_core::storage::control::{
     WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, SamplePool};
+use quack_core::storage::workspace::{
+    DocumentInfo, DocumentSource, Pinning, ResultSort, SamplePool, SortDirection,
+};
 use rust_embed::Embed;
 use serde::Deserialize;
 
-use self::flash::{Flash, UrlEncoded};
+use self::flash::Flash;
 use super::api::admin::CreateUser;
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
@@ -54,7 +57,6 @@ use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
 use super::api::members::AddMember;
 use super::api::ontology::DecideRequest;
-use super::api::query::SqlRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
     documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
@@ -480,18 +482,129 @@ struct SqlPage {
     page: Page,
     sql: String,
     result: String,
+    /// The editor is rendered in place here, never swapped in.
+    editor_swap: bool,
+}
+
+/// A SQL page run: the statement as typed, and the column sort a header
+/// click asked for. With no sort, the rows come back in the statement's own
+/// order; nothing is imposed.
+#[derive(Deserialize)]
+struct SqlRun {
+    sql: String,
+    /// The 1-based column position to sort by.
+    sort: Option<NonZeroUsize>,
+    dir: Option<SortDirection>,
+}
+
+impl SqlRun {
+    fn result_sort(&self) -> Option<ResultSort> {
+        self.sort.map(|column| ResultSort {
+            column,
+            direction: self.dir.unwrap_or(SortDirection::Asc),
+        })
+    }
+
+    /// The statement to run and whether its results can be sorted. A sort
+    /// rewrites the statement's own `ORDER BY` (replacing any it had), and
+    /// the rewritten SQL is what runs and what the editor then shows; a
+    /// statement that is not one `SELECT` runs as typed.
+    async fn statement(&self, app: &App, access: &Access) -> Statement {
+        let (sql, sort) = (self.sql.clone(), self.result_sort());
+        let planned = app
+            .read(&access.workspace.id, move |db| {
+                let Some(sortable) = db.sortable(&sql)? else {
+                    return Ok(None);
+                };
+                sort.map(|sort| db.sort_statement(&sortable, sort))
+                    .transpose()
+                    .map(Some)
+            })
+            .await;
+        let as_typed = |sortable| Statement {
+            sql: self.sql.clone(),
+            sortable,
+            rewritten: false,
+        };
+        match planned {
+            Ok(Some(Some(rewritten))) => Statement {
+                sql: rewritten,
+                sortable: true,
+                rewritten: true,
+            },
+            Ok(Some(None)) => as_typed(true),
+            // Not sortable, or the rewrite failed: run it as typed, and
+            // let the run report whatever is wrong with it.
+            Ok(None) | Err(_) => as_typed(false),
+        }
+    }
+}
+
+/// What a SQL page run executes.
+struct Statement {
+    sql: String,
+    sortable: bool,
+    /// A header's sort rewrote the SQL; the editor takes the new text.
+    rewritten: bool,
+}
+
+/// A result column's header: a button that sorts by it, ascending first,
+/// then the other way.
+struct SortHeader {
+    name: String,
+    position: NonZeroUsize,
+    sorted: Option<SortDirection>,
+}
+
+impl SortHeader {
+    const fn param(direction: SortDirection) -> &'static str {
+        match direction {
+            SortDirection::Asc => "asc",
+            SortDirection::Desc => "desc",
+        }
+    }
+
+    /// The direction a click asks for.
+    fn next(&self) -> &'static str {
+        Self::param(
+            self.sorted
+                .map_or(SortDirection::Asc, SortDirection::flipped),
+        )
+    }
+
+    fn aria_sort(&self) -> &'static str {
+        match self.sorted {
+            Some(SortDirection::Asc) => "ascending",
+            Some(SortDirection::Desc) => "descending",
+            None => "none",
+        }
+    }
+
+    fn arrow(&self) -> &'static str {
+        match self.sorted {
+            Some(SortDirection::Asc) => "▲",
+            Some(SortDirection::Desc) => "▼",
+            None => "",
+        }
+    }
 }
 
 #[derive(Template)]
 #[template(path = "sql_result.html")]
 struct SqlResult {
-    columns: Vec<String>,
+    ws_id: String,
+    /// The statement that ran, which a header click sends back with its
+    /// sort.
+    sql: String,
+    sortable: bool,
+    /// Swap the rewritten statement into the editor.
+    editor_swap: bool,
+    headers: Vec<SortHeader>,
     rows: Vec<Vec<String>>,
     row_count: usize,
     truncated: bool,
     duration_ms: u64,
     error: Option<String>,
-    csv_href: String,
 }
 
 #[derive(Template)]
@@ -652,10 +765,17 @@ struct AdminAuditPage {
 
 // --- routes ------------------------------------------------------------------
 
+/// The embedded stylesheet, scripts, and icon. They sit outside the rate
+/// limiter: every page load fetches four of them, so counting them spent a
+/// person's request budget four times faster than their clicks did, and a
+/// refused stylesheet left the page unstyled.
+pub(crate) fn assets() -> Router<App> {
+    Router::new().route("/static/{*path}", get(static_asset))
+}
+
 pub(crate) fn router() -> Router<App> {
     Router::new()
         .route("/", get(index))
-        .route("/static/{*path}", get(static_asset))
         .route(
             "/login",
             get(login_page).merge(super::throttled_login(post(login_submit))),
@@ -688,7 +808,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/import", post(import_submit))
         .route("/w/{id}/tables/{name}", get(table))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
-        .route("/w/{id}/sql.csv", get(sql_csv))
+        .route("/w/{id}/sql.csv", post(sql_csv))
         .route("/w/{id}/context", get(context_page).post(context_save))
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
@@ -1344,16 +1464,36 @@ async fn sql_page(
         page: Page::in_workspace(&app, Tab::Sql, &access),
         sql: String::new(),
         result: String::new(),
+        editor_swap: false,
     })
 }
 
 impl SqlResult {
-    /// Run `sql` for the caller: its rows, or why it could not run.
-    async fn run(app: &App, access: &Access, sql: &str) -> Self {
-        let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
-        match access.execute_sql(app, sql).await {
+    /// Run the statement for the caller: its rows, or why it could not run.
+    async fn run(app: &App, access: &Access, run: &SqlRun) -> Self {
+        let Statement {
+            sql,
+            sortable,
+            rewritten,
+        } = run.statement(app, access).await;
+        let sort = run.result_sort().filter(|_| rewritten);
+        let ws_id = access.workspace.id.to_string();
+        match access.execute_sql(app, &sql).await {
             Ok(outcome) => Self {
-                columns: outcome.columns,
+                ws_id,
+                sql,
+                sortable,
+                editor_swap: rewritten,
+                headers: outcome
+                    .columns
+                    .into_iter()
+                    .zip((1..).filter_map(NonZeroUsize::new))
+                    .map(|(name, position)| SortHeader {
+                        name,
+                        position,
+                        sorted: sort.filter(|s| s.column == position).map(|s| s.direction),
+                    })
+                    .collect(),
                 rows: outcome
                     .rows
                     .iter()
@@ -1363,16 +1503,18 @@ impl SqlResult {
                 truncated: outcome.truncated,
                 duration_ms: outcome.duration_ms,
                 error: None,
-                csv_href,
             },
             Err(e) => Self {
-                columns: Vec::new(),
+                ws_id,
+                sql,
+                sortable,
+                editor_swap: false,
+                headers: Vec::new(),
                 rows: Vec::new(),
                 row_count: 0,
                 truncated: false,
                 duration_ms: 0,
                 error: Some(e.message),
-                csv_href,
             },
         }
     }
@@ -1382,20 +1524,24 @@ async fn sql_run(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Form(form): Form<SqlRequest>,
+    Form(form): Form<SqlRun>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    Ok(Html(SqlResult::run(&app, &access, &form.sql).await.render()?).into_response())
+    Ok(Html(SqlResult::run(&app, &access, &form).await.render()?).into_response())
 }
 
+/// The rows as a CSV download. A POST, so the statement travels in the
+/// body: in a URL it would land in request logs, proxies, and browser
+/// history, and a long one would not fit.
 async fn sql_csv(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<SqlRequest>,
+    Form(q): Form<SqlRun>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let outcome = access.execute_sql(&app, &q.sql).await?;
+    let statement = q.statement(&app, &access).await;
+    let outcome = access.execute_sql(&app, &statement.sql).await?;
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer
         .write_record(&outcome.columns)

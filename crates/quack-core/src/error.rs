@@ -95,6 +95,13 @@ pub enum Error {
     #[error("cancelled")]
     Cancelled,
 
+    /// A statement ran past the query timeout and the watchdog stopped it.
+    #[error(
+        "the statement ran longer than the {timeout:?} query timeout \
+         ([analysis].query_timeout_seconds) and was stopped"
+    )]
+    QueryTimeout { timeout: std::time::Duration },
+
     /// A structured file would load into a table another document owns
     /// (issue #51): one document per table.
     #[error(
@@ -116,6 +123,10 @@ pub enum Error {
         value: String,
         allowed: String,
     },
+
+    /// A file with no bytes: there is nothing to load or chunk.
+    #[error("'{0}' is empty; there is nothing to ingest")]
+    EmptyFile(String),
 
     #[error("unsupported file type: {0}")]
     UnsupportedFileType(String),

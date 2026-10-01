@@ -39,7 +39,7 @@ secrecy            = { workspace = true }
 serde_json         = { workspace = true, features = ["std"] }
 shlex              = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }
-tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time", "fs"] }
 tokio-util         = { workspace = true }
 tower              = { workspace = true, features = ["util"] }
 tower-http         = { workspace = true, features = ["timeout", "request-id", "limit", "trace"] }

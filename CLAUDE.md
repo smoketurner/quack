@@ -349,7 +349,7 @@ its `_quack_audit` detail row goes to the workspace's insert-only audit connecti
 write in progress just to record itself. `query/stream` forwards the agent event stream as SSE (`text`,
 `status`, `tool_started`, `tool_finished`, `write_refused`, `complete`, `error`); uploads return 202 with a `job` id
 and run on the work queue in a lane of `[server].workers_per_workspace` per workspace
-(`queue.rs`), which locks the workspace only around each database step; `api/jobs.rs`
+(`queue.rs`), which locks the workspace only around each database step and keeps each queued upload's bytes on disk in the workspace's `uploads/` until its job ends; `api/jobs.rs`
 serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
 and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
