@@ -193,7 +193,50 @@ impl Typed {
             {
                 None
             }
-            (Context::Expressions, _) => (!self.word.is_empty()).then_some(Slot::Column),
+            // A blank word gets names only where an expression must
+            // follow, so Enter still sends a finished statement.
+            (Context::Expressions, _) => (!self.word.is_empty()
+                || Self::expects_expression(previous))
+            .then_some(Slot::Column),
+        }
+    }
+
+    /// Whether an expression must come after `token`: a clause keyword, a
+    /// connective, a comma, an open parenthesis, or a comparison or
+    /// arithmetic operator (not `*`, which may be `SELECT *`).
+    fn expects_expression(token: &Token) -> bool {
+        match token {
+            Token::Word(word) => matches!(
+                word.keyword,
+                Keyword::SELECT
+                    | Keyword::WHERE
+                    | Keyword::BY
+                    | Keyword::ON
+                    | Keyword::HAVING
+                    | Keyword::QUALIFY
+                    | Keyword::SET
+                    | Keyword::USING
+                    | Keyword::RETURNING
+                    | Keyword::AND
+                    | Keyword::OR
+                    | Keyword::NOT
+                    | Keyword::CASE
+                    | Keyword::WHEN
+                    | Keyword::THEN
+                    | Keyword::ELSE
+            ),
+            Token::Comma
+            | Token::LParen
+            | Token::Eq
+            | Token::Neq
+            | Token::Lt
+            | Token::Gt
+            | Token::LtEq
+            | Token::GtEq
+            | Token::Plus
+            | Token::Minus
+            | Token::Div => true,
+            _ => false,
         }
     }
 }
@@ -339,6 +382,52 @@ mod tests {
             ["sold", "sales", "stores"]
         );
         assert_eq!(offered("SELECT * FROM stores ORDER BY r"), ["\"Region\""]);
+    }
+
+    #[test]
+    fn a_blank_word_gets_columns_where_an_expression_must_follow() {
+        assert_eq!(
+            offered("SELECT * FROM sales WHERE "),
+            [
+                "region",
+                "revenue",
+                "sold",
+                "\"Order Items\"",
+                "sales",
+                "stores"
+            ]
+        );
+        assert_eq!(
+            offered("SELECT | FROM sales"),
+            [
+                "region",
+                "revenue",
+                "sold",
+                "\"Order Items\"",
+                "sales",
+                "stores"
+            ]
+        );
+        assert_eq!(
+            offered("SELECT * FROM sales WHERE region = 'n' AND ")
+                .first()
+                .map(String::as_str),
+            Some("region")
+        );
+        assert_eq!(
+            offered("SELECT region, | FROM sales")
+                .first()
+                .map(String::as_str),
+            Some("region")
+        );
+        // Not where the statement may already be whole.
+        for line in [
+            "SELECT * FROM sales WHERE revenue > 1 ",
+            "SELECT * ",
+            "SELECT * FROM sales ORDER BY revenue DESC ",
+        ] {
+            assert!(offered(line).is_empty(), "{line}: {:?}", offered(line));
+        }
     }
 
     #[test]

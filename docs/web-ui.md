@@ -125,7 +125,9 @@ row is processing (marked `data-pending`).
   `JOIN`, `DESCRIBE`, `SUMMARIZE`, or a comma in a `FROM` list; after `t.`, that table's or
   alias's columns (lang-sql's own source); in an expression, the columns of every table the
   statement names (before or after the cursor) first, then table names, then keywords and
-  functions; nothing at an alias. The editor is built at once, at the textarea's size and on
+  functions, offered before a letter is typed where an expression must follow (after
+  `SELECT`, `WHERE`, `AND`, a comma, `=`); nothing at an alias. The popup opens as you type;
+  Ctrl+Space opens it anywhere. The editor is built at once, at the textarea's size and on
   its background, and the schema plugs in when it arrives, so the box does not flash. It
   hides the page's `textarea` and keeps it in sync, so the htmx run, the sort swap, and the CSV
   download post it as before, and without JavaScript the textarea is the editor.
