@@ -538,14 +538,14 @@ pub fn record_turn(
     Ok(())
 }
 
-/// Prior user and assistant messages to replay to the model, newest last,
-/// trimmed from the oldest end to fit `token_budget`. Tool messages are not
-/// replayed; the assistant text already describes what the tools found.
-///
-/// The result is always anchored on a `User` message: when trimming drops
-/// the `User` that preceded a kept `Assistant`, that orphaned assistant is
-/// dropped too, so the replayed thread opens with a `User` rather than an
-/// answer whose question was discarded for budget.
+/// Prior turns to replay to the model, newest last, trimmed from the
+/// oldest end to fit `token_budget`. A turn is its question and its answer,
+/// kept or dropped together, so the thread opens on a question and
+/// alternates; tool messages are not replayed, since the answer already
+/// describes what the tools found. A turn with no text on either side is
+/// skipped: it tells the model nothing, and a provider that drops empty
+/// text blocks (Anthropic) would be left with a message of no content and
+/// refuse every later turn of the session.
 ///
 /// # Errors
 ///
@@ -556,27 +556,36 @@ pub fn history_for_model(
     token_budget: Tokens,
 ) -> Result<Vec<rig::message::Message>> {
     let stored = messages(db, session_id)?;
-    let budget = token_budget;
+    let mut turns: Vec<(&MessageRow, &MessageRow)> = Vec::new();
+    let mut question = None;
+    for row in &stored {
+        match row.role {
+            MessageRole::User => question = Some(row),
+            MessageRole::Assistant => {
+                if let Some(asked) = question.take() {
+                    turns.push((asked, row));
+                }
+            }
+            MessageRole::Tool => {}
+        }
+    }
 
     let mut kept: Vec<rig::message::Message> = Vec::new();
     let mut used = Tokens::default();
-    for row in stored.iter().rev() {
-        let message = match row.role {
-            MessageRole::User => rig::message::Message::user(row.content.clone()),
-            MessageRole::Assistant => rig::message::Message::assistant(row.content.clone()),
-            MessageRole::Tool => continue,
-        };
-        let cost = Tokens::estimate(&row.content);
-        if used.saturating_add(cost) > budget {
+    for (asked, answered) in turns.iter().rev() {
+        if asked.content.trim().is_empty() || answered.content.trim().is_empty() {
+            continue;
+        }
+        let cost =
+            Tokens::estimate(&asked.content).saturating_add(Tokens::estimate(&answered.content));
+        if used.saturating_add(cost) > token_budget {
             break;
         }
         used = used.saturating_add(cost);
-        kept.push(message);
+        kept.push(rig::message::Message::assistant(answered.content.clone()));
+        kept.push(rig::message::Message::user(asked.content.clone()));
     }
     kept.reverse();
-    while matches!(kept.first(), Some(rig::message::Message::Assistant { .. })) {
-        kept.remove(0);
-    }
     Ok(kept)
 }
 
@@ -1179,6 +1188,54 @@ mod tests {
                 Some(rig::message::Message::Assistant { .. })
             ),
             "orphaned Assistant first: {trimmed:?}"
+        );
+    }
+
+    /// A turn whose answer (or question) holds no text is left out whole:
+    /// the replayed thread still alternates, and no message reaches the
+    /// provider without content.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn history_skips_turns_with_no_text() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "first",
+            Timestamp::now(),
+            &response("one", vec![]),
+        )
+        .unwrap();
+        append_message(&db, &session.id, MessageRole::User, "second", None).unwrap();
+        append_message(&db, &session.id, MessageRole::Assistant, "  ", None).unwrap();
+        append_message(&db, &session.id, MessageRole::User, "", None).unwrap();
+        append_message(&db, &session.id, MessageRole::Assistant, "orphaned", None).unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "third",
+            Timestamp::now(),
+            &response("three", vec![]),
+        )
+        .unwrap();
+
+        let history = history_for_model(&db, &session.id, Tokens::new(10_000)).unwrap();
+        let texts: Vec<String> = history
+            .iter()
+            .map(|m| match m {
+                rig::message::Message::User { .. } => format!("user: {m:?}"),
+                rig::message::Message::Assistant { .. } => format!("assistant: {m:?}"),
+                rig::message::Message::System { .. } => format!("system: {m:?}"),
+            })
+            .collect();
+        assert_eq!(history.len(), 4, "{texts:#?}");
+        for (text, expected) in texts.iter().zip(["first", "one", "third", "three"]) {
+            assert!(text.contains(expected), "{text} lacks {expected}");
+        }
+        assert!(
+            texts.iter().step_by(2).all(|t| t.starts_with("user:")),
+            "{texts:#?}"
         );
     }
 
