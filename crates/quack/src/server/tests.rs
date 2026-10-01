@@ -2556,6 +2556,8 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     assert_eq!(location(&headers), format!("/w/{ws}/context"));
     let (status, html, _) = h.page(&format!("/w/{ws}/context"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{html}");
+    assert!(html.contains("aria-current=\"page\">Context</a>"), "{html}");
     assert!(
         html.contains("Be brief.") && html.contains("by root"),
         "{html}"

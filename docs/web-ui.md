@@ -36,10 +36,11 @@ slot; a success opens the same session cookie a password login does.
 
 ## Templates
 
-Every page struct carries a `page: Page`: title, username, admin flag, local flag, and the
-current workspace with its role and what the caller may do. `base.html` reads it for the
-header and the workspace tabs: chat, documents, tables (with the import form), SQL,
-context, ontology, graph, settings.
+Every page struct carries a `page: Page`: title, its `Tab`, username, admin flag, local flag,
+and the current workspace with its role and what the caller may do. `base.html` reads it for
+the header and the workspace tabs (`Tab::WORKSPACE`: chat, documents, tables with the import
+form, SQL, context, ontology, graph, jobs, settings), highlighting the page's tab, or the
+Users or Audit link, with `aria-current="page"`.
 
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
   editor; the version list with the diff to the previous version; the propose form; and the

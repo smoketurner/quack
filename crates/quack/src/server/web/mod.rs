@@ -137,10 +137,77 @@ type WebResult<T> = Result<T, HtmlError>;
 /// What the layout needs on every page.
 struct Page {
     title: String,
+    /// The header link to mark as current.
+    tab: Tab,
     username: String,
     is_admin: bool,
     local: bool,
     workspace: Option<WsNav>,
+}
+
+/// A header link: the workspace tabs, then the admin pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Workspaces,
+    Chat,
+    Documents,
+    Tables,
+    Sql,
+    Context,
+    Ontology,
+    Graph,
+    Jobs,
+    Settings,
+    Users,
+    Audit,
+}
+
+impl Tab {
+    /// The workspace tabs, in header order.
+    const WORKSPACE: [Self; 9] = [
+        Self::Chat,
+        Self::Documents,
+        Self::Tables,
+        Self::Sql,
+        Self::Context,
+        Self::Ontology,
+        Self::Graph,
+        Self::Jobs,
+        Self::Settings,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Workspaces => "Workspaces",
+            Self::Chat => "Chat",
+            Self::Documents => "Documents",
+            Self::Tables => "Tables",
+            Self::Sql => "SQL",
+            Self::Context => "Context",
+            Self::Ontology => "Ontology",
+            Self::Graph => "Graph",
+            Self::Jobs => "Jobs",
+            Self::Settings => "Settings",
+            Self::Users => "Users",
+            Self::Audit => "Audit",
+        }
+    }
+
+    /// The path under `/w/{id}/` for a workspace tab.
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Documents => "documents",
+            Self::Tables => "tables",
+            Self::Sql => "sql",
+            Self::Context => "context",
+            Self::Ontology => "ontology",
+            Self::Graph => "graph",
+            Self::Jobs => "jobs",
+            Self::Settings => "settings",
+            Self::Workspaces | Self::Users | Self::Audit => "",
+        }
+    }
 }
 
 struct WsNav {
@@ -177,9 +244,10 @@ impl fmt::Display for Standing {
 
 impl Page {
     /// A page outside any workspace.
-    fn new(app: &App, identity: &Identity, title: &str) -> Self {
+    fn new(app: &App, identity: &Identity, tab: Tab) -> Self {
         Self {
-            title: title.to_owned(),
+            title: tab.label().to_owned(),
+            tab,
             username: identity.username.clone(),
             is_admin: identity.is_admin,
             local: app.mode == ServeMode::Local,
@@ -188,7 +256,7 @@ impl Page {
     }
 
     /// A page inside `access`'s workspace, with its navigation.
-    fn in_workspace(app: &App, title: &str, access: &Access) -> Self {
+    fn in_workspace(app: &App, tab: Tab, access: &Access) -> Self {
         Self {
             workspace: Some(WsNav {
                 id: access.workspace.id.to_string(),
@@ -197,7 +265,7 @@ impl Page {
                 can_write: access.permits(Need::WRITE),
                 can_manage: access.permits(Need::OWN),
             }),
-            ..Self::new(app, &access.identity, title)
+            ..Self::new(app, &access.identity, tab)
         }
     }
 }
@@ -738,7 +806,7 @@ async fn workspaces(
     };
     html(&WorkspacesPage {
         can_create: identity.is_admin,
-        page: Page::new(&app, &identity, "Workspaces"),
+        page: Page::new(&app, &identity, Tab::Workspaces),
         workspaces: items,
         error: q.error,
     })
@@ -867,7 +935,7 @@ async fn chat(
         (Vec::new(), Vec::new())
     };
     html(&ChatPage {
-        page: Page::in_workspace(&app, "Chat", &access),
+        page: Page::in_workspace(&app, Tab::Chat, &access),
         sessions: sessions_list,
         current,
         messages: MessageView::transcript(&messages),
@@ -967,7 +1035,7 @@ async fn jobs_page(
     access.audit_read(&app, AuditAction::Page, "jobs").await?;
     let rows = JobRows::of(&app, &access).render()?;
     html(&JobsPage {
-        page: Page::in_workspace(&app, "Jobs", &access),
+        page: Page::in_workspace(&app, Tab::Jobs, &access),
         rows,
     })
 }
@@ -1008,7 +1076,7 @@ async fn documents(
     let rows = DocumentRows::load(&app, &access).await?.render()?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
-        page: Page::in_workspace(&app, "Documents", &access),
+        page: Page::in_workspace(&app, Tab::Documents, &access),
         rows,
         error: q.error,
         notice: q.notice,
@@ -1149,7 +1217,7 @@ async fn tables(
     access.audit_read(&app, AuditAction::Page, "tables").await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
-        page: Page::in_workspace(&app, "Tables", &access),
+        page: Page::in_workspace(&app, Tab::Tables, &access),
         tables: list,
         selected: None,
         error: q.error,
@@ -1196,7 +1264,10 @@ async fn table(
     let described = access.describe_table(&app, &name).await?;
     let list = app.read(&id, WorkspaceDb::list_tables).await?;
     html(&TablesPage {
-        page: Page::in_workspace(&app, &name, &access),
+        page: Page {
+            title: name.clone(),
+            ..Page::in_workspace(&app, Tab::Tables, &access)
+        },
         tables: list,
         error: None,
         selected: Some(TableView {
@@ -1225,7 +1296,7 @@ async fn sql_page(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "sql").await?;
     html(&SqlPage {
-        page: Page::in_workspace(&app, "SQL", &access),
+        page: Page::in_workspace(&app, Tab::Sql, &access),
         sql: String::new(),
         result: String::new(),
     })
@@ -1381,7 +1452,7 @@ async fn ontology_page(
         None => String::new(),
     };
     html(&OntologyPage {
-        page: Page::in_workspace(&app, "Ontology", &access),
+        page: Page::in_workspace(&app, Tab::Ontology, &access),
         classes: ontology.as_ref().map(ClassRow::tree).unwrap_or_default(),
         ontology,
         json,
@@ -1667,7 +1738,7 @@ async fn context_page(
         })
         .await?;
     html(&ContextPage {
-        page: Page::in_workspace(&app, "Context", &access),
+        page: Page::in_workspace(&app, Tab::Context, &access),
         content: current
             .as_ref()
             .map(|c| c.content.clone())
@@ -1718,7 +1789,7 @@ impl SettingsPage {
             (Vec::new(), Vec::new())
         };
         Ok(Self {
-            page: Page::in_workspace(app, "Settings", access),
+            page: Page::in_workspace(app, Tab::Settings, access),
             classification: access.workspace.classification.clone(),
             providers,
             members,
@@ -1870,7 +1941,7 @@ async fn admin_users(
 ) -> WebResult<Response> {
     identity.require_admin()?;
     html(&AdminUsersPage {
-        page: Page::new(&app, &identity, "Users"),
+        page: Page::new(&app, &identity, Tab::Users),
         users: app.control.list_users().await?,
         error: q.error,
     })
@@ -1936,7 +2007,7 @@ async fn admin_audit(
     let filter = AuditFilter::from(q);
     let AuditPage { rows, next } = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
-        page: Page::new(&app, &identity, "Audit"),
+        page: Page::new(&app, &identity, Tab::Audit),
         rows,
         continued: filter.after.is_some(),
         next_cursor: next.map(|c| c.to_string()),
@@ -2159,7 +2230,7 @@ async fn graph_page(
         .collect();
     drift.sort();
     html(&GraphPage {
-        page: Page::in_workspace(&app, "Graph", &access),
+        page: Page::in_workspace(&app, Tab::Graph, &access),
         status,
         drift,
         has_ontology: data.has_ontology,
